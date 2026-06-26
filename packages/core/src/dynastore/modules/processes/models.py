@@ -143,7 +143,10 @@ class ProcessSummary(BaseModel):
             "catalog-level and collection-level URLs."
         ),
     )
-    jobControlOptions: List[JobControlOptions] = [JobControlOptions.ASYNC_EXECUTE]
+    jobControlOptions: List[JobControlOptions] = [
+        JobControlOptions.ASYNC_EXECUTE,
+        JobControlOptions.DISMISS,
+    ]
     outputTransmission: List[TransmissionMode] = [TransmissionMode.REFERENCE]
     links: List[Link] = []
     typologies: List[ProcessTypology] = Field(
@@ -257,6 +260,34 @@ class StatusInfo(BaseModel):
     # (server-authored runtime status line); `description` is the human-readable
     # purpose submitted by the operator at job-creation time.
     description: Optional[Any] = None
+    links: List[Link]
+
+
+class JobList(BaseModel):
+    """OGC API - Processes JobList model for job listing responses."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "jobs": [
+                        {
+                            "jobID": "550e8400-e29b-41d4-a716-446655440000",
+                            "status": "running",
+                            "type": "process",
+                            "links": [],
+                        }
+                    ],
+                    "links": [
+                        {"rel": "self", "href": "/processes/jobs", "type": "application/json"},
+                        {"rel": "next", "href": "/processes/jobs?offset=20", "type": "application/json"},
+                    ],
+                }
+            ]
+        },
+    )
+
+    jobs: List[StatusInfo]
     links: List[Link]
 
 class OutputExecutionRequest(BaseModel):

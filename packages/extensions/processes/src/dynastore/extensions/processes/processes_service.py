@@ -50,6 +50,7 @@ from dynastore.extensions.tools.language_utils import get_language  # noqa: E402
 from dynastore.extensions.tools.ogc_common_models import Conformance
 from dynastore.extensions.tools.db import get_async_connection, get_async_engine
 from dynastore.extensions.tools.response_i18n import localize_response_dict, resolve_links, resolve_localized  # noqa: E402
+from dynastore.extensions.tools.problem_details import ProblemDetails, ProblemException  # noqa: E402
 from dynastore.tools.json import CustomJSONEncoder  # noqa: E402
 from dynastore.modules.processes.protocols import ProcessRegistryProtocol
 from dynastore.tools.discovery import get_protocols
@@ -460,6 +461,28 @@ def _localize_status_info(si: models.StatusInfo, language: str) -> dict:
     return data
 
 
+def _localize_job_list(jl: models.JobList, language: str) -> dict:
+    """Serialize a JobList and resolve title/description/links to *language*."""
+    data = jl.model_dump(by_alias=True, exclude_none=True)
+    localize_response_dict(data, language, text_fields=("title", "description"), link_keys=("links",))
+    for job in data.get("jobs", []):
+        if "title" in job:
+            job["title"] = resolve_localized(job["title"], language)
+            if job["title"] is None:
+                del job["title"]
+        if "description" in job:
+            job["description"] = resolve_localized(job["description"], language)
+            if job["description"] is None:
+                del job["description"]
+        if "message" in job:
+            job["message"] = resolve_localized(job["message"], language)
+            if job["message"] is None:
+                del job["message"]
+        if "links" in job:
+            job["links"] = resolve_links(job["links"], language)
+    return data
+
+
 @router.get(
     "/conformance",
     response_model=Conformance,
@@ -670,7 +693,7 @@ async def execute_process(
     except Exception as e:
         _handle_execution_exception(process_id, e)
 
-    return _handle_execution_result(result, request, language)
+    return _handle_execution_result(result, request, language, preferred_mode=preferred_mode)
 
 
 @router.post(
@@ -716,7 +739,7 @@ async def execute_process_catalog(
     except Exception as e:
         _handle_execution_exception(process_id, e)
 
-    return _handle_execution_result(result, request, language)
+    return _handle_execution_result(result, request, language, preferred_mode=preferred_mode)
 
 
 @router.post(
@@ -765,7 +788,7 @@ async def execute_process_collection(
     except Exception as e:
         _handle_execution_exception(process_id, e)
 
-    return _handle_execution_result(result, request, language)
+    return _handle_execution_result(result, request, language, preferred_mode=preferred_mode)
 
 
 def _task_to_status_info(task: Task, request: Request) -> models.StatusInfo:
@@ -813,7 +836,8 @@ def _handle_execution_exception(process_id: str, e: Exception):
 
 
 def _handle_execution_result(
-    result: Union[Task, models.StatusInfo, Any], request: Request, language: str = "en"
+    result: Union[Task, models.StatusInfo, Any], request: Request, language: str = "en",
+    preferred_mode: Optional[models.JobControlOptions] = None,
 ):
     if isinstance(result, Task):
         # ASYNC_EXECUTE: The runner returned a new task object.
@@ -845,10 +869,14 @@ def _handle_execution_result(
         links = _get_job_links(result, request)
         status_info = models.task_to_status_info(result, links=links)
 
+        headers = {"Location": _external_url(job_status_url)}
+        if preferred_mode == models.JobControlOptions.ASYNC_EXECUTE:
+            headers["Preference-Applied"] = "respond-async"
+
         return Response(
             content=json.dumps(_localize_status_info(status_info, language), cls=CustomJSONEncoder),
             status_code=status.HTTP_201_CREATED,
-            headers={"Location": _external_url(job_status_url)},
+            headers=headers,
             media_type="application/json",
         )
     else:
@@ -1061,8 +1089,39 @@ async def list_jobs(
 ) -> JSONResponse:
     """Lists jobs (System context)."""
     tasks = await tasks_module.list_tasks(conn, schema="public", limit=limit, offset=offset, kind="process")
+    jobs = [_task_to_status_info(t, request) for t in tasks]
+    links = [
+        models.Link(
+            href=_external_url(request.url),
+            rel="self",
+            type="application/json",
+            title="This document",
+        )
+    ]
+    if len(tasks) == limit:
+        next_url = str(request.url.replace_query_params(offset=offset + limit, limit=limit))
+        links.append(
+            models.Link(
+                href=_external_url(next_url),
+                rel="next",
+                type="application/json",
+                title="Next page",
+            )
+        )
+    if offset > 0:
+        prev_offset = max(0, offset - limit)
+        prev_url = str(request.url.replace_query_params(offset=prev_offset, limit=limit))
+        links.append(
+            models.Link(
+                href=_external_url(prev_url),
+                rel="prev",
+                type="application/json",
+                title="Previous page",
+            )
+        )
+    job_list = models.JobList(jobs=jobs, links=links)
     return JSONResponse(
-        content=[_localize_status_info(_task_to_status_info(t, request), language) for t in tasks],
+        content=_localize_job_list(job_list, language),
         headers={"Content-Language": language},
     )
 
@@ -1082,8 +1141,39 @@ async def list_jobs_catalog(
     """Lists jobs (Catalog context)."""
     schema = await _resolve_catalog_schema(catalog_id, conn)
     tasks = await tasks_module.list_tasks(conn, schema=schema, limit=limit, offset=offset, kind="process")
+    jobs = [_task_to_status_info(t, request) for t in tasks]
+    links = [
+        models.Link(
+            href=_external_url(request.url),
+            rel="self",
+            type="application/json",
+            title="This document",
+        )
+    ]
+    if len(tasks) == limit:
+        next_url = str(request.url.replace_query_params(offset=offset + limit, limit=limit))
+        links.append(
+            models.Link(
+                href=_external_url(next_url),
+                rel="next",
+                type="application/json",
+                title="Next page",
+            )
+        )
+    if offset > 0:
+        prev_offset = max(0, offset - limit)
+        prev_url = str(request.url.replace_query_params(offset=prev_offset, limit=limit))
+        links.append(
+            models.Link(
+                href=_external_url(prev_url),
+                rel="prev",
+                type="application/json",
+                title="Previous page",
+            )
+        )
+    job_list = models.JobList(jobs=jobs, links=links)
     return JSONResponse(
-        content=[_localize_status_info(_task_to_status_info(t, request), language) for t in tasks],
+        content=_localize_job_list(job_list, language),
         headers={"Content-Language": language},
     )
 
@@ -1105,8 +1195,39 @@ async def list_jobs_collection(
     schema = await _resolve_catalog_schema(catalog_id, conn)
     all_tasks = await tasks_module.list_tasks(conn, schema=schema, limit=limit, offset=offset, kind="process")
     filtered = [t for t in all_tasks if getattr(t, "collection_id", None) == collection_id]
+    jobs = [_task_to_status_info(t, request) for t in filtered]
+    links = [
+        models.Link(
+            href=_external_url(request.url),
+            rel="self",
+            type="application/json",
+            title="This document",
+        )
+    ]
+    if len(filtered) == limit:
+        next_url = str(request.url.replace_query_params(offset=offset + limit, limit=limit))
+        links.append(
+            models.Link(
+                href=_external_url(next_url),
+                rel="next",
+                type="application/json",
+                title="Next page",
+            )
+        )
+    if offset > 0:
+        prev_offset = max(0, offset - limit)
+        prev_url = str(request.url.replace_query_params(offset=prev_offset, limit=limit))
+        links.append(
+            models.Link(
+                href=_external_url(prev_url),
+                rel="prev",
+                type="application/json",
+                title="Previous page",
+            )
+        )
+    job_list = models.JobList(jobs=jobs, links=links)
     return JSONResponse(
-        content=[_localize_status_info(_task_to_status_info(t, request), language) for t in filtered],
+        content=_localize_job_list(job_list, language),
         headers={"Content-Language": language},
     )
 
@@ -1406,7 +1527,7 @@ async def start_job(
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found. ({e})") from e
-    return _handle_execution_result(result, request, language)
+    return _handle_execution_result(result, request, language, preferred_mode=preferred_mode)
 
 
 @router.post(
@@ -1435,7 +1556,7 @@ async def start_job_catalog(
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found. ({e})") from e
-    return _handle_execution_result(result, request, language)
+    return _handle_execution_result(result, request, language, preferred_mode=preferred_mode)
 
 
 @router.post(
@@ -1465,14 +1586,18 @@ async def start_job_collection(
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found. ({e})") from e
-    return _handle_execution_result(result, request, language)
+    return _handle_execution_result(result, request, language, preferred_mode=preferred_mode)
 
 
 def _handle_job_results(task: Task, job_id: uuid.UUID):
     if task.status == TaskStatusEnum.FAILED:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Job '{job_id}' failed and has no results. See status for error.",
+        raise ProblemException(
+            ProblemDetails(
+                type="http://www.opengis.net/def/exceptions/ogcapi-processes-1/1.0/job-results-failed",
+                title="Job failed",
+                status=status.HTTP_404_NOT_FOUND,
+                detail=f"Job '{job_id}' failed and has no results. See status for error.",
+            )
         )
     if task.status != TaskStatusEnum.COMPLETED:
         raise HTTPException(
