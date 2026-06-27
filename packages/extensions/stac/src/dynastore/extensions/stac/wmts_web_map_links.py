@@ -46,6 +46,16 @@ Design constraints
 - Defensive: malformed URLs or missing WMTS assets produce no output.
 - Items with no WMTS preview asset (vectors, non-WMTS rasters) are left
   completely untouched.
+
+Native-tile suppression
+-----------------------
+When the dynastore tiles service is active and the item is a COG with a
+resolvable default style, ``TilesStacContributor`` (tiles extension) will
+emit a native map-tile link that already supersedes the external-WMTS
+source.  In that case this contributor silently skips the WMTS link so
+the item does not advertise both.  The shared predicate lives in
+``_map_tiles_gate`` (same package) so both contributors agree on the
+condition without circular imports.
 """
 
 from __future__ import annotations
@@ -55,6 +65,7 @@ from typing import Iterable
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from dynastore.models.protocols.asset_contrib import AssetLink, ResourceRef
+from ._map_tiles_gate import is_item_map_tileable
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +171,15 @@ class WmtsWebMapLinksContributor:
     priority: int = 50  # run before the default-100 contributors
 
     def contribute(self, ref: ResourceRef) -> Iterable[AssetLink]:
-        """Yield a ``wmts`` AssetLink for the first parseable WMTS preview asset."""
+        """Yield a ``wmts`` AssetLink for the first parseable WMTS preview asset.
+
+        Suppressed when the item is dynastore-tileable (COG + default style +
+        tiles route registered): in that case ``TilesStacContributor`` already
+        emits a native map-tile link that takes precedence.
+        """
+        if is_item_map_tileable(ref):
+            return
+
         item_assets: dict = ref.extras.get("item_assets") or {}
         if not item_assets:
             return
@@ -194,8 +213,17 @@ class WmtsWebMapLinksContributor:
             return
 
     def contribute_stac(self, ref: ResourceRef) -> Iterable:
-        """StacContributor: declare the web-map-links extension URI when emitting."""
+        """StacContributor: declare the web-map-links extension URI when emitting.
+
+        Suppressed for the same condition as ``contribute``: when
+        ``TilesStacContributor`` will emit a native link the web-map-links
+        extension URI is not declared either (the render extension is declared
+        instead by the tiles contributor).
+        """
         from .stac_contributor import StacContribution
+
+        if is_item_map_tileable(ref):
+            return
 
         item_assets: dict = ref.extras.get("item_assets") or {}
         has_wmts = any(

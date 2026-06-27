@@ -28,9 +28,12 @@ Covers:
 - GetPreview-only params (width, height) are stripped from the template.
 - tilematrixset is forced to the preferred web-mercator id (EPSG:3857) when
   the source carries a non-slippy-map CRS (EPSG:4326).
+- Suppression: when the item is dynastore-tileable (COG + default style +
+  tiles route registered) the WMTS link is suppressed; native tile link wins.
+- Fallback: when any of the three conditions fails the WMTS link is still emitted.
 """
 
-import pytest
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
 from dynastore.extensions.stac.wmts_web_map_links import (
@@ -39,6 +42,12 @@ from dynastore.extensions.stac.wmts_web_map_links import (
     _derive_wmts_get_tile_href,
 )
 from dynastore.models.protocols.asset_contrib import AssetLink, ResourceRef
+
+# Patch target: is_item_map_tileable is imported into wmts_web_map_links so we
+# patch there (point-of-use), avoiding the need to pre-import _map_tiles_gate.
+_TILEABLE_PATCH = (
+    "dynastore.extensions.stac.wmts_web_map_links.is_item_map_tileable"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -308,3 +317,127 @@ def test_add_dynamic_assets_attaches_wmts_link_to_item():
     assert "{TileRow}" in wmts_asset.href
     assert "{TileCol}" in wmts_asset.href
     assert "GetTile" in wmts_asset.href
+
+
+# ---------------------------------------------------------------------------
+# Native-tile suppression
+#
+# When the item is dynastore-tileable (tiles route registered + COG asset +
+# default style ID), the external-WMTS link must be suppressed in favour of
+# the native link that TilesStacContributor will emit.
+# ---------------------------------------------------------------------------
+
+_COG_ASSET_HREF = "https://storage.googleapis.com/bucket/scene.tif"
+
+_COG_ITEM_ASSETS = {
+    "cog": {
+        "href": _COG_ASSET_HREF,
+        "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+        "roles": ["data"],
+    },
+    "preview": {
+        "href": _FAO_PREVIEW_HREF,
+        "type": "image/png",
+        "roles": ["visual"],
+    },
+}
+
+
+def _make_tileable_ref() -> ResourceRef:
+    """COG item with a WMTS preview and a resolved default style."""
+    return ResourceRef(
+        catalog_id="cat",
+        collection_id="col",
+        item_id="item1",
+        base_url="https://api.example.org",
+        extras={
+            "item_assets": _COG_ITEM_ASSETS,
+            "default_style_id": "ndvi",
+        },
+    )
+
+
+def test_contribute_suppressed_for_tiles_tileable_item():
+    """Dynastore-tileable COG: WMTS link must NOT be emitted."""
+    contributor = WmtsWebMapLinksContributor()
+    ref = _make_tileable_ref()
+
+    with patch(_TILEABLE_PATCH, return_value=True):
+        links = list(contributor.contribute(ref))
+
+    assert links == [], (
+        "Expected no WMTS link for a tiles-tileable COG item; "
+        f"got {links!r}"
+    )
+
+
+def test_contribute_stac_suppressed_for_tiles_tileable_item():
+    """Dynastore-tileable COG: web-map-links extension URI must NOT be declared."""
+    contributor = WmtsWebMapLinksContributor()
+    ref = _make_tileable_ref()
+
+    with patch(_TILEABLE_PATCH, return_value=True):
+        contributions = list(contributor.contribute_stac(ref))
+
+    assert contributions == [], (
+        "Expected no StacContribution for a tiles-tileable COG item; "
+        f"got {contributions!r}"
+    )
+
+
+def test_contribute_emits_wmts_when_not_tileable():
+    """When is_item_map_tileable returns False, the WMTS fallback is emitted."""
+    contributor = WmtsWebMapLinksContributor()
+    ref = _make_tileable_ref()
+
+    # Explicitly mock the predicate to False (simulates tiles route absent,
+    # no COG, or no default style — any of those makes it False).
+    with patch(_TILEABLE_PATCH, return_value=False):
+        links = list(contributor.contribute(ref))
+
+    assert len(links) == 1
+    assert links[0].key == "wmts_tiles"
+    assert "GetTile" in links[0].href
+
+
+def test_contribute_emits_wmts_when_no_cog_asset():
+    """Item has no COG: is_item_map_tileable is False → WMTS link emitted."""
+    contributor = WmtsWebMapLinksContributor()
+    # No COG in item_assets — _first_cog_href returns None, so tileable=False.
+    ref = ResourceRef(
+        catalog_id="cat",
+        collection_id="col",
+        item_id="item1",
+        extras={
+            "item_assets": {
+                "preview": {
+                    "href": _FAO_PREVIEW_HREF,
+                    "type": "image/png",
+                    "roles": ["visual"],
+                }
+            },
+            "default_style_id": "ndvi",
+        },
+    )
+    # In the test process no tiles route is registered, so is_item_map_tileable
+    # returns False without any patching; WMTS link must be emitted.
+    links = list(contributor.contribute(ref))
+    assert len(links) == 1
+    assert links[0].key == "wmts_tiles"
+
+
+def test_contribute_emits_wmts_when_no_default_style():
+    """Item has a COG but no default_style_id → not tileable → WMTS emitted."""
+    contributor = WmtsWebMapLinksContributor()
+    ref = ResourceRef(
+        catalog_id="cat",
+        collection_id="col",
+        item_id="item1",
+        extras={
+            "item_assets": _COG_ITEM_ASSETS,
+            # default_style_id intentionally absent
+        },
+    )
+    links = list(contributor.contribute(ref))
+    assert len(links) == 1
+    assert links[0].key == "wmts_tiles"
