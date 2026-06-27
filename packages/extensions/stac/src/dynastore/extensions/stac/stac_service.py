@@ -736,12 +736,17 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         self,
         definition: STACCatalogRequest,
         language: str = Depends(get_language),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         try:
             input_data = definition.model_dump(exclude_unset=True)
             # Pass input_data as both the payload and the exclude_unset dump so
             # detect_use_lang inside the shared body reads the same dict.
-            return await self._ogc_create_catalog(input_data, input_data, language, None)
+            # ``?hints=defer`` flows to create_catalog, deferring GCP storage
+            # provisioning so the catalog is created core-only (see Hint.DEFER).
+            return await self._ogc_create_catalog(
+                input_data, input_data, language, None, hints=request_hints
+            )
         except Exception as e:
             return handle_or_raise(
                 e,

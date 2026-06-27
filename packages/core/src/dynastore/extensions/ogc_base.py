@@ -34,7 +34,7 @@ Usage::
 """
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Dict, Iterable, List, Literal, Optional, Tuple, Type, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Dict, FrozenSet, Iterable, List, Literal, Optional, Tuple, Type, TypeVar, cast
 
 from fastapi import Depends, HTTPException, Request, Response, status
 
@@ -622,6 +622,8 @@ class OGCServiceMixin:
         input_dump: Dict[str, Any],
         language: str,
         db_resource: Any,
+        *,
+        hints: Optional[FrozenSet[Any]] = None,
     ) -> Response:
         """Shared create-catalog body used by Features and STAC.
 
@@ -630,6 +632,8 @@ class OGCServiceMixin:
         solely to detect the language via ``detect_use_lang``.  *db_resource* is
         the database connection (may be ``None`` when the service omits the
         transactional context — STAC catalog creates do not pass a connection).
+        *hints* carries the request's ``?hints=`` set; ``Hint.DEFER`` defers GCP
+        storage provisioning so the catalog is created core-only.
         """
         from dynastore.extensions.tools.localization_utils import detect_use_lang
 
@@ -643,6 +647,8 @@ class OGCServiceMixin:
         create_kwargs: Dict[str, Any] = {}
         if ctx is not None:
             create_kwargs["ctx"] = ctx
+        if hints:
+            create_kwargs["hints"] = hints
         create_kwargs.update(self._make_catalog_create_kwargs())
 
         created = await catalogs_svc.create_catalog(

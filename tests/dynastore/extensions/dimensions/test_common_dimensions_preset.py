@@ -266,6 +266,19 @@ def test_get_data_fail_fast_when_no_dimensions_registered(
         list(_CommonDimensionsContributor().get_data())
 
 
+def test_seeds_all_defer_provisioning() -> None:
+    """Every DataSeed yielded by the contributor must have defer_provisioning=True
+    — the dimensions catalog is records-only and should be born bucket-free."""
+    from dynastore.extensions.dimensions.presets import _CommonDimensionsContributor
+
+    seeds = list(_CommonDimensionsContributor().get_data())
+
+    for seed in seeds:
+        assert seed.defer_provisioning is True, (
+            f"defer_provisioning must be True for records-only seed {seed.collection_id!r}"
+        )
+
+
 def test_common_dimensions_preset_is_registered() -> None:
     """Importing the presets module must register ``common_dimensions`` in the
     global preset registry (side-effect import contract)."""

@@ -58,6 +58,7 @@ def _make_payload(
     operation: str = "provision",
     collection_id: str | None = None,
     force: bool = False,
+    defer: bool = False,
 ) -> Any:
     from dynastore.tasks.catalog_provision.task import CatalogProvisionInputs
     from dynastore.models.tasks import TaskPayload
@@ -68,6 +69,7 @@ def _make_payload(
         operation=operation,
         collection_id=collection_id,
         force=force,
+        defer=defer,
     )
     return TaskPayload(task_id=uuid.uuid4(), caller_id="test", inputs=inputs)
 
@@ -449,6 +451,86 @@ class TestStepMarking:
             ("c_multi", "s2", "complete"),
             ("c_multi", "s3", "complete"),
         }
+
+
+# ---------------------------------------------------------------------------
+# Deferred provisioning wiring (?hints=defer)
+# ---------------------------------------------------------------------------
+
+
+class TestDeferredProvisionWiring:
+    """The task threads ``defer`` into ``active_provisioners`` and, on an
+    explicit provision, seeds the steps it is about to run via ``ensure_keys``
+    so previously-deferred GCP provisioners are folded into the checklist."""
+
+    async def _run_with(self, payload, groups):
+        task = _make_task()
+        mock_catalogs = _mock_catalogs()
+        with patch(
+            "dynastore.tasks.catalog_provision.task._get_catalog_protocol",
+            return_value=mock_catalogs,
+        ), patch(
+            "dynastore.tasks.catalog_provision.task.managed_transaction",
+            return_value=_txn_ctx(),
+        ), patch(
+            "dynastore.tasks.catalog_provision.task.get_catalog_engine",
+            return_value=MagicMock(),
+        ), patch(
+            "dynastore.tasks.catalog_provision.task.provisioning_registry",
+        ) as mock_reg, patch(
+            "dynastore.tasks.catalog_provision.task._get_group_concurrency",
+            new=AsyncMock(return_value=4),
+        ):
+            mock_reg.active_provisioners = AsyncMock(return_value=groups)
+            await task.run(payload)
+        return mock_reg, mock_catalogs
+
+    @pytest.mark.asyncio
+    async def test_explicit_provision_includes_deferrable_and_seeds_ensure_keys(self):
+        # Default provision (defer=False): active_provisioners is called with
+        # defer=False (deferrable GCP folded in) and the checklist reset is
+        # asked to ensure those keys exist.
+        async def hook(**ctx):
+            pass
+
+        groups = [
+            [_make_provisioner("catalog_core", priority=0, provision_fn=hook)],
+            [_make_provisioner("gcp_bucket", priority=100, provision_fn=hook)],
+        ]
+        payload = _make_payload(catalog_id="c_def", operation="provision")
+        mock_reg, mock_catalogs = await self._run_with(payload, groups)
+
+        _, kwargs = mock_reg.active_provisioners.call_args
+        assert kwargs["defer"] is False
+        reset_kwargs = mock_catalogs.reset_checklist_for_reprovision.call_args.kwargs
+        assert reset_kwargs["ensure_keys"] == ["catalog_core", "gcp_bucket"]
+
+    @pytest.mark.asyncio
+    async def test_deferred_create_holds_back_deferrable(self):
+        # A ?hints=defer create run (defer=True) propagates defer=True so the
+        # executor's active_provisioners matches the create-time checklist.
+        async def hook(**ctx):
+            pass
+
+        groups = [[_make_provisioner("catalog_core", priority=0, provision_fn=hook)]]
+        payload = _make_payload(catalog_id="c_def2", operation="provision", defer=True)
+        mock_reg, _ = await self._run_with(payload, groups)
+
+        _, kwargs = mock_reg.active_provisioners.call_args
+        assert kwargs["defer"] is True
+
+    @pytest.mark.asyncio
+    async def test_deprovision_forces_include_deferrable(self):
+        # Deprovision must always tear down deferrable provisioners regardless of
+        # the defer flag, so active_provisioners is called with defer=False.
+        groups = [[_make_provisioner("catalog_core", priority=0)]]
+        payload = _make_payload(
+            catalog_id="c_del", operation="deprovision_hard", defer=True
+        )
+        mock_reg, _ = await self._run_with(payload, groups)
+
+        _, kwargs = mock_reg.active_provisioners.call_args
+        assert kwargs["defer"] is False
 
 
 # ---------------------------------------------------------------------------

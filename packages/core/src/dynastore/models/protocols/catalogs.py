@@ -187,9 +187,15 @@ class CatalogsProtocol(ItemCrudProtocol, ItemQueryProtocol, ItemIntrospectionPro
         catalog_data: Union[Dict[str, Any], "Catalog"],
         lang: str = "en",
         ctx: Optional["DriverContext"] = None,
+        hints: FrozenSet[Any] = frozenset(),
     ) -> "Catalog":
         """
         Creates a new catalog.
+
+        ``hints`` carries the request's ``?hints=`` set; ``Hint.DEFER``
+        defers the storage-backend (GCP) provisioners past creation so the
+        catalog is created core-only and provisioned later via an explicit
+        ``catalog_provision`` task.
         """
         ...
 

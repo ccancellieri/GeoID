@@ -374,6 +374,17 @@ class GCPModule(
             # (soft/best-effort) steps are contributed only when provisioning is
             # enabled (see ``provisioner_is_active``). The provision task marks each
             # terminal: bucket → complete/skipped/failed; eventing → complete/degraded.
+            #
+            # All three GCP steps are registered ``deferrable=True``: by default
+            # they still run at catalog creation (no behaviour change), but a
+            # create with ``?hints=defer`` holds them back so the catalog is
+            # created (tenant schema only, via catalog_core) and can be
+            # configured — e.g. GcpCatalogBucketConfig.provision_enabled set to
+            # false for a records-only catalog — before any GCS bucket is created.
+            # On a deferred create the catalog reaches ``ready`` on catalog_core
+            # alone, bucket-free; an explicit ``catalog_provision`` task (spawned
+            # via POST /task/catalogs/{id}) then runs these steps, each still
+            # gated by ``provisioner_is_active``/``provision_enabled``.
             # A 'degraded' eventing step does NOT block readiness — see
             # ``evaluate_checklist`` and the fail-soft eventing path in
             # tasks/gcp_provision/task.py.
@@ -463,6 +474,7 @@ class GCPModule(
                 _gcp_config_is_active,
                 priority=1,
                 scope=SCOPE_CATALOG,
+                deferrable=True,
                 name="GCP bucket config link",
                 description=(
                     "Persists the deterministic GCS bucket name onto GcpCatalogBucketConfig "
@@ -640,12 +652,14 @@ class GCPModule(
             provisioning_registry.register(
                 "gcp_bucket",
                 self.provisioner_is_active,
+                deferrable=True,
                 provision=_gcp_bucket_provision,
                 deprovision=_gcp_bucket_deprovision,
             )
             provisioning_registry.register(
                 "gcp_eventing",
                 self.provisioner_is_active,
+                deferrable=True,
                 provision=_gcp_eventing_provision,
                 deprovision=_gcp_eventing_deprovision,
             )

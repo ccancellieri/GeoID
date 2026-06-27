@@ -83,6 +83,15 @@ class CatalogProvisionInputs(BaseModel):
     # current step (full replay). Ignored for deprovision operations, which
     # always run every teardown hook.
     force: bool = False
+    # Deferred provisioning control. Default False → every active provisioner
+    # runs (unchanged behaviour, and the default for an explicit provision
+    # task spawned via POST /task/catalogs/{id}, which folds in the deferrable
+    # GCP steps and provisions storage). True is set only by a ``?hints=defer``
+    # create run so the deferrable provisioners (GCP bucket/eventing/config) are
+    # held back and the catalog reaches ``ready`` core-only. Mirrors ``defer``
+    # on the provisioning registry. Ignored for deprovision, which always tears
+    # down every provisioner including the deferrable ones.
+    defer: bool = False
     # Deprovision context (#2340): config snapshot captured before any
     # deprovision hook runs. Required for deprovision operations so
     # external-resource cleanup (GCP bucket, eventing) can act on the
@@ -117,6 +126,7 @@ class CatalogProvisionTask(TaskProtocol):
         operation = inputs.operation
         collection_id = inputs.collection_id
         force = inputs.force
+        defer = inputs.defer
         config_snapshot = inputs.config_snapshot
 
         if not catalog_id:
@@ -182,9 +192,15 @@ class CatalogProvisionTask(TaskProtocol):
                 )
 
         # Fetch the active provisioners grouped by ascending priority.
+        # ``defer`` holds back the deferrable provisioners (GCP
+        # bucket/eventing/config); it is honoured only for a ``?hints=defer``
+        # create run. An explicit provision (defer=False default) folds them in,
+        # and deprovision ALWAYS includes them so their teardown hooks run to
+        # remove the bucket and eventing.
+        effective_defer = defer if operation == "provision" else False
         async with managed_transaction(get_catalog_engine()) as conn:
             groups: List[List[Any]] = await provisioning_registry.active_provisioners(
-                catalog_id, conn, scope=scope
+                catalog_id, conn, scope=scope, defer=effective_defer
             )
 
         # For deprovision operations, reverse the group order so higher-priority
@@ -204,10 +220,15 @@ class CatalogProvisionTask(TaskProtocol):
         # status transitions monotonically (failed → provisioning → ready)
         # rather than staying on 'failed' while new steps complete.
         # With force=True every step is reset unconditionally (full replay).
-        # When the checklist is empty or absent (no active provisioners, fresh
-        # create without a checklist row) this is a no-op — reset returns {}.
+        # ``ensure_keys`` adds any active provisioner not yet in the checklist —
+        # the deferred GCP steps on an explicit provision of a ``?hints=defer``
+        # catalog, whose create seeded only ``catalog_core``. When the checklist
+        # is empty or absent (no active provisioners) this is a no-op.
         if operation == "provision":
-            await catalogs.reset_checklist_for_reprovision(catalog_id, force=force)
+            ensure_keys = [p.key for group in groups for p in group]
+            await catalogs.reset_checklist_for_reprovision(
+                catalog_id, force=force, ensure_keys=ensure_keys
+            )
 
         # Reprovision only what failed (#2395). For a ``provision`` run that is
         # not a forced full replay, drop provisioners whose checklist step is

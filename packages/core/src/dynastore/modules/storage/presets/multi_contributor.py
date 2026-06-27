@@ -220,7 +220,11 @@ async def _apply_data_kind(
         if existing_catalog is None:
             cat_payload = dict(seed.catalog_data)
             cat_payload.setdefault("id", seed.catalog_id)
-            await catalogs.create_catalog(cat_payload, lang=seed.lang)
+            create_kwargs = {"lang": seed.lang}
+            if seed.defer_provisioning:
+                from dynastore.modules.storage.hints import Hint
+                create_kwargs["hints"] = frozenset({Hint.DEFER})
+            await catalogs.create_catalog(cat_payload, **create_kwargs)
             record["created_catalog"] = True
 
         # --- Collection (create only if absent) ---

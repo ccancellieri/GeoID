@@ -32,6 +32,7 @@ import re
 from typing import (
     Awaitable,
     Callable,
+    Iterable,
     List,
     Optional,
     Any,
@@ -1183,9 +1184,21 @@ class CatalogService(CatalogsProtocol):
         catalog_data: Union[Dict[str, Any], Catalog],
         lang: str = "en",
         ctx: Optional["DriverContext"] = None,
+        hints: Optional[FrozenSet["Hint"]] = None,
     ) -> Catalog:
-        """Create a new catalog."""
+        """Create a new catalog.
+
+        ``hints`` carries the request's ``?hints=`` set. ``Hint.DEFER``
+        (``?hints=defer``) holds back the deferrable provisioners (GCP
+        bucket/eventing/config) so the catalog is created core-only and reaches
+        ``ready`` bucket-free — it can then be configured and provisioned later
+        by an explicit ``catalog_provision`` task. Without the hint every active
+        provisioner runs at creation time (unchanged default behaviour).
+        """
+        from dynastore.modules.storage.hints import Hint as _Hint
+
         db_resource = ctx.db_resource if ctx else None
+        defer = bool(hints) and _Hint.DEFER in hints
 
         if isinstance(catalog_data, dict):
             from dynastore.models.localization import validate_language_consistency
@@ -1231,7 +1244,7 @@ class CatalogService(CatalogsProtocol):
         catalog_model.provisioning_status = "ready"
 
         return await self._create_catalog_async(
-            catalog_model, external_id, db_resource
+            catalog_model, external_id, db_resource, defer=defer
         )
 
     async def _create_catalog_async(
@@ -1239,6 +1252,8 @@ class CatalogService(CatalogsProtocol):
         catalog_model: "Catalog",
         external_id: str,
         db_resource: Any,
+        *,
+        defer: bool = False,
     ) -> "Catalog":
         """Async create path (always active — catalog creation is always deferred).
 
@@ -1251,6 +1266,12 @@ class CatalogService(CatalogsProtocol):
 
         When the provisioning registry is empty (no active provisioners), the
         checklist is empty: the catalog stays ``'ready'`` and no task is enqueued.
+
+        ``defer`` (from ``?hints=defer``) holds back the deferrable provisioners
+        (GCP bucket/eventing/config): both the seeded checklist and the enqueued
+        task's ``defer`` flag exclude them, so the catalog reaches ``ready`` on
+        ``catalog_core`` alone, bucket-free, and storage is provisioned later by
+        an explicit ``catalog_provision`` task.
 
         The tenant schema does NOT exist when this method returns; all code
         that assumes the schema is ready must stay inside the task.
@@ -1301,7 +1322,7 @@ class CatalogService(CatalogsProtocol):
             # is a barrier from the moment the task starts — a step that
             # completes early cannot prematurely flip the catalog ready.
             checklist: Dict[str, str] = await provisioning_registry.build_checklist(
-                catalog_model.id, conn
+                catalog_model.id, conn, defer=defer
             )
 
             if checklist:
@@ -1324,6 +1345,10 @@ class CatalogService(CatalogsProtocol):
                         "catalog_id": committed_internal_id,
                         "scope": "catalog",
                         "operation": "provision",
+                        # Mirror the create-time defer decision so the executor's
+                        # active_provisioners matches the seeded checklist — a
+                        # deferred create must not run the held-back GCP steps.
+                        "defer": defer,
                     },
                     caller_id="system",
                     type="task",
@@ -2973,6 +2998,7 @@ class CatalogService(CatalogsProtocol):
         catalog_id: str,
         *,
         force: bool = False,
+        ensure_keys: Optional[Iterable[str]] = None,
         ctx: Optional["DriverContext"] = None,
     ) -> dict[str, str]:
         """Reset the checklist for a reprovision and set status='provisioning' (#2395).
@@ -2982,6 +3008,16 @@ class CatalogService(CatalogsProtocol):
         (``complete`` / ``skipped``) is reset to ``pending``; satisfied steps are
         left untouched so the executor re-runs only what failed. With
         ``force=True`` every step is reset to ``pending`` (full replay).
+
+        ``ensure_keys`` lists provisioner keys the executor is about to run.
+        Any key not already in the stored checklist is added as ``pending``.
+        This is what lets an explicit provision run (``?hints=defer`` create
+        followed by a ``catalog_provision`` task) fold the previously-deferred
+        GCP steps into the checklist — the create seeded only ``catalog_core``,
+        and the provision task now adds ``gcp_bucket`` / ``gcp_eventing`` /
+        ``gcp_config`` as pending before running them, so the catalog status is
+        ``provisioning`` while they run and a mid-run failure leaves a ``failed``
+        step rather than a silently-ready catalog.
 
         Resetting the to-be-rerun steps to ``pending`` (rather than leaving them
         ``failed``/``degraded``) keeps the catalog status transition monotonic:
@@ -3008,14 +3044,22 @@ class CatalogService(CatalogsProtocol):
             if not row:
                 return {}
             raw = row.get("provisioning_checklist")
-            if raw is None:
-                return {}
-            checklist = json.loads(raw) if isinstance(raw, str) else dict(raw)
-            if not checklist:
-                return {}
+            checklist = (
+                {}
+                if raw is None
+                else (json.loads(raw) if isinstance(raw, str) else dict(raw))
+            )
             for key, state in list(checklist.items()):
                 if force or state not in (STEP_COMPLETE, STEP_SKIPPED):
                     checklist[key] = STEP_PENDING
+            # Fold in any newly-active steps the executor will run (deferred GCP
+            # provisioners on an explicit provision) that the create-time
+            # checklist never contained.
+            for key in ensure_keys or ():
+                if key not in checklist:
+                    checklist[key] = STEP_PENDING
+            if not checklist:
+                return {}
             await _set_provisioning_checklist_query.execute(
                 conn,
                 id=catalog_id,

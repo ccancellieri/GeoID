@@ -168,6 +168,18 @@ class Hint(StrEnum):
     # asset-driver and storage-driver dialects.
     DEFAULT = "default"
 
+    # ── Lifecycle preferences ─────────────────────────────────────────
+    # Unlike the routing hints above (which steer driver selection),
+    # ``DEFER`` is a create-time lifecycle control: ``POST /catalogs?hints=defer``
+    # holds back the deferrable provisioners (GCP bucket/eventing/config) so a
+    # catalog is created core-only (tenant schema) and reaches ``ready``
+    # bucket-free. The catalog can then be configured — e.g.
+    # ``GcpCatalogBucketConfig.provision_enabled`` for a records-only catalog —
+    # before storage is provisioned by an explicit ``catalog_provision`` task
+    # (spawned via ``POST /task/catalogs/{id}``). Omitting the hint keeps the
+    # default behaviour: every active provisioner runs at creation time.
+    DEFER = "defer"
+
 
 # ---------------------------------------------------------------------------
 # Named hint sets

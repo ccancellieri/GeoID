@@ -139,6 +139,17 @@ class Provisioner:
     scope
         Either :data:`SCOPE_CATALOG` (runs at catalog-creation time) or
         :data:`SCOPE_COLLECTION` (runs at collection-creation time).
+    deferrable
+        Marks this provisioner as *eligible to be deferred* past catalog
+        creation. It still runs at creation time by default; it is held back
+        only when the create request opts in with ``?hints=defer``
+        (:func:`build_checklist` / :func:`active_provisioners` called with
+        ``defer=True``). Deferring lets a catalog be created core-only (tenant
+        schema) and configured before its storage-backend provisioning runs —
+        e.g. a records-only catalog can set ``provision_enabled=false`` before
+        any GCS bucket is created — then provisioned by an explicit
+        ``catalog_provision`` task. Defaults to ``False`` (never deferrable;
+        always part of the creation-time checklist).
     name
         Human-readable display name for this provisioning step.  Accepts a
         plain string (English) or a ``{lang: text}`` multilanguage map, e.g.
@@ -158,6 +169,7 @@ class Provisioner:
     is_active: ProvisionerPredicate
     priority: int = field(default=100)
     scope: str = field(default=SCOPE_CATALOG)
+    deferrable: bool = field(default=False)
     name: Optional[LocalizedText] = field(default=None)
     description: Optional[LocalizedText] = field(default=None)
     provision: Optional[Callable[..., Any]] = field(default=None)
@@ -209,6 +221,7 @@ class ProvisioningRegistry:
         *,
         priority: int = 100,
         scope: str = SCOPE_CATALOG,
+        deferrable: bool = False,
         name: Optional[LocalizedText] = None,
         description: Optional[LocalizedText] = None,
         provision: Optional[Callable[..., Any]] = None,
@@ -227,6 +240,11 @@ class ProvisioningRegistry:
             Execution-order hint (lower = earlier).  Defaults to ``100``.
         scope
             :data:`SCOPE_CATALOG` or :data:`SCOPE_COLLECTION`.
+        deferrable
+            When ``True`` the provisioner may be held back from the
+            creation-time checklist on a deferred create (``?hints=defer``) and
+            run later by an explicit provision task. Defaults to ``False`` (runs
+            at creation time like any other provisioner).
         name
             Human-readable step name; plain string or ``{lang: text}`` map.
         description
@@ -243,6 +261,7 @@ class ProvisioningRegistry:
             is_active=is_active,
             priority=priority,
             scope=scope,
+            deferrable=deferrable,
             name=name,
             description=description,
             provision=provision,
@@ -260,15 +279,32 @@ class ProvisioningRegistry:
     def keys(self) -> list[str]:
         return list(self._provisioners.keys())
 
-    def _sorted_provisioners(self, scope: str) -> list[Provisioner]:
-        """Return provisioners matching ``scope``, sorted by ``(priority, key)``."""
+    def _sorted_provisioners(
+        self, scope: str, *, defer: bool = False
+    ) -> list[Provisioner]:
+        """Return provisioners matching ``scope``, sorted by ``(priority, key)``.
+
+        By default every matching provisioner is returned. When ``defer`` is
+        set, provisioners marked ``deferrable`` are held back — this is the
+        ``?hints=defer`` create path; the default (and the explicit provision
+        task) includes them.
+        """
         return sorted(
-            (p for p in self._provisioners.values() if p.scope == scope),
+            (
+                p
+                for p in self._provisioners.values()
+                if p.scope == scope and not (defer and p.deferrable)
+            ),
             key=lambda p: (p.priority, p.key),
         )
 
     async def build_checklist(
-        self, catalog_id: str, conn: Optional[Any] = None, *, scope: str = SCOPE_CATALOG
+        self,
+        catalog_id: str,
+        conn: Optional[Any] = None,
+        *,
+        scope: str = SCOPE_CATALOG,
+        defer: bool = False,
     ) -> Dict[str, str]:
         """Materialise the checklist for ``catalog_id`` from active provisioners.
 
@@ -276,12 +312,19 @@ class ProvisioningRegistry:
         They are evaluated in ``(priority, key)`` order so the resulting dict's
         insertion order is deterministic.
 
+        By default every active provisioner participates. When ``defer`` is
+        ``True`` (a ``?hints=defer`` create) the ``deferrable`` provisioners are
+        held back so the catalog reaches ``ready`` on its core steps alone and
+        can be configured before storage provisioning runs; the explicit
+        provision task then builds the checklist with ``defer=False`` to include
+        them.
+
         Every active provisioner's key maps to ``"pending"``. A predicate that
         raises is treated as inactive (logged) — a misbehaving provisioner must
         never block catalog readiness.
         """
         checklist: Dict[str, str] = {}
-        for provisioner in self._sorted_provisioners(scope):
+        for provisioner in self._sorted_provisioners(scope, defer=defer):
             try:
                 if await provisioner.is_active(catalog_id, conn):
                     checklist[provisioner.key] = STEP_PENDING
@@ -294,7 +337,12 @@ class ProvisioningRegistry:
         return checklist
 
     async def active_provisioners(
-        self, catalog_id: str, conn: Optional[Any] = None, *, scope: str = SCOPE_CATALOG
+        self,
+        catalog_id: str,
+        conn: Optional[Any] = None,
+        *,
+        scope: str = SCOPE_CATALOG,
+        defer: bool = False,
     ) -> List[List[Provisioner]]:
         """Return the active provisioners for ``scope``, grouped by priority.
 
@@ -302,11 +350,15 @@ class ProvisioningRegistry:
         and are eligible to run in parallel.  The outer list is ordered
         ascending by priority (run group 0 first, then group 1, …).
 
+        ``defer`` mirrors :meth:`build_checklist`: when ``True`` the
+        ``deferrable`` provisioners are held back (the ``?hints=defer`` create
+        run), so the executor runs exactly the steps the checklist contains.
+
         Provisioners whose ``is_active`` predicate returns ``False`` or raises
         are excluded (same fail-soft semantics as :meth:`build_checklist`).
         """
         active: list[Provisioner] = []
-        for provisioner in self._sorted_provisioners(scope):
+        for provisioner in self._sorted_provisioners(scope, defer=defer):
             try:
                 if await provisioner.is_active(catalog_id, conn):
                     active.append(provisioner)

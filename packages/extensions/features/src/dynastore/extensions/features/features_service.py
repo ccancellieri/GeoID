@@ -449,6 +449,7 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         definition: ogc_models.CatalogDefinition,
         conn: AsyncConnection = Depends(get_async_connection),
         language: str = Depends(get_language),
+        request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         """Creates a new catalog, its data schema, and required table partitions."""
         try:
@@ -461,7 +462,10 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
                 "extra_metadata": definition.extra_metadata,
             }
             input_dump = definition.model_dump(exclude_unset=True)
-            return await self._ogc_create_catalog(catalog_data, input_dump, language, conn)
+            # ``?hints=defer`` defers GCP storage provisioning (see Hint.DEFER).
+            return await self._ogc_create_catalog(
+                catalog_data, input_dump, language, conn, hints=request_hints
+            )
         except Exception as e:
             return handle_or_raise(
                 e,

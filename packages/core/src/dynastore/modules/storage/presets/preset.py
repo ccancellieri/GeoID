@@ -128,6 +128,12 @@ class DataSeed:
     # per-collection routing. When None the collection inherits the ambient
     # catalog/platform routing (#1285 / #2241).
     items_routing: Optional["ItemsRoutingConfig"] = None
+    # When True the catalog is created with Hint.DEFER so its deferrable
+    # storage-backend (GCP bucket/eventing) provisioning is held back: a
+    # records/feature-only seed catalog reaches ``ready`` bucket-free. Storage,
+    # if ever needed, is provisioned later via an explicit catalog_provision
+    # task. Defaults to False (catalog provisions normally at creation).
+    defer_provisioning: bool = False
 
 
 @dataclass(frozen=True)

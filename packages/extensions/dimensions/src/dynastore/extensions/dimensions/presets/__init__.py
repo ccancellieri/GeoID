@@ -154,6 +154,8 @@ class _CommonDimensionsContributor:
                 items=(),
                 manage_catalog=False,
                 manage_collection=True,
+                # records-only dimensions catalog — born bucket-free (no GCS bucket)
+                defer_provisioning=True,
             )
 
     def get_tasks(self) -> Iterable[TaskSeed]:

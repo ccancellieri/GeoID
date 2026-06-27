@@ -169,6 +169,8 @@ class _DemoDataContributor:
             manage_catalog=True,
             manage_collection=True,
             items_routing=_demo_items_routing(),
+            # feature-only demo — no GCS bucket needed (born bucket-free)
+            defer_provisioning=True,
         )
 
 

@@ -107,6 +107,13 @@ def test_contributor_seed_manage_collection_true() -> None:
     assert seed.manage_collection is True
 
 
+def test_contributor_seed_defer_provisioning_true() -> None:
+    """The demo seed must have defer_provisioning=True — demo_catalog is
+    feature-only and should be born bucket-free."""
+    seed = list(_DemoDataContributor().get_data())[0]
+    assert seed.defer_provisioning is True
+
+
 def test_contributor_seed_declares_es_secondary_routing() -> None:
     """The seed carries an items routing with an Elasticsearch secondary WRITE
     entry (source="auto"), so demo_collection items are searchable rather than

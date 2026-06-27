@@ -328,3 +328,60 @@ def test_dry_run_emits_seed_data_entries():
     assert len(seed_entries) == 1
     assert seed_entries[0].target == "demo_catalog/demo_collection"
     assert seed_entries[0].detail["items"] == 1
+
+
+# ---------------------------------------------------------------------------
+# defer_provisioning — Hint.DEFER threading
+# ---------------------------------------------------------------------------
+
+class _FakeCatalogsHints(_FakeCatalogs):
+    """Extends _FakeCatalogs to also capture the ``hints`` kwarg passed to
+    ``create_catalog``, so tests can assert Hint.DEFER is (or is not) threaded
+    through from DataSeed.defer_provisioning."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._last_create_hints: frozenset = frozenset()
+
+    async def create_catalog(self, catalog_data, lang="en", ctx=None, hints=frozenset()):
+        self._last_create_hints = hints
+        cid = catalog_data["id"]
+        self.calls.append(("create_catalog", cid))
+        self._catalogs.add(cid)
+        return SimpleNamespace(id=cid)
+
+
+def test_apply_passes_hint_defer_when_defer_provisioning_true():
+    """When DataSeed.defer_provisioning=True, create_catalog must be called
+    with hints=frozenset({Hint.DEFER})."""
+    from dynastore.modules.storage.hints import Hint
+
+    catalogs = _FakeCatalogsHints()
+    seed = DataSeed(
+        catalog_id="defer_catalog",
+        collection_id="defer_collection",
+        defer_provisioning=True,
+    )
+    preset = _preset([seed])
+    asyncio.run(preset.apply(NoParams(), "platform", _ctx(catalogs)))
+
+    assert ("create_catalog", "defer_catalog") in catalogs.calls
+    assert catalogs._last_create_hints == frozenset({Hint.DEFER})
+
+
+def test_apply_omits_hints_when_defer_provisioning_false():
+    """When DataSeed.defer_provisioning=False (the default), create_catalog must
+    be called without a hints kwarg — the hints frozenset stays empty."""
+    from dynastore.modules.storage.hints import Hint
+
+    catalogs = _FakeCatalogsHints()
+    seed = DataSeed(
+        catalog_id="normal_catalog",
+        collection_id="normal_collection",
+        defer_provisioning=False,
+    )
+    preset = _preset([seed])
+    asyncio.run(preset.apply(NoParams(), "platform", _ctx(catalogs)))
+
+    assert ("create_catalog", "normal_catalog") in catalogs.calls
+    assert Hint.DEFER not in catalogs._last_create_hints

@@ -195,6 +195,64 @@ class TestScopeFiltering:
         assert checklist == {"only_catalog": STEP_PENDING}
 
 
+class TestDeferrableProvisioners:
+    """``deferrable`` provisioners run at create by default, and are held back
+    only when the checklist is built with ``defer=True`` (a ``?hints=defer``
+    create). An explicit provision builds with ``defer=False`` to include them."""
+
+    @pytest.mark.asyncio
+    async def test_deferrable_included_at_create_by_default(self):
+        # Default (no defer): a deferrable provisioner still runs at creation —
+        # this is what keeps auto-provisioning the unchanged default behaviour.
+        reg = ProvisioningRegistry()
+        reg.register("catalog_core", _active, priority=0)
+        reg.register("gcp_bucket", _active, priority=100, deferrable=True)
+        checklist = await reg.build_checklist("cat")
+        assert checklist == {"catalog_core": STEP_PENDING, "gcp_bucket": STEP_PENDING}
+
+    @pytest.mark.asyncio
+    async def test_deferrable_held_back_when_defer(self):
+        reg = ProvisioningRegistry()
+        reg.register("catalog_core", _active, priority=0)
+        reg.register("gcp_bucket", _active, priority=100, deferrable=True)
+        checklist = await reg.build_checklist("cat", defer=True)
+        assert checklist == {"catalog_core": STEP_PENDING}
+
+    @pytest.mark.asyncio
+    async def test_non_deferrable_unaffected_by_defer(self):
+        # ``defer`` only holds back deferrable provisioners; plain ones still run.
+        reg = ProvisioningRegistry()
+        reg.register("catalog_core", _active, priority=0)
+        reg.register("gcp_bucket", _active, priority=100, deferrable=True)
+        checklist = await reg.build_checklist("cat", defer=True)
+        assert "catalog_core" in checklist
+        assert "gcp_bucket" not in checklist
+
+    @pytest.mark.asyncio
+    async def test_active_provisioners_include_deferrable_by_default(self):
+        reg = ProvisioningRegistry()
+        reg.register("catalog_core", _active, priority=0)
+        reg.register("gcp_bucket", _active, priority=100, deferrable=True)
+        groups = await reg.active_provisioners("cat")
+        keys = [p.key for group in groups for p in group]
+        assert keys == ["catalog_core", "gcp_bucket"]
+
+    @pytest.mark.asyncio
+    async def test_active_provisioners_hold_back_deferrable_when_defer(self):
+        reg = ProvisioningRegistry()
+        reg.register("catalog_core", _active, priority=0)
+        reg.register("gcp_bucket", _active, priority=100, deferrable=True)
+        groups = await reg.active_provisioners("cat", defer=True)
+        keys = [p.key for group in groups for p in group]
+        assert keys == ["catalog_core"]
+
+    @pytest.mark.asyncio
+    async def test_deferrable_default_is_false(self):
+        reg = ProvisioningRegistry()
+        reg.register("plain", _active)
+        assert reg._provisioners["plain"].deferrable is False
+
+
 class TestBackwardCompatRegister:
     """Two-argument register(key, is_active) keeps working unchanged."""
 
