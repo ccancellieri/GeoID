@@ -294,6 +294,12 @@ async def test_get_style_metadata_returns_200_with_serialized_links(monkeypatch)
     monkeypatch.setattr(_svc_mod, "get_root_url", lambda req: "http://example.com")
 
     svc = _build_service()
+    # Inject a stub catalogs protocol so _resolve_internal_catalog_id can resolve
+    # without a live registry.  "c_cat1" is an arbitrary internal id.
+    mock_catalogs = MagicMock()
+    mock_catalogs.resolve_catalog_id = AsyncMock(return_value="c_cat1")
+    svc._ogc_catalogs_protocol = mock_catalogs
+
     req = _make_request("http://example.com/styles/catalogs/cat1/collections/col1/styles/dark/metadata")
     conn = AsyncMock()
 
@@ -340,6 +346,10 @@ async def test_get_style_metadata_includes_stylesheet_links(monkeypatch):
     monkeypatch.setattr(_svc_mod, "get_root_url", lambda req: "http://example.com")
 
     svc = _build_service()
+    mock_catalogs = MagicMock()
+    mock_catalogs.resolve_catalog_id = AsyncMock(return_value="c_cat1")
+    svc._ogc_catalogs_protocol = mock_catalogs
+
     req = _make_request("http://example.com/styles/catalogs/cat1/collections/col1/styles/blue/metadata")
     conn = AsyncMock()
 

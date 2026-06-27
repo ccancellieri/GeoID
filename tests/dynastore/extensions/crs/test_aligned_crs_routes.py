@@ -65,9 +65,17 @@ def _conn_stub() -> MagicMock:
     return MagicMock(spec=AsyncConnection)
 
 
-def _mock_catalogs_proto(catalog_found: bool = True) -> MagicMock:
+_INTERNAL_ID = "c_test_internal_id"
+
+
+def _mock_catalogs_proto(
+    catalog_found: bool = True,
+    internal_id: str | None = _INTERNAL_ID,
+) -> MagicMock:
     svc = MagicMock()
     svc.get_catalog = AsyncMock(return_value=MagicMock() if catalog_found else None)
+    # resolve_catalog_id returns the immutable internal id; None when catalog absent.
+    svc.resolve_catalog_id = AsyncMock(return_value=internal_id if catalog_found else None)
     return svc
 
 
@@ -201,6 +209,9 @@ class TestCreateCrsEndpoint:
     @pytest.mark.asyncio
     async def test_happy_path_returns_crs(self, monkeypatch):
         fake_crs = MagicMock(name="crs")
+        # model_copy is called to rewrite catalog_id to the external value; make it
+        # return the same mock so identity assertions remain useful.
+        fake_crs.model_copy.return_value = fake_crs
         _patch_protocols(monkeypatch, catalog_found=True, crs_obj=fake_crs)
         ext = _make_ext()
 
@@ -214,6 +225,8 @@ class TestCreateCrsEndpoint:
             conn=_conn_stub(),
         )
         assert result is fake_crs
+        # Verify the external catalog id is written back (not the internal one).
+        fake_crs.model_copy.assert_called_once_with(update={"catalog_id": "my-cat"})
 
     @pytest.mark.asyncio
     async def test_unknown_catalog_raises_404(self, monkeypatch):
@@ -243,6 +256,8 @@ class TestGetCrsByNameEndpoint:
     @pytest.mark.asyncio
     async def test_found_returns_crs(self, monkeypatch):
         fake_crs = MagicMock(name="crs")
+        # model_copy rewrites catalog_id to external value; return same mock.
+        fake_crs.model_copy.return_value = fake_crs
         _patch_protocols(monkeypatch, crs_obj=fake_crs)
         ext = _make_ext()
 
@@ -252,6 +267,7 @@ class TestGetCrsByNameEndpoint:
             conn=_conn_stub(),
         )
         assert result is fake_crs
+        fake_crs.model_copy.assert_called_once_with(update={"catalog_id": "my-cat"})
 
     @pytest.mark.asyncio
     async def test_not_found_raises_404(self, monkeypatch):
@@ -495,3 +511,111 @@ class TestListGlobalCrsEndpoint:
 
         rels = [link.rel for link in result.links]
         assert "next" not in rels
+
+
+# ---------------------------------------------------------------------------
+# Rename-safety: partition key is the immutable internal id
+# ---------------------------------------------------------------------------
+
+
+class TestCatalogRenameSafety:
+    """Verify that all DB calls receive the *internal* catalog id, not the external one.
+
+    This tests the core invariant of the PR: the partition key stored in the DB
+    is the immutable internal id (c_…), so existing rows survive when the
+    external (public) catalog id is changed.
+    """
+
+    def _patch_protocols_with_ids(
+        self,
+        monkeypatch,
+        *,
+        external_id: str,
+        internal_id: str,
+        crs_obj=None,
+    ):
+        from dynastore.models.protocols import CatalogsProtocol
+        from dynastore.models.protocols.crs import CRSProtocol
+
+        catalogs_svc = MagicMock()
+        catalogs_svc.get_catalog = AsyncMock(return_value=MagicMock())
+        catalogs_svc.resolve_catalog_id = AsyncMock(return_value=internal_id)
+
+        crs_obj = crs_obj or MagicMock()
+        crs_obj.model_copy = MagicMock(return_value=crs_obj)
+        crs_svc = _mock_crs_proto(crs_obj=crs_obj)
+
+        def _get_protocol(proto):
+            if proto is CatalogsProtocol:
+                return catalogs_svc
+            if proto is CRSProtocol:
+                return crs_svc
+            return None
+
+        monkeypatch.setattr(_crs_mod, "get_protocol", _get_protocol)
+        return catalogs_svc, crs_svc
+
+    @pytest.mark.asyncio
+    async def test_create_uses_internal_id_as_partition_key(self, monkeypatch):
+        """create_crs_endpoint must pass the internal id to CRSProtocol.create_crs."""
+        _EXTERNAL = "my-catalog"
+        _INTERNAL = "c_abc123"
+        _, crs_svc = self._patch_protocols_with_ids(
+            monkeypatch, external_id=_EXTERNAL, internal_id=_INTERNAL
+        )
+        ext = _make_ext()
+
+        from dynastore.modules.crs.models import CRSCreate
+        crs_data = MagicMock(spec=CRSCreate)
+        crs_data.crs_uri = "urn:ogc:def:crs:EPSG::32632"
+
+        await ext.create_crs_endpoint(
+            catalog_id=_EXTERNAL, crs_data=crs_data, conn=_conn_stub()
+        )
+
+        # DB layer must receive the internal id, NOT the external one.
+        crs_svc.create_crs.assert_called_once()
+        call_args = crs_svc.create_crs.call_args
+        assert call_args.args[1] == _INTERNAL, (
+            f"expected internal id '{_INTERNAL}' passed to create_crs, "
+            f"got '{call_args.args[1]}'"
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_uses_internal_id(self, monkeypatch):
+        """list_crs_endpoint must query by internal id."""
+        _EXTERNAL = "renamed-catalog"
+        _INTERNAL = "c_xyz789"
+        _, crs_svc = self._patch_protocols_with_ids(
+            monkeypatch, external_id=_EXTERNAL, internal_id=_INTERNAL
+        )
+        ext = _make_ext()
+
+        await ext.list_crs_endpoint(
+            catalog_id=_EXTERNAL, conn=_conn_stub(), limit=20, offset=0
+        )
+
+        crs_svc.list_crs.assert_called_once()
+        call_args = crs_svc.list_crs.call_args
+        assert call_args.args[1] == _INTERNAL
+
+    @pytest.mark.asyncio
+    async def test_response_contains_external_catalog_id(self, monkeypatch):
+        """model_copy must be called with the external id so the REST response
+        never leaks the internal c_… id."""
+        _EXTERNAL = "public-catalog"
+        _INTERNAL = "c_priv999"
+        fake_crs = MagicMock(name="crs")
+        fake_crs.model_copy.return_value = fake_crs
+        self._patch_protocols_with_ids(
+            monkeypatch, external_id=_EXTERNAL, internal_id=_INTERNAL, crs_obj=fake_crs
+        )
+        ext = _make_ext()
+
+        await ext.get_crs_by_name_endpoint(
+            catalog_id=_EXTERNAL, crs_name="WGS84", conn=_conn_stub()
+        )
+
+        fake_crs.model_copy.assert_called_once_with(
+            update={"catalog_id": _EXTERNAL}
+        )

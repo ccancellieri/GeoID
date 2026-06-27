@@ -69,10 +69,12 @@ logger = logging.getLogger(__name__)
 TILE_MATRIX_SETS_DDL = """
 CREATE TABLE IF NOT EXISTS tiles.tile_matrix_sets (
     id UUID NOT NULL DEFAULT gen_random_uuid(),
+    -- catalog_id holds the immutable internal catalog id (not the public external id).
+    -- Partitioned on this value so rows survive catalog renames transparently.
     catalog_id VARCHAR NOT NULL,
     tms_id VARCHAR NOT NULL,
     definition JSONB NOT NULL, -- The full OGC TileMatrixSet definition
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),    
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (catalog_id, id),
     UNIQUE (catalog_id, tms_id) -- Ensures uniqueness of TMS within a catalog
 ) PARTITION BY LIST (catalog_id);

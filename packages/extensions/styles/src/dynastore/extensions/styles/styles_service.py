@@ -285,6 +285,26 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         return await self.ogc_conformance_handler(request)
 
     # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    async def _resolve_internal_catalog_id(self, external_catalog_id: str) -> str:
+        """Resolve the public external catalog id to the immutable internal id.
+
+        All DB operations and partition keys use the internal id so that a
+        catalog rename (external id change) never orphans existing rows.
+        Raises 404 when the catalog does not exist.
+        """
+        catalogs_svc = await self._get_catalogs_service()
+        internal_id = await catalogs_svc.resolve_catalog_id(external_catalog_id)
+        if not internal_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Catalog '{external_catalog_id}' not found.",
+            )
+        return internal_id
+
+    # ------------------------------------------------------------------
     # Style CRUD
     # ------------------------------------------------------------------
 
@@ -301,6 +321,11 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         if not await catalog_module.get_collection(catalog_id, collection_id):
             raise HTTPException(status_code=404, detail="Collection not found.")
 
+        # Resolve the public external catalog id to the immutable internal id.
+        # All DB operations and partition keys use the internal id so that
+        # a catalog rename (external id change) never orphans existing rows.
+        internal_catalog_id = await self._resolve_internal_catalog_id(catalog_id)
+
         from dynastore.modules.db_config.partition_tools import ensure_partition_exists
 
         try:
@@ -309,7 +334,7 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
                 table_name="styles",
                 schema="styles",
                 strategy="LIST",
-                partition_value=catalog_id,
+                partition_value=internal_catalog_id,
             )
         except Exception as exc:
             logger.error(
@@ -321,7 +346,13 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
             ) from exc
 
         try:
-            return await styles_db.create_style(conn, catalog_id, collection_id, style)
+            return await styles_db.create_style(
+                conn,
+                internal_catalog_id,
+                collection_id,
+                style,
+                external_catalog_id=catalog_id,
+            )
         except IntegrityError as exc:
             if exc.orig and getattr(exc.orig, "sqlstate", None) == "23505":
                 raise HTTPException(
@@ -346,8 +377,16 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
 
         if not await catalog_module.get_collection(catalog_id, collection_id):
             raise HTTPException(status_code=404, detail="Collection not found.")
+
+        internal_catalog_id = await self._resolve_internal_catalog_id(catalog_id)
+
         return await styles_db.list_styles_for_collection(
-            conn, catalog_id, collection_id, limit, offset
+            conn,
+            internal_catalog_id,
+            collection_id,
+            limit,
+            offset,
+            external_catalog_id=catalog_id,
         )
 
     async def get_style(
@@ -360,8 +399,14 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
 
+        internal_catalog_id = await self._resolve_internal_catalog_id(catalog_id)
+
         style = await styles_db.get_style_by_id_and_collection(
-            conn, catalog_id, collection_id, style_id
+            conn,
+            internal_catalog_id,
+            collection_id,
+            style_id,
+            external_catalog_id=catalog_id,
         )
         if not style:
             raise HTTPException(status_code=404, detail="Style not found.")
@@ -378,7 +423,15 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
 
-        updated = await styles_db.update_style(conn, catalog_id, style_id, style_update)
+        internal_catalog_id = await self._resolve_internal_catalog_id(catalog_id)
+
+        updated = await styles_db.update_style(
+            conn,
+            internal_catalog_id,
+            style_id,
+            style_update,
+            external_catalog_id=catalog_id,
+        )
         if not updated:
             raise HTTPException(status_code=404, detail="Style not found.")
         return updated
@@ -393,13 +446,19 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
 
+        internal_catalog_id = await self._resolve_internal_catalog_id(catalog_id)
+
         style_to_delete = await styles_db.get_style_by_id_and_collection(
-            conn, catalog_id, collection_id, style_id
+            conn,
+            internal_catalog_id,
+            collection_id,
+            style_id,
+            external_catalog_id=catalog_id,
         )
         if not style_to_delete:
             raise HTTPException(status_code=404, detail="Style not found.")
 
-        deleted = await styles_db.delete_style(conn, catalog_id, style_to_delete.id)
+        deleted = await styles_db.delete_style(conn, internal_catalog_id, style_to_delete.id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Style found but could not be deleted.")
 
@@ -422,8 +481,10 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
 
+        internal_catalog_id = await self._resolve_internal_catalog_id(catalog_id)
+
         style = await styles_db.get_style_by_id_and_collection(
-            conn, catalog_id, collection_id, style_id
+            conn, internal_catalog_id, collection_id, style_id, external_catalog_id=catalog_id
         )
         if style is None:
             raise HTTPException(status_code=404, detail="Style not found.")
@@ -480,8 +541,10 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
 
+        internal_catalog_id = await self._resolve_internal_catalog_id(catalog_id)
+
         style = await styles_db.get_style_by_id_and_collection(
-            conn, catalog_id, collection_id, style_id
+            conn, internal_catalog_id, collection_id, style_id, external_catalog_id=catalog_id
         )
         if style is None:
             raise HTTPException(status_code=404, detail="Style not found.")
@@ -537,8 +600,10 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
 
+        internal_catalog_id = await self._resolve_internal_catalog_id(catalog_id)
+
         style = await styles_db.get_style_by_id_and_collection(
-            conn, catalog_id, collection_id, style_id
+            conn, internal_catalog_id, collection_id, style_id, external_catalog_id=catalog_id
         )
         if style is None:
             raise HTTPException(status_code=404, detail="Style not found.")

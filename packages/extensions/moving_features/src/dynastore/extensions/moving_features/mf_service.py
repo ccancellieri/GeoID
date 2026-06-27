@@ -214,6 +214,22 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
             }
         )
 
+    async def _resolve_internal_catalog_id(self, external_catalog_id: str) -> str:
+        """Resolve the public external catalog id to the immutable internal id.
+
+        All DB operations and partition keys use the internal id so that a
+        catalog rename (external id change) never orphans existing rows.
+        Raises 404 when the catalog does not exist.
+        """
+        catalogs_svc = await self._get_catalogs_service()
+        internal_id = await catalogs_svc.resolve_catalog_id(external_catalog_id)
+        if not internal_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Catalog '{external_catalog_id}' not found.",
+            )
+        return internal_id
+
     # ------------------------------------------------------------------
     # Collection endpoints (delegate to DynaStore catalog)
     # ------------------------------------------------------------------
@@ -276,13 +292,14 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
         validate_sql_identifier(collection_id)
         if not await catalog_module.get_collection(catalog_id, collection_id):
             raise HTTPException(status_code=404, detail="Collection not found.")
-        
+        internal_id = await self._resolve_internal_catalog_id(catalog_id)
+
         if bbox and intersects:
             raise HTTPException(
                 status_code=400,
                 detail="Only one of 'bbox' or 'intersects' parameters can be specified.",
             )
-        
+
         if bbox:
             from dynastore.tools.geospatial import parse_bbox_string, BboxDimensionality
             try:
@@ -293,10 +310,10 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
                 )
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
-            
-            return await mf_db.list_moving_features_by_bbox(
+
+            results = await mf_db.list_moving_features_by_bbox(
                 conn,
-                catalog_id,
+                internal_id,
                 collection_id,
                 min_lon=bbox_coords[0],
                 min_lat=bbox_coords[1],
@@ -305,7 +322,8 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
                 limit=limit,
                 offset=offset,
             )
-        
+            return [f.model_copy(update={"catalog_id": catalog_id}) for f in results]
+
         if intersects:
             try:
                 import shapely.wkt as wkt
@@ -320,17 +338,19 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
                     status_code=400,
                     detail=f"Invalid geometry WKT: {str(e)}",
                 ) from e
-            
-            return await mf_db.list_moving_features_by_geometry(
+
+            results = await mf_db.list_moving_features_by_geometry(
                 conn,
-                catalog_id,
+                internal_id,
                 collection_id,
                 geometry_wkt=intersects,
                 limit=limit,
                 offset=offset,
             )
-        
-        return await mf_db.list_moving_features(conn, catalog_id, collection_id, limit, offset)
+            return [f.model_copy(update={"catalog_id": catalog_id}) for f in results]
+
+        results = await mf_db.list_moving_features(conn, internal_id, collection_id, limit, offset)
+        return [f.model_copy(update={"catalog_id": catalog_id}) for f in results]
 
     async def create_moving_feature(
         self,
@@ -344,6 +364,7 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
         await self._require_catalog_ready(catalog_id)
         if not await catalog_module.get_collection(catalog_id, collection_id):
             raise HTTPException(status_code=404, detail="Collection not found.")
+        internal_id = await self._resolve_internal_catalog_id(catalog_id)
 
         from dynastore.modules.db_config.partition_tools import ensure_partition_exists
 
@@ -353,14 +374,14 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
                 table_name="moving_features",
                 schema="moving_features",
                 strategy="LIST",
-                partition_value=catalog_id,
+                partition_value=internal_id,
             )
             await ensure_partition_exists(
                 conn,
                 table_name="temporal_geometries",
                 schema="moving_features",
                 strategy="LIST",
-                partition_value=catalog_id,
+                partition_value=internal_id,
             )
         except Exception as exc:
             logger.error(
@@ -371,10 +392,10 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
                 detail=f"Could not prepare database for catalog '{catalog_id}'.",
             ) from exc
 
-        created = await mf_db.create_moving_feature(conn, catalog_id, collection_id, mf)
+        created = await mf_db.create_moving_feature(conn, internal_id, collection_id, mf)
         if not created:
             raise HTTPException(status_code=500, detail="Failed to create moving feature.")
-        return created
+        return created.model_copy(update={"catalog_id": catalog_id})
 
     async def get_moving_feature(
         self,
@@ -388,12 +409,13 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
     ) -> MovingFeature:
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
-        feature = await mf_db.get_moving_feature(conn, catalog_id, mf_id)
+        internal_id = await self._resolve_internal_catalog_id(catalog_id)
+        feature = await mf_db.get_moving_feature(conn, internal_id, mf_id)
         if not feature:
             raise HTTPException(status_code=404, detail="Moving feature not found.")
         if feature.collection_id != collection_id:
             raise HTTPException(status_code=404, detail="Moving feature not found.")
-        return feature
+        return feature.model_copy(update={"catalog_id": catalog_id})
 
     async def delete_moving_feature(
         self,
@@ -405,11 +427,12 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
         await self._require_catalog_ready(catalog_id)
-        feature = await mf_db.get_moving_feature(conn, catalog_id, mf_id)
+        internal_id = await self._resolve_internal_catalog_id(catalog_id)
+        feature = await mf_db.get_moving_feature(conn, internal_id, mf_id)
         if not feature or feature.collection_id != collection_id:
             raise HTTPException(status_code=404, detail="Moving feature not found.")
-        await delete_temporal_geometries_by_mf(conn, catalog_id, mf_id)
-        await mf_db.delete_moving_feature(conn, catalog_id, mf_id)
+        await delete_temporal_geometries_by_mf(conn, internal_id, mf_id)
+        await mf_db.delete_moving_feature(conn, internal_id, mf_id)
 
     async def update_moving_feature(
         self,
@@ -422,14 +445,15 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
         await self._require_catalog_ready(catalog_id)
-        feature = await mf_db.get_moving_feature(conn, catalog_id, mf_id)
+        internal_id = await self._resolve_internal_catalog_id(catalog_id)
+        feature = await mf_db.get_moving_feature(conn, internal_id, mf_id)
         if not feature or feature.collection_id != collection_id:
             raise HTTPException(status_code=404, detail="Moving feature not found.")
-        
-        updated = await mf_db.update_moving_feature(conn, catalog_id, mf_id, mf_update)
+
+        updated = await mf_db.update_moving_feature(conn, internal_id, mf_id, mf_update)
         if not updated:
             raise HTTPException(status_code=500, detail="Failed to update moving feature.")
-        return updated
+        return updated.model_copy(update={"catalog_id": catalog_id})
 
     # ------------------------------------------------------------------
     # Temporal geometry sequence
@@ -449,10 +473,12 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
     ) -> List[TemporalGeometry]:
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
-        feature = await mf_db.get_moving_feature(conn, catalog_id, mf_id)
+        internal_id = await self._resolve_internal_catalog_id(catalog_id)
+        feature = await mf_db.get_moving_feature(conn, internal_id, mf_id)
         if not feature or feature.collection_id != collection_id:
             raise HTTPException(status_code=404, detail="Moving feature not found.")
-        return await mf_db.list_temporal_geometries(conn, catalog_id, mf_id, dt_start, dt_end)
+        results = await mf_db.list_temporal_geometries(conn, internal_id, mf_id, dt_start, dt_end)
+        return [tg.model_copy(update={"catalog_id": catalog_id}) for tg in results]
 
     async def add_tg_sequence(
         self,
@@ -470,7 +496,8 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
                 status_code=400,
                 detail=f"datetimes length ({len(tg.datetimes)}) must match coordinates length ({len(tg.coordinates)}).",
             )
-        feature = await mf_db.get_moving_feature(conn, catalog_id, mf_id)
+        internal_id = await self._resolve_internal_catalog_id(catalog_id)
+        feature = await mf_db.get_moving_feature(conn, internal_id, mf_id)
         if not feature or feature.collection_id != collection_id:
             raise HTTPException(status_code=404, detail="Moving feature not found.")
 
@@ -482,7 +509,7 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
                 table_name="temporal_geometries",
                 schema="moving_features",
                 strategy="LIST",
-                partition_value=catalog_id,
+                partition_value=internal_id,
             )
         except Exception as exc:
             logger.error(
@@ -493,10 +520,10 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
                 detail=f"Could not prepare database for catalog '{catalog_id}'.",
             ) from exc
 
-        created = await mf_db.create_temporal_geometry(conn, catalog_id, mf_id, tg)
+        created = await mf_db.create_temporal_geometry(conn, internal_id, mf_id, tg)
         if not created:
             raise HTTPException(status_code=500, detail="Failed to create temporal geometry sequence.")
-        return created
+        return created.model_copy(update={"catalog_id": catalog_id})
 
     async def update_tg_sequence(
         self,
@@ -510,17 +537,18 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
         await self._require_catalog_ready(catalog_id)
-        
+        internal_id = await self._resolve_internal_catalog_id(catalog_id)
+
         # Verify the moving feature exists and belongs to the collection
-        feature = await mf_db.get_moving_feature(conn, catalog_id, mf_id)
+        feature = await mf_db.get_moving_feature(conn, internal_id, mf_id)
         if not feature or feature.collection_id != collection_id:
             raise HTTPException(status_code=404, detail="Moving feature not found.")
-        
+
         # Verify the temporal geometry exists and belongs to the moving feature
-        tg = await mf_db.get_temporal_geometry(conn, catalog_id, tg_id)
+        tg = await mf_db.get_temporal_geometry(conn, internal_id, tg_id)
         if not tg or tg.mf_id != mf_id:
             raise HTTPException(status_code=404, detail="Temporal geometry sequence not found.")
-        
+
         # Validate datetimes and coordinates length match if both provided
         if tg_update.datetimes is not None and tg_update.coordinates is not None:
             if len(tg_update.datetimes) != len(tg_update.coordinates):
@@ -528,11 +556,11 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
                     status_code=400,
                     detail=f"datetimes length ({len(tg_update.datetimes)}) must match coordinates length ({len(tg_update.coordinates)}).",
                 )
-        
-        updated = await mf_db.update_temporal_geometry(conn, catalog_id, tg_id, tg_update)
+
+        updated = await mf_db.update_temporal_geometry(conn, internal_id, tg_id, tg_update)
         if not updated:
             raise HTTPException(status_code=500, detail="Failed to update temporal geometry sequence.")
-        return updated
+        return updated.model_copy(update={"catalog_id": catalog_id})
 
     # ------------------------------------------------------------------
     # Web page contribution (WebPageContributor / StaticAssetProvider)

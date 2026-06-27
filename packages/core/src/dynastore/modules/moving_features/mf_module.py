@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 MOVING_FEATURES_DDL = """
     CREATE TABLE IF NOT EXISTS moving_features.moving_features (
         id UUID DEFAULT gen_random_uuid(),
+        -- catalog_id holds the immutable internal catalog id (not the public external id).
+        -- Partitioned on this value so rows survive catalog renames transparently.
         catalog_id VARCHAR NOT NULL,
         collection_id VARCHAR NOT NULL,
         feature_type VARCHAR NOT NULL DEFAULT 'Feature',
@@ -43,6 +45,7 @@ TEMPORAL_GEOMETRIES_DDL = """
     CREATE TABLE IF NOT EXISTS moving_features.temporal_geometries (
         id UUID DEFAULT gen_random_uuid(),
         mf_id UUID NOT NULL,
+        -- catalog_id holds the immutable internal catalog id (not the public external id).
         catalog_id VARCHAR NOT NULL,
         datetimes TIMESTAMPTZ[] NOT NULL,
         coordinates JSONB NOT NULL,

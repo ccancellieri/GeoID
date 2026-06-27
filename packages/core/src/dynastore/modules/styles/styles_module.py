@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 STYLES_SCHEMA = """
     CREATE TABLE IF NOT EXISTS styles.styles (
         id UUID DEFAULT gen_random_uuid(),
+        -- catalog_id holds the immutable internal catalog id (not the public external id).
+        -- Partitioned on this value so rows survive catalog renames transparently.
         catalog_id VARCHAR NOT NULL,
         collection_id VARCHAR NOT NULL,
         style_id VARCHAR NOT NULL, -- User-defined style identifier

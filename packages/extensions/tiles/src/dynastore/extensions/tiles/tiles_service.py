@@ -458,11 +458,17 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
     # --- Tile Matrix Sets Endpoints ---
 
     async def create_tile_matrix_set(self, dataset: str, tms_data: TileMatrixSetCreate):
-        """Creates a new custom TileMatrixSet scoped to a specific dataset (catalog)."""
-        # The tms_data is already a TileMatrixSetCreate model, which has 'id' and 'definition' fields.
-        # The module function expects this exact model.
+        """Creates a new custom TileMatrixSet scoped to a specific dataset (catalog).
+
+        ``dataset`` is the public external catalog id. It is resolved to the
+        immutable internal id before writing so the row survives a catalog rename.
+        """
+        catalogs_svc = await self._get_catalogs_service()
+        internal_catalog_id = await catalogs_svc.resolve_catalog_id(dataset)
+        if not internal_catalog_id:
+            raise HTTPException(status_code=404, detail=f"Catalog '{dataset}' not found.")
         stored_tms = await tms_manager.create_custom_tms(
-            catalog_id=dataset, tms_data=tms_data
+            catalog_id=internal_catalog_id, tms_data=tms_data
         )
         return stored_tms.definition
 
@@ -496,9 +502,15 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 )
             )
 
-        # Append custom TMS from DB if a dataset is specified
+        # Append custom TMS from DB if a dataset is specified. Resolve the
+        # external dataset id to the internal id so the DB lookup uses the
+        # partition key that survives catalog renames.
         if dataset:
-            custom_tms_list = await tms_manager.list_custom_tms(catalog_id=dataset)
+            catalogs_svc = await self._get_catalogs_service()
+            internal_dataset_id = await catalogs_svc.resolve_catalog_id(dataset)
+            if not internal_dataset_id:
+                raise HTTPException(status_code=404, detail=f"Catalog '{dataset}' not found.")
+            custom_tms_list = await tms_manager.list_custom_tms(catalog_id=internal_dataset_id)
             for tms in custom_tms_list:
                 # Avoid duplicating if a custom TMS overrides a built-in one
                 if not any(ref.id == tms.id for ref in tms_refs):
@@ -533,11 +545,20 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             None, description="Dataset (catalog) for custom TMS lookup."
         ),
     ):
-        """Return the full definition of a specific Tile Matrix Set."""
+        """Return the full definition of a specific Tile Matrix Set.
+
+        When ``dataset`` is provided, the external catalog id is resolved to
+        the immutable internal id before querying for a custom TMS, ensuring
+        the lookup works after a catalog rename.
+        """
         tms = None
         if dataset:
+            catalogs_svc = await self._get_catalogs_service()
+            internal_dataset_id = await catalogs_svc.resolve_catalog_id(dataset)
+            if not internal_dataset_id:
+                raise HTTPException(status_code=404, detail=f"Catalog '{dataset}' not found.")
             tms = await tms_manager.get_custom_tms(
-                catalog_id=dataset, tms_id=tileMatrixSetId
+                catalog_id=internal_dataset_id, tms_id=tileMatrixSetId
             )
         if not tms:
             tms_model = BUILTIN_TILE_MATRIX_SETS.get(tileMatrixSetId)
@@ -581,9 +602,13 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         """Catalog-centric endpoint defaulting to WebMercatorQuad."""
+        catalogs_svc = await self._get_catalogs_service()
+        internal_dataset = await catalogs_svc.resolve_catalog_id(dataset)
+        if not internal_dataset:
+            raise HTTPException(status_code=404, detail=f"Catalog '{dataset}' not found.")
         return await self.get_vector_tile(
             request=request,
-            dataset=dataset,
+            dataset=internal_dataset,
             tileMatrixSetId="WebMercatorQuad",
             z=z,
             x=x,
@@ -637,9 +662,13 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         """Catalog-centric endpoint with full TMS support."""
+        catalogs_svc = await self._get_catalogs_service()
+        internal_dataset = await catalogs_svc.resolve_catalog_id(dataset)
+        if not internal_dataset:
+            raise HTTPException(status_code=404, detail=f"Catalog '{dataset}' not found.")
         return await self.get_vector_tile(
             request=request,
-            dataset=dataset,
+            dataset=internal_dataset,
             tileMatrixSetId=tileMatrixSetId,
             z=z,
             x=x,
@@ -689,9 +718,13 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         """Defaults to WebMercatorQuad."""
+        catalogs_svc = await self._get_catalogs_service()
+        internal_dataset = await catalogs_svc.resolve_catalog_id(dataset)
+        if not internal_dataset:
+            raise HTTPException(status_code=404, detail=f"Catalog '{dataset}' not found.")
         return await self.get_vector_tile(
             request=request,
-            dataset=dataset,
+            dataset=internal_dataset,
             tileMatrixSetId="WebMercatorQuad",
             z=z,
             x=x,

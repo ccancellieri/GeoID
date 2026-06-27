@@ -25,9 +25,11 @@ from dynastore.modules.db_config.query_executor import DQLQuery, DDLQuery, Resul
 CREATE_CUSTOM_CRS_TABLE = DDLQuery(
     """
     CREATE TABLE IF NOT EXISTS crs.crs_definitions (
-        catalog_id VARCHAR NOT NULL, 
-        crs_uri VARCHAR NOT NULL,    
-        definition JSONB NOT NULL,   
+        -- catalog_id holds the immutable internal catalog id (not the public external id).
+        -- Partitioned on this value so rows survive catalog renames transparently.
+        catalog_id VARCHAR NOT NULL,
+        crs_uri VARCHAR NOT NULL,
+        definition JSONB NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (catalog_id, crs_uri)
     ) PARTITION BY LIST (catalog_id);

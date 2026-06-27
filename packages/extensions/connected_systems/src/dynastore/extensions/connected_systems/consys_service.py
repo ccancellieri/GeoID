@@ -221,6 +221,22 @@ class ConnectedSystemsService(
     # Systems
     # ------------------------------------------------------------------
 
+    async def _resolve_internal_catalog_id(self, external_catalog_id: str) -> str:
+        """Resolve the public external catalog id to the immutable internal id.
+
+        All DB operations and partition keys use the internal id so that a
+        catalog rename (external id change) never orphans existing rows.
+        Raises 404 when the catalog does not exist.
+        """
+        catalogs_svc = await self._get_catalogs_service()
+        internal_id = await catalogs_svc.resolve_catalog_id(external_catalog_id)
+        if not internal_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Catalog '{external_catalog_id}' not found.",
+            )
+        return internal_id
+
     async def list_systems(
         self,
         catalog_id: str = Query(..., description="Catalog identifier"),
@@ -233,7 +249,9 @@ class ConnectedSystemsService(
     ) -> List[System]:
         validate_sql_identifier(catalog_id)
         await self._require_catalog_ready(catalog_id)
-        return await consys_db.list_systems(conn, catalog_id, limit=limit, offset=offset)
+        internal_id = await self._resolve_internal_catalog_id(catalog_id)
+        results = await consys_db.list_systems(conn, internal_id, limit=limit, offset=offset)
+        return [s.model_copy(update={"catalog_id": catalog_id}) for s in results]
 
     async def create_system(
         self,
@@ -243,6 +261,7 @@ class ConnectedSystemsService(
     ) -> System:
         validate_sql_identifier(catalog_id)
         await self._require_catalog_ready(catalog_id)
+        internal_id = await self._resolve_internal_catalog_id(catalog_id)
 
         from dynastore.modules.db_config.partition_tools import ensure_partition_exists
 
@@ -252,28 +271,28 @@ class ConnectedSystemsService(
                 table_name="systems",
                 schema="consys",
                 strategy="LIST",
-                partition_value=catalog_id,
+                partition_value=internal_id,
             )
             await ensure_partition_exists(
                 conn,
                 table_name="deployments",
                 schema="consys",
                 strategy="LIST",
-                partition_value=catalog_id,
+                partition_value=internal_id,
             )
             await ensure_partition_exists(
                 conn,
                 table_name="datastreams",
                 schema="consys",
                 strategy="LIST",
-                partition_value=catalog_id,
+                partition_value=internal_id,
             )
             await ensure_partition_exists(
                 conn,
                 table_name="observations",
                 schema="consys",
                 strategy="LIST",
-                partition_value=catalog_id,
+                partition_value=internal_id,
             )
         except Exception as exc:
             logger.error(
@@ -286,7 +305,7 @@ class ConnectedSystemsService(
             ) from exc
 
         try:
-            result = await consys_db.create_system(conn, catalog_id, system)
+            result = await consys_db.create_system(conn, internal_id, system)
         except IntegrityError as exc:
             if exc.orig and getattr(exc.orig, "sqlstate", None) == "23505":
                 raise HTTPException(
@@ -296,7 +315,7 @@ class ConnectedSystemsService(
             raise
         if not result:
             raise HTTPException(status_code=500, detail="Failed to create system.")
-        return result
+        return result.model_copy(update={"catalog_id": catalog_id})
 
     async def get_system(
         self,
@@ -308,10 +327,11 @@ class ConnectedSystemsService(
         request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> System:
         validate_sql_identifier(catalog_id)
-        result = await consys_db.get_system(conn, catalog_id, system_id)
+        internal_id = await self._resolve_internal_catalog_id(catalog_id)
+        result = await consys_db.get_system(conn, internal_id, system_id)
         if not result:
             raise HTTPException(status_code=404, detail="System not found.")
-        return result
+        return result.model_copy(update={"catalog_id": catalog_id})
 
     async def update_system(
         self,
@@ -322,11 +342,12 @@ class ConnectedSystemsService(
     ) -> System:
         validate_sql_identifier(catalog_id)
         await self._require_catalog_ready(catalog_id)
+        internal_id = await self._resolve_internal_catalog_id(catalog_id)
 
-        result = await consys_db.update_system(conn, catalog_id, system_id, system_update)
+        result = await consys_db.update_system(conn, internal_id, system_id, system_update)
         if not result:
             raise HTTPException(status_code=404, detail="System not found.")
-        return result
+        return result.model_copy(update={"catalog_id": catalog_id})
 
     async def delete_system(
         self,
@@ -336,12 +357,13 @@ class ConnectedSystemsService(
     ) -> None:
         validate_sql_identifier(catalog_id)
         await self._require_catalog_ready(catalog_id)
+        internal_id = await self._resolve_internal_catalog_id(catalog_id)
 
-        existing = await consys_db.get_system(conn, catalog_id, system_id)
+        existing = await consys_db.get_system(conn, internal_id, system_id)
         if not existing:
             raise HTTPException(status_code=404, detail="System not found.")
 
-        deleted = await consys_db.delete_system(conn, catalog_id, existing.id)
+        deleted = await consys_db.delete_system(conn, internal_id, existing.id)
         if not deleted:
             raise HTTPException(status_code=404, detail="System found but could not be deleted.")
 
@@ -357,12 +379,14 @@ class ConnectedSystemsService(
         request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> List[Deployment]:
         validate_sql_identifier(catalog_id)
-        existing = await consys_db.get_system(conn, catalog_id, system_id)
+        internal_id = await self._resolve_internal_catalog_id(catalog_id)
+        existing = await consys_db.get_system(conn, internal_id, system_id)
         if not existing:
             raise HTTPException(status_code=404, detail="System not found.")
-        return await consys_db.list_deployments_for_system(
-            conn, catalog_id, system_id, limit=limit, offset=offset
+        results = await consys_db.list_deployments_for_system(
+            conn, internal_id, system_id, limit=limit, offset=offset
         )
+        return [d.model_copy(update={"catalog_id": catalog_id}) for d in results]
 
     async def list_system_datastreams(
         self,
@@ -376,12 +400,14 @@ class ConnectedSystemsService(
         request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> List[DataStream]:
         validate_sql_identifier(catalog_id)
-        existing = await consys_db.get_system(conn, catalog_id, system_id)
+        internal_id = await self._resolve_internal_catalog_id(catalog_id)
+        existing = await consys_db.get_system(conn, internal_id, system_id)
         if not existing:
             raise HTTPException(status_code=404, detail="System not found.")
-        return await consys_db.list_datastreams_for_system(
-            conn, catalog_id, system_id, limit=limit, offset=offset
+        results = await consys_db.list_datastreams_for_system(
+            conn, internal_id, system_id, limit=limit, offset=offset
         )
+        return [ds.model_copy(update={"catalog_id": catalog_id}) for ds in results]
 
     # ------------------------------------------------------------------
     # DataStreams
@@ -398,7 +424,9 @@ class ConnectedSystemsService(
         request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> List[DataStream]:
         validate_sql_identifier(catalog_id)
-        return await consys_db.list_datastreams(conn, catalog_id, limit=limit, offset=offset)
+        internal_id = await self._resolve_internal_catalog_id(catalog_id)
+        results = await consys_db.list_datastreams(conn, internal_id, limit=limit, offset=offset)
+        return [ds.model_copy(update={"catalog_id": catalog_id}) for ds in results]
 
     async def create_datastream(
         self,
@@ -408,8 +436,9 @@ class ConnectedSystemsService(
     ) -> DataStream:
         validate_sql_identifier(catalog_id)
         await self._require_catalog_ready(catalog_id)
+        internal_id = await self._resolve_internal_catalog_id(catalog_id)
 
-        system = await consys_db.get_system(conn, catalog_id, str(datastream.system_id))
+        system = await consys_db.get_system(conn, internal_id, str(datastream.system_id))
         if not system:
             raise HTTPException(
                 status_code=404,
@@ -417,7 +446,7 @@ class ConnectedSystemsService(
             )
 
         try:
-            result = await consys_db.create_datastream(conn, catalog_id, datastream)
+            result = await consys_db.create_datastream(conn, internal_id, datastream)
         except IntegrityError as exc:
             if exc.orig and getattr(exc.orig, "sqlstate", None) == "23505":
                 raise HTTPException(
@@ -427,7 +456,7 @@ class ConnectedSystemsService(
             raise
         if not result:
             raise HTTPException(status_code=500, detail="Failed to create datastream.")
-        return result
+        return result.model_copy(update={"catalog_id": catalog_id})
 
     async def get_datastream(
         self,
@@ -439,10 +468,11 @@ class ConnectedSystemsService(
         request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> DataStream:
         validate_sql_identifier(catalog_id)
-        result = await consys_db.get_datastream(conn, catalog_id, datastream_id)
+        internal_id = await self._resolve_internal_catalog_id(catalog_id)
+        result = await consys_db.get_datastream(conn, internal_id, datastream_id)
         if not result:
             raise HTTPException(status_code=404, detail="DataStream not found.")
-        return result
+        return result.model_copy(update={"catalog_id": catalog_id})
 
     # ------------------------------------------------------------------
     # Observations
@@ -463,17 +493,19 @@ class ConnectedSystemsService(
         request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> List[Observation]:
         validate_sql_identifier(catalog_id)
-        ds = await consys_db.get_datastream(conn, catalog_id, datastream_id)
+        internal_id = await self._resolve_internal_catalog_id(catalog_id)
+        ds = await consys_db.get_datastream(conn, internal_id, datastream_id)
         if not ds:
             raise HTTPException(status_code=404, detail="DataStream not found.")
-        
+
         parsed_bbox: Optional[Tuple[float, float, float, float]] = None
         if bbox:
             parsed_bbox = parse_bbox_string(bbox)
-        
-        return await consys_db.list_observations(
-            conn, catalog_id, datastream_id, limit=limit, offset=offset, datetime=datetime, bbox=parsed_bbox
+
+        results = await consys_db.list_observations(
+            conn, internal_id, datastream_id, limit=limit, offset=offset, datetime=datetime, bbox=parsed_bbox
         )
+        return [o.model_copy(update={"catalog_id": catalog_id}) for o in results]
 
     async def create_observation(
         self,
@@ -484,14 +516,15 @@ class ConnectedSystemsService(
     ) -> Observation:
         validate_sql_identifier(catalog_id)
         await self._require_catalog_ready(catalog_id)
+        internal_id = await self._resolve_internal_catalog_id(catalog_id)
 
-        ds = await consys_db.get_datastream(conn, catalog_id, datastream_id)
+        ds = await consys_db.get_datastream(conn, internal_id, datastream_id)
         if not ds:
             raise HTTPException(status_code=404, detail="DataStream not found.")
 
         result = await consys_db.create_observation(
-            conn, catalog_id, ds.id, observation
+            conn, internal_id, ds.id, observation
         )
         if not result:
             raise HTTPException(status_code=500, detail="Failed to create observation.")
-        return result
+        return result.model_copy(update={"catalog_id": catalog_id})

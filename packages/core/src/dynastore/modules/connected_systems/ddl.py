@@ -40,6 +40,8 @@ logger = logging.getLogger(__name__)
 CONSYS_SYSTEMS_DDL = """
     CREATE TABLE IF NOT EXISTS consys.systems (
         id            UUID          NOT NULL DEFAULT gen_random_uuid(),
+        -- catalog_id holds the immutable internal catalog id (not the public external id).
+        -- Partitioned on this value so rows survive catalog renames transparently.
         catalog_id    VARCHAR       NOT NULL,
         system_id     VARCHAR       NOT NULL,
         name          VARCHAR       NOT NULL,
@@ -58,6 +60,7 @@ CONSYS_SYSTEMS_DDL = """
 CONSYS_DEPLOYMENTS_DDL = """
     CREATE TABLE IF NOT EXISTS consys.deployments (
         id          UUID        NOT NULL DEFAULT gen_random_uuid(),
+        -- catalog_id holds the immutable internal catalog id (not the public external id).
         catalog_id  VARCHAR     NOT NULL,
         system_id   UUID        NOT NULL,
         name        VARCHAR     NOT NULL,
@@ -74,6 +77,7 @@ CONSYS_DEPLOYMENTS_DDL = """
 CONSYS_DATASTREAMS_DDL = """
     CREATE TABLE IF NOT EXISTS consys.datastreams (
         id                  UUID        NOT NULL DEFAULT gen_random_uuid(),
+        -- catalog_id holds the immutable internal catalog id (not the public external id).
         catalog_id          VARCHAR     NOT NULL,
         datastream_id       VARCHAR     NOT NULL,
         system_id           UUID        NOT NULL,
@@ -92,6 +96,7 @@ CONSYS_DATASTREAMS_DDL = """
 CONSYS_OBSERVATIONS_DDL = """
     CREATE TABLE IF NOT EXISTS consys.observations (
         id               UUID        NOT NULL DEFAULT gen_random_uuid(),
+        -- catalog_id holds the immutable internal catalog id (not the public external id).
         catalog_id       VARCHAR     NOT NULL,
         datastream_id    UUID        NOT NULL,
         phenomenon_time  TIMESTAMPTZ NOT NULL,
