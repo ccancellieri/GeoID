@@ -1304,6 +1304,81 @@ _TRANSIENT_CONNECT_EXCEPTIONS: tuple = (
 )
 
 
+def _err_repr(exc: BaseException) -> str:
+    """One-line representation of an exception for structured log lines."""
+    return f"{type(exc).__name__}: {exc}"
+
+
+async def _run_with_retry_policy(
+    call: "Callable[[], Awaitable[Any]]",
+    *,
+    classify: "Callable[[BaseException], bool]",
+    kind: str,
+    max_attempts: int,
+    compute_delay: "Callable[[int, BaseException], float]",
+    level: int = logging.WARNING,
+    log_exhaustion: bool = False,
+) -> Any:
+    """Private async retry core shared by all retry wrappers in this module.
+
+    Not part of the public API — use :func:`retry_on_transient_connect` or
+    :func:`provisioning_write_with_retry`.
+
+    Emits one unified per-attempt log line at ``level`` (default WARNING):
+
+        retry attempt=N/M kind=<domain> backoff_s=F err=<Type>: <msg>
+
+    A single GCP log-based metric expression on the TEXT covers all retry
+    sites regardless of per-site severity. Callers choose the level to
+    preserve their existing log-flood characteristics.
+
+    When ``log_exhaustion`` is True, emits an additional WARNING on the
+    final failed attempt before re-raising so operators can identify
+    exhausted retry budgets independently of exception tracing.
+
+    :param call: Zero-arg async thunk to attempt on each iteration.
+    :param classify: Return True for exceptions safe to retry; non-matching
+        exceptions propagate immediately without consuming retry budget.
+    :param kind: Domain tag for the log line (e.g. ``"db_connect"``).
+    :param max_attempts: Total attempts (1 = no retry).
+    :param compute_delay: ``(attempt, exc) -> float`` backoff in seconds,
+        called only for non-final attempts.
+    :param level: Log level for per-attempt retry lines (default WARNING).
+    :param log_exhaustion: If True, emit an extra WARNING when all attempts
+        are consumed before re-raising the final exception.
+    """
+    last: Optional[BaseException] = None
+    for attempt in range(max_attempts):
+        try:
+            return await call()
+        except BaseException as exc:
+            if not classify(exc):
+                raise
+            last = exc
+            if attempt == max_attempts - 1:
+                if log_exhaustion:
+                    logger.warning(
+                        "retry exhausted attempts=%d kind=%s err=%s",
+                        max_attempts,
+                        kind,
+                        _err_repr(exc),
+                    )
+                raise
+            delay = compute_delay(attempt, exc)
+            logger.log(
+                level,
+                "retry attempt=%d/%d kind=%s backoff_s=%.2f err=%s",
+                attempt + 1,
+                max_attempts,
+                kind,
+                delay,
+                _err_repr(exc),
+            )
+            await asyncio.sleep(delay)
+    assert last is not None
+    raise last
+
+
 def retry_on_transient_connect(
     max_retries: int | None = None,
     base_delay: float | None = None,
@@ -1341,38 +1416,21 @@ def retry_on_transient_connect(
             _max_delay = max_delay if max_delay is not None else cfg_max_delay
             _jitter = jitter if jitter is not None else cfg_jitter
 
-            last_err: Optional[BaseException] = None
-            for attempt in range(_max_retries):
-                try:
-                    return await func(*args, **kwargs)
-                except _TRANSIENT_CONNECT_EXCEPTIONS as exc:
-                    last_err = exc
-                    fn_mod = getattr(func, "__module__", "<unknown>")
-                    fn_name = getattr(func, "__qualname__", getattr(func, "__name__", "<fn>"))
-                    if attempt == _max_retries - 1:
-                        logger.warning(
-                            "retry_on_transient_connect: %s.%s exhausted %d attempts "
-                            "(%s: %s)",
-                            fn_mod, fn_name, _max_retries,
-                            type(exc).__name__, exc,
-                        )
-                        raise
-                    delay = min(_base_delay * (2 ** attempt), _max_delay)
-                    if _jitter:
-                        delay *= random.uniform(1.0 - _jitter, 1.0 + _jitter)
-                    logger.debug(
-                        "retry_on_transient_connect: %s.%s attempt %d/%d failed "
-                        "(%s: %s); retrying in %.2fs",
-                        fn_mod, fn_name,
-                        attempt + 1,
-                        _max_retries,
-                        type(exc).__name__,
-                        exc,
-                        delay,
-                    )
-                    await asyncio.sleep(delay)
-            assert last_err is not None
-            raise last_err
+            def _compute_delay(attempt: int, exc: BaseException) -> float:
+                delay = min(_base_delay * (2 ** attempt), _max_delay)
+                if _jitter:
+                    delay *= random.uniform(1.0 - _jitter, 1.0 + _jitter)
+                return delay
+
+            return await _run_with_retry_policy(
+                lambda: func(*args, **kwargs),
+                classify=lambda e: isinstance(e, _TRANSIENT_CONNECT_EXCEPTIONS),
+                kind="db_connect",
+                max_attempts=_max_retries,
+                compute_delay=_compute_delay,
+                level=logging.DEBUG,
+                log_exhaustion=True,
+            )
 
         return wrapper
 
@@ -1924,31 +1982,26 @@ async def provisioning_write_with_retry(
     _attempts = attempts if attempts is not None else cfg_attempts
     _lock_backoff = lock_backoff if lock_backoff is not None else cfg_lock_backoff
 
-    for attempt in range(_attempts):
-        try:
-            async with managed_transaction(engine) as conn:
-                return await fn(conn)
-        except Exception as exc:
-            orig = getattr(exc, "orig", None)
-            if is_transient_db_error(exc):
-                if attempt < _attempts - 1:
-                    is_lock = _is_lock_not_available_error(exc) or (
-                        orig is not None and _is_lock_not_available_error(orig)
-                    )
-                    delay = _lock_backoff * (attempt + 1) if is_lock else 0.0
-                    logger.warning(
-                        "provisioning_write_retry "
-                        "attempt=%d/%d exc=%s cause=%s delay=%.1fs; retrying on fresh connection",
-                        attempt + 1,
-                        _attempts,
-                        exc.__class__.__name__,
-                        orig.__class__.__name__ if orig is not None else "none",
-                        delay,
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-            raise
-    raise AssertionError("provisioning_write_with_retry: exhausted attempts without raising")
+    def _compute_delay(attempt: int, exc: BaseException) -> float:
+        orig = getattr(exc, "orig", None)
+        is_lock = _is_lock_not_available_error(exc) or (
+            orig is not None and _is_lock_not_available_error(orig)
+        )
+        return _lock_backoff * (attempt + 1) if is_lock else 0.0
+
+    async def _call() -> "_T":
+        async with managed_transaction(engine) as conn:
+            return await fn(conn)
+
+    return await _run_with_retry_policy(
+        _call,
+        classify=is_transient_db_error,
+        kind="provisioning_write",
+        max_attempts=_attempts,
+        compute_delay=_compute_delay,
+        level=logging.WARNING,
+        log_exhaustion=False,
+    )
 
 
 def run_in_event_loop(awaitable: Awaitable[R]) -> R:

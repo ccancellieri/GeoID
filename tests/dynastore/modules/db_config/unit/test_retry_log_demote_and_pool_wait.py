@@ -16,11 +16,12 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Issue #486: assert two behavioural changes to ``query_executor``.
+"""Issue #486 / #2511: behavioural assertions for ``query_executor`` retry and pool logging.
 
-1. ``retry_on_transient_connect`` per-attempt retries log at DEBUG (was WARNING)
-   so a wedged pool no longer floods Cloud Logging. Terminal exhaustion after
-   ``max_retries`` keeps WARNING so real failures stay visible.
+1. ``retry_on_transient_connect`` per-attempt retries log at DEBUG (issue #486)
+   so a wedged pool no longer floods Cloud Logging. The log line now uses the
+   unified format (issue #2511): ``retry attempt=N/M kind=db_connect ...``.
+   Terminal exhaustion after ``max_retries`` still logs at WARNING.
 2. ``_acquire_async_engine_connection`` emits a structured ``db_pool_acquire``
    log line carrying ``wait_seconds``. INFO when slow (>= threshold), DEBUG
    otherwise. Feeds a GCP log-based metric without requiring a prometheus dep.
@@ -84,7 +85,8 @@ class TestRetryLogDemote:
         assert result == "ok"
         retry_records = [
             r for r in caplog.records
-            if "retry_on_transient_connect" in r.getMessage()
+            if "retry attempt=" in r.getMessage()
+            and "kind=db_connect" in r.getMessage()
             and "exhausted" not in r.getMessage()
         ]
         assert retry_records, "expected at least one per-attempt retry log"
@@ -354,3 +356,88 @@ class TestServiceNameResolution:
             side_effect=RuntimeError("disk gone"),
         ):
             assert query_executor._resolve_service_name() == "envname"
+
+
+# ---------------------------------------------------------------------------
+# Unified retry log — both wrappers emit the same key=value format.
+# Issue #2511: the format is unified; the level is per-site (DEBUG for
+# connect per issue #486, WARNING for provisioning).
+# ---------------------------------------------------------------------------
+
+
+class TestUnifiedRetryLog:
+    """Both retry wrappers delegate to _run_with_retry_policy and emit
+    ``retry attempt=N/M kind=<domain> backoff_s=F err=<type>: <msg>``.
+    The level is site-specific: DEBUG for db_connect, WARNING for
+    provisioning_write.
+    """
+
+    def test_connect_wrapper_emits_unified_line_at_debug(self, caplog):
+        calls = {"n": 0}
+
+        @retry_on_transient_connect(max_retries=3, base_delay=0, max_delay=0, jitter=0)
+        async def flaky() -> str:
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise _TransientOnce("transient-connect")
+            return "done"
+
+        caplog.set_level(logging.DEBUG, logger=query_executor.__name__)
+        result = asyncio.run(flaky())
+
+        assert result == "done"
+        unified = [
+            r for r in caplog.records
+            if "retry attempt=" in r.getMessage()
+            and "kind=db_connect" in r.getMessage()
+            and "backoff_s=" in r.getMessage()
+            and "err=" in r.getMessage()
+        ]
+        assert len(unified) == 2  # 2 failed attempts before success on 3rd
+        for rec in unified:
+            assert rec.levelno == logging.DEBUG
+
+    @pytest.mark.asyncio
+    async def test_provisioning_wrapper_emits_unified_line(self, caplog, monkeypatch):
+        import dynastore.modules.db_config.query_executor as qe
+        from contextlib import asynccontextmanager
+
+        call_count = 0
+
+        @asynccontextmanager
+        async def _fake_managed_transaction(engine):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Simulate a transient closed-connection error on the first attempt.
+                err = qe.OperationalError("server closed the connection", {}, None)
+                err.connection_invalidated = True  # type: ignore[attr-defined]
+                raise err
+            yield object()
+
+        monkeypatch.setattr(qe, "managed_transaction", _fake_managed_transaction)
+
+        async def _fast_sleep(_: float) -> None:
+            return None
+
+        monkeypatch.setattr(qe.asyncio, "sleep", _fast_sleep)
+
+        from dynastore.modules.db_config.query_executor import provisioning_write_with_retry
+
+        caplog.set_level(logging.WARNING, logger=query_executor.__name__)
+
+        async def fn(conn):
+            return "provisioned"
+
+        result = await provisioning_write_with_retry(object(), fn, attempts=3)
+        assert result == "provisioned"
+
+        unified = [
+            r for r in caplog.records
+            if "retry attempt=" in r.getMessage()
+            and "kind=provisioning_write" in r.getMessage()
+            and "backoff_s=" in r.getMessage()
+            and "err=" in r.getMessage()
+        ]
+        assert len(unified) == 1
+        assert unified[0].levelno == logging.WARNING
