@@ -802,6 +802,118 @@ class TestRequireDevEnv:
 
 
 # ---------------------------------------------------------------------------
+# _clean_dsn / _normalize_dsn / _resolve_dsn
+# ---------------------------------------------------------------------------
+
+class TestCleanDsn:
+    def test_strips_surrounding_whitespace(self):
+        assert gc._clean_dsn("  postgresql://x/db  ") == "postgresql://x/db"
+
+    def test_strips_single_quotes(self):
+        assert gc._clean_dsn("'postgresql://x/db'") == "postgresql://x/db"
+
+    def test_strips_double_quotes(self):
+        assert gc._clean_dsn('"postgresql://x/db"') == "postgresql://x/db"
+
+    def test_returns_none_for_empty_string(self):
+        assert gc._clean_dsn("") is None
+
+    def test_returns_none_for_none(self):
+        assert gc._clean_dsn(None) is None
+
+
+class TestNormalizeDsn:
+    def test_strips_postgresql_asyncpg(self):
+        assert gc._normalize_dsn("postgresql+asyncpg://u:p@h/db") == "postgresql://u:p@h/db"
+
+    def test_strips_postgres_asyncpg(self):
+        assert gc._normalize_dsn("postgres+asyncpg://u:p@h/db") == "postgresql://u:p@h/db"
+
+    def test_plain_postgresql_unchanged(self):
+        assert gc._normalize_dsn("postgresql://u:p@h/db") == "postgresql://u:p@h/db"
+
+
+class TestResolveDsn:
+    def test_prefers_db_config_json(self, monkeypatch):
+        """When load_db_config returns a DATABASE_URL, it is used and tagged db_config.json."""
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        dsn_val = "postgresql://user:pass@dbhost:5432/mydb"
+        with patch(
+            "dynastore.modules.db_config.instance.load_db_config",
+            return_value={"DATABASE_URL": dsn_val},
+        ):
+            dsn, source = gc._resolve_dsn()
+        assert dsn == dsn_val
+        assert source == "db_config.json"
+
+    def test_falls_back_to_dbconfig_database_url_when_no_json(self, monkeypatch):
+        """When load_db_config returns empty dict, DBConfig.database_url is tried.
+
+        _LazyDatabaseUrl caches its result in an instance attribute (_resolved) on
+        the descriptor object itself.  Patching the cache directly avoids triggering
+        the descriptor's __get__ (which would raise RuntimeError in a no-env context).
+        """
+        dsn_val = "postgresql://u:p@h/db"
+        import dynastore.modules.db_config.db_config as _dbcfg
+        # Access the descriptor instance via __dict__ to avoid triggering __get__.
+        descriptor = _dbcfg.DBConfig.__dict__["database_url"]
+        # Pre-fill the cache so __get__ returns dsn_val without calling _resolve_database_url.
+        monkeypatch.setattr(descriptor, "_resolved", dsn_val)
+        with patch(
+            "dynastore.modules.db_config.instance.load_db_config",
+            return_value={},
+        ):
+            dsn, source = gc._resolve_dsn()
+        assert dsn == dsn_val
+        assert source == "DBConfig.database_url"
+
+    def test_falls_back_to_env_when_others_unavailable(self, monkeypatch):
+        """When load_db_config raises and DBConfig raises, plain env is used."""
+        dsn_val = "postgresql://u:p@envhost:5432/mydb"
+        monkeypatch.setenv("DATABASE_URL", dsn_val)
+        with patch(
+            "dynastore.modules.db_config.instance.load_db_config",
+            side_effect=ImportError("unavailable"),
+        ):
+            with patch(
+                "dynastore.modules.db_config.db_config.DBConfig",
+                side_effect=RuntimeError("unavailable"),
+            ):
+                dsn, source = gc._resolve_dsn()
+        assert dsn == dsn_val
+        assert source == "env"
+
+    def test_returns_missing_when_nothing_available(self, monkeypatch):
+        """When all three sources fail, dsn is None and source is MISSING."""
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        with patch(
+            "dynastore.modules.db_config.instance.load_db_config",
+            return_value={},
+        ):
+            with patch(
+                "dynastore.modules.db_config.db_config.DBConfig",
+                side_effect=RuntimeError("no db"),
+            ):
+                dsn, source = gc._resolve_dsn()
+        assert dsn is None
+        assert source == "MISSING"
+
+    def test_db_config_json_dsn_without_scheme_is_skipped(self, monkeypatch):
+        """A value in db_config.json without '://' must be skipped, not used."""
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        with patch(
+            "dynastore.modules.db_config.instance.load_db_config",
+            return_value={"DATABASE_URL": "not-a-url"},
+        ):
+            with patch(
+                "dynastore.modules.db_config.db_config.DBConfig",
+                side_effect=RuntimeError("no db"),
+            ):
+                dsn, source = gc._resolve_dsn()
+        assert dsn is None  # the invalid value must not be forwarded
+
+
+# ---------------------------------------------------------------------------
 # Drift guard: is_phantom_external_id must agree with the SSOT predicate
 # is_internal_physical_name from catalog_service.
 # ---------------------------------------------------------------------------

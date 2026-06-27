@@ -55,8 +55,9 @@ HARD SAFETY RULES
 * Dry-run is the default.  Pass ``--execute`` to actually mutate anything.
 
 Connection resolution (first match wins):
-  1. DATABASE_URL env var
-  2. /dynastore/env/.env (Secret Manager mount used by Cloud Run jobs)
+  1. db_config.json (DYNASTORE_CONFIG_ROOT) — the deployment source on dev
+  2. DBConfig.database_url — app resolver (env DATABASE_URL -> db_config.json -> default)
+  3. DATABASE_URL env var — explicit override / manual runs
 
 Usage::
 
@@ -142,18 +143,45 @@ def _parse_url(url: str) -> dict:
     return kwargs
 
 
-def _resolve_database_url() -> str:
-    url = os.environ.get("DATABASE_URL", "")
-    if url:
-        return url
-    env_file = "/dynastore/env/.env"
-    if os.path.isfile(env_file):
-        with open(env_file) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("DATABASE_URL=") or line.startswith("export DATABASE_URL="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
-    return ""
+def _clean_dsn(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    return url.strip().strip("'\"").strip()
+
+
+def _resolve_dsn() -> tuple:
+    """Return (dsn, source). Prefer db_config.json; env DATABASE_URL is last resort."""
+    # 1) db_config.json directly — the service's real source on dev.
+    try:
+        from dynastore.modules.db_config.instance import load_db_config
+        fv = load_db_config() or {}
+        url = _clean_dsn(fv.get("DATABASE_URL"))
+        if url and "://" in url:
+            return url, "db_config.json"
+    except Exception as exc:
+        print(f"  (load_db_config unavailable: {exc})")
+    # 2) The app's own resolver (env DATABASE_URL -> db_config.json -> default).
+    try:
+        from dynastore.modules.db_config.db_config import DBConfig
+        url = _clean_dsn(DBConfig.database_url)
+        if url and "://" in url:
+            return url, "DBConfig.database_url"
+    except Exception as exc:
+        print(f"  (DBConfig.database_url unavailable: {exc})")
+    # 3) Plain env (last resort).
+    url = _clean_dsn(os.environ.get("DATABASE_URL"))
+    if url and "://" in url:
+        return url, "env"
+    return None, "MISSING"
+
+
+def _normalize_dsn(url: str) -> str:
+    """asyncpg wants a plain postgresql:// DSN; the app uses the +asyncpg SQLAlchemy form."""
+    return (
+        url
+        .replace("postgresql+asyncpg://", "postgresql://")
+        .replace("postgres+asyncpg://", "postgresql://")
+    )
 
 
 async def _detect_phantoms(conn) -> List[PhantomCatalog]:
@@ -494,8 +522,6 @@ async def _run(
 ) -> int:
     import asyncpg
 
-    kwargs = _parse_url(url)
-
     # Boot the full module stack when executing with real GCP teardown so that
     # StorageProtocol / EventingProtocol are live inside teardown_phantom_gcp_resources.
     # Dry-run skips the boot for speed; --allow-gcp-skip implies GCP resources
@@ -520,7 +546,7 @@ async def _run(
         _log(f"\nSummary: {ok} torn down, {failed} failed out of {len(targets)} total.")
         return 0 if failed == 0 else 1
 
-    conn: asyncpg.Connection = await asyncpg.connect(**kwargs)
+    conn: asyncpg.Connection = await asyncpg.connect(dsn=_normalize_dsn(url), timeout=30)
     try:
         if all_catalogs:
             targets = await _detect_all_catalogs(conn)
@@ -664,14 +690,27 @@ def main() -> None:
     elif args.ids_file:
         ids = _load_ids_file(args.ids_file)
 
-    url = _resolve_database_url()
-    if not url:
-        print("ERROR: DATABASE_URL is not set", file=sys.stderr, flush=True)
+    dsn, source = _resolve_dsn()
+    if dsn is None:
+        print(
+            "DATABASE_URL not resolvable from db_config.json / DBConfig / env — "
+            "cannot connect. Nothing changed.",
+            file=sys.stderr, flush=True,
+        )
         sys.exit(1)
+
+    # Redacted log so the operator can see where the DSN came from without
+    # leaking credentials.
+    try:
+        from urllib.parse import urlparse as _urlparse
+        _p = _urlparse(dsn)
+        print(f"DSN source={source} host={_p.hostname!r} port={_p.port or 5432}", flush=True)
+    except Exception:
+        print(f"DSN source={source}", flush=True)
 
     rc = asyncio.run(
         _run(
-            url,
+            dsn,
             execute=args.execute,
             allow_gcp_skip=args.allow_gcp_skip,
             ids=ids,
