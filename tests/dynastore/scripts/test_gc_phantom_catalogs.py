@@ -23,17 +23,22 @@ All tests are pure-unit: no real DB, no real GCP.
 Coverage:
 - is_phantom_external_id predicate (both matching and non-matching ids)
 - _detect_phantoms uses the regex filter and resolves bucket_name
+- _detect_all_catalogs selects ALL non-deleted catalogs regardless of shape
 - _fetch_phantoms_by_ids validates id shape, skips non-matching, handles missing rows
 - _resolve_bucket_name returns None when schema absent, None when row absent
 - _run in dry-run mode performs zero DB mutations
 - _run in --execute mode invokes teardown + row delete per phantom
 - teardown is idempotent: already-gone GCP resources are skipped, not errored
 - safety invariant: a real external_id (non-internal-shaped) is never touched
+- --all mode: selects all catalogs (mock DB), not just phantoms
+- dev-only guard: refuses when env is prod/empty, allows when env=dev/development/review
+- dry-run with --all makes no deletions
 """
 from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -48,6 +53,12 @@ import dynastore.scripts.gc_phantom_catalogs as gc
 
 def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
+
+
+@asynccontextmanager
+async def _noop_lifespan(*a, **kw):
+    """Async context manager no-op used to mock modules_lifespan in tests."""
+    yield
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +205,62 @@ class TestDetectPhantoms:
         conn.fetchrow = AsyncMock(return_value=None)
         phantoms = _run(gc._detect_phantoms(conn))
         assert phantoms[0].bucket_name is None
+
+
+# ---------------------------------------------------------------------------
+# _detect_all_catalogs
+# ---------------------------------------------------------------------------
+
+class TestDetectAllCatalogs:
+    """--all mode selects every non-deleted catalog regardless of external_id shape."""
+
+    def _make_conn(self, rows: list, bucket: Optional[str] = "bucket-all") -> Any:
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=rows)
+        conn.fetchval = AsyncMock(return_value=1)
+        conn.fetchrow = AsyncMock(
+            return_value={"config_data": {"bucket_name": bucket}} if bucket else None
+        )
+        return conn
+
+    def test_returns_all_rows_regardless_of_external_id_shape(self):
+        """Both phantom-shaped and real external_ids must appear in the result."""
+        rows = [
+            {"id": "c_2abc3defg4hi5", "external_id": "c_2abc3defg4hi5", "provisioning_status": "ready"},
+            {"id": "c_realinternal1x", "external_id": "my-real-catalog", "provisioning_status": "ready"},
+            {"id": "c_anotherreal1xx", "external_id": "another-catalog", "provisioning_status": "provisioning"},
+        ]
+        conn = self._make_conn(rows)
+        results = _run(gc._detect_all_catalogs(conn))
+        assert len(results) == 3
+        external_ids = {r.external_id for r in results}
+        assert "c_2abc3defg4hi5" in external_ids
+        assert "my-real-catalog" in external_ids
+        assert "another-catalog" in external_ids
+
+    def test_query_has_no_external_id_filter(self):
+        """_detect_all_catalogs must NOT pass a regex argument to conn.fetch."""
+        conn = self._make_conn([])
+        _run(gc._detect_all_catalogs(conn))
+        call_args = conn.fetch.call_args
+        # The query must not carry a positional arg (the regex) like _detect_phantoms does
+        positional = call_args[0]  # (sql,) for all-catalogs vs (sql, regex) for phantoms
+        assert len(positional) == 1, (
+            "_detect_all_catalogs must not pass a regex filter to conn.fetch"
+        )
+
+    def test_returns_empty_when_no_catalogs(self):
+        conn = self._make_conn([])
+        results = _run(gc._detect_all_catalogs(conn))
+        assert results == []
+
+    def test_bucket_name_resolved_per_catalog(self):
+        rows = [
+            {"id": "c_realinternal1x", "external_id": "my-catalog", "provisioning_status": "ready"},
+        ]
+        conn = self._make_conn(rows, bucket="my-bucket")
+        results = _run(gc._detect_all_catalogs(conn))
+        assert results[0].bucket_name == "my-bucket"
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +457,36 @@ class TestRunDryRun:
         out = capsys.readouterr().out
         assert "No phantom catalogs found" in out
 
+    def test_dry_run_all_catalogs_makes_no_mutations(self, capsys):
+        """--all dry-run selects all catalogs but never calls conn.execute."""
+        rows = [
+            {"id": "c_realinternal1x", "external_id": "my-real-catalog", "provisioning_status": "ready"},
+            {"id": "c_2abc3defg4hi5", "external_id": "c_2abc3defg4hi5", "provisioning_status": "ready"},
+        ]
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=rows)
+        conn.fetchval = AsyncMock(return_value=None)
+        conn.fetchrow = AsyncMock(return_value=None)
+        conn.execute = AsyncMock()
+        conn.close = AsyncMock()
+
+        with patch("asyncpg.connect", new=AsyncMock(return_value=conn)):
+            rc = asyncio.get_event_loop().run_until_complete(
+                gc._run(
+                    "postgresql://localhost/test",
+                    execute=False,
+                    allow_gcp_skip=False,
+                    ids=None,
+                    all_catalogs=True,
+                )
+            )
+
+        assert rc == 0
+        conn.execute.assert_not_called()
+        out = capsys.readouterr().out
+        assert "DRY RUN" in out
+        assert "my-real-catalog" in out
+
 
 # ---------------------------------------------------------------------------
 # _run — execute mode calls teardown + delete per phantom
@@ -430,7 +527,11 @@ class TestRunExecute:
     def test_execute_refuses_without_allow_gcp_skip_when_no_protocols(self, capsys):
         """The orphan-guard: when GCP protocols are absent and --allow-gcp-skip is
         NOT set, the schema and row must NOT be dropped.  The phantom must be counted
-        as failed so the operator is alerted and can retry in a GCP-aware context."""
+        as failed so the operator is alerted and can retry in a GCP-aware context.
+
+        The lifespan bootstrap is mocked (no-op) to simulate a run where the module
+        stack booted but the GCP module was not installed/registered.
+        """
         phantom_row = {
             "id": "c_2abc3defg4hi5",
             "external_id": "c_2abc3defg4hi5",
@@ -445,14 +546,19 @@ class TestRunExecute:
 
         with patch("asyncpg.connect", new=AsyncMock(return_value=conn)):
             with patch("dynastore.modules.get_protocol", return_value=None):
-                rc = asyncio.get_event_loop().run_until_complete(
-                    gc._run(
-                        "postgresql://localhost/test",
-                        execute=True,
-                        allow_gcp_skip=False,
-                        ids=None,
-                    )
-                )
+                with patch("dynastore.tasks.bootstrap.bootstrap_task_env"):
+                    with patch(
+                        "dynastore.modules.lifespan",
+                        return_value=_noop_lifespan(),
+                    ):
+                        rc = asyncio.get_event_loop().run_until_complete(
+                            gc._run(
+                                "postgresql://localhost/test",
+                                execute=True,
+                                allow_gcp_skip=False,
+                                ids=None,
+                            )
+                        )
 
         # Must report failure — the orphan guard fired
         assert rc == 1
@@ -488,6 +594,39 @@ class TestRunExecute:
         assert rc == 1
         out = capsys.readouterr().out
         assert "failed" in out.lower() or "ERROR" in out
+
+    def test_execute_all_catalogs_drops_schema_and_deletes_row(self, capsys):
+        """--all --execute tears down every catalog, including real external_ids."""
+        rows = [
+            {"id": "c_realinternal1x", "external_id": "my-real-catalog", "provisioning_status": "ready"},
+            {"id": "c_2abc3defg4hi5", "external_id": "c_2abc3defg4hi5", "provisioning_status": "ready"},
+        ]
+        conn = AsyncMock()
+        conn.fetch = AsyncMock(return_value=rows)
+        conn.fetchval = AsyncMock(return_value=None)
+        conn.fetchrow = AsyncMock(return_value=None)
+        conn.execute = AsyncMock()
+        conn.close = AsyncMock()
+
+        with patch("asyncpg.connect", new=AsyncMock(return_value=conn)):
+            with patch("dynastore.modules.get_protocol", return_value=None):
+                rc = asyncio.get_event_loop().run_until_complete(
+                    gc._run(
+                        "postgresql://localhost/test",
+                        execute=True,
+                        allow_gcp_skip=True,
+                        ids=None,
+                        all_catalogs=True,
+                    )
+                )
+
+        assert rc == 0
+        drop_calls = [str(c) for c in conn.execute.call_args_list]
+        # Both catalogs must have been touched
+        assert any("c_realinternal1x" in s for s in drop_calls)
+        assert any("c_2abc3defg4hi5" in s for s in drop_calls)
+        assert any("DROP SCHEMA" in s for s in drop_calls)
+        assert any("DELETE FROM catalog.catalogs" in s for s in drop_calls)
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +728,77 @@ class TestOrphanGuard:
         drop_calls = [str(c) for c in conn.execute.call_args_list]
         assert any("DROP SCHEMA" in s for s in drop_calls)
         assert any("DELETE FROM catalog.catalogs" in s for s in drop_calls)
+
+
+# ---------------------------------------------------------------------------
+# Dev-only guard: _require_dev_env
+# ---------------------------------------------------------------------------
+
+class TestRequireDevEnv:
+    """_require_dev_env refuses prod/empty and allows dev/development/review."""
+
+    def _call(self, monkeypatch, dynastore_env=None, environment=None):
+        if dynastore_env is not None:
+            monkeypatch.setenv("DYNASTORE_ENV", dynastore_env)
+        else:
+            monkeypatch.delenv("DYNASTORE_ENV", raising=False)
+        if environment is not None:
+            monkeypatch.setenv("ENVIRONMENT", environment)
+        else:
+            monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+    def test_refuses_when_env_is_prod(self, monkeypatch):
+        self._call(monkeypatch, dynastore_env="prod")
+        with pytest.raises(SystemExit) as exc:
+            gc._require_dev_env()
+        assert exc.value.code == 2
+
+    def test_refuses_when_env_is_production(self, monkeypatch):
+        self._call(monkeypatch, dynastore_env="production")
+        with pytest.raises(SystemExit) as exc:
+            gc._require_dev_env()
+        assert exc.value.code == 2
+
+    def test_refuses_when_env_is_empty(self, monkeypatch):
+        """Empty label is refused — --all must not run when env is unknown."""
+        self._call(monkeypatch, dynastore_env=None, environment=None)
+        with pytest.raises(SystemExit) as exc:
+            gc._require_dev_env()
+        assert exc.value.code == 2
+
+    def test_refuses_when_env_is_unknown_label(self, monkeypatch):
+        self._call(monkeypatch, dynastore_env="staging")
+        with pytest.raises(SystemExit) as exc:
+            gc._require_dev_env()
+        assert exc.value.code == 2
+
+    def test_allows_dev(self, monkeypatch):
+        self._call(monkeypatch, dynastore_env="dev")
+        gc._require_dev_env()  # must not raise
+
+    def test_allows_development(self, monkeypatch):
+        self._call(monkeypatch, dynastore_env="development")
+        gc._require_dev_env()
+
+    def test_allows_review(self, monkeypatch):
+        self._call(monkeypatch, dynastore_env="review")
+        gc._require_dev_env()
+
+    def test_allows_dev_case_insensitive(self, monkeypatch):
+        self._call(monkeypatch, dynastore_env="DEV")
+        gc._require_dev_env()
+
+    def test_falls_back_to_environment_var(self, monkeypatch):
+        """When DYNASTORE_ENV is absent, ENVIRONMENT is used as fallback."""
+        self._call(monkeypatch, dynastore_env=None, environment="dev")
+        gc._require_dev_env()
+
+    def test_dynastore_env_takes_priority_over_environment(self, monkeypatch):
+        """DYNASTORE_ENV=prod wins even when ENVIRONMENT=dev."""
+        self._call(monkeypatch, dynastore_env="prod", environment="dev")
+        with pytest.raises(SystemExit) as exc:
+            gc._require_dev_env()
+        assert exc.value.code == 2
 
 
 # ---------------------------------------------------------------------------

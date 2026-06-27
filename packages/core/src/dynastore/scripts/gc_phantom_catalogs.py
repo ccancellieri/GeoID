@@ -16,7 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Operator tool to detect and tear down phantom catalogs.
+"""Operator tool to detect and tear down phantom catalogs, or all catalogs.
 
 A phantom catalog is a row in ``catalog.catalogs`` whose ``external_id``
 accidentally received an internal-id-shaped value (``c_<13 base32>``).
@@ -27,6 +27,21 @@ lookup target).
 Each phantom owns real GCP resources: a dedicated Postgres schema, a GCS
 bucket, and a Pub/Sub topic + subscription.  They must be cleaned up at
 the data layer, keyed on the internal ``id`` PK.
+
+``--all`` mode
+--------------
+Pass ``--all`` to select ALL non-deleted catalogs (not just phantoms) and
+tear them all down.  This is intended for DEV database resets.  A hard
+environment guard refuses to run unless ``DYNASTORE_ENV`` (or ``ENVIRONMENT``)
+is explicitly set to one of ``{dev, development, review}``.  Empty, unknown,
+and production labels are always refused — there is no override flag.
+
+Module stack
+------------
+When ``--execute`` is set without ``--allow-gcp-skip`` the script boots the
+full module stack (StorageProtocol + EventingProtocol) so that GCP teardown
+actually runs rather than being silently skipped.  The bootstrap is skipped
+in dry-run mode for speed.
 
 HARD SAFETY RULES
 -----------------
@@ -49,6 +64,10 @@ Usage::
         [--ids id1 id2 ...] \\
         [--ids-file /path/to/ids.txt] \\
         [--execute]
+
+    # Tear down ALL catalogs (DEV only):
+    DATABASE_URL=postgresql://... DYNASTORE_ENV=dev \\
+        python -m dynastore.scripts.gc_phantom_catalogs --all --execute
 """
 from __future__ import annotations
 
@@ -92,7 +111,7 @@ def is_phantom_external_id(external_id: str) -> bool:
 
 @dataclass
 class PhantomCatalog:
-    """Metadata for one detected phantom row."""
+    """Metadata for one detected phantom (or targeted) catalog row."""
 
     internal_id: str          # PK of catalog.catalogs (= PG schema name)
     external_id: str          # the internal-shaped value used as external_id
@@ -151,6 +170,34 @@ async def _detect_phantoms(conn) -> List[PhantomCatalog]:
         ORDER BY id;
         """,
         r"^c_[2-9a-x]{13}$",
+    )
+
+    results: List[PhantomCatalog] = []
+    for row in rows:
+        internal_id = row["id"]
+        bucket_name = await _resolve_bucket_name(conn, internal_id)
+        results.append(PhantomCatalog(
+            internal_id=internal_id,
+            external_id=row["external_id"],
+            provisioning_status=row["provisioning_status"],
+            bucket_name=bucket_name,
+        ))
+    return results
+
+
+async def _detect_all_catalogs(conn) -> List[PhantomCatalog]:
+    """Select ALL non-deleted catalogs for bulk teardown (``--all`` mode).
+
+    Returns the same ``PhantomCatalog`` dataclass as ``_detect_phantoms`` so
+    the teardown loop is identical for both modes.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT id, external_id, provisioning_status
+        FROM catalog.catalogs
+        WHERE deleted_at IS NULL
+        ORDER BY id;
+        """,
     )
 
     results: List[PhantomCatalog] = []
@@ -385,6 +432,42 @@ async def _teardown_phantom(
 
 
 # ---------------------------------------------------------------------------
+# DEV-only guard for --all
+# ---------------------------------------------------------------------------
+
+# Environment labels that identify a non-production (dev/review) tier.
+# Mirrors the idiom in db_reset._refuse_in_production but inverts the logic:
+# --all requires an explicit dev label rather than merely blocking prod.
+_DEV_ENV_NAMES = frozenset({"dev", "development", "review"})
+
+
+def _require_dev_env() -> None:
+    """Refuse to run when the environment is not an explicit dev/review tier.
+
+    ``--all`` deletes every non-deleted catalog and its GCP resources.  This
+    guard requires ``DYNASTORE_ENV`` or ``ENVIRONMENT`` (checked in that order,
+    case-insensitive) to be one of ``{dev, development, review}``.
+
+    An empty, unknown, or production label is always refused.  There is no
+    override env var — ``--all`` must not run outside a dev environment.
+    """
+    env_label = (
+        os.environ.get("DYNASTORE_ENV")
+        or os.environ.get("ENVIRONMENT")
+        or ""
+    ).strip().lower()
+    if env_label not in _DEV_ENV_NAMES:
+        print(
+            f"REFUSED: --all requires DYNASTORE_ENV or ENVIRONMENT to be one of "
+            f"{sorted(_DEV_ENV_NAMES)}, got {env_label!r}. "
+            "This guard has no override — --all must not run in non-dev environments.",
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(2)
+
+
+# ---------------------------------------------------------------------------
 # Main orchestration
 # ---------------------------------------------------------------------------
 
@@ -407,31 +490,62 @@ async def _run(
     execute: bool,
     allow_gcp_skip: bool,
     ids: Optional[List[str]],
+    all_catalogs: bool = False,
 ) -> int:
     import asyncpg
 
     kwargs = _parse_url(url)
+
+    # Boot the full module stack when executing with real GCP teardown so that
+    # StorageProtocol / EventingProtocol are live inside teardown_phantom_gcp_resources.
+    # Dry-run skips the boot for speed; --allow-gcp-skip implies GCP resources
+    # were already cleaned manually so the protocols are not needed.
+    # The boot is deferred until after target detection so that short-circuits
+    # (empty id list, no matching rows) avoid an unnecessary stack startup.
+    need_lifespan = execute and not allow_gcp_skip
+
+    async def _execute_teardown_loop(conn, targets, mode_label) -> int:
+        """Run the actual GCP + schema + row teardown for a non-empty target list."""
+        _log(f"\nExecuting teardown for {len(targets)} {mode_label}(s) …")
+        ok = 0
+        failed = 0
+        for p in targets:
+            try:
+                await _teardown_phantom(conn, p, allow_gcp_skip=allow_gcp_skip)
+                ok += 1
+            except Exception as exc:
+                _log(f"  ERROR tearing down {p.internal_id!r}: {exc}")
+                logger.exception("Teardown failed for %s", p.internal_id)
+                failed += 1
+        _log(f"\nSummary: {ok} torn down, {failed} failed out of {len(targets)} total.")
+        return 0 if failed == 0 else 1
+
     conn: asyncpg.Connection = await asyncpg.connect(**kwargs)
     try:
-        if ids:
-            phantoms = await _fetch_phantoms_by_ids(conn, ids)
+        if all_catalogs:
+            targets = await _detect_all_catalogs(conn)
+            mode_label = "catalog"
+        elif ids:
+            targets = await _fetch_phantoms_by_ids(conn, ids)
+            mode_label = "phantom catalog"
         else:
-            phantoms = await _detect_phantoms(conn)
+            targets = await _detect_phantoms(conn)
+            mode_label = "phantom catalog"
 
-        if not phantoms:
-            _log("No phantom catalogs found.")
+        if not targets:
+            _log(f"No {mode_label}s found.")
             return 0
 
-        _log(f"\nPhantom catalogs detected ({len(phantoms)}):")
-        for p in phantoms:
+        _log(f"\n{mode_label.capitalize()}s detected ({len(targets)}):")
+        for p in targets:
             _print_phantom(p)
 
         if not execute:
             _log(
-                "\nDRY RUN — no changes applied.  "
-                "Actions that WOULD be taken per phantom:"
+                f"\nDRY RUN — no changes applied.  "
+                f"Actions that WOULD be taken per {mode_label}:"
             )
-            for p in phantoms:
+            for p in targets:
                 _log(f"\n  [{p.internal_id}]")
                 _log(f"    teardown_catalog_eventing('{p.internal_id}')")
                 if p.bucket_name:
@@ -449,21 +563,21 @@ async def _run(
             _log("\nPass --execute to perform the teardown.")
             return 0
 
-        # --- Execute mode ---
-        _log(f"\nExecuting teardown for {len(phantoms)} phantom(s) …")
-        ok = 0
-        failed = 0
-        for p in phantoms:
-            try:
-                await _teardown_phantom(conn, p, allow_gcp_skip=allow_gcp_skip)
-                ok += 1
-            except Exception as exc:
-                _log(f"  ERROR tearing down {p.internal_id!r}: {exc}")
-                logger.exception("Teardown failed for %s", p.internal_id)
-                failed += 1
+        # --- Execute mode: boot the module stack if GCP teardown is needed ---
+        if need_lifespan:
+            from types import SimpleNamespace
+            from dynastore.tasks.bootstrap import bootstrap_task_env
+            from dynastore.modules import lifespan as modules_lifespan
 
-        _log(f"\nSummary: {ok} torn down, {failed} failed out of {len(phantoms)} total.")
-        return 0 if failed == 0 else 1
+            app_state = SimpleNamespace()
+            # Prevent background dispatcher loops from starting in this one-shot
+            # operator context (mirrors main_task.py's ephemeral_job pattern).
+            app_state.ephemeral_job = True
+            bootstrap_task_env(app_state)
+            async with modules_lifespan(app_state):
+                return await _execute_teardown_loop(conn, targets, mode_label)
+        else:
+            return await _execute_teardown_loop(conn, targets, mode_label)
 
     finally:
         await conn.close()
@@ -508,6 +622,19 @@ def main() -> None:
     )
     id_group = parser.add_mutually_exclusive_group()
     id_group.add_argument(
+        "--all",
+        action="store_true",
+        default=False,
+        dest="all_catalogs",
+        help=(
+            "Select ALL non-deleted catalogs (not just phantoms) and tear them all "
+            "down. Intended for DEV database resets. "
+            "REQUIRES DYNASTORE_ENV or ENVIRONMENT to be one of "
+            "{dev, development, review} — refused otherwise with no override. "
+            "Mutually exclusive with --ids and --ids-file."
+        ),
+    )
+    id_group.add_argument(
         "--ids",
         nargs="+",
         metavar="INTERNAL_ID",
@@ -527,6 +654,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Hard dev-only guard: must be checked before any DB work.
+    if args.all_catalogs:
+        _require_dev_env()
+
     ids: Optional[List[str]] = None
     if args.ids:
         ids = args.ids
@@ -538,7 +669,15 @@ def main() -> None:
         print("ERROR: DATABASE_URL is not set", file=sys.stderr, flush=True)
         sys.exit(1)
 
-    rc = asyncio.run(_run(url, execute=args.execute, allow_gcp_skip=args.allow_gcp_skip, ids=ids))
+    rc = asyncio.run(
+        _run(
+            url,
+            execute=args.execute,
+            allow_gcp_skip=args.allow_gcp_skip,
+            ids=ids,
+            all_catalogs=args.all_catalogs,
+        )
+    )
     sys.exit(rc)
 
 
