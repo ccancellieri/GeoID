@@ -36,6 +36,7 @@ Related issues:
 - #2438 — Connection health management architecture
 - #2437 — AUTOCOMMIT + managed_transaction fix
 - #2343 — DB pool starvation (idle_in_txn)
+- #2509 — Pool-pressure-aware semaphore for connection-retry concurrency
 """
 
 from __future__ import annotations
@@ -123,6 +124,13 @@ _provisioning_config: ProvisioningRetryConfig = ProvisioningRetryConfig()
 _leadership_config: LeadershipConfig = LeadershipConfig()
 _health_config: _ConnectionHealthInfraConfig = _ConnectionHealthInfraConfig()
 
+# Cap on concurrent connection-acquisition retries (issue #2509).
+# Mirrors the default of ConnectionHealthConfig.max_concurrent_connection_retries
+# so tests can override this module global without requiring a live platform
+# config service. The process-wide retry semaphore is built lazily from this
+# value at first retry; a process restart is required to apply a changed limit.
+_max_concurrent_connection_retries: int = 3
+
 
 def resolve_connection_retry_config() -> Tuple[int, float, float, float]:
     """Return the current ``(max_retries, base_delay, max_delay, jitter)``."""
@@ -158,6 +166,19 @@ def resolve_slow_pool_acquire_threshold() -> float:
     return _health_config.slow_pool_acquire_threshold_seconds
 
 
+def resolve_max_concurrent_connection_retries() -> int:
+    """Return the current cap on simultaneous connection-acquisition retries.
+
+    Used by ``query_executor`` to size the process-wide retry semaphore that
+    prevents a pool-wedge from being amplified by concurrent retry storms.
+    Reads from the module global ``_max_concurrent_connection_retries`` (default
+    mirrors ``ConnectionHealthConfig.max_concurrent_connection_retries``).
+    Tests may replace the global directly; the semaphore is built lazily on
+    first retry so overrides applied before the first retry take effect.
+    """
+    return _max_concurrent_connection_retries
+
+
 # ---------------------------------------------------------------------------
 # Hot-reloadable leader-liveness probe configuration.
 #
@@ -181,11 +202,11 @@ from dynastore.models.plugin_config import PluginConfig  # noqa: E402
 
 
 class ConnectionHealthConfig(PluginConfig):
-    """Hot-reloadable configuration for the leader-liveness probe.
+    """Hot-reloadable configuration for connection health management.
 
     Stored in the platform configs table and read on each LEADER_ONLY tick via
     ``PlatformConfigService.get_config(ConnectionHealthConfig)``.  All fields
-    are ``Mutable`` so operators can adjust the probe without restarting pods.
+    are ``Mutable`` so operators can adjust them without restarting pods.
 
     Address: ``("platform", "db", "health")``.
     """
@@ -215,5 +236,23 @@ class ConnectionHealthConfig(PluginConfig):
             "timeout fires (often 75 s or more); bounding the probe here ensures "
             "a failed wire is detected within this window rather than stalling "
             "the tick. Must be in [0.5, 30.0] seconds."
+        ),
+    )
+
+    max_concurrent_connection_retries: Mutable[int] = Field(
+        default=3,
+        ge=1,
+        le=32,
+        description=(
+            "Maximum number of concurrent connection-acquisition retries allowed "
+            "at any instant (issue #2509). When the async PG pool wedges, many "
+            "callers enter the retry loop simultaneously and hammer the pool, "
+            "amplifying the pressure. This semaphore bounds the number of in-flight "
+            "retry attempts so excess callers queue gracefully instead of stampeding. "
+            "The first (non-retry) attempt is never gated, preserving happy-path "
+            "latency. Conservative default of 3; raise only if you have a large "
+            "pool and high parallelism. NOTE: the process-wide semaphore is sized "
+            "from the module-global snapshot at first use; a process restart is "
+            "required to apply a changed value (read-once). Must be in [1, 32]."
         ),
     )

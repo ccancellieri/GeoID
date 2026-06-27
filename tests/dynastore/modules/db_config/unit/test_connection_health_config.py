@@ -26,6 +26,8 @@ directly (matching the integration test pattern in
 
 from __future__ import annotations
 
+import pytest
+
 from dynastore.modules.db_config.connection_health_config import (
     ConnectionRetryConfig,
     ProvisioningRetryConfig,
@@ -36,6 +38,7 @@ from dynastore.modules.db_config.connection_health_config import (
     resolve_provisioning_retry_config,
     resolve_leadership_config,
     resolve_slow_pool_acquire_threshold,
+    resolve_max_concurrent_connection_retries,
 )
 
 
@@ -71,6 +74,21 @@ class TestConfigClasses:
         assert config.leader_liveness_probe_enabled is True
         assert config.leader_liveness_probe_timeout_seconds == 2.0
 
+    def test_max_concurrent_connection_retries_default(self):
+        config = ConnectionHealthConfig()
+        assert config.max_concurrent_connection_retries == 3
+
+    def test_max_concurrent_connection_retries_bounds(self):
+        """ge=1 and le=32 are enforced by Pydantic."""
+        with pytest.raises(Exception):
+            ConnectionHealthConfig(max_concurrent_connection_retries=0)
+        with pytest.raises(Exception):
+            ConnectionHealthConfig(max_concurrent_connection_retries=33)
+
+    def test_max_concurrent_connection_retries_valid_range(self):
+        assert ConnectionHealthConfig(max_concurrent_connection_retries=1).max_concurrent_connection_retries == 1
+        assert ConnectionHealthConfig(max_concurrent_connection_retries=32).max_concurrent_connection_retries == 32
+
 
 class TestResolveReadsSnapshot:
     """``resolve_*`` returns the validated class defaults out of the box."""
@@ -89,3 +107,15 @@ class TestResolveReadsSnapshot:
 
     def test_connection_health_config_address(self):
         assert ConnectionHealthConfig._address == ("platform", "db", "health")
+
+    def test_max_concurrent_connection_retries_default(self):
+        assert resolve_max_concurrent_connection_retries() == 3
+
+    def test_max_concurrent_connection_retries_reads_module_global(self):
+        import dynastore.modules.db_config.connection_health_config as chc
+        original = chc._max_concurrent_connection_retries
+        try:
+            chc._max_concurrent_connection_retries = 7
+            assert resolve_max_concurrent_connection_retries() == 7
+        finally:
+            chc._max_concurrent_connection_retries = original

@@ -32,6 +32,7 @@ from contextlib import asynccontextmanager, contextmanager
 
 from dynastore.modules.db_config.connection_health_config import (
     resolve_connection_retry_config,
+    resolve_max_concurrent_connection_retries,
     resolve_provisioning_retry_config,
     resolve_slow_pool_acquire_threshold,
 )
@@ -1304,6 +1305,48 @@ _TRANSIENT_CONNECT_EXCEPTIONS: tuple = (
 )
 
 
+# --- Pool-pressure semaphore (issue #2509) ------------------------------------
+#
+# Bounds the number of *concurrent* connection-acquisition retries so a pool
+# wedge cannot be amplified by a thundering herd of simultaneous retriers.
+#
+# Design:
+# - The semaphore is created lazily on the first retry attempt so asyncio's
+#   event loop is guaranteed to exist at construction time.
+# - It is sized from ``resolve_max_concurrent_connection_retries()`` (which
+#   reads the ``_max_concurrent_connection_retries`` module global, defaulting
+#   to ``ConnectionHealthConfig.max_concurrent_connection_retries = 3``).
+# - The semaphore is process-wide and **read-once**: the limit cannot be changed
+#   at runtime without a process restart.  Operators who change the value in the
+#   platform configs table must restart pods to apply it.
+# - Only retries (attempt >= 1) are gated; the first attempt is never gated so
+#   the happy path retains zero overhead.
+# - Deadlock safety: the semaphore is acquired only when the previous connection
+#   attempt has already failed (i.e., no pool connection is held by the caller).
+#   Therefore a coroutine can never hold a DB connection and simultaneously block
+#   on the retry semaphore — the two resources are mutually exclusive in time.
+# - Tests may replace ``_retry_semaphore`` with ``None`` (or a fresh Semaphore)
+#   to reset state between runs; the module-global ``_max_concurrent_connection_retries``
+#   may also be overridden directly (same pattern as other infra globals in
+#   ``connection_health_config``).
+_retry_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def _get_retry_semaphore() -> asyncio.Semaphore:
+    """Return the process-wide connection-retry concurrency semaphore.
+
+    Built lazily on first call so asyncio's event loop is available.
+    The limit is read from :func:`resolve_max_concurrent_connection_retries`
+    once at construction; subsequent config changes take effect only after a
+    process restart (read-once semantics).
+    """
+    global _retry_semaphore
+    if _retry_semaphore is None:
+        limit = resolve_max_concurrent_connection_retries()
+        _retry_semaphore = asyncio.Semaphore(limit)
+    return _retry_semaphore
+
+
 def _err_repr(exc: BaseException) -> str:
     """One-line representation of an exception for structured log lines."""
     return f"{type(exc).__name__}: {exc}"
@@ -1422,8 +1465,45 @@ def retry_on_transient_connect(
                     delay *= random.uniform(1.0 - _jitter, 1.0 + _jitter)
                 return delay
 
+            # Pool-pressure gate (issue #2509): bound the number of concurrent
+            # connection-acquisition retries so a pool wedge is not amplified by
+            # simultaneous retriers hammering the pool.
+            #
+            # The call counter lets the thunk distinguish the first attempt
+            # (ungated, preserving happy-path latency) from all retries (gated
+            # through the process-wide semaphore).  The semaphore is released
+            # after each attempt — including failed ones — so the slot becomes
+            # available to the next waiting coroutine while this one sleeps
+            # through its backoff delay.
+            #
+            # Deadlock safety: the semaphore is acquired only after a connection
+            # attempt has already failed (no pool connection is held at that
+            # point). A coroutine cannot simultaneously hold a DB connection and
+            # block on this semaphore, so no deadlock cycle is possible.
+            _call_n: list[int] = [0]
+
+            async def _gated_call() -> Any:
+                n = _call_n[0]
+                _call_n[0] += 1
+                if n == 0:
+                    # First attempt: ungated.  Happy path is zero-overhead.
+                    return await func(*args, **kwargs)
+                # Retry attempt: acquire the pool-pressure gate before touching
+                # the pool again.  Check for saturation *before* awaiting so
+                # the log line appears at queue time, not after the wait.
+                sem = _get_retry_semaphore()
+                if sem._value == 0:  # all permits taken — callers will queue
+                    logger.info(
+                        "retry_on_transient_connect_semaphore_saturated "
+                        "service=%s retry_n=%d",
+                        _SERVICE_NAME_FOR_METRICS,
+                        n,
+                    )
+                async with sem:
+                    return await func(*args, **kwargs)
+
             return await _run_with_retry_policy(
-                lambda: func(*args, **kwargs),
+                _gated_call,
                 classify=lambda e: isinstance(e, _TRANSIENT_CONNECT_EXCEPTIONS),
                 kind="db_connect",
                 max_attempts=_max_retries,
