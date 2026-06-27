@@ -1201,6 +1201,14 @@ async def create_item_from_feature(
         extra_fields=getattr(feature, "extra_fields", {}),
     )
 
+    # Restore the source stac_version when one was captured at ingest.  pystac
+    # always writes its own local version in to_dict(); applying the stored value
+    # to extra_fields overrides it because pystac merges extra_fields into the
+    # serialized dict after the version constant.
+    _stored_sv = getattr(feature, "stac_version", None)
+    if _stored_sv and isinstance(_stored_sv, str):
+        item.extra_fields["stac_version"] = _stored_sv
+
     # The StacContributor registry declares the language extension (URI +
     # language/languages) for the item, reusing inject_stac_language_fields.
     # No-ops when no languages are available (mirrors the prior guard).

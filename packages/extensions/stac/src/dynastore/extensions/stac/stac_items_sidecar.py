@@ -380,6 +380,28 @@ class StacItemsSidecar(SidecarProtocol):
             "extra_fields": pruned["extra_fields"],
         }
 
+        # Preserve source bbox in extra_fields when geometry derivation loses information:
+        # 1. 3D bbox (6 elements) — the geometry sidecar always derives a 2D (4-element)
+        #    bbox from the processed geometry; Z coordinates are permanently lost.
+        # 2. 4-element bbox on a Point geometry — the derived bbox collapses to a
+        #    degenerate single-point extent, losing the true spatial coverage declared
+        #    by the source (e.g. centroid-as-geometry STAC items).
+        # Re-derived 2D bboxes from real polygon/line geometries are correct and are
+        # intentionally NOT overridden here.
+        source_bbox = data.get("bbox")
+        if source_bbox is not None:
+            _preserve = False
+            if len(source_bbox) == 6:
+                _preserve = True
+            elif len(source_bbox) == 4:
+                _geom = data.get("geometry") or {}
+                if isinstance(_geom, dict) and _geom.get("type") == "Point":
+                    _preserve = True
+            if _preserve:
+                _ef: Dict[str, Any] = payload.get("extra_fields") or {}
+                _ef["bbox"] = list(source_bbox)
+                payload["extra_fields"] = _ef
+
         if context.get("partition_key_name"):
             payload[context["partition_key_name"]] = context["partition_key_value"]
 

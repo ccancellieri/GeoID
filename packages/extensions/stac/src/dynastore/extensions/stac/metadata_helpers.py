@@ -123,6 +123,12 @@ def prune_managed_content_sync(
                 normalize_i18n_field(value) if isinstance(value, (str, dict)) else value
             )
 
+    # Capture source stac_version for provenance round-trip.  The read path always
+    # emits the local pystac version unless the original is stored here.
+    source_stac_version = item_dict.get("stac_version")
+    if source_stac_version is not None:
+        extra_fields["stac_version"] = source_stac_version
+
     # 2. From properties (if not already found)
     properties = item_dict.get("properties", {})
     for key, value in properties.items():
