@@ -29,6 +29,13 @@ correct realm role.
 After PR-5 the seed lives in the standalone ``_seed_oidc_role_sync_config``
 function in ``dynastore.modules.iam.module`` (previously it was a method on
 ``PolicyService``).
+
+geoid#2227: the seed must be a true one-time cold-boot operation.  Runtime
+changes made via the configs API (e.g. patching ``role_mapping`` to an
+environment-specific Keycloak role name) must survive subsequent redeploys.
+The skip-if-exists guard in ``_seed_oidc_role_sync_config`` provides this —
+see ``test_seed_idempotent_patched_role_mapping_survives`` for the full
+lifecycle regression.
 """
 
 from __future__ import annotations
@@ -268,3 +275,59 @@ async def test_seed_swallows_persistent_storage_error(caplog):
         "platform configs storage" in rec.getMessage().lower()
         for rec in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_seed_idempotent_patched_role_mapping_survives():
+    """geoid#2227: full idempotency lifecycle — first cold-boot seeds the
+    hardcoded default; a subsequent call (simulating a redeploy after an
+    operator API patch) must NOT overwrite the operator-patched row.
+
+    Specifically validates the environment-specific ``role_mapping`` scenario:
+    an operator sets a realm-specific OIDC role name (e.g. one matching a
+    non-default Keycloak realm) via the configs API and expects that value
+    to survive all future redeploys without requiring manual re-patching.
+
+    The ``issuer_whitelist`` patch is also preserved — operators configure
+    the trusted issuer URL once and it is never clobbered by the seed.
+    """
+    # --- First cold-boot: empty DB, seed creates the default row. ---
+    configs_first = AsyncMock()
+    configs_first.list_configs = AsyncMock(return_value={})
+    configs_first.set_config = AsyncMock(return_value=None)
+
+    with patch(
+        "dynastore.modules.iam.module.get_protocol",
+        return_value=configs_first,
+    ):
+        await _seed()
+
+    configs_first.set_config.assert_awaited_once()
+    _, seeded = configs_first.set_config.await_args.args
+    assert isinstance(seeded, OidcRoleSyncConfig)
+    assert seeded.reconcile_enabled is True
+    # Default mapping is hardcoded — backward-compat guarantee.
+    assert seeded.role_mapping == {"geoid.sysadmin": "sysadmin"}
+
+    # --- Operator patches: env-specific role name + trusted issuer. ---
+    operator_patch = OidcRoleSyncConfig(
+        reconcile_enabled=True,
+        role_mapping={"geoid-dev.sysadmin": "sysadmin"},
+        issuer_whitelist=["https://keycloak.example.com/realms/geoid-dev"],
+    )
+
+    # --- Redeploy: DB already has the operator-patched row. ---
+    configs_redeploy = AsyncMock()
+    configs_redeploy.list_configs = AsyncMock(
+        return_value={OidcRoleSyncConfig: operator_patch}
+    )
+    configs_redeploy.set_config = AsyncMock(return_value=None)
+
+    with patch(
+        "dynastore.modules.iam.module.get_protocol",
+        return_value=configs_redeploy,
+    ):
+        await _seed()
+
+    # Seed must not overwrite; operator values must remain intact.
+    configs_redeploy.set_config.assert_not_awaited()
