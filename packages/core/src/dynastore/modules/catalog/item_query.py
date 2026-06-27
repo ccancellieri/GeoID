@@ -1185,6 +1185,12 @@ class ItemQueryMixin:
             # ``_id``s the upsert path indexed under, so index-delete
             # propagation must key on them (not the external/path id).
             deleted_geoids: List[str] = []
+            # #2249: external id used to key the ITEM_DELETION event so the
+            # item->asset forward cascade (which matches asset_references by
+            # ref_id = external id, stamped at harvest) fires regardless of the
+            # delete path. On the sidecar path ``item_id`` is already the
+            # external id; on the geoid fallback below it is resolved explicitly.
+            resolved_external_id: Optional[str] = None
             if col_config and driver_sidecars(col_config):
                 from dynastore.modules.storage.drivers.pg_sidecars.registry import SidecarRegistry
 
@@ -1231,6 +1237,15 @@ class ItemQueryMixin:
 
                 from dynastore.modules.catalog.item_service import soft_delete_item_query
 
+                # #2249: resolve the external id while the row is still active so
+                # the ITEM_DELETION event below is keyed consistently with the
+                # sidecar path (the forward cascade matches on the external id).
+                # Returns None when the collection has no external-id sidecar
+                # mapping, in which case we keep the geoid (existing behaviour).
+                resolved_external_id = await self.resolve_external_id_by_geoid(
+                    catalog_id, collection_id, str(item_id), ctx,
+                )
+
                 rows = await soft_delete_item_query.execute(
                     conn,
                     catalog_id=phys_schema,
@@ -1265,7 +1280,7 @@ class ItemQueryMixin:
                             event_type=CatalogEventType.ITEM_DELETION,
                             catalog_id=catalog_id,
                             collection_id=collection_id,
-                            item_id=item_id,
+                            item_id=resolved_external_id or item_id,
                             payload={"original_id": item_id}
                         )
                 except Exception as e:
