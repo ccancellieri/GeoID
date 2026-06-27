@@ -682,6 +682,19 @@ class ConfigService(ConfigsProtocol):
         validate_sql_identifier(catalog_id)
         class_key = cls.class_key()
 
+        # #2435: a config with no explicitly-set fields serialises to {} under
+        # exclude_unset=True.  {} is falsy at read time — the waterfall skips it —
+        # so the row provides no value.  Return early to avoid an unnecessary write
+        # transaction and spurious config-cache / router-cache invalidation.
+        _serialized = _serialize_config_for_db(config)
+        if _serialized == "{}":
+            logger.debug(
+                "%s: skipping empty config write at catalog scope (%s); "
+                "waterfall defaults apply without a stored row",
+                class_key, catalog_id,
+            )
+            return
+
         async with managed_transaction(db_resource or self.engine) as conn:
             phys_schema = await self._resolve_or_create_phys_schema(
                 catalog_id, conn, reensure_on_missing=True
@@ -703,7 +716,7 @@ class ConfigService(ConfigsProtocol):
                 ref_key=class_key,
                 class_key=class_key,
                 schema_id=type(config).schema_id(),
-                config_data=_serialize_config_for_db(config),
+                config_data=_serialized,
             )
 
             # Phase 3 — apply (post-persist, best-effort).
@@ -726,6 +739,19 @@ class ConfigService(ConfigsProtocol):
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
         class_key = cls.class_key()
+
+        # #2435: a config with no explicitly-set fields serialises to {} under
+        # exclude_unset=True.  {} is falsy at read time — the waterfall skips it —
+        # so the row provides no value.  Return early to avoid an unnecessary write
+        # transaction and spurious config-cache / router-cache invalidation.
+        _serialized = _serialize_config_for_db(config)
+        if _serialized == "{}":
+            logger.debug(
+                "%s: skipping empty config write at collection scope (%s/%s); "
+                "waterfall defaults apply without a stored row",
+                class_key, catalog_id, collection_id,
+            )
+            return
 
         # Issue #2430: Resolve collection_id to immutable internal ID for persistence.
         # This ensures configs are keyed on the stable internal ID, not the mutable
@@ -773,7 +799,7 @@ class ConfigService(ConfigsProtocol):
                 ref_key=class_key,
                 class_key=class_key,
                 schema_id=type(config).schema_id(),
-                config_data=_serialize_config_for_db(config),
+                config_data=_serialized,
             )
 
             # Phase 3 — apply (post-persist, best-effort).
@@ -1109,6 +1135,16 @@ class ConfigService(ConfigsProtocol):
         validate_sql_identifier(catalog_id)
         class_key = cls.class_key()
 
+        # #2435: skip write when no fields were explicitly set (see _set_catalog_config).
+        _serialized = _serialize_config_for_db(config)
+        if _serialized == "{}":
+            logger.debug(
+                "%s: skipping empty config write (by-ref=%r) at catalog scope (%s); "
+                "waterfall defaults apply without a stored row",
+                class_key, ref_key, catalog_id,
+            )
+            return
+
         async with managed_transaction(db_resource or self.engine) as conn:
             phys_schema = await self._resolve_or_create_phys_schema(
                 catalog_id, conn, reensure_on_missing=False
@@ -1141,7 +1177,7 @@ class ConfigService(ConfigsProtocol):
                 ref_key=ref_key,
                 class_key=class_key,
                 schema_id=type(config).schema_id(),
-                config_data=_serialize_config_for_db(config),
+                config_data=_serialized,
             )
 
             # Phase 3 — apply (post-persist, best-effort).
@@ -1165,6 +1201,16 @@ class ConfigService(ConfigsProtocol):
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
         class_key = cls.class_key()
+
+        # #2435: skip write when no fields were explicitly set (see _set_collection_config).
+        _serialized = _serialize_config_for_db(config)
+        if _serialized == "{}":
+            logger.debug(
+                "%s: skipping empty config write (by-ref=%r) at collection scope (%s/%s); "
+                "waterfall defaults apply without a stored row",
+                class_key, ref_key, catalog_id, collection_id,
+            )
+            return
 
         # Issue #2430: Resolve collection_id to immutable internal ID for persistence.
         catalogs = self._get_catalog_manager()
@@ -1209,7 +1255,7 @@ class ConfigService(ConfigsProtocol):
                 ref_key=ref_key,
                 class_key=class_key,
                 schema_id=type(config).schema_id(),
-                config_data=_serialize_config_for_db(config),
+                config_data=_serialized,
             )
 
             # Phase 3 — apply (post-persist, best-effort).
