@@ -385,3 +385,95 @@ def test_apply_omits_hints_when_defer_provisioning_false():
 
     assert ("create_catalog", "normal_catalog") in catalogs.calls
     assert Hint.DEFER not in catalogs._last_create_hints
+
+
+# ---------------------------------------------------------------------------
+# Virtual assets — create_asset on apply, delete_asset on revoke
+# ---------------------------------------------------------------------------
+
+
+class _FakeAssets:
+    """Minimal stand-in for the AssetsProtocol asset-manager surface."""
+
+    def __init__(self):
+        self.created: list = []   # (catalog_id, payload, collection_id)
+        self.deleted: list = []   # (asset_id, catalog_id, collection_id)
+
+    async def create_asset(self, catalog_id, payload, collection_id=None, ctx=None):
+        self.created.append((catalog_id, payload, collection_id))
+
+    async def delete_asset(self, asset_id, catalog_id, collection_id=None):
+        self.deleted.append((asset_id, catalog_id, collection_id))
+
+
+class _FakeCatalogsWithAssets(_FakeCatalogs):
+    """_FakeCatalogs extended with a real ``.assets`` attribute."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.assets = _FakeAssets()
+
+
+def test_apply_virtual_asset_calls_create_asset():
+    """apply of a seed with virtual_assets calls create_asset once with the
+    correct VirtualAssetCreate payload and catalog/collection scope."""
+    from dynastore.modules.catalog.asset_service import VirtualAssetCreate
+
+    catalogs = _FakeCatalogsWithAssets()
+    seed = DataSeed(
+        catalog_id="va_catalog",
+        collection_id="va_collection",
+        virtual_assets=({"asset_id": "a1", "href": "gs://orig/obj.tif"},),
+    )
+    preset = _preset([seed])
+    descriptor = asyncio.run(preset.apply(NoParams(), "platform", _ctx(catalogs)))
+
+    assert len(catalogs.assets.created) == 1
+    cat_id, payload, coll_id = catalogs.assets.created[0]
+    assert cat_id == "va_catalog"
+    assert coll_id == "va_collection"
+    assert isinstance(payload, VirtualAssetCreate)
+    assert payload.asset_id == "a1"
+    assert payload.href == "gs://orig/obj.tif"
+
+    # asset_ids recorded in the descriptor
+    rec = descriptor.payload["data"][0]
+    assert rec["asset_ids"] == ["a1"]
+
+
+def test_revoke_virtual_asset_calls_delete_asset():
+    """revoke of an applied record with asset_ids calls delete_asset for each."""
+    catalogs = _FakeCatalogsWithAssets()
+    seed = DataSeed(
+        catalog_id="va_catalog",
+        collection_id="va_collection",
+        virtual_assets=({"asset_id": "a1", "href": "gs://orig/obj.tif"},),
+    )
+    preset = _preset([seed])
+    descriptor = asyncio.run(preset.apply(NoParams(), "platform", _ctx(catalogs)))
+    # clear apply calls so revoke calls are isolated
+    catalogs.assets.created.clear()
+    catalogs.calls.clear()
+
+    asyncio.run(preset.revoke(descriptor, _ctx(catalogs)))
+
+    assert len(catalogs.assets.deleted) == 1
+    asset_id, cat_id, coll_id = catalogs.assets.deleted[0]
+    assert asset_id == "a1"
+    assert cat_id == "va_catalog"
+    assert coll_id == "va_collection"
+
+
+def test_apply_virtual_assets_requires_assets_manager():
+    """apply of a seed with virtual_assets raises RuntimeError when the
+    catalogs service has no .assets attribute."""
+    seed = DataSeed(
+        catalog_id="va_catalog",
+        collection_id="va_collection",
+        virtual_assets=({"asset_id": "a1", "href": "gs://orig/obj.tif"},),
+    )
+    # _FakeCatalogs has no .assets attribute
+    catalogs = _FakeCatalogs()
+    preset = _preset([seed])
+    with pytest.raises(RuntimeError, match="asset manager"):
+        asyncio.run(preset.apply(NoParams(), "platform", _ctx(catalogs)))

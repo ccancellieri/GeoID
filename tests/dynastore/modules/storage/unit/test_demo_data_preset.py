@@ -34,6 +34,7 @@ from typing import List
 
 from dynastore.modules.storage.presets.demo_data import (
     DEMO_DATA_PRESET,
+    _DEMO_VIRTUAL_ASSET_HREF,
     _DemoDataContributor,
 )
 from dynastore.modules.storage.presets.preset import DataSeed
@@ -172,3 +173,25 @@ def test_demo_data_preset_registry_tier_is_platform() -> None:
 
     preset = find_preset("demo_data")
     assert preset.tier == PresetTier.PLATFORM
+
+
+# ---------------------------------------------------------------------------
+# Virtual assets
+# ---------------------------------------------------------------------------
+
+def test_contributor_seed_has_one_virtual_asset() -> None:
+    """The demo seed declares exactly one virtual asset."""
+    seed = list(_DemoDataContributor().get_data())[0]
+    assert len(seed.virtual_assets) == 1
+
+
+def test_contributor_seed_virtual_asset_href() -> None:
+    """The single virtual asset points at the expected public Landsat object."""
+    seed = list(_DemoDataContributor().get_data())[0]
+    assert seed.virtual_assets[0]["href"] == _DEMO_VIRTUAL_ASSET_HREF
+
+
+def test_contributor_seed_virtual_asset_id() -> None:
+    """The single virtual asset uses the expected asset_id."""
+    seed = list(_DemoDataContributor().get_data())[0]
+    assert seed.virtual_assets[0]["asset_id"] == "demo_virtual_cog"

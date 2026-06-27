@@ -16,16 +16,21 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Self-heal tests for ``GcpStorageOpsMixin.initiate_upload`` when the
-backing GCS bucket is missing for a catalog marked ready.
+"""Self-heal and deferred-storage tests for ``GcpStorageOpsMixin.initiate_upload``
+when the backing GCS bucket is missing for a catalog marked ready.
 
-When ``get_storage_identifier`` returns ``None`` after the catalog's
-``provisioning_status == "ready"`` check has passed, two things MUST happen:
+Two separate cases when ``get_storage_identifier`` returns ``None``:
 
-1. ``CatalogsProtocol.mark_provisioning_step(catalog_id, "gcp_bucket", "failed")``
-   is called (best-effort — a failure there must not mask the original error).
-2. ``GcpFailedDependencyError`` is raised so the client receives an HTTP 424
-   (rather than an opaque 500) and the message explains how to repair.
+1. **Deferred catalog** (``gcp_bucket`` not in checklist): the catalog was
+   created bucket-free via ``?hints=defer`` and never provisioned.
+   ``mark_provisioning_step`` must NOT be called (no false demotion) and
+   ``GcpStorageDeferredError`` (HTTP 409) must be raised.
+
+2. **Stale ready state** (``gcp_bucket`` IS in checklist): the bucket went
+   missing after provisioning — the stored status is stale.
+   ``mark_provisioning_step(catalog_id, "gcp_bucket", "failed")`` must be
+   called (best-effort) and ``GcpFailedDependencyError`` (HTTP 424) must be
+   raised.
 """
 
 from __future__ import annotations
@@ -37,7 +42,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from dynastore.modules.gcp.gcp_storage_ops import GcpStorageOpsMixin
-from dynastore.modules.gcp.errors import GcpFailedDependencyError
+from dynastore.modules.gcp.errors import GcpFailedDependencyError, GcpStorageDeferredError
 
 # ---------------------------------------------------------------------------
 # Module path constants for patching
@@ -109,6 +114,10 @@ async def test_missing_bucket_marks_step_failed_and_raises_424():
     catalogs_mock = MagicMock()
     catalogs_mock.get_catalog = AsyncMock(return_value=fake_cat)
     catalogs_mock.mark_provisioning_step = AsyncMock(return_value=True)
+    # Checklist contains gcp_bucket → stale ready state, not a deferred catalog
+    catalogs_mock.get_provisioning_checklist = AsyncMock(
+        return_value={"gcp_bucket": "complete"}
+    )
 
     from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
 
@@ -150,6 +159,10 @@ async def test_missing_bucket_raises_even_when_demotion_fails():
     catalogs_mock.mark_provisioning_step = AsyncMock(
         side_effect=RuntimeError("DB connection lost")
     )
+    # Checklist contains gcp_bucket → stale ready state, not a deferred catalog
+    catalogs_mock.get_provisioning_checklist = AsyncMock(
+        return_value={"gcp_bucket": "complete"}
+    )
 
     from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
 
@@ -183,6 +196,10 @@ async def test_missing_bucket_without_catalogs_protocol_still_raises():
     catalogs_mock = MagicMock()
     catalogs_mock.get_catalog = AsyncMock(return_value=fake_cat)
     catalogs_mock.mark_provisioning_step = AsyncMock(return_value=False)
+    # Checklist contains gcp_bucket → stale ready state, not a deferred catalog
+    catalogs_mock.get_provisioning_checklist = AsyncMock(
+        return_value={"gcp_bucket": "complete"}
+    )
 
     from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
 
@@ -200,3 +217,95 @@ async def test_missing_bucket_without_catalogs_protocol_still_raises():
                 asset_def=_fake_asset_def(),
                 filename="data.tif",
             )
+
+
+# ---------------------------------------------------------------------------
+# Test: deferred catalog — raises GcpStorageDeferredError, NO demotion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_deferred_catalog_raises_409_and_does_not_demote():
+    """A catalog whose checklist has NO 'gcp_bucket' entry (deferred at create)
+    must raise ``GcpStorageDeferredError`` and must NOT call
+    ``mark_provisioning_step`` — the catalog is intentionally bucket-free."""
+    host = _Host(bucket_name=None, provisioning_status="ready")
+    fake_cat = _fake_catalog("ready")
+
+    catalogs_mock = MagicMock()
+    catalogs_mock.get_catalog = AsyncMock(return_value=fake_cat)
+    catalogs_mock.mark_provisioning_step = AsyncMock(return_value=True)
+    # Checklist lacks 'gcp_bucket' — deferred catalog
+    catalogs_mock.get_provisioning_checklist = AsyncMock(
+        return_value={"catalog_core": "complete"}
+    )
+
+    from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
+
+    def _proto(proto):
+        if proto is CatalogsProtocol:
+            return catalogs_mock
+        if proto is ConfigsProtocol:
+            return None
+        return None
+
+    with patch(_GET_PROTOCOL, side_effect=_proto):
+        with pytest.raises(GcpStorageDeferredError) as exc_info:
+            await host.initiate_upload(
+                catalog_id="cat-deferred",
+                asset_def=_fake_asset_def(),
+                filename="data.tif",
+            )
+
+    # Must NOT demote — the catalog is deliberately bucket-free.
+    catalogs_mock.mark_provisioning_step.assert_not_awaited()
+
+    # Error must mention the catalog, provision task, and virtual-asset path.
+    msg = str(exc_info.value)
+    assert "cat-deferred" in msg
+    assert "catalog_provision" in msg
+    assert "virtual" in msg.lower()
+
+
+# ---------------------------------------------------------------------------
+# Test: stale ready state (gcp_bucket in checklist) → still demotes + 424
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stale_ready_catalog_demotes_and_raises_424():
+    """A catalog whose checklist contains 'gcp_bucket' but has no bucket is a
+    stale ready state — must call ``mark_provisioning_step`` and raise
+    ``GcpFailedDependencyError`` (existing behaviour preserved)."""
+    host = _Host(bucket_name=None, provisioning_status="ready")
+    fake_cat = _fake_catalog("ready")
+
+    catalogs_mock = MagicMock()
+    catalogs_mock.get_catalog = AsyncMock(return_value=fake_cat)
+    catalogs_mock.mark_provisioning_step = AsyncMock(return_value=True)
+    # Checklist includes 'gcp_bucket' → stale state, not a deferred catalog
+    catalogs_mock.get_provisioning_checklist = AsyncMock(
+        return_value={"gcp_bucket": "complete"}
+    )
+
+    from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
+
+    def _proto(proto):
+        if proto is CatalogsProtocol:
+            return catalogs_mock
+        if proto is ConfigsProtocol:
+            return None
+        return None
+
+    with patch(_GET_PROTOCOL, side_effect=_proto):
+        with pytest.raises(GcpFailedDependencyError):
+            await host.initiate_upload(
+                catalog_id="cat-stale",
+                asset_def=_fake_asset_def(),
+                filename="data.tif",
+            )
+
+    # Demotion must have been called — stale ready with bucket in checklist.
+    catalogs_mock.mark_provisioning_step.assert_awaited_once_with(
+        "cat-stale", "gcp_bucket", "failed"
+    )

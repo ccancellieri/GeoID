@@ -46,6 +46,16 @@ class GcpFailedDependencyError(Exception):
     """
 
 
+class GcpStorageDeferredError(Exception):
+    """A real byte upload targeted a catalog whose storage backend was deferred
+    at creation (``?hints=defer``) and never provisioned.
+
+    Maps to HTTP 409. The catalog is intentionally bucket-free, not failed: the
+    caller should provision storage on demand (a ``catalog_provision`` task) or
+    register the data as a virtual asset, which needs no bucket.
+    """
+
+
 class GcpInternalError(Exception):
     """An unexpected internal consistency failure within the GCP module.
 

@@ -114,6 +114,17 @@ _DEMO_ITEMS = tuple(
 )
 
 
+# A public sample object standing in for "the original bucket": the demo
+# registers it as a VIRTUAL (href) asset, so the bucket-free demo_catalog
+# exposes an asset without uploading bytes or provisioning a bucket — the asset
+# is served directly from its original bucket.
+_DEMO_VIRTUAL_ASSET_HREF = (
+    "gs://gcp-public-data-landsat/LC08/01/044/034/"
+    "LC08_L1GT_044034_20130330_20170310_01_T2/"
+    "LC08_L1GT_044034_20130330_20170310_01_T2_B4.TIF"
+)
+
+
 # ---------------------------------------------------------------------------
 # Data contributor
 # ---------------------------------------------------------------------------
@@ -171,6 +182,16 @@ class _DemoDataContributor:
             items_routing=_demo_items_routing(),
             # feature-only demo — no GCS bucket needed (born bucket-free)
             defer_provisioning=True,
+            virtual_assets=(
+                {
+                    "asset_id": "demo_virtual_cog",
+                    "href": _DEMO_VIRTUAL_ASSET_HREF,
+                    "metadata": {
+                        "title": "Demo COG (virtual asset from the original bucket)",
+                        "roles": ["data"],
+                    },
+                },
+            ),
         )
 
 
@@ -182,8 +203,9 @@ DEMO_DATA_PRESET = MultiContributorPreset(
     name="demo_data",
     description=(
         "Seed a demo catalog (demo_catalog/demo_collection) with a 2×3 grid of "
-        "map-tile polygons over Italy — the data-contributor demonstration "
-        "preset (mirrors the legacy /admin/demo/populate content)."
+        "map-tile polygons over Italy and a virtual (href-based, bucket-free) "
+        "COG asset — the data-contributor demonstration preset (mirrors the "
+        "legacy /admin/demo/populate content)."
     ),
     keywords=("demo", "data", "platform", "catalog", "seed"),
     contributors_factory=lambda: [_DemoDataContributor()],

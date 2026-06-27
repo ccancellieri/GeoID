@@ -177,6 +177,7 @@ class GcpStorageOpsMixin:
             GcpFailedDependencyError,
             GcpInternalError,
             GcpServiceUnavailableError,
+            GcpStorageDeferredError,
         )
         from dynastore.modules.gcp.tools import bucket as bucket_tool
         from dynastore.modules.gcp.gcp_config import (
@@ -208,6 +209,29 @@ class GcpStorageOpsMixin:
 
         bucket_name = await self.get_storage_identifier(catalog_id)
         if not bucket_name:
+            # Distinguish a deliberately deferred catalog (no gcp_bucket step in
+            # the checklist → never provisioned) from a stale ready state (the
+            # step IS in the checklist but the bucket is gone).
+            checklist = {}
+            try:
+                checklist = await catalogs_provider.get_provisioning_checklist(catalog_id) or {}
+            except Exception:
+                checklist = {}
+            if "gcp_bucket" not in checklist:
+                # Storage was deferred at create (?hints=defer) and never
+                # provisioned — the catalog is intentionally bucket-free, not
+                # broken. Don't demote; tell the caller to provision on demand.
+                raise GcpStorageDeferredError(
+                    f"Catalog '{catalog_id}' was created without storage "
+                    f"(deferred provisioning), so it has no GCS bucket to upload "
+                    f"into. Provision its storage first by spawning a "
+                    f"catalog_provision task: POST /task/catalogs/{catalog_id} "
+                    f'with {{"task_type": "catalog_provision", "inputs": '
+                    f'{{"operation": "provision"}}}}. Data that already lives '
+                    f"elsewhere can instead be registered as a virtual asset "
+                    f"(POST /catalogs/{catalog_id}/virtual-assets), which needs no "
+                    f"bucket."
+                )
             # The catalog claims ready but has no backing bucket — the stored
             # provisioning status is stale. Demote it (best-effort, must not mask
             # the error below) so the operator can see the broken state and

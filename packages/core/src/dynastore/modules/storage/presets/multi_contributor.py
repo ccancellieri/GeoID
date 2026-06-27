@@ -211,6 +211,7 @@ async def _apply_data_kind(
             "created_catalog": False,
             "created_collection": False,
             "item_ids": [],
+            "asset_ids": [],
             "manage_catalog": seed.manage_catalog,
             "manage_collection": seed.manage_collection,
         }
@@ -292,6 +293,22 @@ async def _apply_data_kind(
                         preset_name, seed.catalog_id, seed.collection_id,
                         exc_info=True,
                     )
+
+        # --- Virtual assets (href-based; no bucket needed) ---
+        if seed.virtual_assets:
+            from dynastore.modules.catalog.asset_service import VirtualAssetCreate
+            assets_mgr = getattr(catalogs, "assets", None)
+            if assets_mgr is None:
+                raise RuntimeError(
+                    f"{preset_name}: seed declares virtual_assets but the catalogs "
+                    "service exposes no asset manager."
+                )
+            for spec in seed.virtual_assets:
+                payload = VirtualAssetCreate(**spec)
+                await assets_mgr.create_asset(
+                    seed.catalog_id, payload, seed.collection_id,
+                )
+                record["asset_ids"].append(payload.asset_id)
 
         applied_data.append(record)
 
@@ -458,6 +475,19 @@ async def _revoke_data_kind(
     for record in reversed(data_records):
         catalog_id = record["catalog_id"]
         collection_id = record["collection_id"]
+
+        # --- Virtual assets (delete before items/collection) ---
+        assets_mgr = getattr(catalogs, "assets", None)
+        for asset_id in record.get("asset_ids", []):
+            if assets_mgr is None:
+                break
+            try:
+                await assets_mgr.delete_asset(asset_id, catalog_id, collection_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "%s: delete_asset %s/%s/%s failed: %s",
+                    preset_name, catalog_id, collection_id, asset_id, exc,
+                )
 
         # --- Items ---
         for item_id in record.get("item_ids", []):

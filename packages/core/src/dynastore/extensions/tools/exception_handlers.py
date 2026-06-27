@@ -813,6 +813,23 @@ class GcpFailedDependencyExceptionHandler(ExceptionHandler):
         )
 
 
+class GcpStorageDeferredExceptionHandler(ExceptionHandler):
+    """Maps ``GcpStorageDeferredError`` to HTTP 409 (Conflict)."""
+
+    def can_handle(self, exception: Exception) -> bool:
+        from dynastore.modules.gcp.errors import GcpStorageDeferredError
+
+        return isinstance(exception, GcpStorageDeferredError)
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exception),
+        )
+
+
 class GcpInternalErrorHandler(ExceptionHandler):
     """Maps ``GcpInternalError`` to HTTP 500 with the error message preserved.
 
@@ -861,6 +878,7 @@ class ExceptionHandlerRegistry:
         self.register(ConflictExceptionHandler())
         self.register(GcpServiceUnavailableExceptionHandler())
         self.register(GcpFailedDependencyExceptionHandler())
+        self.register(GcpStorageDeferredExceptionHandler())
         self.register(ConstraintViolationExceptionHandler())
         self.register(UnknownFieldsExceptionHandler())
         self.register(IndexMappingMismatchExceptionHandler())
