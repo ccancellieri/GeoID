@@ -91,67 +91,29 @@ class GcpCatalogCleanupTask(TaskProtocol):
     # ------------------------------------------------------------------
 
     async def _cleanup_catalog(self, catalog_id: str, bucket_name: Optional[str] = None) -> Dict[str, Any]:
-        from dynastore.modules.gcp.gcp_config import GcpEventingConfig
+        from dynastore.scripts.gc_phantom_catalogs import teardown_phantom_gcp_resources
 
         logger.info(
-            f"GcpCatalogCleanupTask[CATALOG]: Starting GCP cleanup for catalog '{catalog_id}'."
+            "GcpCatalogCleanupTask[CATALOG]: starting GCP cleanup for catalog '%s'.",
+            catalog_id,
         )
 
-        storage = get_protocol(StorageProtocol)
-        eventing = get_protocol(EventingProtocol)
-        configs = get_protocol(ConfigsProtocol)
+        result = await teardown_phantom_gcp_resources(catalog_id, bucket_name)
+        result["scope"] = "catalog"
 
-        # 1. Teardown eventing (topics / subscriptions)
-        if eventing:
-            try:
-                if configs:
-                    eventing_config = await configs.get_config(
-                        GcpEventingConfig, catalog_id
-                    )
-                    await eventing.teardown_catalog_eventing(
-                        catalog_id, config=eventing_config
-                    )
-                else:
-                    await eventing.teardown_catalog_eventing(catalog_id, config=None)
-            except Exception as e:
-                logger.warning(
-                    f"GcpCatalogCleanupTask[CATALOG]: Eventing teardown for '{catalog_id}' "
-                    f"encountered an error (may already be gone): {e}"
-                )
-                # Force teardown as fallback
-                try:
-                    await eventing.teardown_catalog_eventing(catalog_id, config=None)
-                except Exception as force_exc:  # noqa: BLE001 — best-effort; cleanup continues
-                    logger.warning(
-                        "GcpCatalogCleanupTask[CATALOG]: force eventing teardown for '%s' "
-                        "also failed (resource may already be gone): %s",
-                        catalog_id, force_exc,
-                    )
+        if result.get("status") == "skipped_no_protocols":
+            logger.warning(
+                "GcpCatalogCleanupTask[CATALOG]: no GCP protocols registered for '%s'; "
+                "GCP resources were not cleaned up.",
+                catalog_id,
+            )
+        else:
+            logger.info(
+                "GcpCatalogCleanupTask[CATALOG]: cleanup complete for catalog '%s'.",
+                catalog_id,
+            )
 
-        # 2. Delete bucket
-        if storage:
-            # Use pre-resolved bucket_name from task inputs (schema may be
-            # dropped by the time this task runs), falling back to DB lookup.
-            if not bucket_name:
-                bucket_name = await storage.get_storage_identifier(catalog_id)
-            if bucket_name:
-                logger.info(
-                    f"GcpCatalogCleanupTask[CATALOG]: Deleting bucket '{bucket_name}'."
-                )
-                try:
-                    from dynastore.modules.gcp.tools import bucket as bucket_tool
-                    await bucket_tool.delete_bucket(bucket_name, force=True, client=None)
-                except Exception as e:
-                    logger.warning(
-                        f"GcpCatalogCleanupTask[CATALOG]: Failed to delete bucket "
-                        f"'{bucket_name}': {e}"
-                    )
-                    raise  # Bubble up so task retries
-
-        logger.info(
-            f"GcpCatalogCleanupTask[CATALOG]: Cleanup complete for catalog '{catalog_id}'."
-        )
-        return {"catalog_id": catalog_id, "scope": "catalog", "status": "cleaned"}
+        return result
 
     # ------------------------------------------------------------------
     # Collection-level cleanup
