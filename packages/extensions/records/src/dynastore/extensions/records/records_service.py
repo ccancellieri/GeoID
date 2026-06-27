@@ -92,14 +92,18 @@ def _resolve_links_titles(links: Any, language: str) -> None:
 # OGC API - Records conformance URIs (OGC 20-004)
 # ---------------------------------------------------------------------------
 
+# Only classes actually defined by OGC API - Records - Part 1: Core (20-004r1,
+# Tables 3 and 4) are advertised. The standard defines NO `conf/core`,
+# `conf/geojson`, or `conf/manage-records` class — Part 1 is discovery and
+# retrieval only (the GeoJSON encoding is covered by `conf/json`, and record
+# creation/replace/delete has no conformance class in Part 1). Advertising
+# those non-existent classes is an overclaim a CITE run keyed on the URI would
+# fail, so they are not declared here.
 OGC_API_RECORDS_URIS = [
-    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/core",
     "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/record-core",
     "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/record-collection",
     "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/json",
-    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/geojson",
     "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/sorting",
-    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/manage-records",
 ]
 
 

@@ -30,11 +30,22 @@ integration tests; this snapshot is the unit-level guard.
 from __future__ import annotations
 
 
+# OGC API - Records - Part 1: Core (20-004r1) defines these record classes
+# (Tables 3 & 4). The GeoJSON encoding is covered by conf/json; the standard
+# defines no separate conf/geojson, no conf/core, and no record-creation
+# (conf/manage-records) class — Part 1 is discovery and retrieval only.
 EXPECTED_PASS1_RECORDS_URIS = {
-    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/geojson",  # T5
+    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/record-core",
+    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/record-collection",
+    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/json",
+    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/sorting",
 }
 
-EXPECTED_RECORDS_MANAGE_URIS = {
+# Classes OGC API - Records Part 1 does NOT define — must never be advertised
+# (a CITE run keyed on these URIs would fail).
+INVALID_RECORDS_URIS = {
+    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/core",
+    "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/geojson",
     "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/manage-records",
 }
 
@@ -59,26 +70,30 @@ EXPECTED_PASS1_STYLES_URIS = {
 }
 
 
-def test_records_declares_geojson_conformance():
-    from dynastore.extensions.records.records_service import OGC_API_RECORDS_URIS
-    declared = set(OGC_API_RECORDS_URIS)
-    missing = EXPECTED_PASS1_RECORDS_URIS - declared
-    assert not missing, f"Records extension missing Pass 1 URIs: {sorted(missing)}"
+def test_records_declares_valid_part1_classes():
+    """Records advertises the Part 1 classes it implements.
 
-
-def test_records_declares_manage_records_conformance():
-    """OGC API - Records Part 1 manage-records class must be advertised.
-
-    PUT/PATCH/DELETE record routes are registered; the conformance endpoint
-    must reflect that by listing the manage-records class URI defined in
-    OGC 20-004 Section 7.12 (OGC API - Records Part 1, manage-records
-    conformance class).
+    OGC API - Records - Part 1: Core (20-004r1, Tables 3 & 4) defines
+    record-core, record-collection, json and sorting; these must be declared.
     """
     from dynastore.extensions.records.records_service import OGC_API_RECORDS_URIS
     declared = set(OGC_API_RECORDS_URIS)
-    missing = EXPECTED_RECORDS_MANAGE_URIS - declared
-    assert not missing, (
-        f"Records extension missing manage-records conformance URI: {sorted(missing)}"
+    missing = EXPECTED_PASS1_RECORDS_URIS - declared
+    assert not missing, f"Records extension missing Part 1 URIs: {sorted(missing)}"
+
+
+def test_records_does_not_overclaim_undefined_classes():
+    """OGC API - Records Part 1 defines no conf/core, conf/geojson or
+    conf/manage-records class (Part 1 is discovery/retrieval only; the GeoJSON
+    encoding is folded into conf/json). Advertising any of them is an overclaim
+    a CITE run keyed on the URI would fail, so none may be declared.
+    """
+    from dynastore.extensions.records.records_service import OGC_API_RECORDS_URIS
+    declared = set(OGC_API_RECORDS_URIS)
+    overclaimed = INVALID_RECORDS_URIS & declared
+    assert not overclaimed, (
+        f"Records extension advertises classes OGC API Records Part 1 does not "
+        f"define: {sorted(overclaimed)}"
     )
 
 

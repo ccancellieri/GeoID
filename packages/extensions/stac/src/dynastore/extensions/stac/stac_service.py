@@ -227,7 +227,7 @@ STAC_API_URIS = [
     "https://api.stacspec.org/v1.0.0/item-search",
     "https://api.stacspec.org/v1.1.0/item-search#sort",
     "https://api.stacspec.org/v1.0.0/collections",
-    "https://api.stacspec.org/v1.0.0-rc.2/transactions",
+    "https://api.stacspec.org/v1.0.0/ogcapi-features/extensions/transaction",
     "https://api.stacspec.org/v1.0.0/item-search/definition",
     "https://api.stacspec.org/v1.0.0/item-search#filter",
     "https://api.stacspec.org/v1.0.0/item-search#sort",
