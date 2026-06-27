@@ -16,7 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Source-level invariants for the ``main_task.py`` ownership claim (#726, #2463).
+"""Source-level invariants for the ``main_task.py`` ownership claim (#726, #2463, #2483).
 
 ``main_task.py`` used to take ownership of the task row via an *unconditional*
 ``update_task(status=ACTIVE, ...)``. With the REST-path spawn lease (60s)
@@ -35,6 +35,14 @@ matches instead of being mistaken for a foreign owner.
 the Cloud Run retry must exit non-zero so the execution is recorded as FAILED
 in the GCP console, not as a false SUCCEEDED.  ``_exit_code_for_unclaimed_status``
 encodes the mapping and is tested functionally here.
+
+#2483 is the specific retry scenario where this matters: attempt 0 exits 1 (task
+failed), Cloud Run retries, attempt 1 finds the task already terminal and used to
+exit 0 (skip-path bare return).  Cloud Run then recorded the execution as SUCCEEDED
+— a false green.  The fix is that the skip path re-reads the task's terminal status
+and exits non-zero when it is FAILED or DEAD_LETTER, so the retry inherits the
+correct exit code.  Attempt 1 finding a COMPLETED task still exits 0: that's a
+genuine duplicate that should step aside quietly.
 """
 
 from __future__ import annotations
@@ -85,7 +93,7 @@ def test_main_task_skips_execution_on_lost_claim():
 
 
 # ---------------------------------------------------------------------------
-# Fix #2463: correct exit code when task is already FAILED / DEAD_LETTER
+# Fix #2463 / #2483: correct exit code when task is already FAILED / DEAD_LETTER
 # ---------------------------------------------------------------------------
 
 def test_exit_code_for_failed_status_is_nonzero():
