@@ -157,7 +157,8 @@ class TestIsTransientDbError:
         assert is_transient_db_error(exc) is True
 
     def test_asyncpg_connection_does_not_exist(self):
-        exc = type("ConnectionDoesNotExistError", (Exception,), {})("conn gone")
+        asyncpg = pytest.importorskip("asyncpg")
+        exc = asyncpg.exceptions.ConnectionDoesNotExistError("conn gone")
         assert is_transient_db_error(exc) is True
 
     def test_lock_not_available_asyncpg_class_name(self):
