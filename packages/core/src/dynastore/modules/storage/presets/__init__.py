@@ -58,6 +58,8 @@ from .assets_gcs_uploads import AssetsGcsUploadsPreset  # noqa: E402
 from .assets_local_only import AssetsLocalOnlyPreset, _local_backend_available  # noqa: E402
 from .defaults_postgres import DefaultsPostgresPreset  # noqa: E402
 from .demo_data import DEMO_DATA_PRESET  # noqa: E402
+from .vector_ingest_demo import VECTOR_INGEST_DEMO_PRESET  # noqa: E402
+from .tiles_preseed_demo import TILES_PRESEED_DEMO_PRESET  # noqa: E402
 from .file_backed import FileBackedPreset  # noqa: E402
 from .items_es_private import ItemsEsPrivatePreset  # noqa: E402
 from .items_es_public import ItemsEsPublicPreset  # noqa: E402
@@ -75,6 +77,8 @@ register_preset(PrivateCollectionPreset())
 register_preset(ItemsEsPrivatePreset())
 register_preset(ItemsEsPublicPreset())
 register_preset(DEMO_DATA_PRESET)
+register_preset(VECTOR_INGEST_DEMO_PRESET)
+register_preset(TILES_PRESEED_DEMO_PRESET)
 # The two single-responsibility children of the ``stac`` composite —
 # ``routing`` and ``stac_storage`` — must register before it: the registry
 # validates ``compose`` references at registration time, so the children must

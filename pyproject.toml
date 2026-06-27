@@ -322,7 +322,7 @@ outbox_drain = ["dynastore[task_base]"]
 # Worker DB convention split (see #909 and #1420):
 #   task_base        — CPU-bound workers (sync psycopg2 only, no asyncpg in image).
 #                      Preserves #909: ingestion, gdal, tiles_preseed,
-#                      dimensions_materialize, elasticsearch_indexer.
+#                      elasticsearch_indexer.
 #   task_base_async  — I/O-bound streaming workers (asyncpg + psycopg3 via
 #                      module_events; psycopg2-binary absent: db_sync/module_datastore
 #                      not included, module_storage_postgresql is an empty marker,
@@ -397,7 +397,12 @@ worker_task_ingestion = ["dynastore[ingestion,catalog_grp,google_grp,gdal,driver
 worker_task_export_features = ["dynastore[task_base_async,module_gcp,stac,geospatial_core,geospatial_io,module_storage_postgresql]"]
 worker_task_tiles_preseed = ["dynastore[task_base,module_catalog,tiles,crs,module_storage_postgresql]", "morecantile>=7.0.3,<8"]
 worker_task_gdal = ["dynastore[task_base,module_catalog,gdal,module_storage_postgresql]"]
-worker_task_dimensions_materialize = ["dynastore[task_base,module_catalog,extension_dimensions,module_storage_postgresql]"]
+# module_db (asyncpg) is required: CatalogService methods called by this task
+# (ensure_catalog_exists, upsert, update_task) use managed_transaction which
+# awaits async DB calls — the sync psycopg2 engine alone raises
+# TypeError: CursorResult object can't be awaited. Same fix as #2472
+# applied to worker_task_catalog_provision.
+worker_task_dimensions_materialize = ["dynastore[task_base,module_db,module_catalog,extension_dimensions,module_storage_postgresql]"]
 worker_task_elasticsearch_indexer = ["dynastore[task_base,module_catalog,elasticsearch,task_elasticsearch_indexer_deps,outbox_drain,module_storage_postgresql]"]
 # stac_harvest: I/O-bound streaming harvest of a remote STAC catalog into a
 # target dynastore catalog. task_base (sync psycopg2 engine) like ingestion and
