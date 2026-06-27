@@ -540,6 +540,25 @@ list_platform_refs_query = _cq.list_platform_refs
 # --- Manager ---
 
 
+def _serialize_config_for_db(config: "PluginConfig") -> str:
+    """Serialize a config to the JSON string persisted in platform_configs.
+
+    ``secret_mode="db"`` → every Secret field serializes to its encrypted
+    envelope before jsonb persistence.  ``exclude_unset=True`` → store only
+    the fields the caller explicitly sent; class defaults are resolved at read
+    time by the waterfall, not baked in here.
+
+    Single SSOT for the write-side serialization contract shared by
+    ``set_config`` and ``set_config_by_ref`` (platform tier).
+    """
+    config_data = (
+        config.model_dump(mode="json", context={"secret_mode": "db"}, exclude_unset=True)
+        if hasattr(config, "model_dump")
+        else config
+    )
+    return json.dumps(config_data, cls=CustomJSONEncoder)
+
+
 def _post_commit_router_bust(cls: Type["PluginConfig"]) -> None:
     """Bust the distributed storage-router cache after a platform-tier commit.
 
@@ -681,6 +700,20 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
         cls = require_config_class(config_cls)
         class_key = cls.class_key()
         db_resource = ctx.db_resource if ctx else None
+
+        # #2524: a config with no explicitly-set fields serialises to {} under
+        # exclude_unset=True.  {} is falsy at read time — the waterfall skips it —
+        # so the row provides no value.  Return early to avoid an unnecessary write
+        # transaction and spurious config-cache / router-cache invalidation.
+        _serialized = _serialize_config_for_db(config)
+        if _serialized == "{}":
+            logger.debug(
+                "%s: skipping empty config write at platform scope; "
+                "waterfall defaults apply without a stored row",
+                class_key,
+            )
+            return
+
         async with managed_transaction(db_resource or self.engine) as conn:
             old_config: Optional[PluginConfig] = None
             current_data = await get_platform_config_query.execute(
@@ -713,14 +746,7 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
                 ref_key=class_key,
                 class_key=class_key,
                 schema_id=type(config).schema_id(),
-                config_data=json.dumps(
-                    config.model_dump(
-                        mode="json",
-                        context={"secret_mode": "db"},
-                        exclude_unset=True,
-                    ),
-                    cls=CustomJSONEncoder,
-                ),
+                config_data=_serialized,
             )
 
             # Phase 3 — apply (post-persist, best-effort).
@@ -835,6 +861,17 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
         cls = type(config)
         class_key = cls.class_key()
         db_resource = ctx.db_resource if ctx else None
+
+        # #2524: skip write when no fields were explicitly set (see set_config).
+        _serialized = _serialize_config_for_db(config)
+        if _serialized == "{}":
+            logger.debug(
+                "%s: skipping empty config write (by-ref=%r) at platform scope; "
+                "waterfall defaults apply without a stored row",
+                class_key, ref_key,
+            )
+            return
+
         async with managed_transaction(db_resource or self.engine) as conn:
             existing_row = await get_platform_config_by_ref_query.execute(
                 conn, ref_key=ref_key
@@ -863,14 +900,7 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
                 ref_key=ref_key,
                 class_key=class_key,
                 schema_id=type(config).schema_id(),
-                config_data=json.dumps(
-                    config.model_dump(
-                        mode="json",
-                        context={"secret_mode": "db"},
-                        exclude_unset=True,
-                    ),
-                    cls=CustomJSONEncoder,
-                ),
+                config_data=_serialized,
             )
 
             # Phase 3 — apply (post-persist, best-effort).
