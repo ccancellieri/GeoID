@@ -80,6 +80,7 @@ def build_canonical_collection_doc(
     collection_id: str,
     known_fields: Dict[str, Any],
     access: Optional[Dict[str, Any]] = None,
+    lifecycle_status: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Assemble the canonical collection ``_source`` from STAC collection metadata.
 
@@ -87,6 +88,12 @@ def build_canonical_collection_doc(
     :func:`~dynastore.modules.elasticsearch.metadata_canonical.build_canonical_metadata_doc`.
     ``extent`` is carried opaquely as a reserved member (the driver
     enriches/unenriches it). Pure function — *metadata* is not mutated.
+
+    When *lifecycle_status* is non-None it is stamped onto
+    ``doc["system"]["lifecycle_status"]`` so the ES secondary index can
+    filter transitional collections out of q-based searches.  When None
+    the key is not added, preserving back-compat for already-indexed docs
+    that have no such field (missing field = visible/active).
     """
     md = dict(metadata or {})
 
@@ -110,6 +117,10 @@ def build_canonical_collection_doc(
 
     if i18n:
         doc["metadata"] = i18n
+
+    if lifecycle_status is not None:
+        doc.setdefault("system", {})["lifecycle_status"] = lifecycle_status
+
     return doc
 
 def unproject_collection_from_es(source: Dict[str, Any]) -> Dict[str, Any]:

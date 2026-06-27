@@ -75,6 +75,7 @@ class _CollectionDriverStub(CollectionElasticsearchDriver):
     async def upsert_metadata(  # type: ignore[override]
         self, catalog_id: str, collection_id: str,
         metadata: Dict[str, Any], *, db_resource: Any = None,
+        lifecycle_status: Any = None,
     ) -> None:
         self.upserts.append((catalog_id, collection_id, metadata))
 

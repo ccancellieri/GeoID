@@ -250,6 +250,13 @@ CANONICAL_SYSTEM_TYPES: Dict[str, Any] = {
     "validity":         {"type": "date_range"},
     "transaction_time": {"type": "date"},
     "deleted_at":       {"type": "date"},
+    # Transitional lifecycle overlay stamped on collection docs while async
+    # provisioning or hard-delete teardown is in flight.  Absent on active
+    # collection docs, so a ``terms`` must-not filter on this field leaves
+    # active docs (field missing) visible.  Keyword so the filter is exact.
+    # NOTE: existing indices need a one-time offline ``PUT /_mapping`` to add
+    # this field before the filter takes effect on already-indexed docs.
+    "lifecycle_status": {"type": "keyword"},
 }
 
 # Only the fixed-name geometry stats whose emitted shape is verified are pinned

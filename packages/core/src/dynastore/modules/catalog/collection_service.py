@@ -1468,6 +1468,9 @@ class CollectionService:
             await _route_upsert_metadata(
                 catalog_id, collection_model.id, metadata_payload,
                 db_resource=conn,
+                lifecycle_status=(
+                    CollectionLifecycle.PROVISIONING.value if provisioning else None
+                ),
             )
 
             # Steps 8 & 9 (write_policy + schema persistence) moved to
@@ -1521,6 +1524,21 @@ class CollectionService:
             async def _finalize_provisioning() -> None:
                 await self._set_lifecycle_status(_cat_id, _col_id, None)
                 _invalidate_collection_lifecycle_caches(_cat_id, _col_id)
+                # Clear the transitional marker from the ES secondary index so
+                # the collection becomes visible in q-based searches.  Best-effort:
+                # a transient ES failure must not block finalization — PG is the
+                # system of record and the ACTIVE state is already committed above.
+                from dynastore.modules.catalog.collection_router import (
+                    _clear_collection_es_lifecycle_status,
+                )
+                try:
+                    await _clear_collection_es_lifecycle_status(_cat_id, _col_id)
+                except Exception as _exc:
+                    logger.warning(
+                        "ES lifecycle clear failed (best-effort) for %s/%s: %s — "
+                        "collection will appear in ES after the next full reindex",
+                        _cat_id, _col_id, _exc,
+                    )
 
             _on_complete = _finalize_provisioning
 

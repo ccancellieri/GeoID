@@ -146,6 +146,7 @@ async def _dispatch_collection_index(
     *,
     op_type: Literal["upsert", "delete"] = "upsert",
     db_resource: Optional[Any] = None,
+    lifecycle_status: Optional[str] = None,
 ) -> None:
     """Fan a collection ``upsert`` / ``delete`` to every Indexer configured
     as a secondary-index ``WRITE`` entry (``secondary_index=True``) in
@@ -192,6 +193,7 @@ async def _dispatch_collection_index(
         correlation_id=get_correlation_id() or "",
         pg_conn=db_resource,
         entity_type="collection",
+        lifecycle_status=lifecycle_status,
     )
     try:
         await dispatcher.fan_out_bulk(ctx, ops)
@@ -312,6 +314,7 @@ async def upsert_collection_metadata(
     *,
     db_resource: Optional[Any] = None,
     drivers: Optional[List[CollectionStore]] = None,
+    lifecycle_status: Optional[str] = None,
 ) -> None:
     """Fan-out WRITE across every registered driver (sequential, fail-fast).
 
@@ -366,9 +369,14 @@ async def upsert_collection_metadata(
     # secondary-index WRITE hop — propagate the envelope to ES (and any
     # other configured Indexer).  Pure post-write propagation; PG above is
     # the system of record.  db_resource (when a live conn) makes the OUTBOX enqueue
-    # atomic with the caller's transaction.
+    # atomic with the caller's transaction.  lifecycle_status (when non-None)
+    # is threaded into the IndexContext so the ES driver can stamp it on the
+    # system container; PG drivers above are NOT passed lifecycle_status —
+    # they manage it via a dedicated column.
     await _dispatch_collection_index(
-        catalog_id, collection_id, metadata, db_resource=db_resource,
+        catalog_id, collection_id, metadata,
+        db_resource=db_resource,
+        lifecycle_status=lifecycle_status,
     )
 
 
@@ -432,6 +440,39 @@ async def delete_collection_metadata(
             catalog_id, collection_id, op_type="delete", db_resource=db_resource,
         )
     else:
+        raise first_error
+
+
+async def _clear_collection_es_lifecycle_status(
+    catalog_id: str,
+    collection_id: str,
+) -> None:
+    """Targeted partial-update: remove ``system.lifecycle_status`` from the
+    collection's ES document so it becomes visible in q-based searches.
+
+    Discovers all registered ``CollectionStore`` drivers that expose a
+    ``clear_lifecycle_status`` method (i.e. ES-backed drivers) and calls them
+    in sequence.  Errors are re-raised after all drivers have been attempted
+    so the caller can wrap the whole call in best-effort handling.  The PG
+    system-of-record flip is independent of this call.
+    """
+    drivers = _resolve_drivers()
+    first_error: Optional[BaseException] = None
+    for driver in drivers:
+        clear_fn = getattr(driver, "clear_lifecycle_status", None)
+        if clear_fn is None:
+            continue
+        try:
+            await clear_fn(catalog_id, collection_id)
+        except Exception as exc:
+            logger.warning(
+                "_clear_collection_es_lifecycle_status: driver %s failed for "
+                "%s/%s: %s",
+                type(driver).__name__, catalog_id, collection_id, exc,
+            )
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
         raise first_error
 
 

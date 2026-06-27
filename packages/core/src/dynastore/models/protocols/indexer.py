@@ -118,6 +118,16 @@ class IndexContext(BaseModel):
             "entity_type), so the resolver only needs the context value."
         ),
     )
+    lifecycle_status: Optional[str] = Field(
+        default=None,
+        description=(
+            "Transitional lifecycle overlay to stamp on the indexed document "
+            "when non-None (e.g. ``'provisioning'`` during async init).  "
+            "None (the default) means the field is omitted from the indexed "
+            "doc so active / already-indexed documents remain visible.  Only "
+            "meaningful for collection-tier ops; items and assets ignore it."
+        ),
+    )
 
     model_config = {"arbitrary_types_allowed": True, "frozen": True}
 
