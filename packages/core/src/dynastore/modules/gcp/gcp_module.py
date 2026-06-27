@@ -113,6 +113,16 @@ _CATALOG_EXISTS_QUERY = DQLQuery(
     "SELECT 1 FROM catalog.catalogs WHERE id = :catalog_id AND deleted_at IS NULL",
     result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
 )
+
+# ---------------------------------------------------------------------------
+# GCS retry and per-bucket circuit-breaker tunables
+# ---------------------------------------------------------------------------
+# Updated from GcpModuleConfig during lifespan startup (hot-reload on restart).
+# Read at call time via gcs_retry._get_gcs_retry_tunables().
+_GCS_RETRY_MAX_ATTEMPTS: int = 3
+_GCS_BREAKER_FAILURE_THRESHOLD: int = 5
+_GCS_BREAKER_COOLDOWN_SECONDS: float = 30.0
+
 class GCPModule(
     GcpCatalogOpsMixin,
     GcpEventingOpsMixin,
@@ -131,6 +141,10 @@ class GCPModule(
     _engine: Optional[DbResource] = None
     _config_service: Optional[ConfigsProtocol] = None
     _module_config: Optional[GcpModuleConfig] = None
+    # Per-bucket circuit breaker for GCS operations.  Created in lifespan with
+    # thresholds from GcpModuleConfig; None until lifespan runs (e.g. in tests
+    # that instantiate GCPModule without running lifespan).
+    _gcs_breaker: Optional[Any] = None
     # In-memory upload ticket store: ticket_id → {asset_id, catalog_id, collection_id, expires_at}
     _upload_tickets: ClassVar[Dict[str, Dict[str, Any]]] = {}
 
@@ -290,6 +304,16 @@ class GCPModule(
                 global _CATALOG_VISIBILITY_MAX_RETRIES, _CATALOG_VISIBILITY_RETRY_INTERVAL
                 _CATALOG_VISIBILITY_MAX_RETRIES = self._module_config.catalog_visibility_max_retries
                 _CATALOG_VISIBILITY_RETRY_INTERVAL = self._module_config.catalog_visibility_retry_interval
+                # Sync GCS retry tunables and rebuild the per-bucket circuit breaker.
+                global _GCS_RETRY_MAX_ATTEMPTS, _GCS_BREAKER_FAILURE_THRESHOLD, _GCS_BREAKER_COOLDOWN_SECONDS
+                _GCS_RETRY_MAX_ATTEMPTS = self._module_config.gcs_retry_max_attempts
+                _GCS_BREAKER_FAILURE_THRESHOLD = self._module_config.gcs_breaker_failure_threshold
+                _GCS_BREAKER_COOLDOWN_SECONDS = self._module_config.gcs_breaker_cooldown_seconds
+                from dynastore.modules.storage.circuit_breaker import CircuitBreaker as _GcsCB
+                self._gcs_breaker = _GcsCB(
+                    failure_threshold=_GCS_BREAKER_FAILURE_THRESHOLD,
+                    cooldown_seconds=_GCS_BREAKER_COOLDOWN_SECONDS,
+                )
         else:
             logger.warning(
                 "GCP Module: ConfigsProtocol not available. Global settings will use defaults/env."
@@ -329,6 +353,7 @@ class GCPModule(
                 storage_client=self._storage_client,  # type: ignore[arg-type]
                 project_id=self.get_project_id() or "",
                 region=self.get_region() or "",
+                breaker=self._gcs_breaker,
             )
 
             # The GCP module no longer owns any database schema: the catalog →

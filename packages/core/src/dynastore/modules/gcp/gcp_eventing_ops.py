@@ -372,9 +372,21 @@ class GcpEventingOpsMixin:
             max_retries: int = 8,
             initial_delay: float = 0.5,
         ):
-            """
-            Retries listing notifications with exponential backoff to handle GCS eventual consistency.
-            Even after a bucket exists, it may not be immediately ready for all operations.
+            """Retry listing bucket notifications with exponential backoff.
+
+            GCS eventual consistency: even after a bucket exists, it may not be
+            immediately ready for all operations (NotFound on list_notifications
+            is a known race after bucket creation).  Each miss emits a structured
+            WARNING matching the ``gcs_operation_retry`` pattern so a single
+            log-based metric can track both transient-error retries and
+            eventual-consistency waits:
+
+                gcs_operation_retry bucket=%s operation=%s attempt=%d/%d error=%s
+
+            Note: ``NotFound`` here is an eventually-consistent probe, NOT a
+            transient service error, so the per-bucket circuit breaker is not fed
+            by these misses — tripping the breaker on a newly-created bucket would
+            block subsequent legitimate operations on that bucket.
             """
 
             def _list_notifications_sync():
@@ -387,17 +399,25 @@ class GcpEventingOpsMixin:
                 except google_exceptions.NotFound as e:
                     last_exception = e
                     if attempt < max_retries:
-                        # Exponential backoff: 0.5s, 1s, 2s, 4s, 8s, 16s, 32s, 64s (max ~127s total)
+                        # Exponential backoff: 0.5s, 1s, 2s, 4s, 8s, 16s, 32s, 64s
                         delay = initial_delay * (2 ** (attempt - 1))
-                        logger.debug(
-                            f"Attempt {attempt}/{max_retries}: Bucket '{bucket_name_str}' not ready for listing notifications. "
-                            f"Retrying in {delay}s..."
+                        logger.warning(
+                            "gcs_operation_retry bucket=%s operation=%s attempt=%d/%d error=%s",
+                            bucket_name_str,
+                            "list_notifications",
+                            attempt,
+                            max_retries,
+                            f"NotFound: {e}",
                         )
                         await asyncio.sleep(delay)
                     else:
                         logger.warning(
-                            f"Failed to list notifications after {max_retries} attempts. "
-                            f"Bucket '{bucket_name_str}' may not be fully ready yet."
+                            "gcs_operation_retry bucket=%s operation=%s attempt=%d/%d error=%s",
+                            bucket_name_str,
+                            "list_notifications",
+                            max_retries,
+                            max_retries,
+                            f"NotFound: bucket not ready after {max_retries} attempts: {e}",
                         )
                         raise
             # Should never reach here, but just in case

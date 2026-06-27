@@ -23,6 +23,7 @@ from typing import Any, Dict, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from google.cloud import storage
+    from dynastore.modules.storage.circuit_breaker import CircuitBreaker
 else:
     try:
         from google.cloud import storage
@@ -105,12 +106,17 @@ class BucketService:
         storage_client: "storage.Client",
         project_id: str,
         region: str,
+        breaker: Optional["CircuitBreaker"] = None,
     ):
         self._engine = engine
         self._config_service = config_service
         self.storage_client = storage_client
         self.project_id = project_id
         self.region = region
+        # Per-bucket circuit breaker passed from GCPModule.  When None (e.g.
+        # test context without a full lifespan), _apply_bucket_settings falls
+        # back to the legacy google.api_core.retry.Retry path.
+        self._breaker = breaker
 
     @property
     def engine(self) -> DbResource:
@@ -397,6 +403,11 @@ class BucketService:
         """
         Polls for bucket existence with exponential backoff.
         Returns True if the bucket becomes visible, False if retries are exhausted.
+
+        Each poll miss emits a structured WARNING so GCP log-based metrics can
+        track readiness-wait patterns alongside transient-error retries:
+
+            gcs_operation_retry bucket=%s operation=%s attempt=%d/%d error=%s
         """
         bucket = self.storage_client.bucket(bucket_name)
         for attempt in range(1, max_retries + 1):
@@ -404,13 +415,22 @@ class BucketService:
                 return True
             if attempt < max_retries:
                 delay = initial_delay * (2 ** (attempt - 1))
-                logger.debug(
-                    f"Attempt {attempt}/{max_retries}: Bucket '{bucket_name}' not ready. "
-                    f"Retrying in {delay}s..."
+                logger.warning(
+                    "gcs_operation_retry bucket=%s operation=%s attempt=%d/%d error=%s",
+                    bucket_name,
+                    "wait_for_bucket_ready",
+                    attempt,
+                    max_retries,
+                    "NotReady: bucket not yet visible",
                 )
                 await asyncio.sleep(delay)
         logger.warning(
-            f"Bucket '{bucket_name}' not ready after {max_retries} attempts."
+            "gcs_operation_retry bucket=%s operation=%s attempt=%d/%d error=%s",
+            bucket_name,
+            "wait_for_bucket_ready",
+            max_retries,
+            max_retries,
+            "NotReady: bucket not visible after all attempts",
         )
         return False
 
@@ -816,21 +836,30 @@ class BucketService:
     async def _apply_bucket_settings(
         self, bucket_name: str, config: GcpCatalogBucketConfig
     ):
-        """
-        Maps the declarative Pydantic configuration to the GCS bucket properties.
-        This handles partial updates for mutable fields.
+        """Map the declarative Pydantic configuration to the GCS bucket properties.
 
-        Uses exponential backoff retry for transient GCS errors (network issues,
-        temporary unavailability). The bucket settings operation is idempotent,
-        making it safe to retry on transient failures.
+        This handles partial updates for mutable fields and is idempotent, making
+        it safe to retry on transient failures.
+
+        When a per-bucket :class:`CircuitBreaker` is available (set at lifespan
+        startup via ``GCPModule``), retries are handled by
+        :func:`~gcs_retry.gcs_run_with_retry`, which:
+
+        * emits a structured ``gcs_operation_retry`` WARNING on each non-final retry,
+        * records successes and failures to the breaker keyed on ``bucket_name``.
+
+        Without a breaker (test contexts / bare ``BucketService`` construction)
+        the legacy ``google.api_core.retry.Retry`` path is used as a fallback so
+        existing behaviour is preserved.
         """
         if not self.storage_client:
             logger.warning(
-                f"Storage client not available. Skipping update for bucket '{bucket_name}'."
+                "Storage client not available. Skipping update for bucket '%s'.",
+                bucket_name,
             )
             return
 
-        def _sync_update():
+        def _sync_update() -> None:
             bucket = self.storage_client.bucket(bucket_name)
             needs_patch = False
 
@@ -849,7 +878,7 @@ class BucketService:
                     cors_list.append(rule_dict)
 
                 logger.info(
-                    f"Applying CORS rules to bucket '{bucket_name}': {cors_list}"
+                    "Applying CORS rules to bucket '%s': %s", bucket_name, cors_list
                 )
                 bucket.cors = cors_list
                 needs_patch = True
@@ -861,38 +890,56 @@ class BucketService:
             if needs_patch:
                 bucket.patch()
                 logger.info(
-                    f"Successfully applied settings to GCS bucket '{bucket_name}'."
+                    "Successfully applied settings to GCS bucket '%s'.", bucket_name
                 )
 
-        # Wrap with retry logic for transient GCS errors
-        def _sync_update_with_retry():
-            if retry is None:
-                # Fallback if google.api_core is not available
-                return _sync_update()
+        if self._breaker is not None:
+            # Preferred path: async retry with structured observability and breaker.
+            from dynastore.modules.gcp.gcs_retry import gcs_run_with_retry
 
-            @retry.Retry(
-                predicate=retry.if_exception_type(
-                    GoogleCloudError,
-                    ConnectionError,
-                    TimeoutError,
-                ),
-                initial=1.0,
-                maximum=10.0,
-                multiplier=2.0,
-                deadline=60.0,
-            )
-            def _retry_wrapper():
-                return _sync_update()
+            try:
+                await gcs_run_with_retry(
+                    lambda: run_in_thread(_sync_update),
+                    bucket=bucket_name,
+                    operation="patch_cors",
+                    breaker=self._breaker,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to patch GCS bucket '%s': %s", bucket_name, e,
+                    exc_info=True,
+                )
+                raise
+        else:
+            # Fallback path: legacy google.api_core.retry.Retry (no breaker).
+            def _sync_update_with_retry() -> None:
+                if retry is None:
+                    return _sync_update()
 
-            return _retry_wrapper()
+                @retry.Retry(
+                    predicate=retry.if_exception_type(
+                        GoogleCloudError,
+                        ConnectionError,
+                        TimeoutError,
+                    ),
+                    initial=1.0,
+                    maximum=10.0,
+                    multiplier=2.0,
+                    deadline=60.0,
+                )
+                def _retry_wrapper():
+                    return _sync_update()
 
-        try:
-            await run_in_thread(_sync_update_with_retry)
-        except Exception as e:
-            logger.error(
-                f"Failed to patch GCS bucket '{bucket_name}': {e}", exc_info=True
-            )
-            raise
+                return _retry_wrapper()
+
+            try:
+                await run_in_thread(_sync_update_with_retry)
+            except Exception as e:
+                logger.error(
+                    "Failed to patch GCS bucket '%s': %s", bucket_name, e,
+                    exc_info=True,
+                )
+                raise
 
     async def teardown_gcs_notification(
         self, bucket_name: str, gcs_notification_id: str

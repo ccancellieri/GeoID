@@ -234,6 +234,34 @@ class GcpModuleConfig(ExposableConfigMixin, PluginConfig):
                     "MaintenanceSupervisor task_reaper job."
     )
 
+    # --- GCS retry and per-bucket circuit breaker ---
+    gcs_retry_max_attempts: Mutable[int] = Field(
+        default=3,
+        description=(
+            "Total attempt budget for transient GCS operation failures "
+            "(e.g. bucket CORS patch). 1 means no retry. Each non-final failure "
+            "emits a structured 'gcs_operation_retry' log line suitable for a "
+            "GCP log-based metric."
+        ),
+    )
+    gcs_breaker_failure_threshold: Mutable[int] = Field(
+        default=5,
+        description=(
+            "Consecutive transient GCS failures before the per-bucket circuit "
+            "breaker opens. Prevents hammering a wedged GCS endpoint during a "
+            "degradation event. Mirrors the indexer-breaker failure_threshold "
+            "semantics in CircuitBreaker."
+        ),
+    )
+    gcs_breaker_cooldown_seconds: Mutable[float] = Field(
+        default=30.0,
+        description=(
+            "Seconds the per-bucket circuit breaker stays OPEN before allowing "
+            "a HALF_OPEN probe through. Mirrors the indexer-breaker "
+            "cooldown_seconds semantics in CircuitBreaker."
+        ),
+    )
+
 class TriggeredAction(BaseModel):
     """Defines a process to be triggered by a GCS event."""
     process_id: str = Field(..., description="The ID of the process to execute (e.g., 'ingestion').")
