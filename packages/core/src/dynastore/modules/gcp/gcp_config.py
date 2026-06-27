@@ -241,7 +241,8 @@ class GcpModuleConfig(ExposableConfigMixin, PluginConfig):
             "Total attempt budget for transient GCS operation failures "
             "(e.g. bucket CORS patch). 1 means no retry. Each non-final failure "
             "emits a structured 'gcs_operation_retry' log line suitable for a "
-            "GCP log-based metric."
+            "GCP log-based metric. Read per-call via the central cached config "
+            "getter — changes take effect immediately without a pod restart."
         ),
     )
     gcs_breaker_failure_threshold: Mutable[int] = Field(
@@ -250,7 +251,9 @@ class GcpModuleConfig(ExposableConfigMixin, PluginConfig):
             "Consecutive transient GCS failures before the per-bucket circuit "
             "breaker opens. Prevents hammering a wedged GCS endpoint during a "
             "degradation event. Mirrors the indexer-breaker failure_threshold "
-            "semantics in CircuitBreaker."
+            "semantics in CircuitBreaker. NOTE: the per-bucket CircuitBreaker is "
+            "constructed once at lifespan startup with this value; a pod restart "
+            "is required to apply a changed threshold."
         ),
     )
     gcs_breaker_cooldown_seconds: Mutable[float] = Field(
@@ -258,7 +261,9 @@ class GcpModuleConfig(ExposableConfigMixin, PluginConfig):
         description=(
             "Seconds the per-bucket circuit breaker stays OPEN before allowing "
             "a HALF_OPEN probe through. Mirrors the indexer-breaker "
-            "cooldown_seconds semantics in CircuitBreaker."
+            "cooldown_seconds semantics in CircuitBreaker. NOTE: the per-bucket "
+            "CircuitBreaker is constructed once at lifespan startup with this "
+            "value; a pod restart is required to apply a changed cooldown."
         ),
     )
 

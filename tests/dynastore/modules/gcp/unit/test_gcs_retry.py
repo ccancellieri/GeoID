@@ -357,10 +357,12 @@ class TestCircuitBreakerIntegration:
 
 
 class TestGcpModuleConfigRetryFields:
-    """Contract pin for the three GCS retry/breaker fields added to
-    ``GcpModuleConfig``.  A regression here means the fields were renamed,
-    removed, or their mutability marker was changed — all of which break
-    operator-driven runtime tuning.
+    """Contract pin for the three GCS retry/breaker fields on ``GcpModuleConfig``.
+
+    All three fields must remain present and ``Mutable`` so operators can write
+    new values via the configs API.  ``gcs_retry_max_attempts`` is read per-call
+    (live); the breaker fields require a pod restart but are still writable so
+    operators can configure the next-restart value.
     """
 
     @pytest.fixture(autouse=True)
@@ -368,7 +370,7 @@ class TestGcpModuleConfigRetryFields:
         """Neutralize DB-bound autouse fixtures — pure in-memory introspection."""
         return None
 
-    _RETRY_FIELDS = (
+    _ALL_FIELDS = (
         "gcs_retry_max_attempts",
         "gcs_breaker_failure_threshold",
         "gcs_breaker_cooldown_seconds",
@@ -378,21 +380,27 @@ class TestGcpModuleConfigRetryFields:
         from dynastore.modules.gcp.gcp_config import GcpModuleConfig
         return GcpModuleConfig
 
-    @pytest.mark.parametrize("field", _RETRY_FIELDS)
+    @pytest.mark.parametrize("field", _ALL_FIELDS)
     def test_field_present_on_gcp_module_config(self, field):
         assert field in self._cfg_cls().model_fields, (
             f"Field {field!r} is missing from GcpModuleConfig — the GCS "
-            "retry/breaker tunables cannot be hot-configured."
+            "retry/breaker tunables cannot be configured."
         )
 
-    @pytest.mark.parametrize("field", _RETRY_FIELDS)
+    @pytest.mark.parametrize("field", _ALL_FIELDS)
     def test_field_is_marked_mutable(self, field):
+        """All three fields stay Mutable so operators can write new values.
+
+        gcs_retry_max_attempts: live (per-call config read, no restart needed).
+        gcs_breaker_*: writable for next-restart configuration (restart required
+        to take effect; described in the field description).
+        """
         from dynastore.models.mutability import mutability_map
 
         kinds = mutability_map(self._cfg_cls())
         assert kinds.get(field) == "mutable", (
             f"Field {field!r} mutability is {kinds.get(field)!r}; "
-            "expected 'mutable' so operators can tune it at runtime."
+            "expected 'mutable' so operators can configure it via the configs API."
         )
 
     def test_default_max_attempts(self):
@@ -409,13 +417,54 @@ class TestGcpModuleConfigRetryFields:
 
     def test_gcp_module_lifespan_syncs_gcs_tunables(self):
         """``GCPModule.lifespan`` must reference all three GCS tunable names so
-        operators can hot-reconfigure them without a redeploy."""
+        the module-level snapshots stay in sync with PluginConfig at startup."""
         import inspect
         from dynastore.modules.gcp import gcp_module
 
         src = inspect.getsource(gcp_module.GCPModule.lifespan)
-        for field in self._RETRY_FIELDS:
+        for field in self._ALL_FIELDS:
             assert field in src, (
                 f"GCPModule.lifespan does not reference {field!r} — the GCS "
-                "retry/breaker tunable will not be updated from PluginConfig."
+                "retry/breaker snapshot will not be updated at startup."
             )
+
+    def test_breaker_fields_description_mentions_restart(self):
+        """Breaker field descriptions must warn that a pod restart is required."""
+        cfg_cls = self._cfg_cls()
+        for field in ("gcs_breaker_failure_threshold", "gcs_breaker_cooldown_seconds"):
+            fi = cfg_cls.model_fields[field]
+            desc = fi.description or ""
+            assert "restart" in desc.lower(), (
+                f"Field {field!r} description should mention that a pod restart "
+                "is required to apply changes to the circuit breaker."
+            )
+
+    @pytest.mark.asyncio
+    async def test_gcs_run_with_retry_reads_max_attempts_live(self):
+        """gcs_run_with_retry resolves max_attempts via the live async reader
+        when the caller does not supply an explicit override."""
+        from unittest.mock import AsyncMock, patch
+
+        from dynastore.modules.gcp.gcs_retry import gcs_run_with_retry
+        from dynastore.modules.storage.circuit_breaker import CircuitBreaker
+
+        breaker = CircuitBreaker(failure_threshold=10, cooldown_seconds=30.0)
+
+        async def _always_ok():
+            return "live"
+
+        # Patch the live reader to return a controlled value (2 attempts) so
+        # the test is independent of the DB or module globals.
+        with patch(
+            "dynastore.modules.gcp.gcs_retry._get_live_gcs_max_attempts",
+            new=AsyncMock(return_value=2),
+        ) as mock_live:
+            result = await gcs_run_with_retry(
+                _always_ok,
+                bucket="b",
+                operation="op",
+                breaker=breaker,
+            )
+
+        assert result == "live"
+        mock_live.assert_awaited_once()

@@ -16,12 +16,13 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Unit tests for the pool-pressure-aware retry semaphore (issue #2509).
+"""Unit tests for the pool-pressure-aware retry semaphore.
 
 Covers:
 - Concurrent retries never exceed the configured cap.
 - The happy path (no transient failure) never touches the semaphore.
 - The saturation log is emitted when the semaphore is full.
+- The semaphore is rebuilt when the configured limit changes (live resize).
 - Module-global and semaphore state is restored after each test.
 """
 
@@ -46,37 +47,44 @@ class _TransientErr(Exception):
 
 @pytest.fixture(autouse=True)
 def _reset_semaphore_and_globals():
-    """Restore module-level semaphore and config globals after each test."""
+    """Restore module-level semaphore, limit tracker, and config globals after each test."""
     saved_sem = query_executor._retry_semaphore
+    saved_sem_limit = query_executor._retry_semaphore_limit
     saved_limit = chc._max_concurrent_connection_retries
     saved_exceptions = query_executor._TRANSIENT_CONNECT_EXCEPTIONS
     # Patch the exception tuple so _TransientErr is retried by the decorator.
     query_executor._TRANSIENT_CONNECT_EXCEPTIONS = (_TransientErr,)
     yield
     query_executor._retry_semaphore = saved_sem
+    query_executor._retry_semaphore_limit = saved_sem_limit
     chc._max_concurrent_connection_retries = saved_limit
     query_executor._TRANSIENT_CONNECT_EXCEPTIONS = saved_exceptions
 
 
 class TestSemaphoreBuiltLazily:
-    def test_semaphore_uses_configured_limit(self):
-        """_get_retry_semaphore() sizes itself from the module global."""
+    @pytest.mark.asyncio
+    async def test_semaphore_uses_configured_limit(self):
+        """_get_retry_semaphore() sizes itself from the module global fallback."""
         query_executor._retry_semaphore = None
+        query_executor._retry_semaphore_limit = 0
         chc._max_concurrent_connection_retries = 5
-        sem = _get_retry_semaphore()
+        sem = await _get_retry_semaphore()
         assert sem._value == 5
 
-    def test_semaphore_is_reused_on_subsequent_calls(self):
-        """Calling _get_retry_semaphore() twice returns the same object."""
+    @pytest.mark.asyncio
+    async def test_semaphore_is_reused_on_subsequent_calls(self):
+        """Calling _get_retry_semaphore() twice with the same limit returns the same object."""
         query_executor._retry_semaphore = None
+        query_executor._retry_semaphore_limit = 0
         chc._max_concurrent_connection_retries = 2
-        s1 = _get_retry_semaphore()
-        s2 = _get_retry_semaphore()
+        s1 = await _get_retry_semaphore()
+        s2 = await _get_retry_semaphore()
         assert s1 is s2
 
     def test_semaphore_not_created_for_happy_path(self):
         """A function that always succeeds never builds the semaphore."""
         query_executor._retry_semaphore = None
+        query_executor._retry_semaphore_limit = 0
 
         @retry_on_transient_connect(max_retries=3, base_delay=0, max_delay=0, jitter=0)
         async def always_ok():
@@ -88,6 +96,35 @@ class TestSemaphoreBuiltLazily:
         assert query_executor._retry_semaphore is None
 
 
+class TestSemaphoreResizeOnChange:
+    """Semaphore is rebuilt when the configured limit changes (live resize)."""
+
+    @pytest.mark.asyncio
+    async def test_semaphore_rebuilt_when_limit_changes(self):
+        """When the fallback limit changes the holder replaces the semaphore."""
+        query_executor._retry_semaphore = None
+        query_executor._retry_semaphore_limit = 0
+        chc._max_concurrent_connection_retries = 3
+        s1 = await _get_retry_semaphore()
+        assert s1._value == 3
+
+        # Operator changes the limit.
+        chc._max_concurrent_connection_retries = 7
+        s2 = await _get_retry_semaphore()
+        assert s2._value == 7
+        assert s2 is not s1, "a new semaphore must be built when the limit changes"
+
+    @pytest.mark.asyncio
+    async def test_semaphore_not_rebuilt_when_limit_unchanged(self):
+        """No rebuild when the configured limit matches the current semaphore."""
+        query_executor._retry_semaphore = None
+        query_executor._retry_semaphore_limit = 0
+        chc._max_concurrent_connection_retries = 4
+        s1 = await _get_retry_semaphore()
+        s2 = await _get_retry_semaphore()
+        assert s1 is s2
+
+
 class TestConcurrentRetryCap:
     """Concurrent retries never exceed the configured semaphore limit."""
 
@@ -97,6 +134,7 @@ class TestConcurrentRetryCap:
         number of simultaneous in-flight retry calls never exceeds 2."""
         cap = 2
         query_executor._retry_semaphore = None
+        query_executor._retry_semaphore_limit = 0
         chc._max_concurrent_connection_retries = cap
 
         in_flight: list[int] = [0]
@@ -133,7 +171,10 @@ class TestConcurrentRetryCap:
     async def test_happy_path_concurrency_not_restricted(self):
         """Tasks that never fail are never gated — all run concurrently."""
         cap = 1  # restrictive cap; must not affect the happy path
+        # Set both semaphore and limit tracker so the resize holder doesn't rebuild.
         query_executor._retry_semaphore = asyncio.Semaphore(cap)
+        query_executor._retry_semaphore_limit = cap
+        chc._max_concurrent_connection_retries = cap
 
         in_flight: list[int] = [0]
         peak: list[int] = [0]
@@ -165,6 +206,7 @@ class TestSaturationLog:
         # Set cap to 1 so the second concurrent retrier sees a saturated semaphore.
         cap = 1
         query_executor._retry_semaphore = None
+        query_executor._retry_semaphore_limit = 0
         chc._max_concurrent_connection_retries = cap
 
         gate_event = asyncio.Event()   # retrier-1 signals when it holds the slot
@@ -223,6 +265,7 @@ class TestHappyPathNeverTouchesSemaphore:
 
     def test_no_semaphore_created_on_success(self):
         query_executor._retry_semaphore = None
+        query_executor._retry_semaphore_limit = 0
 
         @retry_on_transient_connect(max_retries=5, base_delay=0, max_delay=0, jitter=0)
         async def ok() -> str:

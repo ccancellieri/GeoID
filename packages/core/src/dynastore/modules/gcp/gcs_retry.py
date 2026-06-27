@@ -40,17 +40,26 @@ This module covers GCS bucket API calls only.  Pub/Sub operations
 their own bounded retry loops in :mod:`gcp_eventing_ops`; they are not
 wrapped here.
 
-Retry tunables and breaker thresholds are driven by
-:class:`~dynastore.modules.gcp.gcp_config.GcpModuleConfig` fields, kept
-in module-level variables that are updated at lifespan startup (hot-reload
-on process restart, consistent with the catalog-visibility tunables pattern).
+Retry tunables are driven by
+:class:`~dynastore.modules.gcp.gcp_config.GcpModuleConfig` fields:
+
+* ``gcs_retry_max_attempts`` — read **per-call** from the central
+  ``PlatformConfigsProtocol`` L1-cached getter, so the value is live without
+  a pod restart.  Falls back to the module-level lifespan snapshot when the
+  config service is unavailable.
+
+* ``gcs_breaker_failure_threshold`` / ``gcs_breaker_cooldown_seconds`` — baked
+  into the :class:`~dynastore.modules.storage.circuit_breaker.CircuitBreaker`
+  object at lifespan construction.  A pod restart is required to apply changes
+  (the breaker is ``Mutable`` in the configs API so a new value can be written
+  to take effect on the next restart).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Awaitable, Callable, Optional, Tuple, TypeVar
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional, TypeVar
 
 if TYPE_CHECKING:
     from dynastore.modules.storage.circuit_breaker import CircuitBreaker
@@ -101,26 +110,35 @@ def _is_transient_gcs_error(exc: BaseException) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Tunable reader (hot-reload via module-level variables)
+# Tunable readers
 # ---------------------------------------------------------------------------
 
 
-def _get_gcs_retry_tunables() -> Tuple[int, int, float]:
-    """Return live GCS retry tunables from the gcp_module module-level variables.
+async def _get_live_gcs_max_attempts() -> int:
+    """Return the current ``gcs_retry_max_attempts`` from the central config getter.
 
-    Variables are updated from ``GcpModuleConfig`` during lifespan startup,
-    giving hot-reload-on-restart semantics consistent with the
-    ``_CATALOG_VISIBILITY_*`` pattern in :mod:`gcp_catalog_ops`.
-
-    Returns ``(max_attempts, breaker_failure_threshold, breaker_cooldown_seconds)``.
+    Reads ``GcpModuleConfig.gcs_retry_max_attempts`` per-call via the
+    ``PlatformConfigsProtocol`` L1-cached getter so operators can change the
+    attempt budget at runtime without restarting pods.  Falls back to the
+    module-level startup snapshot when the config service is unavailable
+    (e.g. during tests or before lifespan completes).
     """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.gcp.gcp_config import GcpModuleConfig
+        from dynastore.tools.discovery import get_protocol
+
+        svc = get_protocol(PlatformConfigsProtocol)
+        if svc is not None:
+            cfg = await svc.get_config(GcpModuleConfig)
+            if isinstance(cfg, GcpModuleConfig):
+                return cfg.gcs_retry_max_attempts
+    except Exception:
+        pass
+    # Fallback: module-level snapshot set at lifespan startup.
     from dynastore.modules.gcp import gcp_module as _mod
 
-    return (
-        _mod._GCS_RETRY_MAX_ATTEMPTS,
-        _mod._GCS_BREAKER_FAILURE_THRESHOLD,
-        _mod._GCS_BREAKER_COOLDOWN_SECONDS,
-    )
+    return _mod._GCS_RETRY_MAX_ATTEMPTS
 
 
 # ---------------------------------------------------------------------------
@@ -164,14 +182,15 @@ async def gcs_run_with_retry(
     :param breaker: Shared :class:`CircuitBreaker` held on ``GCPModule``
         and keyed per-bucket.  Pass ``GCPModule._gcs_breaker``.
     :param max_attempts: Total attempt budget (1 = no retry).  Defaults to
-        the live module tunable from :func:`_get_gcs_retry_tunables`.
+        the live value of ``GcpModuleConfig.gcs_retry_max_attempts`` read via
+        the central config getter (L1-cached, no per-call DB hit).
     :param base_delay: Base for the ``base_delay * 2**attempt`` exponential
         back-off in seconds between retry attempts.
     """
     from dynastore.modules.gcp.errors import GcpServiceUnavailableError
 
     if max_attempts is None:
-        max_attempts = _get_gcs_retry_tunables()[0]
+        max_attempts = await _get_live_gcs_max_attempts()
 
     # Fast-fail if the bucket's circuit is already open.
     if breaker.is_open(bucket):

@@ -124,11 +124,12 @@ _provisioning_config: ProvisioningRetryConfig = ProvisioningRetryConfig()
 _leadership_config: LeadershipConfig = LeadershipConfig()
 _health_config: _ConnectionHealthInfraConfig = _ConnectionHealthInfraConfig()
 
-# Cap on concurrent connection-acquisition retries (issue #2509).
+# Fallback for the concurrent connection-acquisition retry cap.
 # Mirrors the default of ConnectionHealthConfig.max_concurrent_connection_retries
 # so tests can override this module global without requiring a live platform
-# config service. The process-wide retry semaphore is built lazily from this
-# value at first retry; a process restart is required to apply a changed limit.
+# config service.  The semaphore in query_executor reads the live
+# ConnectionHealthConfig value per-call (central cached getter) and falls back
+# to this global when the config service is unavailable.
 _max_concurrent_connection_retries: int = 3
 
 
@@ -167,14 +168,14 @@ def resolve_slow_pool_acquire_threshold() -> float:
 
 
 def resolve_max_concurrent_connection_retries() -> int:
-    """Return the current cap on simultaneous connection-acquisition retries.
+    """Return the fallback cap on simultaneous connection-acquisition retries.
 
-    Used by ``query_executor`` to size the process-wide retry semaphore that
-    prevents a pool-wedge from being amplified by concurrent retry storms.
-    Reads from the module global ``_max_concurrent_connection_retries`` (default
-    mirrors ``ConnectionHealthConfig.max_concurrent_connection_retries``).
-    Tests may replace the global directly; the semaphore is built lazily on
-    first retry so overrides applied before the first retry take effect.
+    Used by ``query_executor._read_live_retry_limit`` as the fallback value
+    when the ``PlatformConfigsProtocol`` config service is unavailable.
+    The live path reads ``ConnectionHealthConfig.max_concurrent_connection_retries``
+    directly from the central cached getter and does not call this function.
+    Tests may replace the global ``_max_concurrent_connection_retries`` directly
+    to control the fallback value without a live config service.
     """
     return _max_concurrent_connection_retries
 
@@ -245,14 +246,14 @@ class ConnectionHealthConfig(PluginConfig):
         le=32,
         description=(
             "Maximum number of concurrent connection-acquisition retries allowed "
-            "at any instant (issue #2509). When the async PG pool wedges, many "
-            "callers enter the retry loop simultaneously and hammer the pool, "
-            "amplifying the pressure. This semaphore bounds the number of in-flight "
-            "retry attempts so excess callers queue gracefully instead of stampeding. "
-            "The first (non-retry) attempt is never gated, preserving happy-path "
-            "latency. Conservative default of 3; raise only if you have a large "
-            "pool and high parallelism. NOTE: the process-wide semaphore is sized "
-            "from the module-global snapshot at first use; a process restart is "
-            "required to apply a changed value (read-once). Must be in [1, 32]."
+            "at any instant. When the async PG pool wedges, many callers enter "
+            "the retry loop simultaneously and hammer the pool, amplifying the "
+            "pressure. This semaphore bounds the number of in-flight retry attempts "
+            "so excess callers queue gracefully instead of stampeding. The first "
+            "(non-retry) attempt is never gated, preserving happy-path latency. "
+            "Conservative default of 3; raise only if you have a large pool and "
+            "high parallelism. Read per-call via the central cached config getter "
+            "— changes take effect immediately without a pod restart. Must be in "
+            "[1, 32]."
         ),
     )

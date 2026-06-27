@@ -1313,38 +1313,64 @@ _TRANSIENT_CONNECT_EXCEPTIONS: tuple = (
 # Design:
 # - The semaphore is created lazily on the first retry attempt so asyncio's
 #   event loop is guaranteed to exist at construction time.
-# - It is sized from ``resolve_max_concurrent_connection_retries()`` (which
-#   reads the ``_max_concurrent_connection_retries`` module global, defaulting
-#   to ``ConnectionHealthConfig.max_concurrent_connection_retries = 3``).
-# - The semaphore is process-wide and **read-once**: the limit cannot be changed
-#   at runtime without a process restart.  Operators who change the value in the
-#   platform configs table must restart pods to apply it.
+# - The limit is read **per-call** from ``ConnectionHealthConfig`` via the
+#   central ``PlatformConfigsProtocol`` L1-cached getter so operators can
+#   change the cap without restarting pods.  Falls back to the module-global
+#   ``_max_concurrent_connection_retries`` when the config service is
+#   unavailable (tests, early startup).
+# - A resize-on-change holder tracks the limit the current semaphore was
+#   sized with.  When the configured limit differs, a fresh semaphore is
+#   built.  In-flight holders of the old semaphore are unaffected and
+#   release normally; new retriers get the updated gate.
 # - Only retries (attempt >= 1) are gated; the first attempt is never gated so
 #   the happy path retains zero overhead.
 # - Deadlock safety: the semaphore is acquired only when the previous connection
 #   attempt has already failed (i.e., no pool connection is held by the caller).
 #   Therefore a coroutine can never hold a DB connection and simultaneously block
 #   on the retry semaphore — the two resources are mutually exclusive in time.
-# - Tests may replace ``_retry_semaphore`` with ``None`` (or a fresh Semaphore)
-#   to reset state between runs; the module-global ``_max_concurrent_connection_retries``
-#   may also be overridden directly (same pattern as other infra globals in
-#   ``connection_health_config``).
+# - Tests may replace ``_retry_semaphore`` / ``_retry_semaphore_limit`` with
+#   None / 0 to reset state between runs; the module-global
+#   ``_max_concurrent_connection_retries`` may also be overridden directly
+#   (same pattern as other infra globals in ``connection_health_config``).
 _retry_semaphore: Optional[asyncio.Semaphore] = None
+_retry_semaphore_limit: int = 0  # limit the current semaphore was sized with
 
 
-def _get_retry_semaphore() -> asyncio.Semaphore:
+async def _get_retry_semaphore() -> asyncio.Semaphore:
     """Return the process-wide connection-retry concurrency semaphore.
 
-    Built lazily on first call so asyncio's event loop is available.
-    The limit is read from :func:`resolve_max_concurrent_connection_retries`
-    once at construction; subsequent config changes take effect only after a
-    process restart (read-once semantics).
+    Reads the configured limit live from ``ConnectionHealthConfig`` via the
+    central cached config getter (L1 in-memory, cheap per call).  Rebuilds
+    the semaphore when the limit changes so operators can adjust the cap
+    without a pod restart.  Falls back to
+    :func:`resolve_max_concurrent_connection_retries` (module-global default)
+    when the config service is unavailable.
     """
-    global _retry_semaphore
-    if _retry_semaphore is None:
-        limit = resolve_max_concurrent_connection_retries()
+    global _retry_semaphore, _retry_semaphore_limit
+    limit = await _read_live_retry_limit()
+    if _retry_semaphore is None or _retry_semaphore_limit != limit:
         _retry_semaphore = asyncio.Semaphore(limit)
+        _retry_semaphore_limit = limit
     return _retry_semaphore
+
+
+async def _read_live_retry_limit() -> int:
+    """Read ``ConnectionHealthConfig.max_concurrent_connection_retries`` live."""
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.db_config.connection_health_config import (
+            ConnectionHealthConfig,
+        )
+        from dynastore.tools.discovery import get_protocol
+
+        svc = get_protocol(PlatformConfigsProtocol)
+        if svc is not None:
+            cfg = await svc.get_config(ConnectionHealthConfig)
+            if isinstance(cfg, ConnectionHealthConfig):
+                return cfg.max_concurrent_connection_retries
+    except Exception:
+        pass
+    return resolve_max_concurrent_connection_retries()
 
 
 def _err_repr(exc: BaseException) -> str:
@@ -1491,7 +1517,7 @@ def retry_on_transient_connect(
                 # Retry attempt: acquire the pool-pressure gate before touching
                 # the pool again.  Check for saturation *before* awaiting so
                 # the log line appears at queue time, not after the wait.
-                sem = _get_retry_semaphore()
+                sem = await _get_retry_semaphore()
                 if sem._value == 0:  # all permits taken — callers will queue
                     logger.info(
                         "retry_on_transient_connect_semaphore_saturated "
