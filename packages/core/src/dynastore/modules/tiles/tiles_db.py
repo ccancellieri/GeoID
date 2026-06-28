@@ -281,12 +281,56 @@ async def get_features_as_mvt_filtered(
     if not union_queries:
         return None
 
-    # 4. Final SQL Execution
+    # 4. Resolve zoom-aware feature density filter.
+    #
+    # Read min_feature_pixel_area_by_zoom from the first resolved collection (it comes
+    # from TilesConfig which is catalog-scoped; using the first entry is correct for
+    # single-collection tiles, and a reasonable fallback for multi-collection tiles
+    # that share a catalog).  The lookup mirrors the simplification bracket logic:
+    # find the highest zoom key ≤ the current zoom level.
+    #
+    # Safety: points and lines (projected area = 0) always pass because the predicate is
+    #   NOT (ST_Area(geom) > 0 AND ST_Area(geom) < :min_pixel_area)
+    # which is True when area = 0 (first conjunct is False).
+    # NULL geoms (ST_AsMVTGeom returns NULL for out-of-tile features) are also filtered
+    # because ST_Area(NULL) IS NULL, making the NOT(…) expression evaluate to NULL,
+    # which SQL treats as FALSE in a WHERE clause — consistent with the existing
+    # spatial-intersects pre-filter in the per-collection subqueries.
+    area_where = ""
+    min_pixel_area: Optional[float] = None
+    if resolved_collections:
+        density_map: Dict[int, float] = (
+            resolved_collections[0].get("min_feature_pixel_area_by_zoom") or {}
+        )
+        if density_map:
+            try:
+                z_int = int(z)
+                for zoom_key, area_threshold in sorted(
+                    density_map.items(), reverse=True
+                ):
+                    if z_int >= zoom_key:
+                        min_pixel_area = area_threshold
+                        break
+            except ValueError:
+                pass
+
+    if min_pixel_area and min_pixel_area > 0:
+        # Exclude sub-pixel polygon features; points/lines (area=0) always pass.
+        area_where = (
+            " WHERE NOT (ST_Area(mvtgeom.geom) > 0"
+            " AND ST_Area(mvtgeom.geom) < :min_pixel_area)"
+        )
+        all_bind_params["min_pixel_area"] = min_pixel_area
+        logger.debug(
+            "density filter active: z=%s min_pixel_area=%.4f", z, min_pixel_area
+        )
+
+    # 5. Final SQL Execution
     full_query = f"""
-        WITH 
+        WITH
         mvtgeom AS ({" UNION ALL ".join(union_queries)})
-        SELECT ST_AsMVT(mvtgeom.*, 'default', {extent}, 'geom') 
-        FROM mvtgeom;
+        SELECT ST_AsMVT(mvtgeom.*, 'default', {extent}, 'geom')
+        FROM mvtgeom{area_where};
     """
 
     logger.info(

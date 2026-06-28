@@ -1189,9 +1189,13 @@ async def get_tile_resolution_params(
             ))
 
         # Extract relevant fields
-        simplification_by_zoom = {}
+        simplification_by_zoom: Dict[int, float] = {}
+        min_feature_pixel_area_by_zoom: Dict[int, float] = {}
         if isinstance(tiles_config, TilesConfig):
             simplification_by_zoom = tiles_config.simplification_by_zoom or {}
+            min_feature_pixel_area_by_zoom = (
+                tiles_config.min_feature_pixel_area_by_zoom or {}
+            )
 
         # 4. Resolve the collection config for sidecar-aware MVT queries from
         # the SAME tile-capable driver resolved above (Hint.TILES → PG). Two
@@ -1228,6 +1232,7 @@ async def get_tile_resolution_params(
             "phys_table": phys_table,
             "source_srid": source_srid,
             "simplification_by_zoom": simplification_by_zoom,
+            "min_feature_pixel_area_by_zoom": min_feature_pixel_area_by_zoom,
             "catalog_id": catalog_id,
             "collection_id": collection_id,
             "col_config": col_config,

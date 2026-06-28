@@ -47,12 +47,78 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
     )
 
     # Runtime Generation Settings
-    simplification_by_zoom: Mutable[Optional[Dict[int, float]]] = Field(default=None,
-        description="Map of zoom level to simplification tolerance (in degrees/units). Applied during dynamic generation."
+    #
+    # Default per-zoom simplification tolerances (EPSG:4326 source, WebMercatorQuad TMS,
+    # extent=4096). Each key is the minimum zoom level for the bracket; the lookup in
+    # _build_collection_subquery finds the highest key ≤ the requested zoom.
+    # Tolerance = half a MVT pixel width in source-CRS degrees at the bracket's lower bound.
+    # At z10+ the value is 0.0 (feature detail exceeds pixel resolution; simplification
+    # produces no benefit and risks collapsing thin polygon slivers at interactive zoom).
+    #
+    # Zoom bracket | °/pixel  | Default tolerance
+    # -------------|----------|------------------
+    # z 0–1        | 0.088    | 0.044
+    # z 2–3        | 0.022    | 0.011
+    # z 4–5        | 0.0055   | 0.00275
+    # z 6–7        | 0.00137  | 0.000687
+    # z 8–9        | 0.000343 | 0.000172
+    # z10+         | ≤0.000086| 0.0  (disabled)
+    #
+    # For meter-source collections (EPSG:3857) multiply by ~111 319 (m/° at equator).
+    # Override per-collection via PUT /configs/platform/modules/tiles on the relevant scope.
+    # Set to {} or null to disable all simplification.
+    simplification_by_zoom: Mutable[Optional[Dict[int, float]]] = Field(
+        default_factory=lambda: {
+            0: 0.044,
+            2: 0.011,
+            4: 0.00275,
+            6: 0.000687,
+            8: 0.000172,
+            10: 0.0,
+        },
+        description=(
+            "Per-zoom simplification tolerance in source-CRS units (degrees for EPSG:4326). "
+            "Each key is the minimum zoom level for its bracket; the lookup finds the "
+            "highest key ≤ the requested zoom. 0.0 disables simplification for that bracket. "
+            "Defaults are approximately half a MVT-pixel width at each zoom level for a "
+            "4326-source WebMercatorQuad collection (extent=4096). "
+            "Set to {} or null to disable simplification entirely."
+        ),
     )
     simplification_algorithm: Mutable[Optional[SimplificationAlgorithm]] = Field(
         default=SimplificationAlgorithm.TOPOLOGY_PRESERVING,
-        description="Algorithm used for dynamic simplification."
+        description="Algorithm used for dynamic simplification.",
+    )
+
+    # Zoom-aware feature density filter (opt-in, default disabled).
+    #
+    # At low zoom many polygon features project to sub-pixel area — they inflate
+    # tile byte size and driver render time without being visible. When configured,
+    # the MVT query adds a WHERE clause that discards these features before the
+    # ST_AsMVT aggregate.
+    #
+    # Safety rules:
+    #   - Points and LineStrings (projected area = 0) ALWAYS pass through.
+    #     The predicate is  NOT (ST_Area(geom) > 0 AND ST_Area(geom) < :threshold),
+    #     so only polygon geometries can be dropped.
+    #   - The default is None (disabled) to prevent silently dropping valid features
+    #     from mixed-geometry or sparsely-populated collections.
+    #   - Activate only for polygon-dominant collections (e.g. administrative units).
+    #   - Conservative example: {0: 4.0, 2: 4.0, 4: 2.0, 6: 1.0, 8: 0.0}
+    #     (4 MVT pixel² is reliably invisible to any renderer; 1 px² is a single pixel).
+    #   - 0.0 in any bracket disables filtering for that zoom and above.
+    min_feature_pixel_area_by_zoom: Mutable[Optional[Dict[int, float]]] = Field(
+        default=None,
+        description=(
+            "Opt-in zoom-aware feature density filter. "
+            "Each key is the minimum zoom level for the bracket; value is the minimum "
+            "projected area in MVT pixel² that a polygon feature must have to be included "
+            "in the tile (ST_Area(ST_AsMVTGeom(...)) ≥ threshold). "
+            "Points and LineStrings (area = 0) always pass. "
+            "0.0 in any bracket disables filtering for that zoom and above. "
+            "Default None = no density filtering (safe for all collection types). "
+            "Override per-collection via PUT /configs/platform/modules/tiles."
+        ),
     )
 
     # Caching
