@@ -686,16 +686,24 @@ class TasksService(ExtensionProtocol):
 
     @router.get(
         "/dead-letter",
+        response_model=TaskPage,
         summary="List dead-lettered tasks across all tenants (sysadmin).",
     )
     async def list_dead_letter_system(
         request: Request,  # type: ignore[reportGeneralTypeIssues]
         task_type: Optional[str] = Query(None),
+        cursor: Optional[str] = Query(None),
         limit: int = Query(100, ge=1, le=500),
-    ) -> List[Any]:
+    ) -> TaskPage:
         """System-wide DLQ listing (all tenants).  Requires tasks_system_admin."""
         engine = get_async_engine(request)
-        return await _dlq_list(engine, task_type=task_type, limit=limit)
+        try:
+            rows = await _dlq_list(
+                engine, task_type=task_type, limit=limit + 1, cursor=cursor
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return _to_task_page(rows, limit)
 
     # ------------------------------------------------------------------
     # 11. GET /task/catalogs/{catalog_id}/dead-letter
@@ -703,18 +711,26 @@ class TasksService(ExtensionProtocol):
 
     @router.get(
         "/catalogs/{catalog_id}/dead-letter",
+        response_model=TaskPage,
         summary="List dead-lettered tasks for a catalog (catalog-admin).",
     )
     async def list_dead_letter_catalog(
         catalog_id: str,  # type: ignore[reportGeneralTypeIssues]
         request: Request,
         task_type: Optional[str] = Query(None),
+        cursor: Optional[str] = Query(None),
         limit: int = Query(100, ge=1, le=500),
-    ) -> List[Any]:
+    ) -> TaskPage:
         """Catalog-scoped DLQ listing.  Requires tasks_admin."""
         engine = get_async_engine(request)
         schema = await tasks_module._resolve_catalog_schema(catalog_id)
-        return await _dlq_list(engine, catalog_id=schema, task_type=task_type, limit=limit)
+        try:
+            rows = await _dlq_list(
+                engine, catalog_id=schema, task_type=task_type, limit=limit + 1, cursor=cursor
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return _to_task_page(rows, limit)
 
     # ------------------------------------------------------------------
     # 12. GET /task/catalogs/{catalog_id}/collections/{collection_id}/dead-letter
@@ -722,6 +738,7 @@ class TasksService(ExtensionProtocol):
 
     @router.get(
         "/catalogs/{catalog_id}/collections/{collection_id}/dead-letter",
+        response_model=TaskPage,
         summary="List dead-lettered tasks for a collection (catalog-admin).",
     )
     async def list_dead_letter_collection(
@@ -729,18 +746,24 @@ class TasksService(ExtensionProtocol):
         collection_id: str,
         request: Request,
         task_type: Optional[str] = Query(None),
+        cursor: Optional[str] = Query(None),
         limit: int = Query(100, ge=1, le=500),
-    ) -> List[Any]:
+    ) -> TaskPage:
         """Collection-scoped DLQ listing.  Requires tasks_admin."""
         engine = get_async_engine(request)
         schema = await tasks_module._resolve_catalog_schema(catalog_id)
-        return await _dlq_list(
-            engine,
-            catalog_id=schema,
-            collection_id=collection_id,
-            task_type=task_type,
-            limit=limit,
-        )
+        try:
+            rows = await _dlq_list(
+                engine,
+                catalog_id=schema,
+                collection_id=collection_id,
+                task_type=task_type,
+                limit=limit + 1,
+                cursor=cursor,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return _to_task_page(rows, limit)
 
     # ------------------------------------------------------------------
     # 13. POST /task/dead-letter/{task_id}/requeue

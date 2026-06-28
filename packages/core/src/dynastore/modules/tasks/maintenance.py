@@ -42,7 +42,8 @@ from dynastore.modules.db_config.query_executor import (
     ResultHandler,
     managed_transaction,
 )
-from dynastore.modules.tasks.tasks_module import get_task_schema
+from dynastore.models.tasks import Task
+from dynastore.modules.tasks.tasks_module import decode_cursor, get_task_schema
 
 logger = logging.getLogger(__name__)
 
@@ -137,9 +138,18 @@ async def list_dead_letter_tasks(
     collection_id: Optional[str] = None,
     task_type: Optional[str] = None,
     limit: int = 100,
-) -> List[Dict[str, Any]]:
+    cursor: Optional[str] = None,
+) -> List[Task]:
     """
     Returns tasks in DEAD_LETTER state for operator review.
+
+    Ordered oldest-first (``timestamp ASC, task_id ASC``) for operator triage.
+    Pass ``limit+1`` from the route layer to detect whether a next page exists;
+    use :func:`encode_cursor` on the (limit+1)-th row to produce the token.
+
+    When *cursor* is provided the query uses a keyset predicate
+    ``(timestamp, task_id) > (cursor_ts, cursor_id)`` — the ASC counterpart
+    of the ``<`` predicate used by the DESC task-list routes.
 
     Args:
         catalog_id: Scope to a single tenant (catalog internal id or reserved
@@ -148,7 +158,8 @@ async def list_dead_letter_tasks(
         collection_id: Further scope to a specific STAC collection. Ignored when
                        ``catalog_id`` is ``None`` (system scope has no collections).
         task_type: Optional filter to a specific task_type value.
-        limit: Maximum rows returned (default 100, max 500).
+        limit: Maximum rows to return. Pass ``limit+1`` to detect next page.
+        cursor: Opaque keyset cursor from a previous page response.
     """
     task_schema = get_task_schema()
     filters = "WHERE status = 'DEAD_LETTER'"
@@ -163,18 +174,27 @@ async def list_dead_letter_tasks(
         filters += " AND task_type = :task_type"
         params["task_type"] = task_type
 
-    sql = f"""
-        SELECT task_id, catalog_id, collection_id, task_type, owner_id,
-               retry_count, max_retries, timestamp, finished_at, error_message, inputs
-        FROM {task_schema}.tasks
-        {filters}
-        ORDER BY timestamp ASC
-        LIMIT :limit;
-    """
+    if cursor is not None:
+        c_ts, c_id = decode_cursor(cursor)
+        params["c_ts"] = c_ts
+        params["c_id"] = c_id
+        sql = (
+            f"SELECT * FROM {task_schema}.tasks "
+            f"{filters} AND (timestamp, task_id) > (:c_ts, :c_id) "
+            f"ORDER BY timestamp ASC, task_id ASC LIMIT :limit;"
+        )
+    else:
+        sql = (
+            f"SELECT * FROM {task_schema}.tasks "
+            f"{filters} "
+            f"ORDER BY timestamp ASC, task_id ASC LIMIT :limit;"
+        )
+
     async with managed_transaction(engine) as conn:
-        return await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
+        rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
             conn, **params
         ) or []
+    return [Task.model_validate(r) for r in rows]
 
 
 async def requeue_dead_letter_task(
