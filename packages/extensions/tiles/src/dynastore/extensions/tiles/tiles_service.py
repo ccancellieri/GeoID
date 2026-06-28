@@ -61,6 +61,7 @@ from dynastore.modules.tiles.tiles_module import TileStorageProtocol, TileArchiv
 from dynastore.tools.cache import cached
 from dynastore.modules.tiles.tiles_config import (
     TilesConfig,
+    TilesCachingConfig,
 )
 from dynastore.modules.tiles.tiles_models import (
     TileMatrixSetList,
@@ -859,6 +860,14 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                             logger.warning(f"Failed to refresh tile cache: {e}")
                     else:
                         # Attempt redirect or proxy
+                        caching_cfg = await config_manager.get_config(
+                            TilesCachingConfig
+                        )
+                        serve_mode = (
+                            caching_cfg.cache_serve_mode
+                            if isinstance(caching_cfg, TilesCachingConfig)
+                            else "redirect"
+                        )
                         res = await self._try_cached_tile(
                             provider,
                             dataset,
@@ -869,6 +878,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                             y,
                             format,
                             start_time,
+                            serve_mode=serve_mode,
                         )
                         if res:
                             return res
@@ -1108,12 +1118,40 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
 
     @staticmethod
     async def _try_cached_tile(
-        provider, dataset, cache_id, tms_id, z, x, y, format, start_time
+        provider,
+        dataset,
+        cache_id,
+        tms_id,
+        z,
+        x,
+        y,
+        format,
+        start_time,
+        serve_mode: Literal["proxy", "redirect"] = "redirect",
     ):
-        try:
-            url = await provider.get_tile_url(
-                dataset, cache_id, tms_id, z, x, y, format
-            )
+        """Return a cached-tile response or None (cache miss → caller renders).
+
+        ``serve_mode="redirect"`` (default): resolve a short-lived signed URL
+        and issue a 307 so the client pulls bytes directly from GCS; falls back
+        to proxy if signing raises (logged as WARNING).
+
+        ``serve_mode="proxy"``: stream bytes through this process — no signing
+        call, lower concurrency ceiling, use when signing credentials are absent
+        or a CDN handles redirects upstream.
+        """
+        # --- Redirect mode: try signed URL, fall back to proxy on failure ---
+        if serve_mode == "redirect":
+            url: Optional[str] = None
+            try:
+                url = await provider.get_tile_url(
+                    dataset, cache_id, tms_id, z, x, y, format
+                )
+            except Exception as exc:
+                logger.warning(
+                    "tile_cache: signed URL failed (serve_mode=redirect), "
+                    "falling back to proxy — catalog=%s collection=%s: %s",
+                    dataset, cache_id, exc,
+                )
             if url:
                 duration_ms = (time.perf_counter() - start_time) * 1000
                 logger.info(
@@ -1130,24 +1168,27 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                     },
                 )
 
+        # --- Proxy path: serve_mode=="proxy" OR redirect fell through ---
+        try:
             tile = await provider.get_tile(dataset, cache_id, tms_id, z, x, y, format)
-            if tile:
-                duration_ms = (time.perf_counter() - start_time) * 1000
-                logger.info(
-                    "tile_cache event=hit source=bucket_proxy catalog=%s collection=%s "
-                    "z=%s x=%s y=%s duration_ms=%.2f bytes=%d",
-                    dataset, cache_id, z, x, y, duration_ms, len(tile),
-                )
-                return Response(
-                    content=tile,
-                    media_type="application/vnd.mapbox-vector-tile",
-                    headers={
-                        "X-Tile-Cache": "hit",
-                        "X-Tile-Source": "bucket_proxy",
-                    },
-                )
-        except Exception as e:
-            logger.warning(f"Cache lookup failed: {e}")
+        except Exception as exc:
+            logger.warning("tile_cache: proxy lookup failed: %s", exc)
+            return None
+        if tile:
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            logger.info(
+                "tile_cache event=hit source=bucket_proxy catalog=%s collection=%s "
+                "z=%s x=%s y=%s duration_ms=%.2f bytes=%d",
+                dataset, cache_id, z, x, y, duration_ms, len(tile),
+            )
+            return Response(
+                content=tile,
+                media_type="application/vnd.mapbox-vector-tile",
+                headers={
+                    "X-Tile-Cache": "hit",
+                    "X-Tile-Source": "bucket_proxy",
+                },
+            )
         return None
 
     @staticmethod

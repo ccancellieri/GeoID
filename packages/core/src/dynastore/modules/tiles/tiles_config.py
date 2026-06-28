@@ -16,7 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from typing import ClassVar, Dict, List, Optional, Tuple
+from typing import ClassVar, Dict, List, Literal, Optional, Tuple
 from pydantic import Field
 from dynastore.models.mutability import Mutable
 from dynastore.models.plugin_config import PluginConfig
@@ -127,6 +127,33 @@ class TilesCachingConfig(PluginConfig):
             "tile object written to the bucket. 0 disables browser/CDN "
             "caching (objects still persist server-side). Default is one "
             "year (the GCS max-age ceiling)."
+        ),
+    )
+
+    # --- Serve mode ---
+    #
+    # Controls how cache hits are delivered to the client.
+    #
+    # ``redirect`` (default): the service resolves a short-lived V4 signed URL
+    # and issues a 307 so the client fetches bytes directly from GCS — zero
+    # proxy bandwidth through the API process.  Requires the Cloud Run SA to
+    # have ``iam.serviceAccounts.signBlob`` (IAMCredentials API); signing uses
+    # ``identity_provider.get_account_email()`` + ``get_fresh_token()`` so no
+    # static key file is needed.  If signing raises (e.g. permission denied),
+    # the request falls back to ``proxy`` automatically and a WARNING is logged.
+    #
+    # ``proxy``: bytes are streamed through the API process (old behaviour).
+    # Use when signing credentials are unavailable or when a reverse proxy
+    # (CDN / Nginx) handles client-facing GCS redirects itself.
+    cache_serve_mode: Mutable[Literal["proxy", "redirect"]] = Field(
+        default="redirect",
+        description=(
+            "How cache hits reach the client. ``redirect`` (default) issues a "
+            "307 to a V4 signed GCS URL — offloads byte transfer to GCS, no "
+            "proxy bandwidth through the API. Requires ``iam.serviceAccounts"
+            ".signBlob`` on the Cloud Run SA; falls back to ``proxy`` "
+            "automatically if signing fails. ``proxy`` streams bytes through "
+            "the API process (lower concurrency ceiling)."
         ),
     )
 

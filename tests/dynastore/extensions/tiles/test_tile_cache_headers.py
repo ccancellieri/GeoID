@@ -94,8 +94,8 @@ async def test_full_miss_returns_none_for_caller_to_regenerate():
 
 
 @pytest.mark.asyncio
-async def test_provider_exception_swallowed_falls_through_to_miss():
-    """A flaky bucket must not break the route — caller regenerates from PG."""
+async def test_redirect_signing_failure_falls_back_to_proxy_then_miss():
+    """Signing raises in redirect mode → proxy fallback; tile absent → None."""
     provider = MagicMock()
     provider.get_tile_url = AsyncMock(side_effect=RuntimeError("GCS unavailable"))
     provider.get_tile = AsyncMock(return_value=None)
@@ -103,7 +103,63 @@ async def test_provider_exception_swallowed_falls_through_to_miss():
     resp = await TilesService._try_cached_tile(
         provider, "cat", "coll", "WebMercatorQuad", 5, 17, 11, "mvt",
         start_time=time.perf_counter(),
+        serve_mode="redirect",
     )
+    # Proxy was attempted (fallback), tile absent → cache miss
+    provider.get_tile.assert_called_once()
+    assert resp is None
+
+
+@pytest.mark.asyncio
+async def test_redirect_signing_failure_falls_back_to_proxy_hit():
+    """Signing raises in redirect mode → proxy fallback returns tile bytes."""
+    provider = MagicMock()
+    provider.get_tile_url = AsyncMock(side_effect=RuntimeError("IAM signing denied"))
+    provider.get_tile = AsyncMock(return_value=b"\x1a\x05bytes")
+
+    resp = await TilesService._try_cached_tile(
+        provider, "cat", "coll", "WebMercatorQuad", 5, 17, 11, "mvt",
+        start_time=time.perf_counter(),
+        serve_mode="redirect",
+    )
+    assert resp is not None
+    assert resp.status_code == 200
+    assert resp.headers["X-Tile-Source"] == "bucket_proxy"
+
+
+@pytest.mark.asyncio
+async def test_proxy_mode_skips_signed_url():
+    """serve_mode='proxy' never calls get_tile_url — streams bytes directly."""
+    provider = MagicMock()
+    provider.get_tile_url = AsyncMock(
+        return_value="https://storage.googleapis.com/bkt/tile.mvt?sig=x"
+    )
+    provider.get_tile = AsyncMock(return_value=b"\x1a\x03mvt")
+
+    resp = await TilesService._try_cached_tile(
+        provider, "cat", "coll", "WebMercatorQuad", 5, 17, 11, "mvt",
+        start_time=time.perf_counter(),
+        serve_mode="proxy",
+    )
+    provider.get_tile_url.assert_not_called()
+    assert resp is not None
+    assert resp.status_code == 200
+    assert resp.headers["X-Tile-Source"] == "bucket_proxy"
+
+
+@pytest.mark.asyncio
+async def test_proxy_mode_miss_returns_none():
+    """serve_mode='proxy' + empty bucket → None (cache miss)."""
+    provider = MagicMock()
+    provider.get_tile_url = AsyncMock(return_value="https://should-not-be-called")
+    provider.get_tile = AsyncMock(return_value=None)
+
+    resp = await TilesService._try_cached_tile(
+        provider, "cat", "coll", "WebMercatorQuad", 5, 17, 11, "mvt",
+        start_time=time.perf_counter(),
+        serve_mode="proxy",
+    )
+    provider.get_tile_url.assert_not_called()
     assert resp is None
 
 
