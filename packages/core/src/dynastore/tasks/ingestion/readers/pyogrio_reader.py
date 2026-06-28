@@ -64,15 +64,22 @@ class PyogrioReader(SourceReaderProtocol):
         content_type: str | None = None,  # noqa: ARG002 — forwarded by registry, unused here
         **opts: Any,
     ) -> Iterator[Iterable[dict]]:
-        import geopandas as gpd
-
         path = _to_vsigs(uri)
-        gdf = gpd.read_file(path, engine="pyogrio", encoding=encoding)
-        logger.info("PyogrioReader: opened %r (%d features)", path, len(gdf))
-        # ``iterfeatures`` yields GeoJSON-shaped dicts
-        # (``{"type": "Feature", "properties": …, "geometry": …}``), matching
-        # the record shape the downstream upsert expects.
-        yield gdf.iterfeatures()
+        chunk_size: int = opts.get("read_batch_size", 1000)  # type: ignore[assignment]
+
+        def _iter_chunks() -> Iterator[dict]:
+            # Stream in bounded chunks so the full source file is never
+            # materialised in memory at once.  On a 300+ MB admin-boundary
+            # dataset loading the entire GeoDataFrame in one call exhausts
+            # the container; chunked iteration keeps peak RSS proportional
+            # to chunk_size, not source-file size.
+            for chunk in pyogrio.read_dataframe(path, encoding=encoding, chunksize=chunk_size):
+                yield from chunk.iterfeatures()
+
+        logger.info(
+            "PyogrioReader: opened %r (chunked, chunk_size=%d)", path, chunk_size,
+        )
+        yield _iter_chunks()
 
     def feature_count(
         self, uri: str, *, content_type: str | None = None,  # noqa: ARG002

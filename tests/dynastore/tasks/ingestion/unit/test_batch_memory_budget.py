@@ -106,3 +106,70 @@ def test_ingestion_loop_consults_memory_budget() -> None:
         "the batch flush condition no longer checks the memory budget — it must "
         "flush on whichever of (row cap, memory budget) is reached first."
     )
+
+
+# ---------------------------------------------------------------------------
+# Conservative defaults: geometry-heavy sources must not OOM at default config
+# ---------------------------------------------------------------------------
+
+
+def test_max_batch_memory_default_is_32mb() -> None:
+    """The model default must be 32 MB — conservative enough for dense admin
+    polygons (e.g. GAUL: 3103 features, 331 MB source) without hand-tuning."""
+    from dynastore.tasks.ingestion.ingestion_models import TaskIngestionRequest
+    req = TaskIngestionRequest(
+        asset={"uri": "file:///test.geojson"},
+        column_mapping={},
+    )
+    assert req.max_batch_memory_mb == 32, (
+        f"max_batch_memory_mb default changed from 32 to {req.max_batch_memory_mb}; "
+        "this could OOM containers on geometry-heavy sources. Restore to 32."
+    )
+
+
+def test_row_cap_default_is_200() -> None:
+    """run_ingestion_task must fall back to 200, not 500, when database_batch_size
+    is unset. 500 dense admin polygons at ~200 KB each = 100 MB per batch, which
+    matches the old OOM trigger on GAUL-class sources."""
+    src = inspect.getsource(run_ingestion_task)
+    assert "or 200" in src, (
+        "run_ingestion_task row_cap fallback is no longer 200. "
+        "The higher default risks OOM on geometry-heavy sources; restore 'or 200'."
+    )
+
+
+def test_read_batch_size_forwarded_to_reader() -> None:
+    """read_batch_size must be threaded from the task request into the reader's
+    open() call so pyogrio (the fallback reader) can chunk rather than
+    materialise the whole GeoDataFrame at once."""
+    src = inspect.getsource(run_ingestion_task)
+    assert "read_batch_size=task_request.read_batch_size" in src, (
+        "run_ingestion_task no longer forwards read_batch_size to the reader. "
+        "Without it, PyogrioReader falls back to its internal default and the "
+        "task-level override has no effect on the reader's chunk size."
+    )
+
+
+def test_pyogrio_reader_uses_chunked_read() -> None:
+    """PyogrioReader.open must not call gpd.read_file (which materialises the
+    full GeoDataFrame) but must use pyogrio.read_dataframe with chunksize so
+    large sources are streamed in bounded chunks.
+
+    This test reads the source file directly so it runs without pyogrio
+    installed (pyogrio is only available in the geospatial_io scope).
+    """
+    import pathlib
+    import dynastore.tasks.ingestion  # importable without pyogrio
+    reader_file = (
+        pathlib.Path(dynastore.tasks.ingestion.__file__).parent
+        / "readers" / "pyogrio_reader.py"
+    )
+    src = reader_file.read_text()
+    assert "gpd.read_file" not in src, (
+        "PyogrioReader.open still calls gpd.read_file, which loads the entire "
+        "GeoDataFrame into memory. Replace with pyogrio.read_dataframe(chunksize=...)."
+    )
+    assert "pyogrio.read_dataframe" in src and "chunksize=chunk_size" in src, (
+        "PyogrioReader.open must call pyogrio.read_dataframe with chunksize to "
+        "stream large sources in bounded chunks."
+    )

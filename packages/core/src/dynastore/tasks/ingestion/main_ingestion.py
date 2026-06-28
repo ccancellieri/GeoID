@@ -789,11 +789,11 @@ async def run_ingestion_task(
             logger.warning(f"Could not determine total feature count: {e}")
 
         # Flush a batch on whichever limit is reached first: an explicit row cap
-        # (database_batch_size, default 500) or an accumulated-geometry memory
-        # budget (max_batch_memory_mb, default 100 MB). The memory budget is what
+        # (database_batch_size, default 200) or an accumulated-geometry memory
+        # budget (max_batch_memory_mb, default 32 MB). The memory budget is what
         # auto-shrinks batches for geometry-heavy sources (e.g. admin
         # multipolygons) so a fixed row count cannot exhaust the container.
-        row_cap = task_request.database_batch_size or 500
+        row_cap = task_request.database_batch_size or 200
         mem_budget_bytes = max(1, task_request.max_batch_memory_mb) * 1024 * 1024
         current_batch = []
         current_batch_bytes = 0
@@ -971,6 +971,7 @@ async def run_ingestion_task(
             content_type=source_content_type,
             task_id=task_id,
             task_schema=phys_schema,
+            read_batch_size=task_request.read_batch_size,
         ) as reader:
             sliced_reader = itertools.islice(
                 reader,

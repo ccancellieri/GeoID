@@ -26,8 +26,6 @@ system osgeo bindings).
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 
 import pytest
 
@@ -91,3 +89,81 @@ def test_priority_is_tail_fallback():
     # Strictly behind GdalOsgeoReader (priority=10); higher number = later.
     assert PyogrioReader.priority == 100
     assert PyogrioReader.reader_id == "pyogrio"
+
+
+# ---------------------------------------------------------------------------
+# Chunked streaming: never materialises the full GeoDataFrame at once
+# ---------------------------------------------------------------------------
+
+
+_GEOJSON_LARGE = {
+    "type": "FeatureCollection",
+    "features": [
+        {
+            "type": "Feature",
+            "properties": {"name": f"feat_{i}", "val": i},
+            "geometry": {"type": "Point", "coordinates": [float(i), float(i)]},
+        }
+        for i in range(10)
+    ],
+}
+
+
+@pytest.fixture()
+def geojson_large_path(tmp_path):
+    p = tmp_path / "large.geojson"
+    p.write_text(__import__("json").dumps(_GEOJSON_LARGE))
+    return str(p)
+
+
+def test_open_chunked_yields_all_features(geojson_large_path):
+    """Chunked read (read_batch_size=3) must yield all 10 features, regardless
+    of how many pyogrio read_dataframe calls are made internally."""
+    reader = PyogrioReader()
+    with reader.open(geojson_large_path, read_batch_size=3) as records:
+        feats = list(records)
+    assert len(feats) == 10
+    vals = {f["properties"]["val"] for f in feats}
+    assert vals == set(range(10))
+
+
+def test_open_chunk_size_forwarded_to_pyogrio(geojson_large_path):
+    """read_batch_size opt must reach pyogrio.read_dataframe as chunksize."""
+    import pyogrio
+    from unittest.mock import patch
+
+    # Build a realistic stand-in: two chunks of GeoDataFrames
+    import geopandas as gpd
+    all_feats = _GEOJSON_LARGE
+    gdf = gpd.GeoDataFrame.from_features(all_feats["features"])
+
+    chunk1 = gdf.iloc[:5].copy()
+    chunk2 = gdf.iloc[5:].copy()
+
+    with patch.object(pyogrio, "read_dataframe", return_value=iter([chunk1, chunk2])) as mock_rdf:
+        reader = PyogrioReader()
+        with reader.open(geojson_large_path, read_batch_size=5) as records:
+            feats = list(records)
+
+    mock_rdf.assert_called_once()
+    _, kwargs = mock_rdf.call_args
+    assert kwargs.get("chunksize") == 5, (
+        f"PyogrioReader did not pass chunksize=5 to pyogrio.read_dataframe; got {kwargs}"
+    )
+    assert len(feats) == 10
+
+
+def test_open_does_not_use_gpd_read_file():
+    """The reader must not call gpd.read_file — that materialises the entire
+    dataset in memory. Chunked pyogrio.read_dataframe is the required path."""
+    import inspect
+    from dynastore.tasks.ingestion.readers.pyogrio_reader import PyogrioReader as _R
+    src = inspect.getsource(_R.open)
+    assert "gpd.read_file" not in src, (
+        "PyogrioReader.open still calls gpd.read_file, which loads the whole "
+        "GeoDataFrame into memory. Replace with pyogrio.read_dataframe(chunksize=...)."
+    )
+    assert "pyogrio.read_dataframe" in src, (
+        "PyogrioReader.open must use pyogrio.read_dataframe with chunksize to "
+        "avoid materialising the full source in memory."
+    )
