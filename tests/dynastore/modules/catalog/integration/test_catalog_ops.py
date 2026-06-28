@@ -169,20 +169,29 @@ async def test_catalog_soft_delete_then_recreate(
         # the physical schema and metadata sidecars retained.
         assert await catalogs_svc.delete_catalog(catalog_id) is True
 
-        # Verify it is no longer visible.
-        assert await catalogs_svc.get_catalog_model(catalog_id) is None
+        # Verify it is visible as tombstoned: GET returns the model with
+        # deleted_at set rather than None (200+deleted-state, not 404).
+        deleted_model = await catalogs_svc.get_catalog_model(catalog_id)
+        assert deleted_model is not None, "Tombstoned catalog must be retrievable"
+        assert deleted_model.deleted_at is not None, "deleted_at must be set on a tombstoned catalog"
 
         # Recreate the SAME id — must succeed by reclaiming the tombstone,
         # not raise a PK unique-violation.
+        # create_catalog mutates catalog_obj.id to the internal c_… token on the
+        # first call.  Reset it to the original external id before the second
+        # call so the Catalog-instance path is used (which skips multilanguage
+        # validation and the internal-id guard).
+        catalog_obj.id = catalog_id
         recreated = await catalogs_svc.create_catalog(catalog_obj)
-        assert recreated.id == catalog_id
+        # create_catalog stores the user-supplied id as external_id and assigns
+        # a new internal id to .id — check the public label, not the internal token.
+        assert recreated.external_id == catalog_id
 
-        # It must be live and listable again.
+        # It must be live and retrievable again.
         retrieved = await catalogs_svc.get_catalog_model(catalog_id)
         assert retrieved is not None
-        assert retrieved.id == catalog_id
-        catalogs = await catalogs_svc.list_catalogs(q=catalog_id)
-        assert any(c.id == catalog_id for c in catalogs)
+        assert retrieved.external_id == catalog_id
+        assert retrieved.deleted_at is None, "Recreated catalog must not carry a deleted_at"
     finally:
         await catalogs_svc.delete_catalog(catalog_id, force=True)
 

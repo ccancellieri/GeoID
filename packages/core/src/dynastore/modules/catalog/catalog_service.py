@@ -552,6 +552,16 @@ _catalog_exists_query = DQLQuery(
     result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
 )
 
+# Tombstone-inclusive fetch by external_id. Used by the soft-delete idempotency
+# probe and the GET-catalog tombstone fallback. Strictly scoped to rows where
+# deleted_at IS NOT NULL so it cannot accidentally return an active catalog.
+# Never goes through the external_id cache — tombstones are excluded from it.
+_get_tombstoned_catalog_by_external_id_query = DQLQuery(
+    "SELECT * FROM catalog.catalogs "
+    "WHERE external_id = :external_id AND deleted_at IS NOT NULL;",
+    result_handler=ResultHandler.ONE_DICT,
+)
+
 
 def _catalog_model_is_ready(c: Any) -> bool:
     """Only cache 'ready' catalogs: transient states ('provisioning',
@@ -772,6 +782,56 @@ class CatalogService(CatalogsProtocol):
                 "WHERE external_id = :external_id AND deleted_at IS NULL;",
                 result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
             ).execute(conn, external_id=external_id)
+
+    async def _get_tombstoned_catalog_id_by_external_id_db(self, external_id: str) -> Optional[str]:
+        """Return the internal id for a soft-deleted catalog keyed by its public external_id.
+
+        Narrow tombstone probe used by two paths that must distinguish
+        'already tombstoned' from 'never existed':
+
+        - ``delete_catalog`` (soft path) idempotency check: a repeat
+          soft-delete of an already-tombstoned catalog returns True (→ HTTP
+          204) rather than False (→ HTTP 404).
+        - ``get_catalog_model`` tombstone fallback: a direct GET of a
+          tombstoned catalog returns 200 + deleted state instead of 404.
+
+        Security invariant: this is external_id-keyed (not internal-id-keyed)
+        and only matches rows where ``deleted_at IS NOT NULL``, so it cannot
+        accidentally resolve an active catalog or accept an internal ``c_…``
+        id as an addressable target.  Never goes through the external_id cache
+        — tombstones are excluded from it by the ``condition`` guard.
+        """
+        async with managed_transaction(self.engine) as conn:
+            return await DQLQuery(
+                "SELECT id FROM catalog.catalogs "
+                "WHERE external_id = :external_id AND deleted_at IS NOT NULL;",
+                result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+            ).execute(conn, external_id=external_id)
+
+    async def _get_tombstoned_catalog_model_by_external_id_db(self, external_id: str) -> Optional[Catalog]:
+        """Fetch the full Catalog model for a soft-deleted catalog by external_id.
+
+        Used as a fallback in ``get_catalog_model`` so that a direct GET of a
+        tombstoned catalog returns the model with ``deleted_at`` set rather than
+        None (which maps to 404).  Tombstoned catalogs are reclaimable via
+        ``create_catalog``, so 410 Gone is wrong (RFC 9110 §15.5.11); instead
+        the caller can observe the deleted state and decide whether to wait for
+        the hard-delete or reclaim the id.
+
+        Does not go through any cache — tombstones are excluded from the
+        external_id and model caches by design.  Router metadata fan-out runs
+        after the catalog.catalogs transaction is released (same pattern as
+        ``_get_catalog_model_db``) to avoid idle-in-transaction holds.
+        """
+        async with managed_transaction(self.engine) as conn:
+            result = await _get_tombstoned_catalog_by_external_id_query.execute(
+                conn, external_id=external_id
+            )
+        if not result:
+            return None
+        # Router fan-out on its own connection, after releasing the registry lock.
+        router_metadata = await self._resolve_catalog_router_metadata(result["id"])
+        return self._unpack_catalog_row(result, router_metadata=router_metadata)
 
     async def resolve_catalog_id(
         self,
@@ -1578,7 +1638,12 @@ class CatalogService(CatalogsProtocol):
             catalog = await _catalog_model_cache(self, catalog_id)
 
         if catalog is None:
-            return None
+            # Active-only queries returned nothing. Check whether the external_id
+            # points to a soft-deleted catalog so a direct GET returns 200 +
+            # deleted state instead of 404. Reclaimable tombstones must not be
+            # represented as 410 Gone (RFC 9110 §15.5.11). The probe is
+            # external_id-keyed and bypasses the active-only external_id cache.
+            return await self._get_tombstoned_catalog_model_by_external_id_db(catalog_id)
 
         return await self._run_catalog_pipeline(catalog_id, catalog)
 
@@ -2160,12 +2225,21 @@ class CatalogService(CatalogsProtocol):
         """
         db_resource = ctx.db_resource if ctx else None
         validate_sql_identifier(catalog_id)
+        # Preserve the public external_id before overwriting catalog_id with the
+        # internal id so we can invalidate the external_id cache after soft-delete.
+        external_id = catalog_id
         # Phase 2: resolve external→internal id at the public boundary.  A soft
         # delete of a nonexistent external_id returns False (same semantics as a
         # 0-row UPDATE); for that use allow_missing=True and check for None.
         internal_id = await self.resolve_catalog_id(catalog_id, allow_missing=True)
         if internal_id is None:
-            return False
+            # Not in the active registry. Distinguish 'already soft-deleted'
+            # from 'never existed': RFC 9110 §9.3.5 requires DELETE to be
+            # idempotent, so a repeat soft-delete must return 204, not 404.
+            tombstoned_id = await self._get_tombstoned_catalog_id_by_external_id_db(external_id)
+            if tombstoned_id is not None:
+                return True  # Already tombstoned → no-op success (→ HTTP 204)
+            return False  # Never existed → HTTP 404
         catalog_id = internal_id
 
         # Soft delete path (force=False)
@@ -2189,6 +2263,11 @@ class CatalogService(CatalogsProtocol):
                         "operation": "soft_delete",
                     },
                 )
+                # Evict the external_id → internal_id cache entry so that
+                # subsequent resolve_catalog_id calls return None (not the stale
+                # mapping) and tombstone probes in get_catalog_model receive the
+                # external_id they can match against the tombstoned row.
+                _invalidate_catalog_external_id_cache(external_id)
                 _invalidate_catalog_model_cache(catalog_id)
                 return True
 

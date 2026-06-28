@@ -187,14 +187,20 @@ async def test_delete_catalog_returns_false_for_unknown_external_id():
 
     The original implementation performed a soft-delete UPDATE that returned 0
     rows for an unknown id; Phase 2 preserves that semantics via resolve +
-    allow_missing=True.
+    allow_missing=True. The tombstone probe must also return None for an
+    external_id that was never created (distinguishes 'never existed' → 404
+    from 'already tombstoned' → 204 idempotent).
     """
     svc = CatalogService.__new__(CatalogService)
 
     async def _resolve(ext_id: str, allow_missing: bool = False):
-        return None  # Unknown external_id
+        return None  # Unknown external_id — never in the active registry
+
+    async def _no_tombstone(ext_id: str):
+        return None  # Also not tombstoned — never existed
 
     svc.resolve_catalog_id = _resolve  # type: ignore[assignment]
+    svc._get_tombstoned_catalog_id_by_external_id_db = _no_tombstone  # type: ignore[assignment]
 
     result = await svc.delete_catalog("nonexistent-catalog")
     assert result is False

@@ -443,6 +443,17 @@ async def create_catalog(
             if k not in ["language", "languages"]:
                 catalog.extra_fields[k] = v
 
+    # Surface the deleted_at marker for soft-deleted catalogs. The field lives
+    # on the Catalog model (not in extra_metadata) so it must be copied
+    # explicitly to the pystac extra_fields. Active catalogs have deleted_at=None
+    # (excluded by exclude_none=True in localize()) so this branch is a no-op
+    # for the common case.
+    _deleted_at = meta_dict.get("deleted_at")
+    if _deleted_at is not None:
+        catalog.extra_fields["deleted_at"] = (
+            _deleted_at.isoformat() if hasattr(_deleted_at, "isoformat") else str(_deleted_at)
+        )
+
     # Use dynamic exclusion based on the model's protocol + STAC top level
     stac_top_level = {"stac_version", "stac_extensions", "links", "conformsTo", "id", "title", "description"}
     internal_cols = catalog_metadata_model.get_internal_columns() | stac_top_level

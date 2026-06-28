@@ -464,6 +464,14 @@ class Catalog(BaseMetadata):
     provisioning_status: str = Field(
         "ready", description="Provisioning status: provisioning | ready | failed"
     )
+    deleted_at: Optional[datetime] = Field(
+        None,
+        description=(
+            "Soft-deletion timestamp. Non-null when the catalog has been soft-deleted "
+            "but not yet hard-deleted or reclaimed. Included in GET responses so callers "
+            "can observe the deleted lifecycle state without triggering 404."
+        ),
+    )
 
 
 class CatalogUpdate(LocalizedFieldsBase):
