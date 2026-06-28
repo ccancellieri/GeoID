@@ -310,8 +310,18 @@ class AccessFilter:
 
     @property
     def is_unconditional(self) -> bool:
-        """True when no per-document clause needs to be applied at all."""
-        return self.allow_all and not self.deny and not self.union
+        """True when no per-document clause needs to be applied at all.
+
+        A filter with ``deny_all=True`` denies every document regardless of
+        ``allow_all`` — it is NOT unconditional, and callers that skip access
+        enforcement for unconditional filters must not skip it here.
+        """
+        return (
+            self.allow_all
+            and not self.deny_all
+            and not self.deny
+            and not self.union
+        )
 
     def admits(self, document: Mapping[str, Any]) -> bool:
         """Reference semantics — the contract every driver translation matches.

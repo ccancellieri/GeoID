@@ -285,3 +285,29 @@ async def test_resolve_catalog_provider_returns_allow_everything_gives_none():
     finally:
         reset_request_visibility(token)
         unregister_plugin(provider)
+
+
+# ---------------------------------------------------------------------------
+# AccessFilter.is_unconditional hardening (#2550)
+# ---------------------------------------------------------------------------
+
+
+def test_is_unconditional_allow_everything_is_true() -> None:
+    """allow_everything() must be unconditional — the normal blanket-allow case."""
+    af = AccessFilter.allow_everything()
+    assert af.allow_all is True
+    assert af.deny_all is False
+    assert af.is_unconditional is True
+
+
+def test_is_unconditional_allow_all_and_deny_all_is_false() -> None:
+    """allow_all=True AND deny_all=True must NOT be unconditional.
+
+    deny_all takes precedence in admits() (returns False for every document),
+    so this filter grants nothing.  A caller that skips enforcement for
+    is_unconditional=True must not skip it here.
+    """
+    af = AccessFilter(allow_all=True, deny_all=True)
+    assert af.is_unconditional is False
+    # Confirm admits() is also False — the deny_all wins.
+    assert af.admits({}) is False

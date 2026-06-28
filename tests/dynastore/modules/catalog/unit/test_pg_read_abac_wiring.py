@@ -42,8 +42,25 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from dynastore.extensions.tools.query import dispatch_or_stream_items
-from dynastore.models.protocols.access_filter import AccessFilter
-from dynastore.models.query_builder import QueryRequest, QueryResponse
+from dynastore.models.protocols.access_filter import AccessClause, AccessFilter, FieldPredicate
+from dynastore.models.query_builder import FieldSelection, QueryRequest, QueryResponse
+from dynastore.modules.catalog.query_optimizer import QueryOptimizer
+from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
+from dynastore.modules.storage.drivers.pg_sidecars.access_envelope_config import (
+    AccessEnvelopeSidecarConfig,
+)
+from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
+    AttributeStorageMode,
+    FeatureAttributeSidecarConfig,
+)
+from dynastore.modules.storage.drivers.pg_sidecars.base import (
+    FieldCapability,
+    FieldDefinition,
+)
+from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
+    GeometriesSidecarConfig,
+    TargetDimension,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -275,3 +292,365 @@ def test_get_item_allow_everything_is_not_deny() -> None:
     af = AccessFilter.allow_everything()
     assert af.allow_all is True
     assert af.deny_all is False
+
+
+# ---------------------------------------------------------------------------
+# Optimizer-level conditional ABAC envelope invariants (#2550)
+# ---------------------------------------------------------------------------
+#
+# The post-filter in QueryOptimizer.determine_required_sidecars removes the
+# access_envelope sidecar ONLY when access_filter is provably unconditional
+# (AccessFilter.is_unconditional is True — blanket allow, no deny, no union).
+# Three hard security invariants:
+#   Invariant 1: access_filter=None → envelope RETAINED (fail-closed)
+#   Invariant 2: is_unconditional=False → envelope RETAINED (enforcement)
+#   Invariant 3: is_unconditional=True → envelope DROPPED (optimization)
+# Plus SQL-level checks that the JOIN appears / disappears accordingly.
+# ---------------------------------------------------------------------------
+
+_REGISTRY_PATH = (
+    "dynastore.modules.storage.drivers.pg_sidecars.registry.SidecarRegistry.get_sidecar"
+)
+
+
+class _EnvSidecarLike(MagicMock):
+    """MagicMock subclass that carries the ``serves_consumers`` classmethod.
+
+    ``QueryOptimizer.determine_required_sidecars`` resolves
+    ``type(sc).serves_consumers()`` for the select=* branch; returning ``None``
+    here means "consumer-agnostic" — the production default for all sidecars
+    that do not restrict by consumer.
+    """
+
+    @classmethod
+    def serves_consumers(cls):
+        return None
+
+
+def _make_3sidecar_col_config() -> ItemsPostgresqlDriverConfig:
+    """Three-sidecar PG driver config: geometries + attributes + access_envelope."""
+    return ItemsPostgresqlDriverConfig(
+        sidecars=[
+            GeometriesSidecarConfig(
+                sidecar_type="geometries",
+                target_srid=4326,
+                target_dimension=TargetDimension.FORCE_2D,
+                partition_strategy=None,
+                partition_resolution=0,
+                statistics=None,
+            ),
+            FeatureAttributeSidecarConfig(
+                sidecar_type="attributes",
+                storage_mode=AttributeStorageMode.JSONB,
+                index_external_id=True,
+                index_asset_id=True,
+                validity_column="valid_from",
+                attribute_schema=None,
+                jsonb_column_name="attributes",
+                use_hot_updates=True,
+                partition_strategy=None,
+                partition_attribute=None,
+            ),
+            AccessEnvelopeSidecarConfig(),
+        ],
+    )
+
+
+def _build_3sidecar_mocks():
+    """Return (mock_geom, mock_attr, mock_env) pre-wired for _make_3sidecar_col_config."""
+    mock_geom = _EnvSidecarLike()
+    mock_geom.sidecar_id = "geometries"
+    mock_geom.get_queryable_fields.return_value = {
+        "geom": FieldDefinition(
+            name="geom",
+            sql_expression="sc_geom.geom",
+            capabilities=[FieldCapability.SPATIAL],
+            data_type="geometry",
+        )
+    }
+    mock_geom.get_main_geometry_field.return_value = "geom"
+    mock_geom.get_join_clause.return_value = (
+        'LEFT JOIN "s"."t_geometries" sc_geom ON h.geoid = sc_geom.geoid'
+    )
+    mock_geom.get_default_sort.return_value = None
+    mock_geom.provides_feature_id = False
+
+    mock_attr = _EnvSidecarLike()
+    mock_attr.sidecar_id = "attributes"
+    mock_attr.get_queryable_fields.return_value = {
+        "external_id": FieldDefinition(
+            name="external_id",
+            sql_expression="sc_attr.external_id",
+            capabilities=[FieldCapability.FILTERABLE],
+            data_type="string",
+        )
+    }
+    mock_attr.get_main_geometry_field.return_value = None
+    mock_attr.get_join_clause.return_value = (
+        'LEFT JOIN "s"."t_attributes" sc_attr ON h.geoid = sc_attr.geoid'
+    )
+    mock_attr.get_default_sort.return_value = None
+    mock_attr.provides_feature_id = False
+
+    mock_env = _EnvSidecarLike()
+    mock_env.sidecar_id = "access_envelope"
+    mock_env.get_queryable_fields.return_value = {}
+    mock_env.get_main_geometry_field.return_value = None
+    mock_env.get_join_clause.return_value = (
+        'LEFT JOIN "s"."t_items_access_envelope" ae ON h.geoid = ae.geoid'
+    )
+    mock_env.get_default_sort.return_value = None
+    mock_env.provides_feature_id = False
+
+    return mock_geom, mock_attr, mock_env
+
+
+def _sidecar_router(mock_geom, mock_attr, mock_env):
+    """Return a side_effect callable that dispatches by sidecar_type."""
+    mapping = {
+        "geometries": mock_geom,
+        "attributes": mock_attr,
+        "access_envelope": mock_env,
+    }
+
+    def _get(sc, lenient=True):
+        return mapping.get(getattr(sc, "sidecar_type", ""), None)
+
+    return _get
+
+
+# ---------------------------------------------------------------------------
+# Invariant 1 — access_filter=None → envelope RETAINED (fail-closed)
+# ---------------------------------------------------------------------------
+
+def test_abac_invariant_no_filter_retains_envelope() -> None:
+    """access_filter=None must keep the envelope so it fails closed (appends FALSE)."""
+    col_config = _make_3sidecar_col_config()
+    mock_geom, mock_attr, mock_env = _build_3sidecar_mocks()
+
+    with patch(_REGISTRY_PATH, side_effect=_sidecar_router(mock_geom, mock_attr, mock_env)):
+        optimizer = QueryOptimizer(col_config)
+        qr = QueryRequest(select=[FieldSelection(field="geom")])
+        # access_filter is None by default
+        result_ids = {sc.sidecar_id for sc in optimizer.determine_required_sidecars(qr)}
+
+    assert "access_envelope" in result_ids, (
+        "access_filter=None must retain the envelope (sidecar appends FALSE — fail-closed)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Invariant 2 — is_unconditional=False → envelope RETAINED (enforcement)
+# ---------------------------------------------------------------------------
+
+def test_abac_invariant_restricted_filter_retains_envelope() -> None:
+    """A restricted access_filter (is_unconditional=False) must keep the envelope."""
+    col_config = _make_3sidecar_col_config()
+    mock_geom, mock_attr, mock_env = _build_3sidecar_mocks()
+
+    restricted_af = AccessFilter.from_clauses(
+        allow=[AccessClause((FieldPredicate("_attrs.dept", ("finance",)),))]
+    )
+    assert restricted_af.is_unconditional is False, "pre-condition: filter must not be unconditional"
+
+    with patch(_REGISTRY_PATH, side_effect=_sidecar_router(mock_geom, mock_attr, mock_env)):
+        optimizer = QueryOptimizer(col_config)
+        qr = QueryRequest(
+            select=[FieldSelection(field="geom")],
+            access_filter=restricted_af,
+        )
+        result_ids = {sc.sidecar_id for sc in optimizer.determine_required_sidecars(qr)}
+
+    assert "access_envelope" in result_ids, (
+        "restricted access_filter must retain the envelope so the row-level WHERE clause runs"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Invariant 3 — is_unconditional=True → envelope DROPPED (optimization)
+# ---------------------------------------------------------------------------
+
+def test_abac_invariant_unconditional_filter_drops_envelope() -> None:
+    """AccessFilter.allow_everything() (is_unconditional=True) must drop the envelope JOIN."""
+    col_config = _make_3sidecar_col_config()
+    mock_geom, mock_attr, mock_env = _build_3sidecar_mocks()
+
+    af = AccessFilter.allow_everything()
+    assert af.is_unconditional is True, "pre-condition: allow_everything must be unconditional"
+
+    with patch(_REGISTRY_PATH, side_effect=_sidecar_router(mock_geom, mock_attr, mock_env)):
+        optimizer = QueryOptimizer(col_config)
+        qr = QueryRequest(
+            select=[FieldSelection(field="geom")],
+            access_filter=af,
+        )
+        result_ids = {sc.sidecar_id for sc in optimizer.determine_required_sidecars(qr)}
+
+    assert "access_envelope" not in result_ids, (
+        "allow_everything() is unconditional — envelope JOIN is pure overhead and must be dropped"
+    )
+
+
+# ---------------------------------------------------------------------------
+# SQL-level checks — JOIN presence in build_optimized_query output
+# ---------------------------------------------------------------------------
+
+def test_abac_sql_restricted_has_envelope_join_and_where() -> None:
+    """Restricted principal: generated SQL includes the access_envelope JOIN and WHERE."""
+    col_config = _make_3sidecar_col_config()
+    mock_geom, mock_attr, mock_env = _build_3sidecar_mocks()
+
+    # Make the envelope apply_query_context append a WHERE sentinel so we can
+    # assert both the JOIN and WHERE clause appear.
+    mock_env.apply_query_context.side_effect = lambda req, ctx: ctx[
+        "where_conditions"
+    ].append("FALSE")
+
+    restricted_af = AccessFilter.from_clauses(
+        allow=[AccessClause((FieldPredicate("_attrs.dept", ("finance",)),))]
+    )
+
+    with patch(_REGISTRY_PATH, side_effect=_sidecar_router(mock_geom, mock_attr, mock_env)):
+        optimizer = QueryOptimizer(col_config)
+        qr = QueryRequest(
+            select=[FieldSelection(field="geom")],
+            access_filter=restricted_af,
+        )
+        sql, _ = optimizer.build_optimized_query(qr, "s", "t_items")
+
+    assert "t_items_access_envelope" in sql, (
+        "restricted principal — envelope JOIN must appear in generated SQL"
+    )
+    assert "FALSE" in sql, (
+        "restricted principal — envelope WHERE clause must appear in generated SQL"
+    )
+
+
+def test_abac_sql_unconditional_has_no_envelope_join() -> None:
+    """Unconditional (blanket allow) principal: generated SQL has no access_envelope JOIN."""
+    col_config = _make_3sidecar_col_config()
+    mock_geom, mock_attr, mock_env = _build_3sidecar_mocks()
+
+    with patch(_REGISTRY_PATH, side_effect=_sidecar_router(mock_geom, mock_attr, mock_env)):
+        optimizer = QueryOptimizer(col_config)
+        qr = QueryRequest(
+            select=[FieldSelection(field="geom")],
+            access_filter=AccessFilter.allow_everything(),
+        )
+        sql, _ = optimizer.build_optimized_query(qr, "s", "t_items")
+
+    assert "t_items_access_envelope" not in sql, (
+        "unconditional (blanket allow) — envelope JOIN must be absent from generated SQL"
+    )
+
+
+# ---------------------------------------------------------------------------
+# select=* path — same 3 invariants on the early-return branch
+# ---------------------------------------------------------------------------
+
+def test_abac_star_unconditional_drops_envelope() -> None:
+    """select=* + unconditional filter → access_envelope NOT in result (optimization)."""
+    col_config = _make_3sidecar_col_config()
+    mock_geom, mock_attr, mock_env = _build_3sidecar_mocks()
+
+    af = AccessFilter.allow_everything()
+    assert af.is_unconditional is True
+
+    with patch(_REGISTRY_PATH, side_effect=_sidecar_router(mock_geom, mock_attr, mock_env)):
+        optimizer = QueryOptimizer(col_config)
+        qr = QueryRequest(select=[FieldSelection(field="*")], access_filter=af)
+        result_ids = {sc.sidecar_id for sc in optimizer.determine_required_sidecars(qr)}
+
+    assert "access_envelope" not in result_ids, (
+        "select=* + allow_everything() — envelope must be dropped (pure JOIN overhead)"
+    )
+
+
+def test_abac_star_restricted_retains_envelope() -> None:
+    """select=* + restricted filter → access_envelope IN result (enforcement)."""
+    col_config = _make_3sidecar_col_config()
+    mock_geom, mock_attr, mock_env = _build_3sidecar_mocks()
+
+    restricted_af = AccessFilter.from_clauses(
+        allow=[AccessClause((FieldPredicate("_attrs.dept", ("finance",)),))]
+    )
+    assert restricted_af.is_unconditional is False
+
+    with patch(_REGISTRY_PATH, side_effect=_sidecar_router(mock_geom, mock_attr, mock_env)):
+        optimizer = QueryOptimizer(col_config)
+        qr = QueryRequest(select=[FieldSelection(field="*")], access_filter=restricted_af)
+        result_ids = {sc.sidecar_id for sc in optimizer.determine_required_sidecars(qr)}
+
+    assert "access_envelope" in result_ids, (
+        "select=* + restricted filter — envelope must be retained for row-level enforcement"
+    )
+
+
+def test_abac_star_no_filter_retains_envelope_fail_closed() -> None:
+    """select=* + access_filter=None → access_envelope IN result (fail-closed)."""
+    col_config = _make_3sidecar_col_config()
+    mock_geom, mock_attr, mock_env = _build_3sidecar_mocks()
+
+    with patch(_REGISTRY_PATH, side_effect=_sidecar_router(mock_geom, mock_attr, mock_env)):
+        optimizer = QueryOptimizer(col_config)
+        qr = QueryRequest(select=[FieldSelection(field="*")])  # access_filter=None
+        result_ids = {sc.sidecar_id for sc in optimizer.determine_required_sidecars(qr)}
+
+    assert "access_envelope" in result_ids, (
+        "select=* + access_filter=None — envelope must be retained (fail-closed)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Defense-in-depth: allow_all=True AND deny_all=True → envelope RETAINED
+# (#2550 — is_unconditional hardened to include not self.deny_all)
+# ---------------------------------------------------------------------------
+
+
+def test_abac_allow_all_and_deny_all_retains_envelope_explicit_projection() -> None:
+    """allow_all=True, deny_all=True must NOT drop the envelope (deny_all wins).
+
+    This combination is not constructable via any factory today, but the
+    is_unconditional predicate must exclude it so the envelope is always
+    retained for a deny-all principal — even on the explicit-projection path.
+    """
+    col_config = _make_3sidecar_col_config()
+    mock_geom, mock_attr, mock_env = _build_3sidecar_mocks()
+
+    contradictory_af = AccessFilter(allow_all=True, deny_all=True)
+    assert contradictory_af.is_unconditional is False, (
+        "deny_all=True must override allow_all for is_unconditional"
+    )
+
+    with patch(_REGISTRY_PATH, side_effect=_sidecar_router(mock_geom, mock_attr, mock_env)):
+        optimizer = QueryOptimizer(col_config)
+        qr = QueryRequest(
+            select=[FieldSelection(field="geom")],
+            access_filter=contradictory_af,
+        )
+        result_ids = {sc.sidecar_id for sc in optimizer.determine_required_sidecars(qr)}
+
+    assert "access_envelope" in result_ids, (
+        "allow_all=True, deny_all=True — deny_all wins; envelope must be retained"
+    )
+
+
+def test_abac_allow_all_and_deny_all_retains_envelope_star_path() -> None:
+    """Same defense-in-depth check on the select=* early-return path."""
+    col_config = _make_3sidecar_col_config()
+    mock_geom, mock_attr, mock_env = _build_3sidecar_mocks()
+
+    contradictory_af = AccessFilter(allow_all=True, deny_all=True)
+    assert contradictory_af.is_unconditional is False
+
+    with patch(_REGISTRY_PATH, side_effect=_sidecar_router(mock_geom, mock_attr, mock_env)):
+        optimizer = QueryOptimizer(col_config)
+        qr = QueryRequest(
+            select=[FieldSelection(field="*")],
+            access_filter=contradictory_af,
+        )
+        result_ids = {sc.sidecar_id for sc in optimizer.determine_required_sidecars(qr)}
+
+    assert "access_envelope" in result_ids, (
+        "select=* + allow_all=True, deny_all=True — envelope must be retained"
+    )

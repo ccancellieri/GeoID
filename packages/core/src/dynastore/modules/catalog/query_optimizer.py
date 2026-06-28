@@ -531,6 +531,25 @@ class QueryOptimizer:
             served = type(sc).serves_consumers()
             return served is None or self.consumer in served
 
+        def _drop_unconditional_envelope(
+            sidecars: List[SidecarConfig],
+        ) -> List[SidecarConfig]:
+            """Remove the access_envelope sidecar when access is provably
+            unconditional (blanket allow, no deny, no union).
+
+            The envelope sidecar is RETAINED when:
+            * ``access_filter`` is ``None`` — fail-closed; sidecar appends FALSE.
+            * ``is_unconditional`` is False — row-level WHERE must run.
+            Only dropped when ``is_unconditional`` is True (pure JOIN overhead).
+            """
+            _af = getattr(query, "access_filter", None)
+            if _af is not None and _af.is_unconditional:
+                return [
+                    sc for sc in sidecars
+                    if getattr(sc, "sidecar_type", None) != "access_envelope"
+                ]
+            return sidecars
+
         # Check SELECT fields
         for sel in query.select:
             if sel.field == "*":
@@ -538,10 +557,13 @@ class QueryOptimizer:
                 # selecting *.  Consumer-specific sidecars (e.g.
                 # stac_metadata for non-STAC consumers) are skipped — the
                 # caller asked for "everything for *this* response shape".
-                return [
+                # Conditional ABAC envelope: drop the sidecar when access is
+                # provably unconditional (same invariant as the explicit-
+                # projection path below — see _drop_unconditional_envelope).
+                return _drop_unconditional_envelope([
                     sc for sc in driver_sidecars(self.col_config)
                     if _serves_active_consumer(sc)
-                ]
+                ])
 
             if sel.field in self.field_index:
                 sidecar, _ = self.field_index[sel.field]
@@ -619,17 +641,21 @@ class QueryOptimizer:
         # A user-facing read sets ``access_filter`` via
         # ``access_scope.compile_read_access_filter``; a privileged/system read
         # must pass ``AccessFilter.allow_everything()`` explicitly to opt out.
-        # (The
-        # ``select=*`` path already includes the sidecar via the consumer-serving
-        # branch above; this closes the explicit-projection gap.)
+        # (The ``select=*`` path already includes the sidecar via the consumer-
+        # serving branch above; this closes the explicit-projection gap.)
         for sc_config in driver_sidecars(self.col_config):
             if getattr(sc_config, "sidecar_type", None) == "access_envelope":
                 required_sidecars.add(sc_config.sidecar_id)
 
-        # Return only required sidecar configs, preserving declaration order
-        return [
-            sc for sc in driver_sidecars(self.col_config) if sc.sidecar_id in required_sidecars
-        ]
+        # Conditional ABAC envelope (read-perf, #2550): see
+        # _drop_unconditional_envelope above.  Both the select=* early-return
+        # path and this explicit-projection path apply the same drop so that
+        # unconditional (blanket-allow) principals skip the envelope JOIN on
+        # all read shapes.
+        return _drop_unconditional_envelope([
+            sc for sc in driver_sidecars(self.col_config)
+            if sc.sidecar_id in required_sidecars
+        ])
 
     def build_optimized_query(
         self,
