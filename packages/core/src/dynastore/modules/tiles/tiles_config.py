@@ -32,22 +32,22 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
 
 
     # Global mask/bounds
-    bbox: Mutable[Optional[List[Tuple[float, float, float, float]]]] = Field(default=None, 
+    bbox: Mutable[Optional[List[Tuple[float, float, float, float]]]] = Field(default=None,
         description="Global bounding boxes for the collection/catalog. Requests outside these bounds return 404/Empty. If None, assumes world/max extent."
     )
-    
+
     # Zoom limits
     min_zoom: Mutable[int] = Field(default=0, description="Minimum zoom level served.")
     max_zoom: Mutable[int] = Field(default=12, description="Maximum zoom level served.")
-    
+
     # TMS Support
     supported_tms_ids: Mutable[List[str]] = Field(
-        default=["WebMercatorQuad"], 
+        default=["WebMercatorQuad"],
         description="List of supported TileMatrixSet IDs."
     )
-    
+
     # Runtime Generation Settings
-    simplification_by_zoom: Mutable[Optional[Dict[int, float]]] = Field(default=None, 
+    simplification_by_zoom: Mutable[Optional[Dict[int, float]]] = Field(default=None,
         description="Map of zoom level to simplification tolerance (in degrees/units). Applied during dynamic generation."
     )
     simplification_algorithm: Mutable[Optional[SimplificationAlgorithm]] = Field(
@@ -65,12 +65,16 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
 class TilesCachingConfig(PluginConfig):
     """Operator-tunable knobs for the bucket-backed tile cache.
 
-    Bucket selection is intentionally NOT exposed here — buckets are
-    provisioned per-catalog by ``StorageProtocol.ensure_storage_for_catalog``
-    and surfacing an override would break the per-catalog isolation
-    invariants enforced by the catalog lifecycle. The bucket in use is
-    logged at provisioning time (gcp_provision_catalog task) and visible
-    in the catalog's storage configuration.
+    By default, bucket selection is determined per-catalog by
+    ``StorageProtocol.ensure_storage_for_catalog``.  Catalogs that have no
+    provisioned bucket (bucket-free / deferred-provisioned) silently skip
+    every tile-cache write and return a miss on every read, forcing PostGIS
+    to re-render each tile on every request.
+
+    ``cache_bucket_override`` opts the entire config scope into a shared,
+    operator-managed bucket so bucket-free catalogs can participate in the L2
+    tile cache.  Per-catalog isolation is preserved: blob keys are namespaced
+    by the catalog's external (logical) identifier.
 
     Live edits via ``PUT /configs/plugins/tiles_caching_config`` apply on
     the next tile save / fetch — no rewrite of already-cached objects.
@@ -126,6 +130,46 @@ class TilesCachingConfig(PluginConfig):
         ),
     )
 
+    # --- Shared / external bucket override (opt-in) ---
+    #
+    # When set, ALL tile cache I/O for this config scope is redirected to the
+    # named GCS bucket instead of the catalog's provisioned bucket.  This
+    # unblocks bucket-free (deferred-provisioned) catalogs: without it,
+    # save_tile silently no-ops and every tile re-renders from PostGIS.
+    #
+    # Blob keys are namespaced by the catalog's external (logical) id so
+    # per-catalog isolation is preserved within the shared bucket:
+    #   {effective_prefix}/{catalog_id}/{collection_id}/{tms_id}/{z}/{x}/{y}.{fmt}
+    # where effective_prefix = cache_bucket_prefix or key_prefix.
+    #
+    # The catalog_id written into the path is the external identifier from
+    # the request URL, never the internal c_... physical schema name.
+    cache_bucket_override: Mutable[Optional[str]] = Field(
+        default=None,
+        min_length=3,
+        max_length=222,
+        description=(
+            "Opt-in: GCS bucket name to use for ALL tile cache I/O regardless "
+            "of whether the catalog has a provisioned bucket. Enables bucket-free "
+            "catalogs to cache and preseed tiles. Blob keys are namespaced by "
+            "catalog_id (external logical id) to preserve isolation: "
+            "{prefix}/{catalog_id}/{collection_id}/{tms_id}/{z}/{x}/{y}.{fmt}. "
+            "None (default) = use the catalog's own provisioned bucket as before."
+        ),
+    )
+
+    cache_bucket_prefix: Mutable[Optional[str]] = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_\-/]*[a-zA-Z0-9]$",
+        description=(
+            "Object-key prefix used inside ``cache_bucket_override``. "
+            "Defaults to the value of ``key_prefix`` when None. "
+            "Ignored when ``cache_bucket_override`` is not set."
+        ),
+    )
+
     # --- Write-reactive invalidation (#1292) ---
     #
     # Write-reactive invalidation itself has NO on/off knob: it is enabled by
@@ -166,31 +210,31 @@ class TilesPreseedConfig(PluginConfig):
 
     # What to seed
     target_tms_ids: Mutable[List[str]] = Field(
-        default=["WebMercatorQuad"], 
+        default=["WebMercatorQuad"],
         description="List of TMS IDs to pre-seed. Must be a subset of TilesConfig.supported_tms_ids."
     )
     formats: Mutable[List[str]] = Field(
-        default=["mvt"], 
+        default=["mvt"],
         description="List of output formats to generate (e.g. 'mvt', 'geojson')."
     )
-    
+
     # Where to seed (Spatial subset)
-    bboxes: Mutable[Optional[List[Tuple[float, float, float, float]]]] = Field(default=None, 
+    bboxes: Mutable[Optional[List[Tuple[float, float, float, float]]]] = Field(default=None,
         description="Specific areas to pre-seed. Intersected with TilesConfig.bbox."
     )
-    
+
     # Storage Configuration
     storage_priority: Mutable[List[str]] = Field(
-        default=["bucket", "pg"], 
+        default=["bucket", "pg"],
         description="Priority list of storage providers to use for saving tiles."
     )
-    
+
     # Generation Overrides
-    simplification_by_zoom_override: Mutable[Optional[Dict[int, float]]] = Field(default=None, 
+    simplification_by_zoom_override: Mutable[Optional[Dict[int, float]]] = Field(default=None,
         description="Override runtime simplification settings for pre-seeded tiles."
     )
-    
+
     # Catalog Level specific
-    collections_to_preseed: Mutable[Optional[List[str]]] = Field(default=None, 
+    collections_to_preseed: Mutable[Optional[List[str]]] = Field(default=None,
         description="For Catalog-level config: list of collections to include. If None, applies to all (or logic defined by task)."
     )

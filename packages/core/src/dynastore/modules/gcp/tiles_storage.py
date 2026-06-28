@@ -20,7 +20,7 @@ import logging
 import os
 import shutil
 import tempfile
-from typing import Optional, Any, Dict
+from typing import Optional, Any, Dict, Tuple
 from dynastore.tools.cache import cached, cache_clear
 from datetime import timedelta
 from dynastore.modules.tiles.tiles_module import TileStorageProtocol, TileArchiveStorageProtocol, read_pmtiles_tile
@@ -58,6 +58,40 @@ def _build_blob_path(
     key_prefix: str, collection_id: str, tms_id: str, z: int, x: int, y: int, format: str
 ) -> str:
     return f"{key_prefix}/{collection_id}/{tms_id}/{z}/{x}/{y}.{format}"
+
+
+async def _resolve_bucket(
+    cfg: TilesCachingConfig,
+    catalog_id: str,
+    storage_provider: StorageProtocol,
+    *,
+    ensure: bool = False,
+) -> Tuple[Optional[str], str]:
+    """Return ``(bucket_name, effective_blob_prefix)`` for a catalog.
+
+    Opt-in path (``cache_bucket_override`` is set): use the shared external
+    bucket for all catalogs; namespace blobs by ``catalog_id`` so per-catalog
+    isolation is preserved within the shared bucket.  The ``catalog_id`` value
+    is the external (logical) identifier from the request URL — never an
+    internal ``c_...`` physical schema name.
+
+    Default path: resolve the catalog's own provisioned bucket via
+    ``StorageProtocol``.  ``ensure=True`` calls
+    ``ensure_storage_for_catalog`` (write path); ``ensure=False`` calls
+    ``get_storage_identifier`` (read path, no provisioning side-effect).
+    """
+    if cfg.cache_bucket_override:
+        # Use the operator-provided shared bucket.  Prefix is namespaced by
+        # catalog_id so blobs from different catalogs never collide.
+        base_prefix = cfg.cache_bucket_prefix or cfg.key_prefix
+        return cfg.cache_bucket_override, f"{base_prefix}/{catalog_id}"
+
+    # Default: per-catalog provisioned bucket.
+    if ensure:
+        bucket = await storage_provider.ensure_storage_for_catalog(catalog_id)
+    else:
+        bucket = await storage_provider.get_storage_identifier(catalog_id)
+    return bucket, cfg.key_prefix
 
 
 class TileBucketPreseedStorage(TileStorageProtocol):
@@ -103,11 +137,13 @@ class TileBucketPreseedStorage(TileStorageProtocol):
             storage_provider = self._get_storage_provider()
             client_provider = self._get_client_provider()
 
-            bucket_name = await storage_provider.ensure_storage_for_catalog(catalog_id)
+            bucket_name, effective_prefix = await _resolve_bucket(
+                cfg, catalog_id, storage_provider, ensure=True
+            )
             if not bucket_name:
                 raise RuntimeError(f"Could not resolve bucket for catalog {catalog_id}")
 
-            blob_path = _build_blob_path(cfg.key_prefix, collection_id, tms_id, z, x, y, format)
+            blob_path = _build_blob_path(effective_prefix, collection_id, tms_id, z, x, y, format)
 
             storage_client = client_provider.get_storage_client()
             bucket = storage_client.bucket(bucket_name)
@@ -123,7 +159,7 @@ class TileBucketPreseedStorage(TileStorageProtocol):
 
             blob.cache_control = f"public, max-age={cfg.ttl_seconds}"
             await run_in_thread(blob.patch)
-            
+
             gcs_uri = f"gs://{bucket_name}/{blob_path}"
             logger.info(f"Background save task SUCCEEDED for tile: {tile_identifier} -> {gcs_uri}")
             return gcs_uri
@@ -139,11 +175,11 @@ class TileBucketPreseedStorage(TileStorageProtocol):
         storage_provider = self._get_storage_provider()
         client_provider = self._get_client_provider()
 
-        bucket_name = await storage_provider.get_storage_identifier(catalog_id)
+        bucket_name, effective_prefix = await _resolve_bucket(cfg, catalog_id, storage_provider)
         if not bucket_name:
-            return None # Bucket doesn't exist, tile doesn't exist
+            return None  # Bucket doesn't exist, tile doesn't exist
 
-        blob_path = _build_blob_path(cfg.key_prefix, collection_id, tms_id, z, x, y, format)
+        blob_path = _build_blob_path(effective_prefix, collection_id, tms_id, z, x, y, format)
 
         storage_client = client_provider.get_storage_client()
         bucket = storage_client.bucket(bucket_name)
@@ -167,11 +203,11 @@ class TileBucketPreseedStorage(TileStorageProtocol):
         storage_provider = self._get_storage_provider()
         client_provider = self._get_client_provider()
 
-        bucket_name = await storage_provider.get_storage_identifier(catalog_id)
+        bucket_name, effective_prefix = await _resolve_bucket(cfg, catalog_id, storage_provider)
         if not bucket_name:
             return False
 
-        blob_path = _build_blob_path(cfg.key_prefix, collection_id, tms_id, z, x, y, format)
+        blob_path = _build_blob_path(effective_prefix, collection_id, tms_id, z, x, y, format)
         storage_client = client_provider.get_storage_client()
         bucket = storage_client.bucket(bucket_name)
         blob = bucket.blob(blob_path)
@@ -188,11 +224,11 @@ class TileBucketPreseedStorage(TileStorageProtocol):
         client_provider = self._get_client_provider()
         identity_provider = self._get_identity_provider()
 
-        bucket_name = await storage_provider.get_storage_identifier(catalog_id)
+        bucket_name, effective_prefix = await _resolve_bucket(cfg, catalog_id, storage_provider)
         if not bucket_name:
             return None
 
-        blob_path = _build_blob_path(cfg.key_prefix, collection_id, tms_id, z, x, y, format)
+        blob_path = _build_blob_path(effective_prefix, collection_id, tms_id, z, x, y, format)
         return await generate_gcs_signed_url(
             f"gs://{bucket_name}/{blob_path}",
             method="GET",
@@ -209,17 +245,17 @@ class TileBucketPreseedStorage(TileStorageProtocol):
     async def delete_tiles_for_collection(self, catalog_id: str, collection_id: str) -> int:
         """Deletes all tiles for a given collection from GCS."""
         storage_provider = self._get_storage_provider()
-        bucket_name = await storage_provider.get_storage_identifier(catalog_id)
+        cfg = await _load_caching_config()
+        bucket_name, effective_prefix = await _resolve_bucket(cfg, catalog_id, storage_provider)
         if not bucket_name:
             return 0
 
-        cfg = await _load_caching_config()
-        prefix = f"{cfg.key_prefix}/{collection_id}/"
+        prefix = f"{effective_prefix}/{collection_id}/"
         client_provider = self._get_client_provider()
         storage_client = client_provider.get_storage_client()
         bucket = storage_client.bucket(bucket_name)
-        
-        # We need to list and delete blobs. 
+
+        # We need to list and delete blobs.
         # For efficiency in a thread-safe way using the concurrency backend.
         def _delete_all():
             blobs = list(bucket.list_blobs(prefix=prefix))
@@ -247,13 +283,13 @@ class TileBucketPreseedStorage(TileStorageProtocol):
     ) -> bool:
         """Delete a single cached tile blob (idempotent mark-stale)."""
         storage_provider = self._get_storage_provider()
-        bucket_name = await storage_provider.get_storage_identifier(catalog_id)
-        if not bucket_name:
-            return True  # No bucket → nothing to invalidate; idempotent success.
-
         cfg = await _load_caching_config()
+        bucket_name, effective_prefix = await _resolve_bucket(cfg, catalog_id, storage_provider)
+        if not bucket_name:
+            return True  # No bucket -> nothing to invalidate; idempotent success.
+
         blob_path = _build_blob_path(
-            cfg.key_prefix, collection_id, tms_id, z, x, y, format
+            effective_prefix, collection_id, tms_id, z, x, y, format
         )
         client_provider = self._get_client_provider()
         storage_client = client_provider.get_storage_client()
@@ -294,42 +330,42 @@ class TileBucketPreseedStorage(TileStorageProtocol):
     ) -> bool:
         """Delete every cached variant of one coordinate from GCS (#1292).
 
-        A coordinate is cached under one object per ``effective_cache_id`` ×
+        A coordinate is cached under one object per ``effective_cache_id`` x
         ``format``: the bare ``collection_id``, ``{collection_id}@{hash}``, and
         multi-collection comma-joined cache ids. The blob key is
-        ``{key_prefix}/{cache_id}/{tms_id}/{z}/{x}/{y}.{format}``, so the
+        ``{effective_prefix}/{cache_id}/{tms_id}/{z}/{x}/{y}.{format}``, so the
         cache-id is the path segment after the prefix.
 
         GCS only lists by key prefix, so we list under
-        ``{key_prefix}/{collection_id}`` (catches the exact id, the
+        ``{effective_prefix}/{collection_id}`` (catches the exact id, the
         ``@hash`` variants, and multi-collection keys where this collection is
         FIRST), then keep only blobs whose cache-id segment is a real variant
         of this collection and whose suffix matches the coordinate + a served
         format. Phase-1 known gap: a multi-collection key where this collection
         is NOT the first segment (e.g. ``other,this``) is not reachable by a
         cheap prefix list and is left for the bucket TTL / a reconcile to evict
-        — the PG backend covers every position via SQL ``LIKE``.
+        -- the PG backend covers every position via SQL ``LIKE``.
         """
         fmt_list = list(formats) if formats else []
         if not fmt_list:
             return True
         storage_provider = self._get_storage_provider()
-        bucket_name = await storage_provider.get_storage_identifier(catalog_id)
-        if not bucket_name:
-            return True  # No bucket → nothing to invalidate; idempotent success.
-
         cfg = await _load_caching_config()
+        bucket_name, effective_prefix = await _resolve_bucket(cfg, catalog_id, storage_provider)
+        if not bucket_name:
+            return True  # No bucket -> nothing to invalidate; idempotent success.
+
         client_provider = self._get_client_provider()
         storage_client = client_provider.get_storage_client()
         bucket = storage_client.bucket(bucket_name)
 
-        list_prefix = f"{cfg.key_prefix}/{collection_id}"
+        list_prefix = f"{effective_prefix}/{collection_id}"
         wanted_suffixes = {
             f"/{tms_id}/{z}/{x}/{y}.{fmt}" for fmt in fmt_list
         }
 
         def _cache_id_matches(cache_seg: str) -> bool:
-            # Reconstruct: blob = {key_prefix}/{cache_seg}/{tms}/{z}/{x}/{y}.{fmt}
+            # Reconstruct: blob = {effective_prefix}/{cache_seg}/{tms}/{z}/{x}/{y}.{fmt}
             # cache_seg is the effective_cache_id. Accept exact, @hash, and
             # comma-list membership (cid-first is the only position reachable
             # by this prefix list; mid/last documented as a Phase-1 gap).
@@ -340,7 +376,7 @@ class TileBucketPreseedStorage(TileStorageProtocol):
         def _delete_matching() -> bool:
             blobs = list(bucket.list_blobs(prefix=list_prefix))
             to_delete = []
-            plen = len(cfg.key_prefix) + 1  # "{key_prefix}/"
+            plen = len(effective_prefix) + 1  # "{effective_prefix}/"
             for blob in blobs:
                 name = blob.name
                 # cache-id segment is between the prefix and the next "/".
@@ -375,12 +411,14 @@ class TileBucketPreseedStorage(TileStorageProtocol):
         bucket or empty prefix is a no-op success.
         """
         storage_provider = self._get_storage_provider()
-        bucket_name = await storage_provider.get_storage_identifier(catalog_id)
+        cfg = await _load_caching_config()
+        bucket_name, effective_prefix = await _resolve_bucket(cfg, catalog_id, storage_provider)
         if not bucket_name:
             return
 
-        cfg = await _load_caching_config()
-        prefix = f"{cfg.key_prefix}/"
+        # Under the override bucket, effective_prefix already includes catalog_id
+        # so we only delete this catalog's slice of the shared bucket.
+        prefix = f"{effective_prefix}/"
         client_provider = self._get_client_provider()
         storage_client = client_provider.get_storage_client()
         bucket = storage_client.bucket(bucket_name)
