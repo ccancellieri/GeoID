@@ -944,8 +944,19 @@ ON CONFLICT ({conflict_target}) {on_conflict_clause};
                 f"into \"{schema}\".\"{table}\" — RETURNING clause produced empty result"
             )
 
-        by_geoid: Dict[Any, Dict[str, Any]] = {row["geoid"]: dict(row) for row in rows}
-        return [by_geoid.get(p.get("geoid"), {}) for p in payloads]
+        # asyncpg returns UUID columns as uuid.UUID objects; payload geoids are
+        # pre-generated strings.  Normalize to str on both sides so the dict
+        # lookup never silently misses every key.
+        by_geoid: Dict[str, Dict[str, Any]] = {
+            str(row["geoid"]): dict(row) for row in rows
+        }
+        return [
+            by_geoid.get(
+                str(p["geoid"]) if p.get("geoid") is not None else "",
+                {},
+            )
+            for p in payloads
+        ]
 
     async def _batch_upsert_sidecar_rows(
         self,
