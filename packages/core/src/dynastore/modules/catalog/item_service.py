@@ -1637,10 +1637,68 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         # commit. Rejections are surfaced to the caller via
         # ``ctx.extensions["_rejections"]`` so the HTTP layer can build a 207
         # ``IngestionReport`` instead of reporting a 500 on a single bad row.
-        from dynastore.modules.storage.errors import SidecarRejectedError
+        from dynastore.modules.storage.errors import SidecarRejectedError, ConflictError
         rejections: List[Dict[str, Any]] = []
+        _use_batch_insert = (
+            items_write_policy is not None
+            and getattr(items_write_policy, "enable_batch_insert", False)
+        )
         for start in range(0, len(prepared), chunk_size):
             chunk = prepared[start:start + chunk_size]
+
+            # ── Batch fast path ────────────────────────────────────────────
+            # Attempt a multi-row INSERT when enable_batch_insert is True and
+            # the chunk has more than one plan.  The batch method opens its own
+            # managed_transaction; if it raises (geometry error, constraint
+            # violation, etc.) the transaction has already rolled back and we
+            # fall through to the per-row path which opens a fresh one.
+            # ConflictError (REFUSE_FAIL / refuse_batch) must propagate
+            # immediately — same as the per-row path.
+            if _use_batch_insert and len(chunk) > 1:
+                _batch_ok = False
+                try:
+                    async with managed_transaction(engine) as conn:
+                        _batch_rows, _batch_rejs = (
+                            await self.batch_insert_or_update_distributed(
+                                conn,
+                                catalog_id,
+                                collection_id,
+                                chunk,
+                                col_config=col_config,
+                                sidecars=sidecars,
+                                write_policy=items_write_policy,
+                            )
+                        )
+                    rejections.extend(_batch_rejs)
+                    for plan, row in zip(chunk, _batch_rows):
+                        if row is None:
+                            continue  # rejected — already in _batch_rejs
+                        write_results.append(row)
+                        item_ctx = plan["item_context"]
+                        hub_pl = plan["hub_payload"]
+                        generated_stats.append({
+                            "geoid": row.get("geoid", plan["geoid"]),
+                            "external_id": item_ctx.get("external_id"),
+                            "asset_id": item_ctx.get("asset_id"),
+                            "transaction_time": hub_pl.get("transaction_time"),
+                            "deleted_at": hub_pl.get("deleted_at"),
+                            "validity": hub_pl.get("validity"),
+                            "stats": _collect_generated_stats(
+                                plan["sidecar_payloads"], stat_names
+                            ),
+                        })
+                    _batch_ok = True
+                except ConflictError:
+                    raise
+                except Exception as _batch_exc:
+                    logger.warning(
+                        "Batch insert fell back to per-row for chunk [%d:%d]: %s",
+                        start, start + chunk_size, _batch_exc,
+                    )
+                if _batch_ok:
+                    continue
+
+            # ── Per-row path (unchanged) ───────────────────────────────────
             async with managed_transaction(engine) as conn:
                 for plan in chunk:
                     try:

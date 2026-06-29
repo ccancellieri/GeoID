@@ -26,7 +26,7 @@ inherits from this mixin.
 
 import logging
 from datetime import datetime, timezone
-from typing import List, Optional, Any, Dict, Set, TYPE_CHECKING, cast
+from typing import List, Optional, Any, Dict, Set, Tuple, TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from dynastore.models.ogc import Feature as _Feature
@@ -776,3 +776,674 @@ ON CONFLICT ({conflict_target}) {on_conflict_clause};
                     )
                 )
         return out
+
+    # ── BATCH INSERT FAST PATH ─────────────────────────────────────────────
+
+    async def _batch_resolve_by_external_id(
+        self,
+        conn: DbResource,
+        phys_schema: str,
+        phys_table: str,
+        external_ids: List[str],
+        sidecars: List[SidecarProtocol],
+        write_policy: Optional[ItemsWritePolicy],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Resolve external_id → existing row for a batch of ids in one SELECT.
+
+        Mirrors the single-row query in
+        ``FeatureAttributeSidecar.resolve_existing_item`` (external_id matcher)
+        but replaces the equality predicate with ``= ANY(:ids)`` so one round-
+        trip covers the whole chunk.  Returns a dict keyed on external_id
+        for O(1) per-plan lookup.
+
+        Returns an empty dict when the attributes sidecar is absent or its
+        external_id storage is disabled — callers degrade to per-row.
+        """
+        if not external_ids:
+            return {}
+
+        attrs_sidecar = next(
+            (s for s in sidecars if s.sidecar_id == "attributes"), None
+        )
+        if attrs_sidecar is None:
+            return {}
+
+        sc_cfg = getattr(attrs_sidecar, "config", None)
+        if sc_cfg is None or not getattr(sc_cfg, "enable_external_id", False):
+            return {}
+
+        sc_table = f"{phys_table}_attributes"
+        geom_sc_table = f"{phys_table}_geometries"
+        enable_validity: bool = bool(getattr(sc_cfg, "enable_validity", False))
+
+        validity_clause = "AND upper(s.validity) IS NULL" if enable_validity else ""
+        validity_col = ", s.validity" if enable_validity else ""
+
+        sql = f"""
+            SELECT DISTINCT ON (s.external_id)
+                s.external_id, h.geoid, g.geometry_hash{validity_col}
+            FROM "{phys_schema}"."{phys_table}" h,
+                 "{phys_schema}"."{sc_table}" s,
+                 "{phys_schema}"."{geom_sc_table}" g
+            WHERE s.external_id = ANY(CAST(:ids AS TEXT[]))
+              AND h.deleted_at IS NULL
+              AND h.geoid = s.geoid
+              AND g.geoid = h.geoid
+              {validity_clause}
+            ORDER BY s.external_id, h.transaction_time DESC;
+        """
+        rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
+            conn, ids=list(external_ids)
+        )
+        return {row["external_id"]: dict(row) for row in (rows or [])}
+
+    async def _batch_resolve_by_geometry_hash(
+        self,
+        conn: DbResource,
+        phys_schema: str,
+        phys_table: str,
+        geometry_hashes: List[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Resolve geometry_hash → existing row for a batch in one SELECT.
+
+        Mirrors ``FeatureAttributeSidecar._resolve_by_geometry_hash`` but
+        replaces the equality predicate with ``= ANY(:hashes)`` so the whole
+        chunk is resolved in a single round-trip.  Returns a dict keyed on
+        geometry_hash for O(1) per-plan lookup.
+        """
+        if not geometry_hashes:
+            return {}
+
+        geom_sc_table = f"{phys_table}_geometries"
+        sql = f"""
+            SELECT DISTINCT ON (s.geometry_hash)
+                s.geometry_hash, h.geoid
+            FROM "{phys_schema}"."{phys_table}" h
+            JOIN "{phys_schema}"."{geom_sc_table}" s
+              ON s.geoid = h.geoid
+            WHERE s.geometry_hash = ANY(CAST(:hashes AS TEXT[]))
+              AND h.deleted_at IS NULL
+            ORDER BY s.geometry_hash, h.transaction_time DESC;
+        """
+        rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
+            conn, hashes=list(geometry_hashes)
+        )
+        return {row["geometry_hash"]: dict(row) for row in (rows or [])}
+
+    async def _batch_hub_insert(
+        self,
+        conn: DbResource,
+        schema: str,
+        table: str,
+        payloads: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Multi-row hub INSERT RETURNING *.
+
+        Column set is the union across all payloads in declaration order;
+        missing keys are emitted as NULL so column-level DB defaults apply.
+        Range columns (e.g. ``validity``) are wrapped with ``tstzrange()``,
+        using the same lower/upper/bounds expansion as ``_upsert_sidecar_table_raw``.
+
+        Returns hub rows mapped back to input order by geoid (pre-generated
+        in Phase 2, so no ordering assumption is placed on RETURNING).
+        """
+        if not payloads:
+            return []
+
+        seen: Dict[str, None] = {}
+        for p in payloads:
+            for k in p:
+                seen[k] = None
+        all_cols = list(seen.keys())
+
+        params: Dict[str, Any] = {}
+        value_tuples: List[str] = []
+
+        for i, payload in enumerate(payloads):
+            row_vals: List[str] = []
+            for col in all_cols:
+                if col not in payload:
+                    row_vals.append("NULL")
+                    continue
+                v = payload[col]
+                pk = f"_h_{col}_{i}"
+                if (
+                    hasattr(v, "lower")
+                    and hasattr(v, "upper")
+                    and hasattr(v, "lower_inc")
+                ):
+                    lk = f"_h_{col}_lo_{i}"
+                    uk = f"_h_{col}_hi_{i}"
+                    lb = "[" if v.lower_inc else "("
+                    ub = "]" if v.upper_inc else ")"
+                    row_vals.append(f"tstzrange(:{lk}, :{uk}, '{lb}{ub}')")
+                    params[lk] = v.lower
+                    params[uk] = v.upper
+                else:
+                    row_vals.append(f":{pk}")
+                    params[pk] = v
+            value_tuples.append(f"({', '.join(row_vals)})")
+
+        col_list = ", ".join(f'"{c}"' for c in all_cols)
+        sql = (
+            f'INSERT INTO "{schema}"."{table}" ({col_list})\n'
+            f"VALUES {', '.join(value_tuples)}\n"
+            f"RETURNING *;"
+        )
+        rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
+            conn, **params
+        )
+        # PG INSERT…RETURNING never silently drops rows that were inserted.
+        # An empty result is an invariant violation, not a recoverable path.
+        # The [{}]*N fallback that was here before would produce empty dicts
+        # that survive the `if row is None` guard in the caller and then
+        # crash with KeyError on `row["geoid"]` in result_geoids.
+        if not rows:
+            raise RuntimeError(
+                f"batch hub insert returned no rows for {len(payloads)} payload(s) "
+                f"into \"{schema}\".\"{table}\" — RETURNING clause produced empty result"
+            )
+
+        by_geoid: Dict[Any, Dict[str, Any]] = {row["geoid"]: dict(row) for row in rows}
+        return [by_geoid.get(p.get("geoid"), {}) for p in payloads]
+
+    async def _batch_upsert_sidecar_rows(
+        self,
+        conn: DbResource,
+        schema: str,
+        table: str,
+        payloads: List[Dict[str, Any]],
+        conflict_cols: Optional[List[str]] = None,
+        geom_cols: Optional[Set[str]] = None,
+    ) -> None:
+        """Multi-row sidecar INSERT … ON CONFLICT for a list of finalized payloads.
+
+        Mirrors ``_upsert_sidecar_table_raw`` for a single row but collapses
+        N finalized payloads into one VALUES clause.  Geometry columns receive
+        the same ``ST_GeomFromEWKB(decode(:k, 'hex'))`` expression; range
+        columns (e.g. ``validity``) use the same ``tstzrange()`` expansion.
+        Missing keys in any payload are emitted as NULL so optional columns
+        don't cause column-count errors between rows.
+
+        Bind-parameter names are suffixed with ``_s_<col>_<row>`` to avoid
+        collisions across rows.
+        """
+        if not payloads:
+            return
+        if conflict_cols is None:
+            conflict_cols = ["geoid"]
+        if geom_cols is None:
+            geom_cols = {"geom", "bbox_geom", "centroid"}
+
+        seen: Dict[str, None] = {}
+        for p in payloads:
+            for k in p:
+                seen[k] = None
+        all_cols = list(seen.keys())
+
+        updates = [
+            f'"{c}" = EXCLUDED."{c}"' for c in all_cols if c not in conflict_cols
+        ]
+        params: Dict[str, Any] = {}
+        value_tuples: List[str] = []
+
+        for i, payload in enumerate(payloads):
+            row_vals: List[str] = []
+            for col in all_cols:
+                if col not in payload:
+                    row_vals.append("NULL")
+                    continue
+                v = payload[col]
+                pk = f"_s_{col}_{i}"
+                if col in geom_cols and isinstance(v, str):
+                    row_vals.append(f"ST_GeomFromEWKB(decode(:{pk}, 'hex'))")
+                    params[pk] = v
+                elif (
+                    hasattr(v, "lower")
+                    and hasattr(v, "upper")
+                    and hasattr(v, "lower_inc")
+                ):
+                    lk = f"_s_{col}_lo_{i}"
+                    uk = f"_s_{col}_hi_{i}"
+                    lb = "[" if v.lower_inc else "("
+                    ub = "]" if v.upper_inc else ")"
+                    row_vals.append(f"tstzrange(:{lk}, :{uk}, '{lb}{ub}')")
+                    params[lk] = v.lower
+                    params[uk] = v.upper
+                else:
+                    row_vals.append(f":{pk}")
+                    params[pk] = v
+            value_tuples.append(f"({', '.join(row_vals)})")
+
+        col_list = ", ".join(f'"{c}"' for c in all_cols)
+        conflict_target = ", ".join(f'"{c}"' for c in conflict_cols)
+        on_conflict = (
+            f"DO UPDATE SET {', '.join(updates)}" if updates else "DO NOTHING"
+        )
+        sql = (
+            f'INSERT INTO "{schema}"."{table}" ({col_list})\n'
+            f"VALUES {', '.join(value_tuples)}\n"
+            f"ON CONFLICT ({conflict_target}) {on_conflict};"
+        )
+        await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
+            conn, **params
+        )
+
+    async def batch_insert_or_update_distributed(
+        self,
+        conn: DbResource,
+        catalog_id: str,
+        collection_id: str,
+        plans: List[Dict[str, Any]],
+        col_config: ItemsPostgresqlDriverConfig,
+        sidecars: List[SidecarProtocol],
+        write_policy: Optional[ItemsWritePolicy],
+    ) -> Tuple[List[Optional[Dict[str, Any]]], List[Dict[str, Any]]]:
+        """Batched multi-row write for a chunk of prepared plans.
+
+        Replaces per-row ``insert_or_update_distributed`` calls for the
+        INSERT-dominant bulk-load case.  Round-trip reduction per chunk with
+        default sidecars (attributes + geometries + item_metadata):
+
+          Per-row path: N × (1 identity SELECT + 1 hub INSERT + 3 sidecar
+          INSERTs) ≈ 5N round-trips.
+
+          Batch path: 2 identity SELECTs (external_id ANY + geometry_hash ANY)
+          + 1 multi-row hub INSERT + 3 multi-row sidecar INSERTs + per-row
+          fallback for the UPDATE partition ≈ 5 + U×5 round-trips (where U is
+          the number of matching/update rows — typically 0 in a fresh load).
+
+        Identity-resolution batching covers ``external_id`` and
+        ``geometry_hash`` matchers.  Rules whose ``match_on`` includes
+        ``geohash`` or ``attributes_hash`` fall back to per-row identity
+        resolution (those matchers require per-feature SQL expressions that
+        cannot collapse into a single ANY lookup).
+
+        The UPDATE partition always uses the existing per-row
+        ``insert_or_update_distributed`` path — updates are rare in a fresh
+        bulk load and the archive step (NEW_VERSION) makes batching unsafe.
+
+        Returns:
+            ``(per_plan_results, rejections)`` — ``per_plan_results`` is
+            parallel to ``plans``: ``None`` for rejected plans, a hub-row dict
+            for accepted ones (same shape as the per-row path).
+
+        Raises:
+            ConflictError: for REFUSE_FAIL / refuse_batch policies (same as the
+                per-row path — must abort the whole chunk transaction).
+        """
+        phys_schema = await self._resolve_physical_schema(
+            catalog_id, db_resource=conn
+        )
+        phys_table = await self._resolve_physical_table(
+            catalog_id, collection_id, db_resource=conn
+        )
+        if not phys_table:
+            phys_table = collection_id
+
+        results: List[Optional[Dict[str, Any]]] = [None] * len(plans)
+        rejections: List[Dict[str, Any]] = []
+
+        # ── 1. Sidecar acceptance check ──────────────────────────────────
+        accepted_idx: List[int] = []
+        for i, plan in enumerate(plans):
+            rejected = False
+            for sidecar in sidecars:
+                if not sidecar.is_acceptable(plan["hub_payload"], plan["item_context"]):
+                    external_id = plan["item_context"].get("external_id")
+                    logger.warning(
+                        "Feature rejected by sidecar %s (external_id=%s)",
+                        sidecar.sidecar_id, external_id,
+                    )
+                    rejections.append({
+                        "geoid": str(plan["geoid"]),
+                        "external_id": external_id,
+                        "sidecar_id": sidecar.sidecar_id,
+                        "matcher": None,
+                        "reason": "sidecar_not_acceptable",
+                        "message": (
+                            f"Sidecar '{sidecar.sidecar_id}' refused the feature"
+                        ),
+                        "record": plan["item_context"].get("_raw_item"),
+                    })
+                    rejected = True
+                    break
+            if not rejected:
+                accepted_idx.append(i)
+
+        if not accepted_idx:
+            return results, rejections
+
+        # ── 2. Identity resolution ────────────────────────────────────────
+        # "Batchable" means every match_on field resolves via a single
+        # ANY(:ids) lookup (external_id, geometry_hash).  Geohash requires
+        # per-feature ST_GeoHash(wkb) evaluation; attributes_hash requires
+        # per-feature JSONB hashing — both fall back to per-row to preserve
+        # exact match semantics.
+        _BATCHABLE: Set[str] = {"external_id", "geometry_hash"}
+
+        rules = (
+            write_policy.resolved_identity()
+            if write_policy
+            else [
+                ResolvedIdentityRule(
+                    match_on=[ComputedField(kind=ComputedKind.EXTERNAL_ID)]
+                )
+            ]
+        )
+
+        all_rules_batchable = all(
+            all(str(cf.kind) in _BATCHABLE for cf in rule.match_on)
+            for rule in rules
+        )
+
+        active_recs: Dict[int, Optional[Dict[str, Any]]] = {}
+        matched_rules_map: Dict[int, Optional[ResolvedIdentityRule]] = {}
+
+        if all_rules_batchable:
+            ext_ids: List[Optional[str]] = [
+                plans[i]["item_context"].get("external_id") for i in accepted_idx
+            ]
+            geom_hashes: List[Optional[str]] = [
+                plans[i]["item_context"].get("geometry_hash") for i in accepted_idx
+            ]
+
+            non_null_ext_ids = [e for e in ext_ids if e]
+            non_null_geom_hashes = [h for h in geom_hashes if h]
+
+            ext_id_map: Dict[str, Dict[str, Any]] = {}
+            geom_hash_map: Dict[str, Dict[str, Any]] = {}
+
+            if non_null_ext_ids:
+                ext_id_map = await self._batch_resolve_by_external_id(
+                    conn, phys_schema, phys_table,
+                    non_null_ext_ids, sidecars, write_policy,
+                )
+            if non_null_geom_hashes:
+                geom_hash_map = await self._batch_resolve_by_geometry_hash(
+                    conn, phys_schema, phys_table, non_null_geom_hashes,
+                )
+
+            for i in accepted_idx:
+                ctx = plans[i]["item_context"]
+                active_rec: Optional[Dict[str, Any]] = None
+                matched_rule: Optional[ResolvedIdentityRule] = None
+
+                for rule in rules:
+                    geoid_sets: List[Set[Any]] = []
+                    row_by_geoid: Dict[Any, Dict[str, Any]] = {}
+                    rule_ok = True
+
+                    for cf in rule.match_on:
+                        matcher_str = str(cf.kind)
+                        if matcher_str == "external_id":
+                            ext_id = ctx.get("external_id")
+                            if ext_id and ext_id in ext_id_map:
+                                row = ext_id_map[ext_id]
+                                g = row.get("geoid")
+                                geoid_sets.append({g})
+                                row_by_geoid[g] = row
+                            else:
+                                rule_ok = False
+                                break
+                        elif matcher_str == "geometry_hash":
+                            gh = ctx.get("geometry_hash")
+                            if gh and gh in geom_hash_map:
+                                row = geom_hash_map[gh]
+                                g = row.get("geoid")
+                                geoid_sets.append({g})
+                                row_by_geoid[g] = row
+                            else:
+                                rule_ok = False
+                                break
+
+                    if not rule_ok or not geoid_sets:
+                        continue
+
+                    # AND semantics: intersect geoid sets across match_on fields.
+                    common: Set[Any] = geoid_sets[0]
+                    for nxt in geoid_sets[1:]:
+                        common = common & nxt
+                    if not common:
+                        continue
+
+                    for g in geoid_sets[0]:
+                        if g in common:
+                            active_rec = row_by_geoid[g]
+                            matched_rule = rule
+                            break
+
+                    if active_rec:
+                        kinds = ",".join(str(cf.kind) for cf in rule.match_on)
+                        logger.info(
+                            "BATCH UPSERT: found active record geoid=%s (rule=[%s])",
+                            active_rec.get("geoid"), kinds,
+                        )
+                        break
+
+                active_recs[i] = active_rec
+                matched_rules_map[i] = matched_rule
+        else:
+            # Non-batchable matchers: per-row identity resolution only.
+            for i in accepted_idx:
+                active_rec = None
+                matched_rule = None
+                for rule in rules:
+                    rec = await _resolve_rule(
+                        rule, conn, phys_schema, phys_table,
+                        plans[i]["item_context"], sidecars,
+                    )
+                    if rec:
+                        active_rec = rec
+                        matched_rule = rule
+                        break
+                active_recs[i] = active_rec
+                matched_rules_map[i] = matched_rule
+
+        # ── 3. Classify each accepted plan ───────────────────────────────
+        insert_idx: List[int] = []
+        update_idx: List[int] = []
+
+        for i in accepted_idx:
+            plan = plans[i]
+            active_rec = active_recs[i]
+            matched_rule = matched_rules_map[i]
+            effective_on_conflict = _select_effective_on_conflict(
+                write_policy, matched_rule
+            )
+
+            if effective_on_conflict == WriteConflictPolicy.NEW_VERSION and (
+                write_policy is None or not write_policy.enable_validity
+            ):
+                effective_on_conflict = WriteConflictPolicy.UPDATE
+
+            if active_rec and write_policy and write_policy.on_batch_conflict is not None:
+                from dynastore.modules.storage.driver_config import BatchConflictPolicy
+                if write_policy.on_batch_conflict == BatchConflictPolicy.REFUSE:
+                    rule_name = (
+                        ",".join(str(cf.kind) for cf in matched_rule.match_on)
+                        if matched_rule else "unknown"
+                    )
+                    raise ConflictError(
+                        f"Write refused: duplicate detected via [{rule_name}] "
+                        f"(geoid={active_rec.get('geoid')}); policy=refuse_batch",
+                        geoid=active_rec.get("geoid"),
+                        matcher=rule_name,
+                    )
+
+            if active_rec and effective_on_conflict == WriteConflictPolicy.REFUSE_FAIL:
+                rule_name = (
+                    ",".join(str(cf.kind) for cf in matched_rule.match_on)
+                    if matched_rule else "unknown"
+                )
+                raise ConflictError(
+                    f"Write refused: identity match via [{rule_name}] "
+                    f"(geoid={active_rec.get('geoid')}); policy=REFUSE_FAIL",
+                    geoid=active_rec.get("geoid"),
+                    matcher=rule_name,
+                )
+
+            if active_rec and effective_on_conflict == WriteConflictPolicy.REFUSE_RETURN:
+                logger.info(
+                    "BATCH UPSERT: REFUSE_RETURN — keeping existing record geoid=%s",
+                    active_rec.get("geoid"),
+                )
+                results[i] = {"geoid": active_rec["geoid"], "_refuse_return": True}
+                continue
+
+            if active_rec and effective_on_conflict == WriteConflictPolicy.REFUSE:
+                logger.info(
+                    "BATCH UPSERT: identity matched and REFUSE set. Skipping."
+                )
+                rejections.append({
+                    "geoid": str(active_rec["geoid"]),
+                    "external_id": plan["item_context"].get("external_id"),
+                    "sidecar_id": None,
+                    "matcher": (
+                        ",".join(str(cf.kind) for cf in matched_rule.match_on)
+                        if matched_rule else None
+                    ),
+                    "reason": "write_policy_refuse",
+                    "message": "Feature refused by write policy",
+                    "record": plan["item_context"].get("_raw_item"),
+                })
+                continue
+
+            if not active_rec or effective_on_conflict == WriteConflictPolicy.NEW_VERSION:
+                if active_rec and effective_on_conflict == WriteConflictPolicy.NEW_VERSION:
+                    # Archive step required — fall back to per-row.
+                    update_idx.append(i)
+                else:
+                    insert_idx.append(i)
+            else:
+                update_idx.append(i)
+
+        # ── 4. Batched hub INSERT for the INSERT partition ────────────────
+        if insert_idx:
+            hub_payloads = [plans[i]["hub_payload"] for i in insert_idx]
+            hub_rows = await self._batch_hub_insert(
+                conn, phys_schema, phys_table, hub_payloads
+            )
+
+            for list_pos, plan_i in enumerate(insert_idx):
+                hub_row = hub_rows[list_pos]
+                # Defense-in-depth: _batch_hub_insert raises RuntimeError on
+                # empty RETURNING, so a missing geoid here should not occur in
+                # practice.  Guard anyway so a bug surfaces as a clear error
+                # rather than a silent empty-dict propagating to result_geoids.
+                if not hub_row or "geoid" not in hub_row:
+                    raise RuntimeError(
+                        f"batch hub insert returned a row without 'geoid' for "
+                        f"plan index {plan_i} (geoid={plans[plan_i]['geoid']})"
+                    )
+                results[plan_i] = hub_row
+
+            # ── 5. Batched sidecar INSERT per sidecar ────────────────────
+            for sidecar in sidecars:
+                sc_id = sidecar.sidecar_id
+                sc_table = f"{phys_table}_{sc_id}"
+
+                conflict_cols = sidecar.get_identity_columns()
+                if col_config.partitioning and col_config.partitioning.enabled:
+                    for key in col_config.partitioning.partition_keys:
+                        if key not in conflict_cols:
+                            conflict_cols.insert(0, key)
+
+                _gvc = getattr(sidecar, "geometry_value_columns", None)
+                geom_cols_sc = (
+                    cast("Optional[Set[str]]", _gvc()) if callable(_gvc) else None
+                )
+
+                sc_finalized: List[Dict[str, Any]] = []
+                for list_pos, plan_i in enumerate(insert_idx):
+                    plan = plans[plan_i]
+                    hub_row = hub_rows[list_pos]
+                    sc_data_map = plan["sidecar_payloads"]
+
+                    if sc_id not in sc_data_map and not sidecar.is_mandatory():
+                        continue
+
+                    sc_payload = dict(sc_data_map.get(sc_id, {}))
+                    if "geoid" not in sc_payload:
+                        sc_payload["geoid"] = hub_row.get(
+                            "geoid", plan["hub_payload"]["geoid"]
+                        )
+
+                    full_payload = sidecar.finalize_upsert_payload(
+                        sc_payload, hub_row, plan["item_context"]
+                    )
+                    full_payload = self._strip_undeclared_columns(
+                        sidecar, full_payload, col_config
+                    )
+                    sc_finalized.append(full_payload)
+
+                if sc_finalized:
+                    await self._batch_upsert_sidecar_rows(
+                        conn, phys_schema, sc_table, sc_finalized,
+                        conflict_cols=conflict_cols,
+                        geom_cols=geom_cols_sc,
+                    )
+
+                # JSON-FG Place Statistics — optional per sidecar.
+                _prep_place = getattr(sidecar, "prepare_place_upsert_payload", None)
+                if _prep_place is not None:
+                    place_payloads: List[Dict[str, Any]] = []
+                    for list_pos, plan_i in enumerate(insert_idx):
+                        plan = plans[plan_i]
+                        hub_row = hub_rows[list_pos]
+                        geoid_val = hub_row.get("geoid", plan["hub_payload"]["geoid"])
+                        # Mirror the per-row path (_execute_distributed_insert):
+                        # the `continue` inside the sidecar loop exits the WHOLE
+                        # sidecar block (main INSERT + place stats) for that plan.
+                        # A non-mandatory sidecar with no payload data must
+                        # therefore produce no place row for the feature either.
+                        sc_data_map = plan["sidecar_payloads"]
+                        if sc_id not in sc_data_map and not sidecar.is_mandatory():
+                            continue
+                        try:
+                            pp = _prep_place(
+                                plan["item_context"].get("_raw_item", {}),
+                                plan["item_context"],
+                            )
+                            if pp:
+                                if "geoid" not in pp:
+                                    pp["geoid"] = geoid_val
+                                place_payloads.append(pp)
+                        except Exception as exc:
+                            logger.warning(
+                                "Place stats prep skipped for geoid %s: %s",
+                                geoid_val, exc,
+                            )
+                    if place_payloads:
+                        try:
+                            await self._batch_upsert_sidecar_rows(
+                                conn, phys_schema, f"{phys_table}_place",
+                                place_payloads,
+                                conflict_cols=["geoid"],
+                                geom_cols=geom_cols_sc,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Place stats batch upsert skipped: %s", exc
+                            )
+
+        # ── 6. UPDATE partition — per-row via existing path ──────────────
+        # Updates are rare in bulk-load.  NEW_VERSION's archive step
+        # (expire_version) and validate_update checks make batching complex
+        # and the correctness risk outweighs the gain for a small partition.
+        for i in update_idx:
+            plan = plans[i]
+            row = await self.insert_or_update_distributed(
+                conn,
+                catalog_id,
+                collection_id,
+                plan["hub_payload"],
+                plan["sidecar_payloads"],
+                col_config=col_config,
+                sidecars=sidecars,
+                processing_context=plan["item_context"],
+            )
+            if row is not None:
+                results[i] = row
+
+        return results, rejections
