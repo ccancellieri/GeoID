@@ -86,6 +86,7 @@ async def generate_gcs_signed_url(
     blob = storage_client.bucket(bucket_name).blob(blob_path)
 
     if check_exists and not await run_in_thread(blob.exists):
+        logger.debug("generate_gcs_signed_url: blob %s not found; skipping signing", gs_uri)
         return None
 
     kwargs: dict = {
@@ -96,7 +97,14 @@ async def generate_gcs_signed_url(
     if content_type is not None and method != "GET":
         kwargs["content_type"] = content_type
     if identity_provider is not None:
-        kwargs["service_account_email"] = identity_provider.get_account_email()
+        email = identity_provider.get_account_email()
+        if not email or "@" not in email:
+            raise ValueError(
+                f"IAM signing requires a valid service-account email; got {email!r}. "
+                "Check that the GCP metadata server returned a proper SA email at startup "
+                "(GCPModule._identity['account_email'] must not be None or 'default')."
+            )
+        kwargs["service_account_email"] = email
         kwargs["access_token"] = await identity_provider.get_fresh_token()
 
     return await run_in_thread(blob.generate_signed_url, **kwargs)

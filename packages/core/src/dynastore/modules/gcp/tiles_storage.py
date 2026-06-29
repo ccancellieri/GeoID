@@ -229,13 +229,40 @@ class TileBucketPreseedStorage(TileStorageProtocol):
             return None
 
         blob_path = _build_blob_path(effective_prefix, collection_id, tms_id, z, x, y, format)
+        gs_uri = f"gs://{bucket_name}/{blob_path}"
+
+        # Inline existence check with explicit error handling.
+        # blob.exists() uses the GCS JSON metadata API (storage.objects.get).
+        # A 403 on the metadata endpoint raises in google-cloud-storage v3+, so
+        # we catch it here and surface it as WARNING rather than letting it
+        # propagate silently.  A False return (blob genuinely absent) is a normal
+        # cache-miss and should not be logged above DEBUG.
+        storage_client = client_provider.get_storage_client()
+        blob = storage_client.bucket(bucket_name).blob(blob_path)
+        try:
+            tile_exists = await run_in_thread(blob.exists)
+        except Exception as exc:
+            logger.warning(
+                "tile_cache: existence probe raised %s for %s "
+                "— redirect unavailable; proxy will be tried. "
+                "Check SA has storage.objects.get (metadata) on the bucket.",
+                type(exc).__name__, gs_uri,
+            )
+            return None
+        if not tile_exists:
+            # Normal cache-miss; not logged above DEBUG so the operator
+            # does not see noise on every uncached tile request.
+            return None
+
+        # Tile is confirmed present — sign and return the redirect URL.
+        # check_exists=False: existence already verified above.
         return await generate_gcs_signed_url(
-            f"gs://{bucket_name}/{blob_path}",
+            gs_uri,
             method="GET",
             expiration=timedelta(minutes=60),
             client_provider=client_provider,
             identity_provider=identity_provider,
-            check_exists=True,
+            check_exists=False,
         )
 
     async def get_preseed_state(self, catalog_id: str, collection_id: str, tms_id: str) -> Dict[str, Any]:

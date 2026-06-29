@@ -189,3 +189,101 @@ async def test_hit_log_line_uses_structured_key_value_format(caplog):
     assert "z=5 x=17 y=11" in msg
     assert "duration_ms=" in msg
     assert "bytes=2" in msg
+
+
+# ---------------------------------------------------------------------------
+# Signing-path visibility: WARNING when redirect mode falls back to proxy
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_redirect_mode_url_none_then_proxy_hit_logs_warning(caplog):
+    """When serve_mode=redirect but get_tile_url returns None (no exception) AND
+    proxy finds the tile, a WARNING is logged so operators can diagnose why
+    redirect is not working (blob.exists() permission issue on the bucket)."""
+    import logging
+    provider = MagicMock()
+    provider.get_tile_url = AsyncMock(return_value=None)
+    provider.get_tile = AsyncMock(return_value=b"\x1a\x03mvt")
+
+    with caplog.at_level(logging.WARNING, logger="dynastore.extensions.tiles.tiles_service"):
+        resp = await TilesService._try_cached_tile(
+            provider, "catalog1", "coll1", "WebMercatorQuad", 5, 17, 11, "mvt",
+            start_time=time.perf_counter(),
+            serve_mode="redirect",
+        )
+
+    # Proxy served the tile (fallback)
+    assert resp is not None
+    assert resp.status_code == 200
+    assert resp.headers["X-Tile-Source"] == "bucket_proxy"
+
+    # WARNING must name the misconfiguration so operators know where to look
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings, "Expected a WARNING when proxy serves a tile in redirect mode"
+    assert any("serve_mode=redirect" in w and "proxy" in w for w in warnings)
+
+
+@pytest.mark.asyncio
+async def test_redirect_mode_proxy_hit_warns_about_blob_exists_or_sign(caplog):
+    """Specific text check: warning mentions SA permissions so operators can act."""
+    import logging
+    provider = MagicMock()
+    provider.get_tile_url = AsyncMock(return_value=None)
+    provider.get_tile = AsyncMock(return_value=b"\x1a\x03mvt")
+
+    with caplog.at_level(logging.WARNING, logger="dynastore.extensions.tiles.tiles_service"):
+        await TilesService._try_cached_tile(
+            provider, "cat", "coll", "WebMercatorQuad", 5, 17, 11, "mvt",
+            start_time=time.perf_counter(),
+            serve_mode="redirect",
+        )
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    combined = " ".join(warnings)
+    assert "roles/storage.objectViewer" in combined or "blob.exists" in combined or "signBlob" in combined, (
+        f"WARNING must guide the operator to the IAM fix; got: {combined!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_redirect_mode_url_none_no_proxy_hit_no_warning(caplog):
+    """If redirect mode → url=None AND proxy also misses, no WARNING fires
+    (it is just a normal cache miss, not a misconfiguration)."""
+    import logging
+    provider = MagicMock()
+    provider.get_tile_url = AsyncMock(return_value=None)
+    provider.get_tile = AsyncMock(return_value=None)  # genuine miss
+
+    with caplog.at_level(logging.WARNING, logger="dynastore.extensions.tiles.tiles_service"):
+        resp = await TilesService._try_cached_tile(
+            provider, "cat", "coll", "WebMercatorQuad", 5, 17, 11, "mvt",
+            start_time=time.perf_counter(),
+            serve_mode="redirect",
+        )
+
+    assert resp is None
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert not warnings, f"No WARNING expected on a genuine cache miss, got: {warnings}"
+
+
+@pytest.mark.asyncio
+async def test_redirect_signed_url_exception_type_in_warning(caplog):
+    """When get_tile_url raises, the exception TYPE name appears in the warning."""
+    import logging
+    provider = MagicMock()
+    provider.get_tile_url = AsyncMock(side_effect=ValueError("bad SA email"))
+    provider.get_tile = AsyncMock(return_value=None)
+
+    with caplog.at_level(logging.WARNING, logger="dynastore.extensions.tiles.tiles_service"):
+        await TilesService._try_cached_tile(
+            provider, "cat", "coll", "WebMercatorQuad", 5, 17, 11, "mvt",
+            start_time=time.perf_counter(),
+            serve_mode="redirect",
+        )
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings, "Expected WARNING on signing exception"
+    assert any("ValueError" in w for w in warnings), (
+        f"Exception class name should appear in warning; got {warnings}"
+    )

@@ -1148,9 +1148,9 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 )
             except Exception as exc:
                 logger.warning(
-                    "tile_cache: signed URL failed (serve_mode=redirect), "
+                    "tile_cache: signed URL raised %s (serve_mode=redirect), "
                     "falling back to proxy — catalog=%s collection=%s: %s",
-                    dataset, cache_id, exc,
+                    type(exc).__name__, dataset, cache_id, exc,
                 )
             if url:
                 duration_ms = (time.perf_counter() - start_time) * 1000
@@ -1167,6 +1167,13 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                         "X-Tile-Source": "bucket_redirect",
                     },
                 )
+            else:
+                logger.debug(
+                    "tile_cache: get_tile_url returned None (serve_mode=redirect) "
+                    "catalog=%s collection=%s z=%s x=%s y=%s "
+                    "— tile absent in cache or signing unavailable; trying proxy",
+                    dataset, cache_id, z, x, y,
+                )
 
         # --- Proxy path: serve_mode=="proxy" OR redirect fell through ---
         try:
@@ -1176,6 +1183,22 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             return None
         if tile:
             duration_ms = (time.perf_counter() - start_time) * 1000
+            if serve_mode == "redirect":
+                # Proxy returned bytes while redirect mode is active.
+                # This means the tile IS in the bucket but get_tile_url returned
+                # None — most likely because blob.exists() on the metadata API
+                # returned False despite the object being readable via the
+                # download API, or signing failed silently.
+                # Action: confirm the SA has storage.objects.get on the bucket
+                # for both metadata and download, and that signBlob is granted.
+                logger.warning(
+                    "tile_cache: serve_mode=redirect but proxy returned bytes "
+                    "catalog=%s collection=%s z=%s x=%s y=%s "
+                    "— redirect is misconfigured or SA lacks blob.exists() permission; "
+                    "check roles/storage.objectViewer + roles/iam.serviceAccountTokenCreator "
+                    "on the SA for the cache bucket",
+                    dataset, cache_id, z, x, y,
+                )
             logger.info(
                 "tile_cache event=hit source=bucket_proxy catalog=%s collection=%s "
                 "z=%s x=%s y=%s duration_ms=%.2f bytes=%d",
