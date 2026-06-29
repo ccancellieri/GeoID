@@ -320,6 +320,129 @@ class ItemQueryMixin:
             )
             return None
 
+    async def _resolve_count_config(
+        self,
+        catalog_id: str,
+        collection_id: str,
+    ) -> Optional[Any]:
+        """Resolve :class:`ItemsCountConfig` for the collection.
+
+        Returns ``None`` when the configs protocol is unavailable; callers
+        then use the class defaults (``estimate_count=True``,
+        ``exact_count_threshold=50_000``).
+        """
+        try:
+            from dynastore.modules.storage.read_policy import ItemsCountConfig
+
+            configs = get_protocol(ConfigsProtocol)
+            if configs is None:
+                return None
+            return await configs.get_config(
+                ItemsCountConfig,
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - count config miss must not break the read
+            logger.debug(
+                "count config resolution skipped for %s/%s: %s",
+                catalog_id,
+                collection_id,
+                exc,
+            )
+            return None
+
+    async def _resolve_number_matched(
+        self,
+        conn: Any,
+        phys_schema: str,
+        phys_table: str,
+        count_request: "QueryRequest",
+        context: Dict[str, Any],
+        catalog_id: str,
+        collection_id: str,
+        col_config: Any,
+        consumer: Any,
+    ) -> Optional[int]:
+        """Compute ``numberMatched`` via estimate or exact count.
+
+        Decision logic:
+        1. Load :class:`ItemsCountConfig` (defaults: ``estimate_count=True``,
+           ``exact_count_threshold=50_000``).
+        2. Query ``pg_class.reltuples`` for the physical table — O(1).
+        3. The planner estimate is only applicable when the request is
+           **unfiltered** (no structured filters, raw_where, or CQL2 filter).
+           Filtered requests always get an exact count because ``reltuples``
+           has no knowledge of the WHERE predicate — returning the table's
+           total row-count for a bbox-filtered query that matches 87 rows is
+           incorrect and breaks pagination.
+        4. For unfiltered requests: if the estimate is below
+           ``exact_count_threshold`` OR ``estimate_count=False``, run an exact
+           ``SELECT count(*)``.  Otherwise return the planner estimate.
+        5. For filtered requests (any filter present): always run an exact
+           ``SELECT count(*) FROM (filtered-sql) AS sub``.
+
+        OGC API Features §7.15 permits ``numberMatched`` to be approximate
+        only for unfiltered collection listings; filtered results must be exact
+        so pagination links and result counts remain correct.
+        """
+        from dynastore.modules.storage.read_policy import ItemsCountConfig
+
+        count_cfg = await self._resolve_count_config(catalog_id, collection_id)
+        if count_cfg is None:
+            count_cfg = ItemsCountConfig()
+
+        estimate_count: bool = bool(count_cfg.estimate_count)
+        exact_threshold: int = int(count_cfg.exact_count_threshold)
+
+        # Determine whether the request carries any filter predicate.
+        # cql_filter, filters (structured), and raw_where are all checked;
+        # item_ids is also a filter (restricts the result set).
+        has_filters = bool(
+            count_request.filters
+            or count_request.raw_where
+            or count_request.cql_filter
+            or count_request.item_ids
+            or count_request.bbox
+            or count_request.intersects
+            or count_request.datetime
+        )
+
+        if estimate_count and not has_filters:
+            # Fast O(1) planner estimate from pg_class, safe only for
+            # unfiltered listings.  ``reltuples`` is updated by ANALYZE; it is
+            # a reasonable proxy for the total live-row count of the collection.
+            try:
+                reltuples: int = await DQLQuery(
+                    'SELECT reltuples::bigint FROM pg_class '
+                    'WHERE oid = :table_oid::regclass',
+                    result_handler=ResultHandler.SCALAR,
+                ).execute(conn, table_oid=f'"{phys_schema}"."{phys_table}"')
+                if reltuples is None:
+                    reltuples = 0
+            except Exception as exc:  # noqa: BLE001 - fall back to exact count
+                logger.debug(
+                    "pg_class reltuples lookup failed for %s.%s: %s — falling back to exact count",
+                    phys_schema, phys_table, exc,
+                )
+                reltuples = 0
+                estimate_count = False
+
+            if estimate_count and reltuples >= exact_threshold:
+                return reltuples
+
+        # Filtered requests, requests below the size threshold, or when
+        # estimation is disabled: run an exact count.
+        # Use a fresh copy of context so mutations from the data-query
+        # transformation pass do not bleed into the count transformation.
+        count_sql, count_params = await self._apply_query_transformations(
+            count_request, dict(context), catalog_id, collection_id, col_config,
+            db_resource=conn, consumer=consumer,
+        )
+        count_wrapper = f"SELECT count(*) FROM ({count_sql}) AS sub"
+        return await DQLQuery(
+            count_wrapper, result_handler=ResultHandler.SCALAR
+        ).execute(conn, **(count_params or {}))
+
     def map_row_to_feature(
         self,
         row: Dict[str, Any],
@@ -1561,19 +1684,22 @@ class ItemQueryMixin:
 
             total_count = None
             if count_request is not None:
-                # numberMatched must reflect the full filtered result set, not
-                # the current page. Wrapping the limit-bearing data SQL in
-                # count(*) caps the total at the page size; build the count from
-                # the pagination-free request so the same filters apply without
-                # LIMIT/OFFSET.
-                count_sql, count_params = await self._apply_query_transformations(
-                    count_request, context, catalog_id, collection_id, col_config,
-                    db_resource=conn, consumer=consumer,
+                # numberMatched is computed via _resolve_number_matched which
+                # chooses between a fast planner estimate (pg_class.reltuples,
+                # O(1)) and an exact SELECT count(*) based on ItemsCountConfig.
+                # The page query no longer carries COUNT(*) OVER() so it returns
+                # in time proportional to the page size, not the collection size.
+                total_count = await self._resolve_number_matched(
+                    conn=conn,
+                    phys_schema=phys_schema,
+                    phys_table=phys_table,
+                    count_request=count_request,
+                    context=context,
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                    col_config=col_config,
+                    consumer=consumer,
                 )
-                count_wrapper = f"SELECT count(*) FROM ({count_sql}) AS sub"
-                total_count = await DQLQuery(
-                    count_wrapper, result_handler=ResultHandler.SCALAR
-                ).execute(conn, **(count_params or {}))
 
         # Stream Generator (O(1) Memory)
         lang = (request.raw_params or {}).get("lang", "en")

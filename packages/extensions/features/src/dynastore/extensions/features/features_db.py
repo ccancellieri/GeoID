@@ -62,7 +62,9 @@ async def get_items_filtered(
     if catalogs is None:
         raise HTTPException(status_code=503, detail="CatalogsProtocol unavailable.")
     
-    # Construct robust QueryRequest utilizing the optimized execution pipeline
+    # Construct robust QueryRequest utilizing the optimized execution pipeline.
+    # include_total_count=True so stream_items computes numberMatched via the
+    # decoupled estimate/exact path (ItemsCountConfig) rather than a window fn.
     request = QueryRequest(
         limit=limit,
         offset=offset,
@@ -190,22 +192,17 @@ async def get_items_filtered(
             alias="geom"
         ))
 
-    # --- Execute Single Query utilizing the Optimized Services ---
+    # --- Execute via stream_items so total_count comes from the decoupled
+    # estimate/exact path rather than a per-row window function. ---
     from dynastore.models.driver_context import DriverContext
-    rows_proxy = await catalogs.search_items(
+
+    query_response = await catalogs.stream_items(
         catalog_id=catalog_id,
         collection_id=collection_id,
         request=request,
         ctx=DriverContext(db_resource=conn) if conn is not None else None,
     )
 
-    rows = []
-    total_count = 0
-    if rows_proxy:
-        total_count = (rows_proxy[0].properties or {}).get("_total_count", 0)
-        for row in rows_proxy:
-            r = row.model_dump()
-            r["properties"].pop("_total_count", None)
-            rows.append(r)
-
+    rows = [feature.model_dump() async for feature in query_response.items]
+    total_count = query_response.total_count or 0
     return total_count, rows

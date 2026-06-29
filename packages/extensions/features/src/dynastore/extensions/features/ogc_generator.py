@@ -182,8 +182,6 @@ def _db_row_to_ogc_feature(
 
     _map_validity_to_ogc(properties)
 
-    properties.pop("_total_count", None)
-
     # -- 5. Build OGC links ---------------------------------------------------
     collection_url = (
         f"{root_url}/features/catalogs/{catalog_id}/collections/{collection_id}"

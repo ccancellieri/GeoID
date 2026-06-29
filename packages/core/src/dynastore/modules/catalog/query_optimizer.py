@@ -690,9 +690,6 @@ class QueryOptimizer:
         # Build SELECT clause
         select_fields = []
 
-        if query.include_total_count:
-            select_fields.append("COUNT(*) OVER() AS _total_count")
-
         if any(sel.field == "*" for sel in query.select):
             select_fields.append("h.*")
             # Collect the set of fields explicitly overridden by non-* FieldSelections

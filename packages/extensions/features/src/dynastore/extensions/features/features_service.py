@@ -1061,7 +1061,6 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
                     if feature.properties:
                         # Map validity → start_datetime / end_datetime
                         _map_validity_to_ogc(feature.properties)
-                        feature.properties.pop("_total_count", None)
 
                         # Per-feature property projection — applied uniformly
                         # regardless of which driver served the listing.

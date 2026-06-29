@@ -378,8 +378,61 @@ def pushdown_read_select(
     return result
 
 
+class ItemsCountConfig(PluginConfig):
+    """Performance configuration for ``numberMatched`` computation.
+
+    Controls whether large collections use a PostgreSQL planner estimate
+    (``pg_class.reltuples``, O(1)) or an exact ``SELECT count(*)`` for the
+    OGC API Features ``numberMatched`` field.
+
+    For collections below ``exact_count_threshold`` rows the exact count is
+    always used so small collections remain accurate.  For larger collections
+    the planner estimate is returned when ``estimate_count=True``; it is
+    approximate but returns in microseconds instead of scanning the whole
+    table.
+
+    OGC API — Features Part 1 §7.15 permits ``numberMatched`` to be omitted
+    or approximate; only ``numberReturned`` (the actual page size) must be
+    exact.  Set at platform or catalog scope to tune the threshold globally;
+    override at collection scope for collections that need a different policy.
+    """
+
+    _address: ClassVar[Tuple[str, ...]] = (
+        "platform",
+        "catalog",
+        "collection",
+        "items",
+        "count",
+    )
+
+    estimate_count: Mutable[bool] = Field(
+        default=True,
+        description=(
+            "When True (default), collections above ``exact_count_threshold`` "
+            "rows receive an approximate ``numberMatched`` derived from the "
+            "PostgreSQL planner statistic (``pg_class.reltuples``), which is "
+            "O(1) regardless of collection size. "
+            "When False, an exact ``SELECT count(*)`` is always executed "
+            "(original behavior, safe for small collections, expensive above "
+            "~50k rows under concurrent load)."
+        ),
+    )
+
+    exact_count_threshold: Mutable[int] = Field(
+        default=50_000,
+        description=(
+            "Row-count threshold below which an exact ``SELECT count(*)`` is "
+            "executed even when ``estimate_count=True``. Above this threshold "
+            "the planner estimate is returned as ``numberMatched``. "
+            "Default 50 000 keeps exact counts for small-to-medium collections "
+            "while protecting large collections from full-table scans."
+        ),
+    )
+
+
 __all__ = [
     "ItemsReadPolicy",
+    "ItemsCountConfig",
     "project_select_for_feature_type",
     "pushdown_read_select",
     "is_user_readable_schema_field",
