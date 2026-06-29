@@ -307,7 +307,7 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
         # Used by signal_stop to cancel a local task directly.  Done-callbacks
         # remove entries so the dict stays bounded to live tasks only.
         self._task_registry: dict[str, asyncio.Task] = {}
-        self._max_concurrency = 100
+        self._max_concurrency = 4
         # BackgroundRunner is registered as a module-level singleton at import
         # (register_default_runners()), so a raw asyncio.Semaphore() here would
         # bind to the first loop that blocks on it and break when reused from
@@ -317,6 +317,11 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
 
     def can_handle(self, task_type: str) -> bool:
         return get_task_instance(task_type) is not None
+
+    # Connections reserved for serving/other work when clamping drain concurrency.
+    # The drain may use at most pool_total - _SERVING_RESERVE connections so the
+    # serving path is never starved (root cause of the pool-exhaustion incident).
+    _SERVING_RESERVE: int = 2
 
     @asynccontextmanager
     async def lifespan(self, app_state: object) -> AsyncGenerator[None, None]:
@@ -332,6 +337,29 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                     self._semaphore = LoopLocalSemaphore(self._max_concurrency)
         except Exception as exc:  # noqa: BLE001 — keep default concurrency on any read failure
             logger.debug("BackgroundRunner: concurrency config unavailable (%s) — default %d", exc, self._max_concurrency)
+
+        # Pool-aware clamp: effective drain concurrency may not exceed the
+        # DB connection pool capacity minus the serving reserve, regardless of
+        # the configured value.  DBConfigModule (priority 0) populates
+        # app_state.db_config before any other module's lifespan runs, so the
+        # attribute is present by the time BackgroundRunner.lifespan executes.
+        db_cfg = getattr(app_state, "db_config", None)
+        if db_cfg is not None:
+            pool_total: int = getattr(db_cfg, "pool_max_size", 0)
+            if pool_total > 0:
+                ceiling = max(1, pool_total - self._SERVING_RESERVE)
+                if self._max_concurrency > ceiling:
+                    logger.warning(
+                        "BackgroundRunner: configured concurrency %d exceeds pool "
+                        "capacity %d minus serving reserve %d; clamping effective "
+                        "concurrency to %d to prevent pool exhaustion.",
+                        self._max_concurrency,
+                        pool_total,
+                        self._SERVING_RESERVE,
+                        ceiling,
+                    )
+                    self._max_concurrency = ceiling
+                    self._semaphore = LoopLocalSemaphore(self._max_concurrency)
 
         cancel_listener_task = asyncio.create_task(
             self._cancel_listener(), name="background_runner:cancel_listener"

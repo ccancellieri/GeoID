@@ -112,8 +112,21 @@ class TasksPluginConfig(ExposableConfigMixin, PluginConfig):
     )
 
     background_runner_concurrency: Mutable[int] = Field(
-        default=100, ge=1,
-        description="Max concurrent in-process background tasks per pod.")
+        default=4,
+        ge=1,
+        description=(
+            "Maximum number of in-process background tasks that the BackgroundRunner "
+            "may execute concurrently per pod.  At runtime the BackgroundRunner "
+            "clamps this value to at most pool_total - SERVING_RESERVE so it can "
+            "never exhaust the DB connection pool regardless of the configured value "
+            "(pool_total = DB_POOL_MAX_SIZE, SERVING_RESERVE = 2).  "
+            "Default 4: conservative baseline that fits under the minimum pool "
+            "floor (SAFE_POOL_TOTAL_FLOOR = 10) while leaving headroom for serving "
+            "reads.  Raise via the configs hot-reload API for high-throughput "
+            "environments; the clamp keeps the pool safe even if the value is set "
+            "too high."
+        ),
+    )
     dispatcher_batch_size: Mutable[int] = Field(
         default=10, ge=1,
         description="Rows claimed per dispatcher tick.")
