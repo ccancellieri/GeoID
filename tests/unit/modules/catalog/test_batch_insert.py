@@ -158,9 +158,9 @@ def default_write_policy() -> ItemsWritePolicy:
 
 
 class TestConfigFlag:
-    def test_defaults_to_false(self) -> None:
+    def test_defaults_to_true(self) -> None:
         policy = ItemsWritePolicy()
-        assert policy.enable_batch_insert is False
+        assert policy.enable_batch_insert is True
 
     def test_can_be_set_true(self) -> None:
         policy = ItemsWritePolicy(enable_batch_insert=True)
