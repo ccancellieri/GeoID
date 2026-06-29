@@ -33,8 +33,9 @@ client/mappings imports — no extra import gating needed here.
 """
 from __future__ import annotations
 
+import json as _json
 import logging
-from typing import Any, List, Optional
+from typing import Any, Iterator, List, Optional
 
 # Module-level imports give tests a stable patch target:
 #   ``dynastore.modules.elasticsearch.bulk_reindex.<name>``.
@@ -188,13 +189,53 @@ def _select_writer(
     )
 
 
+# Target ceiling for a single ES _bulk request body (estimated serialized
+# JSON size of all documents in one call).  OpenSearch's default
+# http.max_content_length is 100 MB; this leaves a 12× safety margin so
+# geometry-heavy docs (admin boundaries, networks) that can run 50–200 KB
+# each don't produce 413 responses.  Large read pages are split into
+# multiple sub-chunk writes — small docs accumulate more per call
+# automatically; no operator tuning needed.
+_MAX_BULK_BYTES: int = 8 * 1024 * 1024  # 8 MB
+
+
+def _iter_byte_bounded_chunks(
+    items: List[Any],
+    max_bytes: int,
+) -> Iterator[List[Any]]:
+    """Yield sub-lists of items whose total estimated serialised JSON byte
+    size does not exceed *max_bytes*.
+
+    Each item's size is estimated via ``json.dumps`` with a plain encoder
+    (sufficient for a byte-count approximation; exact ES encoding may
+    differ slightly).  An item that individually exceeds *max_bytes* is
+    yielded alone — the caller must accept an oversized single-doc request
+    rather than infinite-loop or drop the item.
+    """
+    current_chunk: List[Any] = []
+    current_bytes = 0
+    for item in items:
+        try:
+            item_bytes = len(_json.dumps(item, ensure_ascii=False).encode("utf-8"))
+        except (TypeError, ValueError):
+            item_bytes = len(str(item).encode("utf-8"))
+        if current_chunk and current_bytes + item_bytes > max_bytes:
+            yield current_chunk
+            current_chunk = []
+            current_bytes = 0
+        current_chunk.append(item)
+        current_bytes += item_bytes
+    if current_chunk:
+        yield current_chunk
+
+
 async def reindex_collection_into_index(
     catalog_id: str,
     collection_id: str,
     *,
     driver_hint: Optional[str] = None,
     reader_ref: Optional[str] = None,
-    page_size: int = 500,
+    page_size: int = 2000,
 ) -> int:
     """Stream every item of a collection from the routing-resolved source-of-truth
     reader and bulk-write it via the routing-resolved secondary-index writer.
@@ -330,20 +371,23 @@ async def reindex_collection_into_index(
         if not chunk:
             break
 
-        # Write the chunk to the target (raises on failure — no silent drop).
-        try:
-            written = await writer.write_entities(catalog_id, collection_id, chunk)
-            batch_count = len(written) if written is not None else len(chunk)
-        except Exception:
-            logger.error(
-                "reindex_collection_into_index: write_entities raised for %s/%s "
-                "at offset %d (%d docs in batch); propagating error. "
-                "Total successfully written before failure: %d.",
-                catalog_id, collection_id, offset, len(chunk), total_written,
-            )
-            raise
-
-        total_written += batch_count
+        # Split the read page into byte-bounded sub-chunks before writing to ES.
+        # Each sub-chunk produces one _bulk HTTP request; the byte ceiling
+        # (_MAX_BULK_BYTES) prevents 413 on geometry-heavy collections while
+        # still using large batches for lightweight docs.
+        for sub_chunk in _iter_byte_bounded_chunks(chunk, max_bytes=_MAX_BULK_BYTES):
+            try:
+                written = await writer.write_entities(catalog_id, collection_id, sub_chunk)
+                batch_count = len(written) if written is not None else len(sub_chunk)
+            except Exception:
+                logger.error(
+                    "reindex_collection_into_index: write_entities raised for %s/%s "
+                    "at offset %d (%d docs in sub-chunk); propagating error. "
+                    "Total successfully written before failure: %d.",
+                    catalog_id, collection_id, offset, len(sub_chunk), total_written,
+                )
+                raise
+            total_written += batch_count
 
         if len(chunk) < chunk_size:
             break

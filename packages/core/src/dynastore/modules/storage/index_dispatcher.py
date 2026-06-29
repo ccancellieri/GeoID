@@ -75,6 +75,7 @@ from dynastore.models.protocols.indexing import IndexableOp, OutboxStore
 from dynastore.modules.storage.routing_config import (
     FailurePolicy,
     OperationDriverEntry,
+    WriteMode,
 )
 
 
@@ -654,6 +655,35 @@ class IndexDispatcher:
                     failures=rejected,
                 )
                 continue
+            # Honor write_mode=ASYNC: enqueue to the outbox and skip the
+            # inline indexer call entirely.  The outbox worker drains the
+            # row in the background; the write path is not blocked on ES.
+            # BulkResult is built from the ACTUAL count returned by
+            # _enqueue_or_warn — if any of the three drop paths fires (no
+            # outbox, no pg_conn, transient PG error) the returned 0 flows
+            # through as succeeded=0/failed=N so _check_index_health
+            # escalates to FAILED instead of silently claiming success.
+            if entry.write_mode == WriteMode.ASYNC:
+                actually_enqueued = await self._enqueue_or_warn(entry, ctx, entry_ops)
+                enqueue_ok = actually_enqueued == len(entry_ops)
+                _log_dispatch_path(
+                    mode="async_outbox_enqueued" if enqueue_ok else "async_enqueue_failed",
+                    indexer_id=entry.driver_ref,
+                    catalog=ctx.catalog,
+                    collection=ctx.collection,
+                    chunk_size=len(entry_ops),
+                )
+                enqueue_failures: List[Dict[str, Any]] = (
+                    [{"reason": "async_enqueue_failed", "indexer": entry.driver_ref}]
+                    if not enqueue_ok else []
+                )
+                results[entry.driver_ref] = BulkResult(
+                    total=len(entry_ops) + len(rejected),
+                    succeeded=actually_enqueued,
+                    failed=(len(entry_ops) - actually_enqueued) + len(rejected),
+                    failures=enqueue_failures + (rejected if rejected else []),
+                )
+                continue
             result = await self._dispatch_bulk(entry, indexer, ctx, entry_ops)
             # #914 — silent no-op trap: an indexer that returns
             # ``BulkResult(total=N, succeeded=0, failed=0)`` (e.g. ES bulk
@@ -1197,15 +1227,26 @@ class IndexDispatcher:
         ops: Sequence[DispatchableOp],
         *,
         original: Optional[BaseException] = None,
-    ) -> None:
+    ) -> int:
         """Enqueue a batch of ops as chunked outbox rows when configured;
         otherwise degrade to WARN.
+
+        Returns the count of ops actually handed to the outbox writer (0 on any
+        drop path).  Callers on the primary ASYNC path (``write_mode=ASYNC``)
+        must use this count to build ``BulkResult`` so that health-check logic
+        can distinguish "all accepted" from "silently dropped" — the three drop
+        paths below all return 0, which the ASYNC branch propagates as
+        ``failed=N`` rather than the false-success ``succeeded=N``.
+
+        Callers on the SYNC on_failure=OUTBOX path ignore the return value;
+        their best-effort behaviour is unchanged.
 
         Accepts a list so a 500-item bulk failure becomes one chunked
         ``enqueue`` call rather than 500 per-row writes (see #500).
         """
         if not ops:
-            return
+            return 0
+        # Drop path (a): no outbox writer wired.
         if self._outbox is None:
             if entry.driver_ref not in self._outbox_warning_emitted:
                 self._outbox_warning_emitted.add(entry.driver_ref)
@@ -1221,7 +1262,7 @@ class IndexDispatcher:
                     "(policy=outbox, degraded): %s",
                     entry.driver_ref, len(ops), original,
                 )
-            return
+            return 0
 
         # The legacy ``enqueue`` writer expects IndexOp shape; an
         # IndexableOp-only batch is skipped with a single warning rather
@@ -1234,7 +1275,7 @@ class IndexDispatcher:
                 "``enqueue`` method; cannot enqueue %d ops.",
                 entry.driver_ref, len(ops),
             )
-            return
+            return 0
         index_ops: List[IndexOp] = [
             cast(IndexOp, o) for o in ops if not isinstance(o, IndexableOp)
         ]
@@ -1245,7 +1286,19 @@ class IndexDispatcher:
                 "OutboxStore for the bulk path.",
                 len(ops), entry.driver_ref,
             )
-            return
+            return 0
+        # Drop path (b): caller has no open PG connection.
+        # ``TaskTableOutboxWriter.enqueue`` checks this too but returns silently
+        # without raising — catch it here so the ASYNC caller receives the real
+        # failed count rather than a false success.
+        if ctx.pg_conn is None:
+            logger.warning(
+                "IndexDispatcher: cannot enqueue %d op(s) for indexer '%s' — "
+                "ctx.pg_conn is None (no open TX); ops dropped. "
+                "Caller must supply an open PG connection for durable enqueue.",
+                len(index_ops), entry.driver_ref,
+            )
+            return 0
         try:
             await enqueue(
                 indexer_id=entry.driver_ref,
@@ -1253,16 +1306,19 @@ class IndexDispatcher:
                 ops=index_ops,
                 last_error=str(original) if original else None,
             )
+            return len(index_ops)
         except Exception as enqueue_exc:
-            # Outbox itself failed — last-resort WARN.  We do NOT escalate
-            # to FATAL here because the upstream caller has already chosen
-            # OUTBOX as a tolerant policy; surfacing this as fatal would
-            # surprise them.
+            # Drop path (c): transient PG error during enqueue.
+            # We do NOT escalate to FATAL here because the upstream caller has
+            # already chosen OUTBOX as a tolerant policy; surfacing this as
+            # fatal would surprise them.  The ASYNC caller converts 0 to
+            # failed=N so health-check can escalate via its own policy.
             logger.error(
                 "IndexDispatcher: outbox enqueue failed for indexer '%s' "
                 "on %d ops — original error: %s, enqueue error: %s",
                 entry.driver_ref, len(ops), original, enqueue_exc,
             )
+            return 0
 
 
 def _op_payload(op: "DispatchableOp") -> Any:

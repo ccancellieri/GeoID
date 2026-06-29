@@ -42,7 +42,7 @@ driver. If one is needed it belongs in the private subpackage.
 import logging
 from typing import Any, Dict, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Hard runtime dep — see modules/elasticsearch/module.py for rationale.
 # Forces entry-point load to fail on services without ``opensearch-py`` so
@@ -70,12 +70,30 @@ logger = logging.getLogger(__name__)
 class BulkCatalogReindexInputs(BaseModel):
     catalog_id: str
     driver: Optional[str] = None
+    page_size: int = Field(
+        default=2000,
+        description=(
+            "Items per read page (and write chunk) for each collection reindex. "
+            "The effective ES _bulk request size is max(page_size, writer.preferred_chunk_size). "
+            "Raise for high-throughput reindexing; lower if the container runs out of memory on "
+            "geometry-heavy collections."
+        ),
+    )
 
 
 class BulkCollectionReindexInputs(BaseModel):
     catalog_id: str
     collection_id: str
     driver: Optional[str] = None
+    page_size: int = Field(
+        default=2000,
+        description=(
+            "Items per read page (and write chunk) for this collection reindex. "
+            "The effective ES _bulk request size is max(page_size, writer.preferred_chunk_size). "
+            "Raise for high-throughput reindexing; lower if the container runs out of memory on "
+            "geometry-heavy collections."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +165,7 @@ class BulkCatalogReindexTask(TaskProtocol):
                     catalog_id,
                     collection_id,
                     driver_hint=driver_hint,
+                    page_size=inputs.page_size,
                 )
                 total_indexed += count
                 logger.info(
@@ -217,6 +236,7 @@ class BulkCollectionReindexTask(TaskProtocol):
             catalog_id,
             collection_id,
             driver_hint=driver_hint,
+            page_size=inputs.page_size,
         )
 
         return {

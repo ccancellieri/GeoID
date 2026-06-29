@@ -994,3 +994,259 @@ async def test_silent_noop_delete_only_does_not_enqueue():
     assert writer.rows == [], "delete-only no-op must not enqueue"
     # failed count stays 0 for deletes (no upserts to convert)
     assert results["noop-es"].failed == 0
+
+
+# ---------------------------------------------------------------------------
+# write_mode=ASYNC — dispatcher honors the routing-config contract
+# (Refs #2438)
+# ---------------------------------------------------------------------------
+
+
+def _async_entry(driver_ref: str) -> OperationDriverEntry:
+    """ASYNC secondary-index entry matching the items_elasticsearch_driver config."""
+    return OperationDriverEntry(
+        driver_ref=driver_ref,
+        on_failure=FailurePolicy.OUTBOX,
+        write_mode=WriteMode.ASYNC,
+        secondary_index=True,
+        source="auto",
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_write_mode_skips_inline_index_and_enqueues():
+    """An ASYNC entry must NOT call the indexer inline; all ops go to the
+    outbox so ES indexing runs off the write path.
+    """
+    a = _StubIndexer("a")
+    writer = _RecordingWriter()
+    ctx_with_conn = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_async_entry("a")],
+        indexers={"a": a},
+        outbox=writer,
+    )
+    ops = [_op(entity_id="i1"), _op(entity_id="i2")]
+    await dispatcher.fan_out_bulk(ctx_with_conn, ops)
+
+    # Inline indexer must NOT have been called.
+    assert a.bulk_calls == [], (
+        "write_mode=ASYNC must not call the indexer inline"
+    )
+    # Outbox must have received the ops.
+    assert len(writer.rows) >= 1, "ASYNC entry must enqueue ops to outbox"
+    import json as _json
+    enqueued_ids = {
+        item["entity_id"]
+        for row in writer.rows
+        for item in _json.loads(row["params"]["inputs"])["ops"]
+    }
+    assert "i1" in enqueued_ids
+    assert "i2" in enqueued_ids
+
+
+@pytest.mark.asyncio
+async def test_async_write_mode_result_signals_all_accepted():
+    """The BulkResult for an ASYNC entry reports succeeded=N so
+    health-check callers see 'all ops accepted' rather than a FAILED state.
+    """
+    a = _StubIndexer("a")
+    writer = _RecordingWriter()
+    ctx_with_conn = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_async_entry("a")],
+        indexers={"a": a},
+        outbox=writer,
+    )
+    ops = [_op(entity_id="i1"), _op(entity_id="i2"), _op(entity_id="i3")]
+    results = await dispatcher.fan_out_bulk(ctx_with_conn, ops)
+
+    assert "a" in results
+    assert results["a"].succeeded == 3
+    assert results["a"].failed == 0
+
+
+@pytest.mark.asyncio
+async def test_async_write_mode_logs_async_outbox_enqueued(caplog):
+    """Dispatch-path log for an ASYNC entry must use mode=async_outbox_enqueued,
+    not post_commit_inline.
+    """
+    import logging as _logging
+
+    a = _StubIndexer("a")
+    writer = _RecordingWriter()
+    ctx_with_conn = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_async_entry("a")],
+        indexers={"a": a},
+        outbox=writer,
+    )
+    with caplog.at_level(_logging.INFO):
+        await dispatcher.fan_out_bulk(ctx_with_conn, [_op(entity_id="i1")])
+
+    rows = _extract_dispatch_path_records(caplog)
+    assert any(r.get("mode") == "async_outbox_enqueued" for r in rows), rows
+    assert not any(r.get("mode") == "post_commit_inline" for r in rows), (
+        "ASYNC entry must not log post_commit_inline"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sync_write_mode_still_indexes_inline():
+    """SYNC entries are unaffected by the ASYNC fix: they still call the
+    indexer inline as before.
+    """
+    a = _StubIndexer("a")
+    dispatcher = _make_dispatcher(
+        entries=[_entry("a", on_failure=FailurePolicy.WARN)],  # write_mode=SYNC
+        indexers={"a": a},
+    )
+    ops = [_op(entity_id="i1"), _op(entity_id="i2")]
+    results = await dispatcher.fan_out_bulk(_ctx(), ops)
+
+    assert len(a.bulk_calls) == 1
+    assert results["a"].succeeded == 2
+
+
+@pytest.mark.asyncio
+async def test_mixed_sync_and_async_entries_dispatch_correctly():
+    """When one entry is SYNC and another is ASYNC, the SYNC one indexes
+    inline and the ASYNC one enqueues without calling its indexer.
+    """
+    sync_indexer = _StubIndexer("sync-driver")
+    async_indexer = _StubIndexer("async-driver")
+    writer = _RecordingWriter()
+    ctx_with_conn = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    routing = _StubRouting([
+        _entry("sync-driver", on_failure=FailurePolicy.WARN),  # SYNC
+        _async_entry("async-driver"),                           # ASYNC
+    ])
+
+    async def routing_resolver(catalog, collection):
+        return routing
+
+    async def indexer_registry(indexer_id):
+        return {"sync-driver": sync_indexer, "async-driver": async_indexer}.get(indexer_id)
+
+    dispatcher = IndexDispatcher(
+        routing_resolver=routing_resolver,
+        indexer_registry=indexer_registry,
+        outbox=writer,
+    )
+    ops = [_op(entity_id="i1"), _op(entity_id="i2")]
+    results = await dispatcher.fan_out_bulk(ctx_with_conn, ops)
+
+    # SYNC driver indexed inline.
+    assert len(sync_indexer.bulk_calls) == 1
+    assert results["sync-driver"].succeeded == 2
+
+    # ASYNC driver NOT indexed inline; outbox got the ops.
+    assert async_indexer.bulk_calls == [], "ASYNC driver must not be called inline"
+    assert len(writer.rows) >= 1
+    assert results["async-driver"].succeeded == 2
+
+
+# ---------------------------------------------------------------------------
+# write_mode=ASYNC — drop-path correctness (Refs #2438)
+#
+# _enqueue_or_warn has three silent-return paths that do NOT enqueue
+# anything.  The ASYNC branch must convert each into failed=N rather than
+# the false-success succeeded=N that _check_index_health reads to decide
+# whether to mark an ingestion COMPLETED.
+# ---------------------------------------------------------------------------
+
+
+class _FailingWriter(TaskTableOutboxWriter):
+    """Simulates a transient PG error during task-row insertion (drop path c)."""
+
+    def __init__(self) -> None:
+        super().__init__(task_schema_resolver=lambda: "tasks")
+
+    async def _exec_insert(self, conn, sql, params):  # type: ignore[override]
+        raise RuntimeError("simulated transient PG error")
+
+
+@pytest.mark.asyncio
+async def test_async_enqueue_drop_path_a_no_outbox_returns_failed():
+    """Drop path (a): no OutboxWriter wired.
+    The ASYNC branch must return BulkResult(succeeded=0, failed=N) so
+    _check_index_health does NOT mark the ingestion COMPLETED.
+    """
+    a = _StubIndexer("a")
+    # No outbox wired — _enqueue_or_warn returns 0.
+    dispatcher = _make_dispatcher(
+        entries=[_async_entry("a")],
+        indexers={"a": a},
+    )
+    ops = [_op(entity_id="i1"), _op(entity_id="i2")]
+    results = await dispatcher.fan_out_bulk(_ctx(), ops)
+
+    assert a.bulk_calls == [], "ASYNC must never call the indexer inline"
+    assert results["a"].succeeded == 0, (
+        "No outbox wired: succeeded must be 0, not len(ops)"
+    )
+    assert results["a"].failed == 2
+
+
+@pytest.mark.asyncio
+async def test_async_enqueue_drop_path_b_pg_conn_none_returns_failed():
+    """Drop path (b): ctx.pg_conn is None — TaskTableOutboxWriter.enqueue
+    returns silently without enqueuing anything.  The ASYNC branch pre-checks
+    and must return BulkResult(succeeded=0, failed=N).
+    """
+    a = _StubIndexer("a")
+    writer = _RecordingWriter()
+    # _ctx() has pg_conn=None — the known ASYNC silent-drop scenario.
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_async_entry("a")],
+        indexers={"a": a},
+        outbox=writer,
+    )
+    ops = [_op(entity_id="i1"), _op(entity_id="i2"), _op(entity_id="i3")]
+    results = await dispatcher.fan_out_bulk(_ctx(), ops)
+
+    assert a.bulk_calls == [], "ASYNC must never call the indexer inline"
+    assert writer.rows == [], "No task rows should have been inserted"
+    assert results["a"].succeeded == 0, (
+        "pg_conn=None: succeeded must be 0, not len(ops)"
+    )
+    assert results["a"].failed == 3
+
+
+@pytest.mark.asyncio
+async def test_async_enqueue_drop_path_c_transient_pg_error_returns_failed():
+    """Drop path (c): _exec_insert raises a transient PG error.
+    The ASYNC branch must return BulkResult(succeeded=0, failed=N) rather
+    than surfacing the exception to the ingestion task.
+    """
+    a = _StubIndexer("a")
+    failing_writer = _FailingWriter()
+    ctx_with_conn = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_async_entry("a")],
+        indexers={"a": a},
+        outbox=failing_writer,
+    )
+    ops = [_op(entity_id="i1"), _op(entity_id="i2")]
+    results = await dispatcher.fan_out_bulk(ctx_with_conn, ops)
+
+    assert a.bulk_calls == [], "ASYNC must never call the indexer inline"
+    assert results["a"].succeeded == 0, (
+        "Transient PG error: succeeded must be 0, not len(ops)"
+    )
+    assert results["a"].failed == 2
