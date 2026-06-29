@@ -1746,11 +1746,12 @@ async def managed_transaction(db_resource: Optional[DbResource]):
        transaction with ``conn.begin()``.
 
     3. **AUTOCOMMIT connection input**: Connections with isolation_level
-       AUTOCOMMIT (e.g., from :func:`pg_advisory_leadership`) have no active
-       PostgreSQL transaction. Attempting ``begin_nested()`` (SAVEPOINT) on
-       such connections raises ``NoActiveSQLTransactionError``. This function
-       detects AUTOCOMMIT mode and uses ``begin()`` instead, starting a real
-       transaction.
+       AUTOCOMMIT (e.g., from :func:`pg_advisory_leadership`) are yielded
+       as-is without opening any explicit transaction. Autocommit semantics
+       mean each statement commits individually; calling ``begin()`` on a
+       connection that already autobegan raises a SQLAlchemy double-begin
+       error. This function detects AUTOCOMMIT mode and skips
+       ``begin()``/``begin_nested()`` entirely.
 
     The AUTOCOMMIT handling is critical for LEADER_ONLY background services
     that reuse the advisory-lock connection for database work during their
@@ -1916,9 +1917,10 @@ async def managed_transaction(db_resource: Optional[DbResource]):
                         "managed_transaction_autocommit_detected wire_id=%s",
                         wire_id,
                     )
-                    # AUTOCOMMIT mode: start a real transaction with begin()
-                    async with conn.begin():
-                        yield conn
+                    # AUTOCOMMIT: no explicit transaction — yielding as-is avoids the
+                    # double-begin error when the connection already autobegan, and
+                    # matches autocommit semantics (each statement commits individually).
+                    yield conn
                     return
 
                 # Check for poisoned state (SQLAlchemy 2.0)
@@ -2000,8 +2002,9 @@ async def managed_transaction(db_resource: Optional[DbResource]):
                         "managed_transaction_autocommit_detected wire_id=%s (sync)",
                         wire_id,
                     )
-                    with conn.begin():
-                        yield conn
+                    # AUTOCOMMIT: no explicit transaction — yielding as-is avoids the
+                    # double-begin error when the connection already autobegan.
+                    yield conn
                     return
 
                 # Check for poisoned state

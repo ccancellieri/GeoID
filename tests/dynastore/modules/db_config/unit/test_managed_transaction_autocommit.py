@@ -19,11 +19,17 @@
 """Tests for AUTOCOMMIT connection handling in managed_transaction.
 
 AUTOCOMMIT connections (used by pg_advisory_leadership for advisory locks)
-have no active PostgreSQL transaction. Attempting begin_nested() (SAVEPOINT)
-on such connections raises NoActiveSQLTransactionError.
+have no active PostgreSQL transaction. managed_transaction must yield them
+as-is without calling begin() or begin_nested() — calling begin() on a
+connection that already autobegan raises a SQLAlchemy double-begin error
+("This connection has already initialized a SQLAlchemy Transaction() object
+via begin() or autobegin; can't call begin() here unless rollback() or
+commit() is called first").
 
-The managed_transaction function must detect AUTOCOMMIT mode and use begin()
-instead of begin_nested().
+GcpLivenessReconciler passes ctx.lock_connection (AUTOCOMMIT advisory-lock
+connection) into select_lapsed_gcp_tasks → managed_transaction, where the
+old begin() call caused the recurring double-begin error logged as
+managed_transaction_autocommit_detected. Refs #2438 / #1894.
 """
 
 from __future__ import annotations
@@ -32,7 +38,7 @@ from types import SimpleNamespace
 from typing import List
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.exc import InvalidRequestError
 
 
 class _FakeTx:
@@ -67,7 +73,12 @@ class _FakeTx:
 
 
 class _FakeAutocommitConn:
-    """Fake connection with AUTOCOMMIT isolation level."""
+    """Fake connection with AUTOCOMMIT isolation level.
+
+    begin() raises the SQLAlchemy double-begin error that was the root cause
+    of the recurring GcpLivenessReconciler log spam (#2438). After the fix,
+    managed_transaction must never call begin() on an AUTOCOMMIT connection.
+    """
 
     def __init__(self, log: List[str]):
         self._log = log
@@ -84,9 +95,14 @@ class _FakeAutocommitConn:
         return self._in_transaction
 
     def begin(self):
-        self._in_transaction = True
-        self._log.append("begin")
-        return _FakeTx(self._log, "begin")
+        # Simulate the real SQLAlchemy error when begin() is called on a
+        # connection that already autobegan (the root cause of #2438).
+        self._log.append("begin_called")
+        raise InvalidRequestError(
+            "This connection has already initialized a SQLAlchemy Transaction() "
+            "object via begin() or autobegin; can't call begin() here unless "
+            "rollback() or commit() is called first"
+        )
 
     async def begin_nested(self):
         # This would fail with NoActiveSQLTransactionError in real asyncpg
@@ -129,35 +145,58 @@ class _FakeRegularConn:
 
 
 @pytest.mark.asyncio
-async def test_managed_transaction_autocommit_connection(monkeypatch):
-    """Test that managed_transaction uses begin() for AUTOCOMMIT connections."""
+async def test_managed_transaction_autocommit_yields_conn_without_begin(monkeypatch):
+    """AUTOCOMMIT connection is yielded as-is; begin() is never called.
+
+    This is the regression test for #2438: GcpLivenessReconciler passed an
+    AUTOCOMMIT advisory-lock connection into managed_transaction, which then
+    called begin() — raising InvalidRequestError because the connection already
+    had an autobegun transaction.
+
+    The mock's begin() raises that same error so we can confirm it is never
+    invoked even when in_transaction() returns True (the autobegin state that
+    triggered the bug path).
+    """
     from dynastore.modules.db_config import query_executor as qe
 
-    # Monkeypatch to bypass isinstance check and wire_identity
-    monkeypatch.setattr(
-        qe,
-        "AsyncConnection",
-        _FakeAutocommitConn,
-        raising=False
-    )
+    monkeypatch.setattr(qe, "AsyncConnection", _FakeAutocommitConn, raising=False)
     monkeypatch.setattr(qe, "_get_wire_identity", lambda c: c, raising=True)
 
     log: List[str] = []
     conn = _FakeAutocommitConn(log)
-
-    # Simulate connection that appears in_transaction (autobegin)
+    # Simulate autobegin state — in_transaction() returns True but there is no
+    # real PG transaction; this was the state that triggered the bug.
     conn._in_transaction = True
 
+    # Must not raise — begin() on this conn would raise InvalidRequestError
     async with qe.managed_transaction(conn) as managed_conn:
         assert managed_conn is conn
         log.append("body")
 
-    # Should use begin(), not begin_nested()
-    assert "begin" in log
-    assert "begin_nested" not in log
-    assert "begin_enter" in log
-    assert "begin_exit_commit" in log  # __aexit__ calls commit
     assert "body" in log
+    assert "begin_called" not in log, "begin() must not be called on AUTOCOMMIT connection"
+    assert "begin_nested" not in log
+
+
+@pytest.mark.asyncio
+async def test_managed_transaction_autocommit_body_error_propagates(monkeypatch):
+    """Body errors propagate cleanly from an AUTOCOMMIT-yielded connection."""
+    from dynastore.modules.db_config import query_executor as qe
+
+    monkeypatch.setattr(qe, "AsyncConnection", _FakeAutocommitConn, raising=False)
+    monkeypatch.setattr(qe, "_get_wire_identity", lambda c: c, raising=True)
+
+    log: List[str] = []
+    conn = _FakeAutocommitConn(log)
+    conn._in_transaction = True
+
+    with pytest.raises(ValueError, match="test error"):
+        async with qe.managed_transaction(conn):
+            log.append("body_before_error")
+            raise ValueError("test error")
+
+    assert "body_before_error" in log
+    assert "begin_called" not in log
 
 
 @pytest.mark.asyncio
@@ -220,36 +259,6 @@ async def test_managed_transaction_regular_connection_new(monkeypatch):
     assert "begin_exit_commit" in log  # __aexit__ calls commit
     assert "begin_nested" not in log
     assert "body" in log
-
-
-@pytest.mark.asyncio
-async def test_managed_transaction_autocommit_with_error(monkeypatch):
-    """Test that AUTOCOMMIT transactions roll back on error."""
-    from dynastore.modules.db_config import query_executor as qe
-
-    # Monkeypatch to bypass isinstance check and wire_identity
-    monkeypatch.setattr(
-        qe,
-        "AsyncConnection",
-        _FakeAutocommitConn,
-        raising=False
-    )
-    monkeypatch.setattr(qe, "_get_wire_identity", lambda c: c, raising=True)
-
-    log: List[str] = []
-    conn = _FakeAutocommitConn(log)
-    conn._in_transaction = True
-
-    with pytest.raises(ValueError, match="test error"):
-        async with qe.managed_transaction(conn):
-            log.append("body_before_error")
-            raise ValueError("test error")
-
-    # Should roll back the transaction
-    assert "begin" in log
-    assert "begin_enter" in log
-    assert "begin_exit_rollback" in log  # __aexit__ with exception calls rollback
-    assert "body_before_error" in log
 
 
 def test_is_autocommit_connection_detection():
@@ -346,11 +355,21 @@ class _FakeSyncConnBase:
 
 
 class _FakeSyncAutocommitConn(_FakeSyncConnBase):
-    """Fake sync connection with AUTOCOMMIT isolation level."""
+    """Fake sync AUTOCOMMIT connection whose begin() raises the double-begin error."""
 
     def __init__(self, log: List[str]):
         super().__init__(log)
         self._execution_options = {"isolation_level": "AUTOCOMMIT"}
+
+    def begin(self):
+        # Raise the same error the real SQLAlchemy raises on double-begin
+        self._log.append("begin_called")
+        from sqlalchemy.exc import InvalidRequestError as _IRE
+        raise _IRE(
+            "This connection has already initialized a SQLAlchemy Transaction() "
+            "object via begin() or autobegin; can't call begin() here unless "
+            "rollback() or commit() is called first"
+        )
 
     def begin_nested(self):
         # Would raise NoActiveSQLTransactionError on a real AUTOCOMMIT conn.
@@ -368,33 +387,33 @@ class _FakeSyncRegularConn(_FakeSyncConnBase):
 
 
 @pytest.mark.asyncio
-async def test_managed_transaction_sync_autocommit_connection(monkeypatch):
-    """Sync AUTOCOMMIT connection uses begin(), never begin_nested()."""
+async def test_managed_transaction_sync_autocommit_yields_without_begin(monkeypatch):
+    """Sync AUTOCOMMIT connection is yielded as-is; begin() is never called.
+
+    Mirrors the async regression test: the sync branch had the same bug.
+    """
     from dynastore.modules.db_config import query_executor as qe
 
-    # Route the fake through the sync branch: it must NOT be an AsyncConnection,
-    # and it must satisfy ``isinstance(conn, (SAConnection, SASession))``.
     monkeypatch.setattr(qe, "SAConnection", _FakeSyncConnBase, raising=False)
     monkeypatch.setattr(qe, "_get_wire_identity", lambda c: c, raising=True)
 
     log: List[str] = []
     conn = _FakeSyncAutocommitConn(log)
-    conn._in_transaction = True  # autobegin makes in_transaction() True
+    conn._in_transaction = True  # autobegin state that triggered the bug
 
+    # Must not raise even though begin() would raise InvalidRequestError
     async with qe.managed_transaction(conn) as managed_conn:
         assert managed_conn is conn
         log.append("body")
 
-    assert "begin" in log
-    assert "begin_nested" not in log
-    assert "begin_enter" in log
-    assert "begin_exit_commit" in log
     assert "body" in log
+    assert "begin_called" not in log, "begin() must not be called on AUTOCOMMIT connection"
+    assert "begin_nested" not in log
 
 
 @pytest.mark.asyncio
-async def test_managed_transaction_sync_autocommit_with_error(monkeypatch):
-    """Sync AUTOCOMMIT transaction rolls back on error."""
+async def test_managed_transaction_sync_autocommit_body_error_propagates(monkeypatch):
+    """Body errors propagate cleanly from a sync AUTOCOMMIT-yielded connection."""
     from dynastore.modules.db_config import query_executor as qe
 
     monkeypatch.setattr(qe, "SAConnection", _FakeSyncConnBase, raising=False)
@@ -409,10 +428,8 @@ async def test_managed_transaction_sync_autocommit_with_error(monkeypatch):
             log.append("body_before_error")
             raise ValueError("test error")
 
-    assert "begin" in log
-    assert "begin_enter" in log
-    assert "begin_exit_rollback" in log
     assert "body_before_error" in log
+    assert "begin_called" not in log
 
 
 @pytest.mark.asyncio
