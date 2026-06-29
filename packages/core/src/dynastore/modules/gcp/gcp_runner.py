@@ -352,6 +352,18 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
             # rather than the column default of 3) so a single misbehaving job
             # cannot loop more than once by default.
             job_max_retries = get_job_max_retries(context.task_type)
+            # per-execution override takes precedence over the job-config ceiling.
+            _rest_exec_ovr = _exec_overrides  # already resolved above
+            _override_max_retries = (
+                _rest_exec_ovr.max_retries
+                if _rest_exec_ovr and _rest_exec_ovr.max_retries is not None
+                else None
+            )
+            effective_max_retries = (
+                _override_max_retries
+                if _override_max_retries is not None
+                else (job_max_retries if job_max_retries is not None else 3)
+            )
             # Optional: caller may pre-supply a dedup_key in extra_context to
             # collapse at-least-once redeliveries (Pub/Sub push, retry storms).
             dedup_key = (
@@ -363,7 +375,7 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
                 task_type=context.task_type,
                 inputs=inputs_dict,
                 collection_id=context.collection_id,
-                max_retries=job_max_retries if job_max_retries is not None else 3,
+                max_retries=effective_max_retries,
                 dedup_key=dedup_key,
             )
             spawn_lease_seconds = await _resolve_spawn_lease_seconds()
@@ -392,7 +404,7 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
                 f"GcpJobRunner: REST-path born-claimed task '{new_task.task_id}' for "
                 f"job '{job_name}' (execution_id={execution_id}, "
                 f"spawn_lease={spawn_lease_seconds}s, "
-                f"max_retries={job_max_retries if job_max_retries is not None else 'default'})."
+                f"max_retries={effective_max_retries})."
             )
 
         process_defn = try_load_process_definition(context.task_type)

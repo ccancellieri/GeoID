@@ -245,7 +245,18 @@ async def execute_process(
         )
 
     from dynastore.models.tasks import DEFAULT_PROCESS_TITLE
+    from dynastore.modules.tasks.execution import _EXECUTION_OVERRIDES_KEY
     dumped = execution_request.model_dump()
+    # execution_overrides is a vendor-extension field on ExecuteRequest, not a
+    # process input.  Remove it from the serialised dict so it is never visible
+    # to the task's own run() method, then re-inject it under the reserved key
+    # (__execution_overrides__) that the dispatcher pops before forwarding
+    # inputs to the runner — mirroring the /task spawn-handler contract exactly.
+    _exec_overrides = execution_request.execution_overrides
+    dumped.pop("execution_overrides", None)
+    if _exec_overrides is not None:
+        dumped[_EXECUTION_OVERRIDES_KEY] = _exec_overrides.model_dump(exclude_none=True)
+
     # Stamp title with precedence: operator override -> process definition's
     # own -> generic default. This ensures every job row carries a meaningful
     # human-readable label regardless of which runner claims it.
@@ -270,4 +281,5 @@ async def execute_process(
         collection_id=collection_id,
         background_tasks=background_tasks,
         dedup_key=dedup_key,
+        execution_overrides=_exec_overrides,
     )

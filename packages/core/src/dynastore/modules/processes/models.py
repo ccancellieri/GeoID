@@ -23,7 +23,7 @@ from dynastore.models.localization import LocalizedText, CoercibleLocalizedText
 from uuid import UUID
 from datetime import datetime
 from dynastore.models.shared_models import Link
-from dynastore.models.tasks import Task, TaskPayload, TaskExecutionMode
+from dynastore.models.tasks import Task, TaskPayload, TaskExecutionMode, TaskExecutionOverrides
 
 if TYPE_CHECKING:
     from dynastore.modules.tasks.models import Task
@@ -342,6 +342,16 @@ class ExecuteRequest(BaseModel):
     inputs: Dict[str, Any]
     outputs: Optional[Dict[str, OutputExecutionRequest]] = None
     response: str = Field(default="document", pattern="^(document|raw)$")
+    execution_overrides: Optional[TaskExecutionOverrides] = Field(
+        default=None,
+        description=(
+            "Vendor extension: per-execution resource overrides forwarded to the task "
+            "runner. Sets Cloud Run job timeout and retry cap for this execution only. "
+            "Absent for OGC API - Processes standard-compliant callers; silently "
+            "ignored by runners that do not support it. Accepted fields: "
+            "timeout_seconds, cpu, memory, max_retries (all Optional)."
+        ),
+    )
 
 # Type alias for clarity: a process execution task payload
 ProcessTaskPayload = TaskPayload[ExecuteRequest] # This remains for type hinting
