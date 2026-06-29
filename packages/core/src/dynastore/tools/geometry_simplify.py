@@ -38,6 +38,26 @@ primary always keeps full resolution. A collection may opt out by setting
 ``simplify_geometry: false`` on its ES items driver config, in which case an
 oversized geometry is rejected up-front by the ``item_service.upsert`` pre-write
 guard (HTTP 422) rather than truncated.
+
+The default simplification target is :data:`DEFAULT_SIMPLIFY_TARGET_BYTES`
+(1 MB) rather than the hard ES 10 MB ceiling.  Smaller per-document geometries
+speed up ES bulk indexing while PG retains full resolution. Operators may tune
+the target via the ``simplify_target_bytes`` driver config field; values above
+10 MB are clamped to the ES hard limit.
+
+Optional snap-to-grid pre-pass
+--------------------------------
+When ``snap_to_grid=True`` is passed to :func:`maybe_simplify_for_es`, a cheap
+O(n) coordinate-snapping step runs *before* the iterative Douglas-Peucker loop.
+``shapely.set_precision`` snaps every vertex to a regular grid of size
+``snap_grid_size`` (default :data:`DEFAULT_SNAP_GRID_SIZE` ≈ 1 m at the
+equator), which is sub-visual for all typical tile zoom levels.  If snapping
+alone brings the document under the budget the iterative simplify loop is
+skipped entirely, saving CPU on heavy layers.  When snap is insufficient the
+existing tolerance loop still runs as a safety net.
+
+This mode is **off by default** and must be enabled via the
+``snap_to_grid`` field on the driver config.
 """
 
 from typing import Any, Tuple
@@ -50,10 +70,21 @@ from dynastore.tools.json import orjson_default
 
 DEFAULT_MAX_BYTES = 10_000_000
 DEFAULT_MAX_ITERATIONS = 8
+# Default simplification target for the ES write path.  Much smaller than the
+# hard 10 MB ES ceiling so per-document geometry serialization is cheap and
+# ES bulk writes stay fast.  Operators can tune this via ``simplify_target_bytes``
+# on the driver config; the 10 MB ceiling is still enforced as the hard cap.
+DEFAULT_SIMPLIFY_TARGET_BYTES = 1_048_576  # 1 MB
+
+# Default coordinate grid size for the optional snap-to-grid pre-pass.
+# 1e-5 degrees ≈ 1.1 m at the equator — sub-visual at all standard tile
+# zoom levels.  Operators can tune via ``snap_grid_size`` on the driver config.
+DEFAULT_SNAP_GRID_SIZE: float = 1e-5
 
 MODE_NONE = "none"
 MODE_TOLERANCE = "tolerance"
 MODE_BBOX = "bbox"
+MODE_SNAP_TO_GRID = "snap_to_grid"
 
 
 def _doc_size(doc: dict) -> int:
@@ -158,6 +189,8 @@ def maybe_simplify_for_es(
     max_bytes: int = DEFAULT_MAX_BYTES,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     geometry_key: str = "geometry",
+    snap_to_grid: bool = False,
+    snap_grid_size: float = DEFAULT_SNAP_GRID_SIZE,
 ) -> Tuple[dict, float, str]:
     """Opt-in wrapper around :func:`simplify_to_fit` for ES write paths.
 
@@ -174,17 +207,71 @@ def maybe_simplify_for_es(
       geometries are rejected up-front by the ``item_service.upsert``
       pre-write guard rather than truncated here.
 
+    Optional snap-to-grid pre-pass (``snap_to_grid=True``):
+        When the document exceeds ``max_bytes``, a fast O(n)
+        ``shapely.set_precision`` step runs first.  If snapping alone brings
+        the document under the budget the iterative D-P loop is skipped
+        (``mode="snap_to_grid"``).  When snap is insufficient the existing
+        tolerance loop still runs as a safety net and the mode is prefixed:
+        ``"snap_to_grid+tolerance"`` or ``"snap_to_grid+bbox"``.
+
+        This option is **off by default** and must be enabled via the
+        ``snap_to_grid`` field on the driver config.  ``snap_grid_size``
+        defaults to :data:`DEFAULT_SNAP_GRID_SIZE` (1e-5 degrees ≈ 1 m).
+
     The input ``doc`` is returned for chaining (mutated in place only when
     simplification actually runs).
     """
     if not simplify:
         return doc, 1.0, MODE_NONE
-    return simplify_to_fit(
+
+    # Optional snap-to-grid pre-pass: fast O(n) coordinate snapping before
+    # the iterative Douglas-Peucker loop.  Only runs when the doc is already
+    # over budget — geometry under the limit is left untouched.
+    # ``snap_ran`` is set only when snapping actually mutated the document so
+    # the mode label reflects reality (not speculative intent).
+    snap_ran = False
+    if snap_to_grid:
+        original_size = _doc_size(doc)
+        if original_size > max_bytes:
+            geom_raw = doc.get(geometry_key)
+            if geom_raw:
+                try:
+                    from shapely import set_precision as _set_precision
+                    geom = shape(geom_raw)
+                    snapped = _set_precision(geom, snap_grid_size, mode="valid_output")
+                    # Guard: only accept the snapped result when it is non-empty
+                    # AND its geometry type is unchanged.  set_precision with
+                    # mode="valid_output" can return a MultiPolygon from a
+                    # Polygon input when a narrow bridge (< snap_grid_size)
+                    # is removed, which would create a silent type divergence
+                    # between the ES index (MultiPolygon) and the PG primary
+                    # (Polygon).  In that case fall through to the D-P loop,
+                    # which uses preserve_topology=True and never changes type.
+                    if not snapped.is_empty and snapped.geom_type == geom.geom_type:
+                        doc[geometry_key] = mapping(snapped)
+                        snap_ran = True
+                        snapped_size = _doc_size(doc)
+                        if snapped_size <= max_bytes:
+                            # Snap alone was sufficient — skip the D-P loop.
+                            factor = snapped_size / original_size if original_size else 1.0
+                            return doc, factor, MODE_SNAP_TO_GRID
+                        # Snap helped but wasn't enough; continue to the
+                        # iterative loop on the already-snapped geometry.
+                except Exception:
+                    # Snap failed (e.g. geometry type not supported by
+                    # set_precision); fall through to the regular D-P loop.
+                    pass
+
+    doc, factor, mode = simplify_to_fit(
         doc,
         max_bytes=max_bytes,
         max_iterations=max_iterations,
         geometry_key=geometry_key,
     )
+    if snap_ran and mode != MODE_NONE:
+        mode = f"{MODE_SNAP_TO_GRID}+{mode}"
+    return doc, factor, mode
 
 
 def geometry_geojson_size(geometry: Any) -> int:

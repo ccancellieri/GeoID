@@ -18,13 +18,17 @@
 
 """Tests for `dynastore.tools.geometry_simplify.simplify_to_fit`."""
 
+import pytest
 from shapely.geometry import mapping, Polygon
 
 from dynastore.tools.geometry_simplify import (
     DEFAULT_MAX_BYTES,
     DEFAULT_MAX_ITERATIONS,
+    DEFAULT_SIMPLIFY_TARGET_BYTES,
+    DEFAULT_SNAP_GRID_SIZE,
     MODE_BBOX,
     MODE_NONE,
+    MODE_SNAP_TO_GRID,
     MODE_TOLERANCE,
     geometry_geojson_size,
     maybe_simplify_for_es,
@@ -137,3 +141,140 @@ def test_custom_smaller_budget_shrinks_geometry():
     assert geometry_geojson_size(out["geometry"]) <= 1_000_000
     assert mode in (MODE_TOLERANCE, MODE_BBOX)
     assert factor < 1.0
+
+
+# --- New constants -----------------------------------------------------------
+
+
+def test_default_simplify_target_bytes_is_1mb():
+    assert DEFAULT_SIMPLIFY_TARGET_BYTES == 1_048_576
+
+
+def test_default_snap_grid_size():
+    assert DEFAULT_SNAP_GRID_SIZE == pytest.approx(1e-5)
+
+
+def test_mode_snap_to_grid_constant():
+    assert MODE_SNAP_TO_GRID == "snap_to_grid"
+
+
+# --- Snap-to-grid mode -------------------------------------------------------
+
+
+def test_snap_to_grid_under_budget_unchanged():
+    """When the doc is already under budget snap_to_grid has no effect."""
+    poly = Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)])
+    doc = {"id": "x", "geometry": mapping(poly)}
+    out, factor, mode = maybe_simplify_for_es(
+        doc, simplify=True, max_bytes=10_000_000, snap_to_grid=True,
+    )
+    assert mode == MODE_NONE
+    assert factor == 1.0
+
+
+def test_snap_to_grid_reduces_heavy_polygon():
+    """A heavy polygon should reduce to snap_to_grid mode when snap is enough."""
+    # Dense ring: many vertices with tiny gaps, snapping to 0.01 collapses many.
+    poly = Polygon(_ring(50_000))
+    doc = {"id": "x", "geometry": mapping(poly)}
+    out, factor, mode = maybe_simplify_for_es(
+        doc, simplify=True, max_bytes=100_000, snap_to_grid=True, snap_grid_size=0.01,
+    )
+    # snap_to_grid should have produced either snap_to_grid or snap_to_grid+tolerance/bbox
+    assert mode.startswith("snap_to_grid")
+    assert factor < 1.0
+
+
+def test_snap_to_grid_mode_recorded_when_snap_sufficient():
+    """When snap alone brings the doc under budget, mode is exactly 'snap_to_grid'."""
+    # Use a very generous snap grid size so snapping is very aggressive.
+    poly = Polygon(_ring(20_000))
+    doc = {"id": "x", "geometry": mapping(poly)}
+    # Budget: tight but reachable by snapping to a coarse 0.1-degree grid.
+    out, factor, mode = maybe_simplify_for_es(
+        doc, simplify=True, max_bytes=500_000,
+        snap_to_grid=True, snap_grid_size=0.1,
+    )
+    # Either snap alone was enough (snap_to_grid) or snap + D-P ran.
+    assert mode in (MODE_SNAP_TO_GRID, f"{MODE_SNAP_TO_GRID}+{MODE_TOLERANCE}", f"{MODE_SNAP_TO_GRID}+{MODE_BBOX}")
+
+
+def test_snap_to_grid_false_does_not_change_mode_name():
+    """snap_to_grid=False uses the standard mode names without prefix."""
+    poly = Polygon(_ring(50_000))
+    doc = {"id": "x", "geometry": mapping(poly)}
+    out, factor, mode = maybe_simplify_for_es(
+        doc, simplify=True, max_bytes=100_000, snap_to_grid=False, max_iterations=3,
+    )
+    assert mode in (MODE_TOLERANCE, MODE_BBOX)
+    assert not mode.startswith("snap_to_grid")
+
+
+def test_snap_to_grid_prefix_when_snap_plus_simplify():
+    """When snap is insufficient and D-P also runs, mode has 'snap_to_grid+' prefix."""
+    # Extremely tight budget: snap won't be enough, D-P or bbox will also run.
+    poly = Polygon(_ring(50_000))
+    doc = {"id": "x", "geometry": mapping(poly)}
+    out, factor, mode = maybe_simplify_for_es(
+        doc, simplify=True, max_bytes=5_000,
+        snap_to_grid=True, snap_grid_size=1e-5, max_iterations=2,
+    )
+    # Under a very tight budget the result is bbox (or tolerance).
+    assert mode.startswith("snap_to_grid+")
+    assert factor <= 1.0
+
+
+def test_snap_to_grid_type_guard_rejects_type_change():
+    """set_precision can return a MultiPolygon from a Polygon input when a
+    narrow bridge (< snap_grid_size) is collapsed.  The type guard
+    (``snapped.geom_type == geom.geom_type``) must reject such a result and
+    fall through to the D-P loop, which uses preserve_topology=True and never
+    changes geometry type.  The stored geometry must stay Polygon."""
+    import unittest.mock as mock
+    import shapely
+    from shapely.geometry import MultiPolygon
+
+    # A heavy Polygon that exceeds the budget.
+    poly = Polygon(_ring(50_000))
+    doc = {"id": "x", "geometry": mapping(poly)}
+
+    # Simulate set_precision returning a MultiPolygon (type change).
+    multi = MultiPolygon([poly.buffer(-0.1), poly.buffer(0.1)])
+
+    with mock.patch.object(shapely, "set_precision", return_value=multi):
+        out, factor, mode = maybe_simplify_for_es(
+            doc, simplify=True, max_bytes=100_000,
+            snap_to_grid=True, snap_grid_size=1e-5, max_iterations=3,
+        )
+
+    # Type guard rejected the MultiPolygon result; D-P ran instead.
+    # The geometry in the doc must be Polygon (D-P preserves topology).
+    assert out["geometry"]["type"] == "Polygon"
+    # Mode has no snap_to_grid prefix because snap_ran stayed False.
+    assert not mode.startswith("snap_to_grid")
+    assert mode in (MODE_TOLERANCE, MODE_BBOX)
+
+
+def test_snap_to_grid_mode_no_prefix_when_snap_raises():
+    """When the snap step raises, snap_ran stays False and the mode must not
+    carry the 'snap_to_grid+' prefix — D-P runs as if snap was never attempted."""
+    import unittest.mock as mock
+    import shapely
+
+    poly = Polygon(_ring(50_000))
+    doc = {"id": "x", "geometry": mapping(poly)}
+
+    # Patch shapely.set_precision to raise, simulating an unsupported geometry
+    # type or version mismatch.  The lazy import inside the function is
+    # ``from shapely import set_precision as _set_precision``, so patching the
+    # shapely module attribute is sufficient.
+    with mock.patch.object(shapely, "set_precision", side_effect=RuntimeError("snap failure")):
+        out, factor, mode = maybe_simplify_for_es(
+            doc, simplify=True, max_bytes=100_000,
+            snap_to_grid=True, snap_grid_size=1e-5, max_iterations=3,
+        )
+    # D-P ran without snap — mode has no prefix.
+    assert mode in (MODE_TOLERANCE, MODE_BBOX)
+    assert not mode.startswith("snap_to_grid")
+
+

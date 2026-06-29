@@ -230,6 +230,9 @@ class ItemsElasticsearchPrivateDriver(
         simplify_max_bytes = await self._resolve_simplify_max_bytes(
             catalog_id, collection_id, db_resource=db_resource,
         )
+        snap_to_grid, snap_grid_size = await self._resolve_snap_to_grid_config(
+            catalog_id, collection_id, db_resource=db_resource,
+        )
 
         # Tenant-scoped manual mapping overlay (#1295 slice 3). Empty
         # overlay → legacy fully-dynamic ``properties`` sub-tree.
@@ -261,6 +264,7 @@ class ItemsElasticsearchPrivateDriver(
             )
             doc, factor, mode = maybe_simplify_for_es(
                 doc, simplify=simplify_geometry, max_bytes=simplify_max_bytes,
+                snap_to_grid=snap_to_grid, snap_grid_size=snap_grid_size,
             )
             _stamp_simplification(doc, factor, mode)
             doc = project_private_doc(doc, known_fields)
@@ -519,8 +523,12 @@ class ItemsElasticsearchPrivateDriver(
         simplify_max_bytes = await self._resolve_simplify_max_bytes(
             ctx.catalog, ctx.collection,
         )
+        snap_to_grid, snap_grid_size = await self._resolve_snap_to_grid_config(
+            ctx.catalog, ctx.collection,
+        )
         doc, factor, mode = maybe_simplify_for_es(
             doc, simplify=simplify_geometry, max_bytes=simplify_max_bytes,
+            snap_to_grid=snap_to_grid, snap_grid_size=snap_grid_size,
         )
         _stamp_simplification(doc, factor, mode)
         doc = project_private_doc(doc, known_fields)
@@ -557,6 +565,9 @@ class ItemsElasticsearchPrivateDriver(
         simplify_max_bytes = await self._resolve_simplify_max_bytes(
             ctx.catalog, ctx.collection,
         )
+        snap_to_grid, snap_grid_size = await self._resolve_snap_to_grid_config(
+            ctx.catalog, ctx.collection,
+        )
 
         # Tenant-scoped manual mapping overlay (#1295 slice 3).
         known_fields = await resolve_catalog_private_known_fields(ctx.catalog)
@@ -584,6 +595,7 @@ class ItemsElasticsearchPrivateDriver(
             )
             doc, factor, mode = maybe_simplify_for_es(
                 doc, simplify=simplify_geometry, max_bytes=simplify_max_bytes,
+                snap_to_grid=snap_to_grid, snap_grid_size=snap_grid_size,
             )
             _stamp_simplification(doc, factor, mode)
             doc = project_private_doc(doc, known_fields)

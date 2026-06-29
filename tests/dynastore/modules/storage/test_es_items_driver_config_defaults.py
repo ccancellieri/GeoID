@@ -25,6 +25,7 @@ from dynastore.modules.storage.driver_config import (
     ItemsElasticsearchPrivateDriverConfig,
     ItemsElasticsearchEnvelopeDriverConfig,
 )
+from dynastore.tools.geometry_simplify import DEFAULT_SIMPLIFY_TARGET_BYTES, DEFAULT_SNAP_GRID_SIZE
 
 _CONFIGS = [
     ItemsElasticsearchDriverConfig,
@@ -39,8 +40,8 @@ def test_simplify_geometry_defaults_on(cls):
 
 
 @pytest.mark.parametrize("cls", _CONFIGS)
-def test_simplify_target_bytes_defaults_none(cls):
-    assert cls().simplify_target_bytes is None
+def test_simplify_target_bytes_defaults_1mb(cls):
+    assert cls().simplify_target_bytes == DEFAULT_SIMPLIFY_TARGET_BYTES
 
 
 @pytest.mark.parametrize("cls", _CONFIGS)
@@ -55,3 +56,34 @@ def test_simplify_target_bytes_rejects_zero_and_negative(cls):
         cls(simplify_target_bytes=0)
     with pytest.raises(ValidationError):
         cls(simplify_target_bytes=-1)
+
+
+@pytest.mark.parametrize("cls", _CONFIGS)
+def test_snap_to_grid_defaults_off(cls):
+    assert cls().snap_to_grid is False
+
+
+@pytest.mark.parametrize("cls", _CONFIGS)
+def test_snap_grid_size_default(cls):
+    assert cls().snap_grid_size == pytest.approx(DEFAULT_SNAP_GRID_SIZE)
+
+
+@pytest.mark.parametrize("cls", _CONFIGS)
+def test_snap_to_grid_enable(cls):
+    cfg = cls(snap_to_grid=True)
+    assert cfg.snap_to_grid is True
+
+
+@pytest.mark.parametrize("cls", _CONFIGS)
+def test_snap_grid_size_custom(cls):
+    cfg = cls(snap_grid_size=1e-4)
+    assert cfg.snap_grid_size == pytest.approx(1e-4)
+
+
+@pytest.mark.parametrize("cls", _CONFIGS)
+def test_snap_grid_size_rejects_zero_and_negative(cls):
+    # gt=0: a non-positive grid size has no geometric meaning.
+    with pytest.raises(ValidationError):
+        cls(snap_grid_size=0.0)
+    with pytest.raises(ValidationError):
+        cls(snap_grid_size=-1e-5)

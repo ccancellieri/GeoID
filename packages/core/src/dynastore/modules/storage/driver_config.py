@@ -1126,8 +1126,8 @@ class ItemsElasticsearchDriverConfig(CollectionDriverConfig):
         ),
     )
     # Issue #1248: geometry simplification is on by default. The driver
-    # simplifies oversized geometries to fit the ES 10 MB per-document
-    # limit; the PostgreSQL primary always keeps full resolution.
+    # simplifies oversized geometries to fit the ES byte budget; the
+    # PostgreSQL primary always keeps full resolution.
     simplify_geometry: Mutable[bool] = Field(
         default=True,
         description=(
@@ -1139,16 +1139,38 @@ class ItemsElasticsearchDriverConfig(CollectionDriverConfig):
         ),
     )
     simplify_target_bytes: Mutable[Optional[int]] = Field(
-        default=None,
+        default=1_048_576,
         ge=1,
-        examples=[None, 1_000_000],
+        examples=[1_048_576, 5_000_000],
         description=(
-            "Target byte budget for ES geometry simplification. When set, "
-            "geometry is simplified to fit under this size instead of the "
-            "10 MB Elasticsearch per-document limit — lower values keep ES "
-            "indices smaller at the cost of geometry fidelity. Values above "
-            "the 10 MB ES ceiling are clamped down. Defaults to the 10 MB "
-            "limit when unset. Does not affect the PostgreSQL primary."
+            "Target byte budget for ES geometry simplification. Geometry is "
+            "simplified to fit under this size before indexing — lower values "
+            "keep ES indices smaller and writes faster. The hard 10 MB ES "
+            "per-document ceiling is always enforced as an upper bound. "
+            "Defaults to 1 MB (1 048 576 bytes). Does not affect the "
+            "PostgreSQL primary."
+        ),
+    )
+    snap_to_grid: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "When True, an O(n) coordinate snap-to-grid step runs before the "
+            "iterative Douglas-Peucker simplification loop. Snapping is fast "
+            "and reduces vertex count cheaply for heavy layers; if snap alone "
+            "brings the document under the byte budget the D-P loop is skipped "
+            "entirely. Recorded as mode 'snap_to_grid' (or 'snap_to_grid+"
+            "tolerance'/'snap_to_grid+bbox' when the D-P loop also runs). "
+            "Off by default; useful for collections with very dense geometries."
+        ),
+    )
+    snap_grid_size: Mutable[float] = Field(
+        default=1e-5,
+        gt=0,
+        description=(
+            "Grid cell size (in geometry CRS units) for the snap-to-grid "
+            "pre-pass. For geographic coordinates (degrees) the default "
+            "1e-5 ≈ 1.1 m at the equator — sub-visual at all tile zoom "
+            "levels. Only active when snap_to_grid=True."
         ),
     )
 
@@ -1225,16 +1247,32 @@ class ItemsElasticsearchPrivateDriverConfig(CollectionDriverConfig):
         ),
     )
     simplify_target_bytes: Mutable[Optional[int]] = Field(
-        default=None,
+        default=1_048_576,
         ge=1,
-        examples=[None, 1_000_000],
+        examples=[1_048_576, 5_000_000],
         description=(
-            "Target byte budget for ES geometry simplification. When set, "
-            "geometry is simplified to fit under this size instead of the "
-            "10 MB Elasticsearch per-document limit — lower values keep ES "
-            "indices smaller at the cost of geometry fidelity. Values above "
-            "the 10 MB ES ceiling are clamped down. Defaults to the 10 MB "
-            "limit when unset. Does not affect the PostgreSQL primary."
+            "Target byte budget for ES geometry simplification. Geometry is "
+            "simplified to fit under this size before indexing. The hard 10 MB "
+            "ES per-document ceiling is always enforced as an upper bound. "
+            "Defaults to 1 MB (1 048 576 bytes). Does not affect the "
+            "PostgreSQL primary."
+        ),
+    )
+    snap_to_grid: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "When True, an O(n) coordinate snap-to-grid step runs before the "
+            "iterative Douglas-Peucker simplification loop. Off by default; "
+            "useful for collections with very dense geometries."
+        ),
+    )
+    snap_grid_size: Mutable[float] = Field(
+        default=1e-5,
+        gt=0,
+        description=(
+            "Grid cell size for the snap-to-grid pre-pass (geometry CRS "
+            "units). Default 1e-5 degrees ≈ 1.1 m at the equator. "
+            "Only active when snap_to_grid=True."
         ),
     )
 
@@ -1292,16 +1330,32 @@ class ItemsElasticsearchEnvelopeDriverConfig(CollectionDriverConfig):
         ),
     )
     simplify_target_bytes: Mutable[Optional[int]] = Field(
-        default=None,
+        default=1_048_576,
         ge=1,
-        examples=[None, 1_000_000],
+        examples=[1_048_576, 5_000_000],
         description=(
-            "Target byte budget for ES geometry simplification. When set, "
-            "geometry is simplified to fit under this size instead of the "
-            "10 MB Elasticsearch per-document limit — lower values keep ES "
-            "indices smaller at the cost of geometry fidelity. Values above "
-            "the 10 MB ES ceiling are clamped down. Defaults to the 10 MB "
-            "limit when unset. Does not affect the PostgreSQL primary."
+            "Target byte budget for ES geometry simplification. Geometry is "
+            "simplified to fit under this size before indexing. The hard 10 MB "
+            "ES per-document ceiling is always enforced as an upper bound. "
+            "Defaults to 1 MB (1 048 576 bytes). Does not affect the "
+            "PostgreSQL primary."
+        ),
+    )
+    snap_to_grid: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "When True, an O(n) coordinate snap-to-grid step runs before the "
+            "iterative Douglas-Peucker simplification loop. Off by default; "
+            "useful for collections with very dense geometries."
+        ),
+    )
+    snap_grid_size: Mutable[float] = Field(
+        default=1e-5,
+        gt=0,
+        description=(
+            "Grid cell size for the snap-to-grid pre-pass (geometry CRS "
+            "units). Default 1e-5 degrees ≈ 1.1 m at the equator. "
+            "Only active when snap_to_grid=True."
         ),
     )
 

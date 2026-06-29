@@ -55,7 +55,7 @@ operation-based router via the secondary-index ``WRITE`` entries
 
 import logging
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, FrozenSet, List, Optional, Union
+from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, FrozenSet, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from dynastore.modules.storage.driver_config import ItemsWritePolicy
@@ -104,6 +104,8 @@ except ImportError:  # shapely not installed
         max_bytes: int = 10_000_000,
         max_iterations: int = 3,
         geometry_key: str = "geometry",
+        snap_to_grid: bool = False,
+        snap_grid_size: float = 1e-5,
     ) -> "tuple[dict, float, str]":
         """No-op fallback when shapely is not available."""
         return doc, 1.0, "none"
@@ -592,6 +594,31 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         except Exception:
             return DEFAULT_MAX_BYTES
         return _clamp_geometry_budget(getattr(cfg, "simplify_target_bytes", None))
+
+    async def _resolve_snap_to_grid_config(
+        self,
+        catalog_id: str,
+        collection_id: Optional[str] = None,
+        *,
+        db_resource: Optional[Any] = None,
+    ) -> Tuple[bool, float]:
+        """Return ``(snap_to_grid, snap_grid_size)`` from this driver's config.
+
+        Both values default to off / 1e-5 when the config is unavailable.
+        The snap-to-grid mode is off by default and must be enabled explicitly
+        via the driver config.
+        """
+        from dynastore.tools.geometry_simplify import DEFAULT_SNAP_GRID_SIZE
+
+        try:
+            cfg = await self.get_driver_config(
+                catalog_id, collection_id, db_resource=db_resource,
+            )
+        except Exception:
+            return False, DEFAULT_SNAP_GRID_SIZE
+        snap = bool(getattr(cfg, "snap_to_grid", False))
+        grid_size = float(getattr(cfg, "snap_grid_size", DEFAULT_SNAP_GRID_SIZE))
+        return snap, grid_size
 
     # ------------------------------------------------------------------
     # Shared concrete methods — identical across private and envelope drivers
@@ -1240,11 +1267,14 @@ class ItemsElasticsearchDriver(
 
         # Issue #1248: auto-simplify by default. Simplification can be disabled
         # by setting ``simplify_geometry = false`` in the driver config; the
-        # byte budget is clamped to the ES 10 MB ceiling.
+        # byte budget targets 1 MB by default (clamped to 10 MB ES ceiling).
         simplify_geometry = await self._resolve_simplify_geometry(
             catalog_id, collection_id, db_resource=db_resource,
         )
         simplify_max_bytes = await self._resolve_simplify_max_bytes(
+            catalog_id, collection_id, db_resource=db_resource,
+        )
+        snap_to_grid, snap_grid_size = await self._resolve_snap_to_grid_config(
             catalog_id, collection_id, db_resource=db_resource,
         )
 
@@ -1455,6 +1485,7 @@ class ItemsElasticsearchDriver(
             # recorded in system.geometry_simplification (nested, typed).
             es_doc, factor, mode = maybe_simplify_for_es(
                 es_doc, simplify=simplify_geometry, max_bytes=simplify_max_bytes,
+                snap_to_grid=snap_to_grid, snap_grid_size=snap_grid_size,
             )
             _apply_geometry_simplification(es_doc, factor, mode)
 
@@ -2136,8 +2167,12 @@ class ItemsElasticsearchDriver(
         )
         simplify_geometry = await self._resolve_simplify_geometry(ctx.catalog, ctx.collection)
         simplify_max_bytes = await self._resolve_simplify_max_bytes(ctx.catalog, ctx.collection)
+        snap_to_grid, snap_grid_size = await self._resolve_snap_to_grid_config(
+            ctx.catalog, ctx.collection,
+        )
         doc, factor, mode = maybe_simplify_for_es(
             doc, simplify=simplify_geometry, max_bytes=simplify_max_bytes,
+            snap_to_grid=snap_to_grid, snap_grid_size=snap_grid_size,
         )
         _apply_geometry_simplification(doc, factor, mode)
         await es.index(
@@ -2176,6 +2211,9 @@ class ItemsElasticsearchDriver(
         known_fields = await resolve_catalog_known_fields(ctx.catalog)
         simplify_geometry = await self._resolve_simplify_geometry(ctx.catalog, ctx.collection)
         simplify_max_bytes = await self._resolve_simplify_max_bytes(ctx.catalog, ctx.collection)
+        snap_to_grid, snap_grid_size = await self._resolve_snap_to_grid_config(
+            ctx.catalog, ctx.collection,
+        )
 
         # Batch-fetch canonical inputs for all upsert ops in one PG round-trip.
         upsert_geoids = [
@@ -2251,6 +2289,7 @@ class ItemsElasticsearchDriver(
             )
             doc, factor, mode = maybe_simplify_for_es(
                 doc, simplify=simplify_geometry, max_bytes=simplify_max_bytes,
+                snap_to_grid=snap_to_grid, snap_grid_size=snap_grid_size,
             )
             _apply_geometry_simplification(doc, factor, mode)
             body.append({"index": {
