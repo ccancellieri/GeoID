@@ -1360,6 +1360,13 @@ def cached(
 
             def sync_cache_invalidate_impl(*args: Any, **kwargs: Any) -> None:
                 """Sync invalidation -- works in both sync and async contexts."""
+                nonlocal _backend
+                if _backend is None:
+                    # Backend not yet initialized (no GET has run yet on this
+                    # function).  Resolve it now so a PUT that precedes the first
+                    # GET still writes a tombstone to the distributed cache and
+                    # prevents stale reads on other pods.
+                    _resolve_backend()
                 if _backend is None:
                     return
                 cache_key = _build_key(args, kwargs)

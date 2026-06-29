@@ -405,9 +405,15 @@ class ConfigService(ConfigsProtocol):
 
         # Merge base.model_dump() with deltas in order (catalog → collection).
         # mode="python" preserves native types for round-trip re-validation.
+        # Strip keys that are not in the live class schema so a stored delta
+        # written by a newer deploy (field added) or an older one (field later
+        # removed) never injects an unknown key that would cause extra_forbidden
+        # on validation.  The class default for the missing field is used
+        # instead.
+        known_fields = set(cls.model_fields.keys())
         merged: Dict[str, Any] = base.model_dump(mode="python")
         for delta in deltas:
-            merged.update(delta)
+            merged.update({k: v for k, v in delta.items() if k in known_fields})
         return cls.model_validate(merged)
 
     async def get_catalog_config_internal_cached(
@@ -933,7 +939,12 @@ class ConfigService(ConfigsProtocol):
             if cls is None:
                 logger.warning("Skipping catalog_configs row for unknown class_key %r", class_key)
                 continue
-            configs[class_key] = cls.model_validate(row["config_data"])
+            # Strip keys unknown to the live class so a delta written by a newer
+            # or older deploy never causes extra_forbidden on model_validate.
+            _known = set(cls.model_fields.keys())
+            configs[class_key] = cls.model_validate(
+                {k: v for k, v in row["config_data"].items() if k in _known}
+            )
         return configs
 
     # -----------------------------------------------------------------
