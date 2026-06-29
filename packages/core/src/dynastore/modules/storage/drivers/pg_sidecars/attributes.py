@@ -636,6 +636,19 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
             ext_id_cols = pk_columns + [ext_col] if pk_columns else [ext_col]
             ddl += f'\nCREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_ext_id" ON {{schema}}."{table_name}" ({", ".join(ext_id_cols)});'
 
+        # Sort index: a plain B-tree on external_id alone (no pk_columns prefix)
+        # so PostgreSQL can drive the default-sort query (ORDER BY external_id ASC
+        # LIMIT n) via an index-ordered scan of this sidecar rather than a full
+        # filesort of the joined result.  The leading-column of idx_ext_id is
+        # geoid (the PK), so that index does not help ORDER BY external_id.
+        # This index is unconditional on index_external_id because it serves
+        # ORDER BY, not uniqueness.  Created separately so it can be added by
+        # the one-time offline migration (scripts/migrate_attrs_ext_id_sort_index_2567.sql)
+        # for existing collections without reprovisioning.
+        if self.config.external_id_field is not None:
+            ext_col = self.config.external_id_field
+            ddl += f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_ext_id_sort" ON {{schema}}."{table_name}" ({ext_col});'
+
         if self.config.asset_id_field is not None and self.config.index_asset_id:
             asset_col = self.config.asset_id_field
             ddl += f'\nCREATE INDEX IF NOT EXISTS "idx_{table_name}_asset_id" ON {{schema}}."{table_name}" ({asset_col});'

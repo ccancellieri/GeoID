@@ -960,6 +960,27 @@ class QueryOptimizer:
             "table": table,
         }
 
+        # Pre-compute the sort-providing sidecar config for the INNER-join optimisation.
+        # When the default-sort path is active (no explicit sort, no GROUP BY, no
+        # aggregation), the sidecar that provides the default sort (typically the
+        # attributes sidecar via external_id) can drive the query from its
+        # idx_ext_id_sort index — but only when joined as INNER, not LEFT.
+        # LEFT JOIN forces hub to be the outer table and blocks index-ordered
+        # streaming.  We detect the sort-provider here so the JOIN loop below
+        # can pass join_type="INNER" for just that one sidecar without affecting
+        # all other sidecars' join semantics.
+        _default_sort_sc_config = None
+        if (
+            not query.sort
+            and not query.group_by
+            and not any(sel.aggregation for sel in query.select)
+        ):
+            for _sc_conf in required_sidecars:
+                _sc = SidecarRegistry.get_sidecar(_sc_conf, lenient=True)
+                if _sc and _sc.get_default_sort():
+                    _default_sort_sc_config = _sc_conf
+                    break
+
         for sc_config in required_sidecars:
             sidecar = SidecarRegistry.get_sidecar(sc_config, lenient=True)
             if not sidecar:
@@ -978,8 +999,15 @@ class QueryOptimizer:
             # the alias is followed by " ON", not a space.
             join_exists = any(f" AS {sc_alias} " in j for j in query_context["joins"])
             if not join_exists:
+                # Use INNER JOIN for the sort-providing sidecar so the planner can
+                # drive from its ext_id_sort index and stream rows in ORDER BY order
+                # without a full filesort.  Every other sidecar keeps LEFT semantics.
+                _join_type = "INNER" if sc_config is _default_sort_sc_config else "LEFT"
                 query_context["joins"].append(
-                    sidecar.get_join_clause(schema, table, hub_alias="h", sidecar_alias=sc_alias)
+                    sidecar.get_join_clause(
+                        schema, table, hub_alias="h", sidecar_alias=sc_alias,
+                        join_type=_join_type,
+                    )
                 )
         
         # Add any extra joins contributed by sidecars
