@@ -21,6 +21,8 @@
 Tests cover:
 - TilesConfig.simplification_by_zoom has a non-None default with sensible values.
 - The default tolerances decrease (coarser at low zoom, ~0 at high zoom).
+- TilesConfig.simplification_algorithm defaults to TOPOLOGY_PRESERVING (accurate default;
+  SNAP_TO_GRID is opt-in for speed).
 - TilesConfig.min_feature_pixel_area_by_zoom defaults to None (opt-in).
 - get_features_as_mvt_filtered adds a WHERE ST_Area clause when density is configured.
 - The area clause is absent when min_pixel_area resolves to 0.0 or no match.
@@ -33,6 +35,13 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from dynastore.modules.tiles.tiles_config import TilesConfig
+from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
+    SimplificationAlgorithm,
+)
+from dynastore.modules.storage.drivers.pg_sidecars.geometries import (
+    _SIMPLIFY_SQL_FUNCTIONS,
+    _DEFAULT_SIMPLIFY_SQL_FUNCTION,
+)
 from dynastore.modules.tiles import tiles_db
 
 
@@ -98,6 +107,56 @@ def test_simplification_defaults_overridable():
 
     cfg_empty = TilesConfig(simplification_by_zoom={})
     assert cfg_empty.simplification_by_zoom == {}
+
+
+# ---------------------------------------------------------------------------
+# TilesConfig: simplification algorithm default
+# ---------------------------------------------------------------------------
+
+
+def test_simplification_algorithm_default_is_topology_preserving():
+    """Default algorithm must be TOPOLOGY_PRESERVING (accurate; snap_to_grid is opt-in for speed)."""
+    cfg = TilesConfig()
+    assert cfg.simplification_algorithm == SimplificationAlgorithm.TOPOLOGY_PRESERVING
+
+
+def test_snap_to_grid_maps_to_postgis_function():
+    """SNAP_TO_GRID enum value must map to ST_SnapToGrid in the SQL function table."""
+    fn = _SIMPLIFY_SQL_FUNCTIONS.get(SimplificationAlgorithm.SNAP_TO_GRID.value)
+    assert fn == "ST_SnapToGrid", (
+        f"SNAP_TO_GRID should map to ST_SnapToGrid, got {fn!r}"
+    )
+
+
+def test_default_simplify_sql_function_is_topology_preserving():
+    """The fallback (unknown algorithm key) must resolve to ST_SimplifyPreserveTopology.
+
+    The safe fallback matches the default TilesConfig.simplification_algorithm so
+    that any code path that skips the dict lookup still produces accurate output.
+    ST_SnapToGrid is always available as an explicit opt-in via the SNAP_TO_GRID
+    enum value; it is not the default to preserve topology fidelity.
+    """
+    assert _DEFAULT_SIMPLIFY_SQL_FUNCTION == "ST_SimplifyPreserveTopology"
+
+
+def test_simplification_algorithm_snap_to_grid_opt_in():
+    """snap_to_grid must be fully selectable and produce the correct SQL function."""
+    cfg = TilesConfig(simplification_algorithm=SimplificationAlgorithm.SNAP_TO_GRID)
+    assert cfg.simplification_algorithm == SimplificationAlgorithm.SNAP_TO_GRID
+    fn = _SIMPLIFY_SQL_FUNCTIONS.get(SimplificationAlgorithm.SNAP_TO_GRID.value)
+    assert fn == "ST_SnapToGrid"
+
+
+def test_simplification_algorithm_overridable():
+    """Callers can select any registered algorithm."""
+    cfg_tp = TilesConfig(simplification_algorithm=SimplificationAlgorithm.TOPOLOGY_PRESERVING)
+    assert cfg_tp.simplification_algorithm == SimplificationAlgorithm.TOPOLOGY_PRESERVING
+
+    cfg_dp = TilesConfig(simplification_algorithm=SimplificationAlgorithm.DOUGLAS_PEUCKER)
+    assert cfg_dp.simplification_algorithm == SimplificationAlgorithm.DOUGLAS_PEUCKER
+
+    cfg_stg = TilesConfig(simplification_algorithm=SimplificationAlgorithm.SNAP_TO_GRID)
+    assert cfg_stg.simplification_algorithm == SimplificationAlgorithm.SNAP_TO_GRID
 
 
 # ---------------------------------------------------------------------------

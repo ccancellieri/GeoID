@@ -59,6 +59,14 @@ class SimplificationAlgorithm(str, Enum):
     DOUGLAS_PEUCKER = "douglas_peucker"
     TOPOLOGY_PRESERVING = "topology_preserving"
     VISVALINGAM_WHYATT = "visvalingam_whyatt"
+    # ST_SnapToGrid: O(n) grid-snap pre-pass before ST_AsMVTGeom.
+    # Snaps every coordinate to a gridsize cell (same unit as source CRS).
+    # Far faster than topology-preserving for dense polygon collections;
+    # sub-pixel rings collapse to degenerate geometry, which ST_AsMVTGeom
+    # drops as NULL — the same invisible features the density filter removes
+    # explicitly. Preferred for MVT render because ST_AsMVTGeom already
+    # quantises internally; the pre-pass only reduces vertex count cheaply.
+    SNAP_TO_GRID = "snap_to_grid"
 
 
 class GeometryPartitionStrategyPreset(str, Enum):

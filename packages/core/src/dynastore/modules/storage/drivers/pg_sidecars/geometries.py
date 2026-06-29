@@ -74,7 +74,18 @@ _SIMPLIFY_SQL_FUNCTIONS: Dict[str, str] = {
     SimplificationAlgorithm.DOUGLAS_PEUCKER.value: "ST_Simplify",
     SimplificationAlgorithm.TOPOLOGY_PRESERVING.value: "ST_SimplifyPreserveTopology",
     SimplificationAlgorithm.VISVALINGAM_WHYATT.value: "ST_SimplifyVW",
+    # ST_SnapToGrid(geom, gridsize): O(n) coordinate-snap.  The gridsize maps
+    # directly to the ``simplification`` tolerance (source-CRS units), which the
+    # per-zoom defaults calibrate to ~half a MVT pixel width — precisely the
+    # right grid resolution.  Fastest pre-pass before ST_AsMVTGeom because it
+    # requires no recursive distance comparisons; sub-pixel rings collapse to
+    # degenerate geometry that ST_AsMVTGeom silently drops.
+    SimplificationAlgorithm.SNAP_TO_GRID.value: "ST_SnapToGrid",
 }
+# Default when no algorithm key matches.  The accurate topology-preserving function
+# is the safe fallback: it never produces self-intersecting rings and matches the
+# default TilesConfig.simplification_algorithm (TOPOLOGY_PRESERVING).
+# ST_SnapToGrid is available as an explicit opt-in via the SNAP_TO_GRID enum value.
 _DEFAULT_SIMPLIFY_SQL_FUNCTION = "ST_SimplifyPreserveTopology"
 
 

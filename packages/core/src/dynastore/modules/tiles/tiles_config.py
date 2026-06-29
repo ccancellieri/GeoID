@@ -87,7 +87,15 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
     )
     simplification_algorithm: Mutable[Optional[SimplificationAlgorithm]] = Field(
         default=SimplificationAlgorithm.TOPOLOGY_PRESERVING,
-        description="Algorithm used for dynamic simplification.",
+        description=(
+            "Algorithm used for dynamic simplification before ST_AsMVTGeom. "
+            "topology_preserving (default) uses ST_SimplifyPreserveTopology — "
+            "accurate, avoids self-intersections, but O(n log n). "
+            "snap_to_grid uses ST_SnapToGrid — O(n) coordinate-snap, opt-in for "
+            "speed at low/mid zoom where topology fidelity matters less. "
+            "douglas_peucker uses ST_Simplify — faster than topology-preserving "
+            "with minor sliver risk acceptable for display tiles."
+        ),
     )
 
     # Zoom-aware feature density filter (opt-in, default disabled).

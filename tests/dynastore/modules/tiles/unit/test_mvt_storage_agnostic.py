@@ -103,6 +103,7 @@ def test_mvt_geometry_honors_renamed_geometry_column():
         (SimplificationAlgorithm.DOUGLAS_PEUCKER, "ST_Simplify("),
         (SimplificationAlgorithm.TOPOLOGY_PRESERVING, "ST_SimplifyPreserveTopology("),
         (SimplificationAlgorithm.VISVALINGAM_WHYATT, "ST_SimplifyVW("),
+        (SimplificationAlgorithm.SNAP_TO_GRID, "ST_SnapToGrid("),
     ],
 )
 def test_mvt_simplification_maps_algorithm_to_postgis_function(algorithm, expected_fn):
@@ -130,13 +131,14 @@ def test_mvt_simplification_maps_algorithm_to_postgis_function(algorithm, expect
 
 def test_mvt_simplification_defaults_to_preserve_topology():
     """Absent an explicit algorithm, simplification falls back to the
-    topology-preserving PostGIS function."""
+    topology-preserving PostGIS function (the accurate default)."""
     req = MVTQueryTransform().transform_query(
         _base_request(),
         _mvt_context(_col_config(), simplification=0.001),
     )
     raw = " ".join(req.raw_selects)
     assert "ST_SimplifyPreserveTopology(" in raw
+    assert "ST_SnapToGrid(" not in raw
     assert req.raw_params["simplification"] == 0.001
 
 
