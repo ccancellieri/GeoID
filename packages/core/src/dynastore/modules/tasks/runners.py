@@ -180,16 +180,30 @@ class SyncRunner(RunnerProtocol, ProtocolPlugin[Any]):
         )
         _terminal = await _resolve_routing_terminal(context.task_type)
 
+        # Per-execution timeout override takes priority over the routing-config
+        # ceiling; cpu/memory are not applicable to in-process runners.
+        _exec_ovr = context.execution_overrides
+        _effective_timeout: Optional[float] = (
+            float(_exec_ovr.timeout_seconds)
+            if _exec_ovr and _exec_ovr.timeout_seconds
+            else _terminal.timeout_seconds
+        )
+        if _exec_ovr and (_exec_ovr.cpu or _exec_ovr.memory):
+            logger.debug(
+                "SyncRunner: cpu/memory overrides not applicable for in-process "
+                "execution of '%s' — ignored.", context.task_type,
+            )
+
         try:
             logger.info(f"Executing sync task '{job.task_id}'...")
             await tasks_mgr.update_task(context.engine, job.task_id, TaskUpdate(status=TaskStatusEnum.RUNNING), schema=context.db_schema)
 
-            # Hydrate and execute, bounded by the routing deadline when set.
+            # Hydrate and execute, bounded by the effective deadline when set.
             hydrated_payload = hydrate_task_payload(task_instance, raw_payload)
-            if _terminal.timeout_seconds:
+            if _effective_timeout:
                 result = await asyncio.wait_for(
                     task_instance.run(hydrated_payload),
-                    timeout=_terminal.timeout_seconds,
+                    timeout=_effective_timeout,
                 )
             else:
                 result = await task_instance.run(hydrated_payload)
@@ -218,7 +232,7 @@ class SyncRunner(RunnerProtocol, ProtocolPlugin[Any]):
             # 201 + Location instead of blocking the request to the gateway
             # timeout. With any other on_timeout policy the timeout surfaces as
             # an error to the caller (#2221).
-            timeout_s = _terminal.timeout_seconds
+            timeout_s = _effective_timeout
             logger.warning(
                 "SyncRunner: task '%s' (%s) exceeded %ss — dead-lettering and "
                 "applying on_timeout policy.",
@@ -750,6 +764,20 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
             async with self._semaphore:
                 # Terminal routing policy for this task (fail-open to defaults).
                 _terminal = await _resolve_routing_terminal(context.task_type)
+                # Per-execution override takes priority over the routing ceiling.
+                # cpu/memory are not applicable to in-process runners and are ignored.
+                _bg_exec_ovr = context.execution_overrides
+                _bg_effective_timeout: Optional[float] = (
+                    float(_bg_exec_ovr.timeout_seconds)
+                    if _bg_exec_ovr and _bg_exec_ovr.timeout_seconds
+                    else _terminal.timeout_seconds
+                )
+                if _bg_exec_ovr and (_bg_exec_ovr.cpu or _bg_exec_ovr.memory):
+                    logger.debug(
+                        "BackgroundRunner: cpu/memory overrides not applicable "
+                        "for in-process execution of '%s' — ignored.",
+                        context.task_type,
+                    )
                 # Re-register on the heartbeat so the row keeps extending
                 # ``locked_until`` while the actual work runs.  The dispatcher
                 # will skip its own ``unregister`` when it sees
@@ -771,10 +799,10 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                         f"({context.task_type}) in background."
                     )
                     hydrated_payload = hydrate_task_payload(task_instance, raw_payload)
-                    if _terminal.timeout_seconds:
+                    if _bg_effective_timeout:
                         result = await asyncio.wait_for(
                             task_instance.run(hydrated_payload),
-                            timeout=_terminal.timeout_seconds,
+                            timeout=_bg_effective_timeout,
                         )
                     else:
                         result = await task_instance.run(hydrated_payload)
@@ -856,7 +884,7 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                     await _apply_terminal("failure", _terminal.on_failure)
 
                 except asyncio.TimeoutError:
-                    timeout_s = _terminal.timeout_seconds
+                    timeout_s = _bg_effective_timeout
                     logger.error(
                         "BackgroundRunner: claimed task '%s' (%s) timed out after %ss — dead-lettering.",
                         claimed_task_id, context.task_type, timeout_s,

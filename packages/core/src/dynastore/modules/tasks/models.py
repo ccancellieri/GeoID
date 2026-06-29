@@ -28,6 +28,7 @@ from dynastore.models.tasks import (  # noqa: F401 — re-export
     TaskStatusEnum,
     TaskExecutionMode,
     TaskExecutionScope,
+    TaskExecutionOverrides,
     TaskPayload,
     TaskBase,
     TaskCreate,
@@ -54,6 +55,7 @@ __all__ = [
     "TaskStatusEnum",
     "TaskExecutionMode",
     "TaskExecutionScope",
+    "TaskExecutionOverrides",
     "TaskPayload",
     "TaskBase",
     "TaskCreate",
@@ -146,6 +148,14 @@ class RunnerContext(BaseModel):
     tasks collapses redelivered events into a single task. ``create_task``
     returns ``None`` on a dedup hit; the runner then returns ``None`` and
     ``ExecutionEngine.execute`` short-circuits without trying other runners."""
+    execution_overrides: Optional[TaskExecutionOverrides] = Field(
+        default=None,
+        description=(
+            "Per-execution resource overrides sourced from SpawnTaskRequest or "
+            "the task's persisted inputs. Each runner applies the subset it "
+            "supports; unsupported fields are ignored with a debug log."
+        ),
+    )
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 

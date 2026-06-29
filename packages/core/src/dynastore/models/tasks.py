@@ -402,6 +402,84 @@ class Task(TaskBase):
 
 
 # ---------------------------------------------------------------------------
+# Per-execution resource overrides
+# ---------------------------------------------------------------------------
+
+
+class TaskExecutionOverrides(BaseModel):
+    """Per-execution resource hints forwarded to the runner that handles the task.
+
+    All fields are optional (None → runner default).  Each runner applies the
+    subset it supports; unsupported fields are silently ignored with a debug log
+    so the same task spec works across Cloud Run, in-process, and queue runners.
+
+    Cloud Run mapping (``RunJobRequest.Overrides``):
+      - ``timeout_seconds`` → ``overrides.timeout`` (Duration proto)
+      - ``cpu`` / ``memory`` → NOT supported by ``RunJobRequest.Overrides`` in
+        the installed google-cloud-run client (``ContainerOverride`` exposes
+        only args/env/name/clear_args); stored for future client upgrades.
+
+    In-process runners (BackgroundRunner, SyncRunner):
+      - ``timeout_seconds`` → ``asyncio.wait_for`` deadline, taking priority
+        over the routing-config ``timeout_seconds`` when set.
+      - ``cpu`` / ``memory`` → ignored (logged at DEBUG).
+
+    ``max_retries``: applied by all spawn handlers (overrides SpawnTaskRequest.max_retries
+    when not None); not a Cloud Run Overrides-proto field.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "timeout_seconds": 28800,
+                    "cpu": "4",
+                    "memory": "16Gi",
+                    "max_retries": 0,
+                }
+            ]
+        }
+    )
+
+    timeout_seconds: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Wall-clock deadline in seconds for this execution. "
+            "For Cloud Run Jobs, sets RunJobRequest.Overrides.timeout and also "
+            "extends the dispatcher lease to match. "
+            "For in-process runners, applied as asyncio.wait_for timeout, "
+            "overriding the routing-config ceiling."
+        ),
+    )
+    cpu: Optional[str] = Field(
+        default=None,
+        description=(
+            "vCPU request for Cloud Run (e.g. '4'). "
+            "Stored for future client support; not applied by the current "
+            "google-cloud-run client (ContainerOverride has no resources field)."
+        ),
+    )
+    memory: Optional[str] = Field(
+        default=None,
+        description=(
+            "Memory request for Cloud Run (e.g. '16Gi'). "
+            "Stored for future client support; not applied by the current "
+            "google-cloud-run client (ContainerOverride has no resources field)."
+        ),
+    )
+    max_retries: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Per-execution retry cap. When set, overrides SpawnTaskRequest.max_retries "
+            "in all spawn handlers (system, catalog, collection scope). "
+            "Not a Cloud Run Overrides-proto field — honored at task-creation time."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tasks API request / response DTOs
 # ---------------------------------------------------------------------------
 
@@ -447,6 +525,15 @@ class SpawnTaskRequest(BaseModel):
         ge=0,
         description="Per-row retry budget override. When absent the platform "
                     "default (column DEFAULT = 3) applies.",
+    )
+    execution_overrides: Optional[TaskExecutionOverrides] = Field(
+        default=None,
+        description=(
+            "Optional per-execution resource overrides (timeout, cpu, memory, "
+            "max_retries). Persisted alongside task inputs and forwarded to "
+            "whichever runner claims the row. Unsupported fields are silently "
+            "ignored by runners that cannot honour them."
+        ),
     )
 
 

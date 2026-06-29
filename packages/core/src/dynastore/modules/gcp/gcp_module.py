@@ -958,9 +958,20 @@ class GCPModule(
         job_name: str,
         args: Optional[List[str]] = None,
         env_vars: Optional[Dict[str, str]] = None,
+        execution_overrides: Optional[Any] = None,
     ) -> Any:
         """
         JobExecutionProtocol: Triggers a serverless job (Cloud Run job) asynchronously.
+
+        ``execution_overrides`` is a ``TaskExecutionOverrides`` instance (imported
+        lazily to avoid a hard dependency cycle).  Supported fields applied to
+        ``RunJobRequest.Overrides``:
+
+        - ``timeout_seconds`` → ``overrides.timeout`` (google.protobuf.duration_pb2.Duration).
+          Replaces the job-level ``timeout_seconds`` for this execution only.
+        - ``cpu`` / ``memory`` — NOT applied: the installed google-cloud-run client's
+          ``RunJobRequest.Overrides.ContainerOverride`` has no ``resources`` field.
+          Stored on the task model for future client upgrades; logged at DEBUG here.
         """
         project_id = self.get_project_id()
         region = self.get_region()
@@ -977,6 +988,31 @@ class GCPModule(
                 for key, value in env_vars.items():
                     container_overrides.env.append(run_v2.EnvVar(name=key, value=value))
             request.overrides.container_overrides.append(container_overrides)
+
+        if execution_overrides is not None:
+            timeout_s = getattr(execution_overrides, "timeout_seconds", None)
+            if timeout_s:
+                try:
+                    from google.protobuf import duration_pb2
+                    request.overrides.timeout = duration_pb2.Duration(seconds=int(timeout_s))  # type: ignore[attr-defined]
+                    logger.debug(
+                        "GCPModule.run_job: applying per-execution timeout=%ds to job '%s'.",
+                        timeout_s, job_name,
+                    )
+                except ImportError:  # pragma: no cover — protobuf always present with run_v2
+                    logger.warning(
+                        "GCPModule.run_job: google.protobuf not available; "
+                        "timeout_seconds=%d override skipped for job '%s'.",
+                        timeout_s, job_name,
+                    )
+            cpu = getattr(execution_overrides, "cpu", None)
+            memory = getattr(execution_overrides, "memory", None)
+            if cpu or memory:
+                logger.debug(
+                    "GCPModule.run_job: cpu=%r / memory=%r overrides not applied for job '%s' "
+                    "(ContainerOverride has no resources field in this client version).",
+                    cpu, memory, job_name,
+                )
 
         try:
             operation = await client.run_job(request=request)

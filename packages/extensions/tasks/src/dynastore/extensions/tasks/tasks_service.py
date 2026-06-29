@@ -81,6 +81,7 @@ from dynastore.models.tasks import (
     TaskScope,
 )
 from dynastore.modules.tasks import tasks_module
+from dynastore.modules.tasks.execution import _EXECUTION_OVERRIDES_KEY
 from dynastore.modules.tasks.maintenance import (
     list_dead_letter_tasks as _dlq_list,
     requeue_dead_letter_task as _dlq_requeue,
@@ -264,6 +265,8 @@ async def _do_spawn_system(
 
     inputs: Dict[str, Any] = dict(body.inputs)
     inputs["catalog_id"] = "system"
+    if body.execution_overrides is not None:
+        inputs[_EXECUTION_OVERRIDES_KEY] = body.execution_overrides.model_dump(exclude_none=True)
 
     task_data = TaskCreate(
         task_type=body.task_type,
@@ -271,7 +274,11 @@ async def _do_spawn_system(
         inputs=inputs,
         scope=TaskScope.SYSTEM,
         dedup_key=body.dedup_key,
-        max_retries=body.max_retries,
+        max_retries=(
+            body.execution_overrides.max_retries
+            if body.execution_overrides and body.execution_overrides.max_retries is not None
+            else body.max_retries
+        ),
     )
     task = await tasks_module.create_task(engine, task_data, schema="system")
     task_id, task_status = await _resolve_spawn_result(
@@ -308,6 +315,8 @@ async def _do_spawn_catalog(
 
     inputs: Dict[str, Any] = dict(body.inputs)
     inputs["catalog_id"] = schema
+    if body.execution_overrides is not None:
+        inputs[_EXECUTION_OVERRIDES_KEY] = body.execution_overrides.model_dump(exclude_none=True)
 
     task_data = TaskCreate(
         task_type=body.task_type,
@@ -315,7 +324,11 @@ async def _do_spawn_catalog(
         inputs=inputs,
         scope=TaskScope.CATALOG,
         dedup_key=body.dedup_key,
-        max_retries=body.max_retries,
+        max_retries=(
+            body.execution_overrides.max_retries
+            if body.execution_overrides and body.execution_overrides.max_retries is not None
+            else body.max_retries
+        ),
     )
     task = await tasks_module.create_task(engine, task_data, schema=schema)
     task_id, task_status = await _resolve_spawn_result(
@@ -366,6 +379,8 @@ async def _do_spawn_collection(
     inputs: Dict[str, Any] = dict(body.inputs)
     inputs["catalog_id"] = schema
     inputs["collection_id"] = collection_id
+    if body.execution_overrides is not None:
+        inputs[_EXECUTION_OVERRIDES_KEY] = body.execution_overrides.model_dump(exclude_none=True)
 
     task_data = TaskCreate(
         task_type=body.task_type,
@@ -374,7 +389,11 @@ async def _do_spawn_collection(
         scope=TaskScope.CATALOG,
         collection_id=collection_id,
         dedup_key=body.dedup_key,
-        max_retries=body.max_retries,
+        max_retries=(
+            body.execution_overrides.max_retries
+            if body.execution_overrides and body.execution_overrides.max_retries is not None
+            else body.max_retries
+        ),
     )
     task = await tasks_module.create_task(engine, task_data, schema=schema)
     task_id, task_status = await _resolve_spawn_result(

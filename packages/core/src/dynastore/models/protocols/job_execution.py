@@ -20,38 +20,48 @@
 Serverless job execution protocol definitions.
 """
 
-from typing import Protocol, Optional, Dict, List, Any, runtime_checkable
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Protocol, Optional, Dict, List, Any, runtime_checkable
+
+if TYPE_CHECKING:
+    from dynastore.models.tasks import TaskExecutionOverrides
+
 
 @runtime_checkable
 class JobExecutionProtocol(Protocol):
     """
     Protocol for serverless job execution operations, enabling decoupled access
     to job management without direct dependency on specific cloud providers.
-    
+
     This protocol is designed to be optional - implementations should handle
     unavailability gracefully. Can be implemented by Cloud Run, AWS Lambda,
     Azure Functions, or any other serverless execution platform.
     """
-    
+
     async def run_job(
         self,
         job_name: str,
         args: Optional[List[str]] = None,
-        env_vars: Optional[Dict[str, str]] = None
+        env_vars: Optional[Dict[str, str]] = None,
+        execution_overrides: Optional["TaskExecutionOverrides"] = None,
     ) -> Any:
         """
         Triggers a serverless job asynchronously.
-        
+
         Args:
-            job_name: The name of the job to execute
-            args: Optional list of command-line arguments to pass to the job's container
-            env_vars: Optional dictionary of environment variables to override
-            
+            job_name: The name of the job to execute.
+            args: Optional list of command-line arguments to pass to the job's container.
+            env_vars: Optional dictionary of environment variables to override.
+            execution_overrides: Optional per-execution resource overrides (timeout,
+                cpu, memory, max_retries). Each implementation applies the subset it
+                supports and silently ignores the rest.
+
         Returns:
-            Operation object for the job execution
-            
+            Operation object for the job execution.
+
         Raises:
-            RuntimeError: If the job cannot be triggered
+            RuntimeError: If the job cannot be triggered.
         """
         ...
     

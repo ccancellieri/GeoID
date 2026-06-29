@@ -53,12 +53,19 @@ from dynastore.models.tasks import (
     TaskUpdate,
     TaskStatusEnum,
     TaskExecutionMode,
+    TaskExecutionOverrides,
     Task,
 )
 from dynastore.modules.db_config.query_executor import DbResource
 from dynastore.models.auth_models import SYSTEM_USER_ID
 
 logger = logging.getLogger(__name__)
+
+# Reserved key under which ``execution_overrides`` (TaskExecutionOverrides) are
+# serialised inside the task's ``inputs`` JSONB column so they survive the
+# PENDING→dispatch round-trip.  Popped in dispatch() before the inputs dict
+# is handed to the runner, so runners never see this internal key.
+_EXECUTION_OVERRIDES_KEY = "__execution_overrides__"
 
 # Terminal statuses — dismiss and update operations check against these
 _TERMINAL_STATUSES = frozenset({
@@ -659,6 +666,7 @@ class ExecutionEngine:
         collection_id: Optional[str] = None,
         background_tasks: Any = None,
         dedup_key: Optional[str] = None,
+        execution_overrides: Optional[TaskExecutionOverrides] = None,
         **extras: Any,
     ) -> Any:
         """
@@ -726,6 +734,7 @@ class ExecutionEngine:
             db_schema=db_schema,
             collection_id=collection_id,
             dedup_key=dedup_key,
+            execution_overrides=execution_overrides,
             extra_context={
                 "background_tasks": background_tasks,
                 **({"runner_options": runner_options} if runner_options else {}),
@@ -1117,6 +1126,17 @@ class ExecutionEngine:
         cid = task_inputs.pop(_INTERNAL_KEY, None)
         token = set_correlation_id(cid) if cid else None
 
+        # Extract per-execution overrides persisted under the reserved key by the
+        # spawn handlers.  Pop so they do not appear in the task's live inputs.
+        _overrides_raw = task_inputs.pop(_EXECUTION_OVERRIDES_KEY, None)
+        _dispatch_exec_overrides: Optional[TaskExecutionOverrides] = None
+        if _overrides_raw and isinstance(_overrides_raw, dict):
+            try:
+                _dispatch_exec_overrides = TaskExecutionOverrides.model_validate(_overrides_raw)
+            except Exception as exc:  # noqa: BLE001 — malformed overrides must not break dispatch
+                logger.warning("invalid __execution_overrides__ payload, ignoring: %s", exc)
+                pass
+
         # Dispatcher-path handoff: the row is already ACTIVE with the
         # dispatcher's heartbeat extending ``locked_until``.  Runners that
         # schedule async work (``BackgroundRunner``) pick up both the
@@ -1163,6 +1183,7 @@ class ExecutionEngine:
             inputs=task_inputs,
             db_schema=task_row.get("catalog_id", "tasks"),
             extra_context=_extra_context,
+            execution_overrides=_dispatch_exec_overrides,
         )
 
         try:

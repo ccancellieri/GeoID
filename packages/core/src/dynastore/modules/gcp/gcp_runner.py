@@ -234,10 +234,14 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
 
         execution_id = generate_id_hex()
         owner_id = f"gcp_cloud_run_{execution_id}"
-        # Lease for a freshly-launched Cloud Run Job. Picked to outlast typical
-        # job startup + run; the in-job heartbeat (main_task.py) extends it while
-        # the job runs, and the MaintenanceSupervisor task_reaper resets the row
-        # if the lease lapses.
+        # Lease for a freshly-launched Cloud Run Job.  The in-job heartbeat
+        # (main_task.py) extends it while the job runs, and the
+        # MaintenanceSupervisor task_reaper resets the row if the lease lapses.
+        #
+        # Priority: context.execution_overrides.timeout_seconds (per-task) >
+        # TasksPluginConfig.task_timeout_seconds (platform config default).
+        # Both the Cloud Run execution timeout AND the DB lease are set to the
+        # effective value so they never diverge.
         _timeout_seconds = 3600
         try:
             from dynastore.tools.discovery import get_protocol
@@ -250,7 +254,22 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
                     _timeout_seconds = _cfg.task_timeout_seconds
         except Exception:  # noqa: BLE001 — default lease on any read failure
             pass
-        task_lease = timedelta(seconds=_timeout_seconds)
+
+        # Per-task override takes precedence over the platform-wide config value.
+        _exec_overrides = context.execution_overrides
+        _override_timeout = (
+            _exec_overrides.timeout_seconds
+            if _exec_overrides and _exec_overrides.timeout_seconds
+            else None
+        )
+        _effective_timeout_seconds = _override_timeout if _override_timeout else _timeout_seconds
+        if _override_timeout:
+            logger.debug(
+                "GcpJobRunner: using per-task timeout=%ds (config=%ds) for '%s'.",
+                _effective_timeout_seconds, _timeout_seconds, context.task_type,
+            )
+
+        task_lease = timedelta(seconds=_effective_timeout_seconds)
         new_locked_until = datetime.now(timezone.utc) + task_lease
 
         existing_task: Optional[Task] = None
@@ -406,7 +425,10 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
         for attempt in range(1, _RUNJOB_MAX_ATTEMPTS + 1):
             try:
                 runner_ref = await run_cloud_run_job_async(
-                    job_name=job_name, args=args, env_vars=env_vars,
+                    job_name=job_name,
+                    args=args,
+                    env_vars=env_vars,
+                    execution_overrides=context.execution_overrides,
                 )
                 last_exc = None
                 break

@@ -24,6 +24,7 @@ import logging
 
 if TYPE_CHECKING:
     from dynastore.modules.processes.models import Process
+    from dynastore.models.tasks import TaskExecutionOverrides
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +80,10 @@ def extract_execution_name(operation: Any) -> Optional[str]:
 
 
 async def run_cloud_run_job_async(
-    job_name: str, args: Optional[list] = None, env_vars: Optional[dict] = None
+    job_name: str,
+    args: Optional[list] = None,
+    env_vars: Optional[dict] = None,
+    execution_overrides: Optional["TaskExecutionOverrides"] = None,
 ) -> Optional[str]:
     """
     Triggers a serverless job asynchronously using the JobExecutionProtocol.
@@ -88,6 +92,9 @@ async def run_cloud_run_job_async(
         job_name (str): The name of the job to execute.
         args (list, optional): A list of command-line arguments to pass to the job's container.
         env_vars (dict, optional): A dictionary of environment variables to override in the job's container.
+        execution_overrides (TaskExecutionOverrides, optional): Per-execution resource
+            overrides (timeout_seconds, cpu, memory, max_retries). Forwarded to the
+            JobExecutionProtocol implementation; unsupported fields are silently ignored.
 
     Returns:
         Optional[str]: The Cloud Run execution resource name
@@ -102,7 +109,7 @@ async def run_cloud_run_job_async(
     if not job_runner:
         raise RuntimeError("JobExecutionProtocol not available. Unable to trigger job.")
 
-    operation = await job_runner.run_job(job_name, args, env_vars)
+    operation = await job_runner.run_job(job_name, args, env_vars, execution_overrides)
     return extract_execution_name(operation)
 
 
