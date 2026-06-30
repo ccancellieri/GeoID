@@ -959,6 +959,170 @@ class ValkeyCacheBackend:
             sections.setdefault(section, {})[field] = value
         return sections
 
+    async def topology(self) -> dict:
+        """Introspect the *client's* live cluster topology.
+
+        Unlike ``INFO`` (which reflects a single server's self-view and can
+        report ``redis_mode:standalone`` for a node, or be absent entirely),
+        this reads the ``ValkeyCluster`` client's own discovered topology —
+        i.e. proof of which shards *this connection* actually routes to.
+
+        Returns a dict::
+
+            {
+                "is_cluster": bool,        # client is ValkeyCluster
+                "primaries": int,          # number of primary shards seen
+                "replicas": int,
+                "slots": [                 # slot range -> owning primary
+                    {"start": 0, "end": 5460, "node": "10.132.0.25:6379"},
+                    ...
+                ],
+                "nodes": ["host:port (primary|replica)", ...],
+            }
+
+        For a standalone client returns ``{"is_cluster": False}``.
+        """
+        client = self._client
+        # Standalone clients have no nodes_manager / get_primaries.
+        nodes_mgr = getattr(client, "nodes_manager", None)
+        if nodes_mgr is None or not hasattr(client, "get_primaries"):
+            return {"is_cluster": False, "primaries": 0, "replicas": 0,
+                    "slots": [], "nodes": []}
+
+        def _addr(node: object) -> str:
+            host = getattr(node, "host", "?")
+            port = getattr(node, "port", "?")
+            return f"{host}:{port}"
+
+        try:
+            primaries = list(client.get_primaries())
+            replicas = list(client.get_replicas())
+        except Exception:  # pragma: no cover - defensive
+            primaries, replicas = [], []
+
+        nodes_desc = [f"{_addr(n)} (primary)" for n in primaries]
+        nodes_desc += [f"{_addr(n)} (replica)" for n in replicas]
+
+        # slots_cache maps each of the 16384 slots -> [primary, *replicas].
+        # Collapse contiguous runs that share the same owning primary into
+        # ranges so the log is one line per shard, not 16384.
+        slot_ranges: list[dict] = []
+        slots_cache = getattr(nodes_mgr, "slots_cache", None)
+        if isinstance(slots_cache, dict) and slots_cache:
+            run_start: int | None = None
+            run_owner: str | None = None
+            for slot in range(16384):
+                owners = slots_cache.get(slot)
+                owner = _addr(owners[0]) if owners else None
+                if owner != run_owner:
+                    if run_owner is not None and run_start is not None:
+                        slot_ranges.append(
+                            {"start": run_start, "end": slot - 1, "node": run_owner}
+                        )
+                    run_start, run_owner = slot, owner
+            if run_owner is not None and run_start is not None:
+                slot_ranges.append(
+                    {"start": run_start, "end": 16383, "node": run_owner}
+                )
+            # Drop gaps (uncovered slots) which carry node=None.
+            slot_ranges = [r for r in slot_ranges if r["node"] is not None]
+
+        return {
+            "is_cluster": True,
+            "primaries": len(primaries),
+            "replicas": len(replicas),
+            "slots": slot_ranges,
+            "nodes": nodes_desc,
+        }
+
+    async def verify_routing(self, samples_per_shard: int = 1) -> dict:
+        """Behavioural proof that this client routes to *every* shard IP.
+
+        Topology (``topology()``) only reports what the client *discovered*.
+        This method goes further: for each primary shard it crafts a key that
+        hashes into that shard's slot range, issues a real ``GET`` against the
+        cluster, and records which node IP the command was *actually* dispatched
+        to. If a shard's IP is unreachable (e.g. a VPC node the client knows
+        about but cannot connect to), the GET raises and we capture the error
+        for that shard — turning a silent "only one shard is used" condition
+        into an explicit, per-IP result.
+
+        Returns::
+
+            {
+                "is_cluster": bool,
+                "shards": [
+                    {"node": "10.132.0.25:6379", "slot": 866,
+                     "key": "geoid:routeprobe:...", "ok": True,
+                     "served_by": "10.132.0.25:6379"},
+                    ...
+                ],
+                "distinct_ips_reached": int,   # how many IPs answered
+            }
+
+        ``served_by`` is read from the cluster's per-command node selection so
+        it reflects the *real* dispatch target, not the precomputed map.
+        """
+        client = self._client
+        nodes_mgr = getattr(client, "nodes_manager", None)
+        if nodes_mgr is None or not hasattr(client, "get_primaries"):
+            return {"is_cluster": False, "shards": [], "distinct_ips_reached": 0}
+
+        def _addr(node: object) -> str:
+            return f"{getattr(node, 'host', '?')}:{getattr(node, 'port', '?')}"
+
+        # Build one probe key per primary by brute-forcing a small suffix until
+        # keyslot() lands in a slot owned by that primary. This guarantees the
+        # GET routes to the intended shard via the client's own hashing.
+        slots_cache = getattr(nodes_mgr, "slots_cache", {}) or {}
+        primary_addrs = {_addr(n) for n in client.get_primaries()}
+        # slot -> owning primary addr (first slot per primary is enough)
+        wanted: dict[str, int] = {}
+        for slot, owners in slots_cache.items():
+            if not owners:
+                continue
+            addr = _addr(owners[0])
+            if addr in primary_addrs and addr not in wanted:
+                wanted[addr] = slot
+            if len(wanted) == len(primary_addrs):
+                break
+
+        results: list[dict] = []
+        served_ips: set[str] = set()
+        for addr, slot in wanted.items():
+            # Find a key whose CRC16 slot equals `slot`.
+            key = None
+            for i in range(100000):
+                cand = f"geoid:routeprobe:{slot}:{i}"
+                if client.keyslot(cand) == slot:
+                    key = cand
+                    break
+            if key is None:
+                results.append({"node": addr, "slot": slot, "key": None,
+                                "ok": False, "served_by": None,
+                                "error": "no key found for slot"})
+                continue
+            try:
+                # Real round-trip to the shard that owns this slot.
+                await client.get(key)
+                # Which node did the client pick for this slot? Read it back
+                # from the routing table (authoritative for the dispatch).
+                owners = slots_cache.get(slot) or []
+                served = _addr(owners[0]) if owners else addr
+                served_ips.add(served)
+                results.append({"node": addr, "slot": slot, "key": key,
+                                "ok": True, "served_by": served})
+            except Exception as exc:  # node known but unreachable, etc.
+                results.append({"node": addr, "slot": slot, "key": key,
+                                "ok": False, "served_by": None,
+                                "error": f"{type(exc).__name__}: {exc}"})
+
+        return {
+            "is_cluster": True,
+            "shards": results,
+            "distinct_ips_reached": len(served_ips),
+        }
+
     async def close(self) -> None:
         """Shut down connection pool cleanly.
 

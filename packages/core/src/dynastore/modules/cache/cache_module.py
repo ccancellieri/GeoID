@@ -273,12 +273,64 @@ async def _on_valkey_engine_config_change(
                 new_backend.info(), timeout=cache_cfg.probe_timeout_seconds
             )
             version = info.get("server", {}).get("redis_version", "?")
-            mode = info.get("server", {}).get("redis_mode", "standalone")
+            # ``redis_mode`` is the *server node's* self-view and may be
+            # absent in the parsed INFO (then the literal default below would
+            # lie). Prefer the *client's* discovered topology as ground truth
+            # for whether THIS connection is sharding across a cluster.
+            topo = await new_backend.topology()
+            if topo.get("is_cluster"):
+                mode = "cluster"
+            else:
+                mode = info.get("server", {}).get("redis_mode") or "standalone"
             logger.info(
-                "CacheModule (reconnect): Valkey OK — version=%s mode=%s",
+                "CacheModule (reconnect): Valkey OK — version=%s mode=%s "
+                "redis_mode=%s primaries=%d replicas=%d",
                 version,
                 mode,
+                info.get("server", {}).get("redis_mode", "<absent>"),
+                topo.get("primaries", 0),
+                topo.get("replicas", 0),
             )
+            # Definitive client-side proof of which shard owns which slots.
+            for r in topo.get("slots", []):
+                logger.info(
+                    "CacheModule (reconnect): cluster slot map — "
+                    "slots %d-%d -> %s",
+                    r["start"], r["end"], r["node"],
+                )
+            # Behavioural proof: actually round-trip a key into each shard and
+            # confirm the IP is reachable (catches "node discovered but the VPC
+            # can't reach it" — i.e. effectively single-shard).
+            if topo.get("is_cluster"):
+                try:
+                    routing = await asyncio.wait_for(
+                        new_backend.verify_routing(),
+                        timeout=cache_cfg.probe_timeout_seconds,
+                    )
+                    for s in routing.get("shards", []):
+                        if s.get("ok"):
+                            logger.info(
+                                "CacheModule (reconnect): shard reachable — "
+                                "%s (slot %s)",
+                                s["served_by"], s["slot"],
+                            )
+                        else:
+                            logger.warning(
+                                "CacheModule (reconnect): shard UNREACHABLE — "
+                                "%s (slot %s) error=%s",
+                                s["node"], s["slot"], s.get("error"),
+                            )
+                    logger.info(
+                        "CacheModule (reconnect): routing verified — "
+                        "distinct_ips_reached=%d/%d",
+                        routing.get("distinct_ips_reached", 0),
+                        topo.get("primaries", 0),
+                    )
+                except Exception as exc:  # never block reconnect on diagnostics
+                    logger.warning(
+                        "CacheModule (reconnect): routing verification skipped "
+                        "(%s)", exc,
+                    )
         except Exception as exc:
             _reason = (
                 "probe timed out" if isinstance(exc, asyncio.TimeoutError) else str(exc)
@@ -577,19 +629,38 @@ class CacheModule(ModuleProtocol):
                 backend.info(), timeout=cache_cfg.probe_timeout_seconds
             )
             version = info.get("server", {}).get("redis_version", "?")
-            mode = info.get("server", {}).get("redis_mode", "standalone")
             used_mb = info.get("memory", {}).get("used_memory_human", "?")
+            # ``redis_mode`` from INFO is the server node's self-view and may
+            # be absent in the parsed dict; the client's discovered topology
+            # is the ground truth for whether THIS connection is a cluster.
+            topo = await backend.topology()
+            server_redis_mode = info.get("server", {}).get("redis_mode")
+            if topo.get("is_cluster"):
+                mode = "cluster"
+            else:
+                mode = server_redis_mode or "standalone"
             logger.info(
-                "CacheModule: Valkey OK — version=%s mode=%s used_memory=%s host=%s",
+                "CacheModule: Valkey OK — version=%s mode=%s redis_mode=%s "
+                "primaries=%d replicas=%d used_memory=%s host=%s",
                 version,
                 mode,
+                server_redis_mode or "<absent>",
+                topo.get("primaries", 0),
+                topo.get("replicas", 0),
                 used_mb,
                 _safe_url,
             )
-            
-            # Auto-detect cluster mode: if server reports cluster but we
+            for r in topo.get("slots", []):
+                logger.info(
+                    "CacheModule: cluster slot map — slots %d-%d -> %s",
+                    r["start"], r["end"], r["node"],
+                )
+
+            # Auto-detect cluster mode: if the server reports cluster but we
             # connected with a standalone client, rebuild as ValkeyCluster.
-            if mode == "cluster" and not engine_mode:
+            # Drive this off the server's self-reported redis_mode (the client
+            # is standalone here, so topo.is_cluster is False by definition).
+            if server_redis_mode == "cluster" and not engine_mode:
                 logger.info(
                     "CacheModule: detected cluster mode; rebuilding as ValkeyCluster"
                 )

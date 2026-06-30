@@ -149,6 +149,33 @@ async def test_apply_handler_success_swaps_backend_and_logs_metric(
             "memory": {"used_memory_human": "1M"},
         }
     )
+    new_backend.topology = AsyncMock(
+        return_value={
+            "is_cluster": True,
+            "primaries": 3,
+            "replicas": 3,
+            "slots": [
+                {"start": 0, "end": 5460, "node": "10.0.0.1:6379"},
+                {"start": 5461, "end": 10922, "node": "10.0.0.2:6379"},
+                {"start": 10923, "end": 16383, "node": "10.0.0.3:6379"},
+            ],
+            "nodes": [],
+        }
+    )
+    new_backend.verify_routing = AsyncMock(
+        return_value={
+            "is_cluster": True,
+            "shards": [
+                {"node": "10.0.0.1:6379", "slot": 0, "key": "k", "ok": True,
+                 "served_by": "10.0.0.1:6379"},
+                {"node": "10.0.0.2:6379", "slot": 5461, "key": "k", "ok": True,
+                 "served_by": "10.0.0.2:6379"},
+                {"node": "10.0.0.3:6379", "slot": 10923, "key": "k", "ok": True,
+                 "served_by": "10.0.0.3:6379"},
+            ],
+            "distinct_ips_reached": 3,
+        }
+    )
     new_backend.close = AsyncMock(return_value=None)
 
     manager = MagicMock()
