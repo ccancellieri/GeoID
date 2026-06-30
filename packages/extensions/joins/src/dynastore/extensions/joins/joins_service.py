@@ -34,7 +34,7 @@ _ = _bigquery_scope_gate  # silence pyright "unused" — load-bearing for SCOPE 
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Annotated, Any, AsyncIterator, Dict, FrozenSet, List, Optional
+from typing import Annotated, Any, AsyncGenerator, Dict, FrozenSet, List, Optional
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request
@@ -64,6 +64,14 @@ logger = logging.getLogger(__name__)
 # own field bounds (default=100, le=10000).
 DEFAULT_PAGE_LIMIT = 100
 MAX_PAGE_LIMIT = 10_000
+
+# Safety ceiling on the number of primary rows scanned per /join request.
+# The join executor streams the primary collection without a row-based pre-cap
+# (so sparse inner joins find their full quota of matched features); this
+# ceiling prevents runaway scans on very large collections. When hit, the
+# response still emits a `next` link so the client can continue paging.
+# Operators can observe ceiling hits via the `join_scan_ceiling_hit` warning.
+MAX_PRIMARY_SCAN_ROWS = 1_000_000
 
 # GeoJSON media type for join feature collections and pagination links.
 GEOJSON_MEDIA_TYPE = "application/geo+json"
@@ -113,7 +121,7 @@ async def _stream_primary_features(
     driver, *, catalog_id: str, collection_id: str,
     primary_column: str, limit: int = 100_000,
     query_request: Optional[QueryRequest] = None,
-) -> AsyncIterator[Feature]:
+) -> AsyncGenerator[Feature, None]:
     """Wrap any CollectionItemsStore driver's read_entities into the
     plain ``AsyncIterator[Feature]`` shape ``run_join`` expects.
 
@@ -195,7 +203,7 @@ def _with_paging_query(url: str, *, offset: int, limit: int) -> str:
 
 
 def _join_feature_collection(
-    joined: List[Feature], *, request: Request, paging: PagingSpec,
+    joined: List[Feature], *, request: Request, paging: PagingSpec, has_next: bool,
 ) -> Dict[str, Any]:
     """Build an OGC-conformant join FeatureCollection.
 
@@ -203,17 +211,20 @@ def _join_feature_collection(
     ``numberReturned``) instead of a non-standard ``_join_meta`` foreign member.
     ``numberMatched`` is intentionally omitted: the join streams an inner match
     and never materializes the full matched set, so its total is not known
-    cheaply (Features Part 1 permits omitting it). A ``next`` link is emitted
-    only when the page is full (``len(features) >= limit``), i.e. more features
-    may follow. This signal is exact for a dense join and may end paging early
-    for a sparse one — see the read-window note in ``execute_join``.
+    cheaply (Features Part 1 permits omitting it).
+
+    ``has_next`` is computed by the caller (``_execute_primary_join``) which
+    uses a match-bounded read: it requests ``limit+1`` matched features from
+    the join executor and emits ``next`` when the (limit+1)th match exists or
+    the primary-scan safety ceiling was reached before ``limit+1`` matches were
+    found. This is correct for both dense and sparse joins.
     """
     features = [f.model_dump(by_alias=True, exclude_none=True) for f in joined]
     self_href = str(request.url)
     links: List[Dict[str, Any]] = [
         {"rel": "self", "type": GEOJSON_MEDIA_TYPE, "href": self_href},
     ]
-    if len(features) >= paging.limit:
+    if has_next:
         links.append({
             "rel": "next",
             "type": GEOJSON_MEDIA_TYPE,
@@ -228,6 +239,94 @@ def _join_feature_collection(
         "timeStamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "links": links,
     }
+
+
+async def _execute_primary_join(
+    primary_driver,
+    *,
+    catalog_id: str,
+    collection_id: str,
+    body: JoinRequest,
+    secondary_index: Dict[Any, Dict[str, Any]],
+    request: Request,
+) -> Dict[str, Any]:
+    """Stream primary features up to the safety ceiling, run the join, page results.
+
+    Uses a match-bounded read strategy: the primary stream is not pre-capped at
+    ``offset+limit`` rows. Instead it is scanned up to ``MAX_PRIMARY_SCAN_ROWS``
+    rows. The executor is asked for ``limit+1`` matched features; if the
+    (limit+1)th match is found, a ``next`` link is emitted. When the ceiling
+    truncates the scan before ``limit+1`` matches are found, a ``next`` link is
+    still emitted so the client does not stop early on a sparse join.
+
+    A key=value WARNING is logged when the ceiling is hit so sparse-scan
+    truncation is observable in production logs.
+
+    Raises:
+        ValueError: forwarded from the primary driver when a CQL2 expression
+            references an unknown column; the caller maps this to HTTP 400.
+    """
+    paging = body.paging
+    assert paging is not None  # _resolve_paging always sets body.paging before we're called
+
+    query_request = _build_primary_query_request(
+        body.primary_filter, limit=MAX_PRIMARY_SCAN_ROWS,
+    )
+
+    # Count primary rows emitted so we can detect ceiling hits after the join.
+    primary_rows_scanned = 0
+
+    async def _counted_primary() -> AsyncGenerator[Feature, None]:
+        nonlocal primary_rows_scanned
+        inner = _stream_primary_features(
+            primary_driver,
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+            primary_column=body.join.primary_column,
+            limit=MAX_PRIMARY_SCAN_ROWS,
+            query_request=query_request,
+        )
+        try:
+            async for feat in inner:
+                primary_rows_scanned += 1
+                yield feat
+        finally:
+            await inner.aclose()
+
+    # Request limit+1 matched features so the (limit+1)th item acts as a peek
+    # for the `next` link decision.  PagingSpec.model_construct bypasses the
+    # le=10000 validator because this is an internal peek value; the page
+    # exposed to the client is trimmed to paging.limit below.
+    peek_paging = PagingSpec.model_construct(
+        limit=paging.limit + 1, offset=paging.offset,
+    )
+    run_join_body = body.model_copy(update={"paging": peek_paging})
+
+    joined = [
+        feat async for feat in run_join(
+            run_join_body,
+            primary_stream=_counted_primary(),
+            secondary_index=secondary_index,
+        )
+    ]
+
+    ceiling_hit = primary_rows_scanned >= MAX_PRIMARY_SCAN_ROWS
+    if ceiling_hit and len(joined) < paging.limit + 1:
+        logger.warning(
+            "join_scan_ceiling_hit primary_rows=%d matches=%d "
+            "catalog=%s collection=%s",
+            primary_rows_scanned, len(joined), catalog_id, collection_id,
+        )
+
+    # A (limit+1)th match in `joined` proves more matches follow.
+    # A ceiling hit without limit+1 matches means the scan was truncated;
+    # conservatively emit `next` so the client does not stop prematurely.
+    has_next = len(joined) > paging.limit or ceiling_hit
+    joined = joined[: paging.limit]
+
+    return _join_feature_collection(
+        joined, request=request, paging=paging, has_next=has_next,
+    )
 
 
 # Draft URIs — OGC API - Joins Part 1 0.0 (working draft).
@@ -326,17 +425,13 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
         stub remains until its own PR.
         """
         # Effective page: query params win over body, bounded to a sane page.
-        # run_join applies offset/limit to *matched* features while the primary
-        # read is bounded to offset+limit *rows*. This is correct for a dense
-        # join (≈1 match per primary row — the GAUL-style demo case). For a
-        # SPARSE inner join, offset+limit rows may yield fewer than `limit`
-        # matches, so a page past the first can under-fill and the `next` link
-        # be suppressed even though further matches exist below the read window.
-        # Correct sparse-join pagination (match-bounded read / feature-id
-        # cursor) is tracked as a follow-up; large/sparse exports should use the
-        # heavy `joins_export` job, which scans the full collection.
+        # The primary read is NOT pre-capped at offset+limit rows — that caused
+        # sparse inner joins to under-fill pages and suppress the `next` link
+        # prematurely. Instead, _execute_primary_join streams up to
+        # MAX_PRIMARY_SCAN_ROWS rows and asks the executor for limit+1 matched
+        # features so it can reliably decide whether a next page exists.
         body.paging = _resolve_paging(body, limit=limit, offset=offset)
-        read_limit = body.paging.offset + body.paging.limit
+
         if isinstance(body.secondary, BigQuerySecondarySpec):
             # Materialize secondary side via Phase 4a's BQ driver (inline target).
             secondary_index = await index_secondary(
@@ -358,31 +453,19 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
                         "Configure a ItemsRoutingConfig before /join."
                     ),
                 )
-            query_request = _build_primary_query_request(
-                body.primary_filter, limit=read_limit,
-            )
             try:
-                primary_stream = _stream_primary_features(
+                return await _execute_primary_join(
                     primary_driver,
                     catalog_id=catalog_id,
                     collection_id=collection_id,
-                    primary_column=body.join.primary_column,
-                    limit=read_limit,
-                    query_request=query_request,
+                    body=body,
+                    secondary_index=secondary_index,
+                    request=request,
                 )
-                joined = [
-                    feat async for feat in run_join(
-                        body, primary_stream=primary_stream,
-                        secondary_index=secondary_index,
-                    )
-                ]
             except ValueError as e:
                 raise HTTPException(
                     status_code=400, detail=f"Invalid primary_filter: {e}",
                 ) from e
-            return _join_feature_collection(
-                joined, request=request, paging=body.paging,
-            )
 
         if isinstance(body.secondary, NamedSecondarySpec):
             # Resolve secondary collection via the platform's driver registry.
@@ -420,31 +503,19 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
                         f"{catalog_id}/{collection_id}."
                     ),
                 )
-            query_request = _build_primary_query_request(
-                body.primary_filter, limit=read_limit,
-            )
             try:
-                primary_stream = _stream_primary_features(
+                return await _execute_primary_join(
                     primary_driver,
                     catalog_id=catalog_id,
                     collection_id=collection_id,
-                    primary_column=body.join.primary_column,
-                    limit=read_limit,
-                    query_request=query_request,
+                    body=body,
+                    secondary_index=secondary_index,
+                    request=request,
                 )
-                joined = [
-                    feat async for feat in run_join(
-                        body, primary_stream=primary_stream,
-                        secondary_index=secondary_index,
-                    )
-                ]
             except ValueError as e:
                 raise HTTPException(
                     status_code=400, detail=f"Invalid primary_filter: {e}",
                 ) from e
-            return _join_feature_collection(
-                joined, request=request, paging=body.paging,
-            )
 
         raise HTTPException(
             status_code=400,

@@ -36,7 +36,7 @@ key-extraction logic is not duplicated.
 
 from __future__ import annotations
 
-from typing import Any, AsyncIterator, Callable, Dict, Optional
+from typing import Any, AsyncGenerator, AsyncIterator, Callable, Dict, Optional
 
 from dynastore.models.ogc import Feature
 from dynastore.modules.joins.models import JoinRequest
@@ -88,7 +88,7 @@ def _merge_properties(
 async def run_join(
     request: JoinRequest,
     *,
-    primary_stream: AsyncIterator[Feature],
+    primary_stream: AsyncGenerator[Feature, None],
     secondary_index: Dict[Any, Dict[str, Any]],
 ) -> AsyncIterator[Feature]:
     """Execute the join.
@@ -119,45 +119,50 @@ async def run_join(
     yielded = 0
     skipped = 0
 
-    async for feat in primary_stream:
-        feat = normalize_feature_attributes(feat)
-        props = feat.properties or {}
-        # resolve_join_value handles the absent-vs-None distinction and the
-        # feature.id fallback in one place, replacing the inline if/else that
-        # was here before (#1835 unification).
-        key = resolve_join_value(feat, join_col, "properties")
-        if key is None:
-            continue
-        match = secondary_index.get(key)
-        
-        # LEFT JOIN: yield primary feature even without match
-        # INNER JOIN: skip feature if no match
-        if match is None and join_type == "INNER":
-            continue
+    try:
+        async for feat in primary_stream:
+            feat = normalize_feature_attributes(feat)
+            props = feat.properties or {}
+            # resolve_join_value handles the absent-vs-None distinction and the
+            # feature.id fallback in one place, replacing the inline if/else that
+            # was here before (#1835 unification).
+            key = resolve_join_value(feat, join_col, "properties")
+            if key is None:
+                continue
+            match = secondary_index.get(key)
 
-        if paging is not None and skipped < paging.offset:
-            skipped += 1
-            continue
+            # LEFT JOIN: yield primary feature even without match
+            # INNER JOIN: skip feature if no match
+            if match is None and join_type == "INNER":
+                continue
 
-        # For LEFT JOIN with no match, use empty dict for secondary properties
-        secondary_props: Optional[Dict[str, Any]] = match if match is not None else None
-        merged = _merge_properties(
-            primary_props=props,
-            secondary_props=secondary_props,
-            enrich=enrich,
-            join_col=join_col,
-            proj_attrs=proj.attributes,
-        )
+            if paging is not None and skipped < paging.offset:
+                skipped += 1
+                continue
 
-        yield Feature(
-            type="Feature",
-            id=feat.id,
-            geometry=feat.geometry if proj.with_geometry else None,
-            properties=merged,
-        )
-        yielded += 1
-        if paging is not None and yielded >= paging.limit:
-            return
+            # For LEFT JOIN with no match, use empty dict for secondary properties
+            secondary_props: Optional[Dict[str, Any]] = match if match is not None else None
+            merged = _merge_properties(
+                primary_props=props,
+                secondary_props=secondary_props,
+                enrich=enrich,
+                join_col=join_col,
+                proj_attrs=proj.attributes,
+            )
+
+            yield Feature(
+                type="Feature",
+                id=feat.id,
+                geometry=feat.geometry if proj.with_geometry else None,
+                properties=merged,
+            )
+            yielded += 1
+            if paging is not None and yielded >= paging.limit:
+                break
+    finally:
+        # Explicitly close the primary stream on early exit so any underlying
+        # asyncpg cursor or async resource is released before the caller returns.
+        await primary_stream.aclose()
 
 
 async def index_secondary(
