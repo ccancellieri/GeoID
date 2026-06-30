@@ -153,10 +153,11 @@ def _build_tenant_core_ddl_batch(schema: str) -> "DDLBatch":
 def _build_tenant_iam_ddl_batch(schema: str) -> "DDLBatch":
     """Build the per-tenant IAM DDL batch (``roles``, ``role_hierarchy``, ``grants``).
 
-    Sentinel: ``grants`` (newest of the per-scope IAM tables).  Any catalog
-    provisioned before IAM tables were introduced carries ``collection_configs``
-    but not ``grants``; running this batch on the next provision heals such
-    catalogs in a single self-contained round-trip without a full re-provision.
+    Sentinel: ALL three per-scope IAM tables must be present for the batch to
+    be skipped on warm start.  A catalog missing ANY one of them — for example
+    one provisioned before ``role_hierarchy`` was added to the schema — will
+    have the missing table(s) created on the next provision without requiring a
+    full re-provision (#2569 residual fix).
 
     Each step uses ``CREATE TABLE/INDEX IF NOT EXISTS`` so the batch is fully
     idempotent: re-running on a fully-provisioned catalog is a no-op.
@@ -175,15 +176,22 @@ def _build_tenant_iam_ddl_batch(schema: str) -> "DDLBatch":
         CREATE_GRANTS_TABLE,
     )
 
-    def _check_iam_sentinel(conn):
-        return check_table_exists(conn, "grants", schema)
+    # All three tables must exist for the warm-start skip to fire.
+    # Short-circuits on the first missing table (FK order: roles → role_hierarchy → grants).
+    _IAM_BATCH_TABLES = ("roles", "role_hierarchy", "grants")
+
+    async def _check_iam_sentinel(conn):
+        for tbl in _IAM_BATCH_TABLES:
+            if not await check_table_exists(conn, tbl, schema):
+                return False
+        return True
 
     return DDLBatch(
         # The sentinel SQL is never executed by DDLBatch — only its existence
-        # check is used.  A minimal stub avoids duplicating the full
-        # CREATE_GRANTS_TABLE template while keeping the intent legible.
+        # check is used.  A minimal stub avoids duplicating the full DDL
+        # templates while keeping the intent legible.
         sentinel=DDLQuery(
-            "SELECT 1 -- iam sentinel: grants table",
+            "SELECT 1 -- iam sentinel: all per-tenant IAM tables",
             check_query=_check_iam_sentinel,
         ),
         steps=[

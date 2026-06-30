@@ -28,6 +28,7 @@ import time
 from dynastore.modules.db_config.exceptions import TableNotFoundError
 from dynastore.modules.db_config.query_executor import (
     DDLBatch,
+    DDLQuery,
     DQLQuery,
     ResultHandler,
     DbResource,
@@ -186,11 +187,25 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
             sentinel = CREATE_USAGE_COUNTERS_TABLE
         else:
             platform_steps = []
-            # Tenant sentinel: `grants` is the newest of the per-scope
-            # tables; if it exists the whole batch can be skipped on warm
-            # DBs (mirrors the cold-cut rationale above, scoped to the
-            # tenant set).
-            sentinel = CREATE_GRANTS_TABLE
+            # Tenant sentinel: ALL four per-scope IAM tables must be present
+            # for the warm-start skip to fire.  A catalog missing any one of
+            # them — e.g. role_hierarchy added after the catalog was first
+            # provisioned — will have the missing table(s) created on the next
+            # provision without a full re-provision (#2569 residual fix).
+            from dynastore.modules.db_config.locking_tools import check_table_exists as _cte
+
+            _tenant_sentinel_tables = ("roles", "role_hierarchy", "grants", "policies")
+
+            async def _check_tenant_sentinel(conn):
+                for _tbl in _tenant_sentinel_tables:
+                    if not await _cte(conn, _tbl, schema):
+                        return False
+                return True
+
+            sentinel = DDLQuery(
+                "SELECT 1 -- iam tenant sentinel: all per-tenant IAM tables",
+                check_query=_check_tenant_sentinel,
+            )
 
         await DDLBatch(
             sentinel=sentinel,
