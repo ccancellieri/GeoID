@@ -705,7 +705,7 @@ async def _run_health_alert(conn: Any) -> int:
         SELECT COUNT(*) as cnt
         FROM {schema}.events
         WHERE status = 'PENDING'
-          AND timestamp < NOW() - INTERVAL '1 second' * :threshold
+          AND created_at < NOW() - INTERVAL '1 second' * :threshold
         """,
         result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
     ).execute(conn, threshold=pending_threshold)
