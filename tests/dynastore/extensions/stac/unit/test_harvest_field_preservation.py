@@ -292,3 +292,136 @@ def test_d3_generator_override_absent_when_no_stored_version():
     assert result["stac_version"] == pystac.get_stac_version(), (
         "without a stored version the local pystac constant must be emitted"
     )
+
+
+# ---------------------------------------------------------------------------
+# Round-trip: write → read for 3D bbox with Point geometry (#2242)
+# ---------------------------------------------------------------------------
+
+
+def _make_sidecar_and_ctx():
+    """Return (StacItemsSidecar, StacItemsSidecarConfig) for read-side tests."""
+    from dynastore.extensions.stac.stac_items_sidecar import StacItemsSidecar
+    from dynastore.extensions.stac.stac_metadata_config import StacItemsSidecarConfig
+
+    return StacItemsSidecar(config=StacItemsSidecarConfig())
+
+
+def _make_pipeline_ctx(consumer_stac: bool = True):
+    from dynastore.modules.storage.drivers.pg_sidecars.base import (
+        ConsumerType,
+        FeaturePipelineContext,
+    )
+
+    return FeaturePipelineContext(
+        lang="en",
+        consumer=ConsumerType.STAC if consumer_stac else ConsumerType.OGC_FEATURES,
+    )
+
+
+def test_3d_bbox_round_trip_write_then_read():
+    """Full write→read round-trip for a 3D bbox on a Point-geometry item.
+
+    The geometry sidecar always derives a 4-element bbox from the processed
+    geometry.  StacItemsSidecar must:
+    - (write) store the source 3D bbox in extra_fields (D2 fix, PR #2537)
+    - (read)  override feature.bbox with the stored 6-element list so the
+      geometry-derived 4-element bbox does not surface to the API caller.
+    """
+    import json
+    from geojson_pydantic import Feature
+
+    # ── Write side ─────────────────────────────────────────────────────────
+    source_item = {
+        "type": "Feature",
+        "id": "item-3d-point",
+        "stac_version": "1.0.0",
+        "geometry": {
+            "type": "Point",
+            "coordinates": [20.0, 30.0],  # centroid — geometry sidecar derives a degenerate bbox
+        },
+        "bbox": [10, 20, 0, 30, 40, 100],  # 3D source extent declared by producer
+        "properties": {"datetime": "2024-01-01T00:00:00Z"},
+        "assets": {},
+        "stac_extensions": [],
+        "collection": "test-col",
+        "links": [],
+    }
+    payload = _call_prepare_upsert(source_item)
+    ef_raw = payload.get("extra_fields")
+    ef = json.loads(ef_raw) if isinstance(ef_raw, str) else (ef_raw or {})
+
+    # (ii) extra_fields must contain the bbox key
+    assert "bbox" in ef, "write path must store the 3D bbox in extra_fields"
+    assert ef["bbox"] == [10, 20, 0, 30, 40, 100], (
+        f"stored bbox must match source 3D bbox; got {ef['bbox']}"
+    )
+
+    # ── Read side ──────────────────────────────────────────────────────────
+    # Simulate what the geometry sidecar produces: a 4-element degenerate bbox
+    # from the Point centroid coordinates.
+    geometry_derived_bbox = [20.0, 30.0, 20.0, 30.0]
+    feature = Feature(
+        type="Feature",
+        geometry={"type": "Point", "coordinates": [20.0, 30.0]},
+        properties={"datetime": "2024-01-01T00:00:00Z"},
+        bbox=geometry_derived_bbox,
+    )
+    assert list(feature.bbox) == geometry_derived_bbox  # sanity: geometry bbox is 4-element
+
+    # The DB row that map_row_to_feature receives carries extra_fields as
+    # "stac_extra_fields" (aliased in get_select_fields).
+    fake_row = {
+        "stac_extra_fields": ef_raw,  # the serialized payload just computed above
+        "external_extensions": None,
+        "external_assets": None,
+    }
+
+    sidecar = _make_sidecar_and_ctx()
+    ctx = _make_pipeline_ctx(consumer_stac=True)
+
+    # Invoke the read-path sidecar.
+    sidecar.map_row_to_feature(fake_row, feature, ctx)
+
+    # (i) After map_row_to_feature the feature.bbox must be the 6-element source bbox,
+    #     not the geometry-derived 4-element degenerate extent.
+    result_bbox = list(feature.bbox)
+    assert result_bbox == [10, 20, 0, 30, 40, 100], (
+        f"read path must restore 3D bbox from extra_fields; got {result_bbox}"
+    )
+
+
+def test_3d_bbox_read_side_skipped_for_ogc_features_consumer():
+    """OGC Features consumers must not receive STAC extra_fields (including bbox override).
+
+    The sidecar gates on ConsumerType: when the consumer is OGC_FEATURES
+    map_row_to_feature returns immediately, so feature.bbox stays as the
+    geometry-derived 4-element extent.
+    """
+    import json
+    from geojson_pydantic import Feature
+
+    geometry_derived_bbox = [20.0, 30.0, 20.0, 30.0]
+    feature = Feature(
+        type="Feature",
+        geometry={"type": "Point", "coordinates": [20.0, 30.0]},
+        properties={"datetime": "2024-01-01T00:00:00Z"},
+        bbox=geometry_derived_bbox,
+    )
+
+    stored_ef = json.dumps({"bbox": [10, 20, 0, 30, 40, 100]})
+    fake_row = {
+        "stac_extra_fields": stored_ef,
+        "external_extensions": None,
+        "external_assets": None,
+    }
+
+    sidecar = _make_sidecar_and_ctx()
+    ctx = _make_pipeline_ctx(consumer_stac=False)  # OGC_FEATURES
+
+    sidecar.map_row_to_feature(fake_row, feature, ctx)
+
+    # bbox must remain the geometry-derived 4-element one
+    assert list(feature.bbox) == geometry_derived_bbox, (
+        "OGC Features consumer must not receive the stored STAC bbox"
+    )
