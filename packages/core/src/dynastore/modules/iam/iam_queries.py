@@ -932,18 +932,16 @@ def build_search_principals_query(
 ):
     """Build a Principal search query.
 
-    The legacy `role` filter searched a JSONB column on `principals`
-    that no longer exists. Role-based search now joins the unified
-    grants table, projecting `subject_kind='principal' AND
-    object_kind='role'`:
+    ``schema`` governs which ``grants`` table the optional role filter
+    joins through (``iam.grants`` for platform scope, or a tenant
+    schema's ``grants`` for catalog-scoped role filtering).
 
-    - For schema == "iam" (or any schema with platform grants), we
-      filter through `iam.grants`.
-    - For a tenant schema, we filter through that schema's
-      `grants` table.
-
-    Mixing platform + catalog filtering in one search is a separate
-    concern; admin search is per-scope today.
+    Principals themselves always live in ``iam.principals`` — they are
+    platform-global and are never replicated into tenant schemas.  The
+    ``FROM`` clause is therefore hardcoded to ``iam.principals``
+    regardless of the ``schema`` argument, preventing the
+    ``42P01: relation "{tenant}.principals" does not exist`` error that
+    arises when a catalog ``schema`` is passed alongside a role filter.
     """
     clauses = []
     params: Dict[str, Any] = {"limit": limit, "offset": offset}
@@ -956,6 +954,7 @@ def build_search_principals_query(
 
     # Role filter via the unified grants table (replaces the dropped
     # JSONB column). Joins on subject_ref::text = principal_id.
+    # ``schema`` here is the grants scope; principals are always in ``iam``.
     join_clause = ""
     if role:
         params["role"] = role
@@ -970,7 +969,7 @@ def build_search_principals_query(
     where_clause = " AND ".join(clauses) if clauses else "1=1"
 
     sql = f"""
-        SELECT DISTINCT p.* FROM {schema}.principals p
+        SELECT DISTINCT p.* FROM iam.principals p
         {join_clause}
         WHERE {where_clause}
         ORDER BY p.created_at DESC
