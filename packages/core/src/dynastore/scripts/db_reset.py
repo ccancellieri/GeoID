@@ -157,6 +157,27 @@ CREATE INDEX IF NOT EXISTS ix_platform_configs_class_key
 """
 
 
+# Keep in sync with dynastore.modules.db_config.typed_store.ddl.LEADER_LEASE_DDL
+def _get_lease_ddl() -> str:
+    try:
+        from dynastore.modules.db_config.typed_store.ddl import LEADER_LEASE_DDL
+        return LEADER_LEASE_DDL
+    except ImportError:
+        pass
+    return """
+CREATE SCHEMA IF NOT EXISTS configs;
+CREATE TABLE IF NOT EXISTS configs.leader_lease (
+    lock_key    BIGINT      PRIMARY KEY,
+    lock_name   TEXT        NOT NULL,
+    owner       TEXT        NOT NULL,
+    epoch       BIGINT      NOT NULL DEFAULT 1,
+    acquired_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    renewed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at  TIMESTAMPTZ NOT NULL
+);
+"""
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _parse_url(url: str) -> dict:
@@ -185,10 +206,15 @@ def _log(msg: str) -> None:
 # ── Reset modes ────────────────────────────────────────────────────────────────
 
 async def _reset_configs(conn, dry_run: bool) -> None:
-    ddl = _get_platform_ddl()
-    stmts = ["DROP SCHEMA IF EXISTS configs CASCADE;"] + [
-        s.strip() + ";" for s in ddl.strip().split(";") if s.strip()
+    platform_ddl = _get_platform_ddl()
+    lease_ddl = _get_lease_ddl()
+    all_ddl_stmts = [
+        s.strip() + ";"
+        for ddl in (platform_ddl, lease_ddl)
+        for s in ddl.strip().split(";")
+        if s.strip()
     ]
+    stmts = ["DROP SCHEMA IF EXISTS configs CASCADE;"] + all_ddl_stmts
     if dry_run:
         _log("-- DRY RUN: configs schema statements --")
         for s in stmts:
@@ -197,10 +223,8 @@ async def _reset_configs(conn, dry_run: bool) -> None:
 
     await conn.execute("DROP SCHEMA IF EXISTS configs CASCADE;")
     _log("configs schema dropped OK")
-    for stmt in ddl.strip().split(";"):
-        stmt = stmt.strip()
-        if stmt:
-            await conn.execute(stmt + ";")
+    for stmt in all_ddl_stmts:
+        await conn.execute(stmt)
     _log("configs schema DDL recreated OK")
 
 

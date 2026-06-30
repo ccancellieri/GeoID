@@ -42,6 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from dynastore.modules.concurrency import get_background_executor
 from dynastore.modules.db_config.locking_tools import (
     pg_advisory_leadership,
+    lease_leadership,
     probe_lock_connection_liveness,
 )
 from dynastore.tools.async_utils import run_leader_loop
@@ -111,16 +112,22 @@ class ServiceContext:
         Host / service-instance name. Used in log messages and as a fallback
         component in advisory-lock key derivation.
     lock_connection:
-        For LEADER_ONLY services, the dedicated AUTOCOMMIT connection holding
-        the advisory lock. Services should use this connection for DB work
-        during the tick to avoid acquiring a second connection from the pool.
-        None for RUN_EVERYWHERE services or when not the leader.
+        For LEADER_ONLY services backed by the advisory election backend, the
+        dedicated AUTOCOMMIT connection holding the session advisory lock.
+        Services may reuse this connection for DB work during the tick.
+        ``None`` for RUN_EVERYWHERE services, when not the leader, or when
+        the lease-table backend is active (``election_backend="lease"`` in
+        ``LeadershipConfig``).  Services that need a DB connection and may
+        receive ``None`` here should fall back to acquiring one via
+        ``ctx.engine``.
 
-        IMPORTANT: This is an AUTOCOMMIT connection (isolation_level='AUTOCOMMIT').
-        When passing to :func:`~dynastore.modules.db_config.query_executor.managed_transaction`,
+        IMPORTANT: When non-None, this is an AUTOCOMMIT connection
+        (isolation_level='AUTOCOMMIT').  When passing to
+        :func:`~dynastore.modules.db_config.query_executor.managed_transaction`,
         the function automatically detects AUTOCOMMIT mode and uses ``begin()``
-        instead of ``begin_nested()``. Do NOT attempt to create nested transactions
-        manually on this connection - it will raise ``NoActiveSQLTransactionError``.
+        instead of ``begin_nested()``. Do NOT attempt to create nested
+        transactions manually on this connection — it will raise
+        ``NoActiveSQLTransactionError``.
     """
 
     engine: Any
@@ -358,11 +365,18 @@ class BackgroundSupervisor:
         )
 
         def acquire():
-            # pg_advisory_leadership is an async context manager yielding
-            # (is_leader, lock_connection). It opens its own dedicated
-            # AUTOCOMMIT connection so the session-level lock is never leaked
-            # back into the pool. The lock_connection can be reused by the
-            # leader for DB work during the tick.
+            # Select the election backend from live config.
+            # "lease"    → lease_leadership: transaction-mode-pooler safe,
+            #              CAS on configs.leader_lease, no pinned connection.
+            # "advisory" → pg_advisory_leadership: session advisory lock on a
+            #              dedicated AUTOCOMMIT connection (kept one release
+            #              for rollback; not compatible with transaction-mode
+            #              pooling).
+            from dynastore.modules.db_config.connection_health_config import (
+                _leadership_config,
+            )
+            if _leadership_config.election_backend == "lease":
+                return lease_leadership(ctx.engine, key, name=service.name)
             return pg_advisory_leadership(ctx.engine, key, name=service.name)
 
         # One probe closure shared by both run_leader_loop call sites below.
@@ -399,6 +413,8 @@ class BackgroundSupervisor:
 
         if isinstance(service, PeriodicService):
             periodic = service
+            # One-time visibility flag for the lease-TTL tick clamp below.
+            _clamp_logged = {"done": False}
 
             async def on_leader_tick(lock_conn: Any) -> None:
                 # One unit of work per election; the connection is released as
@@ -415,7 +431,40 @@ class BackgroundSupervisor:
                     name=ctx.name,
                     lock_connection=lock_conn,
                 )
-                await periodic.tick(leader_ctx)
+                # Under the lease backend the lease is acquired with a TTL at
+                # tick start and NOT renewed during the tick. A tick that runs
+                # longer than the TTL would lose its lease mid-flight, opening a
+                # two-leader window. Cap the tick at lease_ttl - skew_margin so
+                # it can never outlive its lease; overlap is bounded to the skew
+                # margin regardless of the service's cadence / tick_timeout. Read
+                # the LIVE config here (not at registration) so the cap tracks
+                # hot-reloaded values. Services needing a longer tenure must use
+                # the renewal-heartbeat regime, not a longer cadence.
+                from dynastore.modules.db_config.connection_health_config import (
+                    _leadership_config,
+                )
+                cfg = _leadership_config
+                if cfg.election_backend != "lease":
+                    await periodic.tick(leader_ctx)
+                    return
+                configured = (
+                    periodic.tick_timeout
+                    if periodic.tick_timeout is not None
+                    else periodic.cadence_seconds
+                )
+                cap = cfg.lease_ttl_seconds - cfg.lease_skew_margin_seconds
+                # configured may be 0 (service disabled its timeout); the lease
+                # backend still must bound the tick, so fall back to the cap.
+                effective = min(configured, cap) if configured and configured > 0 else cap
+                if configured and configured > cap and not _clamp_logged["done"]:
+                    _clamp_logged["done"] = True
+                    logger.info(
+                        "%s: tick clamped to %.1fs (lease_ttl %.1fs - skew %.1fs) "
+                        "below configured %.1fs to keep the tick within its lease.",
+                        service.name, effective, cfg.lease_ttl_seconds,
+                        cfg.lease_skew_margin_seconds, configured,
+                    )
+                await asyncio.wait_for(periodic.tick(leader_ctx), timeout=effective)
 
             return run_leader_loop(
                 acquire_leadership=acquire,

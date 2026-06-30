@@ -22,13 +22,16 @@ import functools
 import time
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
-from typing import Any, Optional, Callable, Awaitable, ClassVar, TypeVar, Dict, AsyncGenerator, Iterator, Set, Tuple, Union, cast
+from typing import Any, Optional, Callable, Awaitable, ClassVar, TypeVar, Dict, AsyncGenerator, Iterator, Set, Tuple, Union, cast, TYPE_CHECKING
+from uuid import uuid4
 
 from dynastore.modules.db_config.connection_health_config import (
     resolve_connection_retry_config,
     resolve_leadership_config,
+    _leadership_config,
 )
 from dynastore.modules.db_config.exceptions import DatabaseConnectionError
+from dynastore.modules.db_config.instance import get_service_name
 from sqlalchemy import text, Engine
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from dynastore.modules.tasks.durable.locks import stable_lock_id_sha256 as _stable_lock_id_sha256
@@ -40,7 +43,62 @@ from dynastore.modules.db_config.query_executor import (
     ResultHandler,
     managed_transaction,
     sync_managed_transaction,
+    retry_on_transient_connect,
 )
+
+if TYPE_CHECKING:
+    # Imported lazily at runtime (see _get_lease_breaker): the storage package
+    # __init__ pulls in db_config back-references, so a top-level import here
+    # would create a circular import during module initialisation.
+    from dynastore.modules.storage.circuit_breaker import CircuitBreaker
+
+# Stable per-process identity for the leader_lease table.  Minted once at
+# import time so every acquire/renew within this process uses the same owner
+# string, while different pods always produce different strings (uuid4 suffix).
+_LEASE_OWNER: str = f"{get_service_name() or 'unknown'}:{uuid4().hex}"
+
+# CAS upsert for lease-table leader election.  Returns the winning row
+# (owner, epoch) when this process acquires or renews the lease; returns zero
+# rows when a live foreign owner holds the lease (the WHERE clause filters that
+# case out, so the ON CONFLICT DO UPDATE never fires).
+_LEASE_CAS_SQL = """\
+INSERT INTO configs.leader_lease
+       (lock_key, lock_name, owner, epoch, acquired_at, renewed_at, expires_at)
+VALUES (:lock_key, :name, :owner, 1, now(), now(), now() + make_interval(secs => :ttl))
+ON CONFLICT (lock_key) DO UPDATE
+   SET owner       = EXCLUDED.owner,
+       renewed_at  = now(),
+       expires_at  = now() + make_interval(secs => :ttl),
+       epoch       = CASE WHEN leader_lease.owner = EXCLUDED.owner
+                          THEN leader_lease.epoch ELSE leader_lease.epoch + 1 END,
+       acquired_at = CASE WHEN leader_lease.owner = EXCLUDED.owner
+                          THEN leader_lease.acquired_at ELSE now() END
+ WHERE leader_lease.expires_at < now()
+    OR leader_lease.owner = EXCLUDED.owner
+RETURNING owner, epoch\
+"""
+
+# Shared circuit breaker for the lease-election CAS. A SINGLE breaker (not
+# per-lock) is correct: a failing leadership CAS is a DB-wide signal, so once
+# tripped we stop hammering the database for every leader-elected service.
+# Threshold/cooldown are the CircuitBreaker defaults (5 consecutive failures,
+# 30 s cooldown) stated explicitly for self-documentation. is_open() advances
+# OPEN -> HALF_OPEN after cooldown so the next tick probes for recovery.
+#
+# Constructed lazily on first use: CircuitBreaker lives under the storage
+# package whose __init__ back-references db_config, so a module-level
+# construction here would form a circular import.
+_LEASE_BREAKER: Optional["CircuitBreaker"] = None
+_LEASE_BREAKER_KEY = "leader_lease"
+
+
+def _get_lease_breaker() -> "CircuitBreaker":
+    """Return the process-wide lease circuit breaker, building it on first use."""
+    global _LEASE_BREAKER
+    if _LEASE_BREAKER is None:
+        from dynastore.modules.storage.circuit_breaker import CircuitBreaker
+        _LEASE_BREAKER = CircuitBreaker(failure_threshold=5, cooldown_seconds=30.0)
+    return _LEASE_BREAKER
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +147,43 @@ def _get_probe_service_name() -> str:
     except Exception:
         pass
     return os.getenv("SERVICE_NAME") or "unknown"
+
+
+def _lease_breaker_record_success(lock_name: str) -> None:
+    """Record a healthy CAS round-trip and log the breaker's recovery once.
+
+    The breaker logs its own human-readable transitions; here we additionally
+    emit a structured ``key=value`` line (matching the ``db_pool_acquire``
+    idiom) only when the breaker actually closes, so log scrapers see a single
+    recovery event rather than per-tick churn.
+    """
+    breaker = _get_lease_breaker()
+    was_tripped = breaker.state_of(_LEASE_BREAKER_KEY) != "CLOSED"
+    breaker.record_success(_LEASE_BREAKER_KEY)
+    if was_tripped and breaker.state_of(_LEASE_BREAKER_KEY) == "CLOSED":
+        logger.info(
+            "leader_lease_breaker_closed service=%s lock_name=%s",
+            _get_probe_service_name(),
+            lock_name,
+        )
+
+
+def _lease_breaker_record_failure(lock_name: str) -> None:
+    """Record a CAS failure and log once when it trips the breaker to OPEN.
+
+    Only the CLOSED/HALF_OPEN -> OPEN transition is logged (structured
+    ``key=value``); subsequent failures while already OPEN are silent to avoid
+    per-tick churn.
+    """
+    breaker = _get_lease_breaker()
+    was_open = breaker.state_of(_LEASE_BREAKER_KEY) == "OPEN"
+    breaker.record_failure(_LEASE_BREAKER_KEY)
+    if not was_open and breaker.state_of(_LEASE_BREAKER_KEY) == "OPEN":
+        logger.warning(
+            "leader_lease_breaker_open service=%s lock_name=%s",
+            _get_probe_service_name(),
+            lock_name,
+        )
 
 
 async def probe_lock_connection_liveness(
@@ -386,6 +481,142 @@ async def pg_advisory_leadership(
             await conn_ctx.__aexit__(None, None, None)
         except Exception:
             pass
+
+
+@asynccontextmanager
+async def lease_leadership(
+    engine: Optional[DbResource],
+    key: Union[int, str],
+    *,
+    name: str = "leader",
+) -> AsyncGenerator[Tuple[bool, Optional[AsyncConnection]], None]:
+    """Non-blocking leadership election via a lease table CAS.
+
+    Drop-in replacement for :func:`pg_advisory_leadership` that works under
+    transaction-mode connection pooling (AlloyDB, PgBouncer transaction mode).
+    Each call is a single INSERT … ON CONFLICT statement inside
+    :func:`managed_transaction` — the connection is returned to the pool on
+    COMMIT, so no connection pinning occurs.
+
+    Yields ``(is_leader, None)``.  The second element is always ``None``
+    because lease election does not hold a dedicated connection between
+    yield and release.  Callers that need a DB connection for their tick
+    work must acquire one from the pool via :func:`get_engine`.
+
+    The lock identity is the same ``_get_stable_lock_id`` derivation used by
+    :func:`pg_advisory_leadership`, so a cluster can migrate backends without
+    key drift: ``key`` may be a 64-bit int (used as-is) or a string (folded
+    via sha256).
+
+    Design invariants:
+
+    * Exactly ONE ``yield`` per code path — failures before the yield
+      degrade to ``yield (False, None)``; a second yield would make
+      ``contextlib`` raise ``RuntimeError: generator didn't stop``.
+    * On WIN the lock_id is registered in ``_held_advisory_locks`` so
+      :func:`held_advisory_locks` and the DB contention monitor keep
+      reporting.  The entry is removed in ``finally``.
+    * On WIN the ``finally`` block issues a best-effort expire UPDATE to
+      release early; errors are swallowed because the lease expires
+      naturally.
+    * Per-tick model: this CM is entered/exited per tick by
+      :class:`~dynastore.tools.background_service.BackgroundSupervisor`.
+      No separate renewal task is needed.
+    * Resilience: a circuit breaker short-circuits the CAS while the DB is
+      down (decline immediately rather than hammer it); a modest transient
+      retry covers a single backend drop mid-statement. Both reuse existing
+      primitives (:class:`CircuitBreaker`, :func:`retry_on_transient_connect`).
+    """
+    if not isinstance(engine, AsyncEngine):
+        logger.warning(
+            "%s: leadership requires AsyncEngine (got %s); not a leader.",
+            name,
+            type(engine).__name__ if engine is not None else "None",
+        )
+        yield (False, None)
+        return
+    lock_id = key if isinstance(key, int) else _get_stable_lock_id(key)
+    ttl = _leadership_config.lease_ttl_seconds
+
+    # Circuit breaker: when OPEN the CAS has failed repeatedly, so decline this
+    # tick without touching the DB rather than hammering a database that is
+    # down. is_open() advances OPEN -> HALF_OPEN once the cooldown elapses, so
+    # the next tick is let through as a recovery probe.
+    if _get_lease_breaker().is_open(_LEASE_BREAKER_KEY):
+        yield (False, None)
+        return
+
+    # The CAS runs at CM entry, NOT under the caller's tick_timeout, so retry a
+    # transient backend drop (08003 under a transaction-mode pooler) here on a
+    # fresh connection instead of silently skipping a maintenance tick. Budget
+    # is deliberately MODEST (max_retries=3 -> ~0.5/1/2s, ≈3.5s worst case): it
+    # MUST stay well under lease_ttl_seconds, otherwise a struggling DB would
+    # delay every pod's election by the full default ~15s budget each tick.
+    @retry_on_transient_connect(max_retries=3)
+    async def _run_cas() -> Any:
+        async with managed_transaction(engine) as _conn:
+            aconn = cast(AsyncConnection, _conn)
+            result = await aconn.execute(
+                text(_LEASE_CAS_SQL),
+                {"lock_key": lock_id, "name": name, "owner": _LEASE_OWNER, "ttl": ttl},
+            )
+            return result.fetchone()
+
+    try:
+        row = await _run_cas()
+    except Exception as exc:
+        # Retry budget exhausted: trip the breaker (logged once on transition)
+        # and decline. Fail-safe — a failed election never crashes the loop.
+        logger.warning(
+            "%s: lease acquire failed (%s); not a leader.", name, exc
+        )
+        _lease_breaker_record_failure(name)
+        yield (False, None)
+        return
+    # The CAS round-tripped (1 row = win, 0 rows = a live foreign owner); either
+    # way the DB is healthy, so reset the breaker.
+    _lease_breaker_record_success(name)
+    # RETURNING yields a row iff our CAS WHERE matched (insert, takeover of an
+    # expired lease, or renew of our own), and the upsert sets owner to ours —
+    # so a non-None row always means we own the lease. Zero rows = a live
+    # foreign owner blocked the update.
+    won = row is not None
+    if not won:
+        yield (False, None)
+        return
+    acquired_at = time.monotonic()
+    _held_advisory_locks[lock_id] = (name, acquired_at)
+    logger.info(
+        "%s: lease leadership acquired (key=%s, advisory_locks_held_now=%d).",
+        name,
+        key,
+        len(_held_advisory_locks),
+    )
+    try:
+        yield (True, None)
+    finally:
+        _held_advisory_locks.pop(lock_id, None)
+        logger.info(
+            "%s: lease leadership released (key=%s, held=%.1fs, "
+            "advisory_locks_held_now=%d).",
+            name,
+            key,
+            time.monotonic() - acquired_at,
+            len(_held_advisory_locks),
+        )
+        try:
+            async with managed_transaction(engine) as _rconn:
+                arconn = cast(AsyncConnection, _rconn)
+                await arconn.execute(
+                    text(
+                        "UPDATE configs.leader_lease"
+                        " SET expires_at = now()"
+                        " WHERE lock_key = :lock_key AND owner = :owner"
+                    ),
+                    {"lock_key": lock_id, "owner": _LEASE_OWNER},
+                )
+        except Exception:
+            pass  # best-effort; lease expires naturally via expires_at
 
 
 @contextmanager

@@ -64,6 +64,7 @@ from dynastore.modules.db_config.query_executor import (
 from dynastore.modules.db_config.typed_store.ddl import (
     PLATFORM_SCHEMAS_DDL,
     TASK_CAPABILITY_REGISTRY_DDL,
+    LEADER_LEASE_DDL,
 )
 from dynastore.modules.db_config.typed_store import config_queries as _cq
 from dynastore.tools.plugin import ProtocolPlugin
@@ -631,6 +632,7 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
             await ensure_schema_exists(conn, "configs")
             await DDLQuery(PLATFORM_SCHEMAS_DDL).execute(conn)
             await DDLQuery(TASK_CAPABILITY_REGISTRY_DDL).execute(conn)
+            await DDLQuery(LEADER_LEASE_DDL).execute(conn)
             logger.info("Platform Config Storage initialized successfully.")
         except Exception as e:
             logger.error(

@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from typing import Any, Optional, Union
-from unittest.mock import MagicMock, patch, AsyncMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -191,6 +191,9 @@ async def test_leader_only_wraps_in_leader_loop_is_leader() -> None:
 
     with patch(
         "dynastore.tools.background_service.pg_advisory_leadership",
+        side_effect=lambda *a, **kw: _fake_leader_acquirer(),
+    ), patch(
+        "dynastore.tools.background_service.lease_leadership",
         side_effect=lambda *a, **kw: _fake_leader_acquirer(),
     ):
         supervisor.start(ctx)
@@ -541,6 +544,9 @@ async def test_leader_tick_timeout_releases_lock() -> None:
 
     with patch(
         "dynastore.tools.background_service.pg_advisory_leadership",
+        side_effect=lambda *a, **kw: _fake_leader_acquirer_with_tracking(),
+    ), patch(
+        "dynastore.tools.background_service.lease_leadership",
         side_effect=lambda *a, **kw: _fake_leader_acquirer_with_tracking(),
     ):
         with patch(

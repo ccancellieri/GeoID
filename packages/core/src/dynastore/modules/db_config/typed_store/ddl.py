@@ -102,6 +102,26 @@ CREATE INDEX IF NOT EXISTS task_capability_registry_mandatory_idx
 """
 
 
+# Leader-lease table for transaction-mode-pooler-safe leader election.
+# Must live in the configs schema alongside platform_configs.  Created
+# idempotently at startup inside initialize_storage; never ALTER-ed in place.
+# The leading CREATE SCHEMA IF NOT EXISTS makes the DDL self-contained so it
+# survives a multi-worker cold-start race where the schema-create step is
+# skipped (same reasoning as TASK_CAPABILITY_REGISTRY_DDL above).
+LEADER_LEASE_DDL = """
+CREATE SCHEMA IF NOT EXISTS configs;
+CREATE TABLE IF NOT EXISTS configs.leader_lease (
+    lock_key    BIGINT      PRIMARY KEY,
+    lock_name   TEXT        NOT NULL,
+    owner       TEXT        NOT NULL,
+    epoch       BIGINT      NOT NULL DEFAULT 1,
+    acquired_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    renewed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at  TIMESTAMPTZ NOT NULL
+);
+"""
+
+
 def tenant_configs_ddl(tenant_schema: str) -> str:
     """Return idempotent DDL for the two per-tenant typed-config tables.
 
