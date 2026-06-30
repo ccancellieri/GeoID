@@ -18,6 +18,7 @@
 
 # dynastore/modules/tasks/tasks_module.py
 
+import asyncio
 import base64
 import json
 import logging
@@ -35,6 +36,7 @@ from dynastore.modules.db_config.query_executor import (
     DQLQuery,
     managed_transaction,
     background_managed_transaction,
+    retry_on_transient_connect,
     ResultHandler,
     DbResource,
     run_in_event_loop,
@@ -1004,6 +1006,19 @@ async def _redispatch_stuck_rows(
         logger.debug("stuck-pending redispatch: pg_notify failed: %s", exc)
 
 
+class _BackgroundSlotBusy(Exception):
+    """Fast-skip signal: the background DB-slot semaphore was saturated.
+
+    ``background_managed_transaction`` caps its semaphore wait at ~2s and raises
+    ``asyncio.TimeoutError`` so a maintenance pass skips rather than blocking.
+    But ``asyncio.TimeoutError`` is in ``_TRANSIENT_CONNECT_EXCEPTIONS``, so a
+    bare ``retry_on_transient_connect`` would retry the busy-skip 5× (~25s, 5
+    warnings) and amplify pool pressure. Callers convert that timeout to this
+    non-transient sentinel so only a real mid-query backend drop (08003) retries;
+    the busy-skip propagates once and is logged at debug.
+    """
+
+
 class StuckPendingWarnerService(PeriodicService):
     """Periodic read-only scan for stuck PENDING tasks (retry_count=0).
 
@@ -1050,17 +1065,31 @@ class StuckPendingWarnerService(PeriodicService):
         )
 
     async def tick(self, ctx: ServiceContext) -> None:
+        # Retry the read on a fresh connection when a transaction-mode pooler
+        # tears down the backend mid-checkout (08003). Only the DB scan is
+        # retried; the downstream emit/redispatch side-effects run once.
+        @retry_on_transient_connect()
+        async def _scan():
+            try:
+                async with background_managed_transaction(ctx.engine) as conn:
+                    return await self._query.execute(
+                        conn,
+                        min_age_s=self._min_age_s,
+                        sample_limit=self._sample_limit,
+                    )
+            except asyncio.TimeoutError as exc:
+                # Background-slot saturation, not a connection drop: skip this
+                # pass instead of retrying it. See _BackgroundSlotBusy.
+                raise _BackgroundSlotBusy from exc
+
         try:
-            async with background_managed_transaction(ctx.engine) as conn:
-                rows = await self._query.execute(
-                    conn,
-                    min_age_s=self._min_age_s,
-                    sample_limit=self._sample_limit,
-                )
+            rows = await _scan()
             rows = rows or []
             await _emit_stuck_pending_logs(rows)
             if rows:
                 await _redispatch_stuck_rows(ctx.engine, rows)
+        except _BackgroundSlotBusy:
+            logger.debug("stuck-pending warner: skipped pass, background DB slots busy")
         except Exception as exc:  # noqa: BLE001 — never crash on diagnostic
             logger.warning("stuck-pending warner: scan failed: %s", exc)
 
@@ -1181,6 +1210,7 @@ async def _run_mandatory_backstop_pass(
     Fail-open: any error is logged and swallowed."""
     from dynastore.modules.db_config.query_executor import (
         DQLQuery, ResultHandler, background_managed_transaction,
+        retry_on_transient_connect,
     )
     from dynastore.modules.tasks.dispatcher import (
         _stable_advisory_lock_key, sweep_unclaimable_rows,
@@ -1189,23 +1219,40 @@ async def _run_mandatory_backstop_pass(
     from dynastore.modules.tasks.mandatory import check_mandatory_ownership
 
     lock_key = _stable_advisory_lock_key("dynastore.mandatory.backstop")
+
+    # The whole locked pass is idempotent (a backstop sweep), so on a
+    # transaction-mode pooler tearing down the backend mid-pass (08003) we
+    # re-run it on a fresh connection rather than waiting a full tick. The
+    # advisory xact lock is re-acquired each attempt; a non-transient error
+    # falls through to the warning below after the retry budget is spent.
+    @retry_on_transient_connect()
+    async def _locked_pass() -> None:
+        try:
+            async with background_managed_transaction(engine) as conn:
+                got = await DQLQuery(
+                    "SELECT pg_try_advisory_xact_lock(:k) AS got",
+                    result_handler=ResultHandler.ONE_DICT,
+                ).execute(conn, k=lock_key)
+                if not got or not got.get("got"):
+                    return  # another pod owns this pass; advisory xact lock held until txn end
+                # All three sub-calls receive the locked connection so the whole pass
+                # runs on one pool slot instead of opening three additional connections.
+                await check_mandatory_ownership(engine, ttl_grace_seconds=ttl_grace_seconds, conn=conn)
+                await sweep_unclaimable_rows(
+                    engine, schema, ttl_grace_seconds=ttl_grace_seconds, min_age_s=min_age_s, conn=conn,
+                )
+                await auto_requeue_recovered_mandatory(
+                    engine, ttl_grace_seconds=ttl_grace_seconds, conn=conn,
+                )
+        except asyncio.TimeoutError as exc:
+            # Background-slot saturation, not a connection drop: skip this pass
+            # instead of retrying it. See _BackgroundSlotBusy.
+            raise _BackgroundSlotBusy from exc
+
     try:
-        async with background_managed_transaction(engine) as conn:
-            got = await DQLQuery(
-                "SELECT pg_try_advisory_xact_lock(:k) AS got",
-                result_handler=ResultHandler.ONE_DICT,
-            ).execute(conn, k=lock_key)
-            if not got or not got.get("got"):
-                return  # another pod owns this pass; advisory xact lock held until txn end
-            # All three sub-calls receive the locked connection so the whole pass
-            # runs on one pool slot instead of opening three additional connections.
-            await check_mandatory_ownership(engine, ttl_grace_seconds=ttl_grace_seconds, conn=conn)
-            await sweep_unclaimable_rows(
-                engine, schema, ttl_grace_seconds=ttl_grace_seconds, min_age_s=min_age_s, conn=conn,
-            )
-            await auto_requeue_recovered_mandatory(
-                engine, ttl_grace_seconds=ttl_grace_seconds, conn=conn,
-            )
+        await _locked_pass()
+    except _BackgroundSlotBusy:
+        logger.debug("proactive_sweep: mandatory backstop skipped, background DB slots busy")
     except Exception as exc:  # noqa: BLE001 — never crash the sweep loop
         logger.warning("proactive_sweep: mandatory backstop pass failed: %s", exc)
 

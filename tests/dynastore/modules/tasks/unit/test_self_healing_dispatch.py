@@ -202,7 +202,7 @@ async def test_warn_tick_still_emits_warning_for_stuck_rows(caplog):
 
     caplog.set_level(logging.WARNING)
     with patch("dynastore.modules.tasks.tasks_module.DQLQuery", return_value=fake_query), \
-         patch("dynastore.modules.tasks.tasks_module.managed_transaction", _fake_managed_transaction), \
+         patch("dynastore.modules.tasks.tasks_module.background_managed_transaction", _fake_managed_transaction), \
          patch("dynastore.modules.tasks.tasks_module._redispatch_stuck_rows", fake_redispatch), \
          patch("dynastore.tasks.get_task_instance", return_value=None), \
          patch(

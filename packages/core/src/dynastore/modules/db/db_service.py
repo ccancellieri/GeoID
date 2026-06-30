@@ -21,6 +21,7 @@ import os
 import socket
 from contextlib import asynccontextmanager
 from typing import Optional, Any, Protocol, runtime_checkable
+from uuid import uuid4
 
 # Hard-import the async PG driver at module load.  When SCOPE excludes
 # ``module_db`` (e.g. Cloud Run jobs that use ``db_sync`` + DatastoreModule
@@ -225,6 +226,31 @@ class DBService(ModuleProtocol, DatabaseProtocol):
                     pool_recycle=db_config.pool_recycle,
                     connect_args={
                         "timeout": db_config.connect_timeout,
+                        # Transaction-mode connection poolers (AlloyDB Managed
+                        # Connection Pooling / PgBouncer) multiplex one server
+                        # backend across many client sessions, so a prepared
+                        # statement cached against one backend may be absent —
+                        # or its numeric name already taken — on the next one
+                        # the pooler hands out. Disabling the driver's prepared
+                        # statement cache and giving every prepared statement a
+                        # unique name makes the asyncpg engine safe behind such
+                        # a pooler. It also avoids InvalidCachedStatementError
+                        # when ANOTHER instance emits DDL against shared objects
+                        # (per-catalog schema provisioning, CREATE EXTENSION) and
+                        # invalidates a cached statement's OIDs fleet-wide. See
+                        # SQLAlchemy asyncpg dialect "Prepared Statement Name
+                        # with PGBouncer" + asyncpg #837 / sqlalchemy #6467.
+                        # Deployment invariant: because each query now PREPAREs a
+                        # uniquely-named statement and never DEALLOCATEs it, the
+                        # pooler in front of us must reset the backend on release
+                        # (AlloyDB Managed Connection Pooling and PgBouncer both
+                        # run DISCARD ALL by default). Do NOT set server_reset_query
+                        # empty, or orphaned prepared statements accumulate per
+                        # backend for the life of the SQLAlchemy pool.
+                        "prepared_statement_cache_size": 0,
+                        "prepared_statement_name_func": (
+                            lambda: f"__asyncpg_{uuid4()}__"
+                        ),
                         # asyncpg has no libpq client-side keepalive params;
                         # the equivalent server-side GUCs must be passed as
                         # strings via server_settings so Cloud NAT never
