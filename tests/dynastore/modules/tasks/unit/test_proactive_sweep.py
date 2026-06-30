@@ -224,7 +224,7 @@ async def test_distinct_query_filters_pending_retry_zero_with_min_age():
     with patch(
         "dynastore.modules.tasks.tasks_module.DQLQuery", _FakeQuery,
     ), patch(
-        "dynastore.modules.tasks.tasks_module.managed_transaction",
+        "dynastore.modules.tasks.tasks_module.background_managed_transaction",
         return_value=_FakeTxn(),
     ):
         out = await _distinct_pending_capability_ids(

@@ -197,7 +197,7 @@ async def test_run_once_dispatches_due_jobs_only():
             return_value=repo_mock,
         ),
         patch(
-            "dynastore.modules.catalog.maintenance_supervisor.managed_transaction",
+            "dynastore.modules.catalog.maintenance_supervisor.background_managed_transaction",
         ) as mock_mtx,
         patch(
             "dynastore.modules.catalog.maintenance_supervisor._dispatch_job",
@@ -242,7 +242,7 @@ async def test_run_once_no_due_jobs_does_nothing():
             return_value=repo_mock,
         ),
         patch(
-            "dynastore.modules.catalog.maintenance_supervisor.managed_transaction",
+            "dynastore.modules.catalog.maintenance_supervisor.background_managed_transaction",
         ) as mock_mtx,
         patch(
             "dynastore.modules.catalog.maintenance_supervisor._dispatch_job",
@@ -305,7 +305,7 @@ async def test_run_once_failing_job_marks_error_others_still_run():
             return_value=repo_mock,
         ),
         patch(
-            "dynastore.modules.catalog.maintenance_supervisor.managed_transaction",
+            "dynastore.modules.catalog.maintenance_supervisor.background_managed_transaction",
         ) as mock_mtx,
         patch(
             "dynastore.modules.catalog.maintenance_supervisor._dispatch_job",
@@ -358,7 +358,7 @@ async def test_run_job_calls_mark_running_before_dispatch():
 
     with (
         patch(
-            "dynastore.modules.catalog.maintenance_supervisor.managed_transaction",
+            "dynastore.modules.catalog.maintenance_supervisor.background_managed_transaction",
         ) as mock_mtx,
         patch(
             "dynastore.modules.catalog.maintenance_supervisor._dispatch_job",
@@ -396,7 +396,7 @@ async def test_run_job_mark_done_receives_status_ok_and_rows():
 
     with (
         patch(
-            "dynastore.modules.catalog.maintenance_supervisor.managed_transaction",
+            "dynastore.modules.catalog.maintenance_supervisor.background_managed_transaction",
         ) as mock_mtx,
         patch(
             "dynastore.modules.catalog.maintenance_supervisor._dispatch_job",
@@ -752,7 +752,7 @@ async def test_run_job_skips_when_mark_running_returns_zero_rows(caplog):
 
     with (
         patch(
-            "dynastore.modules.catalog.maintenance_supervisor.managed_transaction",
+            "dynastore.modules.catalog.maintenance_supervisor.background_managed_transaction",
         ) as mock_mtx,
         patch(
             "dynastore.modules.catalog.maintenance_supervisor._dispatch_job",
@@ -835,7 +835,7 @@ async def test_dispatch_job_raises_timeout_on_slow_job():
 
     with (
         patch(
-            "dynastore.modules.catalog.maintenance_supervisor.managed_transaction",
+            "dynastore.modules.catalog.maintenance_supervisor.background_managed_transaction",
         ) as mock_mtx,
         patch(
             "dynastore.modules.catalog.maintenance_supervisor._dispatch_job",

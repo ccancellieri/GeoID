@@ -32,6 +32,8 @@ from contextlib import asynccontextmanager, contextmanager
 
 from dynastore.modules.db_config.connection_health_config import (
     resolve_connection_retry_config,
+    resolve_foreground_pool_acquire_timeout,
+    resolve_max_background_db_concurrency,
     resolve_max_concurrent_connection_retries,
     resolve_pool_hygiene_reacquire_attempts,
     resolve_provisioning_retry_config,
@@ -1538,6 +1540,140 @@ async def _read_live_pool_hygiene_reacquire_attempts() -> int:
     except Exception:
         pass
     return resolve_pool_hygiene_reacquire_attempts()
+
+
+# --- Background maintenance concurrency semaphore (#2582) ---------------------
+#
+# Bounds the number of *concurrent* DB connection checkouts made by background
+# maintenance tasks (proactive sweep, stuck-pending warner, maintenance
+# supervisor, wedged-provisioning sweep).  Under a burst of concurrent catalog
+# provisions the shared pool (default 10 connections) was saturated by
+# background tasks, starving foreground tile requests for the full 30 s pool
+# timeout.
+#
+# Design mirrors the retry semaphore above:
+# - Lazy creation; sized from ConnectionHealthConfig.max_background_db_concurrency
+#   (default 2) read live per call so operators can adjust without a pod restart.
+# - Rebuild-on-change: a fresh semaphore replaces the old one when the limit
+#   changes; in-flight holders of the old semaphore release normally.
+# - Semaphore-acquisition timeout (_BG_SEMAPHORE_WAIT_S): a background task
+#   that cannot get a slot within this window degrades (raises, caught by
+#   callers' except-and-skip handlers) rather than queuing for the full pool
+#   timeout.  2 s is enough for an in-flight background checkout to finish a
+#   typical fast query (< 100 ms) while being much shorter than pool_acquire_
+#   timeout (30 s).
+# - Only background_managed_transaction callers are gated; foreground
+#   managed_transaction callers are unaffected.
+_bg_semaphore: Optional[asyncio.Semaphore] = None
+_bg_semaphore_limit: int = 0
+_BG_SEMAPHORE_WAIT_S: float = 2.0
+
+
+async def _get_bg_semaphore() -> asyncio.Semaphore:
+    """Return the background maintenance concurrency semaphore.
+
+    Reads the configured limit live from ``ConnectionHealthConfig`` via the
+    central cached config getter (L1 in-memory, cheap per call).  Rebuilds
+    the semaphore when the limit changes so operators can adjust the cap
+    without a pod restart.  Falls back to
+    :func:`resolve_max_background_db_concurrency` (module-global default)
+    when the config service is unavailable.
+    """
+    global _bg_semaphore, _bg_semaphore_limit
+    limit = await _read_live_bg_concurrency_limit()
+    if _bg_semaphore is None or _bg_semaphore_limit != limit:
+        _bg_semaphore = asyncio.Semaphore(limit)
+        _bg_semaphore_limit = limit
+    return _bg_semaphore
+
+
+async def _read_live_bg_concurrency_limit() -> int:
+    """Read ``ConnectionHealthConfig.max_background_db_concurrency`` live."""
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.db_config.connection_health_config import (
+            ConnectionHealthConfig,
+        )
+        from dynastore.tools.discovery import get_protocol
+
+        svc = get_protocol(PlatformConfigsProtocol)
+        if svc is not None:
+            cfg = await svc.get_config(ConnectionHealthConfig)
+            if isinstance(cfg, ConnectionHealthConfig):
+                return cfg.max_background_db_concurrency
+    except Exception:
+        pass
+    return resolve_max_background_db_concurrency()
+
+
+async def _read_live_fg_acquire_timeout() -> float:
+    """Read ``ConnectionHealthConfig.foreground_pool_acquire_timeout_s`` live.
+
+    Per-call read from the central cached config getter so operators can change
+    the tile-request fail-fast timeout without a pod restart.  Falls back to
+    :func:`resolve_foreground_pool_acquire_timeout` when the config service is
+    unavailable.
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.db_config.connection_health_config import (
+            ConnectionHealthConfig,
+        )
+        from dynastore.tools.discovery import get_protocol
+
+        svc = get_protocol(PlatformConfigsProtocol)
+        if svc is not None:
+            cfg = await svc.get_config(ConnectionHealthConfig)
+            if isinstance(cfg, ConnectionHealthConfig):
+                return cfg.foreground_pool_acquire_timeout_s
+    except Exception:
+        pass
+    return resolve_foreground_pool_acquire_timeout()
+
+
+@asynccontextmanager
+async def background_managed_transaction(db_resource: Optional[DbResource]):
+    """Like :func:`managed_transaction` but gated by the background semaphore.
+
+    Limits concurrent DB connection checkouts from background maintenance tasks
+    to ``max_background_db_concurrency`` (default 2), structurally reserving
+    the remaining pool slots for foreground requests.
+
+    On semaphore-acquisition timeout (``_BG_SEMAPHORE_WAIT_S`` = 2 s), raises
+    ``asyncio.TimeoutError`` so the caller's ``except Exception`` handler can
+    log a degradation warning and skip this maintenance pass.  The task never
+    blocks the event loop for the full pool_acquire_timeout (30 s).
+
+    Usage: a drop-in replacement for ``managed_transaction`` in background
+    maintenance loops.  Foreground handlers must keep using
+    ``managed_transaction`` (or the engine-begin path in dependencies) directly
+    so they are unaffected by the background semaphore.
+
+    Deadlock safety: the semaphore is acquired BEFORE touching the pool, so no
+    coroutine can simultaneously hold a DB connection and block on the semaphore.
+    Sequential checkouts within one tick each acquire-and-release independently
+    so one tick does not pin a slot for its full duration.
+
+    Tests may replace ``_bg_semaphore`` / ``_bg_semaphore_limit`` with
+    ``None`` / ``0`` to reset state between runs; ``_max_background_db_concurrency``
+    in ``connection_health_config`` may also be overridden directly to control the
+    fallback limit.
+    """
+    sem = await _get_bg_semaphore()
+    try:
+        await asyncio.wait_for(sem.acquire(), timeout=_BG_SEMAPHORE_WAIT_S)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "background_managed_transaction: background semaphore saturated "
+            "(max_background_db_concurrency=%d) — skipping this checkout.",
+            _bg_semaphore_limit,
+        )
+        raise
+    try:
+        async with managed_transaction(db_resource) as conn:
+            yield conn
+    finally:
+        sem.release()
 
 
 def _err_repr(exc: BaseException) -> str:

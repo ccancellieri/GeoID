@@ -551,7 +551,7 @@ async def sweep_dead_capability_rows(
         is_capability_live,
     )
     from dynastore.modules.db_config.query_executor import (
-        DQLQuery, ResultHandler, managed_transaction,
+        DQLQuery, ResultHandler, background_managed_transaction,
     )
     from dynastore.modules.tasks.tasks_module import get_task_schema
 
@@ -569,7 +569,7 @@ async def sweep_dead_capability_rows(
         )
         schema = get_task_schema()
         error_message = _dead_capability_error_message(capability_id)
-        async with managed_transaction(engine) as conn:
+        async with background_managed_transaction(engine) as conn:
             got_lock = await DQLQuery(
                 "SELECT pg_try_advisory_xact_lock(:k) AS got",
                 result_handler=ResultHandler.ONE_DICT,

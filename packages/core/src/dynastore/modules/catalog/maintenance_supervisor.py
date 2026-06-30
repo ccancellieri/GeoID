@@ -61,6 +61,7 @@ from dynastore.modules.db_config.locking_tools import (
 from dynastore.modules.db_config.query_executor import (
     DQLQuery,
     ResultHandler,
+    background_managed_transaction,
     managed_transaction,
 )
 from dynastore.tools.background_service import (
@@ -464,7 +465,7 @@ async def _report_reaped_failures(engine: Any) -> int:
         WHERE t.timestamp = r.timestamp AND t.task_id = r.task_id
         RETURNING t.task_id, t.task_type, t.caller_id, t.inputs, t.error_message;
     """
-    async with managed_transaction(engine) as conn:
+    async with background_managed_transaction(engine) as conn:
         rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(conn)
 
     if not rows:
@@ -871,7 +872,7 @@ class MaintenanceSupervisor(PeriodicService):
 
         # Step 1: reclaim stale jobs (crashed leader mid-run).
         try:
-            async with managed_transaction(engine) as conn:
+            async with background_managed_transaction(engine) as conn:
                 reclaimed = await repo.reclaim_stale_jobs(
                     conn, now=now, stale_after_seconds=_STALE_AFTER_SECONDS
                 )
@@ -887,7 +888,7 @@ class MaintenanceSupervisor(PeriodicService):
 
         # Step 2: fetch due jobs.
         try:
-            async with managed_transaction(engine) as conn:
+            async with background_managed_transaction(engine) as conn:
                 due_jobs = await repo.get_due_jobs(conn, now=now)
         except Exception as exc:
             logger.warning(
@@ -918,7 +919,7 @@ class MaintenanceSupervisor(PeriodicService):
         we skip dispatch entirely and do not call mark_done — the other leader
         owns the completion record.
         """
-        async with managed_transaction(engine) as conn:
+        async with background_managed_transaction(engine) as conn:
             claimed = await repo.mark_running(conn, job_name, now=tick_now)
 
         if not claimed:
@@ -934,7 +935,7 @@ class MaintenanceSupervisor(PeriodicService):
         error: Optional[str] = None
 
         try:
-            async with managed_transaction(engine) as conn:
+            async with background_managed_transaction(engine) as conn:
                 await _set_statement_timeout(conn, _JOB_STATEMENT_TIMEOUT_MS)
                 rows = await asyncio.wait_for(
                     _dispatch_job(job_name, conn, self._config),
@@ -974,7 +975,7 @@ class MaintenanceSupervisor(PeriodicService):
 
         finished_at = datetime.now(tz=timezone.utc)
         try:
-            async with managed_transaction(engine) as conn:
+            async with background_managed_transaction(engine) as conn:
                 await repo.mark_done(
                     conn,
                     job_name,

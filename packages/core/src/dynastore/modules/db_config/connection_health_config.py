@@ -149,6 +149,16 @@ _read_disconnect_retry_attempts: int = 2
 # unavailable.
 _pool_hygiene_reacquire_attempts: int = 3
 
+# Fallback for the background maintenance DB concurrency cap. Mirrors the default
+# of ConnectionHealthConfig.max_background_db_concurrency. Tests may override
+# this global directly to control the semaphore size without a live config service.
+_max_background_db_concurrency: int = 2
+
+# Fallback for the foreground pool-acquire short timeout (seconds). Mirrors the
+# default of ConnectionHealthConfig.foreground_pool_acquire_timeout_s. Used by
+# the tile read path to fail fast instead of waiting 30 s on a saturated pool.
+_foreground_pool_acquire_timeout_s: float = 3.0
+
 
 def resolve_connection_retry_config() -> Tuple[int, float, float, float]:
     """Return the current ``(max_retries, base_delay, max_delay, jitter)``."""
@@ -223,6 +233,28 @@ def resolve_pool_hygiene_reacquire_attempts() -> int:
     a live config service.
     """
     return _pool_hygiene_reacquire_attempts
+
+
+def resolve_max_background_db_concurrency() -> int:
+    """Return the fallback background maintenance DB concurrency cap.
+
+    Used as the fallback when ``PlatformConfigsProtocol`` is unavailable.
+    The live path reads ``ConnectionHealthConfig.max_background_db_concurrency``
+    from the central cached getter. Tests may replace the global
+    ``_max_background_db_concurrency`` directly.
+    """
+    return _max_background_db_concurrency
+
+
+def resolve_foreground_pool_acquire_timeout() -> float:
+    """Return the fallback foreground pool-acquire short timeout in seconds.
+
+    Used as the fallback when the config service is unavailable. The live path
+    reads ``ConnectionHealthConfig.foreground_pool_acquire_timeout_s`` from the
+    central cached getter. Tests may replace ``_foreground_pool_acquire_timeout_s``
+    directly.
+    """
+    return _foreground_pool_acquire_timeout_s
 
 
 # ---------------------------------------------------------------------------
@@ -336,5 +368,44 @@ class ConnectionHealthConfig(PluginConfig):
             "raise only for unusually large pools with many simultaneous stale wires. "
             "Hot-reloadable — changes take effect immediately without a pod restart. "
             "Must be in [1, 8]."
+        ),
+    )
+
+    max_background_db_concurrency: Mutable[int] = Field(
+        default=2,
+        ge=1,
+        le=8,
+        description=(
+            "Maximum number of concurrent DB connection checkouts allowed across "
+            "all background maintenance tasks (proactive sweep, stuck-pending "
+            "warner, maintenance supervisor, wedged-provisioning sweep). "
+            "Background tasks compete with foreground requests for the shared "
+            "SQLAlchemy pool; this semaphore caps background concurrency so the "
+            "remaining pool slots are structurally reserved for foreground. "
+            "Each individual managed_transaction checkout by a background task "
+            "must acquire one slot; sequential checkouts within one tick release "
+            "and re-acquire so the slot is not pinned for the tick duration. "
+            "Default 2 leaves at least 8 of the default 10-connection pool for "
+            "foreground; raise if background tasks starve under very high cadence. "
+            "Hot-reloadable — changes take effect immediately without a pod restart. "
+            "Must be in [1, 8]."
+        ),
+    )
+
+    foreground_pool_acquire_timeout_s: Mutable[float] = Field(
+        default=3.0,
+        ge=0.5,
+        le=15.0,
+        description=(
+            "Maximum seconds a foreground tile read request may wait for a DB "
+            "connection from the pool. The global pool_acquire_timeout (30 s by "
+            "default) is too slow for tile serving: a saturated pool silently "
+            "blocks the request for 30 s and the gateway returns a 504. This "
+            "short timeout causes the tile handler to fail fast (~3 s), then "
+            "serve a cached/stale tile if one is available or return HTTP 503 "
+            "with a Retry-After header. Applies only to the vector-tile DB path; "
+            "all other routes keep the full pool_acquire_timeout. "
+            "Hot-reloadable — changes take effect immediately without a pod restart. "
+            "Must be in [0.5, 15.0] seconds."
         ),
     )

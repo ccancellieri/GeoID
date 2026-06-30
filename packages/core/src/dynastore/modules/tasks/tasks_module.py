@@ -34,6 +34,7 @@ from dynastore.modules.db_config.query_executor import (
     DDLBatch,
     DQLQuery,
     managed_transaction,
+    background_managed_transaction,
     ResultHandler,
     DbResource,
     run_in_event_loop,
@@ -1050,7 +1051,7 @@ class StuckPendingWarnerService(PeriodicService):
 
     async def tick(self, ctx: ServiceContext) -> None:
         try:
-            async with managed_transaction(ctx.engine) as conn:
+            async with background_managed_transaction(ctx.engine) as conn:
                 rows = await self._query.execute(
                     conn,
                     min_age_s=self._min_age_s,
@@ -1111,12 +1112,17 @@ async def sweep_wedged_provisioning_catalogs(
         LIMIT :sample_limit;
     """
     try:
-        async with managed_transaction(engine) as conn:
+        async with background_managed_transaction(engine) as conn:
             if not await check_table_exists(conn, "catalogs", "catalog"):
                 return 0
             rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
                 conn, min_age_s=min_age_s, sample_limit=sample_limit,
             )
+    except TimeoutError:
+        logger.warning(
+            "sweep_wedged_provisioning_catalogs: background semaphore saturated — skipping pass."
+        )
+        return 0
     except Exception as exc:  # noqa: BLE001
         logger.warning("sweep_wedged_provisioning_catalogs: scan query failed: %s", exc)
         return 0
@@ -1174,7 +1180,7 @@ async def _run_mandatory_backstop_pass(
     pod wins ``pg_try_advisory_xact_lock`` for this pass; others return immediately.
     Fail-open: any error is logged and swallowed."""
     from dynastore.modules.db_config.query_executor import (
-        DQLQuery, ResultHandler, managed_transaction,
+        DQLQuery, ResultHandler, background_managed_transaction,
     )
     from dynastore.modules.tasks.dispatcher import (
         _stable_advisory_lock_key, sweep_unclaimable_rows,
@@ -1184,7 +1190,7 @@ async def _run_mandatory_backstop_pass(
 
     lock_key = _stable_advisory_lock_key("dynastore.mandatory.backstop")
     try:
-        async with managed_transaction(engine) as conn:
+        async with background_managed_transaction(engine) as conn:
             got = await DQLQuery(
                 "SELECT pg_try_advisory_xact_lock(:k) AS got",
                 result_handler=ResultHandler.ONE_DICT,
@@ -1425,7 +1431,7 @@ async def _distinct_pending_capability_ids(
         f"LIMIT :sample_limit;"
     )
     query = DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS)
-    async with managed_transaction(engine) as conn:
+    async with background_managed_transaction(engine) as conn:
         rows = await query.execute(
             conn,
             task_type=task_type,

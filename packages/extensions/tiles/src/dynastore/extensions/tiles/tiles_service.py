@@ -49,7 +49,8 @@ from dynastore.tools.discovery import get_protocol
 from dynastore.models.protocols.configs import ConfigsProtocol
 from dynastore.models.protocols.web import WebModuleProtocol, StaticFilesProtocol
 from dynastore.extensions.web.decorators import expose_static
-from dynastore.extensions.tools.db import get_async_connection
+from dynastore.extensions.tools.db import get_async_engine
+from dynastore.modules.db_config.query_executor import _read_live_fg_acquire_timeout
 from dynastore.extensions.tools.query import parse_hints_param
 import dynastore.modules.tiles.tiles_module as tms_manager
 from dynastore.tools.geospatial import SimplificationAlgorithm
@@ -581,7 +582,6 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         y: int,
         request: Request,
         background_tasks: BackgroundTasks,
-        conn: AsyncConnection = Depends(get_async_connection),
         collections: str = Query(..., description="Comma-separated collection IDs."),
         datetime: Optional[str] = Query(None),
         filter: Optional[str] = Query(None, description="CQL2 Filter expression."),
@@ -616,7 +616,6 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             y=y,
             format="mvt",
             background_tasks=background_tasks,
-            conn=conn,
             collections=collections,
             datetime=datetime,
             filter=filter,
@@ -639,7 +638,6 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         y: int,
         format: str,
         background_tasks: BackgroundTasks,
-        conn: AsyncConnection = Depends(get_async_connection),
         collections: str = Query(
             ..., description="Comma-separated list of collection IDs to include."
         ),
@@ -676,7 +674,6 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             y=y,
             format=format,
             background_tasks=background_tasks,
-            conn=conn,
             collections=collections,
             datetime=datetime,
             filter=filter,
@@ -697,7 +694,6 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         y: int,
         request: Request,
         background_tasks: BackgroundTasks,
-        conn: AsyncConnection = Depends(get_async_connection),
         collections: str = Query(..., description="Comma-separated collection IDs."),
         datetime: Optional[str] = Query(None),
         filter: Optional[str] = Query(None, description="CQL2 Filter expression."),
@@ -732,7 +728,6 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             y=y,
             format="mvt",
             background_tasks=background_tasks,
-            conn=conn,
             collections=collections,
             datetime=datetime,
             filter=filter,
@@ -755,7 +750,6 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         y: int,
         format: str,
         background_tasks: BackgroundTasks,
-        conn: AsyncConnection = Depends(get_async_connection),
         collections: str = Query(
             ..., description="Comma-separated list of collection IDs to include."
         ),
@@ -783,6 +777,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         Checks for pre-seeded tiles first.
         """
         start_time = time.perf_counter()
+        _conn: Optional[AsyncConnection] = None
 
         try:
             # 1. Validation & Configuration
@@ -888,6 +883,51 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 "cache_enabled=%s",
                 dataset, collections, z, x, y, effective_cache_enabled,
             )
+
+            # Acquire DB connection with pool-saturation guard.
+            # On timeout: try serving a stale cached tile before failing fast.
+            fg_timeout_s = await _read_live_fg_acquire_timeout()
+            try:
+                _conn = await asyncio.wait_for(
+                    get_async_engine(request).connect(), timeout=fg_timeout_s
+                )
+            except TimeoutError:
+                logger.warning(
+                    "get_vector_tile: DB pool saturated (timeout=%.1fs) "
+                    "catalog=%s z=%s x=%s y=%s — attempting stale tile fallback",
+                    fg_timeout_s, dataset, z, x, y,
+                )
+                if effective_cache_enabled:
+                    _stale_provider = get_protocol(TileStorageProtocol)
+                    if _stale_provider:
+                        _cache_id = (
+                            collections
+                            if len(requested_cols_list) > 1
+                            else requested_cols_list[0]
+                        )
+                        _effective_cache_id = (
+                            f"{_cache_id}@{params_hash}" if params_hash else _cache_id
+                        )
+                        stale = await self._try_cached_tile(
+                            _stale_provider,
+                            dataset,
+                            _effective_cache_id,
+                            tileMatrixSetId,
+                            z,
+                            x,
+                            y,
+                            format,
+                            start_time,
+                            serve_mode="proxy",
+                        )
+                        if stale:
+                            return stale
+                raise HTTPException(
+                    status_code=503,
+                    detail="Database pool saturated, try again shortly.",
+                    headers={"Retry-After": "5"},
+                ) from None
+            conn = _conn
 
             # 4. TMS & Coordinate Validation
             tms_def = await self._validate_tms_and_matrix(
@@ -1029,6 +1069,9 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             raise HTTPException(
                 status_code=500, detail=f"Internal Server Error: {str(e)}"
             ) from e
+        finally:
+            if _conn is not None:
+                await _conn.close()
 
     # --- Helper Private Methods ---
 
@@ -2109,7 +2152,6 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         y: int,
         request: Request,
         background_tasks: BackgroundTasks,
-        conn: AsyncConnection = Depends(get_async_connection),
         datetime: Optional[str] = Query(None),
         filter: Optional[str] = Query(None, description="CQL2 Filter expression."),
         filter_lang: Optional[str] = Query("cql2-text"),
@@ -2140,7 +2182,6 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             y=y,
             format="mvt",
             background_tasks=background_tasks,
-            conn=conn,
             collections=internal_collection_id,
             datetime=datetime,
             filter=filter,
@@ -2164,7 +2205,6 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         format: str,
         request: Request,
         background_tasks: BackgroundTasks,
-        conn: AsyncConnection = Depends(get_async_connection),
         datetime: Optional[str] = Query(None),
         filter: Optional[str] = Query(None, description="CQL2 Filter expression."),
         filter_lang: Optional[str] = Query("cql2-text"),
@@ -2195,7 +2235,6 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             y=y,
             format=format,
             background_tasks=background_tasks,
-            conn=conn,
             collections=internal_collection_id,
             datetime=datetime,
             filter=filter,

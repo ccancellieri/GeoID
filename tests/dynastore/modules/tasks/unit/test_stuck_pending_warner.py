@@ -77,7 +77,7 @@ async def test_warner_logs_one_line_per_stuck_row(caplog):
         "dynastore.modules.tasks.tasks_module.DQLQuery",
         return_value=fake_query,
     ), patch(
-        "dynastore.modules.tasks.tasks_module.managed_transaction",
+        "dynastore.modules.tasks.tasks_module.background_managed_transaction",
         _fake_managed_transaction,
     ):
         svc = StuckPendingWarnerService(schema="tasks", interval_s=0.01, min_age_s=10.0)
@@ -106,7 +106,7 @@ async def test_warner_swallows_query_errors(caplog):
         "dynastore.modules.tasks.tasks_module.DQLQuery",
         return_value=fake_query,
     ), patch(
-        "dynastore.modules.tasks.tasks_module.managed_transaction",
+        "dynastore.modules.tasks.tasks_module.background_managed_transaction",
         _fake_managed_transaction,
     ):
         svc = StuckPendingWarnerService(schema="tasks", interval_s=0.01)

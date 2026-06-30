@@ -65,7 +65,7 @@ async def test_sweep_drains_wedged_catalogs():
 
     with (
         patch(
-            "dynastore.modules.tasks.tasks_module.managed_transaction",
+            "dynastore.modules.tasks.tasks_module.background_managed_transaction",
             _fake_managed_transaction,
         ),
         patch(
@@ -104,7 +104,7 @@ async def test_sweep_returns_zero_when_no_wedged_catalogs():
 
     with (
         patch(
-            "dynastore.modules.tasks.tasks_module.managed_transaction",
+            "dynastore.modules.tasks.tasks_module.background_managed_transaction",
             _fake_managed_transaction,
         ),
         patch(
@@ -133,7 +133,7 @@ async def test_sweep_returns_zero_when_catalogs_table_absent():
     """When catalog.catalogs doesn't exist (fresh DB), sweep returns 0 safely."""
     with (
         patch(
-            "dynastore.modules.tasks.tasks_module.managed_transaction",
+            "dynastore.modules.tasks.tasks_module.background_managed_transaction",
             _fake_managed_transaction,
         ),
         patch(
@@ -171,7 +171,7 @@ async def test_sweep_continues_when_one_drain_fails():
 
     with (
         patch(
-            "dynastore.modules.tasks.tasks_module.managed_transaction",
+            "dynastore.modules.tasks.tasks_module.background_managed_transaction",
             _fake_managed_transaction,
         ),
         patch(
@@ -206,7 +206,7 @@ async def test_sweep_returns_zero_when_protocol_unavailable():
 
     with (
         patch(
-            "dynastore.modules.tasks.tasks_module.managed_transaction",
+            "dynastore.modules.tasks.tasks_module.background_managed_transaction",
             _fake_managed_transaction,
         ),
         patch(
@@ -255,7 +255,7 @@ async def test_sweep_sql_covers_both_provision_task_types() -> None:
 
     with (
         patch(
-            "dynastore.modules.tasks.tasks_module.managed_transaction",
+            "dynastore.modules.tasks.tasks_module.background_managed_transaction",
             _fake_managed_transaction,
         ),
         patch(
