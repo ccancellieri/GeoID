@@ -33,9 +33,12 @@ _ = _bigquery_scope_gate  # silence pyright "unused" — load-bearing for SCOPE 
 
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, FrozenSet, Optional
+from datetime import datetime, timezone
+from typing import Annotated, Any, AsyncIterator, Dict, FrozenSet, List, Optional
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
-from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse  # noqa: E402
 
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.protocols import ExtensionProtocol
@@ -48,12 +51,33 @@ from dynastore.modules.joins.models import (
     BigQuerySecondarySpec,
     JoinRequest,
     NamedSecondarySpec,
+    PagingSpec,
     PrimaryFilterSpec,
 )
 from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.router import resolve_drivers
 
 logger = logging.getLogger(__name__)
+
+# Default and ceiling for a single /join page, mirroring OGC API - Features
+# `limit` semantics (Features Part 1, Req 19). Kept in sync with PagingSpec's
+# own field bounds (default=100, le=10000).
+DEFAULT_PAGE_LIMIT = 100
+MAX_PAGE_LIMIT = 10_000
+
+# GeoJSON media type for join feature collections and pagination links.
+GEOJSON_MEDIA_TYPE = "application/geo+json"
+
+
+class GeoJSONResponse(JSONResponse):
+    """JSON response served with the OGC GeoJSON media type.
+
+    The join FeatureCollection is GeoJSON, so it must be sent as
+    ``application/geo+json`` (OGC API - Features Part 1 §7.15.4 /
+    ``/req/core/fc-response``), not the FastAPI-default ``application/json``.
+    """
+
+    media_type = GEOJSON_MEDIA_TYPE
 
 
 async def _resolve_primary_driver(
@@ -127,6 +151,85 @@ def _build_primary_query_request(
     return req
 
 
+def _resolve_paging(
+    body: JoinRequest, *, limit: Optional[int], offset: Optional[int],
+) -> PagingSpec:
+    """Resolve the effective page from query params over body, bounded.
+
+    Query ``?limit=&offset=`` win over ``body.paging`` so a ``next`` link
+    (which can only carry a query string) is followable by replaying the same
+    POST body. Absent both, default to a bounded page (Features-style) rather
+    than an unbounded scan. The result is clamped to ``[1, MAX_PAGE_LIMIT]``.
+    """
+    eff_limit = (
+        limit if limit is not None
+        else body.paging.limit if body.paging is not None
+        else DEFAULT_PAGE_LIMIT
+    )
+    eff_offset = (
+        offset if offset is not None
+        else body.paging.offset if body.paging is not None
+        else 0
+    )
+    eff_limit = max(1, min(eff_limit, MAX_PAGE_LIMIT))
+    eff_offset = max(0, eff_offset)
+    return PagingSpec(limit=eff_limit, offset=eff_offset)
+
+
+def _with_paging_query(url: str, *, offset: int, limit: int) -> str:
+    """Return ``url`` with ``offset``/``limit`` set in the query string.
+
+    Preserves any other query params already present (e.g. ``?hints=``).
+    """
+    parts = urlsplit(url)
+    kept = [
+        (k, v)
+        for k, v in (
+            tuple(p.split("=", 1)) if "=" in p else (p, "")
+            for p in parts.query.split("&") if p
+        )
+        if k not in ("offset", "limit")
+    ]
+    kept.extend([("offset", str(offset)), ("limit", str(limit))])
+    return urlunsplit(parts._replace(query=urlencode(kept)))
+
+
+def _join_feature_collection(
+    joined: List[Feature], *, request: Request, paging: PagingSpec,
+) -> Dict[str, Any]:
+    """Build an OGC-conformant join FeatureCollection.
+
+    Carries the OGC API - Features response members (``links``, ``timeStamp``,
+    ``numberReturned``) instead of a non-standard ``_join_meta`` foreign member.
+    ``numberMatched`` is intentionally omitted: the join streams an inner match
+    and never materializes the full matched set, so its total is not known
+    cheaply (Features Part 1 permits omitting it). A ``next`` link is emitted
+    only when the page is full (``len(features) >= limit``), i.e. more features
+    may follow. This signal is exact for a dense join and may end paging early
+    for a sparse one — see the read-window note in ``execute_join``.
+    """
+    features = [f.model_dump(by_alias=True, exclude_none=True) for f in joined]
+    self_href = str(request.url)
+    links: List[Dict[str, Any]] = [
+        {"rel": "self", "type": GEOJSON_MEDIA_TYPE, "href": self_href},
+    ]
+    if len(features) >= paging.limit:
+        links.append({
+            "rel": "next",
+            "type": GEOJSON_MEDIA_TYPE,
+            "href": _with_paging_query(
+                self_href, offset=paging.offset + paging.limit, limit=paging.limit,
+            ),
+        })
+    return {
+        "type": "FeatureCollection",
+        "features": features,
+        "numberReturned": len(features),
+        "timeStamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "links": links,
+    }
+
+
 # Draft URIs — OGC API - Joins Part 1 0.0 (working draft).
 OGC_API_JOINS_URIS = [
     "http://www.opengis.net/spec/ogcapi-joins-1/0.0/conf/core",
@@ -174,6 +277,7 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
         self.router.add_api_route(
             "/catalogs/{catalog_id}/collections/{collection_id}/join",
             self.execute_join, methods=["POST"],
+            response_class=GeoJSONResponse,
         )
 
     async def describe_join(
@@ -194,6 +298,14 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
         self, catalog_id: str, collection_id: str, request: Request,
         body: JoinRequest = Body(...),
         request_hints: FrozenSet = Depends(parse_hints_param),
+        limit: Annotated[Optional[int], Query(
+            ge=1, le=MAX_PAGE_LIMIT,
+            description="Page size; overrides body.paging.limit when present.",
+        )] = None,
+        offset: Annotated[Optional[int], Query(
+            ge=0,
+            description="Start offset; overrides body.paging.offset when present.",
+        )] = None,
     ):
         """Execute the join.
 
@@ -204,10 +316,27 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
         the baseline ``JOIN`` hint; omitting the parameter preserves the
         existing routing behaviour.
 
+        ``?limit=`` / ``?offset=`` override ``body.paging`` so the ``next``
+        link in the response is followable by replaying this POST body. The
+        response is an OGC API - Features-style FeatureCollection (``links``,
+        ``timeStamp``, ``numberReturned``).
+
         PR-3: BigQuerySecondarySpec runs the join end-to-end via the
         platform's driver registry for the primary side. NamedSecondarySpec
         stub remains until its own PR.
         """
+        # Effective page: query params win over body, bounded to a sane page.
+        # run_join applies offset/limit to *matched* features while the primary
+        # read is bounded to offset+limit *rows*. This is correct for a dense
+        # join (≈1 match per primary row — the GAUL-style demo case). For a
+        # SPARSE inner join, offset+limit rows may yield fewer than `limit`
+        # matches, so a page past the first can under-fill and the `next` link
+        # be suppressed even though further matches exist below the read window.
+        # Correct sparse-join pagination (match-bounded read / feature-id
+        # cursor) is tracked as a follow-up; large/sparse exports should use the
+        # heavy `joins_export` job, which scans the full collection.
+        body.paging = _resolve_paging(body, limit=limit, offset=offset)
+        read_limit = body.paging.offset + body.paging.limit
         if isinstance(body.secondary, BigQuerySecondarySpec):
             # Materialize secondary side via Phase 4a's BQ driver (inline target).
             secondary_index = await index_secondary(
@@ -229,15 +358,16 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
                         "Configure a ItemsRoutingConfig before /join."
                     ),
                 )
-            limit = body.paging.limit if body.paging else 100_000
-            query_request = _build_primary_query_request(body.primary_filter, limit=limit)
+            query_request = _build_primary_query_request(
+                body.primary_filter, limit=read_limit,
+            )
             try:
                 primary_stream = _stream_primary_features(
                     primary_driver,
                     catalog_id=catalog_id,
                     collection_id=collection_id,
                     primary_column=body.join.primary_column,
-                    limit=limit,
+                    limit=read_limit,
                     query_request=query_request,
                 )
                 joined = [
@@ -250,14 +380,9 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
                 raise HTTPException(
                     status_code=400, detail=f"Invalid primary_filter: {e}",
                 ) from e
-            return {
-                "type": "FeatureCollection",
-                "features": [f.model_dump(by_alias=True, exclude_none=True) for f in joined],
-                "_join_meta": {
-                    "secondary_rows_materialized": len(secondary_index),
-                    "joined_features": len(joined),
-                },
-            }
+            return _join_feature_collection(
+                joined, request=request, paging=body.paging,
+            )
 
         if isinstance(body.secondary, NamedSecondarySpec):
             # Resolve secondary collection via the platform's driver registry.
@@ -295,15 +420,16 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
                         f"{catalog_id}/{collection_id}."
                     ),
                 )
-            limit = body.paging.limit if body.paging else 100_000
-            query_request = _build_primary_query_request(body.primary_filter, limit=limit)
+            query_request = _build_primary_query_request(
+                body.primary_filter, limit=read_limit,
+            )
             try:
                 primary_stream = _stream_primary_features(
                     primary_driver,
                     catalog_id=catalog_id,
                     collection_id=collection_id,
                     primary_column=body.join.primary_column,
-                    limit=limit,
+                    limit=read_limit,
                     query_request=query_request,
                 )
                 joined = [
@@ -316,15 +442,9 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
                 raise HTTPException(
                     status_code=400, detail=f"Invalid primary_filter: {e}",
                 ) from e
-            return {
-                "type": "FeatureCollection",
-                "features": [f.model_dump(by_alias=True, exclude_none=True) for f in joined],
-                "_join_meta": {
-                    "secondary_rows_materialized": len(secondary_index),
-                    "joined_features": len(joined),
-                    "secondary_ref": body.secondary.ref,
-                },
-            }
+            return _join_feature_collection(
+                joined, request=request, paging=body.paging,
+            )
 
         raise HTTPException(
             status_code=400,

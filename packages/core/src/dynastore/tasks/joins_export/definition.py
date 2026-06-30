@@ -16,9 +16,9 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Lightweight OGC Process definition for the DWH join export task.
+"""Lightweight OGC Process definition for the OGC API - Joins export task.
 
-Lives separately from ``dwh_join_export_task.py`` (which imports BigQuery and
+Lives separately from ``joins_export_task.py`` (which imports BigQuery and
 other heavy SDKs) so services that only dispatch the work can still expose the
 Process via ``/processes``.
 """
@@ -32,28 +32,32 @@ from dynastore.modules.processes.models import (
 )
 from dynastore.modules.processes.schema_gen import pydantic_to_process_inputs
 
-from .models import DwhJoinExportRequest
+from .models import JoinsExportRequest
 
-DWH_JOIN_EXPORT_PROCESS_DEFINITION = Process(
-    id="dwh_join",
+JOINS_EXPORT_PROCESS_DEFINITION = Process(
+    id="joins_export",
     version="1.0.0",
-    title="DWH Join Export",
+    title="OGC API - Joins Export",
     description=(
-        "Joins catalog features with DWH query results and exports the result to "
-        "the catalog's Cloud Storage bucket. The artifact is returned by reference "
-        "as a time-limited signed URL: the 'result' output of the job's results "
-        "document (a link), and also the job's status message. The server owns "
-        "the storage location."
+        "Heavy, non-paginated counterpart to the synchronous /join endpoint. "
+        "Joins a primary collection with a secondary source (a registered "
+        "collection or an inline BigQuery target) over its full extent and "
+        "exports the joined FeatureCollection to the catalog's Cloud Storage "
+        "bucket. The artifact is returned by reference as a time-limited "
+        "signed URL: the 'result' output of the job's results document (a "
+        "link), and also the job's status message. The server owns the storage "
+        "location. Use this for dense-geometry or whole-collection joins that a "
+        "single synchronous page cannot carry."
     ),
     scopes=[ProcessScope.COLLECTION],
-    inputs=pydantic_to_process_inputs(DwhJoinExportRequest),
+    inputs=pydantic_to_process_inputs(JoinsExportRequest),
     outputs={
         "result": ProcessOutput.model_validate(
             {
                 "title": "Result",
                 "description": (
-                    "Time-limited (7-day) signed GET URL to the exported file in "
-                    "Cloud Storage."
+                    "Time-limited (7-day) signed GET URL to the exported file "
+                    "in Cloud Storage."
                 ),
                 "schema": {"type": "string", "format": "uri"},
             }

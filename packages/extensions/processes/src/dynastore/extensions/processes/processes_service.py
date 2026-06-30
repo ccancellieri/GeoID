@@ -1647,6 +1647,10 @@ def _handle_job_results(task: Task, job_id: uuid.UUID):
             status_code=status.HTTP_202_ACCEPTED,
             detail=f"Job '{job_id}' is not complete. Current status: {task.status}",
         )
+    # ``task.outputs`` is already the results body: file-export tasks store it
+    # via ``result_message.reference_result`` as the declared output id keyed to
+    # a {href, type} link, alongside the legacy human-facing ``message`` the
+    # existing (customer) contract surfaces. Returned verbatim.
     return task.outputs or {}
 
 

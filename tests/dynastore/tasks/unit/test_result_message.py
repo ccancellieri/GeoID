@@ -70,6 +70,33 @@ def test_results_link_has_ogc_results_rel():
     assert link.href == "https://example.org/file.zip"
 
 
+def test_reference_result_is_link_keyed_by_output_id():
+    # A by-reference output is a map keyed by the declared output id whose value
+    # is a Link-shaped {href, type} qualified value (OGC Processes §7.13).
+    out = rm.reference_result(
+        "result", "https://example.org/x.geojson", media_type="application/geo+json"
+    )
+    assert out["result"] == {
+        "href": "https://example.org/x.geojson",
+        "type": "application/geo+json",
+    }
+    # The human-facing status message defaults to the artifact href.
+    assert out["message"] == "https://example.org/x.geojson"
+
+
+def test_reference_result_keeps_message_funnel_for_status_doc():
+    # The carried ``message`` is what task_to_status_info surfaces on the job
+    # *status* document; it is a sibling of the declared output, not nested in it.
+    out = rm.reference_result(
+        "result", "https://h/x.geojson", media_type="application/geo+json",
+        message="custom status",
+    )
+    assert out["message"] == "custom status"
+    t = Task(task_type="dwh_join", type="process", status=TaskStatusEnum.COMPLETED,
+             error_message=None, outputs=out)
+    assert task_to_status_info(t).message == "custom status"
+
+
 # --------------------------------------------------------------------------- #
 # Server-owned export delivery
 # --------------------------------------------------------------------------- #

@@ -18,7 +18,7 @@
 
 import logging
 import asyncio
-from typing import Optional
+from typing import Any, Dict, Optional
 
 # Hard runtime dep — see modules/elasticsearch/module.py for rationale.
 # Forces entry-point load to fail on services without ``google-cloud-bigquery``
@@ -32,7 +32,6 @@ from dynastore.tools.protocol_helpers import get_engine
 from dynastore.modules.processes.models import (
     Process,
     ExecuteRequest,
-    StatusInfo,
 )
 from dynastore.tasks import result_message
 from dynastore.tasks.tools import initialize_reporters
@@ -53,7 +52,7 @@ from .models import DwhJoinExportRequest
 logger = logging.getLogger(__name__)
 
 
-class DwhJoinExportTask(TaskProtocol[Process, TaskPayload[ExecuteRequest], Optional[StatusInfo]]):
+class DwhJoinExportTask(TaskProtocol[Process, TaskPayload[ExecuteRequest], Optional[Dict[str, Any]]]):
     priority: int = 100
     @staticmethod
     def get_definition() -> Process:
@@ -62,7 +61,7 @@ class DwhJoinExportTask(TaskProtocol[Process, TaskPayload[ExecuteRequest], Optio
     def __init__(self, app_state: object):
         self.app_state = app_state
 
-    async def run(self, payload: TaskPayload[ExecuteRequest]) -> Optional[StatusInfo]:
+    async def run(self, payload: TaskPayload[ExecuteRequest]) -> Optional[Dict[str, Any]]:
         task_id = payload.task_id
         engine = get_engine()
         if engine is None:
@@ -221,4 +220,12 @@ class DwhJoinExportTask(TaskProtocol[Process, TaskPayload[ExecuteRequest], Optio
                     await r.task_finished(TaskStatusEnum.FAILED.value, error_message=str(e))
             raise e
 
-        return result_message.completed(task_id, message=result_url)
+        # Return the artifact as the declared ``result`` output, by reference:
+        # a Link-shaped qualified value ({href, type}) so GET /jobs/{id}/results
+        # is a conformant OGC API - Processes results document (Part 1 §7.13).
+        # The signed URL is also carried as the status ``message``.
+        return result_message.reference_result(
+            "result",
+            result_url,
+            media_type=content_type,
+        )

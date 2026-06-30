@@ -385,6 +385,13 @@ outbox_drain = ["dynastore[task_base]"]
 # module_gcp for the same reason. Confirmed on dynastore-dwh-join-export-job-5k56c,
 # review, 2026-05-29.
 worker_task_dwh_join = ["dynastore[task_base_async,module_catalog,module_crs,extension_dwh,module_gcp,module_storage_postgresql]"]
+# Heavy, non-paginated OGC API - Joins export. Reuses dwh_join's proven scope:
+# its runtime needs are a strict subset (it drives the join via the CORE
+# ``dynastore.modules.joins`` executor rather than the dwh extension, but pulls
+# the same BigQuery + geospatial_io + GCS upload + CRS + PG-read deps). The
+# ``joins`` extra (transitively in extension_dwh) carries google-cloud-bigquery,
+# db-dtypes and pandas for the BigQuery secondary path.
+worker_task_joins_export = ["dynastore[task_base_async,module_catalog,module_crs,extension_dwh,module_gcp,module_storage_postgresql]"]
 worker_task_ingestion = ["dynastore[ingestion,catalog_grp,google_grp,gdal,drivers_grp]"]
 # export_features: writes feature output to GCS (`gs://...` destination_uri)
 # via dynastore.modules.gcp clients. Without module_gcp the worker raises
@@ -541,7 +548,7 @@ api_full = ["dynastore[api_catalog,maps_grp,geospatial_io]"]
 # geoid_service: api_catalog + geoid extension — the ONLY service with auth
 geoid_service = ["dynastore[api_catalog,extension_geoid]"]
 # worker_service: background task processor (sync-db tasks + async-db catalog reads), no auth
-worker_service = ["dynastore[core,catalog_grp,google_grp,index_grp,tasks,processes,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,worker_task_stac_harvest,worker_task_catalog_provision,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup]"]
+worker_service = ["dynastore[core,catalog_grp,google_grp,index_grp,tasks,processes,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_joins_export,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,worker_task_stac_harvest,worker_task_catalog_provision,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup]"]
 # catalog_local: local dev catalog — api_open without google_grp/gcp_cloud_runner (no tools_grp: use the dedicated tools service)
 catalog_local = ["dynastore[core,catalog_grp,monitor_grp,index_grp,processes]"]
 # worker_local: local HTTP simulation of Cloud Run Jobs — all tasks + processes/stats UI
@@ -560,7 +567,7 @@ scope_catalog_review = ["dynastore[scope_catalog,module_gdal,worker_task_gdal]"]
 # scope_geoid: catalog + geoid UI + auth/iam — maps to geospatial-auth in cloud
 scope_geoid = ["dynastore[scope_catalog,extension_geoid,auth_grp]"]
 # scope_worker: background task processor — headless Cloud Run job runner
-scope_worker = ["dynastore[core,module_catalog,gcp,extension_dwh,index_grp,tasks,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,worker_task_stac_harvest,worker_task_catalog_provision,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup]"]
+scope_worker = ["dynastore[core,module_catalog,gcp,extension_dwh,index_grp,tasks,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_joins_export,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,worker_task_stac_harvest,worker_task_catalog_provision,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup]"]
 # scope_tools: proxy + template tools service — no auth
 scope_tools = ["dynastore[core,template,notebooks,cache,dimensions,proxy]"]
 # scope_maps: vector producer + raster renderer (local docker), no auth.

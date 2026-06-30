@@ -84,7 +84,14 @@ async def test_execute_join_bigquery_materializes_secondary(monkeypatch):
     )
     resp = await svc.execute_join("c", "l", req, body=body, request_hints=frozenset())
     assert resp["type"] == "FeatureCollection"
-    assert resp["_join_meta"]["secondary_rows_materialized"] == 1
+    # Conformant response: no _join_meta foreign member; carries OGC API -
+    # Features members instead. A non-matching primary yields an empty page.
+    assert "_join_meta" not in resp
+    assert resp["features"] == []
+    assert resp["numberReturned"] == 0
+    assert "timeStamp" in resp
+    # A partial page (< limit) advertises no `next` link.
+    assert {ln["rel"] for ln in resp["links"]} == {"self"}
 
 
 @pytest.mark.asyncio
@@ -135,8 +142,10 @@ async def test_execute_join_bigquery_end_to_end(monkeypatch):
     assert resp["type"] == "FeatureCollection"
     assert len(resp["features"]) == 1  # only Alice matches
     assert resp["features"][0]["properties"]["score"] == 42
-    assert resp["_join_meta"]["secondary_rows_materialized"] == 2
-    assert resp["_join_meta"]["joined_features"] == 1
+    assert "_join_meta" not in resp
+    assert resp["numberReturned"] == 1
+    assert "timeStamp" in resp
+    assert any(ln["rel"] == "self" for ln in resp["links"])
 
 
 @pytest.mark.asyncio
@@ -217,7 +226,8 @@ async def test_execute_join_named_secondary_resolves_via_registry(monkeypatch):
     assert resp["type"] == "FeatureCollection"
     assert len(resp["features"]) == 1
     assert resp["features"][0]["properties"]["score"] == 99
-    assert resp["_join_meta"]["secondary_ref"] == "the-other-collection"
+    assert "_join_meta" not in resp
+    assert resp["numberReturned"] == 1
 
 
 @pytest.mark.asyncio
@@ -515,3 +525,67 @@ async def test_execute_join_default_is_inner_join(monkeypatch):
     # Default INNER JOIN should only yield matching feature
     assert len(resp["features"]) == 1
     assert resp["features"][0]["properties"]["name"] == "Alice"
+
+
+@pytest.mark.asyncio
+async def test_execute_join_paginates_with_conformant_next_link(monkeypatch):
+    """A full page emits a followable `next` link with offset advanced by limit.
+
+    Two primary features match the secondary; ``?limit=1`` returns the first
+    page (1 feature) and, because the page is full, a ``next`` link pointing at
+    the same endpoint with ``offset=1&limit=1`` so the POST body can be replayed.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    from fastapi import Request
+    from dynastore.extensions.joins.joins_service import JoinsService
+    from dynastore.modules.joins.models import (
+        BigQuerySecondarySpec, JoinRequest, JoinSpec, PagingSpec,
+    )
+    from dynastore.modules.storage.drivers.bigquery_models import BigQueryTarget
+    from dynastore.models.ogc import Feature
+
+    async def fake_bq_stream(spec, *, secondary_column, **kwargs):
+        yield Feature(type="Feature", id="bq1", geometry=None,
+                      properties={"user_id": "alice", "score": 1})
+        yield Feature(type="Feature", id="bq2", geometry=None,
+                      properties={"user_id": "bob", "score": 2})
+
+    import dynastore.extensions.joins.joins_service as svc_mod
+    monkeypatch.setattr(svc_mod, "stream_bigquery_secondary", fake_bq_stream)
+
+    class _FakePrimaryDriver:
+        async def read_entities(self, *args, **kwargs):
+            yield Feature(type="Feature", id="p1", geometry=None,
+                          properties={"uid": "alice", "name": "Alice"})
+            yield Feature(type="Feature", id="p2", geometry=None,
+                          properties={"uid": "bob", "name": "Bob"})
+
+    fake_resolved = type("R", (), {"driver": _FakePrimaryDriver()})()
+    monkeypatch.setattr(
+        svc_mod, "resolve_drivers", AsyncMock(return_value=[fake_resolved]),
+    )
+
+    svc = JoinsService()
+    req = MagicMock(spec=Request)
+    req.url = "http://h/api/maps/join/catalogs/c/collections/l/join?hints=geometry_exact"
+    body = JoinRequest(
+        secondary=BigQuerySecondarySpec(
+            target=BigQueryTarget(project_id="p", dataset_id="d", table_name="t"),
+        ),
+        join=JoinSpec(primary_column="uid", secondary_column="user_id"),
+        paging=PagingSpec(limit=1, offset=0),
+    )
+    resp = await svc.execute_join("c", "l", req, body=body, request_hints=frozenset())
+
+    assert resp["type"] == "FeatureCollection"
+    assert "_join_meta" not in resp
+    assert resp["numberReturned"] == 1
+    assert len(resp["features"]) == 1
+    assert "timeStamp" in resp
+    links = {ln["rel"]: ln for ln in resp["links"]}
+    assert links["self"]["type"] == "application/geo+json"
+    # Full page → next link, offset advanced by limit, other params preserved.
+    assert "next" in links
+    nxt = links["next"]["href"]
+    assert "offset=1" in nxt and "limit=1" in nxt
+    assert "hints=geometry_exact" in nxt

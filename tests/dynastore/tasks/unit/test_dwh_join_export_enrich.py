@@ -144,7 +144,13 @@ async def test_dwh_join_export_signs_server_derived_uri_and_reports_completed():
     # Upload targeted the server-derived URI (no client destination_uri).
     assert upload_calls == [_RESOLVED_URI]
     # The signed URL is the job message.
-    assert result is not None and result.message == _SIGNED_URL
+    # The artifact is surfaced as the declared ``result`` output, by reference
+    # (a Link-shaped {href, type} qualified value) for a conformant OGC results
+    # document, and also carried as the status ``message``.
+    assert result is not None
+    assert result["result"]["href"] == _SIGNED_URL
+    assert result["result"]["type"]  # media type populated from the formatter
+    assert result["message"] == _SIGNED_URL
     # Terminal status reported to reporters is COMPLETED, never "SUCCESS".
     assert reporter.finished == ["COMPLETED"]
     assert reporter.started == [_RESOLVED_URI]
@@ -183,7 +189,13 @@ async def test_dwh_join_export_empty_join_still_completes():
         result = await task.run(_payload(dict(_BASE_INPUTS)))
 
     assert written == []
-    assert result is not None and result.message == _SIGNED_URL
+    # The artifact is surfaced as the declared ``result`` output, by reference
+    # (a Link-shaped {href, type} qualified value) for a conformant OGC results
+    # document, and also carried as the status ``message``.
+    assert result is not None
+    assert result["result"]["href"] == _SIGNED_URL
+    assert result["result"]["type"]  # media type populated from the formatter
+    assert result["message"] == _SIGNED_URL
     assert reporter.finished == ["COMPLETED"]
 
 
