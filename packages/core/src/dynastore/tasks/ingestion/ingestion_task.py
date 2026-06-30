@@ -39,6 +39,70 @@ from .definition import INGESTION_PROCESS_DEFINITION
 from dynastore.modules.processes.models import Process, ExecuteRequest, StatusInfo
 
 logger = logging.getLogger(__name__)
+
+
+async def _maybe_enqueue_tile_preseed(
+    catalog_id: str,
+    collection_id: str,
+    spec: object,
+) -> None:
+    """Chain a ``tiles_preseed`` job after a successful ingestion (opt-in).
+
+    ``spec`` is the ``preseed_on_success`` value carried in the ingestion
+    inputs: falsy/absent → no preseed (the default for ordinary ingestions);
+    a truthy flag → MVT defaults; a dict → overrides (``output_format``
+    default ``"mvt"``, optional ``tms_ids``).
+
+    Submitted through the canonical OGC process-execution path
+    (:func:`execute_process`) so it is validated, mode-resolved and
+    dedup-guarded exactly like a ``POST /processes/tiles_preseed/execution``.
+    A short-lived async engine is built for the enqueue (mirrors the event
+    drain) because the ingestion task itself runs on a synchronous engine.
+    The ``dedup_key`` collapses redundant chains for the same target while the
+    prior job is non-terminal; a fresh ingestion after a terminal preseed
+    enqueues a new one.
+    """
+    if not spec:
+        return
+    opts = spec if isinstance(spec, dict) else {}
+    preseed_inputs: dict = {
+        "catalog_id": catalog_id,
+        "collection_id": collection_id,
+        "output_format": opts.get("output_format", "mvt"),
+        "operation": "seed",
+    }
+    if opts.get("tms_ids"):
+        preseed_inputs["tms_ids"] = opts["tms_ids"]
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from dynastore.modules.db_config.db_config import DBConfig
+    from dynastore.modules.db_config.tools import normalize_db_url
+    from dynastore.modules.processes import models as _proc_models
+    from dynastore.modules.processes.processes_module import execute_process
+
+    db_url = normalize_db_url(DBConfig.database_url, is_async=True)
+    engine = create_async_engine(db_url, poolclass=NullPool)
+    try:
+        await execute_process(
+            "tiles_preseed",
+            _proc_models.ExecuteRequest(inputs=preseed_inputs),
+            engine=engine,
+            caller_id="ingestion:preseed_on_success",
+            preferred_mode=_proc_models.JobControlOptions.ASYNC_EXECUTE,
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+            dedup_key=f"preseed_on_ingest:{catalog_id}:{collection_id}",
+        )
+        logger.info(
+            "Ingestion chained tiles_preseed (%s) for %s/%s",
+            preseed_inputs["output_format"], catalog_id, collection_id,
+        )
+    finally:
+        await engine.dispose()
+
+
 class IngestionTask(ProcessTaskProtocol[Process, TaskPayload[ExecuteRequest], Optional[StatusInfo]]):
     priority: int = 100
     """
@@ -97,6 +161,24 @@ class IngestionTask(ProcessTaskProtocol[Process, TaskPayload[ExecuteRequest], Op
                 caller_id=caller_id
             )
             logger.info(f"Ingestion task '{task_id}' complete.")
+
+            # Opt-in completion chain: once the features are committed, enqueue a
+            # tile preseed for the collection so the tiles render against real
+            # data (a preseed submitted up-front would race this async job and
+            # tile an empty collection). Best-effort — a failure to enqueue must
+            # never fail the already-committed ingestion.
+            try:
+                await _maybe_enqueue_tile_preseed(
+                    catalog_id, collection_id,
+                    inputs_dict.get("preseed_on_success"),
+                )
+            except Exception:  # noqa: BLE001 — preseed chaining is best-effort
+                logger.warning(
+                    "Ingestion task '%s': tiles_preseed chaining failed for "
+                    "%s/%s; ingestion itself succeeded.",
+                    task_id, catalog_id, collection_id, exc_info=True,
+                )
+
             # Standard message: a URL to verify the ingested output — the
             # feature collection (items listing) for the target collection,
             # filtered to the source asset's features when its id is known.

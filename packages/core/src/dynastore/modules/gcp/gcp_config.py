@@ -267,6 +267,55 @@ class GcpModuleConfig(ExposableConfigMixin, PluginConfig):
         ),
     )
 
+class GcpTileCacheConfig(PluginConfig):
+    """Config for the GCS implementation of ``TileStorageProtocol``.
+
+    Addressed under the GCP module but organized by the protocol it backs
+    (``…/gcp/tile_storage``), so a different module/plugin implementing the same
+    ``TileStorageProtocol`` (e.g. an on-prem local-disk cache) declares its own
+    sibling config at ``("platform", "modules", "<module>", "tile_storage")``
+    rather than overloading the backend-agnostic ``TilesCachingConfig``. Keeping
+    the GCS bucket knob here means non-GCP deployments never see it.
+    """
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "modules", "gcp", "tile_storage")
+
+    cache_bucket: Mutable[Optional[str]] = Field(
+        default=None,
+        min_length=3,
+        max_length=222,
+        description=(
+            "Optional external/unmanaged GCS bucket for the tile cache. When "
+            "None (default) each catalog's tiles cache in its own provisioned "
+            "bucket. When set, ALL tile reads/writes/deletes use THIS bucket "
+            "instead, with ``catalog_id`` folded into the key prefix to preserve "
+            "per-catalog isolation in the shared bucket. geoid does not provision "
+            "or manage this bucket: it must already exist and the service account "
+            "must hold read/write on it (existence is verified on the write "
+            "path). Path within the bucket: "
+            "``{cache_prefix or TilesCachingConfig.key_prefix/catalog_id}/"
+            "{collection_id}/{tms_id}/{z}/{x}/{y}.{format}``."
+        ),
+    )
+
+    cache_prefix: Mutable[Optional[str]] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "Optional object-key prefix WITHIN ``cache_bucket`` (ignored when "
+            "``cache_bucket`` is None). When None (default) the prefix is "
+            "``{TilesCachingConfig.key_prefix}/{catalog_id}`` — the catalog_id "
+            "fold keeps catalogs isolated in a shared bucket. When set, this "
+            "exact prefix is used verbatim (no catalog fold), so an operator can "
+            "co-locate a catalog's tile cache with its source data — e.g. a "
+            "preset that ingests ``gs://bucket/dir/file.gpkg`` sets "
+            "``cache_prefix='dir/file/<catalog_id>'`` to land tiles in a folder "
+            "named after the source file, alongside it (the catalog_id segment "
+            "keeps catalogs isolated). Full key then: "
+            "``{cache_prefix}/{collection_id}/{tms_id}/{z}/{x}/{y}.{format}``."
+        ),
+    )
+
+
 class TriggeredAction(BaseModel):
     """Defines a process to be triggered by a GCS event."""
     process_id: str = Field(..., description="The ID of the process to execute (e.g., 'ingestion').")

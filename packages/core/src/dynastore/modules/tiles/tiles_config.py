@@ -145,10 +145,14 @@ class TilesCachingConfig(PluginConfig):
     every tile-cache write and return a miss on every read, forcing PostGIS
     to re-render each tile on every request.
 
-    ``cache_bucket_override`` opts the entire config scope into a shared,
-    operator-managed bucket so bucket-free catalogs can participate in the L2
-    tile cache.  Per-catalog isolation is preserved: blob keys are namespaced
-    by the catalog's external (logical) identifier.
+    Cache STORE selection is intentionally NOT here — it is backend-specific.
+    The GCS backend caches in each catalog's own provisioned bucket by default,
+    or in an operator-configured external bucket (``GcpTileCacheConfig.
+    cache_bucket`` / ``cache_prefix``, GCP-specific and classified in the proxy
+    tree by the protocol it backs) so bucket-free catalogs can still cache and
+    preseed tiles; an on-prem/local-disk backend would key off a filesystem
+    root instead. Keeping store selection out of this class lets non-GCP
+    deployments reuse the same caching knobs without a GCP dependency.
 
     Live edits via ``PUT /configs/plugins/tiles_caching_config`` apply on
     the next tile save / fetch — no rewrite of already-cached objects.
@@ -228,46 +232,6 @@ class TilesCachingConfig(PluginConfig):
             ".signBlob`` on the Cloud Run SA; falls back to ``proxy`` "
             "automatically if signing fails. ``proxy`` streams bytes through "
             "the API process (lower concurrency ceiling)."
-        ),
-    )
-
-    # --- Shared / external bucket override (opt-in) ---
-    #
-    # When set, ALL tile cache I/O for this config scope is redirected to the
-    # named GCS bucket instead of the catalog's provisioned bucket.  This
-    # unblocks bucket-free (deferred-provisioned) catalogs: without it,
-    # save_tile silently no-ops and every tile re-renders from PostGIS.
-    #
-    # Blob keys are namespaced by the catalog's external (logical) id so
-    # per-catalog isolation is preserved within the shared bucket:
-    #   {effective_prefix}/{catalog_id}/{collection_id}/{tms_id}/{z}/{x}/{y}.{fmt}
-    # where effective_prefix = cache_bucket_prefix or key_prefix.
-    #
-    # The catalog_id written into the path is the external identifier from
-    # the request URL, never the internal c_... physical schema name.
-    cache_bucket_override: Mutable[Optional[str]] = Field(
-        default=None,
-        min_length=3,
-        max_length=222,
-        description=(
-            "Opt-in: GCS bucket name to use for ALL tile cache I/O regardless "
-            "of whether the catalog has a provisioned bucket. Enables bucket-free "
-            "catalogs to cache and preseed tiles. Blob keys are namespaced by "
-            "catalog_id (external logical id) to preserve isolation: "
-            "{prefix}/{catalog_id}/{collection_id}/{tms_id}/{z}/{x}/{y}.{fmt}. "
-            "None (default) = use the catalog's own provisioned bucket as before."
-        ),
-    )
-
-    cache_bucket_prefix: Mutable[Optional[str]] = Field(
-        default=None,
-        min_length=1,
-        max_length=128,
-        pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_\-/]*[a-zA-Z0-9]$",
-        description=(
-            "Object-key prefix used inside ``cache_bucket_override``. "
-            "Defaults to the value of ``key_prefix`` when None. "
-            "Ignored when ``cache_bucket_override`` is not set."
         ),
     )
 

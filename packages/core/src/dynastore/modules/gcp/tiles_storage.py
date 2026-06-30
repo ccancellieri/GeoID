@@ -60,6 +60,61 @@ def _build_blob_path(
     return f"{key_prefix}/{collection_id}/{tms_id}/{z}/{x}/{y}.{format}"
 
 
+@cached(maxsize=16, ttl=60, namespace="tile_external_bucket_exists")
+async def _external_bucket_exists(bucket_name: str) -> bool:
+    """True if the operator-supplied cache bucket exists and is reachable.
+
+    Cached per bucket name so the existence probe runs once, not once per saved
+    tile (a preseed writes millions). The 60s ``ttl`` lets a cached ``False``
+    self-heal: if an operator points ``cache_bucket`` at a not-yet-created
+    bucket and creates it afterwards, the probe re-runs within a minute rather
+    than poisoning the whole preseed until process restart. The steady-state
+    flow is create-bucket-then-configure, so a cached miss is rare anyway.
+    """
+    provider = get_protocol(CloudStorageClientProtocol)
+    if not provider:
+        return False
+    client = provider.get_storage_client()
+
+    def _lookup() -> bool:
+        return client.lookup_bucket(bucket_name) is not None
+
+    return await run_in_thread(_lookup)
+
+
+async def _external_gcp_cache(catalog_id: str) -> Tuple[Optional[str], Optional[str]]:
+    """The operator-configured external GCS cache ``(bucket, prefix)``, or
+    ``(None, None)``.
+
+    Read from ``GcpTileCacheConfig`` — a GCP-specific config classified in the
+    proxy tree by the protocol it backs (``…/gcp/tile_storage``) — NOT from the
+    backend-agnostic ``TilesCachingConfig``. This keeps the GCS bucket knob out
+    of the generic tiling config so on-prem/local-disk cache backends never
+    carry it. Resolved via ``ConfigsProtocol`` scoped by ``catalog_id`` (the
+    4-tier waterfall: collection → catalog → platform → defaults), so a preset
+    can pin one catalog's tile cache to a specific bucket/prefix (e.g. alongside
+    its source data) without leaking a global setting onto every other catalog.
+    Returns ``(None, None)`` when unset or the config service is unavailable
+    (tests / cold boot).
+    """
+    try:
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.modules.gcp.gcp_config import GcpTileCacheConfig
+        from dynastore.tools.discovery import get_protocol as _get_protocol
+
+        svc = _get_protocol(ConfigsProtocol)
+        if svc is not None:
+            gcfg = await svc.get_config(GcpTileCacheConfig, catalog_id=catalog_id)
+            if isinstance(gcfg, GcpTileCacheConfig):
+                return gcfg.cache_bucket, gcfg.cache_prefix
+    except Exception as exc:
+        logger.debug(
+            "tile cache: GcpTileCacheConfig read failed (%s); no external bucket",
+            exc,
+        )
+    return None, None
+
+
 async def _resolve_bucket(
     cfg: TilesCachingConfig,
     catalog_id: str,
@@ -69,22 +124,35 @@ async def _resolve_bucket(
 ) -> Tuple[Optional[str], str]:
     """Return ``(bucket_name, effective_blob_prefix)`` for a catalog.
 
-    Opt-in path (``cache_bucket_override`` is set): use the shared external
-    bucket for all catalogs; namespace blobs by ``catalog_id`` so per-catalog
-    isolation is preserved within the shared bucket.  The ``catalog_id`` value
-    is the external (logical) identifier from the request URL — never an
-    internal ``c_...`` physical schema name.
+    Opt-in path (``GcpTileCacheConfig.cache_bucket`` is set for this catalog):
+    use that operator-supplied bucket for all of the catalog's tile I/O. The
+    effective prefix is ``GcpTileCacheConfig.cache_prefix`` verbatim when set
+    (e.g. a folder named after the source file, already catalog-isolated by the
+    preset), otherwise ``{key_prefix}/{catalog_id}`` so blobs from different
+    catalogs never collide in a shared bucket. The ``catalog_id`` value is the
+    external (logical) identifier from the request URL — never an internal
+    ``c_...`` physical schema name. On a write path (``ensure=True``) the
+    bucket's existence is verified first (geoid never provisions it).
 
     Default path: resolve the catalog's own provisioned bucket via
     ``StorageProtocol``.  ``ensure=True`` calls
     ``ensure_storage_for_catalog`` (write path); ``ensure=False`` calls
     ``get_storage_identifier`` (read path, no provisioning side-effect).
+
+    The bucket override is a GCP-specific concern read from
+    ``GcpTileCacheConfig``; ``cfg`` (backend-agnostic ``TilesCachingConfig``)
+    supplies only ``key_prefix``.
     """
-    if cfg.cache_bucket_override:
-        # Use the operator-provided shared bucket.  Prefix is namespaced by
-        # catalog_id so blobs from different catalogs never collide.
-        base_prefix = cfg.cache_bucket_prefix or cfg.key_prefix
-        return cfg.cache_bucket_override, f"{base_prefix}/{catalog_id}"
+    ext_bucket, ext_prefix = await _external_gcp_cache(catalog_id)
+    external = (ext_bucket or "").strip()
+    if external:
+        if ensure and not await _external_bucket_exists(external):
+            raise RuntimeError(
+                f"Configured tile cache_bucket '{external}' does not exist "
+                "or is not accessible to the service account."
+            )
+        prefix = (ext_prefix or "").strip() or f"{cfg.key_prefix}/{catalog_id}"
+        return external, prefix
 
     # Default: per-catalog provisioned bucket.
     if ensure:

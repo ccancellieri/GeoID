@@ -82,8 +82,11 @@ async def test_get_tile_url_returns_signed_url_via_iam_signblob(monkeypatch):
     a valid SA email + fresh token (the IAM signBlob path on Cloud Run)."""
     from dynastore.modules.gcp.tiles_storage import TileBucketPreseedStorage
 
-    cfg = TilesCachingConfig(cache_bucket_override="shared-bucket", cache_bucket_prefix="tiles")
-    _install_config(monkeypatch, cfg)
+    _install_config(monkeypatch, TilesCachingConfig())
+    monkeypatch.setattr(
+        "dynastore.modules.gcp.tiles_storage._external_gcp_cache",
+        AsyncMock(return_value=("shared-bucket", "tiles/cat")),
+    )
 
     signed_url = "https://storage.googleapis.com/shared-bucket/tiles/cat/coll/WMQ/5/17/11.mvt?X-Goog-Signature=abc"
 
@@ -141,8 +144,11 @@ async def test_get_tile_url_warns_when_blob_exists_raises(monkeypatch, caplog):
     from google.api_core.exceptions import Forbidden
     from dynastore.modules.gcp.tiles_storage import TileBucketPreseedStorage
 
-    cfg = TilesCachingConfig(cache_bucket_override="shared-bucket", cache_bucket_prefix="tiles")
-    _install_config(monkeypatch, cfg)
+    _install_config(monkeypatch, TilesCachingConfig())
+    monkeypatch.setattr(
+        "dynastore.modules.gcp.tiles_storage._external_gcp_cache",
+        AsyncMock(return_value=("shared-bucket", "tiles/cat")),
+    )
 
     blob_mock = MagicMock()
     blob_mock.exists = MagicMock(side_effect=Forbidden("403 SA lacks storage.objects.get"))
@@ -190,8 +196,11 @@ async def test_get_tile_url_returns_none_silently_on_blob_miss(monkeypatch, capl
     """Normal cache-miss: blob.exists() returns False → None, no WARNING."""
     from dynastore.modules.gcp.tiles_storage import TileBucketPreseedStorage
 
-    cfg = TilesCachingConfig(cache_bucket_override="shared-bucket", cache_bucket_prefix="tiles")
-    _install_config(monkeypatch, cfg)
+    _install_config(monkeypatch, TilesCachingConfig())
+    monkeypatch.setattr(
+        "dynastore.modules.gcp.tiles_storage._external_gcp_cache",
+        AsyncMock(return_value=("shared-bucket", "tiles/cat")),
+    )
 
     blob_mock = MagicMock()
     blob_mock.exists = MagicMock(return_value=False)
