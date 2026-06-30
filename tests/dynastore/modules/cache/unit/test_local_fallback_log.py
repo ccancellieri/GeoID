@@ -16,21 +16,15 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Regression cover for #629 — Valkey socket-connect timeout passthrough +
-bounded LocalAsyncCacheBackend fallback log.
+"""Regression cover for #629 — bounded LocalAsyncCacheBackend fallback log.
 
-Two contracts pinned here:
+``_log_local_fallback`` logs INFO on first occurrence per process + DEBUG
+on subsequent occurrences. Successful Valkey backend registration re-arms
+the flag so a flap re-emits at INFO.
 
-1. ``VALKEY_SOCKET_CONNECT_TIMEOUT`` env var, when set, raises the
-   socket_connect_timeout floor on the legacy env-driven fallback path
-   above the ``ValkeyEngineConfig`` default (3s). When unset, the
-   timeout defaults to 10s so review-env cold boots don't trip
-   discovery-latency timeouts that cascade into LocalAsyncCacheBackend
-   fallback → distributed-lock contention → DB pool stall.
-
-2. ``_log_local_fallback`` logs INFO on first occurrence per process +
-   DEBUG on subsequent occurrences. Successful Valkey backend
-   registration re-arms the flag so a flap re-emits at INFO.
+``CacheModule`` is engine-driven only: ``ValkeyEngineConfig`` builds the
+client and ``socket_connect_timeout_seconds`` is the sole socket-timeout
+knob (set via the configs API), so there is no env-var override to cover.
 """
 
 from __future__ import annotations
@@ -42,56 +36,8 @@ import pytest
 from dynastore.modules.cache import cache_module
 from dynastore.modules.cache.cache_module import (
     _LOCAL_FALLBACK_LOGGED,  # noqa: F401 — pinned by source-grep guard below
-    _VALKEY_SOCKET_CONNECT_TIMEOUT_DEFAULT,
     _log_local_fallback,
-    _resolve_socket_connect_timeout,
 )
-
-
-# --------------------------------------------------------------------------
-# _resolve_socket_connect_timeout — env-var passthrough + default
-# --------------------------------------------------------------------------
-
-
-def test_resolve_socket_connect_timeout_uses_default_when_env_unset(monkeypatch):
-    """No env var + small engine default → default floor (10s) wins.
-
-    Engine default of 3s is the package value for ValkeyEngineConfig —
-    the legacy fallback path needs a more generous floor (#629) so review
-    env cold boots don't cascade into DB pool starvation.
-    """
-    monkeypatch.delenv("VALKEY_SOCKET_CONNECT_TIMEOUT", raising=False)
-    assert _resolve_socket_connect_timeout(3.0) == _VALKEY_SOCKET_CONNECT_TIMEOUT_DEFAULT
-    assert _VALKEY_SOCKET_CONNECT_TIMEOUT_DEFAULT == 10.0
-
-
-def test_resolve_socket_connect_timeout_honours_env_var(monkeypatch):
-    """Env var wins over both the default and the engine default."""
-    monkeypatch.setenv("VALKEY_SOCKET_CONNECT_TIMEOUT", "20")
-    assert _resolve_socket_connect_timeout(3.0) == 20.0
-    monkeypatch.setenv("VALKEY_SOCKET_CONNECT_TIMEOUT", "2.5")
-    assert _resolve_socket_connect_timeout(3.0) == 2.5  # operator override CAN tighten
-
-
-def test_resolve_socket_connect_timeout_prefers_engine_default_above_floor(
-    monkeypatch,
-):
-    """If an operator has already raised ValkeyEngineConfig above 10s,
-    don't silently tighten — pick the larger of (engine_default, floor).
-    """
-    monkeypatch.delenv("VALKEY_SOCKET_CONNECT_TIMEOUT", raising=False)
-    assert _resolve_socket_connect_timeout(15.0) == 15.0
-
-
-def test_resolve_socket_connect_timeout_invalid_env_falls_back(monkeypatch, caplog):
-    """Garbage in env var → log WARNING + fall through to default."""
-    monkeypatch.setenv("VALKEY_SOCKET_CONNECT_TIMEOUT", "not-a-number")
-    with caplog.at_level(logging.WARNING):
-        result = _resolve_socket_connect_timeout(3.0)
-    assert result == _VALKEY_SOCKET_CONNECT_TIMEOUT_DEFAULT
-    assert any(
-        "VALKEY_SOCKET_CONNECT_TIMEOUT" in rec.message for rec in caplog.records
-    )
 
 
 # --------------------------------------------------------------------------
@@ -151,13 +97,11 @@ def test_log_local_fallback_rearm_after_flag_reset(caplog):
 
 
 def test_module_level_state_pins():
-    """Pin the existence of the module-level flag + default constant so a
-    rename doesn't silently strip the bounded-log mechanism.
+    """Pin the existence of the module-level flag so a rename doesn't
+    silently strip the bounded-log mechanism.
     """
     assert hasattr(cache_module, "_LOCAL_FALLBACK_LOGGED")
     assert isinstance(cache_module._LOCAL_FALLBACK_LOGGED, bool)
-    assert hasattr(cache_module, "_VALKEY_SOCKET_CONNECT_TIMEOUT_DEFAULT")
-    assert cache_module._VALKEY_SOCKET_CONNECT_TIMEOUT_DEFAULT == 10.0
 
 
 def test_success_paths_rearm_bounded_log():

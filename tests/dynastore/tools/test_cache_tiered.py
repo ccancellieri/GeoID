@@ -817,7 +817,7 @@ class TestCircuitBreaker:
         try:
             from dynastore.tools.cache_valkey import ValkeyCacheBackend
 
-            backend = ValkeyCacheBackend("redis://localhost:6379")
+            backend = ValkeyCacheBackend(client=MagicMock())
             assert backend._consecutive_failures == 0
 
             # Simulate a failure
@@ -841,7 +841,7 @@ class TestCircuitBreaker:
         try:
             from dynastore.tools.cache_valkey import ValkeyCacheBackend
 
-            backend = ValkeyCacheBackend("redis://localhost:6379")
+            backend = ValkeyCacheBackend(client=MagicMock())
             backend._consecutive_failures = 2
 
             backend._record_success()
@@ -875,7 +875,7 @@ class TestCircuitBreaker:
         try:
             from dynastore.tools.cache_valkey import ValkeyCacheBackend
 
-            backend = ValkeyCacheBackend("redis://localhost:6379")
+            backend = ValkeyCacheBackend(client=MagicMock())
             backend._client = MagicMock()
             backend._client.set = AsyncMock(side_effect=RuntimeError("boom-from-shard"))
 

@@ -57,9 +57,9 @@ class DBConfigAppState(Protocol):
     # task that may finish AFTER CacheModule starts.  Publishing the task
     # handle here lets downstream priority-9 modules await its completion
     # before reading engine_cache.get(...) — otherwise CacheModule reads an
-    # empty snapshot, raises KeyError, and falls into the legacy env-var
-    # fallback path with whatever VALKEY_CLUSTER topology the env happens
-    # to declare.  See GeoID #833.
+    # empty snapshot, raises KeyError, and degrades to the local in-memory
+    # cache even though the snapshot would have resolved a moment later.
+    # See GeoID #833.
     engine_snapshot_refresh_task: "Optional[asyncio.Task[bool]]"
 
 

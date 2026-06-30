@@ -22,9 +22,9 @@ DBConfigModule (priority 0) populates ``app_state.engine_cache`` by handing
 the same dict to ``asyncio.create_task(refresh_snapshot_until_ready(...))``
 and yielding from its lifespan immediately.  CacheModule (priority 9) then
 ran ``engine_cache.get("valkey_engine")`` *before* the task had a chance to
-fill the dict, raising KeyError and silently latching the legacy
-``VALKEY_URL`` / ``VALKEY_CLUSTER`` env fallback path with whatever topology
-the deployment env happened to declare.
+fill the dict, raising KeyError and silently degrading to the local
+in-memory cache even though the engine snapshot would have resolved a
+moment later.
 
 The fix publishes the task handle on ``app_state.engine_snapshot_refresh_task``
 and CacheModule awaits it before any engine_cache read.  This file pins
@@ -122,15 +122,16 @@ async def test_cache_module_awaits_refresh_task_before_engine_cache_get(
         # the get fired) — get was called exactly once and returned the
         # sentinel client.
         assert backend_built["hit"] is True, (
-            "engine-mode backend must have been built — refresh-await failure "
-            "would route through the legacy env path instead"
+            "engine-mode backend must have been built — a refresh-await "
+            "failure would have left engine_cache.get KeyError-ing and the "
+            "module degrading to the local in-memory cache instead"
         )
         assert refresh_started.is_set()
         assert snapshot_ready.is_set()
         assert get_call_count["n"] == 1
 
 
-async def test_cache_module_no_refresh_task_attr_falls_back_to_legacy_path(
+async def test_cache_module_no_refresh_task_attr_degrades_to_local(
     monkeypatch,
 ):
     """Back-compat: pre-#833 test stubs lack the attribute — must still work.
@@ -143,8 +144,8 @@ async def test_cache_module_no_refresh_task_attr_falls_back_to_legacy_path(
     from dynastore.modules.cache.cache_module import CacheModule
 
     monkeypatch.delenv("VALKEY_URL", raising=False)
-    # No engine_cache, no refresh task — should reach the "VALKEY_URL not
-    # set" early-yield without raising AttributeError on missing attr.
+    # No engine_cache, no refresh task — should reach the local in-memory
+    # cache early-yield without raising AttributeError on missing attr.
     app_state = _make_app_state()  # no engine_cache, no task attr
 
     module = CacheModule(app_state=app_state)

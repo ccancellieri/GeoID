@@ -31,27 +31,20 @@ Configuration SSOT is ``ValkeyEngineConfig`` (in
 under ``platform/protocols/storage`` and applied live without restart —
 URL, discovery_host/port, cluster_mode, require_full_coverage,
 dynamic_startup_nodes, discovery_port_remap, TLS, IAM,
-socket_timeout/connect_timeout, TCP keepalives.
+socket_timeout/connect_timeout, TCP keepalives. ``CacheModule`` acquires
+the client exclusively via ``app_state.engine_cache.get("valkey_engine")``
+— there is no separate env-driven connection path in production.
 
 Cluster mode auto-detection:
-  Regardless of which path (engine-driven or legacy env-driven), the backend
-  probes the server with a standalone client first. If the server reports
-  cluster mode (via INFO), the backend automatically rebuilds as ValkeyCluster
-  transparently. This eliminates the need for pre-config or env-var flags for
-  cluster detection.
+  The backend probes the server with the engine-built client first. If the
+  server reports cluster mode (via INFO) but the client is standalone, the
+  engine config's ``cluster_mode`` is misconfigured; ``CacheModule`` logs a
+  WARNING and rebuilds a dedicated cluster-mode client for the process.
 
-Env-var bootstrap fallback (DEPRECATED; used only when the engine cache isn't
-available, e.g. a minimal worker SCOPE that omits ``DBConfigModule``):
-
-  VALKEY_URL           — connection URL (e.g. ``valkey://10.0.0.1:6379``)
-  VALKEY_TLS           — (deprecated) ``true`` to wrap the connection in TLS.
-                         Use ValkeyEngineConfig.tls instead.
-  VALKEY_TLS_CA_PATH   — (deprecated) optional path to a server CA bundle.
-                         Use ValkeyEngineConfig.tls_ca_path instead.
-  VALKEY_IAM_AUTH      — (deprecated) ``true`` to authenticate via OAuth2/ADC.
-                         Use ValkeyEngineConfig.iam_auth instead.
-  VALKEY_CLUSTER       — (deprecated, auto-detected) ``true`` for Memorystore CLUSTER.
-                         Cluster mode is now detected automatically; no env var needed.
+``VALKEY_URL`` env var:
+  Consumed directly by ``ValkeyEngineConfig.engine_init()`` as the
+  boot-time bootstrap connection string when ``connection_url`` is unset
+  on the engine config — not read by this module.
 """
 
 from __future__ import annotations
@@ -59,7 +52,6 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
-import os
 import socket
 from datetime import datetime
 from enum import Enum
@@ -512,8 +504,8 @@ class _GoogleIamCredentialProvider:
             )
         except ImportError as e:
             raise ImportError(
-                "VALKEY_IAM_AUTH=true requires the 'module_gcp' extra "
-                "(google-auth). "
+                "ValkeyEngineConfig.iam_auth=true requires the 'module_gcp' "
+                "extra (google-auth). "
                 f"Original error: {e}"
             ) from e
 
@@ -552,36 +544,25 @@ class ValkeyCacheBackend:
 
     def __init__(
         self,
-        url: Optional[str] = None,
+        client: Any,
         key_prefix: str = "ds:",
-        socket_connect_timeout: Optional[float] = None,
-        socket_timeout: Optional[float] = None,
-        tcp_keepalive_idle: Optional[int] = None,
-        tcp_keepalive_interval: Optional[int] = None,
-        tcp_keepalive_count: Optional[int] = None,
-        circuit_breaker_threshold: Optional[int] = None,
         *,
-        cluster_mode: Optional[bool] = None,
-        client: Optional[Any] = None,
         pool: Optional[Any] = None,
         owns_client: bool = True,
+        circuit_breaker_threshold: Optional[int] = None,
     ) -> None:
-        """Construct a Valkey cache backend.
+        """Wrap an engine-built Valkey ``client`` as the cache backend.
 
-        Two construction modes:
-
-        1. **Engine-driven (preferred)** — pass a pre-built ``client``
-           (and optional ``pool``). The engine (``ValkeyEngineConfig``)
-           owns lifecycle; set ``owns_client=False`` so ``close()`` does
-           not double-release a resource the engine cache will release.
-
-        2. **Legacy env-driven (deprecated)** — pass ``url`` (and optional timeout /
-           keepalive kwargs). The backend builds its own client via
-           ``build_valkey_client(...)`` consuming the legacy
-           ``VALKEY_TLS`` / ``VALKEY_IAM_AUTH`` / ``VALKEY_CLUSTER`` env
-           vars for backward compatibility. This path is deprecated; use
-           ``ValkeyEngineConfig`` (via the configs API) for live-reconfig instead.
-           Used as the bootstrap fallback when the engine is unavailable.
+        ``ValkeyEngineConfig`` (the configs-API SSOT) is the single
+        client-construction path: it builds the client via
+        ``build_valkey_client`` and ``CacheModule`` wraps it here with
+        ``owns_client=False`` so ``close()`` does not double-release a
+        resource the engine cache releases at shutdown. Connection params
+        (URL / TLS / IAM / socket hardening / cluster mode) live on
+        ``ValkeyEngineConfig`` and ``build_valkey_client`` — never on this
+        wrapper; reconfiguration flows through the configs API and
+        re-inits the engine, never by re-constructing this backend with raw
+        connection kwargs.
         """
         # ModuleNotFoundError (a subclass of ImportError) so existing
         # `except ImportError` handlers still catch it AND the module
@@ -595,59 +576,14 @@ class ValkeyCacheBackend:
                 f"Original error: {_CACHE_DEPS_ERR}"
             )
 
-        if client is not None:
-            # Mode 1: engine-driven — caller owns lifecycle.
-            self._client = client
-            self._pool = pool
-            self._owns_client = owns_client
-        else:
-            # Mode 2: legacy env-driven path — preserved for tests and the
-            # bootstrap fallback when no engine_cache is wired.
-            if not url:
-                raise ValueError(
-                    "ValkeyCacheBackend: either `client` or `url` must be provided."
-                )
-            tls = os.getenv("VALKEY_TLS", "").lower() in ("1", "true", "yes")
-            tls_ca_path = os.getenv("VALKEY_TLS_CA_PATH")
-            iam_auth = os.getenv("VALKEY_IAM_AUTH", "").lower() in ("1", "true", "yes")
-            # Use provided cluster_mode if specified (e.g. from auto-detection),
-            # otherwise read from env var for backward compatibility
-            if cluster_mode is None:
-                cluster_mode = os.getenv("VALKEY_CLUSTER", "").lower() in (
-                    "1",
-                    "true",
-                    "yes",
-                )
-            import logging
-            _logger = logging.getLogger(__name__)
-            _logger.info(
-                "ValkeyCacheBackend (legacy): cluster_mode=%s (from param=%s, env_VALKEY_CLUSTER=%s)",
-                cluster_mode,
-                cluster_mode is not None,
-                os.getenv("VALKEY_CLUSTER", "not-set"),
+        if client is None:
+            raise ValueError(
+                "ValkeyCacheBackend requires a pre-built `client` from "
+                "ValkeyEngineConfig.engine_init()."
             )
-            built_client, built_pool = build_valkey_client(
-                url=url,
-                cluster_mode=cluster_mode,
-                tls=tls,
-                tls_ca_path=tls_ca_path,
-                tls_cert_reqs="required" if tls_ca_path else "none",
-                tls_check_hostname=bool(tls_ca_path),
-                iam_auth=iam_auth,
-                socket_connect_timeout=socket_connect_timeout,
-                socket_timeout=socket_timeout,
-                tcp_keepalive_idle=tcp_keepalive_idle,
-                tcp_keepalive_interval=tcp_keepalive_interval,
-                tcp_keepalive_count=tcp_keepalive_count,
-            )
-            _client_type = type(built_client).__name__
-            _logger.info(
-                "ValkeyCacheBackend (legacy): client type=%s",
-                _client_type,
-            )
-            self._client = built_client
-            self._pool = built_pool
-            self._owns_client = True
+        self._client = client
+        self._pool = pool
+        self._owns_client = owns_client
 
         self._prefix = key_prefix
         self._stats = CacheStats(maxsize=0)

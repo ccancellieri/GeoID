@@ -19,7 +19,7 @@
 """
 CacheModule — registers a shared Valkey cache backend.
 
-Primary mode (engine-driven):
+Engine-driven (the only supported path):
     Acquires the Valkey client from ``app_state.engine_cache`` (backed by
     ``ValkeyEngineConfig``).  Connection params (URL/TLS/IAM/cluster) are
     mutable via the configs API; changes trigger a live rebuild without
@@ -27,17 +27,15 @@ Primary mode (engine-driven):
 
     Config defaults are seeded from ``docker/config/defaults/valkey-engine-config.json``.
     Initial cluster detection (if no config exists yet) is automatic: the module probes
-    with a standalone client first; if the server reports cluster mode, it rebuilds
-    as ValkeyCluster transparently.
+    with the engine-built client first; if the server reports cluster mode but the
+    client is standalone, it rebuilds a dedicated cluster-mode client transparently
+    and logs a WARNING that the stored ``cluster_mode`` config is misconfigured.
 
-Legacy fallback (env-driven):
-    When ``app_state.engine_cache`` is unavailable, falls back to reading
-    ``VALKEY_URL`` from the environment (for backward compatibility).
-    Cluster detection still works: a standalone client probes the server,
-    detects cluster mode from the INFO response, and rebuilds as ValkeyCluster
-    if needed. Note: ``VALKEY_CLUSTER``, ``VALKEY_TLS``, ``VALKEY_IAM_AUTH``,
-    and ``VALKEY_TLS_CA_PATH`` env vars are deprecated; use ``ValkeyEngineConfig``
-    (via the configs API) for live-reconfig instead.
+    When ``app_state.engine_cache`` is absent, or the engine has no connection
+    configured (no ``VALKEY_URL``/``connection_url``/``discovery_host``), or the
+    ``module_cache`` extra isn't installed, the module degrades to
+    ``LocalAsyncCacheBackend`` (in-memory, per-instance) rather than crashing the
+    lifespan.
 
 Cache-layer settings (probe_timeout, circuit_breaker) remain on
 ``CachePluginConfig``.
@@ -51,7 +49,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
@@ -60,6 +57,7 @@ from dynastore.tools.async_utils import LoopLocalLock
 
 if TYPE_CHECKING:
     from dynastore.modules.cache.cache_config import CachePluginConfig
+    from dynastore.modules.db_config.engine_config import ValkeyEngineConfig
     from dynastore.modules.db_config.engine_instance_cache import EngineInstanceCache
 
 logger = logging.getLogger(__name__)
@@ -80,47 +78,6 @@ _apply_lock: LoopLocalLock = LoopLocalLock()
 # DEBUG.  Reset only on a successful Valkey backend registration so a
 # legitimate re-degrade after a flap re-emits at INFO.
 _LOCAL_FALLBACK_LOGGED: bool = False
-
-# Default for the legacy env-driven fallback path's connect timeout when
-# ``VALKEY_SOCKET_CONNECT_TIMEOUT`` is unset (#629).  Picked at 10s — more
-# generous than the engine-driven default (3s) because the legacy path is
-# the cold-boot fallback when no engine snapshot is wired, which is exactly
-# when discovery latency spikes (cluster topology fetch, IAM token mint,
-# TLS handshake) tend to stack up.  A short timeout there cascades to
-# LocalAsyncCacheBackend fallback → distributed-lock contention → DB pool
-# stall (see #629).
-_VALKEY_SOCKET_CONNECT_TIMEOUT_DEFAULT: float = 10.0
-
-
-def _resolve_socket_connect_timeout(engine_default: float) -> float:
-    """Resolve the legacy-fallback socket-connect timeout.
-
-    Precedence:
-      1. ``VALKEY_SOCKET_CONNECT_TIMEOUT`` env var (operators tune review env).
-      2. ``engine_default`` (``ValkeyEngineConfig().socket_connect_timeout_seconds``)
-         when it differs from the package default of 3.0s — operators may
-         already be using the engine-config knob.
-      3. ``_VALKEY_SOCKET_CONNECT_TIMEOUT_DEFAULT`` (10s) — see #629
-         rationale on why we raise the floor for the legacy fallback path.
-
-    Invalid env-var values fall through to the default and emit a WARNING
-    so the operator can see their tuning was rejected (rare).
-    """
-    raw = os.getenv("VALKEY_SOCKET_CONNECT_TIMEOUT")
-    if raw is not None and raw.strip():
-        try:
-            return float(raw)
-        except ValueError:
-            logger.warning(
-                "VALKEY_SOCKET_CONNECT_TIMEOUT=%r is not a number; "
-                "using default %.1fs",
-                raw, _VALKEY_SOCKET_CONNECT_TIMEOUT_DEFAULT,
-            )
-    # Engine default may have been tuned via ValkeyEngineConfig already
-    # (3.0s on the unmodified field default).  Prefer the larger of (engine
-    # default, 10s floor) so existing engine-config tuning is never silently
-    # tightened by this fallback.
-    return max(engine_default, _VALKEY_SOCKET_CONNECT_TIMEOUT_DEFAULT)
 
 
 def _log_local_fallback(message: str, *args: Any) -> None:
@@ -179,6 +136,53 @@ async def _load_cache_config() -> "CachePluginConfig":
     from dynastore.modules.cache.cache_config import CachePluginConfig
 
     return CachePluginConfig()
+
+
+async def _load_valkey_engine_config() -> "ValkeyEngineConfig":
+    """Load the live ``ValkeyEngineConfig`` snapshot from the PluginConfig protocol.
+
+    Mirrors ``_load_cache_config`` above.  Used by the cluster auto-detect
+    rebuild path (``CacheModule.lifespan``) to obtain the connection params
+    that produced the already-built engine client, so the cluster-mode
+    rebuild can reuse ``ValkeyEngineConfig.engine_init()`` instead of
+    re-deriving URL/TLS/IAM/discovery resolution here.
+    """
+    from dynastore.modules.db_config.engine_config import ValkeyEngineConfig
+
+    try:
+        from dynastore.models.protocols.configs import ConfigsProtocol
+
+        try:
+            from dynastore.tools.discovery import get_protocol
+
+            configs_proto = get_protocol(ConfigsProtocol)
+        except Exception as e:
+            logger.debug(
+                "CacheModule: ConfigsProtocol not available for cluster "
+                "auto-detect rebuild (%s), using engine defaults", e
+            )
+            return ValkeyEngineConfig()
+
+        if configs_proto is None:
+            return ValkeyEngineConfig()
+
+        try:
+            cfg = await configs_proto.get_config(ValkeyEngineConfig)
+            if cfg:
+                return cfg
+        except Exception as e:
+            logger.debug(
+                "CacheModule: failed to load ValkeyEngineConfig for cluster "
+                "auto-detect rebuild (%s), using engine defaults", e
+            )
+
+    except Exception as e:
+        logger.debug(
+            "CacheModule: config protocol unavailable for cluster "
+            "auto-detect rebuild (%s), using engine defaults", e
+        )
+
+    return ValkeyEngineConfig()
 
 
 async def _on_valkey_engine_config_change(
@@ -462,9 +466,8 @@ class CacheModule(ModuleProtocol):
         # (priority 9) starts the engine_cache object exists but its
         # snapshot dict is still empty.  Awaiting the published task handle
         # bridges that race — without this, engine_cache.get raises KeyError
-        # and we fall into the legacy VALKEY_URL/VALKEY_CLUSTER env fallback
-        # path against whatever topology the deployment env declares
-        # (mis-matched topology = circuit-breaker trip every cold start).
+        # and the module degrades to the local in-memory cache even though
+        # the engine snapshot would have resolved a moment later.
         # ``getattr`` keeps back-compat with test stubs that pre-date #833.
         refresh_task = getattr(app_state, "engine_snapshot_refresh_task", None)
         if refresh_task is not None:
@@ -475,10 +478,9 @@ class CacheModule(ModuleProtocol):
                 await refresh_task
             except (asyncio.CancelledError, Exception) as exc:  # noqa: BLE001
                 # Failed/cancelled refresh is non-fatal here — the engine_cache
-                # read below will simply KeyError and the legacy fallback
-                # path (now correctly matching env topology after the
-                # apps.review.yml fix) takes over.  Logged at WARNING so
-                # operators can spot the boot-order regression.
+                # read below will simply KeyError and the local in-memory
+                # fallback below takes over.  Logged at WARNING so operators
+                # can spot the boot-order regression.
                 logger.warning(
                     "CacheModule: engine snapshot refresh task did not complete "
                     "cleanly (%s); proceeding with whatever the snapshot has.",
@@ -504,13 +506,13 @@ class CacheModule(ModuleProtocol):
             except KeyError:
                 logger.info(
                     "CacheModule: valkey_engine not registered in engine_cache; "
-                    "falling back to VALKEY_URL env."
+                    "degrading to local in-memory cache."
                 )
             except RuntimeError as e:
                 if "disabled" in str(e).lower():
                     logger.info(
                         "CacheModule: valkey_engine is disabled; "
-                        "falling back to VALKEY_URL env."
+                        "degrading to local in-memory cache."
                     )
                 else:
                     raise
@@ -519,91 +521,18 @@ class CacheModule(ModuleProtocol):
                 # raises ``ValueError`` when neither ``connection_url`` nor a
                 # ``discovery_host`` is configured (e.g. empty defaults in
                 # integration tests, notebooks, demos, fresh installs).
-                # Treat it like the "disabled" RuntimeError path: fall through
-                # to the legacy env-driven fallback (which itself falls back
-                # to LOCAL in-memory cache when ``VALKEY_URL`` is also unset).
-                # WARNING level so misconfigured production deployments are
-                # still visible in logs without aborting the whole lifespan.
+                # ``client`` stays None and the ``backend is None`` check
+                # below degrades to the local in-memory cache.  WARNING
+                # level so misconfigured production deployments are still
+                # visible in logs without aborting the whole lifespan.
                 logger.warning(
                     "CacheModule: valkey_engine misconfigured (%s); "
-                    "falling back to VALKEY_URL env. If this is production, "
-                    "set VALKEY_URL or VALKEY_DISCOVERY_HOST to restore the "
-                    "Valkey backend.",
+                    "degrading to local in-memory cache. If this is "
+                    "production, set ValkeyEngineConfig.connection_url (or "
+                    "VALKEY_URL / discovery_host) to restore the Valkey "
+                    "backend.",
                     e,
                 )
-
-        # Legacy fallback: env-driven mode.
-        if not engine_mode:
-            valkey_url = os.getenv("VALKEY_URL")
-            if not valkey_url:
-                _log_local_fallback(
-                    "CACHE BACKEND: LOCAL (in-memory, per-instance) — "
-                    "VALKEY_URL not set; cross-instance consistency NOT guaranteed."
-                )
-                yield
-                return
-
-            from dynastore.tools.cache_valkey import _CACHE_DEPS_OK
-
-            if not _CACHE_DEPS_OK:
-                _log_local_fallback(
-                    "CACHE BACKEND: LOCAL (in-memory, per-instance) — VALKEY_URL "
-                    "is set but the 'module_cache' extra is not in this "
-                    "deployment's SCOPE (msgpack/valkey not installed); skipping "
-                    "the Valkey backend."
-                )
-                yield
-                return
-
-            _safe_url = valkey_url.split("@")[-1] if "@" in valkey_url else valkey_url
-            _tls = os.getenv("VALKEY_TLS", "").lower() in ("1", "true", "yes")
-            _iam = os.getenv("VALKEY_IAM_AUTH", "").lower() in ("1", "true", "yes")
-            _cluster = os.getenv("VALKEY_CLUSTER", "").lower() in ("1", "true", "yes")
-            # Pull the connection-hardening defaults from ValkeyEngineConfig
-            # so the bootstrap-fallback path is NOT a hole that re-opens the
-            # un-hardened-socket regression that #720 / #724 closed for the
-            # engine-driven mode (idle Cloud NAT drops + cold cluster-topology
-            # fetch exceeding valkey-py's 5s hard default).
-            from dynastore.modules.db_config.engine_config import (
-                ValkeyEngineConfig,
-            )
-
-            _engine_defaults = ValkeyEngineConfig()
-            _socket_connect_timeout = _resolve_socket_connect_timeout(
-                _engine_defaults.socket_connect_timeout_seconds
-            )
-            logger.info(
-                "CacheModule (legacy): Connecting to Valkey at %s (tls=%s, iam_auth=%s, cluster=%s, probe_timeout=%ss, socket_connect_timeout=%ss) …",
-                _safe_url,
-                _tls,
-                _iam,
-                _cluster,
-                cache_cfg.probe_timeout_seconds,
-                _socket_connect_timeout,
-            )
-            try:
-                from dynastore.tools.cache_valkey import ValkeyCacheBackend
-
-                backend = ValkeyCacheBackend(
-                    url=valkey_url,
-                    socket_connect_timeout=_socket_connect_timeout,
-                    socket_timeout=_engine_defaults.socket_timeout_seconds,
-                    tcp_keepalive_idle=_engine_defaults.tcp_keepalive_idle_seconds,
-                    tcp_keepalive_interval=_engine_defaults.tcp_keepalive_interval_seconds,
-                    tcp_keepalive_count=_engine_defaults.tcp_keepalive_count,
-                    circuit_breaker_threshold=cache_cfg.circuit_breaker_threshold,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "CacheModule (legacy): Cannot initialise Valkey backend (%s) — falling back to local cache.",
-                    exc,
-                )
-                _log_local_fallback(
-                    "CACHE BACKEND: LOCAL (in-memory, per-instance) — "
-                    "Valkey unavailable; cross-instance consistency NOT guaranteed."
-                )
-                yield
-                return
 
         # Engine-driven mode: wrap the pre-built client.
         if engine_mode and client is not None:
@@ -656,42 +585,50 @@ class CacheModule(ModuleProtocol):
                     r["start"], r["end"], r["node"],
                 )
 
-            # Auto-detect cluster mode: if the server reports cluster but we
-            # connected with a standalone client, rebuild as ValkeyCluster.
-            # Drive this off the server's self-reported redis_mode (the client
-            # is standalone here, so topo.is_cluster is False by definition).
-            if server_redis_mode == "cluster" and not engine_mode:
-                logger.info(
-                    "CacheModule: detected cluster mode; rebuilding as ValkeyCluster"
+            # Auto-detect cluster mode: if the server reports cluster but the
+            # engine built a standalone client, the stored
+            # ``ValkeyEngineConfig.cluster_mode`` is misconfigured — config
+            # is the SSOT, so this is surfaced as a loud WARNING rather than
+            # silently patched.  We still rebuild a dedicated cluster-mode
+            # client for this process so the cache is correct in the
+            # meantime: a fresh ``cluster_mode=True`` copy of the live
+            # engine config re-runs ``ValkeyEngineConfig.engine_init()`` so
+            # connection-param resolution (URL/TLS/IAM/discovery) stays in
+            # one place rather than being re-derived here.  The new backend
+            # owns the rebuilt client (``owns_client=True``); the engine's
+            # original standalone client is left untouched — it remains
+            # owned by ``engine_cache`` and is released via
+            # ``ValkeyEngineConfig.engine_release`` at engine shutdown, not
+            # here.
+            if server_redis_mode == "cluster" and not topo.get("is_cluster"):
+                logger.warning(
+                    "CacheModule: server reports cluster mode but "
+                    "ValkeyEngineConfig.cluster_mode=False built a "
+                    "standalone client — the stored engine config is "
+                    "misconfigured. Correct it via PATCH "
+                    "/configs/plugins/valkey_engine_config "
+                    "(cluster_mode=true). Rebuilding a cluster-mode client "
+                    "for this process in the meantime."
                 )
-                await backend.close()
                 try:
-                    from dynastore.tools.cache_valkey import ValkeyCacheBackend
-                    backend = ValkeyCacheBackend(
-                        url=valkey_url,
-                        socket_connect_timeout=_socket_connect_timeout,
-                        socket_timeout=_engine_defaults.socket_timeout_seconds,
-                        tcp_keepalive_idle=_engine_defaults.tcp_keepalive_idle_seconds,
-                        tcp_keepalive_interval=_engine_defaults.tcp_keepalive_interval_seconds,
-                        tcp_keepalive_count=_engine_defaults.tcp_keepalive_count,
-                        circuit_breaker_threshold=cache_cfg.circuit_breaker_threshold,
-                        cluster_mode=True,
+                    valkey_cfg = await _load_valkey_engine_config()
+                    cluster_cfg = valkey_cfg.model_copy(
+                        update={"cluster_mode": True}
                     )
+                    new_client = await cluster_cfg.engine_init()
+                    new_backend = ValkeyCacheBackend(
+                        client=new_client,
+                        owns_client=True,
+                        circuit_breaker_threshold=cache_cfg.circuit_breaker_threshold,
+                    )
+                    backend = new_backend
                 except Exception as exc:
                     logger.warning(
-                        "CacheModule: failed to rebuild as ValkeyCluster (%s); using standalone",
+                        "CacheModule: failed to rebuild a cluster-mode "
+                        "client (%s); continuing with the standalone "
+                        "client — commands may misroute until the engine "
+                        "config is corrected.",
                         exc,
-                    )
-                    from dynastore.tools.cache_valkey import ValkeyCacheBackend
-                    backend = ValkeyCacheBackend(
-                        url=valkey_url,
-                        socket_connect_timeout=_socket_connect_timeout,
-                        socket_timeout=_engine_defaults.socket_timeout_seconds,
-                        tcp_keepalive_idle=_engine_defaults.tcp_keepalive_idle_seconds,
-                        tcp_keepalive_interval=_engine_defaults.tcp_keepalive_interval_seconds,
-                        tcp_keepalive_count=_engine_defaults.tcp_keepalive_count,
-                        circuit_breaker_threshold=cache_cfg.circuit_breaker_threshold,
-                        cluster_mode=False,
                     )
         except Exception as exc:
             _reason = (
@@ -721,8 +658,7 @@ class CacheModule(ModuleProtocol):
         global _LOCAL_FALLBACK_LOGGED
         _LOCAL_FALLBACK_LOGGED = False
         logger.info(
-            "CACHE BACKEND: VALKEY (shared, cross-instance, %s) — host=%s version=%s mode=%s used_memory=%s",
-            "engine" if engine_mode else "legacy",
+            "CACHE BACKEND: VALKEY (shared, cross-instance, engine) — host=%s version=%s mode=%s used_memory=%s",
             _safe_url,
             version,
             mode,
@@ -731,9 +667,9 @@ class CacheModule(ModuleProtocol):
 
         # Register the apply handler unconditionally so a later
         # PUT /configs/plugins/valkey_engine_config can trigger a live
-        # reconnect even when the boot snapshot fell back to the legacy
-        # env-driven path (DBService not yet up when DBConfigModule built
-        # its snapshot — see #818).  The handler is null-safe wrt the
+        # reconnect even when the boot snapshot was built before
+        # DBService came up (DBConfigModule populated an empty engine
+        # snapshot — see #818).  The handler is null-safe wrt the
         # backend type: it closes whatever ``_current_backend`` is and
         # then re-gets the engine, which by post-boot wait-and-retry will
         # have been populated by ``refresh_snapshot_until_ready``.
