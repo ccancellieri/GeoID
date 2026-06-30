@@ -132,6 +132,15 @@ _health_config: _ConnectionHealthInfraConfig = _ConnectionHealthInfraConfig()
 # to this global when the config service is unavailable.
 _max_concurrent_connection_retries: int = 3
 
+# Fallback for the read-disconnect retry attempt budget (1 original + N-1
+# retries). Mirrors the default of
+# ConnectionHealthConfig.read_disconnect_retry_attempts so the sync execution
+# path and tests can read the value without a live platform config service. The
+# async execution path reads the live ConnectionHealthConfig value per-call
+# (central cached getter) and falls back to this global when the config service
+# is unavailable.
+_read_disconnect_retry_attempts: int = 2
+
 
 def resolve_connection_retry_config() -> Tuple[int, float, float, float]:
     """Return the current ``(max_retries, base_delay, max_delay, jitter)``."""
@@ -178,6 +187,20 @@ def resolve_max_concurrent_connection_retries() -> int:
     to control the fallback value without a live config service.
     """
     return _max_concurrent_connection_retries
+
+
+def resolve_read_disconnect_retry_attempts() -> int:
+    """Return the fallback total-attempt budget for a mid-flight read disconnect.
+
+    Used by the sync execution path (no async config service to await) and as
+    the fallback for the async path when the ``PlatformConfigsProtocol`` config
+    service is unavailable (tests, early startup). The async live path reads
+    ``ConnectionHealthConfig.read_disconnect_retry_attempts`` directly from the
+    central cached getter. Tests may replace the global
+    ``_read_disconnect_retry_attempts`` directly to control the value without a
+    live config service.
+    """
+    return _read_disconnect_retry_attempts
 
 
 # ---------------------------------------------------------------------------
@@ -255,5 +278,24 @@ class ConnectionHealthConfig(PluginConfig):
             "high parallelism. Read per-call via the central cached config getter "
             "— changes take effect immediately without a pod restart. Must be in "
             "[1, 32]."
+        ),
+    )
+
+    read_disconnect_retry_attempts: Mutable[int] = Field(
+        default=2,
+        ge=1,
+        le=10,
+        description=(
+            "Total attempts (1 original + N-1 retries) for a read-only query whose "
+            "pooled connection dies mid-flight — it passed pool_pre_ping at "
+            "checkout but the wire was killed server-side (NAT idle reset, DB "
+            "failover) before the SELECT reached PostgreSQL. Only read-only (DQL) "
+            "executions retry; writes and DDL never replay, since a half-applied "
+            "write must not be re-run. Each retry invalidates the dead wire and "
+            "acquires a fresh pooled connection. Default 2 (one retry) clears "
+            "virtually all transient TOCTOU disconnects; raise only if the network "
+            "drops idle wires aggressively. Read per-call via the central cached "
+            "config getter — changes take effect immediately without a pod "
+            "restart. Must be in [1, 10]."
         ),
     )

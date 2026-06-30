@@ -1095,9 +1095,17 @@ async def get_collection_source_srid(
             LIMIT 1;
         """)
         sidecar_table = f"{phys_table}_geometries"
+        # Run this pure system-catalog read against the ENGINE, not the
+        # managed_transaction `conn`. It depends only on phys_schema/phys_table
+        # (resolved above from the driver location), never on anything written
+        # or read earlier in this transaction, so it is safe to execute on a
+        # fresh pooled connection. Doing so routes it through the executor's
+        # engine path, which retries once on a mid-flight disconnect (a pooled
+        # wire killed server-side after pool_pre_ping but before execute) —
+        # exactly the TOCTOU failure that 500'd this lookup in production.
         srid = await DQLQuery(
             srid_query, result_handler=ResultHandler.SCALAR_ONE_OR_NONE
-        ).execute(conn, schema=phys_schema, table=phys_table, sidecar=sidecar_table)
+        ).execute(engine, schema=phys_schema, table=phys_table, sidecar=sidecar_table)
         if not srid:
             return 4326
         return srid

@@ -34,6 +34,7 @@ from dynastore.modules.db_config.connection_health_config import (
     resolve_connection_retry_config,
     resolve_max_concurrent_connection_retries,
     resolve_provisioning_retry_config,
+    resolve_read_disconnect_retry_attempts,
     resolve_slow_pool_acquire_threshold,
 )
 from sqlalchemy import text, DDL
@@ -628,6 +629,13 @@ class FunctionQueryBuilder(QueryBuilderStrategy):
 class BaseExecutor:
     """Core executor logic with wire serialization and post-processing."""
 
+    # Subclasses that are safe to retry on a mid-flight connection disconnect
+    # should override this to True. DQLExecutor (read-only SELECT queries) sets
+    # it True; DDLExecutor (schema mutations) leaves it False. Writes that go
+    # through DQLExecutor are always passed a caller-managed connection (not an
+    # engine), so they never reach the engine-path retry branch.
+    _retry_read_on_disconnect: bool = False
+
     def __init__(
         self,
         query_builder_strategy: QueryBuilderStrategy,
@@ -659,8 +667,56 @@ class BaseExecutor:
 
     def _execute_sync_workflow(self, db_resource, raw_params):
         if isinstance(db_resource, Engine):
-            with db_resource.connect() as conn:
-                return self._build_and_execute_sync(conn, raw_params)
+            # Read the attempt budget from ConnectionHealthConfig (hot-reloadable).
+            # The sync path uses the module-global fallback resolver (no async
+            # config service to await); writes/DDL never retry so they skip the
+            # lookup entirely and run exactly once.
+            attempts = (
+                resolve_read_disconnect_retry_attempts()
+                if self._retry_read_on_disconnect
+                else 1
+            )
+            for attempt in range(attempts):
+                conn = db_resource.connect()
+                try:
+                    result = self._build_and_execute_sync(conn, raw_params)
+                    conn.close()
+                    return result
+                except DatabaseConnectionError as exc:
+                    # Dead wire — invalidate so the pool evicts it, then close.
+                    try:
+                        conn.invalidate()
+                    except Exception:
+                        pass
+                    try:
+                        conn.close()
+                    except Exception as close_exc:
+                        logger.warning(
+                            "query_executor: conn.close() (sync) failed during error cleanup: %s",
+                            close_exc,
+                        )
+                    if self._retry_read_on_disconnect and attempt < attempts - 1:
+                        logger.warning(
+                            "db_config: read connection died mid-flight (%s); "
+                            "retrying on fresh connection (attempt %d/%d)",
+                            exc,
+                            attempt + 1,
+                            attempts,
+                        )
+                        continue
+                    raise
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception as close_exc:
+                        logger.warning(
+                            "query_executor: conn.close() (sync) failed during error cleanup: %s",
+                            close_exc,
+                        )
+                    raise
+            raise AssertionError(  # pragma: no cover
+                "Unexpected exit from _execute_sync_workflow retry loop"
+            )
         return self._build_and_execute_sync(db_resource, raw_params)
 
     async def _execute_async_workflow(self, db_resource: DbAsyncResource, raw_params):
@@ -670,28 +726,70 @@ class BaseExecutor:
             # so transient pool/connect failures (DB warming, OperationalError,
             # asyncio.TimeoutError, OSError) trigger bounded retry instead of
             # crashing the caller's lifespan / request.
-            conn = await _acquire_async_engine_connection(db_resource)
-            try:
-                async with _connection_lock_scope(conn):
-                    result = await self._build_and_execute_async(conn, raw_params)
-                    # Paranoid cleanup: ensure no transaction lingers before return to pool
-                    # This helps with StaticPool where the wire is reused immediately
-                    if conn.in_transaction():
-                        await conn.rollback()
-                    await conn.close()
-                    return result
-            except Exception:
-                # Ensure closed if something failed
+            #
+            # Additionally, DQLExecutor sets _retry_read_on_disconnect=True so
+            # that a TOCTOU kill (connection passes pool_pre_ping at checkout,
+            # then dies before the execute reaches PG) is recovered by acquiring
+            # a fresh wire and re-running the read — safe because a read has no
+            # side-effects. Writes and DDL leave the flag False and do not retry.
+            #
+            # The attempt budget is read live from ConnectionHealthConfig via the
+            # central cached getter, so operators can raise/lower it without a pod
+            # restart. Writes skip the lookup and run exactly once.
+            attempts = (
+                await _read_live_read_disconnect_retry_attempts()
+                if self._retry_read_on_disconnect
+                else 1
+            )
+            for attempt in range(attempts):
+                conn = await _acquire_async_engine_connection(db_resource)
                 try:
-                    await conn.close()
-                except Exception as close_exc:
-                    # Connection is likely dead; log so operators can correlate
-                    # pool-slot leaks with the originating error.
-                    logger.warning(
-                        "query_executor: conn.close() failed during error cleanup: %s",
-                        close_exc,
-                    )
-                raise
+                    async with _connection_lock_scope(conn):
+                        result = await self._build_and_execute_async(conn, raw_params)
+                        # Paranoid cleanup: ensure no transaction lingers before return to pool
+                        # This helps with StaticPool where the wire is reused immediately
+                        if conn.in_transaction():
+                            await conn.rollback()
+                        await conn.close()
+                        return result
+                except DatabaseConnectionError as exc:
+                    # Dead wire — invalidate so the pool evicts it, then close.
+                    try:
+                        await conn.invalidate()
+                    except Exception:
+                        pass
+                    try:
+                        await conn.close()
+                    except Exception as close_exc:
+                        logger.warning(
+                            "query_executor: conn.close() failed during error cleanup: %s",
+                            close_exc,
+                        )
+                    if self._retry_read_on_disconnect and attempt < attempts - 1:
+                        logger.warning(
+                            "db_config: read connection died mid-flight (%s); "
+                            "retrying on fresh connection (attempt %d/%d)",
+                            exc,
+                            attempt + 1,
+                            attempts,
+                        )
+                        continue
+                    raise
+                except Exception:
+                    # Ensure closed if something else failed (not a retryable disconnect)
+                    try:
+                        await conn.close()
+                    except Exception as close_exc:
+                        # Connection is likely dead; log so operators can correlate
+                        # pool-slot leaks with the originating error.
+                        logger.warning(
+                            "query_executor: conn.close() failed during error cleanup: %s",
+                            close_exc,
+                        )
+                    raise
+            raise AssertionError(  # pragma: no cover
+                "Unexpected exit from _execute_async_workflow retry loop"
+            )
         return await self._build_and_execute_async(db_resource, raw_params)
 
     async def stream_async_workflow(self, db_resource, raw_params):
@@ -756,6 +854,16 @@ class BaseExecutor:
                 "Transient asyncpg client error",
                 original_exception=original_exc,
             ) from e
+        # Sync psycopg2 mid-flight disconnect: SQLAlchemy wraps it as an
+        # OperationalError with connection_invalidated=True (or a known
+        # server-closed message). It carries no pgcode, so it reaches here.
+        # Surface it as DatabaseConnectionError too, so the sync engine-path
+        # read-disconnect retry can recover it — symmetric with the async path.
+        if _is_sync_closed_connection_error(e) or _is_sync_closed_connection_error(original_exc):
+            raise DatabaseConnectionError(
+                "Sync connection closed mid-operation",
+                original_exception=original_exc,
+            ) from e
         raise QueryExecutionError(
             "Database query failed.", original_exception=original_exc
         ) from e
@@ -789,6 +897,13 @@ class BaseExecutor:
 
 
 class DQLExecutor(BaseExecutor):
+    # DQL = SELECT queries are pure reads: safe to re-run on a fresh connection
+    # if the previous wire died between pool checkout and execute (TOCTOU).
+    # Writes that incidentally go through DQLExecutor always pass a caller-
+    # managed connection (not an AsyncEngine), so they never reach the retry
+    # branch in _execute_async_workflow.
+    _retry_read_on_disconnect = True
+
     def __init__(self, query_builder_strategy, result_handler, **kwargs):
         super().__init__(query_builder_strategy, **kwargs)
         self.result_handler = result_handler
@@ -1371,6 +1486,32 @@ async def _read_live_retry_limit() -> int:
     except Exception:
         pass
     return resolve_max_concurrent_connection_retries()
+
+
+async def _read_live_read_disconnect_retry_attempts() -> int:
+    """Read ``ConnectionHealthConfig.read_disconnect_retry_attempts`` live.
+
+    Mirrors :func:`_read_live_retry_limit`: per-call read from the central
+    cached config getter so operators can change the read-disconnect retry
+    budget without a pod restart. Falls back to
+    :func:`resolve_read_disconnect_retry_attempts` (module-global default) when
+    the config service is unavailable (tests, early startup).
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.db_config.connection_health_config import (
+            ConnectionHealthConfig,
+        )
+        from dynastore.tools.discovery import get_protocol
+
+        svc = get_protocol(PlatformConfigsProtocol)
+        if svc is not None:
+            cfg = await svc.get_config(ConnectionHealthConfig)
+            if isinstance(cfg, ConnectionHealthConfig):
+                return cfg.read_disconnect_retry_attempts
+    except Exception:
+        pass
+    return resolve_read_disconnect_retry_attempts()
 
 
 def _err_repr(exc: BaseException) -> str:
