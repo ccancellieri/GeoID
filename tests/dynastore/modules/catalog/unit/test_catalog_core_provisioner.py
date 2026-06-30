@@ -236,6 +236,10 @@ class TestNoDoubleProvision:
                 return_value=MagicMock(execute=AsyncMock()),
             ),
             patch(
+                "dynastore.modules.catalog.catalog_service._build_tenant_iam_ddl_batch",
+                return_value=MagicMock(execute=AsyncMock()),
+            ),
+            patch(
                 "dynastore.modules.catalog.db_init.core_tables.ensure_tenant_core_tables",
                 new=AsyncMock(),
             ),

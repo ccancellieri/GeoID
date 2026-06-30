@@ -115,7 +115,7 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
         `usage_counters` live platform-only: every read/write path pins
         `schema="iam"`, so the tenant copies were dead weight. The
         catalog provisioning lifecycle hook
-        (`catalog_service._build_tenant_core_ddl_batch`) bootstraps the
+        (`catalog_service._build_tenant_iam_ddl_batch`) bootstraps the
         tenant subset; this method overlaps with it (idempotent CREATE
         TABLE IF NOT EXISTS) and adds the `policies` table that the
         catalog hook doesn't.
