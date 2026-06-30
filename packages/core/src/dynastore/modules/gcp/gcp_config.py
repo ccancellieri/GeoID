@@ -251,9 +251,9 @@ class GcpModuleConfig(ExposableConfigMixin, PluginConfig):
             "Consecutive transient GCS failures before the per-bucket circuit "
             "breaker opens. Prevents hammering a wedged GCS endpoint during a "
             "degradation event. Mirrors the indexer-breaker failure_threshold "
-            "semantics in CircuitBreaker. NOTE: the per-bucket CircuitBreaker is "
-            "constructed once at lifespan startup with this value; a pod restart "
-            "is required to apply a changed threshold."
+            "semantics in CircuitBreaker. Changes apply live via the config-change "
+            "apply-handler — no pod restart required. Existing per-bucket circuit "
+            "state (open/half-open, failure counts) is preserved on update."
         ),
     )
     gcs_breaker_cooldown_seconds: Mutable[float] = Field(
@@ -261,9 +261,9 @@ class GcpModuleConfig(ExposableConfigMixin, PluginConfig):
         description=(
             "Seconds the per-bucket circuit breaker stays OPEN before allowing "
             "a HALF_OPEN probe through. Mirrors the indexer-breaker "
-            "cooldown_seconds semantics in CircuitBreaker. NOTE: the per-bucket "
-            "CircuitBreaker is constructed once at lifespan startup with this "
-            "value; a pod restart is required to apply a changed cooldown."
+            "cooldown_seconds semantics in CircuitBreaker. Changes apply live via "
+            "the config-change apply-handler — no pod restart required. Existing "
+            "per-bucket circuit state is preserved on update."
         ),
     )
 

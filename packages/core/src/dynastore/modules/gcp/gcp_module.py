@@ -339,6 +339,9 @@ class GCPModule(
         )
         _gcp_bg_shutdown = asyncio.Event()
         _gcp_supervisor = BackgroundSupervisor()
+        # Initialised inside the try block; kept here so the finally block can
+        # always reference it without a NameError if the try body fails early.
+        _gcp_breaker_config_handler = None
 
         try:
             # Async clients (_jobs_client/_run_client) are built lazily by
@@ -355,6 +358,35 @@ class GCPModule(
                 region=self.get_region() or "",
                 breaker=self._gcs_breaker,
             )
+
+            # Register an apply-handler so a PUT /configs?plugin_id=gcp_module
+            # hot-reloads the circuit-breaker thresholds without a pod restart.
+            # Per-bucket state (OPEN/HALF_OPEN, failure counts, opened_at) is
+            # preserved — only _threshold and _cooldown are mutated in place.
+            async def _on_gcp_breaker_config_change(
+                cfg, _catalog_id, _collection_id, _conn
+            ) -> None:
+                if not isinstance(cfg, GcpModuleConfig):
+                    return
+                breaker = self._gcs_breaker
+                if breaker is None:
+                    return
+                try:
+                    breaker.update_thresholds(
+                        cfg.gcs_breaker_failure_threshold,
+                        cfg.gcs_breaker_cooldown_seconds,
+                    )
+                    logger.info(
+                        "gcs_breaker thresholds hot-reloaded: "
+                        "failure_threshold=%d cooldown=%.1fs",
+                        cfg.gcs_breaker_failure_threshold,
+                        cfg.gcs_breaker_cooldown_seconds,
+                    )
+                except Exception as exc:  # noqa: BLE001 — never fail config persistence
+                    logger.warning("gcs_breaker apply-handler failed: %s", exc)
+
+            _gcp_breaker_config_handler = _on_gcp_breaker_config_change
+            GcpModuleConfig.register_apply_handler(_on_gcp_breaker_config_change)
 
             # The GCP module no longer owns any database schema: the catalog →
             # bucket-name link lives on ``GcpCatalogBucketConfig.bucket_name``
@@ -773,6 +805,13 @@ class GCPModule(
             yield
         finally:
             logger.info("GCP Module: Exiting lifespan - closing all clients.")
+            # Unregister the breaker config apply-handler so a disabled / restarted
+            # GCP module doesn't leave a dangling reference in the config service.
+            if _gcp_breaker_config_handler is not None:
+                try:
+                    GcpModuleConfig.unregister_apply_handler(_gcp_breaker_config_handler)
+                except Exception:
+                    pass
             # Stop the liveness reconciler supervisor before tearing down clients it uses.
             _gcp_bg_shutdown.set()
             await _gcp_supervisor.stop()

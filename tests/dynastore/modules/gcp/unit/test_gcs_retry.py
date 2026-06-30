@@ -428,15 +428,15 @@ class TestGcpModuleConfigRetryFields:
                 "retry/breaker snapshot will not be updated at startup."
             )
 
-    def test_breaker_fields_description_mentions_restart(self):
-        """Breaker field descriptions must warn that a pod restart is required."""
+    def test_breaker_fields_description_mentions_live_reload(self):
+        """Breaker field descriptions must document that changes apply live."""
         cfg_cls = self._cfg_cls()
         for field in ("gcs_breaker_failure_threshold", "gcs_breaker_cooldown_seconds"):
             fi = cfg_cls.model_fields[field]
             desc = fi.description or ""
-            assert "restart" in desc.lower(), (
-                f"Field {field!r} description should mention that a pod restart "
-                "is required to apply changes to the circuit breaker."
+            assert "live" in desc.lower(), (
+                f"Field {field!r} description should mention that changes apply "
+                "live (no restart required) via the config-change apply-handler."
             )
 
     @pytest.mark.asyncio

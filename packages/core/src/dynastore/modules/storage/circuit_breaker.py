@@ -200,6 +200,33 @@ class CircuitBreaker:
                 for k, v in self._circuits.items()
             }
 
+    def update_thresholds(
+        self, failure_threshold: int, cooldown_seconds: float
+    ) -> None:
+        """Update ``_threshold`` and ``_cooldown`` in-place under the breaker lock.
+
+        Per-bucket circuit state (``_circuits``) is intentionally preserved:
+        open circuits, failure counts, and ``opened_at`` timestamps are left
+        untouched.  The new values take effect at the next decision point —
+        ``record_failure``'s threshold comparison and ``is_open``'s cooldown
+        check — which is exactly when they are read.
+
+        Raises ``ValueError`` for out-of-range arguments so callers (e.g. the
+        config-change apply-handler) can log and skip rather than silently
+        applying a nonsensical value.
+        """
+        if failure_threshold < 1:
+            raise ValueError(
+                f"failure_threshold must be >= 1 (got {failure_threshold})"
+            )
+        if cooldown_seconds <= 0:
+            raise ValueError(
+                f"cooldown_seconds must be > 0 (got {cooldown_seconds})"
+            )
+        with self._lock:
+            self._threshold = failure_threshold
+            self._cooldown = cooldown_seconds
+
     def reset(self, indexer_id: Optional[str] = None) -> None:
         """Operator action — force the breaker back to CLOSED.
 
