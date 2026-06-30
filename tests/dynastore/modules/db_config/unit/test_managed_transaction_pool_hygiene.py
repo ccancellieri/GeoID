@@ -524,21 +524,22 @@ async def test_state15_exhausts_retry_budget_and_raises(monkeypatch):
     monkeypatch.setattr(qe.asyncio, "sleep", _fast_sleep, raising=True)
 
     log: List[str] = []
-    # Two compounding layers each evict a poisoned slot:
-    #   1. _acquire_async_engine_connection's reset-on-checkout hygiene (#1113)
-    #      invalidates the first poisoned wire and reconnects ONCE within a
-    #      single call → 2 connects per call when the fresh wire is also poisoned.
-    #   2. the @retry_on_transient_connect(max_retries=5) decorator retries that
+    # Two compounding layers each evict poisoned slots on a fully-poisoned pool:
+    #   1. _acquire_async_engine_connection's reset-on-checkout hygiene evicts
+    #      slots via the bounded re-acquire loop: 1 initial checkout + N fresh
+    #      slots (pool_hygiene_reacquire_attempts, default 3) = 4 connects per
+    #      single call when every fresh slot is also poisoned.
+    #   2. The @retry_on_transient_connect(max_retries=5) decorator retries that
     #      whole call 5 times (AsyncpgInternalClientError is a transient-connect
     #      type), with back-off, before giving up.
-    # On a fully-poisoned pool that is 5 × 2 = 10 connects, each evicting one slot.
+    # On a fully-poisoned pool: 5 × 4 = 20 connects, each evicting one slot.
     poisoned_conns = [
         _StateMachineFakeConn(
             rollback_errors=[qe.AsyncpgInternalClientError("state 15")],
             log=log,
             tag=f"poisoned{i}",
         )
-        for i in range(10)
+        for i in range(20)
     ]
     engine = _FakeEngine(poisoned_conns)
 
@@ -546,9 +547,9 @@ async def test_state15_exhausts_retry_budget_and_raises(monkeypatch):
         async with qe.managed_transaction(engine):
             pass
 
-    # All 10 checkouts exercised (5 retry attempts × 2 connects each); each
+    # All 20 checkouts exercised (5 retry attempts × 4 connects each); each
     # poisoned slot invalidated and closed exactly once.
-    assert engine.connect_calls == 10
+    assert engine.connect_calls == 20
     for c in poisoned_conns:
         assert c.invalidated_count == 1
         assert c.closed is True

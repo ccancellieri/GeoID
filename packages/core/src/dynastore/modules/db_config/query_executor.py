@@ -33,6 +33,7 @@ from contextlib import asynccontextmanager, contextmanager
 from dynastore.modules.db_config.connection_health_config import (
     resolve_connection_retry_config,
     resolve_max_concurrent_connection_retries,
+    resolve_pool_hygiene_reacquire_attempts,
     resolve_provisioning_retry_config,
     resolve_read_disconnect_retry_attempts,
     resolve_slow_pool_acquire_threshold,
@@ -1514,6 +1515,31 @@ async def _read_live_read_disconnect_retry_attempts() -> int:
     return resolve_read_disconnect_retry_attempts()
 
 
+async def _read_live_pool_hygiene_reacquire_attempts() -> int:
+    """Read ``ConnectionHealthConfig.pool_hygiene_reacquire_attempts`` live.
+
+    Per-call read from the central cached config getter so operators can adjust
+    the poison-storm self-heal budget without a pod restart. Falls back to
+    :func:`resolve_pool_hygiene_reacquire_attempts` (module-global default)
+    when the config service is unavailable (tests, early startup).
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.db_config.connection_health_config import (
+            ConnectionHealthConfig,
+        )
+        from dynastore.tools.discovery import get_protocol
+
+        svc = get_protocol(PlatformConfigsProtocol)
+        if svc is not None:
+            cfg = await svc.get_config(ConnectionHealthConfig)
+            if isinstance(cfg, ConnectionHealthConfig):
+                return cfg.pool_hygiene_reacquire_attempts
+    except Exception:
+        pass
+    return resolve_pool_hygiene_reacquire_attempts()
+
+
 def _err_repr(exc: BaseException) -> str:
     """One-line representation of an exception for structured log lines."""
     return f"{type(exc).__name__}: {exc}"
@@ -1817,16 +1843,36 @@ async def _acquire_async_engine_connection(engine: AsyncEngine) -> AsyncConnecti
             AsyncpgConnectionDoesNotExistError,
             AsyncpgInternalClientError,
         ) as exc:
-            wire_id = id(_get_wire_identity(conn))
-            logger.warning(
-                "managed_transaction pool-hygiene: invalidating poisoned "
-                "pooled connection wire_id=%s (%s)",
-                wire_id, exc.__class__.__name__,
-            )
-            await conn.invalidate()
-            await conn.close()
-            conn = await engine.connect()
-            await conn.rollback()
+            # A poisoned slot was returned from the pool. On a DB failover or
+            # restart, many pooled wires may be stale simultaneously (poison
+            # storm). Evict up to `budget` slots before giving up; each
+            # poisoned slot is invalidated+closed before the next is acquired.
+            budget = await _read_live_pool_hygiene_reacquire_attempts()
+            for attempt in range(1, budget + 1):
+                wire_id = id(_get_wire_identity(conn))
+                logger.warning(
+                    "managed_transaction pool-hygiene: invalidating poisoned "
+                    "pooled connection wire_id=%s (%s) attempt=%d/%d",
+                    wire_id, exc.__class__.__name__, attempt, budget,
+                )
+                await conn.invalidate()
+                await conn.close()
+                conn = await engine.connect()
+                try:
+                    await conn.rollback()
+                    break  # Clean slot acquired; proceed to return
+                except (
+                    PendingRollbackError,
+                    InvalidRequestError,
+                    AsyncpgConnectionDoesNotExistError,
+                    AsyncpgInternalClientError,
+                ) as next_exc:
+                    exc = next_exc
+                    # continue to next attempt
+            else:
+                # All budget slots were poisoned; let the outer handler
+                # invalidate+close the last acquired slot and propagate.
+                raise exc
         return conn
     except BaseException:
         # Invalidate before close so a wire that raised an asyncpg state-machine

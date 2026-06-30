@@ -141,6 +141,14 @@ _max_concurrent_connection_retries: int = 3
 # is unavailable.
 _read_disconnect_retry_attempts: int = 2
 
+# Fallback for the pool-hygiene re-acquire retry budget. Mirrors the default of
+# ConnectionHealthConfig.pool_hygiene_reacquire_attempts so tests can override
+# this module global without requiring a live platform config service. The async
+# execution path reads the live ConnectionHealthConfig value per-call (central
+# cached getter) and falls back to this global when the config service is
+# unavailable.
+_pool_hygiene_reacquire_attempts: int = 3
+
 
 def resolve_connection_retry_config() -> Tuple[int, float, float, float]:
     """Return the current ``(max_retries, base_delay, max_delay, jitter)``."""
@@ -201,6 +209,20 @@ def resolve_read_disconnect_retry_attempts() -> int:
     live config service.
     """
     return _read_disconnect_retry_attempts
+
+
+def resolve_pool_hygiene_reacquire_attempts() -> int:
+    """Return the fallback budget of fresh pooled slots to try on a poisoned checkout.
+
+    Used as the fallback for the async path when the
+    ``PlatformConfigsProtocol`` config service is unavailable (tests, early
+    startup). The async live path reads
+    ``ConnectionHealthConfig.pool_hygiene_reacquire_attempts`` directly from
+    the central cached getter. Tests may replace the global
+    ``_pool_hygiene_reacquire_attempts`` directly to control the value without
+    a live config service.
+    """
+    return _pool_hygiene_reacquire_attempts
 
 
 # ---------------------------------------------------------------------------
@@ -297,5 +319,22 @@ class ConnectionHealthConfig(PluginConfig):
             "drops idle wires aggressively. Read per-call via the central cached "
             "config getter — changes take effect immediately without a pod "
             "restart. Must be in [1, 10]."
+        ),
+    )
+
+    pool_hygiene_reacquire_attempts: Mutable[int] = Field(
+        default=3,
+        ge=1,
+        le=8,
+        description=(
+            "Poison-storm self-heal: maximum number of fresh pooled slots to try "
+            "when a checked-out wire is poisoned (its hygiene rollback raises "
+            "PendingRollbackError, InvalidRequestError, or an asyncpg wire-state "
+            "error) before giving up and propagating the error to the caller. "
+            "Each poisoned slot is invalidated and closed before the next one is "
+            "checked out. Default 3 covers virtually all realistic failover storms; "
+            "raise only for unusually large pools with many simultaneous stale wires. "
+            "Hot-reloadable — changes take effect immediately without a pod restart. "
+            "Must be in [1, 8]."
         ),
     )
