@@ -33,24 +33,25 @@ URL, discovery_host/port, cluster_mode, require_full_coverage,
 dynamic_startup_nodes, discovery_port_remap, TLS, IAM,
 socket_timeout/connect_timeout, TCP keepalives.
 
-Env-var bootstrap fallback (used only when the engine cache isn't
+Cluster mode auto-detection:
+  Regardless of which path (engine-driven or legacy env-driven), the backend
+  probes the server with a standalone client first. If the server reports
+  cluster mode (via INFO), the backend automatically rebuilds as ValkeyCluster
+  transparently. This eliminates the need for pre-config or env-var flags for
+  cluster detection.
+
+Env-var bootstrap fallback (DEPRECATED; used only when the engine cache isn't
 available, e.g. a minimal worker SCOPE that omits ``DBConfigModule``):
 
   VALKEY_URL           — connection URL (e.g. ``valkey://10.0.0.1:6379``)
-  VALKEY_TLS           — ``true`` to wrap the connection in TLS (independent
-                         of URL scheme). Required for GCP Memorystore IAM mode.
-  VALKEY_TLS_CA_PATH   — optional path to a server CA bundle for verification.
-                         If unset and TLS is on, cert/hostname checks are
-                         disabled (acceptable on private VPC).
-  VALKEY_IAM_AUTH      — ``true`` to authenticate via a Google OAuth2 access
-                         token minted from ADC. Requires ``google-auth``
-                         (provided by the ``module_gcp`` extra).
-  VALKEY_CLUSTER       — ``true`` for GCP Memorystore for Valkey CLUSTER
-                         instances. Uses ``ValkeyCluster`` (handles MOVED/ASK
-                         redirects, per-node pools). For Memorystore CLUSTER
-                         the discovery-only pattern (host+port,
-                         ``dynamic_startup_nodes=False``) is the engine-driven
-                         path — there is no env-var alias for it.
+  VALKEY_TLS           — (deprecated) ``true`` to wrap the connection in TLS.
+                         Use ValkeyEngineConfig.tls instead.
+  VALKEY_TLS_CA_PATH   — (deprecated) optional path to a server CA bundle.
+                         Use ValkeyEngineConfig.tls_ca_path instead.
+  VALKEY_IAM_AUTH      — (deprecated) ``true`` to authenticate via OAuth2/ADC.
+                         Use ValkeyEngineConfig.iam_auth instead.
+  VALKEY_CLUSTER       — (deprecated, auto-detected) ``true`` for Memorystore CLUSTER.
+                         Cluster mode is now detected automatically; no env var needed.
 """
 
 from __future__ import annotations
@@ -326,6 +327,17 @@ def build_valkey_client(
     Memorystore Valkey 9 CLUSTER, which advertises unreachable internal shard
     addresses at the cluster-bus port range (see ``build_discovery_port_remap``).
     """
+    import logging
+    _logger = logging.getLogger(__name__)
+    _logger.debug(
+        "build_valkey_client: ENTRY — cluster_mode=%s discovery_host=%s url=%s tls=%s iam_auth=%s",
+        cluster_mode,
+        discovery_host,
+        url,
+        tls,
+        iam_auth,
+    )
+    
     if not _CACHE_DEPS_OK:
         raise ModuleNotFoundError(
             "build_valkey_client requires the 'module_cache' extra "
@@ -376,6 +388,7 @@ def build_valkey_client(
 
     # Cluster mode
     if cluster_mode:
+        _logger.debug("build_valkey_client: CLUSTER MODE — entering cluster path")
         from valkey.asyncio.cluster import ValkeyCluster
 
         # cluster handles per-node pools internally; drop connection_class
@@ -387,35 +400,59 @@ def build_valkey_client(
         cluster_kwargs["require_full_coverage"] = require_full_coverage
         cluster_kwargs["dynamic_startup_nodes"] = dynamic_startup_nodes
 
+        _logger.debug(
+            "build_valkey_client: cluster_kwargs — require_full_coverage=%s dynamic_startup_nodes=%s discovery_port_remap=%s",
+            require_full_coverage,
+            dynamic_startup_nodes,
+            discovery_port_remap,
+        )
+
         # Memorystore Valkey 9 advertises unreachable internal shard
         # addresses (cluster-bus port range) in its topology; rewrite every
         # discovered node's port back to the reachable discovery port.
         if discovery_port_remap:
+            _logger.debug("build_valkey_client: applying discovery_port_remap")
             cluster_kwargs["address_remap"] = build_discovery_port_remap(
                 discovery_port
             )
 
         # Discovery endpoint preferred (Memorystore Valkey CLUSTER pattern)
         if discovery_host:
+            _logger.debug(
+                "build_valkey_client: creating ValkeyCluster via discovery endpoint — host=%s port=%d",
+                discovery_host,
+                discovery_port,
+            )
             client = ValkeyCluster(  # type: ignore[abstract]
                 host=discovery_host,
                 port=discovery_port,
                 **cluster_kwargs,
             )
         elif url:
+            _logger.debug(
+                "build_valkey_client: creating ValkeyCluster via from_url — url=%s",
+                url,
+            )
             client = ValkeyCluster.from_url(url, **cluster_kwargs)
         else:
             raise ValueError(
                 "build_valkey_client(cluster_mode=True): one of "
                 "`discovery_host` or `url` must be provided."
             )
+        _logger.debug("build_valkey_client: ValkeyCluster created successfully, returning")
         return client, None
 
     # Standalone
+    _logger.debug("build_valkey_client: STANDALONE MODE — entering standalone path")
     if not url:
         raise ValueError("build_valkey_client(cluster_mode=False): `url` is required.")
+    _logger.debug(
+        "build_valkey_client: creating Valkey (standalone) client — url=%s",
+        url,
+    )
     pool = avalkey.ConnectionPool.from_url(url, **pool_kwargs)
     client = avalkey.Valkey(connection_pool=pool)
+    _logger.debug("build_valkey_client: Valkey client created successfully, returning")
     return client, pool
 
 
@@ -524,6 +561,7 @@ class ValkeyCacheBackend:
         tcp_keepalive_count: Optional[int] = None,
         circuit_breaker_threshold: Optional[int] = None,
         *,
+        cluster_mode: Optional[bool] = None,
         client: Optional[Any] = None,
         pool: Optional[Any] = None,
         owns_client: bool = True,
@@ -537,12 +575,13 @@ class ValkeyCacheBackend:
            owns lifecycle; set ``owns_client=False`` so ``close()`` does
            not double-release a resource the engine cache will release.
 
-        2. **Legacy env-driven** — pass ``url`` (and optional timeout /
+        2. **Legacy env-driven (deprecated)** — pass ``url`` (and optional timeout /
            keepalive kwargs). The backend builds its own client via
            ``build_valkey_client(...)`` consuming the legacy
            ``VALKEY_TLS`` / ``VALKEY_IAM_AUTH`` / ``VALKEY_CLUSTER`` env
-           vars for back-compat. Used as the bootstrap fallback when
-           the engine is unavailable.
+           vars for backward compatibility. This path is deprecated; use
+           ``ValkeyEngineConfig`` (via the configs API) for live-reconfig instead.
+           Used as the bootstrap fallback when the engine is unavailable.
         """
         # ModuleNotFoundError (a subclass of ImportError) so existing
         # `except ImportError` handlers still catch it AND the module
@@ -571,10 +610,21 @@ class ValkeyCacheBackend:
             tls = os.getenv("VALKEY_TLS", "").lower() in ("1", "true", "yes")
             tls_ca_path = os.getenv("VALKEY_TLS_CA_PATH")
             iam_auth = os.getenv("VALKEY_IAM_AUTH", "").lower() in ("1", "true", "yes")
-            cluster_mode = os.getenv("VALKEY_CLUSTER", "").lower() in (
-                "1",
-                "true",
-                "yes",
+            # Use provided cluster_mode if specified (e.g. from auto-detection),
+            # otherwise read from env var for backward compatibility
+            if cluster_mode is None:
+                cluster_mode = os.getenv("VALKEY_CLUSTER", "").lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                )
+            import logging
+            _logger = logging.getLogger(__name__)
+            _logger.info(
+                "ValkeyCacheBackend (legacy): cluster_mode=%s (from param=%s, env_VALKEY_CLUSTER=%s)",
+                cluster_mode,
+                cluster_mode is not None,
+                os.getenv("VALKEY_CLUSTER", "not-set"),
             )
             built_client, built_pool = build_valkey_client(
                 url=url,
@@ -589,6 +639,11 @@ class ValkeyCacheBackend:
                 tcp_keepalive_idle=tcp_keepalive_idle,
                 tcp_keepalive_interval=tcp_keepalive_interval,
                 tcp_keepalive_count=tcp_keepalive_count,
+            )
+            _client_type = type(built_client).__name__
+            _logger.info(
+                "ValkeyCacheBackend (legacy): client type=%s",
+                _client_type,
             )
             self._client = built_client
             self._pool = built_pool

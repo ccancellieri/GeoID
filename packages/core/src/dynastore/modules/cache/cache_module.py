@@ -25,11 +25,19 @@ Primary mode (engine-driven):
     mutable via the configs API; changes trigger a live rebuild without
     restart.
 
+    Config defaults are seeded from ``docker/config/defaults/valkey-engine-config.json``.
+    Initial cluster detection (if no config exists yet) is automatic: the module probes
+    with a standalone client first; if the server reports cluster mode, it rebuilds
+    as ValkeyCluster transparently.
+
 Legacy fallback (env-driven):
-    When ``app_state.engine_cache`` is unavailable, falls back to the
-    old ``VALKEY_URL`` / ``VALKEY_TLS`` / ``VALKEY_IAM_AUTH`` /
-    ``VALKEY_CLUSTER`` env vars.  Preserves compatibility with
-    deployments that haven't provisioned the engine config.
+    When ``app_state.engine_cache`` is unavailable, falls back to reading
+    ``VALKEY_URL`` from the environment (for backward compatibility).
+    Cluster detection still works: a standalone client probes the server,
+    detects cluster mode from the INFO response, and rebuilds as ValkeyCluster
+    if needed. Note: ``VALKEY_CLUSTER``, ``VALKEY_TLS``, ``VALKEY_IAM_AUTH``,
+    and ``VALKEY_TLS_CA_PATH`` env vars are deprecated; use ``ValkeyEngineConfig``
+    (via the configs API) for live-reconfig instead.
 
 Cache-layer settings (probe_timeout, circuit_breaker) remain on
 ``CachePluginConfig``.
@@ -578,6 +586,42 @@ class CacheModule(ModuleProtocol):
                 used_mb,
                 _safe_url,
             )
+            
+            # Auto-detect cluster mode: if server reports cluster but we
+            # connected with a standalone client, rebuild as ValkeyCluster.
+            if mode == "cluster" and not engine_mode:
+                logger.info(
+                    "CacheModule: detected cluster mode; rebuilding as ValkeyCluster"
+                )
+                await backend.close()
+                try:
+                    from dynastore.tools.cache_valkey import ValkeyCacheBackend
+                    backend = ValkeyCacheBackend(
+                        url=valkey_url,
+                        socket_connect_timeout=_socket_connect_timeout,
+                        socket_timeout=_engine_defaults.socket_timeout_seconds,
+                        tcp_keepalive_idle=_engine_defaults.tcp_keepalive_idle_seconds,
+                        tcp_keepalive_interval=_engine_defaults.tcp_keepalive_interval_seconds,
+                        tcp_keepalive_count=_engine_defaults.tcp_keepalive_count,
+                        circuit_breaker_threshold=cache_cfg.circuit_breaker_threshold,
+                        cluster_mode=True,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "CacheModule: failed to rebuild as ValkeyCluster (%s); using standalone",
+                        exc,
+                    )
+                    from dynastore.tools.cache_valkey import ValkeyCacheBackend
+                    backend = ValkeyCacheBackend(
+                        url=valkey_url,
+                        socket_connect_timeout=_socket_connect_timeout,
+                        socket_timeout=_engine_defaults.socket_timeout_seconds,
+                        tcp_keepalive_idle=_engine_defaults.tcp_keepalive_idle_seconds,
+                        tcp_keepalive_interval=_engine_defaults.tcp_keepalive_interval_seconds,
+                        tcp_keepalive_count=_engine_defaults.tcp_keepalive_count,
+                        circuit_breaker_threshold=cache_cfg.circuit_breaker_threshold,
+                        cluster_mode=False,
+                    )
         except Exception as exc:
             _reason = (
                 "probe timed out" if isinstance(exc, asyncio.TimeoutError) else str(exc)
