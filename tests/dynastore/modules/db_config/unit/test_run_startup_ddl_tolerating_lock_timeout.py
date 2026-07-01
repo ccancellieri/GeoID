@@ -16,20 +16,13 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Regression test for #2616: a lock-timeout on the TasksModule per-schema
-startup-init advisory lock must not abort process startup.
+"""Unit tests for the shared startup-DDL lock-timeout tolerance helper
+(``locking_tools.run_startup_ddl_tolerating_lock_timeout``).
 
-Previously ``acquire_startup_lock`` raising ``LockNotAvailableError`` (PG
-55P03, "canceling statement due to lock timeout") propagated straight out of
-``TasksModule.lifespan``. Since ``TasksModule`` is a foundational module, that
-exception was fatal (``CRITICAL: Foundational module 'TasksModule' failed
-during startup. Aborting.``), which crash-looped the worker under sustained
-lock contention (e.g. a peer pod stalled on a starved connection pool, #2333).
-
-``_run_startup_ddl_tolerating_lock_timeout`` now catches a lock-timeout
-specifically and falls back to running the same idempotent DDL on a fresh,
-unlocked transaction instead of raising. Any other exception must still
-propagate unchanged.
+A lock-timeout on a foundational module's startup advisory lock (PG 55P03,
+"canceling statement due to lock timeout") must not abort process startup:
+the guarded DDL is idempotent, so it's safe to re-run unlocked instead of
+crash-looping the worker. Any other exception must still propagate.
 """
 
 from __future__ import annotations
@@ -39,14 +32,13 @@ from typing import Any
 
 import pytest
 
-from dynastore.modules.tasks import tasks_module
+from dynastore.modules.db_config import locking_tools
 
 
 class LockNotAvailableError(Exception):
     """Stand-in for asyncpg's real exception class of the same name.
 
-    ``_is_lock_not_available_error`` (used by
-    ``is_lock_not_available_error``) matches on this exact class name, so
+    ``is_lock_not_available_error`` matches on this exact class name, so
     reusing it here exercises the same detection path production hits.
     """
 
@@ -72,7 +64,8 @@ async def test_lock_timeout_falls_back_to_unlocked_ddl_instead_of_raising(
 ) -> None:
     """A lock-timeout must not propagate: the DDL runs once, unlocked."""
     monkeypatch.setattr(
-        "dynastore.modules.db_config.locking_tools.acquire_startup_lock",
+        locking_tools,
+        "acquire_startup_lock",
         _make_raising_acquire_startup_lock(
             LockNotAvailableError("canceling statement due to lock timeout")
         ),
@@ -85,7 +78,7 @@ async def test_lock_timeout_falls_back_to_unlocked_ddl_instead_of_raising(
         yield fake_conn
 
     monkeypatch.setattr(
-        tasks_module, "managed_transaction", _fake_managed_transaction
+        locking_tools, "managed_transaction", _fake_managed_transaction
     )
 
     seen_conns = []
@@ -94,9 +87,9 @@ async def test_lock_timeout_falls_back_to_unlocked_ddl_instead_of_raising(
         seen_conns.append(conn)
 
     # Must complete without raising despite the simulated lock timeout.
-    await tasks_module._run_startup_ddl_tolerating_lock_timeout(
+    await locking_tools.run_startup_ddl_tolerating_lock_timeout(
         engine=object(),
-        lock_key="tasks_storage_init.tasks",
+        lock_key="some_module_storage_init",
         ddl_body=_ddl_body,
     )
 
@@ -113,7 +106,8 @@ async def test_non_lock_timeout_error_still_propagates(
     only tolerates the specific, known-safe lock-contention race.
     """
     monkeypatch.setattr(
-        "dynastore.modules.db_config.locking_tools.acquire_startup_lock",
+        locking_tools,
+        "acquire_startup_lock",
         _make_raising_acquire_startup_lock(ConnectionError("db is unreachable")),
     )
 
@@ -121,9 +115,9 @@ async def test_non_lock_timeout_error_still_propagates(
         raise AssertionError("ddl_body must not run when the error isn't a lock timeout")
 
     with pytest.raises(ConnectionError, match="db is unreachable"):
-        await tasks_module._run_startup_ddl_tolerating_lock_timeout(
+        await locking_tools.run_startup_ddl_tolerating_lock_timeout(
             engine=object(),
-            lock_key="tasks_storage_init.tasks",
+            lock_key="some_module_storage_init",
             ddl_body=_ddl_body,
         )
 
@@ -142,16 +136,13 @@ async def test_happy_path_runs_ddl_under_the_lock_exactly_once(
     async def _fake_acquire(conn: Any, lock_key: str, timeout: str | None = None):
         yield locked_conn
 
-    monkeypatch.setattr(
-        "dynastore.modules.db_config.locking_tools.acquire_startup_lock",
-        _fake_acquire,
-    )
+    monkeypatch.setattr(locking_tools, "acquire_startup_lock", _fake_acquire)
 
     async def _unexpected_managed_transaction(engine: Any):
         raise AssertionError("unlocked fallback must not run on the happy path")
 
     monkeypatch.setattr(
-        tasks_module, "managed_transaction", _unexpected_managed_transaction
+        locking_tools, "managed_transaction", _unexpected_managed_transaction
     )
 
     seen_conns = []
@@ -159,9 +150,9 @@ async def test_happy_path_runs_ddl_under_the_lock_exactly_once(
     async def _ddl_body(conn: Any) -> None:
         seen_conns.append(conn)
 
-    await tasks_module._run_startup_ddl_tolerating_lock_timeout(
+    await locking_tools.run_startup_ddl_tolerating_lock_timeout(
         engine=object(),
-        lock_key="tasks_storage_init.tasks",
+        lock_key="some_module_storage_init",
         ddl_body=_ddl_body,
     )
 

@@ -61,10 +61,13 @@ class NotebooksModule(ModuleProtocol):
                 table_exists = await check_table_exists(conn, "platform_notebooks", "notebooks")
 
             if not table_exists:
-                async with managed_transaction(engine) as conn:
-                    async with maintenance_tools.acquire_startup_lock(conn, "notebooks_module"):
-                        await maintenance_tools.ensure_schema_exists(conn, "notebooks")
-                        await DDLQuery(PLATFORM_NOTEBOOKS_DDL).execute(conn)
+                async def _init_notebooks_storage(conn: DbResource) -> None:
+                    await maintenance_tools.ensure_schema_exists(conn, "notebooks")
+                    await DDLQuery(PLATFORM_NOTEBOOKS_DDL).execute(conn)
+
+                await maintenance_tools.run_startup_ddl_tolerating_lock_timeout(
+                    engine, "notebooks_module", _init_notebooks_storage,
+                )
 
             # Trigger built-in notebook registrations BEFORE seeding so the
             # in-memory registry is populated when `seed_platform_notebooks`

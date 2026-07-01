@@ -168,6 +168,45 @@ async def test_neutral_bootstrap_lock_timeout_returns_false() -> None:
     preset.apply.assert_not_called()
 
 
+class _LockNotAvailableError(Exception):
+    """Stand-in for the real PG lock-timeout exception (55P03)."""
+
+    pgcode = "55P03"
+
+
+class _FakeLockRaisesTimeout:
+    """Matches real ``acquire_startup_lock`` behaviour: a lock-timeout raises
+    before yielding, rather than yielding ``None`` (#2625).
+    """
+
+    def __init__(self, *_a: Any, **_kw: Any) -> None:
+        pass
+
+    async def __aenter__(self) -> None:
+        raise _LockNotAvailableError("canceling statement due to lock timeout")
+
+    async def __aexit__(self, *_: Any) -> bool:
+        return False
+
+
+@pytest.mark.asyncio
+async def test_neutral_bootstrap_lock_timeout_raise_returns_false() -> None:
+    """A real lock-timeout raises out of ``acquire_startup_lock`` — it must
+    be caught and folded into the same skip-and-return-False path as the
+    ``conn is None`` case, not propagate and abort startup.
+    """
+    from dynastore.modules.presets.bootstrap import bootstrap_preset_if_absent
+
+    preset = _make_preset("public_access_baseline")
+
+    with patch("dynastore.modules.db_config.locking_tools.acquire_startup_lock", _FakeLockRaisesTimeout), \
+         patch("dynastore.modules.storage.presets.registry.find_preset", return_value=preset):
+        result = await bootstrap_preset_if_absent(MagicMock(), preset_name="public_access_baseline")
+
+    assert result is False
+    preset.apply.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Shim tests: lifecycle.bootstrap_preset_if_absent delegates to neutral module
 # ---------------------------------------------------------------------------

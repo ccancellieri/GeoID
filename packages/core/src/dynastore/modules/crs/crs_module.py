@@ -52,12 +52,16 @@ class CRSModule(ModuleProtocol, CRSProtocol):
             yield; return
 
         logger.info("CRSModule: Initializing crs_definitions table.")
+
+        async def _init_crs_storage(conn: DbResource) -> None:
+            await maintenance_tools.ensure_schema_exists(conn, "crs")
+            await queries.CREATE_CUSTOM_CRS_TABLE.execute(conn)
+            # Partition creation handled on demand via ensure_partition_exists
+
         try:
-            async with managed_transaction(engine) as conn:
-                async with maintenance_tools.acquire_startup_lock(conn, "crs_module"):
-                    await maintenance_tools.ensure_schema_exists(conn, "crs")
-                    await queries.CREATE_CUSTOM_CRS_TABLE.execute(conn)
-                    # Partition creation handled on demand via ensure_partition_exists
+            await maintenance_tools.run_startup_ddl_tolerating_lock_timeout(
+                engine, "crs_module", _init_crs_storage,
+            )
         except Exception as e:
             logger.critical("CRSModule initialization failed: %s", e, exc_info=True)
             raise

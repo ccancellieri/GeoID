@@ -23,7 +23,7 @@ from contextlib import asynccontextmanager
 from dynastore.modules import ModuleProtocol, get_protocol
 from dynastore.models.protocols import DatabaseProtocol
 from dynastore.modules.db_config import maintenance_tools
-from dynastore.modules.db_config.query_executor import managed_transaction, DDLQuery
+from dynastore.modules.db_config.query_executor import DbResource, DDLQuery
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +63,15 @@ class StylesModule(ModuleProtocol):
             yield; return
         
         logger.info("StylesModule: Initializing schema...")
+
+        async def _init_styles_storage(conn: DbResource) -> None:
+            await maintenance_tools.ensure_schema_exists(conn, "styles")
+            await DDLQuery(STYLES_SCHEMA).execute(conn)
+
         try:
-            async with managed_transaction(engine) as conn:
-                async with maintenance_tools.acquire_startup_lock(conn, "styles_module"):
-                    await maintenance_tools.ensure_schema_exists(conn, "styles")
-                    await DDLQuery(STYLES_SCHEMA).execute(conn)
+            await maintenance_tools.run_startup_ddl_tolerating_lock_timeout(
+                engine, "styles_module", _init_styles_storage,
+            )
 
             logger.info("StylesModule: Initialization complete.")
         except Exception as e:

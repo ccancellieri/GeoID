@@ -44,6 +44,7 @@ from dynastore.modules.db_config.query_executor import (
     managed_transaction,
     sync_managed_transaction,
     retry_on_transient_connect,
+    is_lock_not_available_error,
 )
 
 if TYPE_CHECKING:
@@ -735,6 +736,59 @@ async def acquire_startup_lock(
         yield conn
     else:
         yield None
+
+
+async def run_startup_ddl_tolerating_lock_timeout(
+    engine: DbResource,
+    lock_key: str,
+    ddl_body: Callable[[DbResource], Awaitable[None]],
+) -> None:
+    """Run *ddl_body* under the ``lock_key`` startup advisory lock, without
+    letting lock contention abort process startup (#2616).
+
+    ``ddl_body`` MUST be idempotent (``CREATE ... IF NOT EXISTS`` / ``CREATE
+    OR REPLACE``) — required of every startup-DDL lifespan calling this
+    helper. When a peer pod is still holding the lock past
+    ``lock_acquire_timeout_seconds`` (e.g. because it is itself stalled on a
+    starved connection pool, #2333), :func:`acquire_startup_lock` raises a PG
+    lock-timeout error (55P03) instead of blocking forever. Left unhandled,
+    that propagates out of a foundational module's lifespan and crash-loops
+    the whole worker, even though the DDL the lock guards is safe to run
+    unlocked: idempotent ``CREATE ... IF NOT EXISTS`` DDL already tolerates
+    the resulting concurrent-DDL "already exists" races. So on a lock-timeout
+    we log a WARNING and run the same idempotent DDL on a fresh, unlocked
+    transaction instead of aborting startup.
+
+    Any other exception (a genuine connectivity failure, a bug in the DDL
+    itself, etc.) is NOT swallowed — it propagates as before.
+
+    Startup-DDL locks only. Never use this for leader-election locks
+    (``pg_advisory_leadership`` / ``lease_leadership`` / the
+    ``configs.leader_lease`` table) — those arbitrate exclusive ownership of
+    ongoing work rather than guarding one-shot idempotent DDL, so silently
+    falling back to "proceed unlocked" would be wrong for them.
+    """
+    try:
+        async with acquire_startup_lock(engine, lock_key) as locked_conn:
+            if locked_conn is None:
+                raise RuntimeError(
+                    f"Could not acquire startup lock for {lock_key!r}."
+                )
+            await ddl_body(locked_conn)
+        return
+    except Exception as exc:
+        if not is_lock_not_available_error(exc):
+            raise
+        logger.warning(
+            "Startup lock %r timed out — a peer is likely still "
+            "initializing this schema (possibly pool-starved, see #2333). "
+            "Proceeding with the idempotent DDL unlocked instead of aborting "
+            "startup: %s",
+            lock_key, exc,
+        )
+
+    async with managed_transaction(engine) as unlocked_conn:
+        await ddl_body(unlocked_conn)
 
 
 @asynccontextmanager

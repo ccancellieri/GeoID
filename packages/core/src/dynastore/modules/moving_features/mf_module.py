@@ -22,7 +22,7 @@ from contextlib import asynccontextmanager
 from dynastore.models.protocols import DatabaseProtocol
 from dynastore.modules import ModuleProtocol, get_protocol
 from dynastore.modules.db_config import maintenance_tools
-from dynastore.modules.db_config.query_executor import DDLQuery, managed_transaction
+from dynastore.modules.db_config.query_executor import DDLQuery, DbResource
 
 logger = logging.getLogger(__name__)
 
@@ -79,13 +79,17 @@ class MovingFeaturesModule(ModuleProtocol):
             return
 
         logger.info("MovingFeaturesModule: Initializing schema...")
+
+        async def _init_moving_features_storage(conn: DbResource) -> None:
+            await maintenance_tools.ensure_schema_exists(conn, "moving_features")
+            await DDLQuery(MOVING_FEATURES_DDL).execute(conn)
+            await DDLQuery(TEMPORAL_GEOMETRIES_DDL).execute(conn)
+            await DDLQuery(BBOX_INDEX_DDL).execute(conn)
+
         try:
-            async with managed_transaction(engine) as conn:
-                async with maintenance_tools.acquire_startup_lock(conn, "moving_features_module"):
-                    await maintenance_tools.ensure_schema_exists(conn, "moving_features")
-                    await DDLQuery(MOVING_FEATURES_DDL).execute(conn)
-                    await DDLQuery(TEMPORAL_GEOMETRIES_DDL).execute(conn)
-                    await DDLQuery(BBOX_INDEX_DDL).execute(conn)
+            await maintenance_tools.run_startup_ddl_tolerating_lock_timeout(
+                engine, "moving_features_module", _init_moving_features_storage,
+            )
 
             logger.info("MovingFeaturesModule: Initialization complete.")
         except Exception as e:

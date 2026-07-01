@@ -26,7 +26,7 @@ import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
-from typing import List, Optional, Any, Dict, AsyncGenerator, Union, Awaitable, Callable
+from typing import List, Optional, Any, Dict, AsyncGenerator, Union
 from dynastore.tools.cache import cached
 from dynastore.models.driver_context import DriverContext
 from dynastore.modules import ModuleProtocol
@@ -40,11 +40,11 @@ from dynastore.modules.db_config.query_executor import (
     ResultHandler,
     DbResource,
     run_in_event_loop,
-    is_lock_not_available_error,
 )
 from dynastore.modules.db_config.locking_tools import (
     check_table_exists,
     check_trigger_exists,
+    run_startup_ddl_tolerating_lock_timeout,
 )
 from dynastore.modules.db_config.maintenance_tools import ensure_schema_exists
 from dynastore.models.protocols.task_queue import TaskQueueProtocol
@@ -478,56 +478,6 @@ def _build_tasks_ddl_batch(schema: str) -> DDLBatch:
     )
 
 
-async def _run_startup_ddl_tolerating_lock_timeout(
-    engine: DbResource,
-    lock_key: str,
-    ddl_body: Callable[[DbResource], Awaitable[None]],
-) -> None:
-    """Run *ddl_body* under the ``lock_key`` startup advisory lock, without
-    letting lock contention abort process startup (#2616).
-
-    ``ddl_body`` MUST be idempotent (``CREATE ... IF NOT EXISTS`` / ``CREATE
-    OR REPLACE``) — true for every caller in ``TasksModule.lifespan``. When a
-    peer pod is still holding the lock past ``lock_acquire_timeout_seconds``
-    (e.g. because it is itself stalled on a starved connection pool, #2333),
-    ``acquire_startup_lock`` raises a PG lock-timeout error (55P03) instead of
-    blocking forever. That used to propagate out of TasksModule's foundational
-    lifespan and crash-loop the whole worker, even though the DDL the lock
-    guards is safe to run unlocked: ``DDLQuery``/``DDLBatch`` already tolerate
-    the resulting concurrent-DDL "already exists" races (see
-    ``_is_duplicate_object_error``). So on a lock-timeout we log a WARNING and
-    run the same idempotent DDL on a fresh, unlocked transaction instead of
-    aborting startup.
-
-    Any other exception (a genuine connectivity failure, a bug in the DDL
-    itself, etc.) is NOT swallowed — it propagates as before.
-    """
-    from dynastore.modules.db_config.locking_tools import acquire_startup_lock
-
-    try:
-        async with acquire_startup_lock(engine, lock_key) as locked_conn:
-            if locked_conn is None:
-                raise RuntimeError(
-                    f"TasksModule: could not acquire startup lock for {lock_key!r}."
-                )
-            await ddl_body(locked_conn)
-        return
-    except Exception as exc:
-        if not is_lock_not_available_error(exc):
-            raise
-        logger.warning(
-            "TasksModule: startup lock %r timed out — a peer is likely still "
-            "initializing this schema (possibly pool-starved, see #2333). "
-            "Proceeding with the idempotent DDL unlocked instead of aborting "
-            "startup: %s",
-            lock_key, exc,
-        )
-
-    async with managed_transaction(engine) as unlocked_conn:
-        await ddl_body(unlocked_conn)
-
-
-
 class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
     priority: int = 15  # Must start before CatalogModule (20) to create global tables
 
@@ -840,7 +790,7 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                     )
                     await ensure_workclass_storage_exists(conn, schema)
 
-                await _run_startup_ddl_tolerating_lock_timeout(
+                await run_startup_ddl_tolerating_lock_timeout(
                     engine, f"tasks_storage_init.{schema}", _init_tasks_storage,
                 )
 
@@ -863,7 +813,7 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                         "TasksModule: configs.task_capability_registry ensured."
                     )
 
-                await _run_startup_ddl_tolerating_lock_timeout(
+                await run_startup_ddl_tolerating_lock_timeout(
                     engine,
                     f"tasks_storage_init.{schema}.registry",
                     _init_task_capability_registry,

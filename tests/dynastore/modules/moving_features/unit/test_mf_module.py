@@ -50,11 +50,6 @@ async def _raise_on_enter(*_args, **_kwargs):
     yield  # unreachable; required by asynccontextmanager
 
 
-@asynccontextmanager
-async def _ok_conn(*_args, **_kwargs):
-    yield AsyncMock()
-
-
 # ---------------------------------------------------------------------------
 # DDL idempotency (no DB required)
 # ---------------------------------------------------------------------------
@@ -98,8 +93,11 @@ def test_bbox_geom_column_declared_before_index():
 
 
 async def test_lifespan_raises_on_ddl_failure(monkeypatch):
-    """If managed_transaction raises (e.g. DDL failure), the exception must
-    propagate out of lifespan instead of being silently swallowed."""
+    """If the startup lock/DDL raises a non-lock-timeout error (e.g. a real
+    DDL failure), the exception must propagate out of lifespan instead of
+    being silently swallowed. ``run_startup_ddl_tolerating_lock_timeout``
+    only tolerates a PG lock-timeout (#2616/#2625); everything else still
+    aborts startup."""
     mock_db = MagicMock()
     mock_db.engine = MagicMock()
 
@@ -108,7 +106,7 @@ async def test_lifespan_raises_on_ddl_failure(monkeypatch):
         lambda _proto: mock_db,
     )
     monkeypatch.setattr(
-        "dynastore.modules.moving_features.mf_module.managed_transaction",
+        "dynastore.modules.db_config.locking_tools.acquire_startup_lock",
         _raise_on_enter,
     )
 
@@ -129,19 +127,13 @@ async def test_lifespan_yields_when_ddl_succeeds(monkeypatch):
     mock_db = MagicMock()
     mock_db.engine = MagicMock()
 
-    # managed_transaction yields the connection
-    monkeypatch.setattr(
-        "dynastore.modules.moving_features.mf_module.managed_transaction",
-        _ok_conn,
-    )
-
-    # acquire_startup_lock yields the same connection
+    # acquire_startup_lock yields the connection
     @asynccontextmanager
     async def _ok_lock(*_args, **_kwargs):
         yield mock_conn
 
     monkeypatch.setattr(
-        "dynastore.modules.moving_features.mf_module.maintenance_tools.acquire_startup_lock",
+        "dynastore.modules.db_config.locking_tools.acquire_startup_lock",
         _ok_lock,
     )
     monkeypatch.setattr(

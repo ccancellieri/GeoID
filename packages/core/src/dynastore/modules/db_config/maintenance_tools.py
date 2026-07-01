@@ -34,6 +34,7 @@ from dynastore.modules.db_config.query_executor import (
 from dynastore.modules.db_config.partition_tools import ensure_partition_exists
 from dynastore.modules.db_config.locking_tools import (
     acquire_startup_lock,  # noqa: F401  # re-export: consumed as maintenance_tools.acquire_startup_lock by 6 module lifespans (crs, notebooks, styles, proxy, connected_systems, moving_features)
+    run_startup_ddl_tolerating_lock_timeout,  # noqa: F401  # re-export: consumed as maintenance_tools.run_startup_ddl_tolerating_lock_timeout by 5 of those lifespans (crs, notebooks, styles, connected_systems, moving_features)
 )
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     # cross-package re-exports (load-bearing — see note above)
     "acquire_startup_lock",
+    "run_startup_ddl_tolerating_lock_timeout",
     "DDLQuery",
     "DQLQuery",
     "DbResource",

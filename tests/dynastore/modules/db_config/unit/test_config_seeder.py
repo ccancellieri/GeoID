@@ -486,3 +486,33 @@ async def test_guard_unset_seeds_then_runs_normally(monkeypatch, tmp_path):
         await seeder.seed_default_configs(engine=object())
 
     config_mgr.set_config.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_lock_timeout_skips_without_raising(monkeypatch, tmp_path):
+    """A lock-timeout on the seeder's advisory lock must be tolerated the
+    same way as "another process holds it": skip seeding this boot instead
+    of aborting startup (#2625).
+    """
+    _write_seed(tmp_path / "defaults", "task-routing.json", {
+        "class_key": "task_routing_config",
+        "value": {"tasks": {"t_a": [{"consumers": ["catalog"], "runner": "background"}]}},
+    })
+    monkeypatch.setattr(seeder, "DEFAULTS_DIR", tmp_path / "defaults")
+
+    class _LockNotAvailableError(Exception):
+        pgcode = "55P03"
+
+    @asynccontextmanager
+    async def _raising_lock(_engine, _key):
+        raise _LockNotAvailableError("canceling statement due to lock timeout")
+        yield None  # pragma: no cover - unreachable; keeps this a generator
+
+    config_mgr = AsyncMock()
+    config_mgr.set_config = AsyncMock()
+
+    with patch("dynastore.tools.discovery.get_protocol", return_value=config_mgr), \
+         patch.object(seeder, "acquire_startup_lock", _raising_lock):
+        await seeder.seed_default_configs(engine=object())
+
+    config_mgr.set_config.assert_not_awaited()

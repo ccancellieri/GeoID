@@ -29,7 +29,7 @@ from contextlib import asynccontextmanager
 from dynastore.models.protocols import DatabaseProtocol
 from dynastore.modules import ModuleProtocol, get_protocol
 from dynastore.modules.db_config import maintenance_tools
-from dynastore.modules.db_config.query_executor import DDLQuery, managed_transaction
+from dynastore.modules.db_config.query_executor import DDLQuery, DbResource
 
 logger = logging.getLogger(__name__)
 
@@ -189,20 +189,24 @@ class ConnectedSystemsModule(ModuleProtocol):
             return
 
         logger.info("ConnectedSystemsModule: initialising schema...")
+
+        async def _init_consys_storage(conn: DbResource) -> None:
+            await maintenance_tools.ensure_schema_exists(conn, "consys")
+            await DDLQuery(CONSYS_SYSTEMS_DDL).execute(conn)
+            await DDLQuery(CONSYS_DEPLOYMENTS_DDL).execute(conn)
+            await DDLQuery(CONSYS_DATASTREAMS_DDL).execute(conn)
+            await DDLQuery(CONSYS_OBSERVATIONS_DDL).execute(conn)
+            await DDLQuery(CONSYS_OBSERVATIONS_IDX_DDL).execute(conn)
+            await DDLQuery(CONSYS_SYSTEMS_GEOM_IDX_DDL).execute(conn)
+            await DDLQuery(CONSYS_DEPLOYMENTS_GEOM_IDX_DDL).execute(conn)
+            await DDLQuery(CONSYS_FK_DATASTREAM_SYSTEM_DDL).execute(conn)
+            await DDLQuery(CONSYS_FK_OBSERVATION_DATASTREAM_DDL).execute(conn)
+            await DDLQuery(CONSYS_FK_DEPLOYMENT_SYSTEM_DDL).execute(conn)
+
         try:
-            async with managed_transaction(engine) as conn:
-                async with maintenance_tools.acquire_startup_lock(conn, "connected_systems_module"):
-                    await maintenance_tools.ensure_schema_exists(conn, "consys")
-                    await DDLQuery(CONSYS_SYSTEMS_DDL).execute(conn)
-                    await DDLQuery(CONSYS_DEPLOYMENTS_DDL).execute(conn)
-                    await DDLQuery(CONSYS_DATASTREAMS_DDL).execute(conn)
-                    await DDLQuery(CONSYS_OBSERVATIONS_DDL).execute(conn)
-                    await DDLQuery(CONSYS_OBSERVATIONS_IDX_DDL).execute(conn)
-                    await DDLQuery(CONSYS_SYSTEMS_GEOM_IDX_DDL).execute(conn)
-                    await DDLQuery(CONSYS_DEPLOYMENTS_GEOM_IDX_DDL).execute(conn)
-                    await DDLQuery(CONSYS_FK_DATASTREAM_SYSTEM_DDL).execute(conn)
-                    await DDLQuery(CONSYS_FK_OBSERVATION_DATASTREAM_DDL).execute(conn)
-                    await DDLQuery(CONSYS_FK_DEPLOYMENT_SYSTEM_DDL).execute(conn)
+            await maintenance_tools.run_startup_ddl_tolerating_lock_timeout(
+                engine, "connected_systems_module", _init_consys_storage,
+            )
             logger.info("ConnectedSystemsModule: initialisation complete.")
         except Exception as exc:
             logger.critical("ConnectedSystemsModule initialization failed: %s", exc, exc_info=True)
