@@ -51,6 +51,27 @@ def _make_service() -> tuple[AppliedPresetsService, dict]:
     return svc, state
 
 
+@pytest.fixture(autouse=True)
+def _stub_managed_transaction():
+    """The write path (``_write`` with ``conn=None``) opens its own
+    ``managed_transaction(self._engine)``, which validates the resource is a
+    real SQLAlchemy engine/connection and rejects the bare ``_MockEngine``.
+    These unit tests patch the individual query objects' ``execute`` and only
+    assert on the params passed to them, so stub the transaction to yield a
+    mock connection and let the patched query record the call."""
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _fake_txn(_engine: Any):
+        yield MagicMock()
+
+    with patch(
+        "dynastore.modules.iam.applied_presets_service.managed_transaction",
+        _fake_txn,
+    ):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Test get / list (pure read — mock the query module)
 # ---------------------------------------------------------------------------
