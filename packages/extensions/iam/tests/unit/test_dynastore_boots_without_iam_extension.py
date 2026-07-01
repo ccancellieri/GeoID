@@ -192,10 +192,6 @@ def test_iam_extension_lifespan_no_policy_contributor():
 # 6. The public_access_normalize migration exists and is idempotent
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(
-    reason="normalize_public_access migration not yet implemented (GeoID #2613)",
-    strict=False,
-)
 def test_normalize_public_access_migration_exists():
     """The normalize_public_access migration module must be importable."""
     spec = importlib.util.find_spec(
@@ -206,10 +202,6 @@ def test_normalize_public_access_migration_exists():
     )
 
 
-@pytest.mark.xfail(
-    reason="normalize_public_access migration not yet implemented (GeoID #2613)",
-    strict=False,
-)
 def test_normalize_public_access_removes_stale_catchall():
     """_normalize_resources replaces /web/.* with enumerated safe paths."""
     from dynastore.modules.iam.migrations.normalize_public_access import (
@@ -229,10 +221,6 @@ def test_normalize_public_access_removes_stale_catchall():
     assert "/auth/.*" in result, "/auth/.* should be preserved"
 
 
-@pytest.mark.xfail(
-    reason="normalize_public_access migration not yet implemented (GeoID #2613)",
-    strict=False,
-)
 def test_normalize_public_access_no_op_when_clean():
     """_normalize_resources returns None when the stale pattern is absent."""
     from dynastore.modules.iam.migrations.normalize_public_access import (
