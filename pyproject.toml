@@ -455,7 +455,22 @@ worker_task_stac_harvest = ["dynastore[task_base,catalog_grp,drivers_grp,index_g
 #   - index_grp          — Elasticsearch client (provisioners may set up ES index)
 #   - configs            — ConfigsProtocol for hot-reloadable threshold/concurrency
 #   - module_storage_postgresql — explicit per SCOPE × routing invariant
-worker_task_catalog_provision = ["dynastore[task_base,module_db,catalog_grp,module_gcp,drivers_grp,index_grp,configs,module_storage_postgresql]"]
+#   - module_iam         — IAM tenant provisioning (#2610). The IamModule owns
+#                          the `initialize_iam_tenant` critical sync catalog
+#                          initializer, which creates every per-tenant IAM table
+#                          (roles, role_hierarchy, grants, policies) in the new
+#                          schema atomically with the catalog. That hook only
+#                          registers when the IAM module is installed and
+#                          discovered in the running process; catalog creation
+#                          executes here (in the provision Job), not on the
+#                          IAM-less serving catalog service, so without module_iam
+#                          the hook never runs and fresh catalogs come up with no
+#                          IAM tables — failing closed on the first per-catalog
+#                          IAM read. Only the module (not extension_iam / the REST
+#                          surface) is pulled: the Job needs the lifecycle hook,
+#                          not HTTP routes. The serving catalog service stays
+#                          IAM-less (api_open / scope_catalog do not include IAM).
+worker_task_catalog_provision = ["dynastore[task_base,module_db,catalog_grp,module_gcp,drivers_grp,index_grp,configs,module_storage_postgresql,module_iam]"]
 # Write-reactive tile-cache invalidation (#1292) needs no dedicated SCOPE / Job
 # (#1298): it reuses the existing tiles_preseed task (operation=invalidate),
 # which already deploys as the geospatial-tiles-preseed-job
