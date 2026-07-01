@@ -94,6 +94,7 @@ from dynastore.models.protocols.asset_contrib import (
 from dynastore.models.protocols.conformance import ConformanceContributor
 from dynastore.models.protocols.scaling_signal import ScalingSignalProtocol
 from dynastore.models.protocols.platform_scaling import PlatformScalingProtocol
+from dynastore.models.protocols.metrics_backend import MetricsBackendProtocol, MetricKind
 from dynastore.models.protocols.catalog_source import (
     CatalogListProvider,
     CatalogOption,
@@ -213,6 +214,8 @@ __all__ = [
     "ConformanceContributor",
     "ScalingSignalProtocol",
     "PlatformScalingProtocol",
+    "MetricsBackendProtocol",
+    "MetricKind",
     "CatalogListProvider",
     "CatalogOption",
     "WebPageContributor",

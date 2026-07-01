@@ -23,6 +23,22 @@ pod can only observe its own instance-scope state). Each tick collects
 ``scaling_signals()`` from every registered ``ScalingSignalProtocol``
 provider and publishes them to the shared Valkey-backed signals document
 so the leader-elected platform reconciler can aggregate fleet-wide.
+
+Also carries the #2333 cgroup-v2 self-report (``dynastore.modules.scaling.
+cgroup_metrics``) on this same cadence and the same single Valkey backend
+handle (``get_cache_manager().get_async_backend()`` below) — no second
+connection pool. Cgroup self-report is a PORTABILITY FALLBACK for platforms
+that expose the cgroup filesystem (GKE, local, bare-metal), not the Cloud
+Run signal source: a live probe on ``dev-dynastore-catalog`` (Cloud Run
+gen2) confirmed ``/sys/fs/cgroup/*`` is not exposed inside Cloud Run's
+sandbox at all, so ``MonitoringSignalProvider`` (Cloud Monitoring) remains
+the only working Cloud Run backend and the one ``compute_desired_min``
+reads. Usability is probed once per pod at first tick and cached — when
+unusable (Cloud Run today), every later tick skips the cgroup read and
+publishes no cgroup signal entirely; when usable, the reading rides in this
+pod's existing per-instance payload, published but not yet consumed by
+``compute_desired_min`` (dormant, pending a portability target that can
+actually exercise it).
 """
 
 from __future__ import annotations
@@ -30,11 +46,18 @@ from __future__ import annotations
 import logging
 import os
 import socket
-from typing import Optional
+import time
+from typing import List, Optional
 
 from dynastore.models.protocols.configs import ConfigsProtocol
 from dynastore.models.protocols.scaling_signal import ScalingSignalProtocol
+from dynastore.models.scaling import ScalingSignal
 from dynastore.modules.scaling.aggregator import write_global_signals, write_instance_signals
+from dynastore.modules.scaling.cgroup_metrics import (
+    CgroupMetricsReader,
+    format_cgroup_probe,
+    probe_cgroup,
+)
 from dynastore.modules.scaling.config import ScalingPolicyConfig
 from dynastore.tools.background_service import PeriodicService, PodPolicy, ServiceContext
 from dynastore.tools.cache import get_cache_manager
@@ -66,6 +89,16 @@ class ScalingSignalPublisher(PeriodicService):
 
     def __init__(self, configs: Optional[ConfigsProtocol] = None) -> None:
         self._configs = configs
+        self._cgroup = CgroupMetricsReader()
+        # ``None`` = not probed yet. Probed exactly once, on this pod's very
+        # first tick (which PeriodicService fires immediately on start — see
+        # its docstring), regardless of ``policy.enabled`` — the boot
+        # diagnostic is useful even when the loop is off. Cached for the
+        # process's lifetime: once ``False`` (e.g. Cloud Run, whose sandbox
+        # does not expose ``/sys/fs/cgroup`` at all), every later tick skips
+        # the cgroup read and publishes no cgroup signal — a dead filesystem
+        # doesn't start working mid-process, so there is nothing to re-probe.
+        self._cgroup_usable: Optional[bool] = None
 
     async def _load_policy(self) -> ScalingPolicyConfig:
         configs = self._configs or get_protocol(ConfigsProtocol)
@@ -77,12 +110,34 @@ class ScalingSignalPublisher(PeriodicService):
     async def tick(self, ctx: ServiceContext) -> None:
         policy = await self._load_policy()
         self.cadence_seconds = float(policy.publish_interval_seconds)
+
+        if self._cgroup_usable is None:
+            try:
+                diag = probe_cgroup()
+                logger.info(format_cgroup_probe(diag))
+                self._cgroup_usable = bool(diag["usable"])
+            except Exception:
+                logger.debug("scaling: cgroup_probe failed (best-effort)", exc_info=True)
+                self._cgroup_usable = False
+
+        # Skip the read entirely when the boot probe found no cgroup
+        # filesystem — no per-tick cost, no per-tick log, on a platform
+        # (Cloud Run) where it will never succeed.
+        cgroup_cpu: Optional[float] = None
+        cgroup_mem: Optional[float] = None
+        if self._cgroup_usable:
+            try:
+                cgroup_cpu = self._cgroup.read_cpu_utilization()
+                cgroup_mem = self._cgroup.read_memory_utilization()
+            except Exception:
+                logger.debug("scaling: cgroup read failed (best-effort)", exc_info=True)
+
         if not policy.enabled:
             return
 
         providers = get_protocols(ScalingSignalProtocol)
-        instance_signals = []
-        global_signals = []
+        instance_signals: List[ScalingSignal] = []
+        global_signals: List[ScalingSignal] = []
         for provider in providers:
             try:
                 for signal in provider.scaling_signals():
@@ -94,6 +149,28 @@ class ScalingSignalPublisher(PeriodicService):
                 logger.debug(
                     "scaling: provider %r raised collecting signals", provider, exc_info=True
                 )
+
+        # Dormant fallback: rides in this pod's existing per-instance
+        # payload, published through the SAME backend handle below — no
+        # second Valkey client, no new connection pool. Not consumed by
+        # ``compute_desired_min`` (that stays on the Monitoring-derived
+        # global signal) — publish-only until a portability target proves
+        # it out.
+        now = time.time()
+        if cgroup_cpu is not None:
+            instance_signals.append(
+                ScalingSignal(
+                    source="cgroup", metric="cpu_utilization",
+                    value=cgroup_cpu, scope="instance", ts=now,
+                )
+            )
+        if cgroup_mem is not None:
+            instance_signals.append(
+                ScalingSignal(
+                    source="cgroup", metric="memory_utilization",
+                    value=cgroup_mem, scope="instance", ts=now,
+                )
+            )
 
         try:
             backend = get_cache_manager().get_async_backend()

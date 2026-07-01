@@ -24,6 +24,8 @@ so the test never touches process-global state or a real backend.
 
 from __future__ import annotations
 
+import logging
+from types import SimpleNamespace
 from typing import List
 
 import pytest
@@ -185,3 +187,166 @@ async def test_tick_provider_raising_does_not_abort_publish(monkeypatch):
 
     doc = backend._store[SIGNALS_CACHE_KEY]
     assert doc["instances"], "the good provider's signal must still be published"
+
+
+def _fake_cgroup(cpu=0.7, mem=0.4):
+    return SimpleNamespace(
+        read_cpu_utilization=lambda: cpu, read_memory_utilization=lambda: mem,
+    )
+
+
+def _diag(usable: bool) -> dict:
+    """A ``probe_cgroup()``-shaped dict with every key ``format_cgroup_probe``
+    reads, for tests that want to control the boot-probe verdict
+    deterministically instead of depending on the real host filesystem."""
+    return {
+        "cgroup_version": "v2" if usable else "unknown (no cpu.stat found)",
+        "cpu_stat_path": "/sys/fs/cgroup/cpu.stat", "cpu_stat_raw": None, "cpu_stat_error": None,
+        "cpu_max_path": "/sys/fs/cgroup/cpu.max", "cpu_max_raw": None, "cpu_max_error": None,
+        "memory_current_path": "/sys/fs/cgroup/memory.current", "memory_current_raw": None,
+        "memory_current_error": None,
+        "memory_max_path": "/sys/fs/cgroup/memory.max", "memory_max_raw": None, "memory_max_error": None,
+        "cpu_usage_usec": None, "allotted_cores": 1.0, "memory_utilization": None,
+        "usable": usable,
+    }
+
+
+@pytest.mark.asyncio
+async def test_cgroup_probe_logged_once_regardless_of_disabled_policy(caplog):
+    """The one-shot startup probe fires on the very first tick even with the
+    loop disabled — dev validation needs no config flip — and never again
+    after, regardless of the verdict."""
+    policy = ScalingPolicyConfig(enabled=False)
+    configs = _StubConfigs(policy)
+    pub = ScalingSignalPublisher(configs)
+    pub._cgroup = _fake_cgroup()
+
+    with caplog.at_level(logging.INFO, logger=publisher_mod.logger.name):
+        await pub.tick(_ctx())
+        await pub.tick(_ctx())
+
+    probe_lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("cgroup_probe")]
+    assert len(probe_lines) == 1, "the startup probe must log exactly once, not every tick"
+
+
+@pytest.mark.asyncio
+async def test_no_per_tick_compare_log(monkeypatch, caplog):
+    """The per-tick comparison log was removed as noise once cgroup proved
+    non-viable on Cloud Run — the boot probe is the only cgroup-related log
+    line a normal tick can produce."""
+    monkeypatch.setattr(publisher_mod, "probe_cgroup", lambda: _diag(usable=True))
+    policy = ScalingPolicyConfig(enabled=True)
+    configs = _StubConfigs(policy)
+    monkeypatch.setattr(publisher_mod, "get_protocols", lambda proto: [])
+    monkeypatch.setattr(publisher_mod, "get_cache_manager", lambda: _FailingCacheManager())
+
+    pub = ScalingSignalPublisher(configs)
+    pub._cgroup = _fake_cgroup(cpu=0.42, mem=0.33)
+
+    with caplog.at_level(logging.INFO, logger=publisher_mod.logger.name):
+        await pub.tick(_ctx())
+        await pub.tick(_ctx())
+
+    assert not any(r.getMessage().startswith("scaling_metric_compare") for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_cgroup_read_skipped_entirely_when_probe_reports_unusable(monkeypatch):
+    """Cloud Run's confirmed shape: the boot probe finds no cgroup
+    filesystem, so every later tick must skip the read outright — no
+    per-tick filesystem cost on a platform where it will never succeed."""
+    monkeypatch.setattr(publisher_mod, "probe_cgroup", lambda: _diag(usable=False))
+    policy = ScalingPolicyConfig(enabled=True)
+    configs = _StubConfigs(policy)
+    monkeypatch.setattr(publisher_mod, "get_protocols", lambda proto: [])
+
+    backend = _FakeAsyncCacheBackend()
+
+    class _CacheManager:
+        def get_async_backend(self):
+            return backend
+
+    monkeypatch.setattr(publisher_mod, "get_cache_manager", lambda: _CacheManager())
+
+    calls = {"cpu": 0, "mem": 0}
+
+    def _cpu():
+        calls["cpu"] += 1
+        return 0.9
+
+    def _mem():
+        calls["mem"] += 1
+        return 0.9
+
+    pub = ScalingSignalPublisher(configs)
+    pub._cgroup = SimpleNamespace(read_cpu_utilization=_cpu, read_memory_utilization=_mem)
+
+    await pub.tick(_ctx())
+    await pub.tick(_ctx())
+    await pub.tick(_ctx())
+
+    assert calls == {"cpu": 0, "mem": 0}, "unusable cgroup must never be read, not even once"
+    doc = backend._store.get(SIGNALS_CACHE_KEY, {"instances": {}})
+    published = next(iter(doc["instances"].values()), {}).get("signals", [])
+    assert not any(s["source"] == "cgroup" for s in published)
+
+
+@pytest.mark.asyncio
+async def test_cgroup_readings_published_as_instance_signals(monkeypatch):
+    """When usable, the cgroup self-report rides in the SAME per-instance
+    payload, via the SAME backend handle the publisher already uses — no
+    second Valkey client, purely additive to the existing instance-signal
+    list."""
+    monkeypatch.setattr(publisher_mod, "probe_cgroup", lambda: _diag(usable=True))
+    policy = ScalingPolicyConfig(enabled=True)
+    configs = _StubConfigs(policy)
+    monkeypatch.setattr(publisher_mod, "get_protocols", lambda proto: [])
+
+    backend = _FakeAsyncCacheBackend()
+
+    class _CacheManager:
+        def get_async_backend(self):
+            return backend
+
+    monkeypatch.setattr(publisher_mod, "get_cache_manager", lambda: _CacheManager())
+
+    pub = ScalingSignalPublisher(configs)
+    pub._cgroup = _fake_cgroup(cpu=0.6, mem=0.2)
+
+    await pub.tick(_ctx())
+
+    doc = backend._store[SIGNALS_CACHE_KEY]
+    published = next(iter(doc["instances"].values()))["signals"]
+    by_metric = {s["metric"]: s for s in published}
+    assert by_metric["cpu_utilization"]["value"] == 0.6
+    assert by_metric["cpu_utilization"]["source"] == "cgroup"
+    assert by_metric["cpu_utilization"]["scope"] == "instance"
+    assert by_metric["memory_utilization"]["value"] == 0.2
+
+
+@pytest.mark.asyncio
+async def test_cgroup_none_reading_contributes_no_signal(monkeypatch):
+    """A fail-soft ``None`` (e.g. the first CPU sample after a usable
+    probe) must not publish a fabricated signal."""
+    monkeypatch.setattr(publisher_mod, "probe_cgroup", lambda: _diag(usable=True))
+    policy = ScalingPolicyConfig(enabled=True)
+    configs = _StubConfigs(policy)
+    monkeypatch.setattr(publisher_mod, "get_protocols", lambda proto: [])
+
+    backend = _FakeAsyncCacheBackend()
+
+    class _CacheManager:
+        def get_async_backend(self):
+            return backend
+
+    monkeypatch.setattr(publisher_mod, "get_cache_manager", lambda: _CacheManager())
+
+    pub = ScalingSignalPublisher(configs)
+    pub._cgroup = _fake_cgroup(cpu=None, mem=None)
+
+    await pub.tick(_ctx())
+
+    doc = backend._store[SIGNALS_CACHE_KEY]
+    # No provider and no cgroup reading this tick -> nothing published for
+    # this instance, but the tick must still complete without raising.
+    assert doc["instances"] == {} or not next(iter(doc["instances"].values()))["signals"]

@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from dynastore.models.scaling import ScalingSignal
 from dynastore.modules.scaling.config import ScalingPolicyConfig
@@ -184,6 +184,20 @@ def _percentile(values: List[float], pct: float) -> float:
     return ordered[rank]
 
 
+def extract_global_metric(signals: Sequence[ScalingSignal], metric: str) -> Optional[float]:
+    """Fleet-wide MAX reading for a ``scope="global"`` *metric*, or ``None``
+    when no fresh signal reports it this tick. MAX (not mean) mirrors the
+    OR-up scale-out semantics ``compute_desired_min`` already applies to
+    ``conn_pressure`` — used here for ``conn_pressure``, ``cpu_utilization``
+    (both consumed by ``compute_desired_min``) and ``memory_utilization``
+    (a reconciler-only recommendation, never fed back into this function).
+    """
+    return max(
+        (s.value for s in signals if s.scope == "global" and s.metric == metric),
+        default=None,
+    )
+
+
 def effective_max_replicas(policy: ScalingPolicyConfig) -> int:
     """Budget-clamped ceiling: never lets the controller invent DB capacity."""
     budget_ceiling = (policy.db_max_connections - policy.connection_headroom) // max(
@@ -214,11 +228,28 @@ def compute_desired_min(
     3. Global guard: if the fleet-wide ``conn_pressure`` (scope="global")
        is at or above ``conn_pressure_ceiling``, scale-out is suppressed —
        the DB is already the bottleneck and more instances make it worse.
-    4. Budget ceiling: the result never exceeds
+    4. Actuator selection via ``cpu_utilization`` (scope="global", the slow
+       corroborating platform-metrics tier — see ``MonitoringSignalProvider``).
+       Absent that signal (no monitoring backend registered, or its first
+       poll hasn't landed yet) this step is skipped entirely and the
+       decision reduces to the pool-only algorithm above, unchanged:
+         a. Pool saturated (step 1 would scale out) but the fleet is
+            compute-idle (``cpu_utilization < cpu_idle_ceiling``): hold —
+            adding instances would not relieve a bottleneck that isn't CPU,
+            the correct lever is a deeper PG pool instead (a separate
+            actuator, not this one).
+         b. Pool NOT saturated but ``cpu_utilization >= cpu_scale_out_ceiling``:
+            scale out anyway — a compute-bound fleet the pool signal alone
+            would miss.
+         c. Otherwise scale-in proceeds on the pool p95 signal as usual,
+            UNLESS ``cpu_utilization >= cpu_scale_out_ceiling`` (confirmed
+            hot) — a cool pool alongside confirmed-high CPU must NOT scale
+            in, the pool being idle doesn't mean the fleet is.
+    5. Budget ceiling: the result never exceeds
        ``(db_max_connections - connection_headroom) // per_instance_pool``,
        regardless of ``max_replicas`` — the controller cannot invent DB
        capacity.
-    5. Asymmetric cooldown + step: scale-OUT (raising the floor) uses
+    6. Asymmetric cooldown + step: scale-OUT (raising the floor) uses
        ``scale_out_cooldown_seconds`` (short — react fast to DB pressure,
        protect the SLA) and ``step``. Scale-IN (lowering the floor) uses
        ``scale_in_cooldown_seconds`` (longer than scale-out, damping
@@ -245,10 +276,8 @@ def compute_desired_min(
     if not instance_values:
         return current_min
 
-    global_conn_pressure = max(
-        (s.value for s in signals if s.scope == "global" and s.metric == "conn_pressure"),
-        default=None,
-    )
+    global_conn_pressure = extract_global_metric(signals, "conn_pressure")
+    cpu_utilization = extract_global_metric(signals, "cpu_utilization")
 
     fleet_max = max(instance_values, default=0.0)
     fleet_p95 = _percentile(instance_values, 95)
@@ -258,13 +287,30 @@ def compute_desired_min(
     guard_tripped = (
         global_conn_pressure is not None and global_conn_pressure >= policy.conn_pressure_ceiling
     )
+    cpu_idle = cpu_utilization is not None and cpu_utilization < policy.cpu_idle_ceiling
+    cpu_hot = cpu_utilization is not None and cpu_utilization >= policy.cpu_scale_out_ceiling
 
     target = current_min
     if fleet_max >= policy.scale_out_saturation:
-        if not guard_tripped:
+        if guard_tripped:
+            pass  # hold — the DB guard suppresses scale-out regardless of CPU.
+        elif cpu_idle:
+            # Pool-saturated but compute-idle: not a CPU bottleneck more
+            # instances can relieve — prefer deepening the PG pool instead.
+            logger.info(
+                "scaling: pool saturated (%.2f) but cpu_utilization=%.2f is "
+                "below the idle ceiling (%.2f) — holding min_instances, a "
+                "deeper PG pool is the correct lever here, not more instances.",
+                fleet_max, cpu_utilization, policy.cpu_idle_ceiling,
+            )
+        else:
             target = current_min + policy.step
-        # else: hold — guard suppresses scale-out.
-    elif fleet_p95 < (policy.scale_out_saturation - policy.deadband):
+    elif cpu_hot and not guard_tripped:
+        # Compute-bound even though the pool isn't saturated yet.
+        target = current_min + policy.step
+    elif fleet_p95 < (policy.scale_out_saturation - policy.deadband) and not cpu_hot:
+        # Scale-IN uses the larger asymmetric step so the floor ratchets back
+        # down quickly once load clears; a confirmed-hot CPU blocks it.
         target = current_min - policy.scale_in_step
     # else: inside the deadband — no change.
 

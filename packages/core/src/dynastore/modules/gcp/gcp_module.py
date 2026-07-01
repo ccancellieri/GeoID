@@ -815,6 +815,35 @@ class GCPModule(
                     exc_info=True,
                 )
 
+            # --- Monitoring signal provider (slow, corroborating CPU/memory
+            # tier for the scaling control loop) ---
+            # Cloud-neutral MonitoringSignalProvider (modules/scaling) fed by
+            # GCPMonitoringBackend, the only place a Cloud Monitoring metric
+            # type or REST shape appears. Off by default
+            # (MonitoringSignalConfig.enabled=False) — it costs Monitoring
+            # API calls and requires monitoring-viewer on the service
+            # account, so it stays opt-in even once the pool-only loop is on.
+            try:
+                from dynastore.modules.gcp.gcp_monitoring_backend import (
+                    GCPMonitoringBackend,
+                )
+                from dynastore.modules.scaling.monitoring_signal_provider import (
+                    MonitoringSignalProvider,
+                )
+
+                self._monitoring_signal_provider = MonitoringSignalProvider(
+                    backend=GCPMonitoringBackend(self),
+                    configs=self._config_service,
+                )
+                _gcp_supervisor.register(self._monitoring_signal_provider)
+                register_plugin(self._monitoring_signal_provider)
+                logger.info("GCP Module: monitoring signal provider registered.")
+            except Exception as e:
+                logger.error(
+                    "GCP Module: failed to register monitoring signal provider (%s).", e,
+                    exc_info=True,
+                )
+
             _gcp_bg_ctx = _GcpServiceContext(
                 engine=reconciler_engine,
                 shutdown=_gcp_bg_shutdown,
@@ -845,6 +874,7 @@ class GCPModule(
                 "_asset_download_process",
                 "_tile_bucket_storage",
                 "_tile_archive_storage",
+                "_monitoring_signal_provider",
             ):
                 obj = getattr(self, attr, None)
                 if obj:

@@ -136,6 +136,53 @@ async def test_actuates_on_hot_fleet_signal():
 
 
 @pytest.mark.asyncio
+async def test_memory_recommendation_logged_not_actuated(caplog):
+    """Memory is a SLOW revision-roll actuator — a high reading must be
+    logged as a recommendation, never fed into ``set_min_instances``."""
+    import logging
+
+    from dynastore.modules.gcp import scaling_reconciler as mod
+
+    now = time.time()
+    doc = {
+        "instances": {
+            "host-a:1": {
+                "ts": now,
+                "signals": [
+                    {
+                        "source": "duckdb_pool", "metric": "pool_saturation",
+                        "value": 0.1, "scope": "instance", "ts": now,
+                    }
+                ],
+            }
+        },
+        "global": {
+            "monitoring_signal_provider:memory_utilization": {
+                "ts": now,
+                "signal": {
+                    "source": "monitoring_signal_provider", "metric": "memory_utilization",
+                    "value": 0.92, "scope": "global", "ts": now,
+                },
+            }
+        },
+    }
+    platform = SimpleNamespace(
+        get_min_instances=AsyncMock(return_value=2),
+        set_min_instances=AsyncMock(),
+    )
+    policy = ScalingPolicyConfig(
+        enabled=True, min_replicas=2, memory_recommendation_ceiling=0.85,
+    )
+    reconciler = GcpScalingReconciler(platform=platform, configs=_fake_configs(policy))
+
+    with _patch_cache(mod, _fake_backend(doc)), caplog.at_level(logging.WARNING, logger=mod.logger.name):
+        await reconciler._reconcile_once()
+
+    platform.set_min_instances.assert_not_awaited()
+    assert any("memory_utilization" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_reads_signals_from_the_shared_cache_key():
     """Guards against a key-name drift between publisher and reconciler."""
     from dynastore.modules.gcp import scaling_reconciler as mod

@@ -29,6 +29,11 @@ The one exception is the reconciler's *loop cadence*
 once at process start, so a change there only takes effect on the next
 deployment. ``publish_interval_seconds`` is genuinely hot-reloaded because the
 RUN_EVERYWHERE publisher re-reads it each iteration.
+
+``MonitoringSignalConfig`` (below) governs the separate, slower
+platform-metrics provider — its own poll cadence and on/off switch — while
+the CPU/memory decision thresholds it feeds live on ``ScalingPolicyConfig``
+alongside every other threshold ``compute_desired_min`` reads.
 """
 
 from __future__ import annotations
@@ -269,4 +274,87 @@ class ScalingPolicyConfig(PluginConfig):
         default=30,
         ge=1,
         description="Cadence of the leader-elected platform reconciler tick.",
+    )
+
+    cpu_scale_out_ceiling: Mutable[float] = Field(
+        default=0.65,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fleet-wide CPU utilization (``scope='global'``, e.g. from "
+            "``MonitoringSignalProvider``) at or above which scale-out is "
+            "warranted even when no per-instance pool is saturated yet — "
+            "the compute-bound case a connection-pool-only signal misses."
+        ),
+    )
+    cpu_idle_ceiling: Mutable[float] = Field(
+        default=0.30,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fleet-wide CPU utilization below which the fleet is considered "
+            "compute-idle. Gates two decisions: (1) when the per-instance "
+            "pool IS saturated but CPU is below this ceiling, scale-out is "
+            "held — more instances would not relieve a bottleneck that isn't "
+            "compute, so the correct lever is a deeper PG pool, not more "
+            "replicas; (2) reinforces scale-in — a cool pool is trusted to "
+            "mean genuinely low load only when CPU is also idle."
+        ),
+    )
+    memory_recommendation_ceiling: Mutable[float] = Field(
+        default=0.85,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fleet-wide memory utilization at or above which the reconciler "
+            "logs a recommendation to raise the Cloud Run memory limit. "
+            "Memory is a revision-roll actuator (cold start on every "
+            "instance) — never actuated automatically per-tick, only "
+            "surfaced for an operator to act on."
+        ),
+    )
+
+
+class MonitoringSignalConfig(PluginConfig):
+    """Tunables for ``MonitoringSignalProvider`` — the slow, corroborating
+    platform-metrics tier (CPU/memory utilization) feeding the #2333
+    control loop alongside the fast in-process pool signals.
+
+    Kept separate from ``ScalingPolicyConfig`` because these knobs govern
+    the *provider's own polling* (whether it polls at all, how often, over
+    what lookback window), not the control loop's decision thresholds
+    (which live in ``ScalingPolicyConfig`` and apply regardless of which
+    backend produced the ``cpu_utilization`` / ``memory_utilization``
+    signals).
+    """
+
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "modules", "scaling", "monitoring_signal")
+
+    enabled: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "Master switch for the platform-metrics provider. Off by "
+            "default: querying a metrics API costs API calls and requires "
+            "a service account with monitoring-viewer access, so it stays "
+            "opt-in even when ``ScalingPolicyConfig.enabled`` is on."
+        ),
+    )
+    poll_interval_seconds: Mutable[int] = Field(
+        default=60,
+        ge=30,
+        description=(
+            "Cadence of the provider's own poll against the metrics "
+            "backend. Floored at 30s (the reconciler's own cadence) — "
+            "metrics lag 1-3 minutes on most platforms, so polling faster "
+            "than that only adds API cost without fresher data."
+        ),
+    )
+    window_seconds: Mutable[float] = Field(
+        default=120.0,
+        ge=60.0,
+        description=(
+            "Lookback window queried on each poll. Must comfortably cover "
+            "the metrics backend's own reporting lag so a poll always finds "
+            "at least one aligned point."
+        ),
     )

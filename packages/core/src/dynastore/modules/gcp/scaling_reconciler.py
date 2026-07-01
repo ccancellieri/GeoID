@@ -36,7 +36,12 @@ from typing import Optional, Union
 
 from dynastore.models.protocols.configs import ConfigsProtocol
 from dynastore.models.protocols.platform_scaling import PlatformScalingProtocol
-from dynastore.modules.scaling.aggregator import collect_live_signals, compute_desired_min, read_signals_document
+from dynastore.modules.scaling.aggregator import (
+    collect_live_signals,
+    compute_desired_min,
+    extract_global_metric,
+    read_signals_document,
+)
 from dynastore.modules.scaling.config import ScalingPolicyConfig
 from dynastore.tools.background_service import Leadership, PeriodicService, PodPolicy, ServiceContext
 from dynastore.tools.cache import get_cache_manager
@@ -118,6 +123,22 @@ class GcpScalingReconciler(PeriodicService):
             last_change_ts=self._last_change_ts,
             now=now,
         )
+
+        # Memory is a SLOW revision-roll actuator (a limit bump cold-starts
+        # every instance) — never actuated per-tick. Surface a recommendation
+        # only, so an operator (or a future, separately-gated actuator) can
+        # act on it deliberately.
+        memory_utilization = extract_global_metric(signals, "memory_utilization")
+        if (
+            memory_utilization is not None
+            and memory_utilization >= policy.memory_recommendation_ceiling
+        ):
+            logger.warning(
+                "GcpScalingReconciler: memory_utilization=%.2f >= recommendation "
+                "ceiling %.2f — consider raising the Cloud Run memory limit "
+                "(revision-roll change, not actuated automatically).",
+                memory_utilization, policy.memory_recommendation_ceiling,
+            )
 
         if desired != current:
             await platform.set_min_instances(desired)

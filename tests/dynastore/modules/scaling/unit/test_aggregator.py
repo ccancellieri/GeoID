@@ -239,6 +239,91 @@ def test_no_instance_signals_holds_current_not_drains_to_min():
     ) == 5
 
 
+def test_pool_saturated_but_cpu_idle_holds_prefers_pool_depth():
+    """Actuator selection (#2333 monitoring signal): the pool looks hot but
+    the fleet is compute-idle — adding instances would not relieve a
+    bottleneck that isn't CPU. Hold; a deeper PG pool is the right lever."""
+    policy = _policy(
+        min_replicas=0, max_replicas=10, scale_out_saturation=0.80,
+        cpu_idle_ceiling=0.30, step=1,
+    )
+    signals = [_instance_signal(0.95, source="pg_pool"), _global_signal(0.15, metric="cpu_utilization")]
+
+    result = compute_desired_min(
+        signals, policy, current_min=2, last_change_ts=0.0, now=1000.0
+    )
+
+    assert result == 2
+
+
+def test_cpu_high_without_pool_saturation_still_scales_out():
+    """Actuator selection: compute-bound fleet the pool-only signal would
+    miss (pool well under saturation) still triggers scale-out."""
+    policy = _policy(
+        min_replicas=0, max_replicas=10, scale_out_saturation=0.80,
+        cpu_scale_out_ceiling=0.65, step=1,
+    )
+    signals = [_instance_signal(0.5), _global_signal(0.70, metric="cpu_utilization")]
+
+    result = compute_desired_min(
+        signals, policy, current_min=2, last_change_ts=0.0, now=1000.0
+    )
+
+    assert result == 3
+
+
+def test_cpu_scale_out_suppressed_by_conn_pressure_guard_too():
+    """The DB-pressure guard suppresses scale-out regardless of which
+    signal (pool saturation or CPU) is driving it."""
+    policy = _policy(
+        min_replicas=0, max_replicas=10, scale_out_saturation=0.80,
+        cpu_scale_out_ceiling=0.65, conn_pressure_ceiling=0.80, step=1,
+    )
+    signals = [
+        _instance_signal(0.5),
+        _global_signal(0.70, metric="cpu_utilization"),
+        _global_signal(0.85, metric="conn_pressure"),
+    ]
+
+    result = compute_desired_min(
+        signals, policy, current_min=2, last_change_ts=0.0, now=1000.0
+    )
+
+    assert result == 2
+
+
+def test_cool_pool_but_confirmed_hot_cpu_does_not_scale_in():
+    """A cool connection pool alone must not be read as "low load" when CPU
+    is confirmed high — the pool being idle doesn't mean the fleet is. With no
+    DB-pressure guard, a compute-bound fleet scales OUT on the CPU signal the
+    pool alone would miss, and never scales IN."""
+    policy = _policy(
+        min_replicas=0, max_replicas=10, scale_out_saturation=0.80,
+        deadband=0.10, cpu_scale_out_ceiling=0.65, step=1,
+    )
+    signals = [_instance_signal(0.1), _global_signal(0.90, metric="cpu_utilization")]
+
+    result = compute_desired_min(
+        signals, policy, current_min=4, last_change_ts=0.0, now=1000.0
+    )
+
+    assert result == 5
+
+
+def test_no_cpu_signal_falls_back_to_pool_only_algorithm():
+    """Absent a monitoring backend entirely, the controller runs the pool-only
+    path — the CPU branches are skipped when no CPU signal is present, and a
+    cool p95 pool scales in by the asymmetric ``scale_in_step`` (2)."""
+    policy = _policy(min_replicas=0, max_replicas=10, scale_out_saturation=0.80, deadband=0.10, step=1)
+    signals = [_instance_signal(0.5)]
+
+    result = compute_desired_min(
+        signals, policy, current_min=4, last_change_ts=0.0, now=1000.0
+    )
+
+    assert result == 2
+
+
 def test_scale_out_clamps_to_effective_max_replicas():
     policy = _policy(
         min_replicas=0, max_replicas=5, scale_out_saturation=0.80,
