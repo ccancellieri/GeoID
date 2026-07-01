@@ -43,7 +43,7 @@ from fastapi.responses import JSONResponse  # noqa: E402
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.tools.query import parse_hints_param  # noqa: E402
-from dynastore.models.ogc import Feature
+from dynastore.models.ogc import Feature, FeatureCollection
 from dynastore.models.query_builder import QueryRequest
 from dynastore.modules.joins.bq_secondary import stream_bigquery_secondary
 from dynastore.modules.joins.executor import index_secondary, run_join
@@ -75,6 +75,9 @@ MAX_PRIMARY_SCAN_ROWS = 1_000_000
 
 # GeoJSON media type for join feature collections and pagination links.
 GEOJSON_MEDIA_TYPE = "application/geo+json"
+# Plain JSON alternative a client can request via `Accept` (see
+# `_negotiate_join_response`).
+JSON_MEDIA_TYPE = "application/json"
 
 
 class GeoJSONResponse(JSONResponse):
@@ -86,6 +89,22 @@ class GeoJSONResponse(JSONResponse):
     """
 
     media_type = GEOJSON_MEDIA_TYPE
+
+
+def _negotiate_join_response(body: Dict[str, Any], accept_header: str):
+    """Honor `Accept: application/json` vs the OGC-default `geo+json`.
+
+    Mirrors the substring `Accept` check already used elsewhere in the catalog
+    for content negotiation (e.g. ``CRSService.get_crs``): the join
+    FeatureCollection defaults to ``application/geo+json`` (OGC API - Features
+    Part 1 §7.15.4 fc-response) for any other/absent/wildcard ``Accept``. Only
+    an explicit plain-JSON request gets an explicit ``JSONResponse`` here — the
+    default case returns ``body`` unwrapped and lets the route's
+    ``response_class=GeoJSONResponse`` serve it.
+    """
+    if JSON_MEDIA_TYPE in accept_header and GEOJSON_MEDIA_TYPE not in accept_header:
+        return JSONResponse(content=body)
+    return body
 
 
 async def _resolve_primary_driver(
@@ -204,26 +223,43 @@ def _with_paging_query(url: str, *, offset: int, limit: int) -> str:
 
 def _join_feature_collection(
     joined: List[Feature], *, request: Request, paging: PagingSpec, has_next: bool,
+    number_matched: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Build an OGC-conformant join FeatureCollection.
 
     Carries the OGC API - Features response members (``links``, ``timeStamp``,
     ``numberReturned``) instead of a non-standard ``_join_meta`` foreign member.
-    ``numberMatched`` is intentionally omitted: the join streams an inner match
+    ``numberMatched`` is only set when the caller already knows the exact total
+    for free (see ``_execute_primary_join``: a terminal page reached after a
+    full, untruncated primary scan). The join otherwise streams an inner match
     and never materializes the full matched set, so its total is not known
-    cheaply (Features Part 1 permits omitting it).
+    cheaply and stays omitted (Features Part 1 permits omitting it) rather than
+    paying for a separate count.
 
     ``has_next`` is computed by the caller (``_execute_primary_join``) which
     uses a match-bounded read: it requests ``limit+1`` matched features from
     the join executor and emits ``next`` when the (limit+1)th match exists or
     the primary-scan safety ceiling was reached before ``limit+1`` matches were
     found. This is correct for both dense and sparse joins.
+
+    ``prev`` is emitted whenever ``paging.offset > 0``, mirroring how ``next``
+    is built (same ``_with_paging_query`` helper) — omitted on the first page.
     """
     features = [f.model_dump(by_alias=True, exclude_none=True) for f in joined]
     self_href = str(request.url)
     links: List[Dict[str, Any]] = [
         {"rel": "self", "type": GEOJSON_MEDIA_TYPE, "href": self_href},
     ]
+    if paging.offset > 0:
+        links.append({
+            "rel": "prev",
+            "type": GEOJSON_MEDIA_TYPE,
+            "href": _with_paging_query(
+                self_href,
+                offset=max(0, paging.offset - paging.limit),
+                limit=paging.limit,
+            ),
+        })
     if has_next:
         links.append({
             "rel": "next",
@@ -232,13 +268,16 @@ def _join_feature_collection(
                 self_href, offset=paging.offset + paging.limit, limit=paging.limit,
             ),
         })
-    return {
+    result: Dict[str, Any] = {
         "type": "FeatureCollection",
         "features": features,
         "numberReturned": len(features),
         "timeStamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "links": links,
     }
+    if number_matched is not None:
+        result["numberMatched"] = number_matched
+    return result
 
 
 async def _execute_primary_join(
@@ -324,8 +363,16 @@ async def _execute_primary_join(
     has_next = len(joined) > paging.limit or ceiling_hit
     joined = joined[: paging.limit]
 
+    # `numberMatched` for free: reaching a terminal page (`not has_next`) means
+    # the primary was scanned to completion without hitting the safety ceiling
+    # and no further match exists — so the total is exactly what's already
+    # been counted across pages (`offset` + this page's own count), with no
+    # extra query. Any other page keeps it omitted (see `_join_feature_collection`).
+    number_matched = None if has_next else paging.offset + len(joined)
+
     return _join_feature_collection(
         joined, request=request, paging=paging, has_next=has_next,
+        number_matched=number_matched,
     )
 
 
@@ -377,6 +424,27 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
             "/catalogs/{catalog_id}/collections/{collection_id}/join",
             self.execute_join, methods=["POST"],
             response_class=GeoJSONResponse,
+            # Doc-only response schema: the join FeatureCollection carries
+            # arbitrary per-request properties/geometry that a real
+            # `response_model=FeatureCollection` would re-validate on every
+            # request (and reject legitimate `geometry: null` features, since
+            # geojson_pydantic's `Feature.geometry` isn't itself nullable-
+            # optional) — that's the join *semantics* this issue must not
+            # touch. `responses=` documents the schema for the OpenAPI spec
+            # without imposing runtime (re-)validation.
+            responses={
+                200: {
+                    "description": (
+                        "Joined FeatureCollection page, served as "
+                        f"`{GEOJSON_MEDIA_TYPE}` by default or `{JSON_MEDIA_TYPE}` "
+                        "when explicitly requested via `Accept`."
+                    ),
+                    "content": {
+                        GEOJSON_MEDIA_TYPE: {"schema": FeatureCollection.model_json_schema()},
+                        JSON_MEDIA_TYPE: {"schema": FeatureCollection.model_json_schema()},
+                    },
+                },
+            },
         )
 
     async def describe_join(
@@ -420,10 +488,16 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
         response is an OGC API - Features-style FeatureCollection (``links``,
         ``timeStamp``, ``numberReturned``).
 
+        Honors ``Accept: application/json`` for a plain-JSON response body;
+        any other (or absent/wildcard) ``Accept`` keeps the OGC-conformant
+        ``application/geo+json`` default.
+
         PR-3: BigQuerySecondarySpec runs the join end-to-end via the
         platform's driver registry for the primary side. NamedSecondarySpec
         stub remains until its own PR.
         """
+        accept_header = request.headers.get("Accept", GEOJSON_MEDIA_TYPE)
+
         # Effective page: query params win over body, bounded to a sane page.
         # The primary read is NOT pre-capped at offset+limit rows — that caused
         # sparse inner joins to under-fill pages and suppress the `next` link
@@ -454,7 +528,7 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
                     ),
                 )
             try:
-                return await _execute_primary_join(
+                result = await _execute_primary_join(
                     primary_driver,
                     catalog_id=catalog_id,
                     collection_id=collection_id,
@@ -466,6 +540,7 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
                 raise HTTPException(
                     status_code=400, detail=f"Invalid primary_filter: {e}",
                 ) from e
+            return _negotiate_join_response(result, accept_header)
 
         if isinstance(body.secondary, NamedSecondarySpec):
             # Resolve secondary collection via the platform's driver registry.
@@ -504,7 +579,7 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
                     ),
                 )
             try:
-                return await _execute_primary_join(
+                result = await _execute_primary_join(
                     primary_driver,
                     catalog_id=catalog_id,
                     collection_id=collection_id,
@@ -516,6 +591,7 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
                 raise HTTPException(
                     status_code=400, detail=f"Invalid primary_filter: {e}",
                 ) from e
+            return _negotiate_join_response(result, accept_header)
 
         raise HTTPException(
             status_code=400,

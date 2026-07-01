@@ -589,6 +589,161 @@ async def test_execute_join_paginates_with_conformant_next_link(monkeypatch):
     nxt = links["next"]["href"]
     assert "offset=1" in nxt and "limit=1" in nxt
     assert "hints=geometry_exact" in nxt
+    # First page (offset=0) must not advertise a `prev` link.
+    assert "prev" not in links
+
+
+@pytest.mark.asyncio
+async def test_execute_join_offset_page_emits_prev_link(monkeypatch):
+    """A page with offset>0 emits a `prev` link (mirrors `next`'s link builder),
+    pointing back at offset - limit."""
+    from unittest.mock import AsyncMock, MagicMock
+    from fastapi import Request
+    from dynastore.extensions.joins.joins_service import JoinsService
+    from dynastore.modules.joins.models import (
+        BigQuerySecondarySpec, JoinRequest, JoinSpec, PagingSpec,
+    )
+    from dynastore.modules.storage.drivers.bigquery_models import BigQueryTarget
+    from dynastore.models.ogc import Feature
+
+    async def fake_bq_stream(spec, *, secondary_column, **kwargs):
+        yield Feature(type="Feature", id="bq1", geometry=None,
+                      properties={"user_id": "alice", "score": 1})
+        yield Feature(type="Feature", id="bq2", geometry=None,
+                      properties={"user_id": "bob", "score": 2})
+
+    import dynastore.extensions.joins.joins_service as svc_mod
+    monkeypatch.setattr(svc_mod, "stream_bigquery_secondary", fake_bq_stream)
+
+    class _FakePrimaryDriver:
+        async def read_entities(self, *args, **kwargs):
+            yield Feature(type="Feature", id="p1", geometry=None,
+                          properties={"uid": "alice", "name": "Alice"})
+            yield Feature(type="Feature", id="p2", geometry=None,
+                          properties={"uid": "bob", "name": "Bob"})
+
+    fake_resolved = type("R", (), {"driver": _FakePrimaryDriver()})()
+    monkeypatch.setattr(
+        svc_mod, "resolve_drivers", AsyncMock(return_value=[fake_resolved]),
+    )
+
+    svc = JoinsService()
+    req = MagicMock(spec=Request)
+    req.url = "http://h/join/catalogs/c/collections/l/join"
+    body = JoinRequest(
+        secondary=BigQuerySecondarySpec(
+            target=BigQueryTarget(project_id="p", dataset_id="d", table_name="t"),
+        ),
+        join=JoinSpec(primary_column="uid", secondary_column="user_id"),
+        paging=PagingSpec(limit=1, offset=1),
+    )
+    resp = await svc.execute_join("c", "l", req, body=body, request_hints=frozenset())
+
+    links = {ln["rel"]: ln for ln in resp["links"]}
+    assert "prev" in links
+    prev_href = links["prev"]["href"]
+    assert "offset=0" in prev_href and "limit=1" in prev_href
+    # Final page (no more matches beyond bob) → no `next`.
+    assert "next" not in links
+    # This is also a terminal page reached without a truncated scan, so the
+    # exact total is known for free.
+    assert resp["numberMatched"] == 2
+
+
+@pytest.mark.asyncio
+async def test_execute_join_honors_accept_application_json(monkeypatch):
+    """`Accept: application/json` gets a plain JSONResponse, not geo+json."""
+    from unittest.mock import AsyncMock, MagicMock
+    from fastapi.responses import JSONResponse
+    from fastapi import Request
+    from dynastore.extensions.joins.joins_service import JoinsService
+    from dynastore.modules.joins.models import (
+        BigQuerySecondarySpec, JoinRequest, JoinSpec,
+    )
+    from dynastore.modules.storage.drivers.bigquery_models import BigQueryTarget
+    from dynastore.models.ogc import Feature
+
+    async def fake_bq_stream(spec, *, secondary_column, **kwargs):
+        yield Feature(type="Feature", id="bq1", geometry=None,
+                      properties={"user_id": "alice", "score": 42})
+
+    import dynastore.extensions.joins.joins_service as svc_mod
+    monkeypatch.setattr(svc_mod, "stream_bigquery_secondary", fake_bq_stream)
+
+    class _FakePrimaryDriver:
+        async def read_entities(self, *args, **kwargs):
+            yield Feature(type="Feature", id="p1", geometry=None,
+                          properties={"uid": "alice", "name": "Alice"})
+
+    fake_resolved = type("R", (), {"driver": _FakePrimaryDriver()})()
+    monkeypatch.setattr(
+        svc_mod, "resolve_drivers", AsyncMock(return_value=[fake_resolved]),
+    )
+
+    svc = JoinsService()
+    req = MagicMock(spec=Request)
+    req.url = "http://h/join/catalogs/c/collections/l/join"
+    req.headers = {"Accept": "application/json"}
+    body = JoinRequest(
+        secondary=BigQuerySecondarySpec(
+            target=BigQueryTarget(project_id="p", dataset_id="d", table_name="t"),
+        ),
+        join=JoinSpec(primary_column="uid", secondary_column="user_id"),
+    )
+    resp = await svc.execute_join("c", "l", req, body=body, request_hints=frozenset())
+
+    assert isinstance(resp, JSONResponse)
+    assert resp.media_type == "application/json"
+    import json
+    payload = json.loads(resp.body)
+    assert payload["type"] == "FeatureCollection"
+    assert len(payload["features"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_join_default_accept_stays_geojson_dict(monkeypatch):
+    """Absent/`*/*` `Accept` keeps the existing dict return (served as
+    geo+json by the route's `response_class`)."""
+    from unittest.mock import AsyncMock, MagicMock
+    from fastapi import Request
+    from dynastore.extensions.joins.joins_service import JoinsService
+    from dynastore.modules.joins.models import (
+        BigQuerySecondarySpec, JoinRequest, JoinSpec,
+    )
+    from dynastore.modules.storage.drivers.bigquery_models import BigQueryTarget
+    from dynastore.models.ogc import Feature
+
+    async def fake_bq_stream(spec, *, secondary_column, **kwargs):
+        yield Feature(type="Feature", id="bq1", geometry=None,
+                      properties={"user_id": "alice", "score": 42})
+
+    import dynastore.extensions.joins.joins_service as svc_mod
+    monkeypatch.setattr(svc_mod, "stream_bigquery_secondary", fake_bq_stream)
+
+    class _FakePrimaryDriver:
+        async def read_entities(self, *args, **kwargs):
+            yield Feature(type="Feature", id="p1", geometry=None,
+                          properties={"uid": "alice", "name": "Alice"})
+
+    fake_resolved = type("R", (), {"driver": _FakePrimaryDriver()})()
+    monkeypatch.setattr(
+        svc_mod, "resolve_drivers", AsyncMock(return_value=[fake_resolved]),
+    )
+
+    svc = JoinsService()
+    req = MagicMock(spec=Request)
+    req.url = "http://h/join/catalogs/c/collections/l/join"
+    req.headers = {"Accept": "*/*"}
+    body = JoinRequest(
+        secondary=BigQuerySecondarySpec(
+            target=BigQueryTarget(project_id="p", dataset_id="d", table_name="t"),
+        ),
+        join=JoinSpec(primary_column="uid", secondary_column="user_id"),
+    )
+    resp = await svc.execute_join("c", "l", req, body=body, request_hints=frozenset())
+
+    assert isinstance(resp, dict)
+    assert resp["type"] == "FeatureCollection"
 
 
 # ---------------------------------------------------------------------------

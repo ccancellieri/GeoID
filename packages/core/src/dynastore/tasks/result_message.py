@@ -162,13 +162,16 @@ def reference_result(
     the artifact ``href``) so :func:`task_to_status_info` still populates the
     job *status* document.
 
-    Note: the results handler returns ``task.outputs`` verbatim, so ``message``
-    also appears on the *results* document next to the declared output. For the
-    frozen ``dwh_join`` customer contract this is intentional — the released
-    integration reads ``message``, and the conformant ``result`` link was added
-    additively beside it. A strict OGC API - Processes §7.13 results document
-    would carry only declared output ids; projecting ``message`` out (for new,
-    non-frozen processes) is tracked as a follow-up.
+    Note: ``message`` also lands in ``task.outputs`` alongside the declared
+    output, and the results handler (``_handle_job_results`` in the processes
+    extension) returns it verbatim by default. For the frozen ``dwh_join``
+    customer contract this is intentional — the released integration reads
+    ``message``, and the conformant ``result`` link was added additively beside
+    it. A strict OGC API - Processes §7.13 results document would carry only
+    declared output ids; the results handler projects ``message`` out for
+    processes that opt in (new, non-frozen processes — see
+    ``_STRICT_RESULTS_PROCESSES`` there) rather than changing this helper's
+    output for everyone.
     """
     return {
         "message": message or href,

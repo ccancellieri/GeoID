@@ -1756,6 +1756,18 @@ async def start_job_collection(
     return _handle_execution_result(result, request, language, preferred_mode=preferred_mode)
 
 
+# Process ids whose §7.13 results document must carry ONLY declared output
+# ids — no ``message`` alongside them. ``result_message.reference_result``
+# (the shared helper file-export tasks use) always bundles a human-facing
+# ``message`` next to the declared output for the job *status* document; the
+# *results* document historically surfaced it too. That's a frozen contract for
+# already-released processes (``dwh_join`` in particular — released customer
+# integrations read ``message`` there and must keep working). New processes
+# designed against the strict OGC API - Processes Part 1 §7.13 schema opt in
+# here instead of changing the shared helper or any existing process's output.
+_STRICT_RESULTS_PROCESSES = frozenset({"joins_export"})
+
+
 def _handle_job_results(task: Task, job_id: uuid.UUID):
     if task.status == TaskStatusEnum.FAILED:
         raise ProblemException(
@@ -1774,8 +1786,21 @@ def _handle_job_results(task: Task, job_id: uuid.UUID):
     # ``task.outputs`` is already the results body: file-export tasks store it
     # via ``result_message.reference_result`` as the declared output id keyed to
     # a {href, type} link, alongside the legacy human-facing ``message`` the
-    # existing (customer) contract surfaces. Returned verbatim.
-    return task.outputs or {}
+    # existing (customer) contract surfaces.
+    outputs = task.outputs or {}
+    if task.task_type in _STRICT_RESULTS_PROCESSES:
+        declared_outputs = None
+        cfg = get_task_config(task.task_type)
+        if cfg is not None and cfg.definition is not None:
+            declared_outputs = getattr(cfg.definition, "outputs", None)
+        if declared_outputs is not None:
+            outputs = {k: v for k, v in outputs.items() if k in declared_outputs}
+        else:
+            # Registry lookup unavailable (e.g. a remote-runner context that
+            # hasn't discovered tasks) — fall back to dropping the one known
+            # non-output key rather than serving an unfiltered document.
+            outputs = {k: v for k, v in outputs.items() if k != "message"}
+    return outputs
 
 
 class ProcessesService(ExtensionProtocol, OGCServiceMixin):
