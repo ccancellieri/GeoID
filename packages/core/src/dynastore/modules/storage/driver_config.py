@@ -1675,13 +1675,15 @@ class ItemsSchema(PluginConfig):
     DuckDB CREATE TABLE) and optional service-layer enforcement.
 
     ``constraints`` is an open list of :class:`~dynastore.modules.storage.schema_types.FieldConstraint`
-    instances, e.g.::
+    instances, e.g. a 2-column composite uniqueness constraint::
 
         ItemsSchema(
-            fields={"name": FieldDefinition(data_type="string")},
+            fields={
+                "name": FieldDefinition(data_type="string"),
+                "code": FieldDefinition(data_type="string"),
+            },
             constraints=[
-                RequiredConstraint(field="name"),
-                UniqueConstraint(field="name"),
+                UniqueConstraint(field_names=["name", "code"]),
             ],
         )
     """
@@ -1749,6 +1751,45 @@ class ItemsSchema(PluginConfig):
             "Examples: RequiredConstraint, UniqueConstraint."
         ),
     )
+
+    @model_validator(mode="after")
+    def validate_constraints(self) -> "ItemsSchema":
+        """Validate declarative ``constraints`` against ``self.fields``.
+
+        Every ``UniqueConstraint.field_names`` entry must reference a field
+        declared in ``self.fields``. An empty ``field_names`` (the default)
+        is a legacy no-op placeholder — per-field uniqueness is expressed on
+        ``FieldDefinition.unique``, not here — and is skipped entirely.
+        Composite (2+ column) constraints may not repeat the same column
+        twice within themselves, nor duplicate another composite
+        constraint's exact column set (both would produce the identical
+        PostgreSQL unique index and are almost certainly a config mistake).
+        """
+        from dynastore.modules.storage.schema_types import UniqueConstraint
+
+        seen_composite: set[Tuple[str, ...]] = set()
+        for constraint in self.constraints:
+            if not isinstance(constraint, UniqueConstraint) or not constraint.field_names:
+                continue
+            names = constraint.field_names
+            if len(names) != len(set(names)):
+                raise ValueError(
+                    f"UniqueConstraint.field_names has repeated column(s): {names}"
+                )
+            missing = [n for n in names if n not in self.fields]
+            if missing:
+                raise ValueError(
+                    f"UniqueConstraint.field_names references undeclared field(s) "
+                    f"{missing}; declared fields: {sorted(self.fields)}"
+                )
+            if len(names) >= 2:
+                key = tuple(names)
+                if key in seen_composite:
+                    raise ValueError(
+                        f"Duplicate composite UniqueConstraint on fields {names}"
+                    )
+                seen_composite.add(key)
+        return self
 
 
 # ---------------------------------------------------------------------------

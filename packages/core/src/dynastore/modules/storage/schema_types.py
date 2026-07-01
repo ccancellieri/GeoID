@@ -91,9 +91,24 @@ class UniqueConstraint(FieldConstraint):
     Enforcement is native (DDL-level) when the primary driver advertises
     ``Capability.UNIQUE_ENFORCEMENT``; otherwise falls through to service-layer
     enforcement when ``ItemsSchema.allow_app_level_enforcement=True``.
+
+    ``field_names`` lists the columns composing the constraint. An empty list
+    (the default) is a legacy no-op placeholder — single-field uniqueness is
+    already expressed natively via ``FieldDefinition.unique`` and does not
+    need an entry here. Two or more names express a COMPOSITE constraint
+    (the combination of those columns must be unique), which
+    ``FieldDefinition.unique`` cannot express on its own.
     """
 
     constraint_type: ClassVar[str] = "unique"
+    field_names: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Column names composing this uniqueness constraint. Empty "
+            "(default) is a no-op placeholder; 2+ names declare a "
+            "composite (multi-column) UNIQUE index."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -69,6 +69,19 @@ class TestUniqueConstraint:
         c = UniqueConstraint()
         assert c.constraint_type == "unique"
 
+    def test_default_field_names_empty(self):
+        c = UniqueConstraint()
+        assert c.field_names == []
+
+    def test_composite_field_names(self):
+        c = UniqueConstraint(field_names=["a", "b"])
+        assert c.field_names == ["a", "b"]
+
+    def test_frozen_field_names(self):
+        c = UniqueConstraint(field_names=["a", "b"])
+        with pytest.raises(Exception):
+            c.field_names = ["c"]  # type: ignore
+
 
 class TestAllConstraintTypesDistinct:
     def test_constraint_types_distinct(self):
@@ -236,3 +249,55 @@ class TestItemsSchemaConstraints:
     def test_class_key(self):
         from dynastore.modules.storage.driver_config import ItemsSchema
         assert ItemsSchema.class_key() == "items_schema"
+
+
+# ---------------------------------------------------------------------------
+# ItemsSchema composite UniqueConstraint validation
+# ---------------------------------------------------------------------------
+
+
+class TestItemsSchemaCompositeUniqueValidation:
+    def _schema(self, **kwargs):
+        from dynastore.models.protocols.field_definition import FieldDefinition
+        from dynastore.modules.storage.driver_config import ItemsSchema
+
+        return ItemsSchema(
+            fields={
+                "name": FieldDefinition(name="name", data_type="string"),
+                "code": FieldDefinition(name="code", data_type="string"),
+            },
+            **kwargs,
+        )
+
+    def test_composite_constraint_on_declared_fields_succeeds(self):
+        cfg = self._schema(
+            constraints=[UniqueConstraint(field_names=["name", "code"])]
+        )
+        assert cfg.constraints[0].field_names == ["name", "code"]
+
+    def test_composite_constraint_on_undeclared_field_rejected(self):
+        with pytest.raises(ValidationError):
+            self._schema(
+                constraints=[UniqueConstraint(field_names=["name", "missing"])]
+            )
+
+    def test_composite_constraint_repeated_column_rejected(self):
+        with pytest.raises(ValidationError):
+            self._schema(
+                constraints=[UniqueConstraint(field_names=["name", "name"])]
+            )
+
+    def test_duplicate_composite_constraints_rejected(self):
+        with pytest.raises(ValidationError):
+            self._schema(
+                constraints=[
+                    UniqueConstraint(field_names=["name", "code"]),
+                    UniqueConstraint(field_names=["name", "code"]),
+                ]
+            )
+
+    def test_empty_field_names_is_inert_placeholder(self):
+        # Backward compat: a bare UniqueConstraint() (no field_names) must
+        # not be validated against declared fields — it is a no-op.
+        cfg = self._schema(constraints=[UniqueConstraint()])
+        assert cfg.constraints[0].field_names == []

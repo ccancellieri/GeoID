@@ -656,6 +656,19 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
             # and thus PK is (collection_id, asset_id).
             # Integrity is enforced via trigger (trg_asset_cleanup).
 
+        # Composite UNIQUE indexes — bridged from ItemsSchema.constraints
+        # (2+ column UniqueConstraint entries) by
+        # field_constraints.bridge_schema_to_attribute_sidecar onto
+        # ``composite_unique_constraints`` (an extra, undeclared attribute;
+        # absent when no composite constraint was declared).
+        for composite_cols in getattr(self.config, "composite_unique_constraints", None) or []:
+            quoted_cols = ", ".join(f'"{c}"' for c in composite_cols)
+            idx_name = f"idx_{table_name}_" + "_".join(composite_cols) + "_uniq"
+            ddl += (
+                f'\nCREATE UNIQUE INDEX IF NOT EXISTS "{idx_name}" '
+                f'ON {{schema}}."{table_name}" ({quoted_cols});'
+            )
+
         # Add Computed Indices from schema/paths
         for idx_stmt in indexes:
             ddl += f"\n{idx_stmt};"
