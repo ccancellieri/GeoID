@@ -87,35 +87,15 @@ from dynastore.models.plugin_config import (
     require_config_class,
     resolve_config_class,
 )
+# Re-exported for backward compatibility — callers historically imported
+# ``_validate_stored_config`` from this module. The implementation now lives
+# in ``stored_config_read`` so the catalog/collection tier (config_service.py)
+# can share it instead of duplicating it.
+from dynastore.modules.db_config.stored_config_read import (  # noqa: F401
+    _validate_stored_config,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _validate_stored_config(cls: Type[PluginConfig], data: dict) -> PluginConfig:
-    """Validate a config row read from the persistent store, tolerating keys
-    the live model no longer declares.
-
-    ``PersistentModel`` sets ``extra="forbid"`` so a wrong-shape *inbound API
-    payload* fails with 422 instead of being silently persisted as ``{}``
-    (#918). That strictness is right on write but fatal on read: once a field
-    is renamed or removed, every pre-existing stored row raises
-    ``extra_forbidden`` and bricks config loading — the scaling publisher hit
-    exactly this on a stale ``cooldown_seconds`` row after the cooldown fields
-    were split into ``scale_out_/scale_in_cooldown_seconds``. On read we drop
-    unknown keys with a warning so a schema evolution degrades gracefully.
-    Mirrors the catalog read path (``config_service`` bulk list_configs).
-    """
-    known = set(cls.model_fields)
-    unknown = [k for k in data if k not in known]
-    if unknown:
-        logger.warning(
-            "Dropping %d legacy key(s) %s from stored %s config; a field was "
-            "renamed or removed since this row was written. PATCH the config to "
-            "rewrite it cleanly and silence this warning.",
-            len(unknown), sorted(unknown), cls.__name__,
-        )
-        data = {k: v for k, v in data.items() if k in known}
-    return cls.model_validate(data)
 
 
 # Exceptions that legitimately mean "physical layer absent / not yet

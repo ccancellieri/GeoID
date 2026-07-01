@@ -41,7 +41,7 @@ def _materialise_ref_row(row: Optional[Dict[str, Any]], ref_key: str) -> Optiona
             row["class_key"],
         )
         return None
-    return cls.model_validate(row["config_data"])
+    return _validate_stored_config(cls, row["config_data"])
 
 
 def _maybe_bust_router(cls: Type["PluginConfig"], catalog_id: Optional[str], collection_id: Optional[str]) -> None:
@@ -78,6 +78,7 @@ from dynastore.modules.db_config.platform_config_service import (
     run_apply_handlers,
     run_validate_handlers,
 )
+from dynastore.modules.db_config.stored_config_read import _validate_stored_config
 from dynastore.modules.db_config.locking_tools import check_table_exists
 from dynastore.modules.db_config.typed_store.ddl import (
     CATALOG_CONFIGS_TABLE,
@@ -309,7 +310,13 @@ class ConfigService(ConfigsProtocol):
             if class_key in config_snapshot:
                 data = config_snapshot[class_key]
                 if data:
-                    return cls.model_validate(data)
+                    # Snapshots built from ``list_catalog_configs`` carry
+                    # already-validated instances; only raw dicts (e.g. a
+                    # stored-row shape written before a field rename) need the
+                    # tolerant-read treatment.
+                    if isinstance(data, cls):
+                        return data
+                    return _validate_stored_config(cls, data)
             # Authoritative snapshot: skip DB tiers, fall through to platform.
             catalog_id = None
             collection_id = None
@@ -405,16 +412,15 @@ class ConfigService(ConfigsProtocol):
 
         # Merge base.model_dump() with deltas in order (catalog → collection).
         # mode="python" preserves native types for round-trip re-validation.
-        # Strip keys that are not in the live class schema so a stored delta
-        # written by a newer deploy (field added) or an older one (field later
-        # removed) never injects an unknown key that would cause extra_forbidden
-        # on validation.  The class default for the missing field is used
-        # instead.
-        known_fields = set(cls.model_fields.keys())
+        # ``_validate_stored_config`` strips keys the live class schema no
+        # longer declares (warning logged) so a stored delta written by an
+        # older deploy (field later removed) never injects an unknown key
+        # that would cause extra_forbidden on validation.  The class default
+        # for the missing field is used instead.
         merged: Dict[str, Any] = base.model_dump(mode="python")
         for delta in deltas:
-            merged.update({k: v for k, v in delta.items() if k in known_fields})
-        return cls.model_validate(merged)
+            merged.update(delta)
+        return _validate_stored_config(cls, merged)
 
     async def get_catalog_config_internal_cached(
         self, catalog_id: str, class_key: str
@@ -665,7 +671,7 @@ class ConfigService(ConfigsProtocol):
         Shared by the catalog and collection ``_set_*_config`` paths; the
         scope-specific select stays at the call site (explicit per tier).
         """
-        current_config = cls.model_validate(current_data) if current_data else None
+        current_config = _validate_stored_config(cls, current_data) if current_data else None
         restore_system_assigned_fields(cls, config, current_config)
         if current_config is not None:
             await enforce_config_immutability(
@@ -868,7 +874,7 @@ class ConfigService(ConfigsProtocol):
                     continue
                 results.append({
                     "plugin_id": ck,
-                    "config": cls.model_validate(r["config_data"]).model_dump(),
+                    "config": _validate_stored_config(cls, r["config_data"]).model_dump(),
                 })
             return {"total": total, "results": results}
 
@@ -900,7 +906,7 @@ class ConfigService(ConfigsProtocol):
                     continue
                 results.append({
                     "plugin_id": ck,
-                    "config": cls.model_validate(r["config_data"]).model_dump(),
+                    "config": _validate_stored_config(cls, r["config_data"]).model_dump(),
                 })
             return {"total": total, "results": results}
         else:
@@ -939,12 +945,7 @@ class ConfigService(ConfigsProtocol):
             if cls is None:
                 logger.warning("Skipping catalog_configs row for unknown class_key %r", class_key)
                 continue
-            # Strip keys unknown to the live class so a delta written by a newer
-            # or older deploy never causes extra_forbidden on model_validate.
-            _known = set(cls.model_fields.keys())
-            configs[class_key] = cls.model_validate(
-                {k: v for k, v in row["config_data"].items() if k in _known}
-            )
+            configs[class_key] = _validate_stored_config(cls, row["config_data"])
         return configs
 
     # -----------------------------------------------------------------
@@ -1176,7 +1177,7 @@ class ConfigService(ConfigsProtocol):
                     )
                 if check_immutability:
                     await enforce_config_immutability(
-                        cls.model_validate(existing["config_data"]), config,
+                        _validate_stored_config(cls, existing["config_data"]), config,
                         catalog_id=catalog_id, collection_id=None, conn=conn,
                     )
 
@@ -1253,7 +1254,7 @@ class ConfigService(ConfigsProtocol):
                     )
                 if check_immutability:
                     await enforce_config_immutability(
-                        cls.model_validate(existing["config_data"]), config,
+                        _validate_stored_config(cls, existing["config_data"]), config,
                         catalog_id=catalog_id, collection_id=internal_collection_id, conn=conn,
                     )
 
@@ -1459,7 +1460,7 @@ class ConfigService(ConfigsProtocol):
                             "catalog_id": catalog_id,
                             "collection_id": r.get("collection_id"),
                             "plugin_id": class_key,
-                            "config": cls.model_validate(r["config_data"]).model_dump(),
+                            "config": _validate_stored_config(cls, r["config_data"]).model_dump(),
                         }
                     )
                 return {"total": total, "results": results}
