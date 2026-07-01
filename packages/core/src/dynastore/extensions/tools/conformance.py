@@ -54,6 +54,10 @@ class ConformanceSummary(BaseModel):
     standards: List[StandardSummary]
     not_implemented: List[str]
     roadmap: List[RoadmapEntry] = []
+    # Standards with shipped code that require an optional dependency (e.g. BQ)
+    # and are therefore absent from the live conformance registry in deployments
+    # that don't install that dependency. Shown separately from pure roadmap items.
+    scope_conditional: List[RoadmapEntry] = []
 
 
 # --- Pattern map: standard display name -> regex matching its conformance URIs
@@ -137,6 +141,17 @@ _ALL_OGC_STANDARDS = [
     # surface only advertises standards we may still implement.
     "STAC API",
 ]
+
+# Standards that ARE fully implemented as extension code but require an
+# optional SCOPE dependency to load (e.g. google-cloud-bigquery for Joins).
+# When such a standard is absent from the live conformance registry it means
+# the dependency is not installed in this deployment — NOT that the standard
+# is unimplemented. The home-page renders these with a distinct "available,
+# optional dependency" label rather than the "Roadmap" label used for
+# standards that have no implementation at all.
+_SCOPE_CONDITIONAL_STANDARDS: Set[str] = {
+    "OGC API Joins",  # dynastore-ext-joins; requires google-cloud-bigquery
+}
 
 # --- Public API ---
 
@@ -224,13 +239,21 @@ def get_conformance_summary() -> ConformanceSummary:
         ))
         implemented_names.add("OGC API Common")
 
-    # Determine which standards have zero coverage
+    # Determine which standards have zero coverage and split into two buckets:
+    # - scope_conditional: shipped code, absent because optional dep not installed
+    # - roadmap: no implementation yet
     not_implemented = sorted(
         s for s in _ALL_OGC_STANDARDS if s not in implemented_names
     )
+    scope_conditional = [
+        RoadmapEntry(name=n, doc_url=_STANDARD_DOC_URLS.get(n))
+        for n in not_implemented
+        if n in _SCOPE_CONDITIONAL_STANDARDS
+    ]
     roadmap = [
         RoadmapEntry(name=n, doc_url=_STANDARD_DOC_URLS.get(n))
         for n in not_implemented
+        if n not in _SCOPE_CONDITIONAL_STANDARDS
     ]
 
     return ConformanceSummary(
@@ -239,4 +262,5 @@ def get_conformance_summary() -> ConformanceSummary:
         standards=standards,
         not_implemented=not_implemented,
         roadmap=roadmap,
+        scope_conditional=scope_conditional,
     )

@@ -1067,10 +1067,30 @@ class Web(ExtensionProtocol, OGCServiceMixin):
                     standards_html_parts.append(
                         f'<div class="glass-panel p-4 rounded-xl border border-white/5 group">{card_inner}</div>'
                     )
+            # Scope-conditional entries: implemented but not active in this deployment.
+            # Shown in the same grid with amber styling so coverage is clear.
+            for entry in summary.scope_conditional:
+                card_inner = f"""
+                    <div class="flex items-center justify-between mb-1">
+                        <h4 class="text-sm font-semibold text-amber-300/80 group-hover:text-amber-200 transition-colors">{entry.name}</h4>
+                    </div>
+                    <div class="text-[10px] text-amber-700/80 uppercase tracking-wider">available</div>
+                """
+                if entry.doc_url:
+                    standards_html_parts.append(
+                        f'<a href="{entry.doc_url}" target="_blank" rel="noopener" '
+                        f'class="block glass-panel p-4 rounded-xl border border-amber-900/30 '
+                        f'hover:border-amber-600/40 transition-colors group">{card_inner}</a>'
+                    )
+                else:
+                    standards_html_parts.append(
+                        f'<div class="glass-panel p-4 rounded-xl border border-amber-900/30 group">{card_inner}</div>'
+                    )
             standards_grid = "".join(standards_html_parts) or (
                 f'<div class="text-slate-500 text-sm col-span-full">No conformance classes registered.</div>'
             )
 
+            # Roadmap pills (gray) — not yet implemented.
             not_impl_pill_parts: List[str] = []
             for entry in summary.roadmap:
                 base_cls = "px-2 py-1 rounded-full text-[11px] border border-slate-700/60 bg-slate-800/40"
@@ -1089,7 +1109,7 @@ class Web(ExtensionProtocol, OGCServiceMixin):
             )
 
             ogc_total = summary.total_conformance_classes
-            ogc_families = len(summary.standards)
+            ogc_families = len(summary.standards) + len(summary.scope_conditional)
         except Exception:
             # Degrade gracefully if the conformance registry is unavailable —
             # the page must still render for anonymous visitors.
