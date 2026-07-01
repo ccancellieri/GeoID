@@ -119,6 +119,21 @@ class CatalogsProtocol(ItemCrudProtocol, ItemQueryProtocol, ItemIntrospectionPro
         """
         ...
 
+    async def resolve_catalog_external_id(
+        self,
+        internal_id: str,
+        allow_missing: bool = True,
+    ) -> Optional[str]:
+        """
+        Resolves a catalog's immutable internal ``id`` to its public ``external_id``.
+
+        Used by read paths that stored/echoed an internal id to project it
+        back to the client-visible label.  Returns ``None`` (default) or
+        raises ``ValueError`` when the catalog is not found, depending on
+        ``allow_missing``.
+        """
+        ...
+
     async def ensure_catalog_exists(
         self, catalog_id: str, lang: str = "en", ctx: Optional["DriverContext"] = None,
     ) ->None:

@@ -662,6 +662,35 @@ def _invalidate_catalog_external_id_cache(external_id: str) -> None:
     _catalog_external_id_cache.cache_invalidate(None, external_id)
 
 
+@cached(
+    maxsize=2048,
+    ttl=300,
+    namespace="catalog_internal_to_external_id",
+    ignore=["service"],
+    condition=lambda v: v is not None,
+)
+async def _catalog_internal_to_external_id_cache(
+    service: "CatalogService", internal_id: str
+) -> Optional[str]:
+    """Resolve a catalog's public ``external_id`` from its immutable internal ``id``.
+
+    Mirrors ``_collection_internal_to_external_id_cache`` (collection_service.py).
+    Read straight from the authoritative ``catalog.catalogs`` registry.  The
+    cache is a pure accelerator; on any miss the registry SELECT is the
+    source of truth.  ``condition`` keeps misses out so a renamed catalog
+    resolves to its new label immediately.
+    """
+    return await service._get_catalog_external_id_by_internal_id_db(internal_id)
+
+
+def _invalidate_catalog_internal_to_external_id_cache(internal_id: str) -> None:
+    """Drop the internal → external_id cache entry for a catalog.
+
+    Called on rename so the new external label is picked up immediately.
+    """
+    _catalog_internal_to_external_id_cache.cache_invalidate(None, internal_id)
+
+
 from dynastore.modules.catalog.collection_service import CollectionService
 from dynastore.modules.catalog.item_service import ItemService
 
@@ -774,6 +803,19 @@ class CatalogService(CatalogsProtocol):
                 result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
             ).execute(conn, external_id=external_id)
 
+    async def _get_catalog_external_id_by_internal_id_db(self, internal_id: str) -> Optional[str]:
+        """Authoritative internal id → external_id lookup against ``catalog.catalogs``.
+
+        The cold-miss fallback behind ``_catalog_internal_to_external_id_cache``.
+        Mirrors ``CollectionService._get_collection_external_id_by_internal_id_db``.
+        """
+        async with managed_transaction(self.engine) as conn:
+            return await DQLQuery(
+                "SELECT external_id FROM catalog.catalogs "
+                "WHERE id = :internal_id AND deleted_at IS NULL;",
+                result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+            ).execute(conn, internal_id=internal_id)
+
     async def _get_tombstoned_catalog_id_by_external_id_db(self, external_id: str) -> Optional[str]:
         """Return the internal id for a soft-deleted catalog keyed by its public external_id.
 
@@ -861,6 +903,28 @@ class CatalogService(CatalogsProtocol):
         if not internal_id and not allow_missing:
             raise ValueError(f"Catalog '{external_id}' not found.")
         return internal_id
+
+    async def resolve_catalog_external_id(
+        self,
+        internal_id: str,
+        allow_missing: bool = True,
+    ) -> Optional[str]:
+        """Resolve the public ``external_id`` for a catalog from its immutable internal ``id``.
+
+        Mirrors ``CollectionService.resolve_collection_external_id``.  Used by
+        the STAC read path to project a stored/legacy internal catalog id back
+        to the client-visible label.  Goes through
+        ``_catalog_internal_to_external_id_cache`` — a lossless string cache.
+
+        Returns the external_id string, or ``None`` when ``allow_missing=True``
+        (default) — callers can fall back to returning ``internal_id`` as-is so
+        a missing cache/DB row degrades gracefully.  Raises ``ValueError`` when
+        ``allow_missing=False`` and no live catalog carries that internal id.
+        """
+        external_id = await _catalog_internal_to_external_id_cache(self, internal_id)
+        if not external_id and not allow_missing:
+            raise ValueError(f"Catalog with internal id '{internal_id}' not found.")
+        return external_id
 
     async def resolve_physical_schema(
         self,
@@ -1853,6 +1917,9 @@ class CatalogService(CatalogsProtocol):
         # Invalidate both prev and new external_id cache entries, and the model cache.
         _invalidate_catalog_external_id_cache(prev_external_id)
         _invalidate_catalog_external_id_cache(new_external_id)
+        # Also invalidate the reverse (internal → external) cache so the read path
+        # immediately surfaces the new label instead of the stale one.
+        _invalidate_catalog_internal_to_external_id_cache(internal_id)
         _invalidate_catalog_model_cache(internal_id)
 
         logger.info(

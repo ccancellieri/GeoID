@@ -67,6 +67,26 @@ from dynastore.tools.discovery import get_protocol, get_protocols
 from dynastore.models.localization import normalize_i18n_for_replace
 
 logger = logging.getLogger(__name__)
+
+
+def _reject_internal_id(value: str, prefix: str, resource_name: str) -> None:
+    """Reject a public path-param id shaped like an internal storage id.
+
+    The STAC REST surface is keyed on external ids only (#2354): an internal
+    id (``{prefix}_{13 base32}``) must never resolve to a real resource here,
+    even when a stale/lenient lookup further down the stack would find one —
+    that would let a caller route around external-id-scoped IAM policies.
+    Data-layer callers that already hold a resolved internal id never reach
+    this function; it only guards the public route-handler entry points.
+    """
+    from dynastore.modules.catalog.catalog_service import is_internal_physical_name
+
+    if is_internal_physical_name(value, prefix):
+        raise HTTPException(
+            status_code=404, detail=f"{resource_name} '{value}' not found."
+        )
+
+
 from dynastore.extensions.tools.language_utils import get_language
 from dynastore.extensions.web.decorators import expose_web_page
 from dynastore.models.protocols.web import StaticFilesProtocol
@@ -544,6 +564,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         request_hints: FrozenSet = Depends(parse_hints_param),
     ):
         catalog_id = validate_sql_identifier(catalog_id)
+        _reject_internal_id(catalog_id, "c", "Catalog")
         catalogs_svc = await self._get_catalogs_service()
         if not await catalogs_svc.get_catalog(catalog_id, lang=language, hints=request_hints):
             raise HTTPException(
@@ -598,6 +619,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/simple-query.
         """
         catalog_id = validate_sql_identifier(catalog_id)
+        _reject_internal_id(catalog_id, "c", "Catalog")
         catalogs_svc = await self._get_catalogs_service()
         try:
             catalog = await catalogs_svc.get_catalog(catalog_id, lang=language, hints=request_hints)
@@ -702,6 +724,8 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
     ):
         catalog_id = validate_sql_identifier(catalog_id)
         collection_id = validate_sql_identifier(collection_id)
+        _reject_internal_id(catalog_id, "c", "Catalog")
+        _reject_internal_id(collection_id, "col", "Collection")
         catalogs_svc = await self._get_catalogs_service()
         if not await catalogs_svc.get_collection(catalog_id, collection_id, hints=request_hints):
             raise HTTPException(
@@ -903,6 +927,8 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
     ):
         catalog_id = validate_sql_identifier(catalog_id)
         collection_id = validate_sql_identifier(collection_id)
+        _reject_internal_id(catalog_id, "c", "Catalog")
+        _reject_internal_id(collection_id, "col", "Collection")
         catalogs_svc = await self._get_catalogs_service()
 
         # Single-field equality shorthand: any non-reserved query parameter is
@@ -1081,6 +1107,8 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
     ):
         catalog_id = validate_sql_identifier(catalog_id)
         collection_id = validate_sql_identifier(collection_id)
+        _reject_internal_id(catalog_id, "c", "Catalog")
+        _reject_internal_id(collection_id, "col", "Collection")
 
         if not engine:
             from dynastore.models.protocols import DatabaseProtocol
@@ -1362,6 +1390,8 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         )
         catalog_id = validate_sql_identifier(catalog_id)
         collection_id = validate_sql_identifier(collection_id)
+        _reject_internal_id(catalog_id, "c", "Catalog")
+        _reject_internal_id(collection_id, "col", "Collection")
 
         async with managed_transaction(engine) as conn:
             return await self._delete_item(
@@ -1865,6 +1895,8 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
 
         catalog_id = validate_sql_identifier(catalog_id)
         collection_id = validate_sql_identifier(collection_id)
+        _reject_internal_id(catalog_id, "c", "Catalog")
+        _reject_internal_id(collection_id, "col", "Collection")
 
         async with managed_transaction(engine) as conn:
             # Get STAC config

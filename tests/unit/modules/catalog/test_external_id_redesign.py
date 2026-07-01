@@ -1343,3 +1343,102 @@ class TestResolveCatalogIdExternalOnly:
         assert cs.is_internal_physical_name("c_short", "c") is False
         # Wrong prefix does not match the catalog shape.
         assert cs.is_internal_physical_name("col_cw5tetduiu959", "c") is False
+
+
+# ---------------------------------------------------------------------------
+# resolve_catalog_external_id — internal → external reverse resolver (#2354)
+# ---------------------------------------------------------------------------
+#
+# Mirrors CollectionService.resolve_collection_external_id. Used by the STAC
+# read path (stac_generator) to project a stored/legacy internal catalog id
+# back to the client-visible label, so the public REST surface never echoes
+# an internal id.
+class TestResolveCatalogExternalId:
+    """CatalogService.resolve_catalog_external_id (internal → external)."""
+
+    @pytest.mark.asyncio
+    async def test_resolves_external_label_for_known_internal_id(self):
+        from dynastore.modules.catalog import catalog_service as cs
+
+        svc = cs.CatalogService(engine=None)
+        with patch.object(
+            cs, "_catalog_internal_to_external_id_cache",
+            AsyncMock(return_value="a-prod"),
+        ) as cache:
+            result = await svc.resolve_catalog_external_id("c_internal1", allow_missing=True)
+
+        assert result == "a-prod"
+        cache.assert_awaited_once_with(svc, "c_internal1")
+
+    @pytest.mark.asyncio
+    async def test_fails_open_to_none_when_allow_missing(self):
+        from dynastore.modules.catalog import catalog_service as cs
+
+        svc = cs.CatalogService(engine=None)
+        with patch.object(
+            cs, "_catalog_internal_to_external_id_cache", AsyncMock(return_value=None)
+        ):
+            result = await svc.resolve_catalog_external_id("c_unknown", allow_missing=True)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_found_and_allow_missing_false(self):
+        from dynastore.modules.catalog import catalog_service as cs
+
+        svc = cs.CatalogService(engine=None)
+        with patch.object(
+            cs, "_catalog_internal_to_external_id_cache", AsyncMock(return_value=None)
+        ):
+            with pytest.raises(ValueError):
+                await svc.resolve_catalog_external_id("c_unknown", allow_missing=False)
+
+    @pytest.mark.asyncio
+    async def test_rename_invalidates_reverse_cache(self):
+        """rename_catalog drops the internal→external cache entry so the read
+        path immediately surfaces the new label (mirrors collection rename)."""
+        from dynastore.modules.catalog.catalog_service import CatalogService
+
+        svc = CatalogService.__new__(CatalogService)
+        svc.engine = MagicMock()
+        svc._collection_service = None
+        svc._item_service = None
+        svc._cascade_orchestrator = None
+
+        current_row = MagicMock()
+        current_row._mapping = {"id": "c_internal1", "external_id": "old_label"}
+
+        execute_calls = []
+
+        async def _execute(*args, **kwargs):
+            execute_calls.append(kwargs)
+            if len(execute_calls) == 1:  # SELECT current row
+                return current_row
+            if len(execute_calls) == 2:  # SELECT conflict check
+                return None  # no conflict
+            return 1  # UPDATE rowcount
+
+        with patch(
+            "dynastore.modules.catalog.catalog_service.managed_transaction"
+        ) as mock_tx, patch(
+            "dynastore.modules.catalog.catalog_service.DQLQuery"
+        ) as mock_dql, patch(
+            "dynastore.modules.catalog.catalog_service._invalidate_catalog_external_id_cache"
+        ), patch(
+            "dynastore.modules.catalog.catalog_service._invalidate_catalog_internal_to_external_id_cache"
+        ) as invalidate_reverse, patch(
+            "dynastore.modules.catalog.catalog_service._invalidate_catalog_model_cache"
+        ):
+            mock_dql_inst = MagicMock()
+            mock_dql_inst.execute = _execute
+            mock_dql.return_value = mock_dql_inst
+
+            class _FakeCM:
+                async def __aenter__(self): return MagicMock()
+                async def __aexit__(self, *a): pass
+
+            mock_tx.return_value = _FakeCM()
+
+            await svc.rename_catalog("c_internal1", "new_label")
+
+        invalidate_reverse.assert_called_once_with("c_internal1")

@@ -71,6 +71,45 @@ def _public_id(model: Any) -> str:
     return getattr(model, "external_id", None) or model.id
 
 
+async def _resolve_public_catalog_id(catalog_id: str) -> str:
+    """Project ``catalog_id`` to its public external id when it is shaped like
+    an internal storage id (``c_{13 base32}``); otherwise return it unchanged.
+
+    A path param is already external in the common case (no lookup needed).
+    A stored/legacy internal id is projected internal → external via
+    ``resolve_catalog_external_id``. Fails open to the input value when
+    ``CatalogsProtocol`` is unavailable or the id cannot be resolved, so a
+    read never 500s over an id-space mismatch (#2354 read-path leak).
+    """
+    from dynastore.modules.catalog.catalog_service import is_internal_physical_name
+
+    if not is_internal_physical_name(catalog_id, "c"):
+        return catalog_id
+    catalogs_svc = get_protocol(CatalogsProtocol)
+    if catalogs_svc is None:
+        return catalog_id
+    resolved = await catalogs_svc.resolve_catalog_external_id(catalog_id, allow_missing=True)
+    return resolved or catalog_id
+
+
+async def _resolve_public_collection_id(catalog_id: str, collection_id: str) -> str:
+    """Project ``collection_id`` to its public external id when it is shaped
+    like an internal storage id (``col_{13 base32}``); otherwise return it
+    unchanged.  Mirrors ``_resolve_public_catalog_id``; see its docstring.
+    """
+    from dynastore.modules.catalog.catalog_service import is_internal_physical_name
+
+    if not is_internal_physical_name(collection_id, "col"):
+        return collection_id
+    catalogs_svc = get_protocol(CatalogsProtocol)
+    if catalogs_svc is None:
+        return collection_id
+    resolved = await catalogs_svc.collections.resolve_collection_external_id(
+        catalog_id, collection_id, allow_missing=True
+    )
+    return resolved or collection_id
+
+
 def _apply_extra_metadata_fallbacks(
     collection: "pystac.Collection",
     merged_summaries: Dict[str, Any],
@@ -568,6 +607,15 @@ async def create_collection(
     )
     if not metadata_model:
         return None
+
+    # Project catalog_id/collection_id to their public (external) labels once,
+    # for the wire ``id`` and every self/parent/items link built below. The
+    # collection model already carries ``external_id`` from the registry
+    # lookup (_public_id prefers it over the immutable internal ``id``); the
+    # catalog id is resolved separately since no Catalog model is fetched here.
+    # Never echo the raw path param — it may be an internal id (#2354).
+    collection_id = _public_id(metadata_model)
+    catalog_id = await _resolve_public_catalog_id(catalog_id)
 
     # Localize metadata
     meta_dict, available_langs = stac_localize(metadata_model, lang)
@@ -1105,8 +1153,20 @@ async def create_item_from_feature(
     view_mode: str = "standard",
     lang: str = "en",
     collection_url_override: Optional[str] = None,
+    external_catalog_id: Optional[str] = None,
+    external_collection_id: Optional[str] = None,
 ) -> Optional[pystac.Item]:
-    """Generates a STAC Item from a mapped Feature."""
+    """Generates a STAC Item from a mapped Feature.
+
+    ``external_catalog_id`` / ``external_collection_id``: the public labels
+    for ``catalog_id`` / ``collection_id``, pre-resolved once by the caller
+    (e.g. ``create_item_collection`` resolves once per page instead of once
+    per item). When omitted (a standalone single-item call) they are
+    resolved here. Every wire member and link below is built from these
+    public ids — ``catalog_id`` / ``collection_id`` may be internal storage
+    ids (a stored/legacy echo or an internal-shaped path param) and must
+    never reach the client (#2354).
+    """
     from dynastore.models.protocols.configs import ConfigsProtocol
 
     # 1. Resolve Configs
@@ -1120,6 +1180,15 @@ async def create_item_from_feature(
 
     if feature is None:
         return None
+
+    if external_catalog_id is None:
+        external_catalog_id = await _resolve_public_catalog_id(catalog_id)
+    if external_collection_id is None:
+        external_collection_id = await _resolve_public_collection_id(
+            catalog_id, collection_id
+        )
+    catalog_id = external_catalog_id
+    collection_id = external_collection_id
 
     # 3. Detect available languages
     available_langs = set()
@@ -1426,6 +1495,12 @@ async def create_item_collection(
             hints=hints,
         )
 
+    # Resolve the page's public (external) catalog/collection ids ONCE — every
+    # item on this page belongs to the same collection, so a per-item
+    # resolution would be N wasted lookups (#2354 read-path leak fix).
+    public_catalog_id = await _resolve_public_catalog_id(catalog_id)
+    public_collection_id = await _resolve_public_collection_id(catalog_id, collection_id)
+
     stac_items_tasks = [
         create_item_from_feature(
             request,
@@ -1435,6 +1510,8 @@ async def create_item_collection(
             stac_config,
             view_mode=view_mode,
             lang=lang,
+            external_catalog_id=public_catalog_id,
+            external_collection_id=public_collection_id,
         )
         for feature in items_rows
     ]
