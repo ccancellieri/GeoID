@@ -68,6 +68,14 @@ _current_backend: Optional[Any] = None
 _app_state: Optional[Any] = None
 _apply_lock: LoopLocalLock = LoopLocalLock()
 
+# Sentinel default for ``_on_valkey_engine_config_change``'s ``config`` arg.
+# The boot-order upgrade path (``_boot_upgrade_to_valkey``) calls the handler
+# with no config to say "keep whatever the engine snapshot already resolved,
+# just (re)build the backend" — distinct from a real config-change apply
+# (which pushes the new config into the snapshot) and from an explicit
+# ``None`` config, which callers/tests may still pass through step 2.
+_KEEP_SNAPSHOT_CONFIG: Any = object()
+
 # Bounded LocalAsyncCacheBackend fallback log (#629).
 # The "CACHE BACKEND: LOCAL" fall-back path is hit on every cold start when
 # Valkey is unreachable AND on every reconnect-attempt failure that the
@@ -186,10 +194,10 @@ async def _load_valkey_engine_config() -> "ValkeyEngineConfig":
 
 
 async def _on_valkey_engine_config_change(
-    config: Any,
-    _catalog_id: Any,
-    _collection_id: Any,
-    _conn: Any,
+    config: Any = _KEEP_SNAPSHOT_CONFIG,
+    _catalog_id: Any = None,
+    _collection_id: Any = None,
+    _conn: Any = None,
 ) -> None:
     """Apply handler for ValkeyEngineConfig — live reconnect on config change.
 
@@ -200,6 +208,12 @@ async def _on_valkey_engine_config_change(
          the cached instance (#827).
       3. Re-get the engine (lazy re-init with new config).
       4. Build + probe + register the new backend.
+
+    Called with no ``config`` (``_KEEP_SNAPSHOT_CONFIG``) on the boot-order
+    upgrade path (driven by ``_boot_upgrade_to_valkey``): step 2 is skipped
+    so the engine snapshot already populated post-pool by
+    ``refresh_snapshot_until_ready`` is kept as-is, and only the backend is
+    (re)built, probed, and registered.
     """
     global _current_backend, _app_state
 
@@ -237,12 +251,15 @@ async def _on_valkey_engine_config_change(
         # 2. Push the fresh config into the snapshot + evict the cached
         # instance.  Without the snapshot swap, the next ``get`` would
         # rebuild the client against the stale boot-time config (#827).
-        try:
-            await engine_cache.update_config(config)
-        except Exception:
-            logger.exception(
-                "ValkeyEngineConfig apply handler: engine_cache.update_config failed"
-            )
+        # Skipped on the boot-order upgrade path (``_KEEP_SNAPSHOT_CONFIG``):
+        # the snapshot already holds the seeded config once the pool is up.
+        if config is not _KEEP_SNAPSHOT_CONFIG:
+            try:
+                await engine_cache.update_config(config)
+            except Exception:
+                logger.exception(
+                    "ValkeyEngineConfig apply handler: engine_cache.update_config failed"
+                )
 
         # 3. Re-get the engine (lazy re-init with the freshly-stamped config).
         try:
@@ -431,6 +448,161 @@ async def _on_cache_plugin_config_change(
         )
 
 
+# Bounded retry budget for the boot-order LOCAL -> Valkey upgrade.  Mirrors
+# ``engine_resolver.refresh_snapshot_until_ready`` (30 attempts, 0.5s -> 5s
+# exponential backoff) so the two boot-order retry loops stay in step.
+_BOOT_UPGRADE_MAX_ATTEMPTS: int = 30
+_BOOT_UPGRADE_INITIAL_DELAY: float = 0.5
+_BOOT_UPGRADE_MAX_DELAY: float = 5.0
+
+
+def _register_engine_apply_handlers() -> None:
+    """Register the ValkeyEngineConfig + CachePluginConfig apply handlers.
+
+    Registered even when boot fell back to LOCAL so a later config change
+    (PATCH /configs/plugins/valkey_engine_config) drives a live connection
+    rebuild via ``_on_valkey_engine_config_change``.
+    """
+    try:
+        from dynastore.modules.db_config.engine_config import ValkeyEngineConfig
+
+        ValkeyEngineConfig.register_apply_handler(_on_valkey_engine_config_change)
+    except Exception:
+        logger.exception(
+            "CacheModule: failed to register ValkeyEngineConfig apply handler"
+        )
+    try:
+        from dynastore.modules.cache.cache_config import CachePluginConfig
+
+        CachePluginConfig.register_apply_handler(_on_cache_plugin_config_change)
+    except Exception:
+        logger.exception(
+            "CacheModule: failed to register CachePluginConfig apply handler"
+        )
+
+
+def _unregister_engine_apply_handlers() -> None:
+    """Best-effort unregister of both cache apply handlers on shutdown."""
+    try:
+        from dynastore.modules.db_config.engine_config import ValkeyEngineConfig
+
+        ValkeyEngineConfig.unregister_apply_handler(_on_valkey_engine_config_change)
+    except Exception:
+        pass
+    try:
+        from dynastore.modules.cache.cache_config import CachePluginConfig
+
+        CachePluginConfig.unregister_apply_handler(_on_cache_plugin_config_change)
+    except Exception:
+        pass
+
+
+async def _boot_upgrade_to_valkey(engine_cache: "EngineInstanceCache") -> None:
+    """Upgrade a boot-order LOCAL fallback to the shared Valkey backend.
+
+    CacheModule (priority 9) initialises before DBService (priority 10)
+    creates the pool and before TasksModule (priority 15) seeds
+    ``valkey_engine_config``, so ``engine_cache.get('valkey_engine')`` can
+    only resolve AFTER this module yields.  Poll with bounded exponential
+    backoff and, on the first successful resolve, drive the existing
+    config-apply reconnect (build + probe + register the Valkey backend and
+    bump the ``@cached`` backend generation).  ``@cached`` consumers
+    re-resolve their backend lazily via ``_notify_backend_upgrade`` so none
+    of them need a restart.
+
+    Without this, a boot-order degrade to LOCAL latches per-instance for the
+    whole process lifetime — the snapshot refresh repopulates the engine
+    cache moments later, but CacheModule never re-checks it.
+    """
+    delay = _BOOT_UPGRADE_INITIAL_DELAY
+    for attempt in range(1, _BOOT_UPGRADE_MAX_ATTEMPTS + 1):
+        if _current_backend is not None:
+            # Already upgraded (e.g. via a concurrent config apply).
+            return
+        try:
+            await engine_cache.get("valkey_engine")
+        except Exception:
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, _BOOT_UPGRADE_MAX_DELAY)
+            continue
+        # Engine resolvable now — reconnect using the current snapshot
+        # (no config arg -> _KEEP_SNAPSHOT_CONFIG keeps the seeded config,
+        # only builds the backend).
+        await _on_valkey_engine_config_change()
+        if _current_backend is not None:
+            logger.info(
+                "CacheModule: boot upgrade LOCAL -> VALKEY succeeded "
+                "(attempt %d/%d).",
+                attempt, _BOOT_UPGRADE_MAX_ATTEMPTS,
+            )
+            return
+        # Engine resolved but the reconnect did not register a backend — the
+        # Valkey server itself was transiently unreachable (still coming up,
+        # brief network blip). That is distinct from "engine not yet
+        # resolvable": keep retrying with the same backoff budget rather than
+        # latching LOCAL on a momentary probe failure.
+        logger.warning(
+            "CacheModule: engine resolved but the Valkey reconnect did not "
+            "register a backend (attempt %d/%d); retrying.",
+            attempt, _BOOT_UPGRADE_MAX_ATTEMPTS,
+        )
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, _BOOT_UPGRADE_MAX_DELAY)
+    logger.warning(
+        "CacheModule: Valkey backend not established after %d attempts "
+        "(engine snapshot never resolved, or the Valkey server stayed "
+        "unreachable); cache stays LOCAL for this process. A later PATCH "
+        "/configs/plugins/valkey_engine_config will still trigger a "
+        "reconnect.",
+        _BOOT_UPGRADE_MAX_ATTEMPTS,
+    )
+
+
+@asynccontextmanager
+async def _degraded_local_lifespan(
+    engine_cache: "Optional[EngineInstanceCache]",
+) -> AsyncGenerator[None, None]:
+    """Yield in LOCAL-cache mode while keeping a live path back to Valkey.
+
+    Used by every boot-order degrade path that COULD later reach Valkey
+    (i.e. the engine snapshot was simply not ready yet, or the boot probe
+    failed transiently) — as opposed to the deps-missing path where Valkey
+    is impossible.  Registers the apply handlers and spawns a bounded
+    background upgrade task, then cleans both up on shutdown (closing the
+    Valkey backend if the upgrade succeeded).
+    """
+    global _current_backend
+    upgrade_task: Optional["asyncio.Task[None]"] = None
+    handlers_registered = False
+    if engine_cache is not None:
+        _register_engine_apply_handlers()
+        handlers_registered = True
+        upgrade_task = asyncio.create_task(
+            _boot_upgrade_to_valkey(engine_cache),
+            name="cache-boot-upgrade-to-valkey",
+        )
+    try:
+        yield
+    finally:
+        if upgrade_task is not None:
+            upgrade_task.cancel()
+            try:
+                await upgrade_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        if handlers_registered:
+            _unregister_engine_apply_handlers()
+        if _current_backend is not None:
+            try:
+                await _current_backend.close()
+            except Exception:
+                logger.exception(
+                    "CacheModule: closing upgraded Valkey backend failed"
+                )
+            _current_backend = None
+            logger.info("CacheModule: Valkey connection closed.")
+
+
 class CacheModule(ModuleProtocol):
     """SCOPE-controlled module that wires Valkey as the shared cache backend.
 
@@ -549,7 +721,12 @@ class CacheModule(ModuleProtocol):
                 "CACHE BACKEND: LOCAL (in-memory, per-instance) — "
                 "no Valkey backend constructed; cross-instance consistency NOT guaranteed."
             )
-            yield
+            # Boot-order degrade: the engine snapshot resolves only after
+            # DBService (10) + config seeding (15), i.e. after this module
+            # yields.  Keep a live path back to Valkey instead of latching
+            # LOCAL for the process lifetime.
+            async with _degraded_local_lifespan(engine_cache):
+                yield
             return
 
         # Probe the backend.
@@ -644,7 +821,10 @@ class CacheModule(ModuleProtocol):
                 "Valkey connection failed; cross-instance consistency NOT guaranteed."
             )
             await backend.close()
-            yield
+            # Transient boot probe failure: keep the apply handler live and
+            # attempt one background reconnect rather than latching LOCAL.
+            async with _degraded_local_lifespan(engine_cache):
+                yield
             return
 
         from dynastore.tools.cache import _notify_backend_upgrade, get_cache_manager
