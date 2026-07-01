@@ -90,6 +90,34 @@ from dynastore.models.plugin_config import (
 
 logger = logging.getLogger(__name__)
 
+
+def _validate_stored_config(cls: Type[PluginConfig], data: dict) -> PluginConfig:
+    """Validate a config row read from the persistent store, tolerating keys
+    the live model no longer declares.
+
+    ``PersistentModel`` sets ``extra="forbid"`` so a wrong-shape *inbound API
+    payload* fails with 422 instead of being silently persisted as ``{}``
+    (#918). That strictness is right on write but fatal on read: once a field
+    is renamed or removed, every pre-existing stored row raises
+    ``extra_forbidden`` and bricks config loading — the scaling publisher hit
+    exactly this on a stale ``cooldown_seconds`` row after the cooldown fields
+    were split into ``scale_out_/scale_in_cooldown_seconds``. On read we drop
+    unknown keys with a warning so a schema evolution degrades gracefully.
+    Mirrors the catalog read path (``config_service`` bulk list_configs).
+    """
+    known = set(cls.model_fields)
+    unknown = [k for k in data if k not in known]
+    if unknown:
+        logger.warning(
+            "Dropping %d legacy key(s) %s from stored %s config; a field was "
+            "renamed or removed since this row was written. PATCH the config to "
+            "rewrite it cleanly and silence this warning.",
+            len(unknown), sorted(unknown), cls.__name__,
+        )
+        data = {k: v for k, v in data.items() if k in known}
+    return cls.model_validate(data)
+
+
 # Exceptions that legitimately mean "physical layer absent / not yet
 # reachable" — for these the gate correctly fails open to ``False`` so
 # Immutable / WriteOnce enforcement stays out of the way on
@@ -690,7 +718,7 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
             return None
         if isinstance(data, cls):
             return data
-        return cls.model_validate(data)
+        return _validate_stored_config(cls, data)
 
     async def set_config(
         self,
@@ -722,9 +750,9 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
                 conn, ref_key=class_key
             )
             if current_data:
-                old_config = cls.model_validate(current_data) if not isinstance(
-                    current_data, cls
-                ) else current_data
+                old_config = _validate_stored_config(
+                    cls, current_data
+                ) if not isinstance(current_data, cls) else current_data
             if check_immutability:
                 # Discard caller values for machine-assigned (Computed) fields
                 # BEFORE enforcement/persist (#1135). Internal provisioning uses
@@ -775,7 +803,7 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
                     class_key,
                 )
                 continue
-            configs[cls] = cls.model_validate(row["config_data"])
+            configs[cls] = _validate_stored_config(cls, row["config_data"])
         return configs
 
     async def list_refs(self) -> Dict[str, str]:
@@ -820,7 +848,7 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
             )
             return None
         data = row["config_data"]
-        return cls.model_validate(data)
+        return _validate_stored_config(cls, data)
 
     async def delete_config(
         self,
@@ -888,7 +916,9 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
                         f"the ref first or pick a different name."
                     )
                 if check_immutability:
-                    old_config = cls.model_validate(existing_row["config_data"])
+                    old_config = _validate_stored_config(
+                        cls, existing_row["config_data"]
+                    )
                     await enforce_config_immutability(
                         old_config, config,
                         catalog_id=None, collection_id=None, conn=conn,

@@ -79,3 +79,42 @@ def test_schema_id_version_tag_distinguishes_shapes():
     tag identifies which shape it was serialized under (drift detection)."""
     assert EvoConfigOriginal.schema_id() != EvoConfigEvolved.schema_id()
     assert EvoConfigOriginal.class_key() != EvoConfigEvolved.class_key()
+
+
+def test_validate_stored_config_drops_legacy_key_and_warns(caplog):
+    """Read boundary tolerates an in-place field removal.
+
+    The scaling publisher crashed every tick because a persisted
+    ``ScalingPolicyConfig`` row still carried ``cooldown_seconds`` after that
+    field was split — ``extra='forbid'`` turned a stale row into a fatal
+    ``extra_forbidden``. ``_validate_stored_config`` drops keys the live class
+    no longer declares (with a warning) so a rename/removal degrades to a warn,
+    not a crash — no versioned class required for graceful reads."""
+    from dynastore.modules.db_config.platform_config_service import (
+        _validate_stored_config,
+    )
+
+    old_row = EvoConfigOriginal(a=1, b=2).model_dump()  # carries legacy ``b``
+    with caplog.at_level(
+        "WARNING", logger="dynastore.modules.db_config.platform_config_service"
+    ):
+        cfg = _validate_stored_config(EvoConfigEvolved, old_row)
+
+    assert isinstance(cfg, EvoConfigEvolved)
+    assert cfg.a == 1
+    assert not hasattr(cfg, "b")
+    assert any(
+        "legacy key" in r.getMessage() and "'b'" in r.getMessage()
+        for r in caplog.records
+    ), "must warn naming the dropped legacy key"
+
+
+def test_validate_stored_config_still_raises_on_real_error():
+    """Stripping unknown keys must not mask genuine validation errors: a known
+    field with a wrong-typed value still raises, so real corruption surfaces."""
+    from dynastore.modules.db_config.platform_config_service import (
+        _validate_stored_config,
+    )
+
+    with pytest.raises(ValidationError):
+        _validate_stored_config(EvoConfigEvolved, {"a": "not-an-int"})
