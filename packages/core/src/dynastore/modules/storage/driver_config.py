@@ -1925,6 +1925,24 @@ async def _validate_items_schema(
 ItemsSchema.register_validate_handler(_validate_items_schema)
 
 
+# GeoJSON/STAC top-level member names — never legitimately live inside
+# ``properties`` on a tenant feature doc, regardless of ``container``.
+# Mirrors ``elasticsearch_private.mappings._RESERVED_MEMBER_KEYS`` (kept
+# as a separate copy here, not imported, for the same config->driver
+# layering reason documented on ``_PRIVATE_RESERVED_ROOT_FIELDS`` below).
+_RESERVED_MEMBER_KEYS: FrozenSet[str] = frozenset({
+    "id",
+    "type",
+    "geometry",
+    "bbox",
+    "links",
+    "assets",
+    "collection",
+    "stac_version",
+    "stac_extensions",
+})
+
+
 async def _validate_items_schema_reserved_names(
     config: PluginConfig,
     catalog_id: "Optional[str]",
@@ -1939,21 +1957,40 @@ async def _validate_items_schema_reserved_names(
     fail downstream in opaque ways (DDL collision, JSONB extract returning
     the system value, sidecar config rebuild loops). Fail loud at config-save
     so the operator picks a different name before any write hits the driver.
+
+    #2642: a name outside the true-structural ``_RESERVED_MEMBER_KEYS`` set
+    (e.g. ``external_id``) is allowed when the field's ``container`` is
+    ``"properties"`` — it resolves to the distinct ``properties.<name>``
+    path, not the doc root, so it never shadows the system field there (the
+    private write projection additionally quarantines any accidental
+    structural leak into ``properties.extras``). The nested-container names
+    ``properties`` / ``extras`` stay blocked regardless of ``container`` —
+    those would collide with the quarantine bucket itself.
     """
     if not isinstance(config, ItemsSchema):
         return
     if not config.fields:
         return
+
+    def _collides(name: str, container: str) -> bool:
+        if name in _RESERVED_MEMBER_KEYS or name in ("properties", "extras"):
+            return True
+        if container == "properties":
+            return False
+        return name in _PRIVATE_RESERVED_ROOT_FIELDS
+
     # A field collides whether the reserved name is used as the declared key
     # (``name``) OR as the read-time rename (``alias``): an alias of e.g.
     # ``geometry`` would shadow the system field on the wire exactly as a
     # like-named key would in storage (#1489 item 3). Both are reported in one
     # error so the operator fixes every offender in a single pass.
-    collisions = sorted(n for n in config.fields if n in _PRIVATE_RESERVED_ROOT_FIELDS)
+    collisions = sorted(
+        n for n, fd in config.fields.items() if _collides(n, fd.container)
+    )
     alias_collisions = sorted(
         f"{n} (alias={fd.alias!r})"
         for n, fd in config.fields.items()
-        if fd.alias and fd.alias in _PRIVATE_RESERVED_ROOT_FIELDS
+        if fd.alias and _collides(fd.alias, fd.container)
     )
     if collisions or alias_collisions:
         offenders = collisions + alias_collisions

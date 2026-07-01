@@ -311,9 +311,12 @@ def project_private_doc(
     contract.
 
     Pure function; the input is not mutated. GeoJSON/STAC structural
-    members that leaked under ``properties`` are dropped (they belong
-    at the doc root). An existing ``extras`` sub-bucket is merged
-    forward so the projection is idempotent.
+    members that leaked under ``properties`` are quarantined into
+    ``properties.extras.<member>`` rather than dropped — the canonical
+    value still lives at the doc root, but the tenant's colliding
+    attribute is preserved losslessly instead of silently discarded
+    (#2642). An existing ``extras`` sub-bucket is merged forward so the
+    projection is idempotent.
     """
     if not known_fields:
         return doc
@@ -327,6 +330,13 @@ def project_private_doc(
     extras: Dict[str, Any] = {}
     for k, v in props.items():
         if k in _RESERVED_MEMBER_KEYS:
+            # Quarantine rather than drop: a tenant attribute whose key
+            # collides with a GeoJSON/STAC structural member (e.g.
+            # ``collection``) would shadow the doc root if left at
+            # ``properties.<member>``. Route it into
+            # ``properties.extras.<member>`` instead so the value
+            # survives the write (#2642).
+            extras[k] = v
             continue
         if k == "extras":
             if isinstance(v, dict):

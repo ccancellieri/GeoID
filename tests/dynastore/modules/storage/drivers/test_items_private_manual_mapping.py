@@ -236,10 +236,12 @@ class TestProjectPrivateDoc:
         out = project_private_doc(doc, known)
         assert out["properties"]["extras"] == {"prior": "a", "fresh": "b"}
 
-    def test_reserved_member_keys_dropped_from_properties(self):
-        # If someone leaks ``id`` or ``geometry`` inside ``properties``,
-        # drop it rather than routing to extras (the canonical value
-        # lives at the doc root).
+    def test_reserved_member_keys_quarantined_into_extras(self):
+        # If a tenant attribute leaks under ``properties`` using a
+        # GeoJSON/STAC structural name (``id``, ``geometry``, …), route it
+        # into ``properties.extras.<member>`` instead of dropping it — the
+        # canonical value still lives at the doc root, but the tenant's
+        # colliding attribute is preserved losslessly (#2642).
         known = {"my:declared": {"type": "keyword"}}
         doc = {
             "geoid": "g1",
@@ -253,7 +255,31 @@ class TestProjectPrivateDoc:
         out = project_private_doc(doc, known)
         assert "id" not in out["properties"]
         assert "geometry" not in out["properties"]
-        assert out["properties"]["extras"] == {"my:other": "z"}
+        assert out["properties"]["extras"] == {
+            "id": "leak",
+            "geometry": {"type": "Point", "coordinates": [0, 0]},
+            "my:other": "z",
+        }
+        # The doc-root ``geoid`` is untouched — no shadowing occurred.
+        assert out["geoid"] == "g1"
+
+    def test_reserved_member_key_round_trips_via_extras(self):
+        # Round-trip: ingest a feature carrying ``properties.collection``,
+        # assert it lands under ``properties.extras.collection`` and the
+        # value is intact (not mangled/stringified) (#2642).
+        known = {"my:declared": {"type": "keyword"}}
+        doc = {
+            "geoid": "g1",
+            "properties": {"my:declared": "v", "collection": "external-value"},
+        }
+        out = project_private_doc(doc, known)
+        assert "collection" not in out["properties"]
+        assert out["properties"]["extras"]["collection"] == "external-value"
+        # Re-projecting the already-projected doc (idempotent — the read
+        # path may feed a stored doc back through the same helper) keeps
+        # the quarantined value intact.
+        out2 = project_private_doc(out, known)
+        assert out2["properties"]["extras"]["collection"] == "external-value"
 
     def test_input_not_mutated(self):
         known = {"my:declared": {"type": "keyword"}}

@@ -55,8 +55,11 @@ def _schema(**fields: FieldDefinition) -> ItemsSchema:
 
 
 def _fd(name: str, *, data_type: str = "string", alias: str | None = None,
-        required: bool = False) -> FieldDefinition:
-    return FieldDefinition(name=name, data_type=data_type, alias=alias, required=required)
+        required: bool = False, container: str = "properties") -> FieldDefinition:
+    return FieldDefinition(
+        name=name, data_type=data_type, alias=alias, required=required,
+        container=container,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -82,13 +85,13 @@ async def test_reserved_name_collision_on_alias_rejected():
 async def test_reserved_name_both_key_and_alias_reported_together():
     schema = _schema(
         bbox=_fd("bbox"),                       # key collision
-        my_id=_fd("my_id", alias="asset_id"),   # alias collision
+        my_geom=_fd("my_geom", alias="geometry"),  # alias collision
     )
     with pytest.raises(ValueError) as exc:
         await _validate_items_schema_reserved_names(schema, "cat", "col", None)
     msg = str(exc.value)
     assert "bbox" in msg
-    assert "asset_id" in msg
+    assert "geometry" in msg
 
 
 async def test_clean_schema_passes_reserved_names():
@@ -102,6 +105,53 @@ async def test_clean_schema_passes_reserved_names():
 
 async def test_reserved_names_noop_on_non_items_schema():
     await _validate_items_schema_reserved_names(object(), "cat", "col", None)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# _validate_items_schema_reserved_names — container-gated relaxation (#2642)
+# ---------------------------------------------------------------------------
+
+
+async def test_non_structural_reserved_name_with_properties_container_passes():
+    # ``external_id`` is a reserved root field of the private tenant feature
+    # mapping, but it is NOT a true GeoJSON/STAC structural member. Declared
+    # with ``container="properties"`` it resolves to the distinct
+    # ``properties.external_id`` path, so it no longer collides with the
+    # doc root and must be allowed (#2642).
+    schema = _schema(external_id=_fd("external_id", container="properties"))
+    # Must not raise.
+    await _validate_items_schema_reserved_names(schema, "cat", "col", None)
+
+
+async def test_true_structural_reserved_name_still_rejected_regardless_of_container():
+    # ``collection`` is a true GeoJSON/STAC structural member — it stays
+    # blocked even with ``container="properties"`` since the private write
+    # projection would otherwise need to quarantine it into
+    # ``properties.extras`` rather than storing it as declared (#2642).
+    schema = _schema(collection=_fd("collection", container="properties"))
+    with pytest.raises(ValueError, match=r"reserved root name"):
+        await _validate_items_schema_reserved_names(schema, "cat", "col", None)
+
+
+async def test_nested_container_names_still_rejected_with_properties_container():
+    # ``properties`` / ``extras`` stay blocked even under
+    # ``container="properties"`` — they'd collide with the quarantine
+    # bucket used by ``project_private_doc`` (#2642).
+    schema = _schema(
+        properties=_fd("properties", container="properties"),
+        extras=_fd("extras", container="properties"),
+    )
+    with pytest.raises(ValueError, match=r"reserved root name"):
+        await _validate_items_schema_reserved_names(schema, "cat", "col", None)
+
+
+async def test_non_structural_reserved_name_blocked_outside_properties_container():
+    # Without the ``container="properties"`` exemption, ``external_id``
+    # still collides with the doc root (e.g. declared under ``"system"``),
+    # so the pre-#2642 protection holds.
+    schema = _schema(external_id=_fd("external_id", container="system"))
+    with pytest.raises(ValueError, match=r"reserved root name"):
+        await _validate_items_schema_reserved_names(schema, "cat", "col", None)
 
 
 # ---------------------------------------------------------------------------
