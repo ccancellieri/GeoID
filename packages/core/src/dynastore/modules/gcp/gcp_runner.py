@@ -19,8 +19,9 @@
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, timezone, timedelta
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from dynastore.modules.processes.models import Process, ExecuteRequest, as_process_task_payload
 from dynastore.modules.tasks import tasks_module
@@ -35,8 +36,14 @@ from dynastore.modules.tasks.models import (
 from dynastore.tools.identifiers import generate_id_hex
 from dynastore.tools.plugin import ProtocolPlugin
 
+try:
+    from google.cloud.logging_v2.types import ListLogEntriesRequest
+except ImportError:  # google-cloud-logging is optional within module_gcp
+    ListLogEntriesRequest = None
+
 if TYPE_CHECKING:
     from dynastore.modules.tasks.liveness import LivenessVerdict
+    from dynastore.models.tasks import LogPage
 
 logger = logging.getLogger(__name__)
 
@@ -772,3 +779,188 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
                 "— returning False.", runner_ref, exc,
             )
             return False
+
+    # ------------------------------------------------------------------
+    # LogSourceProtocol — vendor-extension job logs (GET /jobs/{id}/logs)
+    #
+    # Not OGC Processes core: a client-facing, best-effort convenience so an
+    # operator/caller can see why a job died without shelling into Cloud
+    # Logging directly. The runner service account may not have
+    # roles/logging.viewer granted yet, so every failure mode here degrades
+    # to an empty LogPage with an explanatory note rather than raising.
+    #
+    # IAM perm needed by the runner service account:
+    #   logging.logEntries.list  (roles/logging.viewer)
+    # ------------------------------------------------------------------
+
+    _RUNNER_REF_RE = re.compile(
+        r"^projects/[^/]+/locations/[^/]+/jobs/(?P<job>[^/]+)/executions/(?P<execution>[^/]+)$"
+    )
+
+    @classmethod
+    def _parse_runner_ref(cls, runner_ref: Optional[str]) -> Optional[Tuple[str, str]]:
+        """Extract ``(job_name, execution_name)`` from a Cloud Run ``runner_ref``.
+
+        Expected shape: ``projects/{p}/locations/{l}/jobs/{JOB}/executions/{EXEC}``.
+        Returns ``None`` when ``runner_ref`` is absent or doesn't match —
+        e.g. captured before the executions segment was set, or a
+        foreign-format ref from a different runner family.
+        """
+        if not runner_ref:
+            return None
+        m = cls._RUNNER_REF_RE.match(runner_ref)
+        if not m:
+            return None
+        return m.group("job"), m.group("execution")
+
+    @staticmethod
+    def _get_logging_client_safe() -> Optional[Any]:
+        """Resolve the Cloud Logging async client without raising.
+
+        Mirrors ``_get_executions_client_safe`` — same guard pattern. Returns
+        ``None`` when the client is unavailable (GCP module not loaded,
+        google-cloud-logging not installed, early startup, or tests without
+        mocking).
+        """
+        try:
+            from dynastore.modules import get_protocol
+            from dynastore.models.protocols import JobExecutionProtocol
+
+            gcp_module = get_protocol(JobExecutionProtocol)
+            if gcp_module is None or not hasattr(gcp_module, "get_logging_client"):
+                return None
+            return gcp_module.get_logging_client()  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001 — never raise from a log-fetch helper
+            logger.debug(
+                "GcpJobRunner._get_logging_client_safe: client unavailable (%s).", exc
+            )
+            return None
+
+    @staticmethod
+    def _extract_log_message(entry: Any) -> str:
+        """Best-effort extraction of a human-readable message from a
+        ``LogEntry``'s oneof ``payload`` (text/json/proto)."""
+        text = getattr(entry, "text_payload", None)
+        if text:
+            return text
+        json_payload = getattr(entry, "json_payload", None)
+        if json_payload:
+            try:
+                import json as _json
+                return _json.dumps(dict(json_payload))
+            except Exception:  # noqa: BLE001 — fall through to str()
+                return str(json_payload)
+        proto_payload = getattr(entry, "proto_payload", None)
+        if proto_payload:
+            return str(proto_payload)
+        return ""
+
+    async def fetch_logs(
+        self,
+        task: Any,
+        *,
+        limit: int = 200,
+        cursor: Optional[str] = None,
+        order: str = "asc",
+    ) -> "LogPage":
+        """Read one page of Cloud Logging entries for the Cloud Run execution
+        backing ``task``.
+
+        Best-effort and lenient by design: a malformed/absent ``runner_ref``,
+        an unavailable logging client, a missing project id, or any Cloud
+        Logging API error — including ``PermissionDenied`` when the runner
+        service account lacks ``roles/logging.viewer`` — all return an EMPTY
+        ``LogPage`` with a human-readable ``note`` instead of raising. This
+        method MUST NOT raise: the job-logs endpoint must still return 200
+        even when logs are unavailable.
+        """
+        from dynastore.models.tasks import LogEntry, LogPage
+
+        runner_ref = getattr(task, "runner_ref", None)
+        parsed = self._parse_runner_ref(runner_ref)
+        if parsed is None:
+            return LogPage(
+                entries=[],
+                note="no runner_ref (or unrecognized format) — logs unavailable",
+            )
+        job_name, execution_name = parsed
+
+        try:
+            client = self._get_logging_client_safe()
+            if client is None:
+                return LogPage(
+                    entries=[],
+                    note="Cloud Logging client unavailable — logs unavailable",
+                )
+
+            from dynastore.modules import get_protocol
+            from dynastore.models.protocols import CloudIdentityProtocol
+
+            identity = get_protocol(CloudIdentityProtocol)
+            project_id = identity.get_project_id() if identity else None
+            if not project_id:
+                return LogPage(
+                    entries=[],
+                    note="GCP project id unavailable — logs unavailable",
+                )
+
+            log_filter = (
+                'resource.type="cloud_run_job" '
+                f'AND resource.labels.job_name="{job_name}" '
+                f'AND labels."run.googleapis.com/execution_name"="{execution_name}"'
+            )
+            order_by = "timestamp desc" if order == "desc" else "timestamp asc"
+            request_kwargs = dict(
+                resource_names=[f"projects/{project_id}"],
+                filter=log_filter,
+                order_by=order_by,
+                page_size=limit,
+                page_token=cursor or "",
+            )
+            # ``ListLogEntriesRequest`` when google-cloud-logging is installed
+            # (the typed request the module_gcp extra declares); GAPIC async
+            # clients also accept a plain dict with the same fields, so a
+            # service running without the optional dependency (or a test
+            # double) still gets a well-formed request.
+            request = (
+                ListLogEntriesRequest(**request_kwargs)
+                if ListLogEntriesRequest is not None
+                else request_kwargs
+            )
+            pager = await client.list_log_entries(request=request)
+
+            # Take exactly ONE raw page (``.pages`` — not the flattened
+            # auto-paginating iterator) so ``limit``/``cursor`` map 1:1 onto
+            # our own LogPage/next_cursor contract instead of the pager
+            # silently issuing further RPCs to backfill a short first page.
+            entries: list = []
+            next_token: Optional[str] = None
+            async for raw_page in pager.pages:
+                for log_entry in raw_page.entries:
+                    entries.append(
+                        LogEntry(
+                            timestamp=log_entry.timestamp,
+                            severity=(
+                                log_entry.severity.name
+                                if getattr(log_entry, "severity", None) is not None
+                                else None
+                            ),
+                            message=self._extract_log_message(log_entry),
+                        )
+                    )
+                next_token = raw_page.next_page_token or None
+                break
+
+            return LogPage(entries=entries, next_cursor=next_token)
+        except Exception as exc:  # noqa: BLE001 — MUST NOT raise; degrade to empty page
+            if type(exc).__name__ in ("PermissionDenied", "Forbidden"):
+                reason = (
+                    "log access not granted (roles/logging.viewer) — logs unavailable"
+                )
+            else:
+                reason = f"log read failed ({type(exc).__name__}) — logs unavailable"
+            logger.warning(
+                "GcpJobRunner.fetch_logs: read failed for runner_ref '%s' (%s) — %s.",
+                runner_ref, exc, reason,
+            )
+            return LogPage(entries=[], note=reason)

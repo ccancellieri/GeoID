@@ -581,6 +581,43 @@ class TaskPage(BaseModel):
     )
 
 
+class LogEntry(BaseModel):
+    """A single remote-execution log line (vendor extension, not OGC core)."""
+
+    timestamp: datetime = Field(..., description="Log entry timestamp (UTC).")
+    severity: Optional[str] = Field(default=None, description="Log severity, e.g. 'INFO', 'ERROR' (runner-specific).")
+    message: str = Field(..., description="Log line text.")
+
+
+class LogPage(BaseModel):
+    """Best-effort page of remote execution logs for a job.
+
+    Vendor extension: ``GET /jobs/{id}/logs`` is a dynastore-specific surface,
+    not part of OGC API - Processes core. Always returns HTTP 200, even when
+    logs are unavailable — a missing IAM permission on the runner service
+    account, an unmapped/in-process owner, or a transient read failure all
+    degrade to an empty page with ``note`` explaining why, rather than a 404
+    or 500.
+    """
+
+    entries: List[LogEntry] = Field(default_factory=list)
+    next_cursor: Optional[str] = Field(
+        default=None,
+        description="Opaque page token for the next page of logs; None on "
+                    "the last page or when logs are unavailable.",
+    )
+    note: Optional[str] = Field(
+        default=None,
+        description="Human-readable reason when logs are unavailable or "
+                    "incomplete (e.g. 'log access not granted').",
+    )
+    links: List[Link] = Field(
+        default_factory=list,
+        description="HATEOAS links (e.g. rel='next' for pagination). "
+                    "Vendor extension, not OGC core.",
+    )
+
+
 class RequeueResult(BaseModel):
     """Result of a single dead-letter requeue operation."""
 

@@ -26,6 +26,9 @@ if TYPE_CHECKING:
     from google.api_core import exceptions as google_exceptions
     from google.api_core.exceptions import Aborted
     from google.cloud import storage, pubsub_v1, run_v2
+    from google.cloud.logging_v2.services.logging_service_v2 import (
+        LoggingServiceV2AsyncClient,
+    )
 else:
     try:
         from google.api_core import exceptions as google_exceptions
@@ -71,6 +74,12 @@ if not TYPE_CHECKING:
         from google.cloud import run_v2
     except ImportError:
         run_v2 = None
+    try:
+        from google.cloud.logging_v2.services.logging_service_v2 import (
+            LoggingServiceV2AsyncClient,
+        )
+    except ImportError:
+        LoggingServiceV2AsyncClient = None
 from dynastore.modules.gcp.bucket_service import BucketService
 from .gcp_catalog_ops import GcpCatalogOpsMixin
 from .gcp_eventing_ops import GcpEventingOpsMixin
@@ -184,6 +193,7 @@ class GCPModule(
     _jobs_client: Optional["run_v2.JobsAsyncClient"] = None
     _run_client: Optional["run_v2.ServicesAsyncClient"] = None
     _executions_client: Optional["run_v2.ExecutionsAsyncClient"] = None
+    _logging_client: Optional["LoggingServiceV2AsyncClient"] = None
     _async_clients_loop: Optional[asyncio.AbstractEventLoop] = None
     _bucket_service: Optional[BucketService] = None
     # Background reconciler that probes lapsed-lease Cloud Run task rows for
@@ -274,6 +284,7 @@ class GCPModule(
             self._jobs_client = None
             self._run_client = None
             self._executions_client = None
+            self._logging_client = None
             self._async_clients_loop = None
 
             # Update BucketService if it exists
@@ -895,6 +906,7 @@ class GCPModule(
             ("_jobs_client", self._jobs_client),
             ("_run_client", self._run_client),
             ("_executions_client", self._executions_client),
+            ("_logging_client", self._logging_client),
         ]
 
         for attr, client in clients_to_close:
@@ -987,10 +999,18 @@ class GCPModule(
             # caller is already sync, and no await will happen.
             return
 
+        # ``_logging_client`` only gates the cache-hit check when the
+        # google-cloud-logging client class is actually importable; a
+        # service without that optional dependency must not rebuild the
+        # jobs/run/executions clients on every call.
+        _logging_ready = (
+            self._logging_client is not None or LoggingServiceV2AsyncClient is None
+        )
         if (
             self._jobs_client is not None
             and self._run_client is not None
             and self._executions_client is not None
+            and _logging_ready
             and self._async_clients_loop is loop
         ):
             return
@@ -1004,6 +1024,10 @@ class GCPModule(
         self._executions_client = run_v2.ExecutionsAsyncClient(
             credentials=self._credentials
         )
+        if LoggingServiceV2AsyncClient is not None:
+            self._logging_client = LoggingServiceV2AsyncClient(
+                credentials=self._credentials
+            )
         self._async_clients_loop = loop
         logger.info("GCP async clients built on event loop %r.", loop)
 
@@ -1040,6 +1064,26 @@ class GCPModule(
                 + ("credentials missing" if not self._credentials else "no running event loop")
             )
         return self._executions_client
+
+    def get_logging_client(self) -> "LoggingServiceV2AsyncClient":
+        """
+        Returns the async Cloud Logging client, bound to the current loop.
+
+        Used by :meth:`GcpJobRunner.fetch_logs` (vendor-extension job-logs
+        endpoint) to read log entries for a Cloud Run Job execution. Built
+        lazily and rebound on loop change for the same reason as
+        ``get_executions_client`` — see
+        :meth:`_ensure_async_clients_for_current_loop`. Raises when
+        ``google-cloud-logging`` is not installed (not part of the base
+        ``module_gcp`` extra's hard requirements) or credentials are missing.
+        """
+        self._ensure_async_clients_for_current_loop()
+        if not self._logging_client:
+            raise RuntimeError(
+                "GCPModule logging client unavailable: "
+                + ("credentials missing" if not self._credentials else "google-cloud-logging not installed or no running event loop")
+            )
+        return self._logging_client
 
     # --- JobExecutionProtocol Implementation ---
 

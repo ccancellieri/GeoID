@@ -86,6 +86,7 @@ from dynastore.modules.tasks.maintenance import (
     list_dead_letter_tasks as _dlq_list,
     requeue_dead_letter_task as _dlq_requeue,
 )
+from dynastore.modules.tasks.reconciliation import reconcile_task_liveness
 from dynastore.modules.tasks.tasks_module import encode_cursor
 
 logger = logging.getLogger(__name__)
@@ -143,6 +144,13 @@ async def _get_task_scoped_uncached(
         raise HTTPException(
             status_code=404,
             detail=f"Task with ID '{task_id}' not found in catalog '{catalog_id}'.",
+        )
+    try:
+        task = await reconcile_task_liveness(conn, task, schema=schema)
+    except Exception as e:  # noqa: BLE001 — best-effort; never turn a 200 into a 500
+        logger.warning(
+            "reconcile_task_liveness failed for task %s: %s — serving unreconciled status.",
+            task_id, e,
         )
     return task
 
@@ -498,6 +506,17 @@ class TasksService(ExtensionProtocol):
         if not task:
             raise HTTPException(
                 status_code=404, detail=f"Task '{task_id}' not found."
+            )
+        try:
+            # Unscoped route: no separately-resolved tenant schema in hand, so
+            # reuse the already-fetched task's own catalog_id (real rows
+            # always have one — the reserved 'platform'/'system' sentinels
+            # included).
+            task = await reconcile_task_liveness(conn, task, schema=task.catalog_id or "")
+        except Exception as e:  # noqa: BLE001 — best-effort; never turn a 200 into a 500
+            logger.warning(
+                "reconcile_task_liveness failed for task %s: %s — serving unreconciled status.",
+                task_id, e,
             )
         return task
 

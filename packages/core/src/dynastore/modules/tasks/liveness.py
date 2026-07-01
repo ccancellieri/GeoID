@@ -40,7 +40,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Optional, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from dynastore.models.tasks import Task
+    from dynastore.models.tasks import Task, LogPage
 
 
 class LivenessVerdict(str, Enum):
@@ -176,5 +176,70 @@ def resolve_stop_signal(owner_id: Optional[str]) -> Optional[StopSignalProtocol]
             if runner.owns(owner_id):
                 return runner
         except Exception:  # noqa: BLE001 — a broken runner must not block resolution
+            continue
+    return None
+
+
+@runtime_checkable
+class LogSourceProtocol(Protocol):
+    """Contract for a runner that can fetch logs for its out-of-process execution.
+
+    Deliberately a SEPARATE ``@runtime_checkable Protocol`` rather than new
+    methods on :class:`LivenessProbeProtocol` or :class:`StopSignalProtocol` —
+    same rationale as those two: adding a method to an existing
+    ``@runtime_checkable`` protocol drops every current implementer out of
+    structural ``isinstance`` / ``get_protocols`` discovery. A standalone
+    sibling lets the vendor-extension logs route resolve log sources
+    independently via ``get_protocols(LogSourceProtocol)`` and lets a future
+    runner ship log access without touching its probe/stop-signal path.
+
+    ``fetch_logs`` MUST NOT raise — on any error it returns an empty
+    :class:`~dynastore.models.tasks.LogPage` with a human-readable ``note``
+    so a caller (e.g. missing IAM permission on the runner service account)
+    degrades to "no logs available" rather than turning a log fetch into a
+    500 on the job-status surface.
+    """
+
+    runner_type: str
+
+    def owns(self, owner_id: str) -> bool:
+        """True if this runner is the one that stamped ``owner_id`` on a task row."""
+        ...
+
+    async def fetch_logs(
+        self,
+        task: "Task",
+        *,
+        limit: int = 200,
+        cursor: Optional[str] = None,
+        order: str = "asc",
+    ) -> "LogPage":
+        """Return a page of logs for the execution backing ``task``.
+
+        Best-effort: never raises. Any error (including a missing IAM
+        permission) is logged and swallowed, returning an empty
+        :class:`~dynastore.models.tasks.LogPage` carrying a ``note`` that
+        explains why logs are unavailable.
+        """
+        ...
+
+
+def resolve_log_source(owner_id: Optional[str]) -> Optional[LogSourceProtocol]:
+    """Return the registered log source that owns ``owner_id``, or ``None``.
+
+    Mirrors :func:`resolve_stop_signal` — resolution keys on ``owner_id``,
+    not on ``can_handle(task_type)``. ``None`` means the owner is an
+    in-process / ephemeral / unrecognized runner that has no remote log
+    source: the caller returns an empty ``LogPage`` with an explanatory note.
+    """
+    if not owner_id:
+        return None
+    from dynastore.tools.discovery import get_protocols
+
+    for source in get_protocols(LogSourceProtocol):
+        try:
+            if source.owns(owner_id):
+                return source
+        except Exception:  # noqa: BLE001 — a broken log source must not block resolution
             continue
     return None

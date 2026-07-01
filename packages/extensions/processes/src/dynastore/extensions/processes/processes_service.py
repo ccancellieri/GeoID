@@ -63,6 +63,9 @@ from dynastore.modules.tasks.models import (
     TaskStatusEnum,
 )
 from dynastore.modules.tasks.execution import execution_engine
+from dynastore.modules.tasks.reconciliation import reconcile_task_liveness
+from dynastore.modules.tasks.liveness import resolve_log_source
+from dynastore.models.tasks import LogPage
 from dynastore.modules.processes import models
 from dynastore.modules.processes.inventory import (
     build_process_inventory_entries,
@@ -960,6 +963,13 @@ async def _get_job_internal(job_id: uuid.UUID, catalog_id: str, conn: AsyncConne
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Job '{job_id}' not found.",
         )
+    try:
+        task = await reconcile_task_liveness(conn, task, schema=schema)
+    except Exception as e:  # noqa: BLE001 — best-effort; never turn a 200 into a 500
+        logger.warning(
+            "reconcile_task_liveness failed for job %s: %s — serving unreconciled status.",
+            job_id, e,
+        )
     return task
 
 
@@ -993,6 +1003,16 @@ async def get_job_status(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Job '{job_id}' not found.",
+        )
+    try:
+        # Unscoped route: no separately-resolved tenant schema in hand, so
+        # reuse the already-fetched task's own catalog_id (real rows always
+        # have one — the reserved 'platform'/'system' sentinels included).
+        task = await reconcile_task_liveness(conn, task, schema=task.catalog_id or "")
+    except Exception as e:  # noqa: BLE001 — best-effort; never turn a 200 into a 500
+        logger.warning(
+            "reconcile_task_liveness failed for job %s: %s — serving unreconciled status.",
+            job_id, e,
         )
     si = _task_to_status_info(task, request)
     return JSONResponse(
@@ -1109,6 +1129,110 @@ async def get_job_results_catalog(
     """Gets the results of a completed job (Catalog context)."""
     task = await _get_job_internal(job_id, catalog_id, conn)
     return _handle_job_results(task, job_id)
+
+
+# --- Vendor extension: Job Logs (GET /jobs/{id}/logs) at 3 scopes ---
+#
+# NOT part of OGC API - Processes core (log surfaces are out of scope for
+# the standard) — a dynastore-specific convenience, kept out of the
+# /conformance declaration. Best-effort: an unmapped owner (in-process
+# runner), or any read failure on the owning runner's side (including a
+# missing IAM permission), returns an empty LogPage with an explanatory
+# ``note`` rather than a 404/500.
+
+async def _job_logs_response(
+    task: Task, *, limit: int, cursor: Optional[str], order: str, request: Request
+) -> JSONResponse:
+    src = resolve_log_source(task.owner_id)
+    if src is None:
+        page = LogPage(entries=[], note="no remote log source for this job")
+    else:
+        try:
+            page = await src.fetch_logs(task, limit=limit, cursor=cursor, order=order)
+        except Exception as e:  # noqa: BLE001 — best-effort; never turn a 200 into a 500
+            logger.warning(
+                "get_job_logs: fetch_logs failed for job %s: %s", task.task_id, e,
+            )
+            page = LogPage(entries=[], note="log fetch failed unexpectedly")
+
+    content = page.model_dump(mode="json")
+    if page.next_cursor:
+        next_url = str(
+            request.url.replace_query_params(cursor=page.next_cursor, limit=limit, order=order)
+        )
+        content["links"] = [
+            {
+                "href": _external_url(next_url),
+                "rel": "next",
+                "type": "application/json",
+                "title": "Next page",
+            }
+        ]
+    return JSONResponse(content=content)
+
+
+@router.get(
+    "/jobs/{job_id}/logs",
+    name="get_job_logs",
+)
+async def get_job_logs(
+    job_id: uuid.UUID,
+    request: Request,
+    limit: int = Query(200, ge=1, le=1000),
+    cursor: Optional[str] = None,
+    order: str = Query("asc", pattern="^(asc|desc)$"),
+    conn: AsyncConnection = Depends(get_async_connection),
+) -> JSONResponse:
+    """Best-effort remote execution logs for a job (System context, vendor extension)."""
+    task = await tasks_module.get_task_by_id_unscoped(conn, job_id)
+    if not task or task.type != "process":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job '{job_id}' not found.",
+        )
+    return await _job_logs_response(task, limit=limit, cursor=cursor, order=order, request=request)
+
+
+@router.get(
+    "/catalogs/{catalog_id}/jobs/{job_id}/logs",
+    name="get_job_logs_catalog",
+)
+async def get_job_logs_catalog(
+    catalog_id: str,
+    job_id: uuid.UUID,
+    request: Request,
+    limit: int = Query(200, ge=1, le=1000),
+    cursor: Optional[str] = None,
+    order: str = Query("asc", pattern="^(asc|desc)$"),
+    conn: AsyncConnection = Depends(get_async_connection),
+) -> JSONResponse:
+    """Best-effort remote execution logs for a job (Catalog context, vendor extension)."""
+    task = await _get_job_internal(job_id, catalog_id, conn)
+    return await _job_logs_response(task, limit=limit, cursor=cursor, order=order, request=request)
+
+
+@router.get(
+    "/catalogs/{catalog_id}/collections/{collection_id}/jobs/{job_id}/logs",
+    name="get_job_logs_collection",
+)
+async def get_job_logs_collection(
+    catalog_id: str,
+    collection_id: str,
+    job_id: uuid.UUID,
+    request: Request,
+    limit: int = Query(200, ge=1, le=1000),
+    cursor: Optional[str] = None,
+    order: str = Query("asc", pattern="^(asc|desc)$"),
+    conn: AsyncConnection = Depends(get_async_connection),
+) -> JSONResponse:
+    """Best-effort remote execution logs for a job (Collection context, vendor extension)."""
+    task = await _get_job_internal(job_id, catalog_id, conn)
+    if task.collection_id and task.collection_id != collection_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job '{job_id}' does not belong to collection '{collection_id}'.",
+        )
+    return await _job_logs_response(task, limit=limit, cursor=cursor, order=order, request=request)
 
 
 # --- OGC Part 1: List Jobs (GET /jobs) at 3 scopes ---

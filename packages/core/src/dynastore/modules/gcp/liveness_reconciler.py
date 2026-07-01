@@ -51,6 +51,7 @@ from typing import Any, Dict, NamedTuple, Optional, Union
 
 from dynastore.modules.tasks import tasks_module
 from dynastore.modules.tasks.liveness import LivenessVerdict, resolve_probe, resolve_stop_signal
+from dynastore.modules.tasks.reconciliation import VerdictAction, decide_verdict_action
 from dynastore.modules.db_config.connection_health_config import resolve_leadership_config
 from dynastore.tools.background_service import (
     Leadership,
@@ -396,7 +397,15 @@ class GcpLivenessReconciler(PeriodicService):
         now = datetime.now(timezone.utc)
         runner_ref = row.get("runner_ref")
 
-        if verdict == LivenessVerdict.ALIVE:
+        # ``decide_verdict_action`` is the single source of truth for the
+        # verdict→action mapping, shared with the on-demand
+        # ``reconcile_task_liveness`` read-path trigger (#750-followup) — the
+        # two paths cannot drift apart on which action a verdict authorizes.
+        # Each branch below still owns its own logging, retry-message wording,
+        # race-loss bookkeeping and terminal-action routing.
+        action = decide_verdict_action(verdict)
+
+        if action is VerdictAction.EXTEND_LEASE:
             # The execution is genuinely running (or cold-starting) — extend
             # the lease so the reaper's next pass skips the row. This IS the
             # liveness signal that replaces the fixed spawn-lease timer.
@@ -428,7 +437,7 @@ class GcpLivenessReconciler(PeriodicService):
             # verdict stays ALIVE (the probe was truthful); race_lost carries
             # the "reaper got there first" signal for the pass summary.
             return ReconcileOutcome(verdict, race_lost=not extended)
-        elif verdict in (LivenessVerdict.DEAD, LivenessVerdict.TERMINAL_FAILED):
+        elif action is VerdictAction.FAIL_RETRY:
             reason = (
                 "Cloud Run execution failed"
                 if verdict == LivenessVerdict.TERMINAL_FAILED
@@ -489,7 +498,7 @@ class GcpLivenessReconciler(PeriodicService):
                     task_id, verdict.value, runner_ref,
                 )
             return ReconcileOutcome(verdict, race_lost=not acted)
-        elif verdict == LivenessVerdict.TERMINAL_SUCCEEDED:
+        elif action is VerdictAction.COMPLETE:
             # The execution exited 0 but the row is still ACTIVE — reconcile it
             # to COMPLETED from the outputs the container persisted before exit
             # (main_task.py writes outputs before the terminal status flip, so
@@ -545,7 +554,7 @@ class GcpLivenessReconciler(PeriodicService):
                     task_id, runner_ref,
                 )
             return ReconcileOutcome(verdict, race_lost=not acted)
-        else:  # LivenessVerdict.UNKNOWN
+        else:  # VerdictAction.NOOP (LivenessVerdict.UNKNOWN)
             started_at = row.get("started_at")
             young = (
                 started_at is not None

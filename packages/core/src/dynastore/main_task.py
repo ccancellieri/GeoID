@@ -68,20 +68,44 @@ def _exit_code_for_unclaimed_status(status: str | None) -> int:
     return 1 if status in _FAIL_EXIT_STATUSES else 0
 
 
-async def _heartbeat_loop(engine, task_id: uuid.UUID, interval_seconds: float) -> None:
+async def _heartbeat_loop(
+    engine, task_id: uuid.UUID, interval_seconds: float, schema: str
+) -> None:
     """Extend locked_until every interval_seconds while the task runs.
 
     On Cloud Run job preempt (SIGTERM) the asyncio task tree is cancelled,
     this coroutine stops, locked_until lapses, and the maintenance reaper resets
     the row to PENDING (retry_count + 1) for another worker to pick up.
+
+    Also re-persists the latest worker-reported progress (tracked by
+    ``dynastore.tasks.progress_state``) through the normal ``update_task``
+    path on this same cadence. Task reporters already write ``progress`` to
+    the DB on their own cadence (e.g. once per processed batch); doing it
+    again here is a belt-and-braces measure so a SIGTERM landing between two
+    reporter writes still leaves the most recently known value on the row —
+    exactly what a reconciled ``failed`` row surfaces to a client poll.
     """
-    from dynastore.modules.tasks.tasks_module import heartbeat_tasks
+    from dynastore.modules.tasks.tasks_module import heartbeat_tasks, update_task
+    from dynastore.modules.tasks.models import TaskUpdate
+    from dynastore.tasks.progress_state import get_progress
+
+    last_persisted_progress: typing.Optional[int] = None
     while True:
         await asyncio.sleep(interval_seconds)
         try:
             await heartbeat_tasks(engine, [task_id], _VISIBILITY_TIMEOUT)
         except Exception as e:
             logger.warning(f"Heartbeat failed for task {task_id}: {e}")
+
+        progress = get_progress(task_id)
+        if progress is not None and progress != last_persisted_progress:
+            try:
+                await update_task(
+                    engine, task_id, TaskUpdate(progress=progress), schema=schema
+                )
+                last_persisted_progress = progress
+            except Exception as e:
+                logger.warning(f"Progress persist failed for task {task_id}: {e}")
 
 
 def _resolve_payload_model(target_task: object, task_name: str) -> type:
@@ -294,7 +318,7 @@ async def main(task_name: str, payload: dict, schema: str):
                         return
                     interval = _VISIBILITY_TIMEOUT.total_seconds() / 3
                     hb_task = asyncio.create_task(
-                        _heartbeat_loop(engine, task_id_uuid, interval)
+                        _heartbeat_loop(engine, task_id_uuid, interval, schema)
                     )
                     logger.info(
                         f"--- [main_task.py] Took ownership of task {task_id_uuid} "

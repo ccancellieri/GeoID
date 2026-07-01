@@ -28,6 +28,7 @@ from dynastore.modules.tasks.models import TaskUpdate, TaskStatusEnum
 
 from dynastore.tasks.reporters import ReportingInterface
 from dynastore.tasks.ingestion.reporters import ingestion_reporter
+from dynastore.tasks.progress_state import record_progress
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,11 @@ class DatabaseStatusReporter(ReportingInterface):
             progress_value = min(self.processed_chunks, 99)
         update = TaskUpdate(progress=progress_value)
         await self._update_task_async(update)
+        # Durable progress: also record in the process-local tracker so the
+        # generic heartbeat loop (main_task.py) can re-persist this value on
+        # its own cadence, independent of this reporter's batching — belt
+        # and braces against a SIGTERM landing between reporter updates.
+        record_progress(self.task_id, progress_value)
 
     async def task_finished(
         self,

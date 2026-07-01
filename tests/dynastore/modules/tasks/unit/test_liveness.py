@@ -142,3 +142,82 @@ def test_resolve_probe_swallows_owns_errors(monkeypatch):
         lambda proto: [_Raises(), good],
     )
     assert liveness.resolve_probe("gcp_cloud_run_abc") is good
+
+
+# ---------------------------------------------------------------------------
+# LogSourceProtocol / resolve_log_source (vendor-extension GET /jobs/{id}/logs)
+# ---------------------------------------------------------------------------
+
+class _FakeLogSource:
+    runner_type = "gcp_cloud_run"
+
+    def owns(self, owner_id: str) -> bool:
+        return bool(owner_id) and owner_id.startswith("gcp_cloud_run_")
+
+    async def fetch_logs(self, task, *, limit=200, cursor=None, order="asc"):  # pragma: no cover - not called here
+        from dynastore.models.tasks import LogPage
+        return LogPage(entries=[])
+
+
+def test_log_source_protocol_shape():
+    """Structurally identical to StopSignalProtocol: runner_type, owns(), and
+    an async fetch_logs()."""
+    LogSourceProtocol = _liveness().LogSourceProtocol
+    assert hasattr(LogSourceProtocol, "owns")
+    assert hasattr(LogSourceProtocol, "fetch_logs")
+    assert getattr(LogSourceProtocol, "_is_runtime_protocol", False)
+
+
+def test_fetch_logs_is_async():
+    LogSourceProtocol = _liveness().LogSourceProtocol
+    assert inspect.iscoroutinefunction(LogSourceProtocol.fetch_logs)
+
+
+def test_fake_log_source_satisfies_protocol_structurally():
+    LogSourceProtocol = _liveness().LogSourceProtocol
+    assert isinstance(_FakeLogSource(), LogSourceProtocol)
+
+
+def test_resolve_log_source_matches_gcp_owner(monkeypatch):
+    liveness = _liveness()
+    source = _FakeLogSource()
+    monkeypatch.setattr(
+        "dynastore.tools.discovery.get_protocols",
+        lambda proto: [source],
+    )
+    assert liveness.resolve_log_source("gcp_cloud_run_abc123") is source
+
+
+def test_resolve_log_source_unmapped_owner_returns_none(monkeypatch):
+    liveness = _liveness()
+    source = _FakeLogSource()
+    monkeypatch.setattr(
+        "dynastore.tools.discovery.get_protocols",
+        lambda proto: [source],
+    )
+    assert liveness.resolve_log_source("dispatcher-pod-7") is None
+
+
+def test_resolve_log_source_none_owner_returns_none():
+    assert _liveness().resolve_log_source(None) is None
+    assert _liveness().resolve_log_source("") is None
+
+
+def test_resolve_log_source_swallows_owns_errors(monkeypatch):
+    liveness = _liveness()
+
+    class _Raises:
+        runner_type = "broken"
+
+        def owns(self, owner_id):
+            raise RuntimeError("boom")
+
+        async def fetch_logs(self, task, *, limit=200, cursor=None, order="asc"):  # pragma: no cover
+            ...
+
+    good = _FakeLogSource()
+    monkeypatch.setattr(
+        "dynastore.tools.discovery.get_protocols",
+        lambda proto: [_Raises(), good],
+    )
+    assert liveness.resolve_log_source("gcp_cloud_run_abc") is good
