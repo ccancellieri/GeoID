@@ -193,6 +193,24 @@ class TasksPluginConfig(ExposableConfigMixin, PluginConfig):
         ),
     )
 
+    async_writer_backlog_threshold: Mutable[int] = Field(
+        default=2000,
+        ge=0,
+        description=(
+            "Aggregate ready-row count across the global tasks.storage "
+            "('ready') + tasks.events ('PENDING') outbox tables above which "
+            "the serving-path secondary-write drainers (storage_drain / "
+            "event_drain) prefer the offloaded async_writer Cloud Run Job "
+            "over the in-process BackgroundRunner (#2622). Below the "
+            "threshold the drain stays in-process — light load must not pay "
+            "for a job hop. Read on every dispatch decision via a short-TTL "
+            "cached probe (dynastore.modules.tasks.async_writer_backlog), so "
+            "changes take effect within a few seconds, no restart required. "
+            "Has no effect when no async_writer Cloud Run Job is deployed — "
+            "the offload guard fails open to the in-process path in that case."
+        ),
+    )
+
     @model_validator(mode="after")
     def _enforce_refresh_le_half_ttl(self) -> "TasksPluginConfig":
         if self.capability_publisher_refresh_seconds > self.capability_publisher_ttl_seconds / 2:

@@ -410,7 +410,22 @@ worker_task_gdal = ["dynastore[task_base,module_catalog,gdal,module_storage_post
 # TypeError: CursorResult object can't be awaited. Same fix as #2472
 # applied to worker_task_catalog_provision.
 worker_task_dimensions_materialize = ["dynastore[task_base,module_db,module_catalog,extension_dimensions,module_storage_postgresql]"]
-worker_task_elasticsearch_indexer = ["dynastore[task_base,module_catalog,elasticsearch,task_elasticsearch_indexer_deps,outbox_drain,module_storage_postgresql]"]
+# worker_task_async_writer (#2622): the generic secondary-write drain job.
+# Hosts the write-from-source crash-recovery backstop (elasticsearch_indexer /
+# envelope_attrs_backfill, the former sole reason for this SCOPE) alongside
+# the driver-agnostic outbox drainers (storage_drain / event_drain, entry
+# points always registered by task_base — this SCOPE just gives them a
+# capable-for-ES container to run in when offloaded off the serving tier).
+# `outbox_drain` (=task_base) is kept as its own extras key name for anyone
+# still referencing it directly. Add new secondary write-driver modules here
+# as they are built so this job stays the ONE place that drains every driver
+# family, not just Elasticsearch.
+worker_task_async_writer = ["dynastore[task_base,module_catalog,elasticsearch,task_elasticsearch_indexer_deps,outbox_drain,module_storage_postgresql]"]
+# Back-compat alias: `worker_task_elasticsearch_indexer` was this SCOPE's name
+# before #2622 generalized it beyond Elasticsearch. Kept as a pure alias so
+# `pip install dynastore[worker_task_elasticsearch_indexer]` (still used by
+# the dynastore repo's deploy config) keeps resolving to the same deps.
+worker_task_elasticsearch_indexer = ["dynastore[worker_task_async_writer]"]
 # stac_harvest: I/O-bound streaming harvest of a remote STAC catalog into a
 # target dynastore catalog. task_base (sync psycopg2 engine) like ingestion and
 # every other driver-heavy worker — the task reads its engine via get_engine()

@@ -90,13 +90,31 @@ def _assert_scope_has_module_catalog(scope: str, why: str) -> None:
     )
 
 
-def test_elasticsearch_indexer_scope_includes_catalog() -> None:
+def test_async_writer_scope_includes_catalog() -> None:
     """B6 regression: SCOPE must include module_catalog so CatalogsProtocol
-    has an implementor in the Cloud Run Job container."""
+    has an implementor in the Cloud Run Job container.
+
+    `worker_task_elasticsearch_indexer` was renamed to `worker_task_async_writer`
+    (#2622) when the job was generalized beyond Elasticsearch; the old name is
+    kept as a pure alias (see `test_elasticsearch_indexer_alias_resolves_to_async_writer`)."""
     _assert_scope_has_module_catalog(
-        "worker_task_elasticsearch_indexer",
+        "worker_task_async_writer",
         "Without it, BulkCatalog/CollectionReindexTask crashes when calling "
         "get_protocol(CatalogsProtocol).",
+    )
+
+
+def test_elasticsearch_indexer_alias_resolves_to_async_writer() -> None:
+    """`worker_task_elasticsearch_indexer` is a pure back-compat alias (#2622)
+    for `worker_task_async_writer` — pins the contract so a future edit can't
+    silently diverge the two and break `pip install
+    dynastore[worker_task_elasticsearch_indexer]` (still used by the
+    dynastore repo's deploy config)."""
+    line = _scope_definition("worker_task_elasticsearch_indexer")
+    assert _extract_dynastore_extras(line) == {"worker_task_async_writer"}, (
+        "worker_task_elasticsearch_indexer must remain a pure "
+        "dynastore[worker_task_async_writer] alias. Current definition: "
+        f"{line!r}"
     )
 
 
@@ -280,14 +298,36 @@ def _meta_extra_definition(name: str) -> str:
     return _scope_definition(name)
 
 
+
+# SCOPEs whose suffix does NOT name a single `dynastore.tasks` entry-point
+# because the job deliberately hosts several task types (#2622's generic
+# async_writer job: the elasticsearch_indexer bulk-reindex backstop plus the
+# driver-agnostic storage_drain / event_drain outbox drainers, all in one
+# container). Declared explicitly here rather than silently skipped — the
+# `test_async_writer_scope_hosts_declared_entry_points` check below still
+# verifies every listed task type resolves to a real entry-point.
+_MULTI_TASK_WORKER_SCOPES: dict[str, frozenset[str]] = {
+    "worker_task_async_writer": frozenset(
+        {"elasticsearch_indexer", "envelope_attrs_backfill", "storage_drain", "event_drain"}
+    ),
+}
+
+
 def _assert_scope_family_maps_to_entry_points(prefix: str) -> None:
     """Assert every ``<prefix><name>`` extras key has a matching
-    ``dynastore.tasks.<name>`` entry-point declared in pyproject.toml."""
+    ``dynastore.tasks.<name>`` entry-point declared in pyproject.toml.
+
+    SCOPEs listed in ``_MULTI_TASK_WORKER_SCOPES`` are exempt from the 1:1
+    suffix match (they intentionally host several task types); see
+    ``test_async_writer_scope_hosts_declared_entry_points`` for their check.
+    """
     scope_names = _all_task_scope_names(prefix)
     entry_points = _all_dynastore_tasks_entry_points()
 
     missing: list[str] = []
     for scope in scope_names:
+        if scope in _MULTI_TASK_WORKER_SCOPES:
+            continue
         short = scope.removeprefix(prefix)
         if short not in entry_points:
             missing.append(short)
@@ -297,6 +337,20 @@ def _assert_scope_family_maps_to_entry_points(prefix: str) -> None:
         f"entry-point: {missing}. Either add the entry-point or remove the "
         f"orphan SCOPE. Available entry-points: {sorted(entry_points)}"
     )
+
+
+def test_async_writer_scope_hosts_declared_entry_points() -> None:
+    """Every task type `_MULTI_TASK_WORKER_SCOPES` declares for
+    `worker_task_async_writer` must resolve to a real `dynastore.tasks`
+    entry-point — the multi-task exemption above must not become a way to
+    silently orphan one of the hosted task types."""
+    entry_points = _all_dynastore_tasks_entry_points()
+    for scope, task_types in _MULTI_TASK_WORKER_SCOPES.items():
+        missing = sorted(t for t in task_types if t not in entry_points)
+        assert not missing, (
+            f"{scope} declares task types with no matching `dynastore.tasks` "
+            f"entry-point: {missing}. Available: {sorted(entry_points)}"
+        )
 
 
 def test_every_worker_task_scope_has_matching_entry_point() -> None:

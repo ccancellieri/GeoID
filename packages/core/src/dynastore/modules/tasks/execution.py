@@ -181,14 +181,34 @@ async def select_runner_for(task_key: str):
 
 _OFFLOAD_RUNNER_TYPES = frozenset({"gcp_cloud_run", "worker_queue"})
 
+# System tasks whose offload decision also consults the LIVE aggregate outbox
+# backlog (dynastore.modules.tasks.async_writer_backlog), not just the static
+# routing-config hints every other task relies on (#2622). These are the
+# generic secondary-write drainers: under light load they stay in-process
+# (the routing-config hint path below is empty for them by default); once the
+# aggregate backlog crosses TasksPluginConfig.async_writer_backlog_threshold,
+# offload_required() starts returning True so _restrict_to_offload_runners can
+# hand them to the async_writer Cloud Run Job when one is deployed.
+_BACKLOG_ADAPTIVE_TASK_KEYS = frozenset({"storage_drain", "event_drain"})
+
 
 async def offload_required(task_key: str) -> bool:
-    """True when routing tags ``task_key`` OFFLOAD/HEAVY (must not run in-process).
+    """True when ``task_key`` must not run in-process on this pod.
 
-    Fail-open: any resolver error or absent routing opinion (empty targets)
-    returns ``False`` so in-process execution remains available where it is the
-    intent — the ``onprem`` profile (every process routed to ``background``),
-    system tasks, and test fixtures with no live routing config.
+    Two independent signals, either of which is sufficient:
+
+    1. Routing tags ``task_key`` OFFLOAD/HEAVY (static, config-driven) — the
+       existing contract for heavy processes like ``ingestion``.
+    2. ``task_key`` is a backlog-adaptive drain task (``storage_drain`` /
+       ``event_drain``, #2622) AND the live aggregate outbox backlog exceeds
+       the configured threshold — see
+       :func:`dynastore.modules.tasks.async_writer_backlog.backlog_is_high`.
+
+    Fail-open: any resolver/probe error or absent opinion returns ``False`` so
+    in-process execution remains available where it is the intent — the
+    ``onprem`` profile (every process routed to ``background``), system
+    tasks, and test fixtures with no live routing config or no deployed
+    async_writer job.
     """
     from dynastore.modules.tasks.routing import resolver as routing_resolver
     from dynastore.modules.tasks.routing.exec_hints import ExecHint
@@ -196,9 +216,18 @@ async def offload_required(task_key: str) -> bool:
     try:
         targets = await routing_resolver.resolved_targets(task_key)
     except Exception:  # noqa: BLE001 — resolver is best-effort
-        return False
+        targets = []
     heavy = {ExecHint.OFFLOAD, ExecHint.HEAVY}
-    return any(heavy & set(t.hints) for t in targets)
+    if any(heavy & set(t.hints) for t in targets):
+        return True
+
+    if task_key in _BACKLOG_ADAPTIVE_TASK_KEYS:
+        try:
+            from dynastore.modules.tasks.async_writer_backlog import backlog_is_high
+            return await backlog_is_high()
+        except Exception:  # noqa: BLE001 — backlog probe is best-effort
+            return False
+    return False
 
 
 def _restrict_to_offload_runners(runners: list) -> list:

@@ -292,6 +292,60 @@ async def test_collision_own_env_listed_first(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# (d) TASK_TYPE as a comma-separated list — one job hosting several task
+# types (#2622's generalized async_writer job).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_task_type_comma_list_maps_every_type_to_the_same_job(monkeypatch):
+    """A single job advertising TASK_TYPE="a,b,c" maps every one of a/b/c to
+    that job's name — the mechanism that lets one Cloud Run Job host several
+    task types (the generalized async_writer job drains storage_drain +
+    event_drain alongside the elasticsearch_indexer bulk-reindex backstop)."""
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+    jobs = [
+        _make_job("dynastore-async-writer-job", {
+            "APP": "dynastore",
+            "TASK_TYPE": "elasticsearch_indexer,storage_drain,event_drain",
+        }),
+    ]
+    module = _make_module(jobs)
+
+    with patch("dynastore.modules.gcp.gcp_module.run_v2", _run_v2_stub()), \
+         patch("dynastore.modules.gcp.tools.jobs.set_job_extras"):
+        result = await module.get_job_config()
+
+    assert result == {
+        "elasticsearch_indexer": "dynastore-async-writer-job",
+        "storage_drain": "dynastore-async-writer-job",
+        "event_drain": "dynastore-async-writer-job",
+    }
+
+
+@pytest.mark.asyncio
+async def test_task_type_single_value_unaffected_by_list_support(monkeypatch):
+    """A plain single-value TASK_TYPE (the common case, no commas) still maps
+    to exactly one entry — the list-parsing change must not alter the
+    existing single-value contract."""
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+    jobs = [
+        _make_job("dynastore-ingestion-job", {
+            "APP": "dynastore", "TASK_TYPE": "ingestion",
+        }),
+    ]
+    module = _make_module(jobs)
+
+    with patch("dynastore.modules.gcp.gcp_module.run_v2", _run_v2_stub()), \
+         patch("dynastore.modules.gcp.tools.jobs.set_job_extras"):
+        result = await module.get_job_config()
+
+    assert result == {"ingestion": "dynastore-ingestion-job"}
+
+
+# ---------------------------------------------------------------------------
 # Non-dynastore jobs are never included (existing guard — regression check)
 # ---------------------------------------------------------------------------
 

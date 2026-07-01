@@ -1222,20 +1222,28 @@ class GCPModule(
                         )
                         continue
 
-                # Strategy 1 (explicit): TASK_TYPE env var — canonical task name
-                task_type = env_map.get("TASK_TYPE", "").strip() or None
+                # Strategy 1 (explicit): TASK_TYPE env var — comma-separated list
+                # of canonical task names this job advertises. A single value
+                # (the common case) works exactly as before; a list lets one
+                # job image host several task types — e.g. the generalized
+                # async_writer job (#2622), which drains storage_drain +
+                # event_drain alongside the elasticsearch_indexer bulk-reindex
+                # backstop, all from the same container.
+                task_types = [
+                    t.strip() for t in env_map.get("TASK_TYPE", "").split(",") if t.strip()
+                ]
 
                 # Strategy 2 (fallback): derive task type from SCOPE env var
-                if not task_type:
+                if not task_types:
                     for token in (
                         s.strip() for s in env_map.get("SCOPE", "").split(",") if s.strip()
                     ):
-                        task_type = _task_type_from_scope_token(token)
-                        if task_type:
+                        derived = _task_type_from_scope_token(token)
+                        if derived:
+                            task_types = [derived]
                             break
 
-                if task_type:
-                    job_map[task_type] = job_name
+                if task_types:
                     # Side-channel: capture per-job MAX_RETRIES env so
                     # GcpJobRunner can stamp it on the task row at create-time
                     # (caps long-running expensive jobs at deploy-time intent
@@ -1249,11 +1257,13 @@ class GCPModule(
                             logger.warning(
                                 f"Job '{job_name}' has non-integer MAX_RETRIES='{max_retries_raw}'; ignoring."
                             )
-                    if extras:
-                        from dynastore.modules.gcp.tools.jobs import set_job_extras
-                        set_job_extras(task_type, extras)
+                    for task_type in task_types:
+                        job_map[task_type] = job_name
+                        if extras:
+                            from dynastore.modules.gcp.tools.jobs import set_job_extras
+                            set_job_extras(task_type, extras)
                     logger.info(
-                        f"Discovered GCP job: task '{task_type}' -> job '{job_name}' "
+                        f"Discovered GCP job: task(s) {task_types} -> job '{job_name}' "
                         f"(extras={extras or '{}'})"
                     )
         except Exception as e:

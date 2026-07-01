@@ -100,6 +100,115 @@ async def test_offload_required_false_on_resolver_error(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# offload_required — backlog-adaptive drain tasks (#2622)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_offload_required_true_for_storage_drain_when_backlog_high(monkeypatch):
+    """storage_drain has no static OFFLOAD/HEAVY routing hint by default — the
+    live backlog signal alone must be able to trigger offload."""
+    import dynastore.modules.tasks.routing.resolver as rr
+    import dynastore.modules.tasks.async_writer_backlog as backlog
+
+    async def _targets(_k):
+        return []
+
+    async def _high(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(rr, "resolved_targets", _targets)
+    monkeypatch.setattr(backlog, "backlog_is_high", _high)
+    assert await execution.offload_required("storage_drain") is True
+
+
+@pytest.mark.asyncio
+async def test_offload_required_false_for_storage_drain_when_backlog_low(monkeypatch):
+    import dynastore.modules.tasks.routing.resolver as rr
+    import dynastore.modules.tasks.async_writer_backlog as backlog
+
+    async def _targets(_k):
+        return []
+
+    async def _low(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(rr, "resolved_targets", _targets)
+    monkeypatch.setattr(backlog, "backlog_is_high", _low)
+    assert await execution.offload_required("storage_drain") is False
+
+
+@pytest.mark.asyncio
+async def test_offload_required_true_for_event_drain_when_backlog_high(monkeypatch):
+    import dynastore.modules.tasks.routing.resolver as rr
+    import dynastore.modules.tasks.async_writer_backlog as backlog
+
+    async def _targets(_k):
+        return []
+
+    async def _high(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(rr, "resolved_targets", _targets)
+    monkeypatch.setattr(backlog, "backlog_is_high", _high)
+    assert await execution.offload_required("event_drain") is True
+
+
+@pytest.mark.asyncio
+async def test_offload_required_ignores_backlog_signal_for_unrelated_task(monkeypatch):
+    """Only the backlog-adaptive task keys consult the live signal — a high
+    backlog must not spuriously offload an unrelated task."""
+    import dynastore.modules.tasks.routing.resolver as rr
+    import dynastore.modules.tasks.async_writer_backlog as backlog
+
+    async def _targets(_k):
+        return []
+
+    async def _high(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(rr, "resolved_targets", _targets)
+    monkeypatch.setattr(backlog, "backlog_is_high", _high)
+    assert await execution.offload_required("gdal") is False
+
+
+@pytest.mark.asyncio
+async def test_offload_required_false_for_storage_drain_on_backlog_probe_error(monkeypatch):
+    """A backlog-probe failure must never force offload — fail-open False."""
+    import dynastore.modules.tasks.routing.resolver as rr
+    import dynastore.modules.tasks.async_writer_backlog as backlog
+
+    async def _targets(_k):
+        return []
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("pool exhausted")
+
+    monkeypatch.setattr(rr, "resolved_targets", _targets)
+    monkeypatch.setattr(backlog, "backlog_is_high", _boom)
+    assert await execution.offload_required("storage_drain") is False
+
+
+@pytest.mark.asyncio
+async def test_offload_required_static_hint_short_circuits_backlog_probe(monkeypatch):
+    """A static OFFLOAD/HEAVY routing hint is sufficient on its own — the
+    backlog probe must not even be consulted in that case."""
+    from dynastore.modules.tasks.routing.exec_hints import ExecHint
+    import dynastore.modules.tasks.routing.resolver as rr
+    import dynastore.modules.tasks.async_writer_backlog as backlog
+
+    async def _targets(_k):
+        return [_target("gcp_cloud_run", {ExecHint.OFFLOAD})]
+
+    async def _boom(*args, **kwargs):
+        raise AssertionError("backlog probe must not be called")
+
+    monkeypatch.setattr(rr, "resolved_targets", _targets)
+    monkeypatch.setattr(backlog, "backlog_is_high", _boom)
+    assert await execution.offload_required("storage_drain") is True
+
+
+# ---------------------------------------------------------------------------
 # _restrict_to_offload_runners
 # ---------------------------------------------------------------------------
 
