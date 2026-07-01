@@ -53,7 +53,10 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Union
+
+if TYPE_CHECKING:
+    from dynastore.models.scaling import ScalingSignal
 
 from dynastore.modules.db_config.locking_tools import (
     held_advisory_locks,
@@ -208,10 +211,39 @@ class DbContentionMonitor(PeriodicService):
         self._config = config
         self.cadence_seconds = float(config.interval_seconds)
         self.lock_key: Optional[Union[int, str]] = _CONTENTION_MONITOR_LOCK_KEY
+        # Last conn_pressure computed by _emit(), for ScalingSignalProtocol.
+        # None until this pod has actually run a tick as the elected leader —
+        # a non-leader pod's instance has nothing fresh to contribute.
+        self._last_conn_pressure: Optional[float] = None
+        self._last_conn_pressure_ts: Optional[float] = None
 
     async def tick(self, ctx: ServiceContext) -> None:
         """Take one snapshot and log it."""
         await self.run_once()
+
+    def scaling_signals(self) -> List["ScalingSignal"]:
+        """``ScalingSignalProtocol``: fleet-wide DB connection pressure.
+
+        ``scope="global"`` — the value is the same for every pod, computed
+        from ``pg_stat_activity`` which sees all connections, not just this
+        pod's. Reuses the value already computed by ``_emit()`` on this
+        pod's most recent leader tick; never re-queries. Returns an empty
+        list when this pod hasn't run a leader tick yet (a non-leader pod
+        has nothing fresh to contribute).
+        """
+        if self._last_conn_pressure is None or self._last_conn_pressure_ts is None:
+            return []
+        from dynastore.models.scaling import ScalingSignal
+
+        return [
+            ScalingSignal(
+                source="db_contention_monitor",
+                metric="conn_pressure",
+                value=max(0.0, min(1.0, self._last_conn_pressure)),
+                scope="global",
+                ts=self._last_conn_pressure_ts,
+            )
+        ]
 
     async def run_once(self) -> Optional[dict]:
         """Take one snapshot and log it. Returns the snapshot dict (or None).
@@ -291,6 +323,8 @@ class DbContentionMonitor(PeriodicService):
 
         cfg = self._config
         conn_pressure = (total / max_conns) if max_conns else 0.0
+        self._last_conn_pressure = conn_pressure
+        self._last_conn_pressure_ts = time.time()
         contended = bool(
             blocked
             or slow

@@ -92,6 +92,8 @@ from dynastore.models.protocols.asset_contrib import (
     ResourceRef,
 )
 from dynastore.models.protocols.conformance import ConformanceContributor
+from dynastore.models.protocols.scaling_signal import ScalingSignalProtocol
+from dynastore.models.protocols.platform_scaling import PlatformScalingProtocol
 from dynastore.models.protocols.catalog_source import (
     CatalogListProvider,
     CatalogOption,
@@ -209,6 +211,8 @@ __all__ = [
     "CollectionPipelineProtocol",
     "CatalogPipelineProtocol",
     "ConformanceContributor",
+    "ScalingSignalProtocol",
+    "PlatformScalingProtocol",
     "CatalogListProvider",
     "CatalogOption",
     "WebPageContributor",

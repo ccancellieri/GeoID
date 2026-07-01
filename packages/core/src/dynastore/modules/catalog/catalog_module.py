@@ -633,9 +633,19 @@ class CatalogModule(ModuleProtocol):
                 DbContentionMonitor,
                 load_db_contention_monitor_config,
             )
+            from dynastore.modules.scaling.publisher import ScalingSignalPublisher
+            # Import-time side effect: registers the lowest-priority fallback
+            # PlatformScalingProtocol so the control loop has somewhere safe
+            # to land on deployments with no platform-specific actuator.
+            import dynastore.modules.scaling.noop_actuator  # noqa: F401
 
             _bg_shutdown = asyncio.Event()
             bg_supervisor = BackgroundSupervisor()
+            # ScalingSignalProtocol providers registered alongside the
+            # BackgroundSupervisor services (rather than via the
+            # ``registered_services`` tuple, which enters ``.lifespan()`` on
+            # each entry — these have none) so they unregister cleanly below.
+            _scaling_plugins: list = []
 
             try:
                 reaper_cfg = await load_reaper_config()
@@ -689,7 +699,13 @@ class CatalogModule(ModuleProtocol):
             try:
                 contention_cfg = load_db_contention_monitor_config()
                 if contention_cfg.enabled:
-                    bg_supervisor.register(DbContentionMonitor(contention_cfg))
+                    monitor = DbContentionMonitor(contention_cfg)
+                    bg_supervisor.register(monitor)
+                    # Same instance registered for discovery so the scaling
+                    # publisher can read the global conn_pressure signal this
+                    # monitor's leader ticks populate on ``_last_conn_pressure``.
+                    register_plugin(monitor)
+                    _scaling_plugins.append(monitor)
                     logger.info(
                         "CatalogModule: DB contention monitor registered "
                         "(interval=%ds, slow_query=%ds, lock_wait=%ds).",
@@ -701,6 +717,33 @@ class CatalogModule(ModuleProtocol):
                 logger.warning(
                     "CatalogModule: DB contention monitor failed to configure: %s — "
                     "lock/slow-query contention will not be logged automatically.",
+                    exc,
+                )
+
+            try:
+                from dynastore.modules.storage.drivers.duckdb import (
+                    DuckDbPoolSignalProvider,
+                )
+
+                duckdb_signal_provider = DuckDbPoolSignalProvider()
+                register_plugin(duckdb_signal_provider)
+                _scaling_plugins.append(duckdb_signal_provider)
+            except Exception as exc:  # noqa: BLE001 — never block startup
+                logger.warning(
+                    "CatalogModule: DuckDB pool signal provider failed to "
+                    "register: %s — DuckDB pool saturation will not feed the "
+                    "autoscaling control loop.",
+                    exc,
+                )
+
+            try:
+                bg_supervisor.register(ScalingSignalPublisher(self.config_service))
+                logger.info("CatalogModule: scaling signal publisher registered.")
+            except Exception as exc:  # noqa: BLE001 — never block startup
+                logger.warning(
+                    "CatalogModule: scaling signal publisher failed to "
+                    "configure: %s — autoscaling signals will not be "
+                    "published.",
                     exc,
                 )
 
@@ -723,6 +766,8 @@ class CatalogModule(ModuleProtocol):
                 # Remove the services from the discovery registry so a future
                 # lifespan does not leave stale instances behind them.
                 for svc in registered_services:
+                    unregister_plugin(svc)
+                for svc in _scaling_plugins:
                     unregister_plugin(svc)
 
     # === Private service accessors (assert-narrowed for pyright) ===

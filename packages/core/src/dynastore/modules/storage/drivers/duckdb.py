@@ -63,12 +63,14 @@ import logging
 import queue
 import re
 import threading
+import time
 import uuid
 from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, FrozenSet, List, Optional, Set, Tuple, Union
 
 if TYPE_CHECKING:
     from dynastore.models.protocols.field_definition import FieldDefinition
+    from dynastore.models.scaling import ScalingSignal
     from dynastore.modules.storage.driver_config import ItemsSchema, ItemsWritePolicy
     from dynastore.modules.storage.storage_location import StorageLocation
 
@@ -286,6 +288,52 @@ def _close_pool():
         _loaded_extensions.clear()
         if closed:
             logger.info("DuckDB: connection pool closed (%d connections)", closed)
+
+
+def get_pool_saturation() -> Optional[float]:
+    """Read-only connection-pool saturation for THIS instance, in [0, 1].
+
+    ``(pool_size - available) / pool_size``. Returns ``None`` when the pool
+    has not been initialized yet (no DuckDB-backed collection has run a
+    query on this process) — never touches pool state.
+    """
+    if not _pool_initialized or _pool_size <= 0:
+        return None
+    available = _pool.qsize()
+    return max(0.0, min(1.0, (_pool_size - available) / _pool_size))
+
+
+class DuckDbPoolSignalProvider:
+    """``ScalingSignalProtocol``: this pod's DuckDB connection-pool saturation.
+
+    A dedicated singleton rather than a method on ``ItemsDuckdbDriver``: the
+    driver is instantiated per-collection (multi-instance), but the
+    underlying connection pool is a single process-wide resource (see the
+    module-level ``_pool`` above) — a per-driver-instance signal would
+    double-count the same pool once per collection using DuckDB. Register
+    exactly one instance so ``get_protocols(ScalingSignalProtocol)`` reports
+    the pool's saturation once per pod.
+    """
+
+    def scaling_signals(self) -> List["ScalingSignal"]:
+        """``scope="instance"`` — only meaningful for the reporting pod. Empty
+        when the pool hasn't been initialized (no DuckDB query has run here
+        yet), so an idle/unused pod contributes nothing.
+        """
+        saturation = get_pool_saturation()
+        if saturation is None:
+            return []
+        from dynastore.models.scaling import ScalingSignal
+
+        return [
+            ScalingSignal(
+                source="duckdb_pool",
+                metric="pool_saturation",
+                value=saturation,
+                scope="instance",
+                ts=time.time(),
+            )
+        ]
 
 
 class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):

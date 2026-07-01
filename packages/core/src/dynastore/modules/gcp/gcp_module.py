@@ -50,6 +50,7 @@ from dynastore.models.protocols import (
     CloudIdentityProtocol,
     EventingProtocol,
     AssetUploadProtocol,
+    PlatformScalingProtocol,
 )
 from dynastore.modules.gcp.tools.service_account import get_credentials
 from dynastore.modules.gcp.gcp_config import (
@@ -135,6 +136,7 @@ class GCPModule(
     EventingProtocol,
     AssetUploadProtocol,
     ProcessRegistryProtocol,
+    PlatformScalingProtocol,
 ):
     _credentials: Optional[Any] = None
     _identity: Optional[Dict[str, Any]] = None
@@ -794,6 +796,25 @@ class GCPModule(
                         "(%s). MaintenanceSupervisor task_reaper remains the backstop.", e,
                         exc_info=True,
                     )
+            # --- Autoscaling reconciler (scaling P0 control loop) ---
+            # Always registered (cheap no-op tick): ScalingPolicyConfig.enabled
+            # defaults to False, so the tick returns immediately until an
+            # operator opts in via the configs API. Runs regardless of the
+            # job-runner gate above — it actuates the Cloud Run *service*
+            # min-instance-count, unrelated to Cloud Run Job dispatch.
+            try:
+                from dynastore.modules.gcp.scaling_reconciler import GcpScalingReconciler
+
+                _gcp_supervisor.register(
+                    GcpScalingReconciler(platform=self, configs=self._config_service)
+                )
+                logger.info("GCP Module: scaling reconciler registered.")
+            except Exception as e:
+                logger.error(
+                    "GCP Module: failed to register scaling reconciler (%s).", e,
+                    exc_info=True,
+                )
+
             _gcp_bg_ctx = _GcpServiceContext(
                 engine=reconciler_engine,
                 shutdown=_gcp_bg_shutdown,
@@ -1232,6 +1253,86 @@ class GCPModule(
                 + ("credentials missing" if not self._credentials else "no running event loop")
             )
         return self._run_client
+
+    # --- PlatformScalingProtocol Implementation ---
+
+    async def set_min_instances(self, n: int) -> None:
+        """Set Cloud Run's ``scaling.min_instance_count`` for this service.
+
+        Builds a MINIMAL ``Service`` patch touching only
+        ``scaling.min_instance_count`` via the update mask — never
+        ``template.scaling.*``, which rolls a new revision (cold start).
+        The patch object is constructed fresh, never round-tripped from a
+        fetched ``Service`` (a known client bug returns HTTP 409
+        "Revision ... already exists" when a fetched object is fed back
+        into an update: googleapis/google-cloud-python#14259).
+
+        No-ops (logs at DEBUG) when credentials are missing or this isn't
+        running as a named Cloud Run service. Never raises — transient API
+        errors are logged and swallowed so a reconciler tick is never lost
+        to a single failed actuation.
+        """
+        if self._credentials is None:
+            logger.debug(
+                "GCPModule.set_min_instances(%d): no GCP credentials — no-op.", n
+            )
+            return
+        project_id = self.get_project_id()
+        region = self.get_region()
+        service_name = self.get_service_name()
+        if not (project_id and region and service_name):
+            logger.debug(
+                "GCPModule.set_min_instances(%d): not a named Cloud Run service "
+                "(project_id=%s region=%s service_name=%s) — no-op.",
+                n, project_id, region, service_name,
+            )
+            return
+        try:
+            from google.protobuf import field_mask_pb2
+
+            client = self.get_run_client()
+            service_path = client.service_path(project_id, region, service_name)
+            patch = run_v2.Service(
+                name=service_path,
+                scaling=run_v2.ServiceScaling(min_instance_count=n),
+            )
+            request = run_v2.UpdateServiceRequest(
+                service=patch,
+                update_mask=field_mask_pb2.FieldMask(paths=["scaling.min_instance_count"]),
+            )
+            await client.update_service(request=request)
+            logger.info(
+                "GCPModule.set_min_instances: min_instance_count=%d for %s",
+                n, service_path,
+            )
+        except Exception as exc:  # noqa: BLE001 — actuation must never crash the reconciler
+            logger.warning(
+                "GCPModule.set_min_instances(%d): update_service failed: %s",
+                n, exc, exc_info=True,
+            )
+
+    async def get_min_instances(self) -> Optional[int]:
+        """Read Cloud Run's current ``scaling.min_instance_count``.
+
+        Returns ``None`` when it cannot be determined (no credentials, not
+        a named Cloud Run service, transient API error).
+        """
+        if self._credentials is None:
+            return None
+        project_id = self.get_project_id()
+        region = self.get_region()
+        service_name = self.get_service_name()
+        if not (project_id and region and service_name):
+            return None
+        try:
+            client = self.get_run_client()
+            service_path = client.service_path(project_id, region, service_name)
+            service = await client.get_service(name=service_path)
+            scaling = getattr(service, "scaling", None)
+            return int(scaling.min_instance_count) if scaling is not None else None
+        except Exception as exc:
+            logger.debug("GCPModule.get_min_instances: get_service failed: %s", exc)
+            return None
 
     def _refresh_credentials(self) -> bool:
         """
