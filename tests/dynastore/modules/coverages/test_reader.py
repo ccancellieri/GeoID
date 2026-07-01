@@ -28,6 +28,27 @@ def test_module_importable_without_rasterio():
     assert hasattr(reader, "read_window_iter")
 
 
+def test_reader_for_dispatches_cog_and_zarr_to_gdal_opener():
+    """Per-asset media types resolve to a registered reader (COG and Zarr
+    alike currently open through GDAL, but the lookup is explicit)."""
+    from dynastore.modules.coverages.reader import _open_via_gdal, reader_for
+
+    assert reader_for("image/tiff; application=geotiff; profile=cloud-optimized") is _open_via_gdal
+    assert reader_for("application/vnd+zarr") is _open_via_gdal
+    assert reader_for("application/x-netcdf") is _open_via_gdal
+
+
+def test_reader_for_defaults_empty_media_type_to_gdal():
+    from dynastore.modules.coverages.reader import _open_via_gdal, reader_for
+    assert reader_for("") is _open_via_gdal
+
+
+def test_reader_for_rejects_unknown_media_type():
+    from dynastore.modules.coverages.reader import UnsupportedReaderMediaType, reader_for
+    with pytest.raises(UnsupportedReaderMediaType):
+        reader_for("application/octet-stream")
+
+
 @pytest.mark.xfail(reason="#514 — rasterio: TIFF block dims must be multiples of 16; fixture rebuild needed.", strict=False)
 @skipif_no_rasterio
 def test_read_window_iter_emits_block_tiles(tmp_path):

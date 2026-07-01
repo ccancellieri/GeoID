@@ -203,32 +203,26 @@ def _stream_coverage_geotiff(
     href: str,
     subset,
     *,
+    media_type: str = "",
     scale_factor: Optional[float] = None,
     scale_size: Optional[str] = None,
 ):
     """Stream a GeoTIFF response by reading the source raster at ``href``.
 
-    ``scale_factor`` (OGC 19-087 §7.11) and ``scale_size`` (§7.12) control
-    output resolution. Imports rasterio lazily so the helper remains
-    importable without it.
+    ``media_type`` is the source asset's declared STAC media type — it
+    selects the reader via the format->reader registry
+    (:func:`dynastore.modules.coverages.reader.open_coverage`), not the
+    output encoding. ``scale_factor`` (OGC 19-087 §7.11) and ``scale_size``
+    (§7.12) control output resolution. Imports rasterio lazily so the
+    helper remains importable without it.
     """
-    from dynastore.modules.coverages.reader import read_scaled
-    from dynastore.modules.coverages.window import RasterGeoRef, resolve_window
+    from dynastore.modules.coverages.reader import open_coverage, read_scaled
+    from dynastore.modules.coverages.window import resolve_window
     from dynastore.modules.coverages.writers.geotiff import write_geotiff
-    from dynastore.modules.gdal.service import open_raster_vsi
     from rasterio.transform import from_bounds
 
     req = parse_subset(subset)
-    ds = open_raster_vsi(href)
-    try:
-        t = ds.transform
-        ref = RasterGeoRef(
-            width=ds.width, height=ds.height,
-            origin_x=t.c, origin_y=t.f,
-            pixel_x=t.a, pixel_y=t.e,
-            crs=str(ds.crs),
-            axis_order=("Lon", "Lat"),
-        )
+    with open_coverage(href, media_type) as (ds, ref):
         box = resolve_window(req, ref)
         out_w, out_h = _resolve_scale(
             box_width=box.width, box_height=box.height,
@@ -251,28 +245,16 @@ def _stream_coverage_geotiff(
             dtype=str(ds.dtypes[0]), band_count=1,
             tiles=tiles,
         )
-    finally:
-        ds.close()
 
 
-def _stream_coverage_netcdf(href: str, subset, *, band_names: list):
+def _stream_coverage_netcdf(href: str, subset, *, band_names: list, media_type: str = ""):
     """Stream a NetCDF-4 response by reading the source raster at ``href``."""
-    from dynastore.modules.coverages.reader import read_window_iter
-    from dynastore.modules.coverages.window import RasterGeoRef, resolve_window
+    from dynastore.modules.coverages.reader import open_coverage, read_window_iter
+    from dynastore.modules.coverages.window import resolve_window
     from dynastore.modules.coverages.writers.netcdf import write_netcdf
-    from dynastore.modules.gdal.service import open_raster_vsi
 
     req = parse_subset(subset)
-    ds = open_raster_vsi(href)
-    try:
-        t = ds.transform
-        ref = RasterGeoRef(
-            width=ds.width, height=ds.height,
-            origin_x=t.c, origin_y=t.f,
-            pixel_x=t.a, pixel_y=t.e,
-            crs=str(ds.crs),
-            axis_order=("Lon", "Lat"),
-        )
+    with open_coverage(href, media_type) as (ds, ref):
         box = resolve_window(req, ref)
         west = ref.origin_x + ref.pixel_x * box.col_off
         east = ref.origin_x + ref.pixel_x * (box.col_off + box.width)
@@ -285,28 +267,18 @@ def _stream_coverage_netcdf(href: str, subset, *, band_names: list):
             bbox=bbox, crs=str(ds.crs),
             band_names=band_names, tiles=tiles,
         )
-    finally:
-        ds.close()
 
 
-def _stream_coverage_zarr(href: str, subset, *, band_names: list, chunk_size: int = 256):
+def _stream_coverage_zarr(
+    href: str, subset, *, band_names: list, media_type: str = "", chunk_size: int = 256
+):
     """Stream a ZIP-wrapped Zarr response by reading the source raster at ``href``."""
-    from dynastore.modules.coverages.reader import read_window_iter
-    from dynastore.modules.coverages.window import RasterGeoRef, resolve_window
+    from dynastore.modules.coverages.reader import open_coverage, read_window_iter
+    from dynastore.modules.coverages.window import resolve_window
     from dynastore.modules.coverages.writers.zarr import write_zarr
-    from dynastore.modules.gdal.service import open_raster_vsi
 
     req = parse_subset(subset)
-    ds = open_raster_vsi(href)
-    try:
-        t = ds.transform
-        ref = RasterGeoRef(
-            width=ds.width, height=ds.height,
-            origin_x=t.c, origin_y=t.f,
-            pixel_x=t.a, pixel_y=t.e,
-            crs=str(ds.crs),
-            axis_order=("Lon", "Lat"),
-        )
+    with open_coverage(href, media_type) as (ds, ref):
         box = resolve_window(req, ref)
         west = ref.origin_x + ref.pixel_x * box.col_off
         east = ref.origin_x + ref.pixel_x * (box.col_off + box.width)
@@ -320,11 +292,9 @@ def _stream_coverage_zarr(href: str, subset, *, band_names: list, chunk_size: in
             band_names=band_names, tiles=tiles,
             chunk_size=chunk_size,
         )
-    finally:
-        ds.close()
 
 
-def _read_coverage_values(href: str, subset, rangetype: dict):
+def _read_coverage_values(href: str, subset, rangetype: dict, *, media_type: str = ""):
     """Yield one 2-D array per band for a CoverageJSON response.
 
     Reads the raster at ``href`` restricted to ``subset``, one band per
@@ -332,21 +302,11 @@ def _read_coverage_values(href: str, subset, rangetype: dict):
     ``[[row0_col0, row0_col1, ...], [row1_col0, ...], ...]`` as expected by
     :func:`write_coveragejson`.
     """
-    from dynastore.modules.coverages.reader import read_scaled
-    from dynastore.modules.coverages.window import RasterGeoRef, resolve_window
-    from dynastore.modules.gdal.service import open_raster_vsi
+    from dynastore.modules.coverages.reader import open_coverage, read_scaled
+    from dynastore.modules.coverages.window import resolve_window
 
     req = parse_subset(subset)
-    ds = open_raster_vsi(href)
-    try:
-        t = ds.transform
-        ref = RasterGeoRef(
-            width=ds.width, height=ds.height,
-            origin_x=t.c, origin_y=t.f,
-            pixel_x=t.a, pixel_y=t.e,
-            crs=str(ds.crs),
-            axis_order=("Lon", "Lat"),
-        )
+    with open_coverage(href, media_type) as (ds, ref):
         box = resolve_window(req, ref)
         n_bands = ds.count
         field_count = len(rangetype.get("field", []))
@@ -354,8 +314,6 @@ def _read_coverage_values(href: str, subset, rangetype: dict):
         for band_idx in bands_to_read:
             arr = read_scaled(ds, box, band=band_idx)
             yield arr.tolist()
-    finally:
-        ds.close()
 
 
 def _resolve_format(f) -> str:
@@ -365,6 +323,35 @@ def _resolve_format(f) -> str:
     if v not in MEDIA_TYPE_FOR:
         raise HTTPException(status_code=415, detail=f"Unsupported coverage format: {f!r}")
     return v
+
+
+def _resolve_coverage_asset(item: dict) -> Tuple[str, str]:
+    """Return ``(href, media_type)`` for the item's coverage source asset.
+
+    Reuses :func:`ogc_asset_href` for the href — same ``data``/``coverage``
+    key preference and 404 behaviour — then looks up the declared STAC media
+    type (``type``) of that same asset so the caller can pick a reader from
+    the format->reader registry (:func:`dynastore.modules.coverages.reader.reader_for`).
+    """
+    href = ogc_asset_href(item, error_detail="No asset href on coverage item.")
+    for asset in (item.get("assets") or {}).values():
+        if asset.get("href") == href:
+            return href, asset.get("type") or ""
+    return href, ""
+
+
+def _require_reader(media_type: str) -> None:
+    """Validate a reader is registered for ``media_type``, else raise 415.
+
+    Runs eagerly — before the streaming generator is built — so an
+    unsupported source asset format fails fast with a clean response
+    instead of surfacing mid-stream once headers are already sent.
+    """
+    from dynastore.modules.coverages.reader import UnsupportedReaderMediaType, reader_for
+    try:
+        reader_for(media_type)
+    except UnsupportedReaderMediaType as exc:
+        raise HTTPException(status_code=415, detail=str(exc)) from exc
 
 
 def _extract_domainset(item: Optional[dict]) -> dict:
@@ -698,11 +685,13 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
         item = await self._get_first_item(catalog_id, collection_id)
         if item is None:
             raise HTTPException(status_code=404, detail="No coverage item found.")
-        href = ogc_asset_href(item, error_detail="No asset href on coverage item.")
+        href, media_type = _resolve_coverage_asset(item)
+        _require_reader(media_type)
         if fmt == "geotiff":
             gen = _stream_coverage_geotiff(
                 href,
                 subset=effective_subset,
+                media_type=media_type,
                 scale_factor=scale_factor,
                 scale_size=scale_size,
             )
@@ -720,7 +709,7 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
             )
             ds_meta = build_domainset(item) or {}
             rt = build_rangetype(item) or {"type": "DataRecord", "field": []}
-            values_iter = _read_coverage_values(href, effective_subset, rt)
+            values_iter = _read_coverage_values(href, effective_subset, rt, media_type=media_type)
             gen = write_coveragejson(ds_meta, rt, values_iter)
         elif fmt == "netcdf":
             if scale_factor is not None or scale_size is not None:
@@ -734,7 +723,7 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
             rt = build_rangetype(item) or {"type": "DataRecord", "field": []}
             band_names = [fld["name"] for fld in rt.get("field", [])] or ["band"]
             gen = _stream_coverage_netcdf(
-                href, subset=effective_subset, band_names=band_names
+                href, subset=effective_subset, band_names=band_names, media_type=media_type
             )
         elif fmt == "zarr":
             if scale_factor is not None or scale_size is not None:
@@ -748,7 +737,7 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
             rt = build_rangetype(item) or {"type": "DataRecord", "field": []}
             band_names = [fld["name"] for fld in rt.get("field", [])] or ["band"]
             gen = _stream_coverage_zarr(
-                href, subset=effective_subset, band_names=band_names
+                href, subset=effective_subset, band_names=band_names, media_type=media_type
             )
         else:  # pragma: no cover - guarded by _resolve_format above
             raise HTTPException(status_code=415, detail=f"Unsupported format: {fmt!r}")

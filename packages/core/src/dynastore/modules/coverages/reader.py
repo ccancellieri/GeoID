@@ -20,13 +20,86 @@
 
 Lazy-imports rasterio. Callers must supply an open rasterio dataset
 (``open_raster_vsi`` from ``modules/gdal/service``).
+
+``reader_for``/``open_coverage`` below are the format->reader registry: they
+pick the opener for a *source* asset from its declared STAC media type
+(``item["assets"][key]["type"]``), so a collection can mix e.g. a COG asset
+in one item with a Zarr asset in another. This is distinct from the output
+*writer* registry (``writers/__init__.py:writer_for``), which dispatches on
+the client-requested response format instead.
 """
 
 from __future__ import annotations
 
-from typing import Any, Iterator, Optional, Tuple
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator, Optional, Tuple
 
-from dynastore.modules.coverages.window import WindowBox
+from dynastore.modules.coverages.window import RasterGeoRef, WindowBox
+
+
+class UnsupportedReaderMediaType(ValueError):
+    """Raised when no reader is registered for a source asset's media type."""
+
+
+def _open_via_gdal(href: str):
+    from dynastore.modules.gdal.service import open_raster_vsi
+    return open_raster_vsi(href)
+
+
+# STAC media types that open through GDAL's VSI layer (rasterio). GDAL 3.13
+# (pinned in module_gdal) natively drivers all three of these — COG/GeoTIFF,
+# NetCDF, and Zarr — so one reader currently serves every registered format.
+# "" covers items that don't declare a precise ``type`` (back-compat default).
+# Adding a dedicated reader for a new format (e.g. a native xarray reader)
+# only means adding an entry here; no call site changes.
+_READER_FOR_MEDIA_TYPE: dict = {
+    "": _open_via_gdal,
+    "image/tiff; application=geotiff": _open_via_gdal,
+    "image/tiff; application=geotiff; profile=cloud-optimized": _open_via_gdal,
+    "image/tiff": _open_via_gdal,
+    "image/geotiff": _open_via_gdal,
+    "application/x-netcdf": _open_via_gdal,
+    "application/netcdf": _open_via_gdal,
+    "application/vnd+zarr": _open_via_gdal,
+}
+
+
+def reader_for(media_type: str) -> Callable[[str], Any]:
+    """Return the opener registered for *media_type*.
+
+    Raises :class:`UnsupportedReaderMediaType` for a declared media type
+    with no registered reader, rather than silently trying to open it.
+    """
+    try:
+        return _READER_FOR_MEDIA_TYPE[media_type]
+    except KeyError:
+        raise UnsupportedReaderMediaType(
+            f"No reader registered for asset media type {media_type!r}."
+        ) from None
+
+
+@contextmanager
+def open_coverage(href: str, media_type: str = ""):
+    """Open *href* via the reader registered for *media_type*.
+
+    Yields ``(ds, ref)`` — the opened dataset and its :class:`RasterGeoRef`
+    — and closes the dataset on exit. Consolidates the open/georeference
+    steps that used to be duplicated per output format in
+    ``coverages_service.py``.
+    """
+    ds = reader_for(media_type)(href)
+    try:
+        t = ds.transform
+        ref = RasterGeoRef(
+            width=ds.width, height=ds.height,
+            origin_x=t.c, origin_y=t.f,
+            pixel_x=t.a, pixel_y=t.e,
+            crs=str(ds.crs),
+            axis_order=("Lon", "Lat"),
+        )
+        yield ds, ref
+    finally:
+        ds.close()
 
 
 def read_window_iter(ds, box: WindowBox, band: int = 1, block: int = 512) -> Iterator:
