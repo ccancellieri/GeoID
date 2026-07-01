@@ -409,6 +409,26 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         contributor = TilesStacContributor()
         register_plugin(contributor)
         logger.info("Tiles Service startup.")
+
+        # Register the tiles cold-boot contributor so run_cold_boot (called
+        # from main.py) self-heals 'tiles_enable' at priority=35 whenever an
+        # IAM policy writer is present in this process AND the deployment
+        # already opted into tiles_enable (e.g. via the platform_demo
+        # composite). Mirrors extensions/auth's _AuthColdBootContributor: a
+        # service with no IAM writer (e.g. a maps-only tier) skips cleanly
+        # instead of crashing on ctx.policy.update_policy — see
+        # modules/presets/enable_cold_boot.py for the shared mechanism.
+        from dynastore.modules.presets.cold_boot import register_cold_boot_contributor
+        from dynastore.modules.presets.enable_cold_boot import make_enable_cold_boot_contributor
+        try:
+            register_cold_boot_contributor(
+                make_enable_cold_boot_contributor(
+                    name="tiles", priority=35, preset_name="tiles_enable",
+                )
+            )
+        except ValueError:
+            logger.debug("TilesColdBootContributor already registered; skipping duplicate.")
+
         try:
             yield
         finally:

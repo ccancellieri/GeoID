@@ -242,6 +242,28 @@ async def bootstrap_preset_if_absent(
         return False
 
 
+async def preset_previously_applied(
+    engine: Any,
+    *,
+    preset_name: str,
+    scope_key: str = "platform",
+) -> bool:
+    """Return ``True`` if an ``iam.applied_presets`` row exists for *preset_name*.
+
+    Row presence — regardless of state (``applied``, ``failed``, ...) — is the
+    signal that an operator or a prior boot sequence already intended this
+    preset to be active for this deployment. Capability self-heal contributors
+    (see ``modules/presets/enable_cold_boot.py``) use this to avoid
+    force-opening an opt-in, anonymous-read capability (e.g. ``tiles_enable``)
+    on a deployment that never requested it — unlike ``auth_enable``, which is
+    universally desired and always self-heals.
+    """
+    row = await _SELECT_SENTINEL.execute(
+        engine, preset_name=preset_name, scope_key=scope_key
+    )
+    return row is not None
+
+
 async def bootstrap_presets(
     engine: Any,
     payloads: Any,
