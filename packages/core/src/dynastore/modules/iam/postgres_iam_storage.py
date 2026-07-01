@@ -25,7 +25,10 @@ import json
 import logging
 import time
 
-from dynastore.modules.db_config.exceptions import TableNotFoundError
+from dynastore.modules.db_config.exceptions import (
+    SchemaNotFoundError,
+    TableNotFoundError,
+)
 from dynastore.modules.db_config.query_executor import (
     DDLBatch,
     DDLQuery,
@@ -423,9 +426,22 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
                 return list(result)
 
         async with managed_transaction(conn or self.engine) as db:
-            children = await GET_FULL_ROLE_HIERARCHY.execute(
-                db, schema=schema, role_names=role_names
-            )
+            try:
+                children = await GET_FULL_ROLE_HIERARCHY.execute(
+                    db, schema=schema, role_names=role_names
+                )
+            except (TableNotFoundError, SchemaNotFoundError):
+                # Tombstoned catalog whose schema was dropped, or a catalog
+                # still provisioning — treat as an empty role hierarchy
+                # (no custom roles) rather than raising and forcing token
+                # validation into an ERROR-logged 500. Mirrors the
+                # TableNotFoundError tolerance already used elsewhere in
+                # this class (list_catalog_roles, get_identity_roles).
+                logger.debug(
+                    "role_hierarchy table/schema absent for schema %r; "
+                    "treating as empty hierarchy", schema,
+                )
+                children = []
             merged = list(set(role_names + children))
             self._role_hierarchy_cache[cache_key] = (merged, time.monotonic())
             return merged
