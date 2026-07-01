@@ -36,5 +36,5 @@ OGCServiceMixin.register_ogc_preset(
 # Harvest preset — catalog-scoped; submits an async stac_harvest job.
 from dynastore.extensions.stac.presets import stac_harvester as _stac_harvester  # noqa: F401, E402
 
-# Platform-tier harvest demo — one-click CI / demo preset.
+# Platform-tier harvest demo — one-click, parameterizable CI / demo preset.
 from . import stac_harvest_demo as _stac_harvest_demo  # noqa: F401, E402
