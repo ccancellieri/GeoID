@@ -124,7 +124,21 @@ def _effective_sidecars(
     # ``strip_geometry_for_records`` model_validator on
     # ``ItemsPostgresqlDriverConfig`` (which can no longer see
     # ``collection_type`` since the field was hoisted to ``CollectionInfo``).
-    if collection_type == "RECORDS" and explicit:
+    #
+    # RFC #2550: an explicit ``allow_geometry=True`` capability override
+    # (threaded in via ``context``) opts a RECORDS collection into a real
+    # geometry sidecar — honour the caller's explicit config in that case
+    # instead of stripping it.
+    #
+    # A hard ``allow_geometry=False`` override forces geometry off for *any*
+    # kind (RFC #2550), including an already-materialised VECTOR/RASTER
+    # collection whose persisted ``sidecars`` still carries the geometry
+    # sidecar — otherwise the "off regardless of kind" contract would be a
+    # silent no-op on the explicit branch below.
+    allow_geometry = (context or {}).get("allow_geometry")
+    _force_off = allow_geometry is False
+    _records_default = collection_type == "RECORDS" and allow_geometry is not True
+    if explicit and (_force_off or _records_default):
         from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
             GeometriesSidecarConfig,
         )

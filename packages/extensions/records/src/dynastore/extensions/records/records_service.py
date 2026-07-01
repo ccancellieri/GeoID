@@ -21,7 +21,10 @@
 Serves RECORDS-type collections as OGC API - Records catalogues.
 Records are stored as ``Feature(geometry=None, properties={...})`` using
 the standard sidecar pipeline (AttributesSidecar).  The GeometrySidecar
-is skipped for RECORDS collections.
+is skipped for RECORDS collections by default, unless the collection has
+opted into the geometry capability via ``CollectionInfo.allow_geometry``
+(RFC #2550) — see ``records_generator.collection_has_geometry``. Req 55 of
+OGC API - Records Part 1 allows ``geometry`` to be a real geometry or null.
 
 Delegates to ``CatalogsProtocol`` / ``ItemsProtocol`` for all CRUD —
 no new storage layer is introduced.
@@ -586,6 +589,9 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             catalog_id, collection_id, ctx=DriverContext(db_resource=conn),
         )
         read_policy = await resolve_items_read_policy(catalog_id, collection_id)
+        geometry_enabled = await gen.collection_has_geometry(
+            catalog_id, collection_id, db_resource=conn,
+        )
 
         # Per-feature post-fetch projection — covers drivers that ignore
         # ``QueryRequest.select`` (e.g. ES) and the empty-properties case.
@@ -601,19 +607,20 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
                     for key in list(props.keys()):
                         if key not in projection_set:
                             props.pop(key, None)
-            # ``Record`` already emits ``geometry: null`` by construction
-            # (records_generator builds ``rm.Record(geometry=None, ...)``),
-            # so ``skip_geometry`` is mainly a hint to the driver layer here
-            # (PG drops the geom SELECT, ES adds ``geometry`` to
-            # ``_source.excludes``). The Feature-level normalisation below
-            # keeps the contract honest if the generator ever evolves to
-            # carry a geometry.
+            # For a geometry-less collection ``Record`` always emits
+            # ``geometry: null`` regardless of what the driver returned
+            # (``db_row_to_record`` with ``geometry_enabled=False``); for a
+            # geometry-enabled one, ``skipGeometry``/``returnGeometry`` is
+            # still honoured as a per-request override.
             if skip_geom_bool and hasattr(feature, "geometry"):
                 try:
                     feature.geometry = None
                 except Exception:
                     pass
-            records.append(gen.db_row_to_record(feature, catalog_id, collection_id, root_url, layer_config, read_policy=read_policy))
+            records.append(gen.db_row_to_record(
+                feature, catalog_id, collection_id, root_url, layer_config,
+                read_policy=read_policy, geometry_enabled=geometry_enabled,
+            ))
 
         # Pagination links
         from dynastore.extensions.tools.pagination import build_pagination_links
@@ -677,8 +684,14 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             catalog_id, collection_id, ctx=DriverContext(db_resource=conn),
         )
         read_policy = await resolve_items_read_policy(catalog_id, collection_id)
+        geometry_enabled = await gen.collection_has_geometry(
+            catalog_id, collection_id, db_resource=conn,
+        )
         root_url = get_root_url(request)
-        record = gen.db_row_to_record(feature, catalog_id, collection_id, root_url, layer_config, read_policy=read_policy)
+        record = gen.db_row_to_record(
+            feature, catalog_id, collection_id, root_url, layer_config,
+            read_policy=read_policy, geometry_enabled=geometry_enabled,
+        )
         content = record.model_dump(exclude_none=True)
         _resolve_links_titles(content.get("links"), language)
         return JSONResponse(
@@ -704,9 +717,16 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             was_single = True
             items = [payload.model_dump(by_alias=True, exclude_unset=True)]
 
-        # Ensure geometry is null for records
-        for item in items:
-            item["geometry"] = None
+        # Ensure geometry is null for records, unless the collection has
+        # opted into the geometry capability (RFC #2550 / OGC API - Records
+        # Part 1 Req 55) — then the submitted geometry is preserved and
+        # written through the standard geometry sidecar, like a VECTOR item.
+        geometry_enabled = await gen.collection_has_geometry(
+            catalog_id, collection_id, db_resource=conn, strict=True,
+        )
+        if not geometry_enabled:
+            for item in items:
+                item["geometry"] = None
 
         from dynastore.modules.storage.driver_config import ItemsWritePolicy
         policy_source = (
@@ -738,7 +758,7 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         if was_single:
             record = gen.db_row_to_record(
                 accepted_rows[0], catalog_id, collection_id, root_url, layer_config,
-                read_policy=read_policy,
+                read_policy=read_policy, geometry_enabled=geometry_enabled,
             )
             return JSONResponse(
                 content=record.model_dump(exclude_none=True),
@@ -746,7 +766,10 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             )
 
         records = [
-            gen.db_row_to_record(feat, catalog_id, collection_id, root_url, layer_config, read_policy=read_policy)
+            gen.db_row_to_record(
+                feat, catalog_id, collection_id, root_url, layer_config,
+                read_policy=read_policy, geometry_enabled=geometry_enabled,
+            )
             for feat in accepted_rows
         ]
         collection = rm.RecordCollection(
@@ -771,7 +794,11 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         """Replace a record (PUT)."""
         body = payload.model_dump(by_alias=True, exclude_unset=True)
         body["id"] = record_id
-        body["geometry"] = None
+        geometry_enabled = await gen.collection_has_geometry(
+            catalog_id, collection_id, db_resource=conn, strict=True,
+        )
+        if not geometry_enabled:
+            body["geometry"] = None
 
         catalogs_svc = await self._get_catalogs_service()
         updated_row = await catalogs_svc.upsert(
@@ -793,7 +820,7 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         read_policy = await resolve_items_read_policy(catalog_id, collection_id)
         record = gen.db_row_to_record(
             updated_row, catalog_id, collection_id, root_url, layer_config,
-            read_policy=read_policy,
+            read_policy=read_policy, geometry_enabled=geometry_enabled,
         )
         content = record.model_dump(exclude_none=True)
         _resolve_links_titles(content.get("links"), "*")
@@ -829,9 +856,21 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         else:
             merged_props = body.get("properties", {})
 
+        geometry_enabled = await gen.collection_has_geometry(
+            catalog_id, collection_id, db_resource=conn, strict=True,
+        )
+        if not geometry_enabled:
+            new_geometry = None
+        elif "geometry" in body:
+            # Client explicitly touched ``geometry`` in this PATCH.
+            new_geometry = body["geometry"]
+        else:
+            # Partial update — leave the existing geometry untouched.
+            new_geometry = getattr(existing, "geometry", None)
+
         merged = {
             "id": record_id,
-            "geometry": None,
+            "geometry": new_geometry,
             "properties": merged_props,
         }
         if body.get("links"):
@@ -856,7 +895,7 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         read_policy = await resolve_items_read_policy(catalog_id, collection_id)
         record = gen.db_row_to_record(
             updated_row, catalog_id, collection_id, root_url, layer_config,
-            read_policy=read_policy,
+            read_policy=read_policy, geometry_enabled=geometry_enabled,
         )
         content = record.model_dump(exclude_none=True)
         _resolve_links_titles(content.get("links"), "*")

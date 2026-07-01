@@ -209,7 +209,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
             catalog_id=catalog_id,
             collection_id=collection_id or "",
             collection_type=ct.kind.value,
-            context={"stac_items_pg": stac_items_pg},
+            context={"stac_items_pg": stac_items_pg, "allow_geometry": ct.allow_geometry},
         )
         return config.model_copy(update={"sidecars": effective})
 
@@ -528,13 +528,25 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
             _effective_sidecars,
         )
         from dynastore.models.protocols.configs import ConfigsProtocol as _ConfigsProtocol
+        from dynastore.modules.catalog.catalog_config import CollectionInfo as _CollectionInfo
         _configs_for_stac = get_protocol(_ConfigsProtocol)
         stac_items_pg = await _resolve_stac_items_pg(
             catalog_id, collection_id or "", configs=_configs_for_stac,
         )
+        # RFC #2550: thread the geometry capability override (independent of
+        # `collection_type`, which this DDL entry point doesn't resolve) so
+        # an explicit `allow_geometry=False` can suppress the geometries
+        # sidecar even at provisioning time. `allow_geometry=None` (default)
+        # leaves this call's behaviour byte-identical to before.
+        _ct_for_geom = await _configs_for_stac.get_config(
+            _CollectionInfo, catalog_id=catalog_id, collection_id=collection_id,
+        ) if _configs_for_stac else _CollectionInfo()
         effective_sidecars = _effective_sidecars(
             col_config, catalog_id=catalog_id, collection_id=collection_id,
-            context={"stac_items_pg": stac_items_pg},
+            context={
+                "stac_items_pg": stac_items_pg,
+                "allow_geometry": _ct_for_geom.allow_geometry,
+            },
         )
         col_config = col_config.model_copy(update={"sidecars": effective_sidecars})
 

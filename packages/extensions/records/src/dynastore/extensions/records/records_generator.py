@@ -18,9 +18,12 @@
 
 """Transforms internal Feature / DB rows into OGC Records API responses.
 
-The internal model is ``Feature(geometry=None, properties={...})``; this
-module maps those to the ``Record`` wire format defined by OGC API -
-Records Part 1 (OGC 20-004).
+The internal model is ``Feature(geometry=None, properties={...})`` by
+default; this module maps those to the ``Record`` wire format defined by
+OGC API - Records Part 1 (OGC 20-004). Req 55 of that spec allows a
+record's ``geometry`` to be a real geometry instead of ``null`` — a
+collection opts into that via the ``CollectionInfo.allow_geometry``
+capability (RFC #2550), resolved by :func:`collection_has_geometry`.
 """
 
 import logging
@@ -31,12 +34,77 @@ from geojson_pydantic import Feature as _GeoJSONFeature
 from dynastore.models.protocols import ItemsProtocol
 from dynastore.models.localization import LocalizedText
 from dynastore.models.shared_models import Link
+from dynastore.models.driver_context import DriverContext
 from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
 from dynastore.tools.discovery import get_protocol
 
 from . import records_models as rm
 
 logger = logging.getLogger(__name__)
+
+
+async def collection_has_geometry(
+    catalog_id: str,
+    collection_id: str,
+    db_resource: Optional[Any] = None,
+    strict: bool = False,
+) -> bool:
+    """Resolve whether *collection_id* currently has an active geometry sidecar.
+
+    Consults the same ``_effective_sidecars`` resolution the PG driver uses
+    at write/read time — ``CollectionInfo.kind`` plus the ``allow_geometry``
+    capability override (RFC #2550) — instead of re-reading
+    ``allow_geometry`` in isolation. This keeps the answer correct across a
+    ``kind``/``allow_geometry`` reclassification (both are mutable) without
+    requiring a matching physical migration: the resolved sidecar list is
+    the single source of truth every write/read call site already uses.
+
+    ``strict`` selects the error posture:
+
+    - ``strict=False`` (default, read paths) fails *closed* — a resolution
+      error returns ``False`` (the historic geometry-less RECORDS default),
+      so a geometry is at worst hidden from a response, never fabricated.
+    - ``strict=True`` (write paths) re-raises the resolution error instead
+      of returning ``False``. On a write, a false negative would force a
+      client-submitted geometry to ``null`` and persist that data loss
+      behind a ``201`` — so a transient config-resolution hiccup must fail
+      the write loudly and let the client retry, not silently drop data.
+    """
+    try:
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.modules.catalog.catalog_config import CollectionInfo
+        from dynastore.modules.storage.drivers.pg_sidecars import _effective_sidecars
+        from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
+            GeometriesSidecarConfig,
+        )
+
+        configs = get_protocol(ConfigsProtocol)
+        if configs is None:
+            return False
+        ct = await configs.get_config(
+            CollectionInfo, catalog_id=catalog_id, collection_id=collection_id,
+        )
+        col_config = await configs.get_config(
+            ItemsPostgresqlDriverConfig,
+            catalog_id=catalog_id, collection_id=collection_id,
+            ctx=DriverContext(db_resource=db_resource),
+        )
+        resolved = _effective_sidecars(
+            col_config,
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+            collection_type=ct.kind.value,
+            context={"allow_geometry": ct.allow_geometry},
+        )
+        return any(isinstance(sc, GeometriesSidecarConfig) for sc in resolved)
+    except Exception:
+        logger.warning(
+            "collection_has_geometry: resolution failed for %s/%s",
+            catalog_id, collection_id, exc_info=True,
+        )
+        if strict:
+            raise
+        return False
 
 
 def db_row_to_record(
@@ -46,6 +114,7 @@ def db_row_to_record(
     root_url: str,
     layer_config: Optional[ItemsPostgresqlDriverConfig] = None,
     read_policy: Optional[Any] = None,
+    geometry_enabled: bool = False,
 ) -> rm.Record:
     """Convert a DB row or mapped Feature into an OGC Record.
 
@@ -60,6 +129,13 @@ def db_row_to_record(
     fallback honours ``feature_type.expose`` / ``external_id_as_feature_id``.
     Items arriving already mapped (the canonical ``stream_items`` path) skip
     the fallback and are unaffected.
+
+    ``geometry_enabled`` (RFC #2550, resolved by the caller via
+    :func:`collection_has_geometry`) gates whether the mapped item's
+    ``geometry``/``bbox`` are surfaced on the returned ``Record`` or forced
+    to ``null`` — the OGC API - Records Part 1 default for a collection with
+    no geometry capability. Defaults to ``False`` so existing callers that
+    don't pass it keep the byte-identical geometry-less behaviour.
     """
     # Map raw DB row via sidecar pipeline if needed
     if not isinstance(item, _GeoJSONFeature):
@@ -108,13 +184,19 @@ def db_row_to_record(
         ),
     ]
 
-    return rm.Record(
+    record_kwargs: Dict[str, Any] = dict(
         type="Feature",
         id=feature_id,
-        geometry=None,
+        geometry=getattr(item, "geometry", None) if geometry_enabled else None,
         properties=record_props,
         links=links,
     )
+    if geometry_enabled:
+        bbox = getattr(item, "bbox", None)
+        if bbox is not None:
+            record_kwargs["bbox"] = bbox
+
+    return rm.Record(**record_kwargs)
 
 
 def collection_to_records_collection(

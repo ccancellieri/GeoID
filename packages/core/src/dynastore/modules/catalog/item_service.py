@@ -1384,7 +1384,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 catalog_id=catalog_id,
                 collection_id=collection_id,
                 collection_type=ct.kind.value,
-                context={"stac_items_pg": stac_items_pg},
+                context={"stac_items_pg": stac_items_pg, "allow_geometry": ct.allow_geometry},
             )
 
             sidecars: List[Any] = []

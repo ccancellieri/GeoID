@@ -60,6 +60,20 @@ class CollectionInfo(PluginConfig):
         ),
     )
 
+    allow_geometry: Mutable[Optional[bool]] = Field(
+        default=None,
+        description=(
+            "Capability override for the geometry sidecar, independent of "
+            "``kind`` (RFC #2550 — ``kind`` informs defaults, it no longer "
+            "hard-gates storage capabilities). ``None`` (default) derives the "
+            "decision from ``kind``: VECTOR/RASTER get a geometry sidecar, "
+            "RECORDS does not. ``True`` forces the geometry sidecar on "
+            "regardless of kind (e.g. a RECORDS collection with a real "
+            "footprint geometry, per OGC API - Records Part 1 Req 55). "
+            "``False`` forces it off regardless of kind."
+        ),
+    )
+
 
 # --- Partitioning (Physical) ---
 

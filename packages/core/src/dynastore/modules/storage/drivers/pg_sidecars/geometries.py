@@ -276,8 +276,21 @@ class GeometriesSidecar(SidecarProtocol):
     def get_default_config(cls, context: Dict[str, Any]) -> Optional[GeometriesSidecarConfig]:
         """Auto-inject geometries sidecar by default.
 
-        Skipped for RECORDS collections which have no spatial component.
+        Skipped for RECORDS collections which have no spatial component,
+        unless the collection's ``CollectionInfo.allow_geometry`` capability
+        override (RFC #2550) forces the decision either way:
+
+        - ``allow_geometry is True`` → inject regardless of kind (e.g. a
+          RECORDS collection carrying a real footprint geometry).
+        - ``allow_geometry is False`` → never inject, regardless of kind.
+        - ``allow_geometry is None`` (default/unset) → fall back to the
+          kind-derived default below, unchanged from before.
         """
+        allow_geometry = context.get("allow_geometry")
+        if allow_geometry is True:
+            return GeometriesSidecarConfig()
+        if allow_geometry is False:
+            return None
         if context.get("collection_type") == "RECORDS":
             return None
         return GeometriesSidecarConfig()

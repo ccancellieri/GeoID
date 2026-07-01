@@ -159,3 +159,111 @@ def test_resolver_collection_type_round_trip(kind_str: str, expected_has_geometr
     )
     types = [s.sidecar_type for s in resolved]
     assert ("geometries" in types) is expected_has_geometries
+
+
+# ---------------------------------------------------------------------------
+# RFC #2550: ``allow_geometry`` capability override (Issue #2645)
+# ---------------------------------------------------------------------------
+
+
+def test_collection_info_allow_geometry_default_is_none():
+    assert CollectionInfo().allow_geometry is None
+
+
+def test_records_allow_geometry_true_injects_geometry_by_default():
+    """A default-body RECORDS collection with ``allow_geometry=True`` gets
+    the geometries sidecar injected, same as VECTOR.
+    """
+    cfg = ItemsPostgresqlDriverConfig()
+    resolved = _effective_sidecars(
+        cfg, catalog_id="cat", collection_id="col",
+        collection_type="RECORDS",
+        context={"allow_geometry": True},
+    )
+    types = [s.sidecar_type for s in resolved]
+    assert "geometries" in types
+    assert "attributes" in types
+
+
+def test_records_allow_geometry_true_honours_explicit_geometry_sidecar():
+    """A RECORDS collection with an explicit geometries sidecar AND
+    ``allow_geometry=True`` keeps the explicit config instead of stripping
+    it (the RECORDS-strip in ``_effective_sidecars`` step 1 only applies
+    when ``allow_geometry`` is not ``True``).
+    """
+    from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
+        GeometriesSidecarConfig,
+    )
+
+    cfg = ItemsPostgresqlDriverConfig(
+        sidecars=[GeometriesSidecarConfig(sidecar_type="geometries")],
+    )
+    resolved = _effective_sidecars(
+        cfg, catalog_id="cat", collection_id="col",
+        collection_type="RECORDS",
+        context={"allow_geometry": True},
+    )
+    types = [s.sidecar_type for s in resolved]
+    assert "geometries" in types
+
+
+def test_vector_allow_geometry_false_drops_default_geometry():
+    """A default-body VECTOR collection with ``allow_geometry=False``
+    never gets a geometries sidecar injected, even though ``kind`` alone
+    would default to VECTOR → geometry.
+    """
+    cfg = ItemsPostgresqlDriverConfig()
+    resolved = _effective_sidecars(
+        cfg, catalog_id="cat", collection_id="col",
+        collection_type="VECTOR",
+        context={"allow_geometry": False},
+    )
+    types = [s.sidecar_type for s in resolved]
+    assert "geometries" not in types
+    assert "attributes" in types
+
+
+@pytest.mark.parametrize("collection_type", ["VECTOR", "RASTER"])
+def test_allow_geometry_false_strips_materialized_geometry_for_any_kind(collection_type):
+    """``allow_geometry=False`` forces geometry off even for a non-RECORDS
+    collection whose *persisted* ``sidecars`` already carries an explicit
+    geometry sidecar (the materialised state after ``ensure_storage``).
+
+    Regression for the RFC #2550 "off regardless of kind" contract: the
+    explicit-strip previously fired only for RECORDS, so ``False`` was a
+    silent no-op on an already-materialised VECTOR/RASTER collection.
+    """
+    from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
+        GeometriesSidecarConfig,
+    )
+
+    cfg = ItemsPostgresqlDriverConfig(
+        sidecars=[GeometriesSidecarConfig(sidecar_type="geometries")],
+    )
+    resolved = _effective_sidecars(
+        cfg, catalog_id="cat", collection_id="col",
+        collection_type=collection_type,
+        context={"allow_geometry": False},
+    )
+    assert "geometries" not in [s.sidecar_type for s in resolved]
+
+
+@pytest.mark.parametrize("collection_type", ["VECTOR", "RECORDS"])
+def test_allow_geometry_none_is_byte_identical_to_kind_only_resolution(collection_type):
+    """Hard constraint: ``allow_geometry=None`` (unset/default) must resolve
+    identically to omitting the ``allow_geometry`` key from context
+    entirely — the pre-existing kind-only behaviour.
+    """
+    cfg = ItemsPostgresqlDriverConfig()
+    resolved_without_key = _effective_sidecars(
+        cfg, catalog_id="cat", collection_id="col",
+        collection_type=collection_type,
+    )
+    resolved_with_none = _effective_sidecars(
+        cfg, catalog_id="cat", collection_id="col",
+        collection_type=collection_type,
+        context={"allow_geometry": None},
+    )
+    types_without = sorted(s.sidecar_type for s in resolved_without_key)
+    types_with = sorted(s.sidecar_type for s in resolved_with_none)
+    assert types_without == types_with
