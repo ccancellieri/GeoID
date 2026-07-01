@@ -332,16 +332,30 @@
             const recentList = this.querySelector('.ds-recent-searches');
             if (!recentList) return;
 
-            recentList.innerHTML = state.search.recent.length > 0
-                ? state.search.recent.map(query => `
-                    <li>
-                        <button class="ds-recent-search" data-query="${query}">
-                            <i class="fa-solid fa-history"></i>
-                            ${query}
-                        </button>
-                    </li>
-                `).join('')
-                : '<li class="ds-empty">No recent searches</li>';
+            // Built via DOM, not an innerHTML template: recent queries are
+            // user-typed text persisted to localStorage and replayed here, so
+            // they must reach the attribute/text via setAttribute/textContent,
+            // never HTML string interpolation.
+            recentList.replaceChildren();
+            if (state.search.recent.length > 0) {
+                state.search.recent.forEach(query => {
+                    const li = document.createElement('li');
+                    const btn = document.createElement('button');
+                    btn.className = 'ds-recent-search';
+                    btn.setAttribute('data-query', query);
+                    const icon = document.createElement('i');
+                    icon.className = 'fa-solid fa-history';
+                    btn.appendChild(icon);
+                    btn.appendChild(document.createTextNode(` ${query}`));
+                    li.appendChild(btn);
+                    recentList.appendChild(li);
+                });
+            } else {
+                const empty = document.createElement('li');
+                empty.className = 'ds-empty';
+                empty.textContent = 'No recent searches';
+                recentList.appendChild(empty);
+            }
 
             recentList.querySelectorAll('.ds-recent-search').forEach(btn => {
                 btn.addEventListener('click', (e) => {
@@ -405,116 +419,68 @@
             if (!resultsContainer) return;
 
             const { results, total, query_time_ms } = data;
-            
+
+            // Built via DOM, not an innerHTML template: every field below
+            // (title, url, description, category, catalog_id, the query
+            // itself) comes from the /web/search response or user input and
+            // must never be parsed as HTML.
+            resultsContainer.replaceChildren();
+
             if (total === 0) {
-                resultsContainer.innerHTML = `
-                    <div class="ds-search-empty">
-                        <i class="fa-solid fa-search"></i>
-                        <p>No results found for "${query}"</p>
-                        <p class="ds-muted">Try different keywords or check your spelling</p>
-                    </div>
-                `;
+                const empty = document.createElement('div');
+                empty.className = 'ds-search-empty';
+                const icon = document.createElement('i');
+                icon.className = 'fa-solid fa-search';
+                const p1 = document.createElement('p');
+                p1.textContent = `No results found for "${query}"`;
+                const p2 = document.createElement('p');
+                p2.className = 'ds-muted';
+                p2.textContent = 'Try different keywords or check your spelling';
+                empty.append(icon, p1, p2);
+                resultsContainer.appendChild(empty);
                 return;
             }
 
-            let html = `<div class="ds-search-stats">
-                ${total} results (${query_time_ms}ms)
-            </div>`;
+            const stats = document.createElement('div');
+            stats.className = 'ds-search-stats';
+            stats.textContent = `${total} results (${query_time_ms}ms)`;
+            resultsContainer.appendChild(stats);
 
-            // Catalogs
-            if (results.catalogs && results.catalogs.length > 0) {
-                html += `
-                    <div class="ds-result-group">
-                        <h4><i class="fa-solid fa-database"></i> Catalogs</h4>
-                        <ul>
-                            ${results.catalogs.map(c => `
-                                <li>
-                                    <a href="${c.url}" class="ds-result-item">
-                                        <div class="ds-result-title">${this.highlightMatch(c.title, query)}</div>
-                                        ${c.description ? `<div class="ds-result-desc">${this.truncate(c.description, 80)}</div>` : ''}
-                                    </a>
-                                </li>
-                            `).join('')}
-                        </ul>
-                    </div>
-                `;
-            }
+            const groups = [
+                {
+                    key: 'catalogs', icon: 'fa-database', label: 'Catalogs',
+                    secondaryClass: 'ds-result-desc',
+                    secondary: (c) => c.description ? this.truncate(c.description, 80) : null
+                },
+                {
+                    key: 'collections', icon: 'fa-layer-group', label: 'Collections',
+                    secondaryClass: 'ds-result-meta',
+                    secondary: (c) => c.catalog_id || null
+                },
+                {
+                    key: 'items', icon: 'fa-cube', label: 'Items',
+                    secondaryClass: 'ds-result-meta',
+                    secondary: () => null
+                },
+                {
+                    key: 'docs', icon: 'fa-book', label: 'Documentation',
+                    secondaryClass: 'ds-result-meta',
+                    secondary: (d) => d.category || null
+                },
+                {
+                    key: 'tasks', icon: 'fa-tasks', label: 'Tasks',
+                    secondaryClass: 'ds-result-meta',
+                    secondary: () => null
+                }
+            ];
 
-            // Collections
-            if (results.collections && results.collections.length > 0) {
-                html += `
-                    <div class="ds-result-group">
-                        <h4><i class="fa-solid fa-layer-group"></i> Collections</h4>
-                        <ul>
-                            ${results.collections.map(c => `
-                                <li>
-                                    <a href="${c.url}" class="ds-result-item">
-                                        <div class="ds-result-title">${this.highlightMatch(c.title, query)}</div>
-                                        <div class="ds-result-meta">${c.catalog_id}</div>
-                                    </a>
-                                </li>
-                            `).join('')}
-                        </ul>
-                    </div>
-                `;
-            }
-
-            // Items
-            if (results.items && results.items.length > 0) {
-                html += `
-                    <div class="ds-result-group">
-                        <h4><i class="fa-solid fa-cube"></i> Items</h4>
-                        <ul>
-                            ${results.items.map(i => `
-                                <li>
-                                    <a href="${i.url}" class="ds-result-item">
-                                        <div class="ds-result-title">${this.highlightMatch(i.title, query)}</div>
-                                    </a>
-                                </li>
-                            `).join('')}
-                        </ul>
-                    </div>
-                `;
-            }
-
-            // Docs
-            if (results.docs && results.docs.length > 0) {
-                html += `
-                    <div class="ds-result-group">
-                        <h4><i class="fa-solid fa-book"></i> Documentation</h4>
-                        <ul>
-                            ${results.docs.map(d => `
-                                <li>
-                                    <a href="${d.url}" class="ds-result-item">
-                                        <div class="ds-result-title">${this.highlightMatch(d.title, query)}</div>
-                                        ${d.category ? `<div class="ds-result-meta">${d.category}</div>` : ''}
-                                    </a>
-                                </li>
-                            `).join('')}
-                        </ul>
-                    </div>
-                `;
-            }
-
-            // Tasks
-            if (results.tasks && results.tasks.length > 0) {
-                html += `
-                    <div class="ds-result-group">
-                        <h4><i class="fa-solid fa-tasks"></i> Tasks</h4>
-                        <ul>
-                            ${results.tasks.map(t => `
-                                <li>
-                                    <a href="${t.url}" class="ds-result-item">
-                                        <div class="ds-result-title">${this.highlightMatch(t.title, query)}</div>
-                                    </a>
-                                </li>
-                            `).join('')}
-                        </ul>
-                    </div>
-                `;
-            }
-
-            resultsContainer.innerHTML = html;
+            groups.forEach(({ key, icon, label, secondary, secondaryClass }) => {
+                const items = results[key];
+                if (!items || items.length === 0) return;
+                resultsContainer.appendChild(
+                    this.buildResultGroup(icon, label, items, secondary, secondaryClass, query)
+                );
+            });
 
             // Add click handlers to track recent items
             resultsContainer.querySelectorAll('.ds-result-item').forEach(link => {
@@ -526,9 +492,63 @@
             });
         }
 
+        buildResultGroup(iconClass, label, items, secondaryFn, secondaryClass, query) {
+            const group = document.createElement('div');
+            group.className = 'ds-result-group';
+
+            const h4 = document.createElement('h4');
+            const headerIcon = document.createElement('i');
+            headerIcon.className = `fa-solid ${iconClass}`;
+            h4.appendChild(headerIcon);
+            h4.appendChild(document.createTextNode(` ${label}`));
+            group.appendChild(h4);
+
+            const ul = document.createElement('ul');
+            items.forEach(item => {
+                const li = document.createElement('li');
+                const a = document.createElement('a');
+                a.setAttribute('href', item.url);
+                a.className = 'ds-result-item';
+
+                const titleDiv = document.createElement('div');
+                titleDiv.className = 'ds-result-title';
+                titleDiv.appendChild(this.highlightMatch(item.title, query));
+                a.appendChild(titleDiv);
+
+                const secondaryText = secondaryFn(item);
+                if (secondaryText) {
+                    const secondaryDiv = document.createElement('div');
+                    secondaryDiv.className = secondaryClass;
+                    secondaryDiv.textContent = secondaryText;
+                    a.appendChild(secondaryDiv);
+                }
+
+                li.appendChild(a);
+                ul.appendChild(li);
+            });
+            group.appendChild(ul);
+            return group;
+        }
+
+        // Returns a DocumentFragment with the match wrapped in <mark>
+        // elements built via createElement — the untrusted title text is
+        // split into text nodes and never passed through innerHTML/replace
+        // with an HTML string, so it can't be parsed as markup.
         highlightMatch(text, query) {
+            const frag = document.createDocumentFragment();
             const regex = new RegExp(`(${query})`, 'gi');
-            return text.replace(regex, '<mark>$1</mark>');
+            const parts = String(text).split(regex);
+            parts.forEach((part, i) => {
+                if (!part) return;
+                if (i % 2 === 1) {
+                    const mark = document.createElement('mark');
+                    mark.textContent = part;
+                    frag.appendChild(mark);
+                } else {
+                    frag.appendChild(document.createTextNode(part));
+                }
+            });
+            return frag;
         }
 
         open() {
