@@ -689,29 +689,24 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         self,
         catalog_id: str,
         collection_id: str,
+        payload: rm.RecordOrRecordCollection,
         request: Request,
         conn: AsyncConnection = Depends(get_async_connection),
     ) -> Response:
         """Create/upsert records into a RECORDS-type collection."""
-        body = await request.json()
-
         # Normalise to list and determine whether caller sent a single item.
-        if isinstance(body, list):
+        if isinstance(payload, rm.RecordCollection):
             was_single = False
-            items: list = body
-        elif isinstance(body, dict) and body.get("type") == "FeatureCollection":
-            was_single = False
-            items = body.get("features", [])
-        elif isinstance(body, dict):
-            was_single = True
-            items = [body]
+            items: list = [
+                r.model_dump(by_alias=True, exclude_unset=True) for r in payload.features
+            ]
         else:
-            raise HTTPException(status_code=400, detail="Invalid request body.")
+            was_single = True
+            items = [payload.model_dump(by_alias=True, exclude_unset=True)]
 
         # Ensure geometry is null for records
         for item in items:
-            if isinstance(item, dict):
-                item["geometry"] = None
+            item["geometry"] = None
 
         from dynastore.modules.storage.driver_config import ItemsWritePolicy
         policy_source = (
@@ -769,16 +764,14 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         catalog_id: str,
         collection_id: str,
         record_id: str,
+        payload: rm.Record,
         request: Request,
         conn: AsyncConnection = Depends(get_async_connection),
     ) -> rm.Record:
         """Replace a record (PUT)."""
-        body = await request.json()
-        if isinstance(body, dict):
-            body["id"] = record_id
-            body["geometry"] = None
-        else:
-            raise HTTPException(status_code=400, detail="Invalid request body.")
+        body = payload.model_dump(by_alias=True, exclude_unset=True)
+        body["id"] = record_id
+        body["geometry"] = None
 
         catalogs_svc = await self._get_catalogs_service()
         updated_row = await catalogs_svc.upsert(
@@ -811,13 +804,12 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         catalog_id: str,
         collection_id: str,
         record_id: str,
+        payload: rm.Record,
         request: Request,
         conn: AsyncConnection = Depends(get_async_connection),
     ) -> rm.Record:
         """Partially update a record (PATCH)."""
-        body = await request.json()
-        if not isinstance(body, dict):
-            raise HTTPException(status_code=400, detail="Invalid request body.")
+        body = payload.model_dump(by_alias=True, exclude_unset=True)
 
         catalogs_svc = await self._get_catalogs_service()
         items_protocol = cast(ItemsProtocol, catalogs_svc)

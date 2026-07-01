@@ -25,7 +25,7 @@ transformed at the API boundary by ``records_generator.py``.
 Reference: OGC API - Records - Part 1: Core (OGC 20-004)
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -113,13 +113,33 @@ class Record(BaseModel):
 
 
 class RecordCollection(BaseModel):
-    """OGC API - Records record collection response."""
+    """OGC API - Records record collection (also accepted as bulk request body)."""
+
+    model_config = ConfigDict(extra="allow")
 
     type: str = "FeatureCollection"
     features: List[Record] = Field(default_factory=list)
     links: Optional[List[Link]] = None
     numberMatched: Optional[int] = None
     numberReturned: Optional[int] = None
+
+
+from pydantic import Discriminator, Tag  # noqa: E402
+
+
+def _discriminate_record_type(v: Any) -> str:
+    if isinstance(v, dict):
+        return v.get("type", "Feature")
+    return getattr(v, "type", "Feature")
+
+
+RecordOrRecordCollection = Annotated[
+    Union[
+        Annotated[Record, Tag("Feature")],
+        Annotated[RecordCollection, Tag("FeatureCollection")],
+    ],
+    Discriminator(_discriminate_record_type),
+]
 
 
 # ---------------------------------------------------------------------------
