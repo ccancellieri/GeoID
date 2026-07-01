@@ -16,7 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from dynastore.modules.db_config.query_executor import DbResource, managed_transaction
+from dynastore.modules.db_config.query_executor import DbResource
 from dynastore.modules.db_config import maintenance_tools
 from dynastore.modules.proxy import queries
 from dynastore.modules.proxy.models import AnalyticsPage, ShortURL
@@ -57,11 +57,21 @@ class PostgresProxyStorage(AbstractProxyStorage):
             yield
             return
 
-        async with managed_transaction(engine) as conn:
-            async with maintenance_tools.acquire_startup_lock(conn, "proxy_storage_init"):
-                await queries.CREATE_SHORT_URL_SEQUENCE.execute(conn, schema="proxy")
-                await queries.CREATE_BASE62_FUNCTION.execute(conn, schema="proxy")
-                await queries.CREATE_OBFUSCATE_FUNCTION.execute(conn, schema="proxy")
+        logger.info("PostgresProxyStorage: Initializing proxy schema objects.")
+
+        async def _init_proxy_storage(conn: DbResource) -> None:
+            await queries.CREATE_SHORT_URL_SEQUENCE.execute(conn, schema="proxy")
+            await queries.CREATE_BASE62_FUNCTION.execute(conn, schema="proxy")
+            await queries.CREATE_OBFUSCATE_FUNCTION.execute(conn, schema="proxy")
+
+        try:
+            await maintenance_tools.run_startup_ddl_tolerating_lock_timeout(
+                engine, "proxy_storage_init", _init_proxy_storage,
+            )
+            logger.info("PostgresProxyStorage: Initialization complete.")
+        except Exception as e:
+            logger.critical("PostgresProxyStorage initialization failed: %s", e, exc_info=True)
+            raise
 
         yield
 
