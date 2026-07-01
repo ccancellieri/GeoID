@@ -230,6 +230,16 @@ def _is_lock_not_available_error(exc: Optional[BaseException]) -> bool:
     return any(fragment in msg for fragment in _LOCK_TIMEOUT_MESSAGE_FRAGMENTS)
 
 
+def is_lock_not_available_error(exc: Optional[BaseException]) -> bool:
+    """Public alias of :func:`_is_lock_not_available_error`.
+
+    Exposed for callers outside this module that need to special-case a PG
+    lock-timeout (55P03) -- e.g. a foundational module's startup DDL deciding
+    whether losing an ``acquire_startup_lock`` race is safe to tolerate.
+    """
+    return _is_lock_not_available_error(exc)
+
+
 # --- Sync (psycopg2 / SQLAlchemy) closed-connection detection ----------------
 
 _SYNC_CLOSED_CONN_MESSAGE_FRAGMENTS = (

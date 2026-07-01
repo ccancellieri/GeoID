@@ -26,7 +26,7 @@ import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
-from typing import List, Optional, Any, Dict, AsyncGenerator, Union
+from typing import List, Optional, Any, Dict, AsyncGenerator, Union, Awaitable, Callable
 from dynastore.tools.cache import cached
 from dynastore.models.driver_context import DriverContext
 from dynastore.modules import ModuleProtocol
@@ -40,6 +40,7 @@ from dynastore.modules.db_config.query_executor import (
     ResultHandler,
     DbResource,
     run_in_event_loop,
+    is_lock_not_available_error,
 )
 from dynastore.modules.db_config.locking_tools import (
     check_table_exists,
@@ -477,6 +478,53 @@ def _build_tasks_ddl_batch(schema: str) -> DDLBatch:
     )
 
 
+async def _run_startup_ddl_tolerating_lock_timeout(
+    engine: DbResource,
+    lock_key: str,
+    ddl_body: Callable[[DbResource], Awaitable[None]],
+) -> None:
+    """Run *ddl_body* under the ``lock_key`` startup advisory lock, without
+    letting lock contention abort process startup (#2616).
+
+    ``ddl_body`` MUST be idempotent (``CREATE ... IF NOT EXISTS`` / ``CREATE
+    OR REPLACE``) — true for every caller in ``TasksModule.lifespan``. When a
+    peer pod is still holding the lock past ``lock_acquire_timeout_seconds``
+    (e.g. because it is itself stalled on a starved connection pool, #2333),
+    ``acquire_startup_lock`` raises a PG lock-timeout error (55P03) instead of
+    blocking forever. That used to propagate out of TasksModule's foundational
+    lifespan and crash-loop the whole worker, even though the DDL the lock
+    guards is safe to run unlocked: ``DDLQuery``/``DDLBatch`` already tolerate
+    the resulting concurrent-DDL "already exists" races (see
+    ``_is_duplicate_object_error``). So on a lock-timeout we log a WARNING and
+    run the same idempotent DDL on a fresh, unlocked transaction instead of
+    aborting startup.
+
+    Any other exception (a genuine connectivity failure, a bug in the DDL
+    itself, etc.) is NOT swallowed — it propagates as before.
+    """
+    from dynastore.modules.db_config.locking_tools import acquire_startup_lock
+
+    try:
+        async with acquire_startup_lock(engine, lock_key) as locked_conn:
+            if locked_conn is None:
+                raise RuntimeError(
+                    f"TasksModule: could not acquire startup lock for {lock_key!r}."
+                )
+            await ddl_body(locked_conn)
+        return
+    except Exception as exc:
+        if not is_lock_not_available_error(exc):
+            raise
+        logger.warning(
+            "TasksModule: startup lock %r timed out — a peer is likely still "
+            "initializing this schema (possibly pool-starved, see #2333). "
+            "Proceeding with the idempotent DDL unlocked instead of aborting "
+            "startup: %s",
+            lock_key, exc,
+        )
+
+    async with managed_transaction(engine) as unlocked_conn:
+        await ddl_body(unlocked_conn)
 
 
 
@@ -780,21 +828,21 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                 # SAME connection as the DDL, otherwise two concurrent revisions
                 # can both observe "table missing" and race to create it (and
                 # its partitions). Using the locked_conn yielded by
-                # acquire_startup_lock guarantees that.
-                from dynastore.modules.db_config.locking_tools import acquire_startup_lock
-                async with acquire_startup_lock(
-                    engine, f"tasks_storage_init.{schema}"
-                ) as locked_conn:
-                    if locked_conn is None:
-                        raise RuntimeError(
-                            f"TasksModule: could not acquire startup lock for '{schema}.tasks' "
-                            "initialization — refusing to start dispatcher."
-                        )
-                    await ensure_task_storage_exists(locked_conn, schema)
+                # acquire_startup_lock guarantees that. A lock-timeout (a peer
+                # pod still holding it, possibly pool-starved — #2333) is
+                # tolerated rather than fatal (#2616): the DDL is idempotent,
+                # so it is safe to run unlocked instead of crash-looping the
+                # foundational module.
+                async def _init_tasks_storage(conn: DbResource) -> None:
+                    await ensure_task_storage_exists(conn, schema)
                     from dynastore.modules.tasks.workclass_ddl import (
                         ensure_workclass_storage_exists,
                     )
-                    await ensure_workclass_storage_exists(locked_conn, schema)
+                    await ensure_workclass_storage_exists(conn, schema)
+
+                await _run_startup_ddl_tolerating_lock_timeout(
+                    engine, f"tasks_storage_init.{schema}", _init_tasks_storage,
+                )
 
                 # Ensure configs.task_capability_registry exists before the
                 # backstop/sweep loops start querying it. PlatformConfigService
@@ -804,17 +852,22 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                 # point the engine is present and the idempotent CREATE TABLE IF NOT
                 # EXISTS is safe.  Advisory lock mirrors the tasks_storage_init
                 # namespace pattern: one pod wins per cold-start, others skip.
+                # A lock timeout is tolerated the same way as above.
                 from dynastore.modules.db_config.typed_store.ddl import (
                     TASK_CAPABILITY_REGISTRY_DDL,
                 )
-                async with acquire_startup_lock(
-                    engine, f"tasks_storage_init.{schema}.registry"
-                ) as reg_conn:
-                    if reg_conn is not None:
-                        await DDLQuery(TASK_CAPABILITY_REGISTRY_DDL).execute(reg_conn)
-                        logger.info(
-                            "TasksModule: configs.task_capability_registry ensured."
-                        )
+
+                async def _init_task_capability_registry(conn: DbResource) -> None:
+                    await DDLQuery(TASK_CAPABILITY_REGISTRY_DDL).execute(conn)
+                    logger.info(
+                        "TasksModule: configs.task_capability_registry ensured."
+                    )
+
+                await _run_startup_ddl_tolerating_lock_timeout(
+                    engine,
+                    f"tasks_storage_init.{schema}.registry",
+                    _init_task_capability_registry,
+                )
 
                 # Optional one-shot cleanup of pre-existing per-tenant
                 # ``{schema}.tasks`` tables left over from the
