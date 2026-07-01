@@ -302,11 +302,24 @@ class LifecycleRegistry:
 
     # Synchronous transactional hook registration
     def sync_catalog_initializer(
-        self, priority: int = 0
+        self, priority: int = 0, critical: bool = False
     ) -> Callable[[SyncCatalogInitializer], SyncCatalogInitializer]:
-        """Decorator to register a catalog initialization hook."""
+        """Decorator to register a catalog initialization hook.
+
+        ``critical=True`` marks a hook whose failure must abort the catalog
+        creation rather than being isolated and skipped. Like every hook it
+        still runs inside a SAVEPOINT (so a mid-flight failure cannot poison
+        sibling hooks), but when that SAVEPOINT rolls back the error is
+        re-raised instead of swallowed, propagating up to roll back the outer
+        creation transaction. Use only for modules whose per-tenant tables the
+        catalog is functionally broken without (e.g. IAM ``policies``): a
+        best-effort savepoint is the wrong home for a table authorization
+        hard-depends on. Non-critical hooks keep the default isolated-and-skip
+        behaviour so one optional module cannot block catalog creation.
+        """
 
         def decorator(func: SyncCatalogInitializer) -> SyncCatalogInitializer:
+            func._lifecycle_critical = critical  # type: ignore[attr-defined]
             return self._register_hook(self._sync_catalog_initializers, priority, func)
 
         # Handle case where it's used without parentheses: @registry.sync_catalog_initializer
@@ -552,7 +565,16 @@ class LifecycleRegistry:
                     f"Cannot continue lifecycle initialization. Error: {e}"
                 )
                 raise  # fatal — caller must roll back the outer transaction
-            # Otherwise the SAVEPOINT was rolled back cleanly; log and continue
+            # Otherwise the SAVEPOINT was rolled back cleanly; the outer tx is
+            # still healthy so a critical hook can re-raise to abort the create,
+            # while a normal hook is logged and skipped.
+            if getattr(func, "_lifecycle_critical", False):
+                logger.error(
+                    f"{label} is CRITICAL and failed (SAVEPOINT rolled back); "
+                    f"aborting catalog creation. Error: {e}",
+                    exc_info=True,
+                )
+                raise
             logger.error(f"{label} failed (SAVEPOINT rolled back, outer tx healthy): {e}", exc_info=True)
             return False
 

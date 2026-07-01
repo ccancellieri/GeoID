@@ -179,9 +179,51 @@ class PostgresPolicyStorage(AbstractPolicyStorage):
         # 1. Base Table (auto-inferred existence check via {schema})
         await CREATE_POLICIES_TABLE.execute(conn, schema=schema)
 
-        # 2. Partitions (IF NOT EXISTS in SQL handles idempotency)
-        await CREATE_PARTITION_GLOBAL.execute(conn, schema=schema)
-        await CREATE_PARTITION_DEFAULT.execute(conn, schema=schema)
+        # 2. Partitions. IF NOT EXISTS handles the idempotent re-provision case
+        # (no error when the partition is already present). The remaining
+        # exposure is the create-create race: two provisions of the same tenant
+        # both pass the internal existence check and one loses with
+        # duplicate_table (42P07). Because the owning lifecycle hook is now
+        # registered ``critical`` — a rollback aborts the whole catalog create —
+        # swallow that specific race in a nested SAVEPOINT so a benign concurrent
+        # duplicate cannot fail an otherwise-valid create. Mirrors the tolerance
+        # ``ensure_policy_partition`` already applies to the same parent table.
+        await self._execute_partition_tolerant(conn, CREATE_PARTITION_GLOBAL, schema, "policies_global")
+        await self._execute_partition_tolerant(conn, CREATE_PARTITION_DEFAULT, schema, "policies_default")
+
+    async def _execute_partition_tolerant(
+        self, conn: DbResource, ddl: DDLQuery, schema: str, partition_name: str
+    ) -> None:
+        """Create a fixed ``policies`` partition, tolerating the 42P07 race.
+
+        Runs the CREATE in its own SAVEPOINT (when the connection supports one)
+        so a duplicate-table error from a concurrent same-tenant provision rolls
+        back only this statement and leaves the surrounding transaction healthy.
+        """
+        from sqlalchemy.ext.asyncio import AsyncConnection
+
+        def _is_duplicate(exc: Exception) -> bool:
+            orig = getattr(exc, "orig", None)
+            return "already exists" in str(exc) or (
+                orig is not None and getattr(orig, "pgcode", None) == "42P07"
+            )
+
+        try:
+            if isinstance(conn, AsyncConnection):
+                async with conn.begin_nested():
+                    await ddl.execute(conn, schema=schema)
+            else:
+                # No nested-savepoint support (e.g. engine-level resource):
+                # rely on IF NOT EXISTS and tolerate the rare race directly.
+                await ddl.execute(conn, schema=schema)
+        except Exception as exc:
+            if _is_duplicate(exc):
+                logger.debug(
+                    "Policy partition %s.%s existed (concurrently created).",
+                    schema, partition_name,
+                )
+                return
+            raise
 
     async def ensure_policy_partition(self, conn: DbResource, partition_key: str, schema: str = "iam"):
         from dynastore.tools.db import validate_sql_identifier

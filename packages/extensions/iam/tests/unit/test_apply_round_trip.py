@@ -23,7 +23,7 @@ Uses an in-memory state dict to simulate a minimal policy + role store.
 from __future__ import annotations
 
 from typing import Any, Dict, List
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from dynastore.extensions.iam.presets.iam_baseline import (
@@ -98,6 +98,11 @@ class _InMemoryStore:
         iam_svc.update_role = _update_role
         iam_svc.list_roles = _list_roles
         iam_svc.delete_role = _delete_role
+        # apply() binds IAM-service policies additively via bind_policy_to_role
+        # (append+dedupe), distinct from update_role's full-replace. These
+        # round-trip tests assert only on the policy store + descriptor payload,
+        # not on role bindings, so a no-op async stub is sufficient.
+        iam_svc.bind_policy_to_role = AsyncMock()
 
         return PresetContext(
             db=MagicMock(),

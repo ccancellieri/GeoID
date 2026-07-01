@@ -223,6 +223,54 @@ def test_failing_sync_initializer_savepoint_rolled_back(fake_conn):
     ]
 
 
+def test_failing_critical_initializer_reraises_after_rollback(fake_conn):
+    """A hook registered ``critical=True`` must NOT be swallowed: its
+    SAVEPOINT is still rolled back cleanly (so siblings are unharmed
+    mid-flight), but the exception then re-raises so the caller aborts
+    the whole catalog create. This is the #2610 guarantee — a table
+    authorization hard-depends on cannot be silently dropped."""
+    mgr = _build_manager()
+
+    async def critical_init(conn, schema, catalog_id):
+        conn.events.append(f"init-critical:{schema}/{catalog_id}")
+        raise ValueError("iam boom")
+
+    # Production sets this via ``sync_catalog_initializer(critical=True)``.
+    critical_init._lifecycle_critical = True
+
+    with pytest.raises(ValueError, match="iam boom"):
+        asyncio.run(
+            mgr._run_initializer_isolated(
+                fake_conn, "iam-label", critical_init, fake_conn, "s", "c"
+            )
+        )
+
+    # Savepoint still rolled back cleanly before the re-raise.
+    assert fake_conn.events == [
+        "savepoint:enter",
+        "init-critical:s/c",
+        "savepoint:exit-rollback(ValueError)",
+    ]
+
+
+def test_non_critical_initializer_is_swallowed_by_default(fake_conn):
+    """Default (``critical`` unset) hooks keep the isolated-and-skip
+    contract: a failure returns False, never re-raises, so one optional
+    module cannot block catalog creation."""
+    mgr = _build_manager()
+
+    async def optional_init(conn, schema, catalog_id):
+        raise ValueError("optional boom")
+
+    # No _lifecycle_critical attribute → getattr default False.
+    ok = asyncio.run(
+        mgr._run_initializer_isolated(
+            fake_conn, "opt-label", optional_init, fake_conn, "s", "c"
+        )
+    )
+    assert ok is False
+
+
 def test_source_does_not_precall_initializer_in_init_catalog():
     """Source-level pin: ``init_catalog`` and ``init_collection`` must
     NOT pre-call the initializer before passing it to

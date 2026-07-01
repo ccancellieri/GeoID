@@ -673,9 +673,20 @@ async def _seed_catalog_roles(conn: Any, schema: str, iam_storage: Any) -> None:
                 )
 
 
-@lifecycle_registry.sync_catalog_initializer()
+@lifecycle_registry.sync_catalog_initializer(critical=True)
 async def initialize_iam_tenant(conn: DbResource, schema: str, catalog_id: str):
-    """Initializes IAM and Policy tables within a tenant schema."""
+    """Initializes IAM and Policy tables within a tenant schema.
+
+    Registered ``critical=True``: this hook is the single owner of every
+    per-tenant IAM table (``roles``, ``role_hierarchy``, ``grants``,
+    ``policies`` + partitions). Authorization hard-depends on ``policies``,
+    so a silent SAVEPOINT rollback here (leaving a catalog that fails closed
+    with a 403 on every request) is worse than failing the create. Being
+    critical, a rollback aborts catalog creation so the tables commit
+    atomically with the catalog or not at all. The DDL is idempotent
+    (``CREATE ... IF NOT EXISTS`` + table sentinel), so a re-provision of a
+    catalog missing any table self-heals on the next create.
+    """
     logger.info(
         f"Initializing IAM tables for tenant: {catalog_id} in schema {schema}"
     )

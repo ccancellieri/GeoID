@@ -126,13 +126,12 @@ def _build_tenant_core_ddl_batch(schema: str) -> "DDLBatch":
     ``collection_stac``) are created by
     :func:`ensure_tenant_metadata_domain_tables` — not in this batch.
 
-    IAM tables (``roles``, ``role_hierarchy``, ``grants``) are managed by
-    :func:`_build_tenant_iam_ddl_batch`, which runs immediately after this
-    batch in :meth:`CatalogService._run_core_init`.  Keeping them in a
-    separate batch with their own sentinel (``grants``) ensures that
-    catalogs provisioned before IAM was added to the schema get the
-    missing tables on the next provision/re-provision without requiring a
-    full tear-down.
+    IAM tables are not created here.  IAM is an optional, self-contained
+    module and owns its own per-tenant persistence: its ``critical``
+    lifecycle initializer (``initialize_iam_tenant``) creates ``roles``,
+    ``role_hierarchy``, ``grants`` and ``policies`` (+ partitions) inside the
+    same creation transaction.  Core stays IAM-agnostic and interacts only
+    through the lifecycle-hook contract.
     """
     from dynastore.modules.db_config.query_executor import DDLBatch
     from dynastore.modules.db_config.locking_tools import check_table_exists
@@ -146,58 +145,6 @@ def _build_tenant_core_ddl_batch(schema: str) -> "DDLBatch":
         steps=[
             DDLQuery(TENANT_COLLECTIONS_DDL),
             DDLQuery(tenant_configs_sql, check_query=_check_sentinel),
-        ],
-    )
-
-
-def _build_tenant_iam_ddl_batch(schema: str) -> "DDLBatch":
-    """Build the per-tenant IAM DDL batch (``roles``, ``role_hierarchy``, ``grants``).
-
-    Sentinel: ALL three per-scope IAM tables must be present for the batch to
-    be skipped on warm start.  A catalog missing ANY one of them — for example
-    one provisioned before ``role_hierarchy`` was added to the schema — will
-    have the missing table(s) created on the next provision without requiring a
-    full re-provision (#2569 residual fix).
-
-    Each step uses ``CREATE TABLE/INDEX IF NOT EXISTS`` so the batch is fully
-    idempotent: re-running on a fully-provisioned catalog is a no-op.
-
-    Default role rows are seeded by the ``IamModule`` lifecycle hook
-    ``initialize_iam_tenant`` via :meth:`PolicyService.provision_default_policies`
-    (config-driven via ``IamRolesConfig.catalog_roles``).  That seed runs in
-    step 4 of :meth:`CatalogService._run_core_init` — after both DDL batches
-    have completed — so roles and hierarchy rows are not duplicated here.
-    """
-    from dynastore.modules.db_config.query_executor import DDLBatch
-    from dynastore.modules.db_config.locking_tools import check_table_exists
-    from dynastore.modules.iam.iam_queries import (
-        CREATE_ROLES_TABLE,
-        CREATE_ROLE_HIERARCHY_TABLE,
-        CREATE_GRANTS_TABLE,
-    )
-
-    # All three tables must exist for the warm-start skip to fire.
-    # Short-circuits on the first missing table (FK order: roles → role_hierarchy → grants).
-    _IAM_BATCH_TABLES = ("roles", "role_hierarchy", "grants")
-
-    async def _check_iam_sentinel(conn):
-        for tbl in _IAM_BATCH_TABLES:
-            if not await check_table_exists(conn, tbl, schema):
-                return False
-        return True
-
-    return DDLBatch(
-        # The sentinel SQL is never executed by DDLBatch — only its existence
-        # check is used.  A minimal stub avoids duplicating the full DDL
-        # templates while keeping the intent legible.
-        sentinel=DDLQuery(
-            "SELECT 1 -- iam sentinel: all per-tenant IAM tables",
-            check_query=_check_iam_sentinel,
-        ),
-        steps=[
-            CREATE_ROLES_TABLE,
-            CREATE_ROLE_HIERARCHY_TABLE,
-            CREATE_GRANTS_TABLE,
         ],
     )
 
@@ -1216,19 +1163,14 @@ class CatalogService(CatalogsProtocol):
             conn, schema=physical_schema
         )
 
-        # 2a. IAM Tables (roles, role_hierarchy, grants).
-        # Kept in a separate batch with its own sentinel (grants) so that
-        # catalogs provisioned before IAM tables were introduced get the
-        # missing tables on re-provision without a full tear-down (#2569).
-        await _build_tenant_iam_ddl_batch(physical_schema).execute(
-            conn, schema=physical_schema
-        )
-
-        # 2b. Catalog-tier IAM seeding is performed by the IamModule's
-        # lifecycle hook ``initialize_iam_tenant`` which calls
-        # ``PolicyService.provision_default_policies(catalog_id, ...)``.
-        # That path is config-driven (``IamRolesConfig.catalog_roles``)
-        # and replaces the historical inline SQL seed (geoid#643).
+        # 2a. IAM tenant tables are NOT created here.  IAM is an optional,
+        # self-contained module that owns its own per-tenant persistence
+        # (``roles``, ``role_hierarchy``, ``grants``, ``policies`` + partitions)
+        # via its ``critical`` lifecycle initializer ``initialize_iam_tenant``,
+        # which runs in step 4 below inside this same creation transaction.
+        # Being ``critical`` it fails the create rather than leaving a catalog
+        # half-provisioned for authorization (#2610).  Catalog-tier role seeding
+        # is config-driven (``IamRolesConfig.catalog_roles``) inside that hook.
 
         # 3. Per-tenant collection-metadata CORE table.  STAC sidecar
         # (when StacModule is loaded) attaches via lifecycle_registry

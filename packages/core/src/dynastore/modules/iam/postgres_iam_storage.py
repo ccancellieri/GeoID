@@ -114,15 +114,16 @@ class PostgresIamStorage(AbstractIamStorage, AuthorizationStorageProtocol):
         (consumed via `PolicyService._resolve_schema(catalog_id)`).
         `principals` / `identity_links` / `refresh_tokens` / `audit_log` /
         `usage_counters` live platform-only: every read/write path pins
-        `schema="iam"`, so the tenant copies were dead weight. The
-        catalog provisioning lifecycle hook
-        (`catalog_service._build_tenant_iam_ddl_batch`) bootstraps the
-        tenant subset; this method overlaps with it (idempotent CREATE
-        TABLE IF NOT EXISTS) and adds the `policies` table that the
-        catalog hook doesn't.
+        `schema="iam"`, so the tenant copies were dead weight. This method
+        is the single owner of the tenant subset — it is invoked by the
+        `critical` catalog lifecycle hook `initialize_iam_tenant`, so the
+        four per-tenant tables (`roles`, `role_hierarchy`, `grants`,
+        `policies`) commit atomically with the catalog or the create is
+        aborted (#2610). Core no longer bootstraps any IAM table.
 
         Uses DDLBatch sentinel check — on warm start, 1 query confirms
-        all tables exist.
+        all tables exist; missing tables self-heal on the next provision
+        (idempotent CREATE TABLE IF NOT EXISTS + 4-table sentinel).
         """
         # Strip quotes just in case, to prevent double quoting.
         schema = schema.strip('"')
