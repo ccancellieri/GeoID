@@ -200,6 +200,18 @@ async def enqueue_collection_reindex_task(
         )
 
 
+# Cap on the per-indexer failure-detail sample carried across batches, and
+# the bounded merge itself, live in dynastore.models.protocols.indexer
+# (shared with the other two accumulation sites — IndexDispatcher's
+# per-chunk aggregation and item_service's per-batch aggregation — #2657).
+# Re-exported under the historical private name so existing call sites and
+# tests in this module are unaffected.
+from dynastore.models.protocols.indexer import (
+    MAX_ACCUMULATED_FAILURE_SAMPLES as _MAX_ACCUMULATED_FAILURE_SAMPLES,  # noqa: F401
+    merge_bulk_results as _merge_bulk_results,
+)
+
+
 def _merge_index_results(
     accumulated: Dict[str, Any],
     batch_results: Dict[str, Any],
@@ -207,14 +219,7 @@ def _merge_index_results(
     """Merge per-batch BulkResult entries into the running totals in-place."""
     for indexer_id, bulk_res in batch_results.items():
         if indexer_id in accumulated:
-            prev = accumulated[indexer_id]
-            from dynastore.models.protocols.indexer import BulkResult
-            accumulated[indexer_id] = BulkResult(
-                total=prev.total + bulk_res.total,
-                succeeded=prev.succeeded + bulk_res.succeeded,
-                failed=prev.failed + bulk_res.failed,
-                failures=prev.failures + bulk_res.failures,
-            )
+            accumulated[indexer_id] = _merge_bulk_results(accumulated[indexer_id], bulk_res)
         else:
             accumulated[indexer_id] = bulk_res
 

@@ -163,6 +163,27 @@ def _collect_generated_stats(
     return flat
 
 
+def _merge_index_results_into(
+    existing: Dict[str, Any],
+    batch_results: Dict[str, Any],
+) -> None:
+    """Merge one write's per-indexer ``BulkResult``s into the running
+    per-request totals in-place (``ctx.extensions["_index_results"]``).
+
+    Bounded merge (#2657) — delegates to :func:`merge_bulk_results` so the
+    accumulated ``failures`` detail list stays capped even when a single
+    request folds in many chunked writes (e.g. the ingestion task's inline
+    per-batch dispatch), instead of growing unbounded across the request.
+    """
+    from dynastore.models.protocols.indexer import merge_bulk_results
+
+    for indexer_id, bulk_res in batch_results.items():
+        if indexer_id in existing:
+            existing[indexer_id] = merge_bulk_results(existing[indexer_id], bulk_res)
+        else:
+            existing[indexer_id] = bulk_res
+
+
 async def _storage_resolves_columnar_async(
     configs: Any,
     catalog_id: str,
@@ -1210,19 +1231,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 # without additional round-trips.
                 if ctx is not None and _index_results:
                     existing = ctx.extensions.get("_index_results") or {}
-                    # Merge per-batch results: accumulate succeeded/failed totals.
-                    for indexer_id, bulk_res in _index_results.items():
-                        if indexer_id in existing:
-                            prev = existing[indexer_id]
-                            from dynastore.models.protocols.indexer import BulkResult
-                            existing[indexer_id] = BulkResult(
-                                total=prev.total + bulk_res.total,
-                                succeeded=prev.succeeded + bulk_res.succeeded,
-                                failed=prev.failed + bulk_res.failed,
-                                failures=prev.failures + bulk_res.failures,
-                            )
-                        else:
-                            existing[indexer_id] = bulk_res
+                    _merge_index_results_into(existing, _index_results)
                     ctx.extensions["_index_results"] = existing
 
             # Write-reactive tile-cache invalidation (#1292 / #1297 Phase 2b):

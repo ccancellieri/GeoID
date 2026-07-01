@@ -70,6 +70,7 @@ from dynastore.models.protocols.indexer import (
     Indexer,
     IndexContext,
     IndexOp,
+    merge_bulk_results,
 )
 from dynastore.models.protocols.indexing import IndexableOp, OutboxStore
 from dynastore.modules.storage.routing_config import (
@@ -1148,12 +1149,10 @@ class IndexDispatcher:
                 collection=ctx.collection,
                 chunk_size=len(chunk),
             )
-            aggregated = BulkResult(
-                total=aggregated.total + chunk_result.total,
-                succeeded=aggregated.succeeded + chunk_result.succeeded,
-                failed=aggregated.failed + chunk_result.failed,
-                failures=[*aggregated.failures, *chunk_result.failures],
-            )
+            # Bounded merge (#2657) — an unbounded concat here was one of
+            # three uncapped accumulation sites driving peak RSS to
+            # O(dataset) instead of O(chunk) on a degraded secondary index.
+            aggregated = merge_bulk_results(aggregated, chunk_result)
         return aggregated
 
     async def _handle_failure(

@@ -141,6 +141,37 @@ class BulkResult(BaseModel):
     failures: List[Dict[str, Any]] = Field(default_factory=list)
 
 
+# Cap the per-indexer failure-detail sample carried across every site that
+# merges ``BulkResult``s (chunk aggregation in ``IndexDispatcher``, per-batch
+# aggregation in ``item_service``, and the cross-batch accumulator in the
+# ingestion task). The accumulated ``failures`` list is only ever read as a
+# debugging sample — indexer health is classified purely on the integer
+# counts — so an unbounded concatenation across chunks/batches is pure
+# memory growth. On a large ingest against a degraded secondary index (e.g.
+# an Elasticsearch endpoint under load returning per-doc errors), each
+# failure dict carries an echoed payload and the list grows without bound,
+# driving peak RSS to O(dataset) instead of O(chunk). Bounding at every
+# merge site — not just the outermost one — is what keeps peak memory
+# proportional to a single chunk.
+MAX_ACCUMULATED_FAILURE_SAMPLES = 100
+
+
+def merge_bulk_results(prev: "BulkResult", curr: "BulkResult") -> "BulkResult":
+    """Merge two :class:`BulkResult`\\ s, capping the accumulated
+    ``failures`` detail list at :data:`MAX_ACCUMULATED_FAILURE_SAMPLES`.
+
+    The integer counts (``total``/``succeeded``/``failed``) stay exact
+    regardless of how many merges are folded in; only the debugging sample
+    is bounded.
+    """
+    return BulkResult(
+        total=prev.total + curr.total,
+        succeeded=prev.succeeded + curr.succeeded,
+        failed=prev.failed + curr.failed,
+        failures=(prev.failures + curr.failures)[-MAX_ACCUMULATED_FAILURE_SAMPLES:],
+    )
+
+
 @runtime_checkable
 class Indexer(Protocol):
     """Slim, generic index sink.
