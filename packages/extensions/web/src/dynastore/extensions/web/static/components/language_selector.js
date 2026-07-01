@@ -2,6 +2,15 @@
  * Shared Language Selector Component
  * Centralized logic for language switching across extensions.
  */
+function escapeHtml(s) {
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 class LanguageSelector extends HTMLElement {
     constructor() {
         super();
@@ -43,11 +52,14 @@ class LanguageSelector extends HTMLElement {
     render() {
         const currentLang = this.getCurrentLang();
         const currentLangName = this.languages[currentLang] || currentLang.toUpperCase();
+        // currentLang is read from the `language` URL query parameter, so it is
+        // attacker-influenceable; escape before interpolating into markup.
+        const safeLangLabel = escapeHtml(currentLang.toUpperCase());
 
         this.innerHTML = `
             <div class="ds-lang-selector">
                 <button class="ds-lang-btn" id="ds-lang-trigger" aria-haspopup="true" aria-expanded="false">
-                    <span class="ds-lang-label">${currentLang.toUpperCase()}</span>
+                    <span class="ds-lang-label">${safeLangLabel}</span>
                     <svg class="ds-icon-chevron" viewBox="0 0 20 20" fill="currentColor">
                         <path fill-rule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clip-rule="evenodd" />
                     </svg>

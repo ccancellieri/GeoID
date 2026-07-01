@@ -165,7 +165,9 @@ window.addEventListener('load', function() {
 
             const titleDiv = document.createElement('div');
             titleDiv.className = 'header-app-title';
-            titleDiv.innerHTML = `${appTitleText}`;
+            // appTitleText comes from the OpenAPI spec's info.description — a
+            // plain title, never markup — so it must be set as text, not HTML.
+            titleDiv.textContent = appTitleText;
             leftSection.appendChild(titleDiv);
 
             wrapper.appendChild(leftSection);

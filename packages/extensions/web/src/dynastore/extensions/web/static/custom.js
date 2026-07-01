@@ -38,7 +38,6 @@ function apiRoot() {
     return _SCRIPT_ROOT;
 }
 
-
 // --- I18n & Interface Logic ---
 function toggleLangDropdown() {
     const dd = document.getElementById('lang-dropdown');
@@ -95,7 +94,11 @@ async function loadSidebar() {
             return a.title.localeCompare(b.title);
         });
 
-        container.innerHTML = topLevelPages.map(page => {
+        // Built imperatively (not via innerHTML string interpolation): page
+        // titles/icons/ids come from the config-driven `config/pages` payload,
+        // which is admin-editable and must not be trusted as literal HTML.
+        container.replaceChildren();
+        topLevelPages.forEach(page => {
             // Find pages targeting this one as a section (never list a page as
             // its own child, in case a promoted app shares its id with a section).
             const subPages = pages.filter(p => p.section === page.id && p.id !== page.id).sort((a, b) => (b.priority || 0) - (a.priority || 0));
@@ -105,41 +108,64 @@ async function loadSidebar() {
             const storageKey = `ds_nav_section_${page.id}`;
             const isCollapsed = hasSubPages && localStorage.getItem(storageKey) === 'collapsed';
 
-            let subHtml = '';
+            const group = document.createElement('div');
+            group.className = `nav-group${isCollapsed ? ' ds-nav-group-collapsed' : ''}`;
+            group.dataset.sectionId = page.id;
+
+            const row = document.createElement('div');
+            row.className = 'flex items-center gap-1';
+
+            const mainBtn = document.createElement('button');
+            mainBtn.id = `nav-${page.id}`;
+            mainBtn.className = 'nav-btn flex-1 flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/5 transition-all group';
+            mainBtn.addEventListener('click', () => switchTab(page.id));
+            const mainIcon = document.createElement('i');
+            mainIcon.className = `fa-solid ${page.icon} text-lg w-6 text-center group-hover:text-blue-400 transition-colors`;
+            const mainLabel = document.createElement('span');
+            mainLabel.className = 'hidden lg:block text-sm font-medium';
+            mainLabel.textContent = page.title;
+            mainBtn.appendChild(mainIcon);
+            mainBtn.appendChild(mainLabel);
+            row.appendChild(mainBtn);
+
             if (hasSubPages) {
-                subHtml = `
-                    <div class="nav-subsection mt-1 mb-3 ml-4 border-l border-white/5 pl-2 space-y-1 hidden lg:block${isCollapsed ? ' ds-nav-hidden' : ''}">
-                        ${subPages.map(s => `
-                            <button onclick="switchTab('${s.id}')" id="nav-${s.id}" class="nav-btn w-full flex items-center gap-2 px-3 py-1.5 rounded-lg text-slate-500 hover:text-blue-400 hover:bg-white/5 transition-all text-xs">
-                                <i class="fa-solid ${s.icon} w-4 text-center text-[10px]"></i>
-                                <span class="truncate font-medium">${s.title}</span>
-                            </button>
-                        `).join('')}
-                    </div>
-                `;
+                const chevronBtn = document.createElement('button');
+                chevronBtn.className = `nav-chevron ml-auto hidden lg:flex items-center justify-center w-5 h-5 text-slate-500 hover:text-slate-300 transition-all flex-shrink-0${isCollapsed ? ' ds-chevron-collapsed' : ''}`;
+                chevronBtn.setAttribute('aria-label', `Toggle ${page.title} section`);
+                chevronBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    toggleNavSection(page.id, chevronBtn);
+                });
+                const chevronIcon = document.createElement('i');
+                chevronIcon.className = 'fa-solid fa-chevron-down text-[10px] transition-transform duration-200';
+                chevronBtn.appendChild(chevronIcon);
+                row.appendChild(chevronBtn);
             }
 
-            const chevronHtml = hasSubPages ? `
-                <button class="nav-chevron ml-auto hidden lg:flex items-center justify-center w-5 h-5 text-slate-500 hover:text-slate-300 transition-all flex-shrink-0${isCollapsed ? ' ds-chevron-collapsed' : ''}"
-                        aria-label="Toggle ${page.title} section"
-                        onclick="event.stopPropagation(); toggleNavSection('${page.id}', this)">
-                    <i class="fa-solid fa-chevron-down text-[10px] transition-transform duration-200"></i>
-                </button>
-            ` : '';
+            group.appendChild(row);
 
-            return `
-                <div class="nav-group${isCollapsed ? ' ds-nav-group-collapsed' : ''}" data-section-id="${page.id}">
-                    <div class="flex items-center gap-1">
-                        <button onclick="switchTab('${page.id}')" id="nav-${page.id}" class="nav-btn flex-1 flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/5 transition-all group">
-                            <i class="fa-solid ${page.icon} text-lg w-6 text-center group-hover:text-blue-400 transition-colors"></i>
-                            <span class="hidden lg:block text-sm font-medium">${page.title}</span>
-                        </button>
-                        ${chevronHtml}
-                    </div>
-                    ${subHtml}
-                </div>
-            `;
-        }).join('');
+            if (hasSubPages) {
+                const subDiv = document.createElement('div');
+                subDiv.className = `nav-subsection mt-1 mb-3 ml-4 border-l border-white/5 pl-2 space-y-1 hidden lg:block${isCollapsed ? ' ds-nav-hidden' : ''}`;
+                subPages.forEach(s => {
+                    const subBtn = document.createElement('button');
+                    subBtn.id = `nav-${s.id}`;
+                    subBtn.className = 'nav-btn w-full flex items-center gap-2 px-3 py-1.5 rounded-lg text-slate-500 hover:text-blue-400 hover:bg-white/5 transition-all text-xs';
+                    subBtn.addEventListener('click', () => switchTab(s.id));
+                    const subIcon = document.createElement('i');
+                    subIcon.className = `fa-solid ${s.icon} w-4 text-center text-[10px]`;
+                    const subLabel = document.createElement('span');
+                    subLabel.className = 'truncate font-medium';
+                    subLabel.textContent = s.title;
+                    subBtn.appendChild(subIcon);
+                    subBtn.appendChild(subLabel);
+                    subDiv.appendChild(subBtn);
+                });
+                group.appendChild(subDiv);
+            }
+
+            container.appendChild(group);
+        });
 
         // Ensure current active tab is highlighted
         updateActiveNav();
@@ -147,6 +173,33 @@ async function loadSidebar() {
     } catch (e) {
         console.error("Sidebar load error:", e);
     }
+}
+
+/**
+ * Build a "load failed" panel (icon + message lines + retry button) without
+ * ever passing dynamic values (tabId, error message) through an HTML string.
+ */
+function _buildLoadErrorPanel({ wrapperClass, iconClass, lines, retryClass, tabId }) {
+    const wrapper = document.createElement('div');
+    wrapper.className = wrapperClass;
+    const icon = document.createElement('i');
+    icon.className = iconClass;
+    wrapper.appendChild(icon);
+    for (const line of lines) {
+        const p = document.createElement('p');
+        if (line.className) p.className = line.className;
+        p.textContent = line.text;
+        wrapper.appendChild(p);
+    }
+    const btn = document.createElement('button');
+    btn.className = retryClass;
+    btn.addEventListener('click', () => window.switchTab(tabId));
+    const btnIcon = document.createElement('i');
+    btnIcon.className = 'fa-solid fa-redo mr-2';
+    btn.appendChild(btnIcon);
+    btn.appendChild(document.createTextNode('Retry'));
+    wrapper.appendChild(btn);
+    return wrapper;
 }
 
 function toggleNavSection(sectionId, chevronBtn) {
@@ -245,7 +298,14 @@ async function switchTab(tabId) {
             }
             contentArea.classList.remove('max-w-7xl', 'mx-auto', 'fade-in');
             contentArea.style.cssText = 'height:100%;display:flex;flex-direction:column;';
-            contentArea.innerHTML = `<iframe src="pages/${tabId}?language=${currentLocale}" style="width:100%;flex:1;border:none;display:block;" allowfullscreen></iframe>`;
+            // Built via DOM (not an innerHTML template): tabId is attacker-influenceable
+            // (derived from the URL hash), so it must only ever reach the `src` property,
+            // never be parsed as HTML markup.
+            const _iframe = document.createElement('iframe');
+            _iframe.src = `pages/${tabId}?language=${currentLocale}`;
+            Object.assign(_iframe.style, { width: '100%', flex: '1', border: 'none', display: 'block' });
+            _iframe.setAttribute('allowfullscreen', '');
+            contentArea.replaceChildren(_iframe);
         } else {
             // Fragment: inject HTML then check if it requests full-height treatment.
             // Check both the root element (explicit opt-in) and any descendant
@@ -294,26 +354,32 @@ async function switchTab(tabId) {
         console.error(`Error switching to tab ${tabId}:`, e);
         clearTimeout(timeoutId);
         
+        // Built via DOM, not innerHTML templates: tabId is attacker-influenceable
+        // (URL hash) and e.message may echo it back, so neither can be interpolated
+        // into an HTML string (both the markup and the inline "onclick" handler
+        // were injectable via a crafted hash).
         if (e.name === 'AbortError') {
-            contentArea.innerHTML = `
-                <div class="p-20 text-center">
-                    <i class="fa-solid fa-clock text-4xl mb-4 text-yellow-500"></i>
-                    <p class="text-lg mb-2">Loading timed out</p>
-                    <p class="text-sm text-gray-500 mb-4">The page took too long to load.</p>
-                    <button onclick="window.switchTab('${tabId}')" class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600">
-                        <i class="fa-solid fa-redo mr-2"></i>Retry
-                    </button>
-                </div>`;
+            contentArea.replaceChildren(_buildLoadErrorPanel({
+                wrapperClass: 'p-20 text-center',
+                iconClass: 'fa-solid fa-clock text-4xl mb-4 text-yellow-500',
+                lines: [
+                    { text: 'Loading timed out', className: 'text-lg mb-2' },
+                    { text: 'The page took too long to load.', className: 'text-sm text-gray-500 mb-4' },
+                ],
+                retryClass: 'px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600',
+                tabId,
+            }));
         } else {
-            contentArea.innerHTML = `
-                <div class="p-20 text-center text-red-400">
-                    <i class="fa-solid fa-triangle-exclamation text-4xl mb-4"></i>
-                    <p>Failed to load ${tabId}</p>
-                    <p class="text-sm mt-2">${e.message}</p>
-                    <button onclick="window.switchTab('${tabId}')" class="mt-4 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600">
-                        <i class="fa-solid fa-redo mr-2"></i>Retry
-                    </button>
-                </div>`;
+            contentArea.replaceChildren(_buildLoadErrorPanel({
+                wrapperClass: 'p-20 text-center text-red-400',
+                iconClass: 'fa-solid fa-triangle-exclamation text-4xl mb-4',
+                lines: [
+                    { text: `Failed to load ${tabId}` },
+                    { text: e.message, className: 'text-sm mt-2' },
+                ],
+                retryClass: 'mt-4 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600',
+                tabId,
+            }));
         }
     }
 
@@ -349,20 +415,45 @@ async function loadExtensions() {
             return;
         }
 
-        container.innerHTML = appPages.map(page => `
-            <div class="glass-card p-6 rounded-xl hover:bg-white/5 transition-colors group cursor-pointer border border-white/5 hover:border-blue-500/30" onclick="openExtension('${page.id}')">
-                <div class="flex items-start justify-between mb-4">
-                    <div class="w-12 h-12 bg-blue-500/10 rounded-lg flex items-center justify-center text-blue-400 group-hover:scale-110 transition-transform">
-                        <i class="fa-solid ${page.icon} text-xl"></i>
-                    </div>
-                </div>
-                <h3 class="text-lg font-bold text-white mb-2">${page.title}</h3>
-                <p class="text-sm text-slate-400 mb-6 h-10 overflow-hidden text-ellipsis line-clamp-2">${page.description || 'No description available.'}</p>
-                <div class="flex items-center text-blue-400 text-xs font-mono font-bold group-hover:underline uppercase tracking-wider">
-                    Launch App <i class="fa-solid fa-arrow-right ml-2 opacity-0 group-hover:opacity-100 transition-opacity"></i>
-                </div>
-            </div>
-        `).join('');
+        // Built imperatively: page title/icon/description are config-driven
+        // (admin-editable via `config/pages`), so they must not be interpolated
+        // into an HTML string.
+        container.replaceChildren();
+        appPages.forEach(page => {
+            const card = document.createElement('div');
+            card.className = 'glass-card p-6 rounded-xl hover:bg-white/5 transition-colors group cursor-pointer border border-white/5 hover:border-blue-500/30';
+            card.addEventListener('click', () => openExtension(page.id));
+
+            const iconWrap = document.createElement('div');
+            iconWrap.className = 'flex items-start justify-between mb-4';
+            const iconBox = document.createElement('div');
+            iconBox.className = 'w-12 h-12 bg-blue-500/10 rounded-lg flex items-center justify-center text-blue-400 group-hover:scale-110 transition-transform';
+            const icon = document.createElement('i');
+            icon.className = `fa-solid ${page.icon} text-xl`;
+            iconBox.appendChild(icon);
+            iconWrap.appendChild(iconBox);
+
+            const title = document.createElement('h3');
+            title.className = 'text-lg font-bold text-white mb-2';
+            title.textContent = page.title;
+
+            const desc = document.createElement('p');
+            desc.className = 'text-sm text-slate-400 mb-6 h-10 overflow-hidden text-ellipsis line-clamp-2';
+            desc.textContent = page.description || 'No description available.';
+
+            const launch = document.createElement('div');
+            launch.className = 'flex items-center text-blue-400 text-xs font-mono font-bold group-hover:underline uppercase tracking-wider';
+            launch.appendChild(document.createTextNode('Launch App '));
+            const arrowIcon = document.createElement('i');
+            arrowIcon.className = 'fa-solid fa-arrow-right ml-2 opacity-0 group-hover:opacity-100 transition-opacity';
+            launch.appendChild(arrowIcon);
+
+            card.appendChild(iconWrap);
+            card.appendChild(title);
+            card.appendChild(desc);
+            card.appendChild(launch);
+            container.appendChild(card);
+        });
 
     } catch (e) {
         console.error("Extensions load error:", e);
@@ -423,7 +514,19 @@ async function initDocs() {
         handleHashChange();
     } catch (e) {
         console.error(e);
-        if (contentDiv) contentDiv.innerHTML = `<div class="p-6 border border-red-500/20 bg-red-500/10 rounded-lg text-red-400"><h3>Error</h3><p>${e.message}</p></div>`;
+        // Built via DOM: e.message may echo back server/network error text and
+        // must be shown as plain text, never parsed as HTML.
+        if (contentDiv) {
+            const wrap = document.createElement('div');
+            wrap.className = 'p-6 border border-red-500/20 bg-red-500/10 rounded-lg text-red-400';
+            const h3 = document.createElement('h3');
+            h3.textContent = 'Error';
+            const p = document.createElement('p');
+            p.textContent = e.message;
+            wrap.appendChild(h3);
+            wrap.appendChild(p);
+            contentDiv.replaceChildren(wrap);
+        }
         if (sidebarDiv) sidebarDiv.innerHTML = '<div class="text-red-400 text-xs p-4">Error loading docs</div>';
     }
 }
@@ -516,7 +619,12 @@ async function loadDocContent(docId) {
             if (!header.id) header.id = header.textContent.toLowerCase().trim().replace(/[^\w\s-]/g, '').replace(/\s/g, '-');
         });
     } catch (e) {
-        contentDiv.innerHTML = `<div class="p-8 text-center text-red-400 border border-red-500/20 bg-red-500/5 rounded-xl">Document not found: ${docId}</div>`;
+        // Built via DOM: docId is attacker-influenceable (URL hash), so it
+        // must be shown as plain text, never parsed as HTML.
+        const div = document.createElement('div');
+        div.className = 'p-8 text-center text-red-400 border border-red-500/20 bg-red-500/5 rounded-xl';
+        div.textContent = `Document not found: ${docId}`;
+        contentDiv.replaceChildren(div);
     }
 }
 
@@ -662,7 +770,38 @@ async function fetchDashboardTasks() {
         if(!res.ok) return;
         const tasks = await res.json();
         const container = document.getElementById('dashboard-tasks');
-        if(container) container.innerHTML = tasks.length ? tasks.map(t => `<div class="p-2 border-b border-white/5"><div class="flex justify-between"><div class="font-bold text-sm">${t.type}</div><div class="text-xs text-purple-300 bg-purple-500/10 px-1 rounded">${t.status}</div></div><div class="text-[10px] text-slate-500">${t.id}</div></div>`).join('') : '<div class="text-slate-500 text-center py-4">No active tasks</div>';
+        // Built via DOM: task type/status/id are server-derived and must not be
+        // interpolated into an HTML string.
+        if (container) {
+            container.replaceChildren();
+            if (tasks.length) {
+                for (const t of tasks) {
+                    const row = document.createElement('div');
+                    row.className = 'p-2 border-b border-white/5';
+                    const top = document.createElement('div');
+                    top.className = 'flex justify-between';
+                    const typeEl = document.createElement('div');
+                    typeEl.className = 'font-bold text-sm';
+                    typeEl.textContent = t.type;
+                    const statusEl = document.createElement('div');
+                    statusEl.className = 'text-xs text-purple-300 bg-purple-500/10 px-1 rounded';
+                    statusEl.textContent = t.status;
+                    top.appendChild(typeEl);
+                    top.appendChild(statusEl);
+                    const idEl = document.createElement('div');
+                    idEl.className = 'text-[10px] text-slate-500';
+                    idEl.textContent = t.id;
+                    row.appendChild(top);
+                    row.appendChild(idEl);
+                    container.appendChild(row);
+                }
+            } else {
+                const empty = document.createElement('div');
+                empty.className = 'text-slate-500 text-center py-4';
+                empty.textContent = 'No active tasks';
+                container.appendChild(empty);
+            }
+        }
         if(document.getElementById('stat-active-tasks')) document.getElementById('stat-active-tasks').innerText = tasks.length;
     } catch(e){}
 }
