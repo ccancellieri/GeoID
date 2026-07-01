@@ -231,14 +231,31 @@ class TestFullMessageLogged:
 
 
 class TestRegistryDispatch:
-    def test_handle_exception_routes_table_not_found_to_500(self) -> None:
+    def test_handle_exception_routes_table_not_found_to_404(self) -> None:
+        """#2658: ``TableNotFoundExceptionHandler`` is registered ahead of
+        the generic ``DatabaseErrorHandler`` and claims ``TableNotFoundError``
+        first, mapping it to a clean 404 instead of an opaque 500 — a missing
+        PG hub table means "nothing to render/query yet", not a server
+        malfunction. See ``test_table_not_found_exception_handler.py`` for
+        the dedicated coverage of that handler; this test only pins that the
+        registry ordering routes here rather than to ``DatabaseErrorHandler``.
+        """
         exc = _table_not_found("c_abc.items_xyz")
         result = handle_exception(exc)
-        assert result.status_code == 500
+        assert result.status_code == 404
         detail = str(result.detail)
         assert "c_abc" not in detail
         assert "items_xyz" not in detail
-        assert "TableNotFoundError" in detail
+
+    def test_handle_exception_routes_other_database_error_to_500(self) -> None:
+        """Non-``TableNotFoundError`` database errors still fall through to
+        the generic ``DatabaseErrorHandler`` 500 mapping."""
+        exc = _query_exec_error("40001")
+        result = handle_exception(exc)
+        assert result.status_code == 500
+        detail = str(result.detail)
+        assert "could not serialize access" not in detail
+        assert "QueryExecutionError" in detail
 
     def test_unknown_exception_still_reraises(self) -> None:
         with pytest.raises(RuntimeError):

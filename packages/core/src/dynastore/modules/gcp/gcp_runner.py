@@ -41,6 +41,11 @@ try:
 except ImportError:  # google-cloud-logging is optional within module_gcp
     ListLogEntriesRequest = None
 
+try:
+    from google.logging.type.log_severity_pb2 import LogSeverity as _LogSeverity
+except ImportError:  # google-cloud-logging is optional within module_gcp
+    _LogSeverity = None
+
 if TYPE_CHECKING:
     from dynastore.modules.tasks.liveness import LivenessVerdict
     from dynastore.models.tasks import LogPage
@@ -837,6 +842,31 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
             return None
 
     @staticmethod
+    def _severity_name(value: Any) -> Optional[str]:
+        """Map a raw Cloud Logging ``LogEntry.severity`` value to its name.
+
+        ``LogEntry.severity`` is typed as
+        ``google.logging.type.log_severity_pb2.LogSeverity`` — a legacy-style
+        protobuf enum whose values are plain ``int``s at runtime (it predates
+        the newer ``proto.Enum``/``IntEnum`` convention), so they carry no
+        ``.name`` attribute. Calling ``.name`` on that ``int`` unconditionally
+        (the pre-#2658 code did, since a proto3 enum field is never actually
+        ``None``) raised an ``AttributeError`` on every real Cloud Logging
+        response, which the caller's lenient ``except Exception`` swallowed
+        as "logs unavailable" — defeating the durable-logs read path
+        entirely. ``0`` (``DEFAULT``) means "no severity set" and is reported
+        as ``None`` to match the field's original omitted-severity intent.
+        """
+        if value is None or value == 0:
+            return None
+        if _LogSeverity is not None:
+            try:
+                return _LogSeverity.Name(value)
+            except ValueError:
+                pass
+        return str(value)
+
+    @staticmethod
     def _extract_log_message(entry: Any) -> str:
         """Best-effort extraction of a human-readable message from a
         ``LogEntry``'s oneof ``payload`` (text/json/proto)."""
@@ -940,10 +970,8 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
                     entries.append(
                         LogEntry(
                             timestamp=log_entry.timestamp,
-                            severity=(
-                                log_entry.severity.name
-                                if getattr(log_entry, "severity", None) is not None
-                                else None
+                            severity=self._severity_name(
+                                getattr(log_entry, "severity", None)
                             ),
                             message=self._extract_log_message(log_entry),
                         )
@@ -957,10 +985,22 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
                 reason = (
                     "log access not granted (roles/logging.viewer) — logs unavailable"
                 )
+                logger.warning(
+                    "GcpJobRunner.fetch_logs: read failed for runner_ref '%s' (%s) — %s.",
+                    runner_ref, exc, reason,
+                )
             else:
                 reason = f"log read failed ({type(exc).__name__}) — logs unavailable"
-            logger.warning(
-                "GcpJobRunner.fetch_logs: read failed for runner_ref '%s' (%s) — %s.",
-                runner_ref, exc, reason,
-            )
+                # Anything other than the recognized "no IAM grant" condition
+                # above is unexpected — most likely a code bug in this read
+                # path (see #2658). Log it at ERROR with a full traceback
+                # server-side so a real bug surfaces in the logs instead of
+                # silently masquerading as "no logs", while this method still
+                # honors its MUST-NOT-raise contract and returns a lenient
+                # empty page to the caller.
+                logger.error(
+                    "GcpJobRunner.fetch_logs: unexpected read failure for "
+                    "runner_ref '%s' — %s.",
+                    runner_ref, reason, exc_info=True,
+                )
             return LogPage(entries=[], note=reason)

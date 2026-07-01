@@ -213,6 +213,58 @@ def _extract_pgcode(exception: Exception) -> Optional[str]:
     return None
 
 
+class TableNotFoundExceptionHandler(ExceptionHandler):
+    """Maps ``TableNotFoundError`` (pgcode 42P01) to a clean HTTP 404.
+
+    A collection can be fully registered in the catalog/STAC index (served
+    from Elasticsearch) while its PostgreSQL feature table was never
+    persisted — e.g. an ingest job that OOM-crashed and rolled back before
+    the table-create transaction committed. Read surfaces that query the
+    PG hub table directly (maps render, vector tiles) then hit a raw
+    ``UndefinedTableError`` from asyncpg. Without this handler that bubbles
+    to the generic ``DatabaseErrorHandler`` below as an opaque 500.
+
+    The missing table means "nothing to render yet for this collection",
+    not a server malfunction, so this is surfaced as 404 with an actionable
+    message instead. Registered ahead of ``DatabaseErrorHandler`` so this
+    more specific mapping wins.
+    """
+
+    def can_handle(self, exception: Exception) -> bool:
+        from dynastore.modules.db_config.exceptions import TableNotFoundError
+
+        return isinstance(exception, TableNotFoundError)
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        from dynastore.tools.correlation import get_correlation_id
+
+        context = context or {}
+        collection_id = context.get("collection_id") or context.get("resource_id")
+        catalog_id = context.get("catalog_id")
+        cid = get_correlation_id() or "(no correlation id)"
+
+        # Full exception (may embed the physical table name) logged server-side only.
+        logger.error(
+            "Missing PostgreSQL feature table (catalog=%s, collection=%s, "
+            "correlation_id=%s): %s",
+            catalog_id, collection_id, cid, str(exception), exc_info=True,
+        )
+
+        if collection_id:
+            detail = (
+                f"Collection '{collection_id}' has no PostgreSQL feature table; "
+                f"ingest has not populated a renderable store."
+            )
+        else:
+            detail = (
+                "The requested collection has no PostgreSQL feature table; "
+                "ingest has not populated a renderable store."
+            )
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
+
+
 class DatabaseErrorHandler(ExceptionHandler):
     """Handles database errors with a sanitized HTTP response.
 
@@ -898,6 +950,7 @@ class ExceptionHandlerRegistry:
         )  # Catch programming errors before generic validation
         self.register(GcpInternalErrorHandler())  # GcpInternalError → 500 with message preserved
         self.register(DatabaseInputExceptionHandler())  # Catch DB input errors (400)
+        self.register(TableNotFoundExceptionHandler())  # 404 — missing PG hub table, not a server error
         self.register(DatabaseErrorHandler())  # Surface original DB exception details for better debugging
         self.register(ValidationExceptionHandler())  # Generic - must be last
 
