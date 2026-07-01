@@ -33,12 +33,13 @@ from dynastore.models.protocols.indexer import (
     BulkResult, IndexContext, IndexOp,
 )
 from dynastore.modules.storage.index_dispatcher import (
-    IndexDispatcher, IndexerFatal, TaskTableOutboxWriter,
-    get_index_dispatcher, reset_index_dispatcher,
+    INLINE_DISPATCH_CHUNK_SIZE, IndexDispatcher, IndexerFatal,
+    TaskTableOutboxWriter, get_index_dispatcher, reset_index_dispatcher,
 )
 from dynastore.modules.storage.routing_config import (
     FailurePolicy, Operation, OperationDriverEntry, WriteMode,
 )
+from dynastore.tools.execution_context import in_task_run, task_run_scope
 
 
 # ---------------------------------------------------------------------------
@@ -1018,6 +1019,7 @@ async def test_async_write_mode_skips_inline_index_and_enqueues():
     """An ASYNC entry must NOT call the indexer inline; all ops go to the
     outbox so ES indexing runs off the write path.
     """
+    assert not in_task_run(), "this test exercises the serving (non-task-run) path"
     a = _StubIndexer("a")
     writer = _RecordingWriter()
     ctx_with_conn = IndexContext(
@@ -1046,6 +1048,148 @@ async def test_async_write_mode_skips_inline_index_and_enqueues():
     }
     assert "i1" in enqueued_ids
     assert "i2" in enqueued_ids
+
+
+@pytest.mark.asyncio
+async def test_async_not_in_task_run_still_enqueues_outbox():
+    """Explicit companion to the test above: outside a task run, an ASYNC
+    entry preserves the existing outbox behaviour and zero rows are
+    dispatched inline.
+    """
+    assert not in_task_run()
+    a = _StubIndexer("a")
+    writer = _RecordingWriter()
+    ctx_with_conn = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_async_entry("a")],
+        indexers={"a": a},
+        outbox=writer,
+    )
+    ops = [_op(entity_id="i1"), _op(entity_id="i2")]
+    results = await dispatcher.fan_out_bulk(ctx_with_conn, ops)
+
+    assert a.bulk_calls == [], "indexer must not be called inline outside a task run"
+    assert len(writer.rows) >= 1, "outbox must be enqueued outside a task run"
+    assert results["a"].succeeded == 2
+
+
+@pytest.mark.asyncio
+async def test_async_in_task_run_dispatches_inline_and_enqueues_zero_outbox():
+    """Inside a task run, an ASYNC entry must be absorbed inline through
+    the driver-agnostic bulk path instead of spawning an outbox row.
+    """
+    a = _StubIndexer("a")
+    writer = _RecordingWriter()
+    ctx_with_conn = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_async_entry("a")],
+        indexers={"a": a},
+        outbox=writer,
+    )
+    ops = [_op(entity_id="i1"), _op(entity_id="i2")]
+    with task_run_scope():
+        results = await dispatcher.fan_out_bulk(ctx_with_conn, ops)
+
+    # Indexer received the ops inline.
+    assert len(a.bulk_calls) == 1
+    assert list(a.bulk_calls[0]) == ops
+    # Zero outbox rows — the whole point of the fix.
+    assert writer.rows == []
+    assert results["a"].succeeded == 2
+    assert results["a"].failed == 0
+
+
+@pytest.mark.asyncio
+async def test_inline_in_task_run_chunks_large_batch():
+    """A batch larger than INLINE_DISPATCH_CHUNK_SIZE is split into
+    sequential chunked driver calls; the aggregated result reflects the
+    full batch.
+    """
+    a = _StubIndexer("a")
+    writer = _RecordingWriter()
+    ctx_with_conn = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_async_entry("a")],
+        indexers={"a": a},
+        outbox=writer,
+    )
+    n = INLINE_DISPATCH_CHUNK_SIZE * 2 + 37
+    ops = [_op(entity_id=f"i{i}") for i in range(n)]
+    with task_run_scope():
+        results = await dispatcher.fan_out_bulk(ctx_with_conn, ops)
+
+    import math
+    expected_chunks = math.ceil(n / INLINE_DISPATCH_CHUNK_SIZE)
+    assert len(a.bulk_calls) == expected_chunks
+    assert sum(len(c) for c in a.bulk_calls) == n
+    assert writer.rows == []
+    assert results["a"].total == n
+    assert results["a"].succeeded == n
+
+
+@pytest.mark.asyncio
+async def test_inline_in_task_run_opens_one_short_tx_per_chunk():
+    """With a tx_factory (the in-task-run inline path), the dispatcher opens
+    a FRESH transaction per chunk — never one long-lived transaction across
+    the whole sequential fan-out — and enters/exits each one, so a busy job
+    never parks a pooled connection with an open transaction across the full
+    ES dispatch.
+    """
+    opened: list = []
+
+    class _FakeTx:
+        def __init__(self) -> None:
+            self.entered = False
+            self.exited = False
+            self.conn = object()
+
+        async def __aenter__(self):
+            self.entered = True
+            return self.conn
+
+        async def __aexit__(self, *exc):
+            self.exited = True
+            return False
+
+    def _tx_factory():
+        tx = _FakeTx()
+        opened.append(tx)
+        return tx
+
+    a = _StubIndexer("a")
+    writer = _RecordingWriter()
+    ctx = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=None,
+    )
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_async_entry("a")],
+        indexers={"a": a},
+        outbox=writer,
+    )
+    n = INLINE_DISPATCH_CHUNK_SIZE * 2 + 5
+    ops = [_op(entity_id=f"i{i}") for i in range(n)]
+    with task_run_scope():
+        results = await dispatcher.fan_out_bulk(ctx, ops, tx_factory=_tx_factory)
+
+    import math
+    expected_chunks = math.ceil(n / INLINE_DISPATCH_CHUNK_SIZE)
+    # One transaction per chunk, each entered AND exited (released between
+    # chunks — not one TX spanning the whole batch).
+    assert len(opened) == expected_chunks
+    assert all(tx.entered and tx.exited for tx in opened)
+    assert len(a.bulk_calls) == expected_chunks
+    assert results["a"].succeeded == n
+    assert writer.rows == []
 
 
 @pytest.mark.asyncio

@@ -308,7 +308,9 @@ async def main(task_name: str, payload: dict, schema: str):
 
                 try:
                     logger.info(f"--- [main_task.py] Executing task: '{task_name}' ---")
-                    res = await target_task.run(payload=validate_payload)
+                    from dynastore.tools.execution_context import task_run_scope
+                    with task_run_scope():
+                        res = await target_task.run(payload=validate_payload)
                     logger.info(f"--- [main_task.py] Task '{task_name}' returned: {res} ---")
 
                     # Success: mark COMPLETED in the same row that GcpJobRunner created.

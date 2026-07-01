@@ -27,6 +27,7 @@ import asyncio
 from dynastore.tools.plugin import ProtocolPlugin
 from dynastore.tools.discovery import register_plugin
 from dynastore.tools.async_utils import LoopLocalLock, LoopLocalSemaphore
+from dynastore.tools.execution_context import task_run_scope
 from dynastore.modules.concurrency import get_background_executor
 from dynastore.modules.tasks.dispatcher import _SERVICE_NAME
 
@@ -200,13 +201,14 @@ class SyncRunner(RunnerProtocol, ProtocolPlugin[Any]):
 
             # Hydrate and execute, bounded by the effective deadline when set.
             hydrated_payload = hydrate_task_payload(task_instance, raw_payload)
-            if _effective_timeout:
-                result = await asyncio.wait_for(
-                    task_instance.run(hydrated_payload),
-                    timeout=_effective_timeout,
-                )
-            else:
-                result = await task_instance.run(hydrated_payload)
+            with task_run_scope():
+                if _effective_timeout:
+                    result = await asyncio.wait_for(
+                        task_instance.run(hydrated_payload),
+                        timeout=_effective_timeout,
+                    )
+                else:
+                    result = await task_instance.run(hydrated_payload)
 
             # OGC API - Processes Part 1 requires ``GET /jobs/{id}/results`` to work
             # for both async AND sync executions when status=successful. Persist
@@ -827,13 +829,14 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                         f"({context.task_type}) in background."
                     )
                     hydrated_payload = hydrate_task_payload(task_instance, raw_payload)
-                    if _bg_effective_timeout:
-                        result = await asyncio.wait_for(
-                            task_instance.run(hydrated_payload),
-                            timeout=_bg_effective_timeout,
-                        )
-                    else:
-                        result = await task_instance.run(hydrated_payload)
+                    with task_run_scope():
+                        if _bg_effective_timeout:
+                            result = await asyncio.wait_for(
+                                task_instance.run(hydrated_payload),
+                                timeout=_bg_effective_timeout,
+                            )
+                        else:
+                            result = await task_instance.run(hydrated_payload)
 
                     await _complete_task(
                         context.engine, claimed_task_id,

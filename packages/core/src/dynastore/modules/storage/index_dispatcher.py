@@ -63,7 +63,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple, Union, cast
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple, Union, cast
 
 from dynastore.models.protocols.indexer import (
     BulkResult,
@@ -77,6 +77,7 @@ from dynastore.modules.storage.routing_config import (
     OperationDriverEntry,
     WriteMode,
 )
+from dynastore.tools.execution_context import in_task_run
 
 
 # Public surface of the dispatcher accepts either the legacy
@@ -88,6 +89,11 @@ from dynastore.modules.storage.routing_config import (
 DispatchableOp = Union[IndexOp, IndexableOp]
 
 logger = logging.getLogger(__name__)
+
+# Mirrors TaskTableOutboxWriter.DEFAULT_CHUNK_SIZE; chunk the inline
+# in-task-run dispatch so a large batch never builds one oversized
+# driver call.
+INLINE_DISPATCH_CHUNK_SIZE = 500
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +397,9 @@ def _log_dispatch_path(
     # `index_dispatch_path_total{mode}` (counter on mode label) and
     # `index_chunk_size_bucket` (distribution on the chunk_size field).
     # `mode` is one of: post_commit_inline | outbox_handoff |
-    # partial_failure_drop (per-doc rejections from an otherwise-OK bulk; #2064).
+    # partial_failure_drop (per-doc rejections from an otherwise-OK bulk; #2064) |
+    # inline_in_task_run (ASYNC entry absorbed inline because the dispatch
+    # is already running inside a background task/job execution).
     logger.info(
         "index_dispatch_path mode=%s indexer=%s catalog=%s collection=%s "
         "chunk_size=%d",
@@ -612,7 +620,11 @@ class IndexDispatcher:
     # ------------------------------------------------------------------
 
     async def fan_out_bulk(
-        self, ctx: IndexContext, ops: Sequence[DispatchableOp],
+        self,
+        ctx: IndexContext,
+        ops: Sequence[DispatchableOp],
+        *,
+        tx_factory: Optional[Callable[[], Any]] = None,
     ) -> Dict[str, BulkResult]:
         """Dispatch a bulk of index ops across every configured indexer.
 
@@ -620,6 +632,14 @@ class IndexDispatcher:
         failures (a 207-style report).  Per-op failures inside an indexer
         are absorbed into ``BulkResult.failures``; an indexer raising
         applies ``FailurePolicy`` to the whole batch.
+
+        ``tx_factory`` (in-task-run inline path only): a zero-arg callable
+        returning an ``async with``-able transaction. When supplied, the
+        inline chunked dispatch opens a fresh short transaction per chunk
+        (bound to that chunk's ``pg_conn``) instead of running the whole
+        fan-out under one long-lived ``ctx.pg_conn`` — so a busy job never
+        parks a pooled connection with an open transaction across the full
+        sequential ES dispatch.
         """
         results: Dict[str, BulkResult] = {}
         entries = await self._index_entries(ctx)
@@ -663,7 +683,12 @@ class IndexDispatcher:
             # outbox, no pg_conn, transient PG error) the returned 0 flows
             # through as succeeded=0/failed=N so _check_index_health
             # escalates to FAILED instead of silently claiming success.
-            if entry.write_mode == WriteMode.ASYNC:
+            # Exception: when this dispatch is already running inside a
+            # background task/job execution (``in_task_run()``), spawning an
+            # outbox row per chunk would fan out onto the serving pods that
+            # drain it — the write is instead absorbed inline below, in the
+            # running job.
+            if entry.write_mode == WriteMode.ASYNC and not in_task_run():
                 actually_enqueued = await self._enqueue_or_warn(entry, ctx, entry_ops)
                 enqueue_ok = actually_enqueued == len(entry_ops)
                 _log_dispatch_path(
@@ -684,52 +709,14 @@ class IndexDispatcher:
                     failures=enqueue_failures + (rejected if rejected else []),
                 )
                 continue
-            result = await self._dispatch_bulk(entry, indexer, ctx, entry_ops)
-            # #914 — silent no-op trap: an indexer that returns
-            # ``BulkResult(total=N, succeeded=0, failed=0)`` (e.g. ES bulk
-            # response shape the driver doesn't parse) was previously
-            # indistinguishable from a real success in logs, leaving the
-            # target index empty with no warning.  Pure upsert no-ops are
-            # converted to retryable failures so the batch routes through the
-            # durable outbox path (``_enqueue_or_warn``) and
-            # ``IndexPropagationTask`` replays it post-commit.  Delete ops are
-            # unaffected — they have their own pass-through.
-            if result.total > 0 and result.succeeded == 0 and result.failed == 0:
-                logger.warning(
-                    "IndexDispatcher: indexer '%s' returned a silent no-op "
-                    "(total=%d, succeeded=0, failed=0) for catalog=%s "
-                    "collection=%s — index will be empty despite a "
-                    "'successful' dispatch. Check the driver's bulk-response "
-                    "parser. Routing upsert ops to outbox for durable retry.",
-                    entry.driver_ref, result.total,
-                    ctx.catalog, ctx.collection,
-                )
-                noop_upserts: List[DispatchableOp] = [
-                    o for o in entry_ops
-                    if (
-                        o.op == "upsert"
-                        if isinstance(o, IndexableOp)
-                        else o.op_type == "upsert"
-                    )
-                ]
-                if noop_upserts:
-                    await self._enqueue_or_warn(entry, ctx, noop_upserts)
-                    result = BulkResult(
-                        total=result.total,
-                        succeeded=result.succeeded,
-                        failed=result.failed + len(noop_upserts),
-                        failures=[
-                            *result.failures,
-                            *[
-                                {
-                                    "reason": "silent_noop",
-                                    "indexer": entry.driver_ref,
-                                    "entity_id": _op_entity_id(o),
-                                }
-                                for o in noop_upserts
-                            ],
-                        ],
-                    )
+            # SYNC entries, and ASYNC entries absorbed inline because the
+            # dispatch is already running inside a task run, both land here:
+            # the write is chunked and dispatched inline through the same
+            # driver-agnostic path (silent no-op conversion lives inside
+            # ``_dispatch_bulk``, applied per chunk).
+            result = await self._dispatch_bulk_chunked(
+                entry, indexer, ctx, entry_ops, tx_factory=tx_factory,
+            )
             # Only log clean success when the batch genuinely has no failures
             # (placed after no-op conversion so a converted no-op — now
             # failed > 0 — does not appear in the success log).
@@ -1054,6 +1041,51 @@ class IndexDispatcher:
             # ``_handle_failure_bulk`` has already applied the on_failure
             # policy, so emitting for those too would double-signal.
             await self._surface_partial_failures(entry, ctx, result)
+            # #914 — silent no-op trap: an indexer that returns
+            # ``BulkResult(total=N, succeeded=0, failed=0)`` (e.g. ES bulk
+            # response shape the driver doesn't parse) was previously
+            # indistinguishable from a real success in logs, leaving the
+            # target index empty with no warning.  Pure upsert no-ops are
+            # converted to retryable failures so the batch routes through the
+            # durable outbox path (``_enqueue_or_warn``) and
+            # ``IndexPropagationTask`` replays it post-commit.  Delete ops are
+            # unaffected — they have their own pass-through.
+            if result.total > 0 and result.succeeded == 0 and result.failed == 0:
+                logger.warning(
+                    "IndexDispatcher: indexer '%s' returned a silent no-op "
+                    "(total=%d, succeeded=0, failed=0) for catalog=%s "
+                    "collection=%s — index will be empty despite a "
+                    "'successful' dispatch. Check the driver's bulk-response "
+                    "parser. Routing upsert ops to outbox for durable retry.",
+                    entry.driver_ref, result.total,
+                    ctx.catalog, ctx.collection,
+                )
+                noop_upserts: List[DispatchableOp] = [
+                    o for o in ops
+                    if (
+                        o.op == "upsert"
+                        if isinstance(o, IndexableOp)
+                        else o.op_type == "upsert"
+                    )
+                ]
+                if noop_upserts:
+                    await self._enqueue_or_warn(entry, ctx, noop_upserts)
+                    result = BulkResult(
+                        total=result.total,
+                        succeeded=result.succeeded,
+                        failed=result.failed + len(noop_upserts),
+                        failures=[
+                            *result.failures,
+                            *[
+                                {
+                                    "reason": "silent_noop",
+                                    "indexer": entry.driver_ref,
+                                    "entity_id": _op_entity_id(o),
+                                }
+                                for o in noop_upserts
+                            ],
+                        ],
+                    )
             return result
         except Exception as exc:
             if self._breaker is not None:
@@ -1065,6 +1097,64 @@ class IndexDispatcher:
                 failed=len(ops),
                 failures=[{"reason": str(exc), "indexer": entry.driver_ref}],
             )
+
+    async def _dispatch_bulk_chunked(
+        self,
+        entry: OperationDriverEntry,
+        indexer: Indexer,
+        ctx: IndexContext,
+        ops: Sequence[DispatchableOp],
+        *,
+        tx_factory: Optional[Callable[[], Any]] = None,
+    ) -> BulkResult:
+        """Split ``ops`` into ``INLINE_DISPATCH_CHUNK_SIZE``-sized chunks and
+        dispatch each one SEQUENTIALLY through :meth:`_dispatch_bulk`,
+        aggregating the per-chunk results into one.
+
+        Sequential on purpose — a bounded footprint per chunk is the whole
+        point of the inline-dispatch path (both the ordinary SYNC entry and
+        an ASYNC entry absorbed inline during a task run land here), so
+        chunks are never fanned out concurrently.
+
+        When ``tx_factory`` is supplied (the in-task-run inline path), each
+        chunk is dispatched under a FRESH short transaction whose connection
+        is stamped onto a per-chunk :class:`IndexContext` copy — the pooled
+        connection is held only across that one chunk's dispatch (kept open
+        so an on-failure outbox enqueue is still atomic) and released before
+        the next chunk. Without it, dispatch runs under the ambient
+        ``ctx.pg_conn`` (the serving SYNC path, unchanged).
+        """
+        if not ops:
+            return BulkResult()
+        # Distinguish the two callers that land here: an ASYNC entry absorbed
+        # inline during a task/job run vs. an ordinary SYNC entry chunked on the
+        # post-commit tail. Same code path, different provenance in the logs.
+        chunk_mode = "inline_in_task_run" if in_task_run() else "sync_chunked"
+        aggregated = BulkResult()
+        for start in range(0, len(ops), INLINE_DISPATCH_CHUNK_SIZE):
+            chunk = ops[start:start + INLINE_DISPATCH_CHUNK_SIZE]
+            if tx_factory is not None:
+                async with tx_factory() as chunk_conn:
+                    chunk_ctx = ctx.model_copy(update={"pg_conn": chunk_conn})
+                    chunk_result = await self._dispatch_bulk(
+                        entry, indexer, chunk_ctx, chunk,
+                    )
+            else:
+                chunk_result = await self._dispatch_bulk(entry, indexer, ctx, chunk)
+            _log_dispatch_path(
+                mode=chunk_mode,
+                indexer_id=entry.driver_ref,
+                catalog=ctx.catalog,
+                collection=ctx.collection,
+                chunk_size=len(chunk),
+            )
+            aggregated = BulkResult(
+                total=aggregated.total + chunk_result.total,
+                succeeded=aggregated.succeeded + chunk_result.succeeded,
+                failed=aggregated.failed + chunk_result.failed,
+                failures=[*aggregated.failures, *chunk_result.failures],
+            )
+        return aggregated
 
     async def _handle_failure(
         self,

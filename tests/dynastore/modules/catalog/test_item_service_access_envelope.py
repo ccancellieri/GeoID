@@ -61,8 +61,9 @@ def _capture_dispatcher(monkeypatch):
     captured: dict = {}
 
     class _Dispatcher:
-        async def fan_out_bulk(self, ctx, ops):
+        async def fan_out_bulk(self, ctx, ops, *, tx_factory=None):
             captured["ops"] = ops
+            captured["tx_factory"] = tx_factory
 
     monkeypatch.setattr(
         "dynastore.modules.storage.index_dispatcher.get_index_dispatcher",

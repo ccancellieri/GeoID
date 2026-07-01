@@ -22,7 +22,7 @@ import logging
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, FrozenSet, List, Optional, Any, Dict, Union, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, FrozenSet, List, Optional, Any, Dict, Union, Sequence, Tuple
 
 if TYPE_CHECKING:
     from dynastore.modules.storage.router import ResolvedDriver
@@ -44,6 +44,7 @@ from dynastore.models.ogc import Feature
 from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
 from dynastore.models.protocols.items import ItemsProtocol
 from dynastore.tools.discovery import get_protocol
+from dynastore.tools.execution_context import in_task_run
 from dynastore.tools.db import validate_sql_identifier
 from dynastore.tools.json import CustomJSONEncoder
 from dynastore.modules.db_config import shared_queries
@@ -2232,8 +2233,25 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 dispatcher, catalog_id, collection_id, ops, pg_conn=None,
             )
 
-        # Phase 2f: open a wrapping TX so the outbox INSERT (if any) is
-        # atomic with the indexer attempt.
+        # Inside a task/job run the ASYNC secondary write is absorbed inline
+        # (see IndexDispatcher.fan_out_bulk). Do NOT wrap that inline ES
+        # fan-out in a single wrapping transaction: it would park one pooled
+        # connection with an open transaction for the whole sequential
+        # dispatch, re-introducing the DB-pool / idle-in-transaction pressure
+        # this inline path exists to relieve. Instead hand the dispatcher a
+        # transaction factory so it opens a SHORT transaction per chunk —
+        # the connection is held only across one chunk's dispatch (kept open
+        # so an on-failure outbox enqueue stays durable) and released between
+        # chunks.
+        if in_task_run():
+            return await self._do_dispatch(
+                dispatcher, catalog_id, collection_id, ops,
+                pg_conn=None,
+                tx_factory=lambda: managed_transaction(engine),
+            )
+
+        # Serving path — Phase 2f: open a single wrapping TX so the outbox
+        # INSERT (if any) is atomic with the indexer attempt.
         async with managed_transaction(engine) as conn:
             return await self._do_dispatch(
                 dispatcher, catalog_id, collection_id, ops, pg_conn=conn,
@@ -2247,9 +2265,15 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         ops: List[Any],
         *,
         pg_conn: Optional[DbResource],
+        tx_factory: Optional[Callable[[], Any]] = None,
     ) -> Dict[str, Any]:
         """Inner dispatch helper — split out so the wrapping TX in
         :meth:`_dispatch_index_upsert` is a single ``async with`` block.
+
+        ``tx_factory``, when supplied, is a zero-arg callable returning an
+        ``async with``-able transaction (used by the in-task-run inline path
+        so the dispatcher opens a fresh short transaction per chunk instead
+        of running under one long-lived ``pg_conn``).
 
         Returns the per-indexer :class:`BulkResult` dict from
         :meth:`~IndexDispatcher.fan_out_bulk` so callers can inspect
@@ -2267,7 +2291,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             entity_type="item",
         )
         try:
-            return await dispatcher.fan_out_bulk(ctx, ops)
+            return await dispatcher.fan_out_bulk(ctx, ops, tx_factory=tx_factory)
         except IndexerFatal:
             # FATAL contract: a routing entry with on_failure=FATAL
             # MUST propagate so the caller's TX rolls back.  Don't
