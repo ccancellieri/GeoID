@@ -51,6 +51,18 @@ _FILE_VALUES: Mapping[str, Any] = load_db_config()
 # for no concurrency benefit. So we trust the operator's small ``pool_min_size``
 # and floor it only at 1 — a pool needs at least one connection; everything
 # above that is a deployment choice. Burst safety is the total floor's job.
+#
+# This is also the idle-cost lever (#2333): keep ``pool_min_size`` near this
+# floor (1-2) and size ``pool_max_size`` for burst instead. SQLAlchemy's
+# QueuePool already grows and shrinks around that small base on its own —
+# overflow connections (anything above ``pool_size``) are opened on demand
+# under load and CLOSED on check-in once the base is full again, rather than
+# kept warm. So a small base + generous ``max_overflow`` is not just cheaper
+# at idle, it is the mechanism that returns the pool to its cheap baseline
+# automatically once load clears — no separate "shrink" actuator needed. The
+# instance-count floor (``modules/scaling``) is the other half of that
+# picture and must ratchet down just as promptly — see
+# ``ScalingPolicyConfig.scale_in_cooldown_seconds`` / ``scale_in_step``.
 SAFE_POOL_MIN_FLOOR: int = 1
 
 # Smallest total pool capacity (``pool_size + max_overflow``) we consider safe

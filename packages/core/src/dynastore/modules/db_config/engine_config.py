@@ -368,18 +368,43 @@ class DuckdbEngineConfig(EngineConfig):
     default lifecycle suggests ``ttl_lru`` for idle eviction in
     long-running deployments.  Operators tune ``pool_size`` to the
     available cores; ``max_memory_gb`` caps the per-process heap.
+
+    ``pool_size`` is the SSOT for ``ItemsDuckdbDriver``'s bounded
+    connection pool (a ``queue.Queue`` of pre-warmed ``duckdb.connect()``
+    in-process wires, see ``drivers/duckdb.py``).  The driver reads it from
+    the central cached config getter once, at its ``lifespan()`` startup —
+    it used to be the env var ``DUCKDB_POOL_SIZE`` (also fixed at process
+    boot); moved here so operators change it via the configs API instead of
+    a redeploy, though a change still only takes effect on the next pod
+    restart (the queue is sized once and never resized in place).
+
+    Each pooled connection is a genuine in-memory DuckDB process with its
+    own thread/memory budget (``threads``, ``max_memory_gb``) — but it
+    never opens a PostgreSQL connection, so this pool is independent of,
+    and does NOT consume, the shared Postgres connection budget modeled by
+    ``ScalingPolicyConfig`` (``modules/scaling/config.py``). Its ceiling is
+    CPU (threads × pool_size vs. available vCPU) and memory
+    (max_memory_gb × pool_size vs. available RAM) on the instance, not DB
+    connections. Default raised 4 -> 8 (2026-07) to give DuckDB-routed
+    analytical reads more concurrency headroom; this is a secondary,
+    optional lever for that read path only — verify the instance's CPU/
+    memory allocation can absorb 8 × threads / 8 × max_memory_gb before
+    raising further.
     """
 
     engine_class: ClassVar[str] = "duckdb_engine"
     _address: ClassVar[Tuple[str, ...]] = ("platform", "protocols", "storage")
 
     pool_size: Mutable[int] = Field(
-        default=4,
+        default=8,
         ge=1,
         le=64,
         description=(
-            "Number of DuckDB processes in the pool.  Tune to available "
-            "cores × workload concurrency."
+            "Number of DuckDB connections in the pool.  Tune to available "
+            "cores × workload concurrency.  Read once at driver startup — "
+            "takes effect on next pod restart, not live.  CPU/memory-bound "
+            "only — does not consume PostgreSQL connections, so it is NOT "
+            "part of ``ScalingPolicyConfig``'s connection budget."
         ),
     )
 

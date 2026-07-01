@@ -112,10 +112,10 @@ def test_deadband_is_a_no_op():
     assert result == 4
 
 
-def test_cooldown_blocks_change_within_window():
+def test_scale_out_cooldown_blocks_change_within_window():
     policy = _policy(
         min_replicas=0, max_replicas=10, scale_out_saturation=0.80, step=1,
-        cooldown_seconds=300,
+        scale_out_cooldown_seconds=300,
     )
     signals = [_instance_signal(0.9)]
 
@@ -126,10 +126,10 @@ def test_cooldown_blocks_change_within_window():
     assert result == 2
 
 
-def test_change_allowed_once_cooldown_elapses():
+def test_scale_out_change_allowed_once_cooldown_elapses():
     policy = _policy(
         min_replicas=0, max_replicas=10, scale_out_saturation=0.80, step=1,
-        cooldown_seconds=300,
+        scale_out_cooldown_seconds=300,
     )
     signals = [_instance_signal(0.9)]
 
@@ -140,9 +140,61 @@ def test_change_allowed_once_cooldown_elapses():
     assert result == 3
 
 
+def test_scale_in_cooldown_blocks_change_within_window():
+    policy = _policy(
+        min_replicas=0, max_replicas=10, scale_out_saturation=0.80, deadband=0.10,
+        scale_in_step=2, scale_in_cooldown_seconds=120,
+        per_instance_pool=1, db_max_connections=1000, connection_headroom=0,
+    )
+    signals = [_instance_signal(0.1)]
+
+    result = compute_desired_min(
+        signals, policy, current_min=8, last_change_ts=950.0, now=1000.0,  # 50s ago
+    )
+
+    assert result == 8
+
+
+def test_scale_in_change_allowed_once_its_shorter_cooldown_elapses():
+    """Asymmetric cooldown: scale-in's own (shorter) window has elapsed even
+    though it's well inside what a symmetric 300s cooldown would have
+    blocked — this is the fix for the #2333 ~25-minute stale-high-floor
+    finding. Budget kept generous (non-binding) so only the cooldown/step
+    behaviour is under test."""
+    policy = _policy(
+        min_replicas=0, max_replicas=10, scale_out_saturation=0.80, deadband=0.10,
+        scale_in_step=2, scale_in_cooldown_seconds=120,
+        per_instance_pool=1, db_max_connections=1000, connection_headroom=0,
+    )
+    signals = [_instance_signal(0.1)]
+
+    result = compute_desired_min(
+        signals, policy, current_min=8, last_change_ts=850.0, now=1000.0,  # 150s ago
+    )
+
+    assert result == 6
+
+
+def test_scale_in_step_defaults_larger_than_scale_out_step():
+    """Asymmetric by default: draining the floor moves faster than raising it."""
+    policy = ScalingPolicyConfig()
+    assert policy.scale_in_step > policy.step
+
+
+def test_scale_in_cooldown_defaults_shorter_than_old_symmetric_value():
+    """The replaced single ``cooldown_seconds`` defaulted to 300s; scale-in's
+    own cooldown must default well under that so the floor ratchets down
+    promptly once load clears (not the ~25-minute hold observed in the dev
+    load test)."""
+    policy = ScalingPolicyConfig()
+    assert policy.scale_in_cooldown_seconds < 300
+    assert policy.scale_out_cooldown_seconds <= policy.scale_in_cooldown_seconds
+
+
 def test_scale_in_when_fleet_p95_below_deadband_threshold():
     policy = _policy(
-        min_replicas=0, max_replicas=10, scale_out_saturation=0.80, deadband=0.10, step=1,
+        min_replicas=0, max_replicas=10, scale_out_saturation=0.80, deadband=0.10,
+        scale_in_step=1,
     )
     signals = [_instance_signal(0.5), _instance_signal(0.5)]
 
@@ -155,7 +207,8 @@ def test_scale_in_when_fleet_p95_below_deadband_threshold():
 
 def test_scale_in_clamps_to_min_replicas():
     policy = _policy(
-        min_replicas=1, max_replicas=10, scale_out_saturation=0.80, deadband=0.10, step=5,
+        min_replicas=1, max_replicas=10, scale_out_saturation=0.80, deadband=0.10,
+        scale_in_step=5,
     )
     signals = [_instance_signal(0.1)]
 

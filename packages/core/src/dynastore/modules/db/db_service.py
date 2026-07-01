@@ -19,9 +19,13 @@
 import logging
 import os
 import socket
+import time
 from contextlib import asynccontextmanager
-from typing import Optional, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, List, Optional, Any, Protocol, runtime_checkable
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from dynastore.models.scaling import ScalingSignal
 
 # Hard-import the async PG driver at module load.  When SCOPE excludes
 # ``module_db`` (e.g. Cloud Run jobs that use ``db_sync`` + DatastoreModule
@@ -117,6 +121,58 @@ class DBServiceAppState(Protocol):
     sync_engine: Optional[Engine]
 
 
+class PgPoolSignalProvider:
+    """``ScalingSignalProtocol``: this pod's PostgreSQL connection-pool saturation.
+
+    Reports ``checkedout() / (pool_min_size + pool_max_overflow)`` on the
+    SQLAlchemy async engine this module builds — the same pool whose
+    acquire waits ``query_executor._acquire_async_engine_connection`` logs
+    as ``db_pool_acquire slow``. Before this provider existed, the only
+    instance-scope signal feeding the autoscaling control loop
+    (``modules/scaling``) was ``DuckDbPoolSignalProvider``'s DuckDB
+    saturation — a real, CPU/memory-bound pool, but not the one Postgres
+    reads/writes actually contend on. A fleet whose hot path is PG-backed
+    (the common case) could stay fully saturated on this pool while
+    reporting near-zero DuckDB saturation, so the control loop would never
+    see a reason to scale out. Registering this alongside the DuckDB
+    provider closes that blind spot.
+
+    ``pool_max_overflow`` is read from the same ``DBConfig`` used to build
+    the engine rather than introspected off the live ``Pool`` object —
+    SQLAlchemy does not expose the configured ``max_overflow`` ceiling
+    (only the *current* ``overflow()`` count, which can be negative).
+    """
+
+    def __init__(self, engine: AsyncEngine, db_config: DBConfig) -> None:
+        self._engine = engine
+        self._db_config = db_config
+
+    def scaling_signals(self) -> List["ScalingSignal"]:
+        from dynastore.models.scaling import ScalingSignal
+
+        pool = self._engine.pool
+        checkedout = getattr(pool, "checkedout", None)
+        if checkedout is None:
+            return []
+        try:
+            in_use = checkedout()
+        except Exception:
+            return []
+        capacity = self._db_config.pool_min_size + self._db_config.pool_max_overflow
+        if capacity <= 0:
+            return []
+        saturation = max(0.0, min(1.0, in_use / capacity))
+        return [
+            ScalingSignal(
+                source="pg_pool",
+                metric="pool_saturation",
+                value=saturation,
+                scope="instance",
+                ts=time.time(),
+            )
+        ]
+
+
 class DBService(ModuleProtocol, DatabaseProtocol):
     priority: int = 10
     app_state: DBServiceAppState
@@ -179,6 +235,7 @@ class DBService(ModuleProtocol, DatabaseProtocol):
         # Check if engine is already injected (e.g. by tests)
         existing_engine = getattr(app_state, "engine", None)
         engine_created_by_service = False
+        pg_pool_signal_provider: Optional[PgPoolSignalProvider] = None
 
         if existing_engine:
             logger.info("DBService: Using existing engine from app_state.")
@@ -326,6 +383,21 @@ class DBService(ModuleProtocol, DatabaseProtocol):
                         exc_info=True,
                     )
 
+            if _async_engine is not None:
+                try:
+                    from dynastore.tools.discovery import register_plugin
+
+                    pg_pool_signal_provider = PgPoolSignalProvider(_async_engine, db_config)
+                    register_plugin(pg_pool_signal_provider)
+                except Exception:
+                    logger.warning(
+                        "DBService: PG pool signal provider failed to register — "
+                        "PostgreSQL pool saturation will not feed the autoscaling "
+                        "control loop.",
+                        exc_info=True,
+                    )
+                    pg_pool_signal_provider = None
+
             yield
 
         except Exception as e:
@@ -335,6 +407,10 @@ class DBService(ModuleProtocol, DatabaseProtocol):
             )
             raise
         finally:
+            if pg_pool_signal_provider is not None:
+                from dynastore.tools.discovery import unregister_plugin
+
+                unregister_plugin(pg_pool_signal_provider)
             logger.info("DBService: Database connection shutdown initiated...")
             # Only dispose if we created it
             if (

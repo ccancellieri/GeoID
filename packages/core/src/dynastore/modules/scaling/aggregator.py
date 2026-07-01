@@ -218,8 +218,15 @@ def compute_desired_min(
        ``(db_max_connections - connection_headroom) // per_instance_pool``,
        regardless of ``max_replicas`` — the controller cannot invent DB
        capacity.
-    5. Cooldown: a change is suppressed if the last actuated change was
-       less than ``cooldown_seconds`` ago.
+    5. Asymmetric cooldown + step: scale-OUT (raising the floor) uses
+       ``scale_out_cooldown_seconds`` (short — react fast to DB pressure,
+       protect the SLA) and ``step``. Scale-IN (lowering the floor) uses
+       ``scale_in_cooldown_seconds`` (longer than scale-out, damping
+       flapping right at the deadband boundary, but far shorter than a
+       symmetric cooldown would allow) and ``scale_in_step`` (larger than
+       ``step`` by default), so the floor ratchets back down to
+       ``min_replicas`` in a handful of ticks once load clears instead of
+       lingering at a stale-high (costly) floor one instance at a time.
     """
     # ScalingSignal carries no instance id, so the fleet MAX/p95 are taken
     # directly over every instance-scope signal value collected this tick
@@ -258,12 +265,19 @@ def compute_desired_min(
             target = current_min + policy.step
         # else: hold — guard suppresses scale-out.
     elif fleet_p95 < (policy.scale_out_saturation - policy.deadband):
-        target = current_min - policy.step
+        target = current_min - policy.scale_in_step
     # else: inside the deadband — no change.
 
     target = max(policy.min_replicas, min(effective_max, target))
 
-    if target != current_min and (now - last_change_ts) < policy.cooldown_seconds:
+    if target > current_min:
+        cooldown = policy.scale_out_cooldown_seconds
+    elif target < current_min:
+        cooldown = policy.scale_in_cooldown_seconds
+    else:
+        cooldown = 0
+
+    if target != current_min and (now - last_change_ts) < cooldown:
         target = current_min
 
     return target

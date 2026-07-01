@@ -472,3 +472,102 @@ class TestDuckDBEnsureStorageProjection:
         assert fast_columns is not None
         assert "fast_field" in fast_columns
         assert "auto_field" not in fast_columns
+
+
+class TestDuckDBPoolSizeConfig:
+    """Pool sizing is config-registry-driven (``DuckdbEngineConfig.pool_size``),
+    not the removed ``DUCKDB_POOL_SIZE`` env var. See #2333."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_pool_globals(self):
+        import dynastore.modules.storage.drivers.duckdb as duckdb_mod
+
+        saved = (
+            duckdb_mod._pool_initialized,
+            duckdb_mod._pool_size,
+            duckdb_mod._pool,
+        )
+        duckdb_mod._pool_initialized = False
+        duckdb_mod._pool_size = 0
+        duckdb_mod._pool = duckdb_mod.queue.Queue()
+        yield
+        (
+            duckdb_mod._pool_initialized,
+            duckdb_mod._pool_size,
+            duckdb_mod._pool,
+        ) = saved
+
+    async def test_read_live_pool_size_falls_back_when_no_config_service(self):
+        from dynastore.modules.storage.drivers.duckdb import (
+            _DUCKDB_POOL_SIZE_FALLBACK,
+            _read_live_pool_size,
+        )
+
+        with patch(
+            "dynastore.tools.discovery.get_protocol", return_value=None,
+        ):
+            size = await _read_live_pool_size()
+        assert size == _DUCKDB_POOL_SIZE_FALLBACK
+
+    async def test_read_live_pool_size_reads_duckdb_engine_config(self):
+        from dynastore.modules.db_config.engine_config import DuckdbEngineConfig
+        from dynastore.modules.storage.drivers.duckdb import _read_live_pool_size
+
+        fake_svc = AsyncMock()
+        fake_svc.get_config.return_value = DuckdbEngineConfig(pool_size=16)
+
+        with patch(
+            "dynastore.tools.discovery.get_protocol", return_value=fake_svc,
+        ):
+            size = await _read_live_pool_size()
+        assert size == 16
+
+    def test_init_pool_uses_explicit_size(self):
+        from dynastore.modules.storage.drivers.duckdb import _init_pool
+        import dynastore.modules.storage.drivers.duckdb as duckdb_mod
+
+        with patch.object(
+            duckdb_mod, "_create_connection", return_value=object(),
+        ):
+            _init_pool(size=6)
+        assert duckdb_mod._pool_size == 6
+        assert duckdb_mod._pool.qsize() == 6
+
+    def test_init_pool_falls_back_to_default_when_size_omitted(self):
+        from dynastore.modules.storage.drivers.duckdb import (
+            _DUCKDB_POOL_SIZE_FALLBACK,
+            _init_pool,
+        )
+        import dynastore.modules.storage.drivers.duckdb as duckdb_mod
+
+        with patch.object(
+            duckdb_mod, "_create_connection", return_value=object(),
+        ):
+            _init_pool()
+        assert duckdb_mod._pool_size == _DUCKDB_POOL_SIZE_FALLBACK
+
+    async def test_lifespan_resolves_size_live_and_initializes_pool(self):
+        from dynastore.modules.db_config.engine_config import DuckdbEngineConfig
+        from dynastore.modules.storage.drivers.duckdb import ItemsDuckdbDriver
+        import dynastore.modules.storage.drivers.duckdb as duckdb_mod
+
+        fake_svc = AsyncMock()
+        fake_svc.get_config.return_value = DuckdbEngineConfig(pool_size=3)
+
+        driver = ItemsDuckdbDriver()
+        with patch(
+            "dynastore.tools.discovery.get_protocol", return_value=fake_svc,
+        ), patch.object(
+            duckdb_mod, "_create_connection", return_value=object(),
+        ):
+            # Assert INSIDE the context: lifespan's exit calls _close_pool(),
+            # which resets _pool_size back to 0 (verified separately by the
+            # driver's normal shutdown behaviour, not this test's concern).
+            async with driver.lifespan(app_state=None):
+                assert duckdb_mod._pool_size == 3
+
+    def test_duckdb_config_no_longer_has_pool_size(self):
+        """Pool sizing moved off the env-var-driven DuckDBConfig entirely."""
+        from dynastore.modules.storage.driver_config import DuckDBConfig
+
+        assert not hasattr(DuckDBConfig, "pool_size")

@@ -95,15 +95,21 @@ _logger = logging.getLogger(__name__)
 class DuckDBConfig:
     """DuckDB driver-level configuration (env vars).
 
-    Controls connection pooling, resource limits, and extension loading for
-    the DuckDB storage driver.  Follows the same pattern as
-    ``DBConfig`` (``DB_POOL_*``) and Elasticsearch (``ES_*``).
+    Controls resource limits and extension loading for the DuckDB storage
+    driver.  Follows the same pattern as ``DBConfig`` (``DB_POOL_*``) and
+    Elasticsearch (``ES_*``).
 
     Per-collection configs (``ItemsDuckdbDriverConfig``) hold only file
     paths and format overrides; they should be relative to ``data_root``.
+
+    Connection-pool sizing is NOT here: it is behavioral (an operator tunes
+    it live to relieve read-throughput pressure) rather than a boot-time
+    infra constant, so it lives on ``DuckdbEngineConfig.pool_size``
+    (``modules/db_config/engine_config.py``) — the hot-reloadable config
+    registry entry the driver reads at ``lifespan()`` time. See
+    ``drivers/duckdb.py::_read_live_pool_size``.
     """
 
-    pool_size: int = int(os.getenv("DUCKDB_POOL_SIZE", "4"))
     max_memory: str = os.getenv("DUCKDB_MAX_MEMORY", "4GB")
     threads: int = int(os.getenv("DUCKDB_THREADS", "4"))
     extensions: str = os.getenv("DUCKDB_EXTENSIONS", "spatial")

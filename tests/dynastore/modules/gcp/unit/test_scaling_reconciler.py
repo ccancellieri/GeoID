@@ -125,7 +125,7 @@ async def test_actuates_on_hot_fleet_signal():
         set_min_instances=AsyncMock(),
     )
     policy = ScalingPolicyConfig(
-        enabled=True, scale_out_saturation=0.80, step=1, cooldown_seconds=0
+        enabled=True, scale_out_saturation=0.80, step=1, scale_out_cooldown_seconds=0
     )
     reconciler = GcpScalingReconciler(platform=platform, configs=_fake_configs(policy))
 

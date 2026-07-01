@@ -29,7 +29,9 @@ Capabilities vary based on configuration:
 
 Connection lifecycle:
   - **Pool**: bounded pool of in-memory DuckDB connections, sized by
-    ``DUCKDB_POOL_SIZE`` (default 4).
+    ``DuckdbEngineConfig.pool_size`` (config registry, default 8) — read
+    once via the central cached config getter at ``lifespan()`` startup;
+    see ``_read_live_pool_size``.
   - **Lazy init**: pool created on first use via ``lifespan()``, not at
     import time.
   - **Extensions loaded once**: ``spatial`` (and optionally ``sqlite``)
@@ -169,6 +171,36 @@ _pool_lock = threading.Lock()
 _pool_initialized: bool = False
 _loaded_extensions: Set[str] = set()
 
+# Fallback pool size used when the platform config service is unavailable
+# (sync callers reaching ``_borrow_conn`` before ``lifespan()`` has run —
+# tests, early startup). Mirrors ``DuckdbEngineConfig.pool_size``'s default
+# so behaviour matches the live path when the config service isn't reachable
+# (same pattern as the module globals in ``connection_health_config.py``).
+_DUCKDB_POOL_SIZE_FALLBACK: int = 8
+
+
+async def _read_live_pool_size() -> int:
+    """Read ``DuckdbEngineConfig.pool_size`` live from the central cached
+    config getter.
+
+    Falls back to :data:`_DUCKDB_POOL_SIZE_FALLBACK` when the platform
+    config service is unavailable (tests, early startup) — mirrors the
+    ``_read_live_*`` helpers in ``db_config/query_executor.py``.
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.db_config.engine_config import DuckdbEngineConfig
+        from dynastore.tools.discovery import get_protocol
+
+        svc = get_protocol(PlatformConfigsProtocol)
+        if svc is not None:
+            cfg = await svc.get_config(DuckdbEngineConfig)
+            if isinstance(cfg, DuckdbEngineConfig):
+                return cfg.pool_size
+    except Exception:
+        pass
+    return _DUCKDB_POOL_SIZE_FALLBACK
+
 
 def _duckdb_available() -> bool:
     try:
@@ -208,8 +240,14 @@ def _try_load_extension_on(conn, name: str) -> bool:
         return False
 
 
-def _init_pool():
-    """Initialize the connection pool (idempotent, thread-safe)."""
+def _init_pool(size: Optional[int] = None):
+    """Initialize the connection pool (idempotent, thread-safe).
+
+    ``size`` — the pool size, already resolved live from
+    ``DuckdbEngineConfig`` by an async caller (``lifespan()``). If ``None``
+    (a sync caller reaching this before ``lifespan()`` ran — tests, direct
+    driver use), falls back to :data:`_DUCKDB_POOL_SIZE_FALLBACK`.
+    """
     global _pool_initialized, _pool_size
 
     if _pool_initialized:
@@ -219,14 +257,14 @@ def _init_pool():
         if _pool_initialized:
             return
 
-        size = DuckDBConfig.pool_size
-        for _ in range(size):
+        resolved_size = size if size is not None else _DUCKDB_POOL_SIZE_FALLBACK
+        for _ in range(resolved_size):
             conn = _create_connection()
             _pool.put(conn)
 
-        _pool_size = size
+        _pool_size = resolved_size
         _pool_initialized = True
-        logger.info("DuckDB: connection pool initialized (size=%d)", size)
+        logger.info("DuckDB: connection pool initialized (size=%d)", resolved_size)
 
 
 @contextmanager
@@ -403,8 +441,9 @@ class ItemsDuckdbDriver(TypedDriver[ItemsDuckdbDriverConfig], ModuleProtocol):
 
     @asynccontextmanager
     async def lifespan(self, app_state: object):
-        _init_pool()
-        logger.info("ItemsDuckdbDriver: started (pool_size=%d)", DuckDBConfig.pool_size)
+        size = await _read_live_pool_size()
+        _init_pool(size=size)
+        logger.info("ItemsDuckdbDriver: started (pool_size=%d)", _pool_size)
         yield
         _close_pool()
         logger.info("ItemsDuckdbDriver: stopped")
