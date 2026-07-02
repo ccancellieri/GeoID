@@ -205,9 +205,6 @@ app = FastAPI(
     swagger_ui_parameters={"defaultModelsExpandDepth": -1} # Optional: hide models by default
 )
 
-# Add correlation ID middleware
-app.add_middleware(CorrelationIdMiddleware)
-
 @app.get("/api", include_in_schema=False)
 async def get_api_document(f: Optional[str] = None, request: Request = None):  # type: ignore[assignment]
     """OGC API - Common canonical API document.
@@ -358,9 +355,23 @@ async def readiness_check():
 # /redoc is currently not exposed; if reintroduced it should also live in the
 # documentation extension so all docs-rendering routes share one owner.
 
+# Extensions register their own middleware (IamMiddleware, TenantScopeMiddleware,
+# SessionMiddleware, CORS, GZip, proxy-headers, slash-redirect, ...) inside
+# bootstrap_app. Starlette makes the *last*-added middleware the *outermost*
+# one, so bootstrap_app must run before we add the correlation-id and global
+# exception-handling middleware below — otherwise an exception raised inside
+# one of those extension middlewares would bypass both and hit Starlette's
+# bare ServerErrorMiddleware instead of the platform JSON error shape.
+bootstrap_app(app)
+
 from dynastore.extensions.tools.exception_handlers import setup_exception_handlers
 setup_exception_handlers(app)
-bootstrap_app(app)
+
+# Correlation ID middleware must be the outermost middleware so it stamps
+# X-Request-ID on every response — including error responses produced by
+# GlobalExceptionHandlingMiddleware for exceptions raised inside any
+# extension-registered middleware.
+app.add_middleware(CorrelationIdMiddleware)
 
 logger.info("--- [main.py] FastAPI application instance created. ---")
 
