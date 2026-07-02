@@ -160,7 +160,7 @@ class TestStuckPendingWarnerService:
         async def _fake_redispatch(engine, r):
             redispatch_calls.append(r)
 
-        monkeypatch.setattr(tm, "managed_transaction", _fake_mt)
+        monkeypatch.setattr(tm, "background_managed_transaction", _fake_mt)
         monkeypatch.setattr(tm.DQLQuery, "execute", _fake_execute)
         monkeypatch.setattr(tm, "_emit_stuck_pending_logs", _fake_emit)
         monkeypatch.setattr(tm, "_redispatch_stuck_rows", _fake_redispatch)
