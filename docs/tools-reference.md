@@ -368,12 +368,12 @@ async def my_db_operation():
 
 Lock-id derivation lives in `dynastore.durable.locks` and is **frozen** (pin-tested):
 `stable_lock_id_sha256(key)` folds a string to the signed 64-bit id used by
-session-scoped leadership (`pg_advisory_leadership`, `acquire_startup_lock`);
+session-scoped startup coordination (`acquire_startup_lock`);
 `stable_lock_id_blake2b(*parts)` produces the non-negative 63-bit id used by
 transaction-scoped guards (`pg_try_advisory_xact_lock`). The two are
 intentionally distinct; changing either re-keys live advisory locks and breaks
 single-leader guarantees during a rolling deploy. Leadership loops compose
-`pg_advisory_leadership` with `run_leader_loop` (`dynastore.tools.async_utils`).
+`lease_leadership` with `run_leader_loop` (`dynastore.tools.async_utils`).
 
 ### Partition Management
 

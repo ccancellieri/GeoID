@@ -18,18 +18,18 @@
 
 """Tests for AUTOCOMMIT connection handling in managed_transaction.
 
-AUTOCOMMIT connections (used by pg_advisory_leadership for advisory locks)
-have no active PostgreSQL transaction. managed_transaction must yield them
-as-is without calling begin() or begin_nested() — calling begin() on a
-connection that already autobegan raises a SQLAlchemy double-begin error
-("This connection has already initialized a SQLAlchemy Transaction() object
-via begin() or autobegin; can't call begin() here unless rollback() or
-commit() is called first").
+AUTOCOMMIT connections have no active PostgreSQL transaction.
+managed_transaction must yield them as-is without calling begin() or
+begin_nested() — calling begin() on a connection that already autobegan
+raises a SQLAlchemy double-begin error ("This connection has already
+initialized a SQLAlchemy Transaction() object via begin() or autobegin;
+can't call begin() here unless rollback() or commit() is called first").
 
-GcpLivenessReconciler passes ctx.lock_connection (AUTOCOMMIT advisory-lock
-connection) into select_lapsed_gcp_tasks → managed_transaction, where the
-old begin() call caused the recurring double-begin error logged as
-managed_transaction_autocommit_detected. Refs #2438 / #1894.
+GcpLivenessReconciler passes ctx.lock_connection (an AUTOCOMMIT connection
+under a leader-election backend that pins one) into select_lapsed_gcp_tasks
+→ managed_transaction, where the old begin() call caused the recurring
+double-begin error logged as managed_transaction_autocommit_detected. Refs
+#2438 / #1894.
 """
 
 from __future__ import annotations

@@ -95,8 +95,8 @@ class LeadershipConfig:
     leadership_interval_seconds: float = 20.0
     visibility_extend_seconds: int = 300
     unknown_grace_seconds: int = 180
-    # Lease-table election (election_backend="lease"): leader_lease row TTL.
-    # Must exceed the longest expected tick so the lease outlives one work cycle.
+    # Lease-table election: leader_lease row TTL. Must exceed the longest
+    # expected tick so the lease outlives one work cycle.
     lease_ttl_seconds: float = 30.0
     # Renewal cadence for the continuous-tenure heartbeat regime (opt-in via
     # BackgroundService.lease_renewal_mode = HEARTBEAT; see
@@ -108,9 +108,6 @@ class LeadershipConfig:
     # Safety margin: a tick whose timeout is within this many seconds of
     # lease_ttl_seconds risks outliving its lease under clock skew or load.
     lease_skew_margin_seconds: float = 5.0
-    # "lease" uses configs.leader_lease CAS (transaction-mode-pooler safe).
-    # "advisory" uses pg_advisory_leadership (kept one release for rollback).
-    election_backend: str = "lease"
 
 
 @dataclass
@@ -202,12 +199,11 @@ def resolve_leadership_config() -> Tuple[int, int, float, int, int]:
     leadership_interval_seconds, visibility_extend_seconds,
     unknown_grace_seconds)``.
 
-    This 5-tuple is retained for the legacy advisory-lock callers only. The
-    lease-election fields (``lease_ttl_seconds``, ``lease_skew_margin_seconds``,
-    ``lease_renew_interval_seconds``, ``election_backend``) are intentionally
-    NOT folded into the tuple — new code reads them via direct
-    ``_leadership_config.<field>`` attribute access, which is the canonical
-    pattern for those fields.
+    This 5-tuple is retained for legacy callers only. The lease-election
+    fields (``lease_ttl_seconds``, ``lease_skew_margin_seconds``,
+    ``lease_renew_interval_seconds``) are intentionally NOT folded into the
+    tuple — new code reads them via direct ``_leadership_config.<field>``
+    attribute access, which is the canonical pattern for those fields.
     """
     c = _leadership_config
     return (

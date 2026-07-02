@@ -102,7 +102,7 @@ def _make_service(
     return _Svc()  # type: ignore[return-value]
 
 
-# Fake advisory-lock context managers
+# Fake leader-election context managers
 
 
 @asynccontextmanager
@@ -113,7 +113,7 @@ async def _fake_leader_acquirer():
 
 @asynccontextmanager
 async def _fake_non_leader_acquirer():
-    """Always yields (False, None) (another pod holds the lock)."""
+    """Always yields (False, None) (another pod holds the lease)."""
     yield (False, None)
 
 
@@ -140,7 +140,7 @@ async def test_leader_only_wraps_in_leader_loop_non_leader() -> None:
     from sqlalchemy.ext.asyncio import AsyncEngine as _AsyncEngine
 
     with patch(
-        "dynastore.tools.background_service.pg_advisory_leadership",
+        "dynastore.tools.background_service.lease_leadership",
         side_effect=lambda *a, **kw: _fake_non_leader_acquirer(),
     ):
         with patch(
@@ -191,9 +191,6 @@ async def test_leader_only_wraps_in_leader_loop_is_leader() -> None:
     ))
 
     with patch(
-        "dynastore.tools.background_service.pg_advisory_leadership",
-        side_effect=lambda *a, **kw: _fake_leader_acquirer(),
-    ), patch(
         "dynastore.tools.background_service.lease_leadership",
         side_effect=lambda *a, **kw: _fake_leader_acquirer(),
     ):
@@ -208,7 +205,7 @@ async def test_leader_only_wraps_in_leader_loop_is_leader() -> None:
 
 @pytest.mark.asyncio
 async def test_run_everywhere_skips_election() -> None:
-    """RUN_EVERYWHERE: pg_advisory_leadership is NEVER called."""
+    """RUN_EVERYWHERE: lease_leadership is NEVER called."""
     ran = {"yes": False}
 
     async def _run(ctx: ServiceContext) -> None:
@@ -227,7 +224,7 @@ async def test_run_everywhere_skips_election() -> None:
     mock_pg = MagicMock()
 
     with patch(
-        "dynastore.tools.background_service.pg_advisory_leadership",
+        "dynastore.tools.background_service.lease_leadership",
         mock_pg,
     ):
         supervisor.start(ctx)
@@ -263,7 +260,7 @@ async def test_leader_only_downgrades_on_non_async_engine() -> None:
     mock_pg = MagicMock()
 
     with patch(
-        "dynastore.tools.background_service.pg_advisory_leadership",
+        "dynastore.tools.background_service.lease_leadership",
         mock_pg,
     ):
         supervisor.start(ctx)
@@ -437,7 +434,7 @@ async def test_skip_ephemeral_evaluated_before_leadership() -> None:
     ))
 
     mock_pg = MagicMock()
-    with patch("dynastore.tools.background_service.pg_advisory_leadership", mock_pg):
+    with patch("dynastore.tools.background_service.lease_leadership", mock_pg):
         supervisor.start(ctx)
 
     assert "service:leader-ephemeral" not in executor.submitted
@@ -508,7 +505,7 @@ async def test_start_continues_when_one_submit_fails() -> None:
 
 @pytest.mark.asyncio
 async def test_leader_tick_timeout_releases_lock() -> None:
-    """A LEADER_ONLY PeriodicService with tick_timeout releases the advisory lock
+    """A LEADER_ONLY PeriodicService with tick_timeout releases leadership
     when the tick exceeds the timeout, preventing indefinite lock hold."""
     from sqlalchemy.ext.asyncio import AsyncEngine as _AsyncEngine
 
@@ -544,9 +541,6 @@ async def test_leader_tick_timeout_releases_lock() -> None:
         return original_isinstance(obj, cls)
 
     with patch(
-        "dynastore.tools.background_service.pg_advisory_leadership",
-        side_effect=lambda *a, **kw: _fake_leader_acquirer_with_tracking(),
-    ), patch(
         "dynastore.tools.background_service.lease_leadership",
         side_effect=lambda *a, **kw: _fake_leader_acquirer_with_tracking(),
     ):
@@ -622,10 +616,9 @@ def test_periodic_service_default_lease_renewal_mode_is_per_tick() -> None:
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_mode_dispatches_to_heartbeat_loop_under_lease_backend() -> None:
-    """A HEARTBEAT-mode PeriodicService under election_backend='lease' is
-    wrapped by run_lease_leadership_heartbeat_loop, not run_leader_loop."""
-    import dynastore.modules.db_config.connection_health_config as chc
+async def test_heartbeat_mode_dispatches_to_heartbeat_loop() -> None:
+    """A HEARTBEAT-mode PeriodicService is wrapped by
+    run_lease_leadership_heartbeat_loop, not run_leader_loop."""
 
     class _HeartbeatPeriodic(PeriodicService):
         name = "heartbeat-periodic"
@@ -645,64 +638,19 @@ async def test_heartbeat_mode_dispatches_to_heartbeat_loop_under_lease_backend()
         captured["args"] = args
         captured["kwargs"] = kwargs
 
-    original_backend = chc._leadership_config.election_backend
-    chc._leadership_config.election_backend = "lease"
-    try:
-        with patch(
-            "dynastore.tools.background_service.run_lease_leadership_heartbeat_loop",
-            side_effect=_fake_heartbeat_loop,
-        ) as mock_heartbeat_loop, patch(
-            "dynastore.tools.background_service.run_leader_loop",
-        ) as mock_per_tick_loop:
-            coro = supervisor._leader_elected_coro(_HeartbeatPeriodic(), ctx)
-            await coro
-    finally:
-        chc._leadership_config.election_backend = original_backend
+    with patch(
+        "dynastore.tools.background_service.run_lease_leadership_heartbeat_loop",
+        side_effect=_fake_heartbeat_loop,
+    ) as mock_heartbeat_loop, patch(
+        "dynastore.tools.background_service.run_leader_loop",
+    ) as mock_per_tick_loop:
+        coro = supervisor._leader_elected_coro(_HeartbeatPeriodic(), ctx)
+        await coro
 
     mock_heartbeat_loop.assert_called_once()
     mock_per_tick_loop.assert_not_called()
     assert captured["kwargs"]["name"] == "heartbeat-periodic"
     assert captured["kwargs"]["cadence_seconds"] == 30.0
-
-
-@pytest.mark.asyncio
-async def test_heartbeat_mode_falls_back_to_per_tick_under_advisory_backend() -> None:
-    """HEARTBEAT mode is a lease-table-only capability: under
-    election_backend='advisory' it silently falls back to the per-tick path
-    (run_leader_loop) instead of stranding the service leaderless."""
-    import dynastore.modules.db_config.connection_health_config as chc
-
-    class _HeartbeatPeriodic(PeriodicService):
-        name = "heartbeat-periodic-advisory"
-        leadership = Leadership.LEADER_ONLY
-        lease_renewal_mode = LeaseRenewalMode.HEARTBEAT
-        cadence_seconds = 5.0
-
-        async def tick(self, ctx: ServiceContext) -> None:
-            pass
-
-    ctx = _make_ctx(engine=MagicMock())
-    supervisor = BackgroundSupervisor()
-
-    async def _capture_and_exit(**kwargs: Any) -> None:
-        pass
-
-    original_backend = chc._leadership_config.election_backend
-    chc._leadership_config.election_backend = "advisory"
-    try:
-        with patch(
-            "dynastore.tools.background_service.run_lease_leadership_heartbeat_loop",
-        ) as mock_heartbeat_loop, patch(
-            "dynastore.tools.background_service.run_leader_loop",
-            MagicMock(side_effect=_capture_and_exit),
-        ) as mock_per_tick_loop:
-            coro = supervisor._leader_elected_coro(_HeartbeatPeriodic(), ctx)
-            await coro
-    finally:
-        chc._leadership_config.election_backend = original_backend
-
-    mock_heartbeat_loop.assert_not_called()
-    mock_per_tick_loop.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -733,19 +681,12 @@ async def test_heartbeat_mode_ticks_repeatedly_without_reacquiring() -> None:
     ctx = _make_ctx(engine=MagicMock())
     supervisor = BackgroundSupervisor()
 
-    import dynastore.modules.db_config.connection_health_config as chc
-
-    original_backend = chc._leadership_config.election_backend
-    chc._leadership_config.election_backend = "lease"
-    try:
-        with patch(
-            "dynastore.modules.db_config.locking_tools.lease_leadership_with_heartbeat",
-            _fake_heartbeat_acquire,
-        ):
-            coro = supervisor._leader_elected_coro(_HeartbeatPeriodic(), ctx)
-            await asyncio.wait_for(coro, timeout=2.0)
-    finally:
-        chc._leadership_config.election_backend = original_backend
+    with patch(
+        "dynastore.modules.db_config.locking_tools.lease_leadership_with_heartbeat",
+        _fake_heartbeat_acquire,
+    ):
+        coro = supervisor._leader_elected_coro(_HeartbeatPeriodic(), ctx)
+        await asyncio.wait_for(coro, timeout=2.0)
 
     assert acquire_count["n"] == 1, "lease must be acquired ONCE, not per tick"
     assert tick_count["n"] == 3

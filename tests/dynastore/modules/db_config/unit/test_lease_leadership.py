@@ -23,8 +23,7 @@ A second yield makes contextlib raise ``RuntimeError: generator didn't stop``
 and the leader loop resigns every cycle — the regression these tests pin down.
 
 DB layer is mocked via monkeypatching ``managed_transaction`` in the
-``locking_tools`` module, mirroring the mock-DQLQuery approach used in
-``test_pg_advisory_leadership.py``.
+``locking_tools`` module.
 """
 from __future__ import annotations
 

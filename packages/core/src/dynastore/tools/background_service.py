@@ -41,7 +41,6 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from dynastore.modules.concurrency import get_background_executor
 from dynastore.modules.db_config.locking_tools import (
-    pg_advisory_leadership,
     lease_leadership,
     probe_lock_connection_liveness,
     run_lease_leadership_heartbeat_loop,
@@ -75,8 +74,8 @@ class Leadership(Enum):
     """Every pod runs run() directly — no leadership election."""
 
     LEADER_ONLY = "leader_only"
-    """Wrap run() in run_leader_loop + pg_advisory_leadership. Only the elected
-    leader pod drives this service; followers skip until the lock is free."""
+    """Wrap run() in run_leader_loop + lease_leadership. Only the elected
+    leader pod drives this service; followers skip until the lease is free."""
 
 
 class PodPolicy(Enum):
@@ -89,13 +88,8 @@ class PodPolicy(Enum):
 
 
 class LeaseRenewalMode(Enum):
-    """How a LEADER_ONLY :class:`PeriodicService` holds its lease-table tenure.
-
-    Only meaningful under ``election_backend="lease"``
-    (:class:`~dynastore.modules.db_config.connection_health_config.LeadershipConfig`);
-    ``HEARTBEAT`` is silently treated as ``PER_TICK`` under the advisory
-    backend, whose session-affinity model does not fit a periodic renewal
-    task (see #2438).
+    """How a LEADER_ONLY :class:`PeriodicService` holds its lease-table tenure
+    (see #2438).
     """
 
     PER_TICK = "per_tick"
@@ -136,23 +130,22 @@ class ServiceContext:
         runners). Services with PodPolicy.SKIP_EPHEMERAL are omitted.
     name:
         Host / service-instance name. Used in log messages and as a fallback
-        component in advisory-lock key derivation.
+        component in leader-election key derivation.
     lock_connection:
-        For LEADER_ONLY services backed by the advisory election backend, the
-        dedicated AUTOCOMMIT connection holding the session advisory lock.
-        Services may reuse this connection for DB work during the tick.
-        ``None`` for RUN_EVERYWHERE services, when not the leader, or when
-        the lease-table backend is active (``election_backend="lease"`` in
-        ``LeadershipConfig``).  Services that need a DB connection and may
-        receive ``None`` here should fall back to acquiring one via
-        ``ctx.engine``.
+        Always ``None`` under the lease-table election backend (the only
+        backend today — see :func:`~dynastore.modules.db_config.
+        locking_tools.lease_leadership`), which does not hold a dedicated
+        connection between yield and release. Kept as a field (rather than
+        removed) so a future election backend can populate it without an
+        API change. Services that need a DB connection should fall back to
+        acquiring one via ``ctx.engine``.
 
-        IMPORTANT: When non-None, this is an AUTOCOMMIT connection
-        (isolation_level='AUTOCOMMIT').  When passing to
-        :func:`~dynastore.modules.db_config.query_executor.managed_transaction`,
-        the function automatically detects AUTOCOMMIT mode and uses ``begin()``
+        IMPORTANT: if a future backend ever populates this with an AUTOCOMMIT
+        connection (isolation_level='AUTOCOMMIT'), passing it to
+        :func:`~dynastore.modules.db_config.query_executor.managed_transaction`
+        makes that function auto-detect AUTOCOMMIT mode and use ``begin()``
         instead of ``begin_nested()``. Do NOT attempt to create nested
-        transactions manually on this connection — it will raise
+        transactions manually on such a connection — it would raise
         ``NoActiveSQLTransactionError``.
     """
 
@@ -234,7 +227,7 @@ class PeriodicService(ABC):
     ``lease_ttl_seconds`` without releasing leadership between ticks."""
     cadence_seconds: float = 30.0
     tick_timeout: Optional[float] = None
-    """Maximum time a tick may run before the advisory lock is released.
+    """Maximum time a tick may run before leadership is released.
 
     When set, a tick exceeding this timeout is cancelled and leadership is
     resigned, preventing a slow tick from blocking election under pool
@@ -261,10 +254,10 @@ class PeriodicService(ABC):
 
         The asymmetry is deliberate. RUN_EVERYWHERE self-heals in place because
         no shared resource is held across ticks. LEADER_ONLY MUST NOT retry in
-        place: its tick holds the advisory-lock AUTOCOMMIT connection, so an
-        in-place retry pins that connection and a pool slot through the backoff.
+        place: its tick holds the lease-table leadership row, so an in-place
+        retry withholds leadership from other pods through the backoff.
         A failing leader tick must raise so ``run_leader_loop`` resigns and the
-        lock is freed for another pod — never add an inner retry loop there.
+        lease is freed for another pod — never add an inner retry loop there.
         """
         try:
             await self.tick(ctx)
@@ -365,25 +358,25 @@ class BackgroundSupervisor:
     ) -> Coroutine[Any, Any, None]:
         """Wrap a LEADER_ONLY service in single-leader election.
 
-        ``run_leader_loop`` repeatedly tries to acquire the per-service advisory
-        lock; only the pod that wins runs the leader work. Followers retry on the
+        ``run_leader_loop`` repeatedly tries to acquire the per-service lease;
+        only the pod that wins runs the leader work. Followers retry on the
         loop's cadence until they win or shutdown is set.
 
-        Connection cost — why periodic services elect *per tick*
-        --------------------------------------------------------
-        ``pg_advisory_leadership`` holds a dedicated pooled connection for the
-        duration of the ``with`` block. If the leader work were the service's
-        whole ``run()`` loop, that connection would stay checked out for the
-        pod's entire lifetime — one pinned connection per LEADER_ONLY service.
-        With several such services and a small pool (``DB_POOL_MIN_SIZE`` floors
-        low and operators run it small), the leader pod would starve its own
-        request traffic.
+        Why periodic services elect *per tick*
+        ---------------------------------------
+        ``lease_leadership`` acquires a lease-table row with a bounded TTL
+        (``lease_ttl_seconds``) for a single tick, not for the leader pod's
+        entire lifetime. If the leader work were the service's whole ``run()``
+        loop, the lease would need continuous renewal (see the opt-in
+        ``LeaseRenewalMode.HEARTBEAT`` regime) or it would expire mid-tenure
+        and hand leadership to another pod.
 
         So for a :class:`PeriodicService` the leader work is a *single* ``tick``:
-        acquire → one tick → release → sleep one cadence → re-elect. The advisory
-        connection is held only while a tick runs, never between ticks. This is
-        exactly the proven reaper pattern (``run_leader_loop(on_leader=run_once)``)
-        these daemons used before unification, and it keeps the pool budget safe.
+        acquire → one tick → release → sleep one cadence → re-elect. The lease
+        is held only while a tick runs, never between ticks. This is exactly the
+        proven reaper pattern (``run_leader_loop(on_leader=run_once)``) these
+        daemons used before unification, and every tick is bounded by the lease
+        TTL by construction.
 
         A non-periodic LEADER_ONLY service (none exist today) owns its own loop,
         so it necessarily holds leadership for its whole ``run()`` — the fallback
@@ -399,19 +392,9 @@ class BackgroundSupervisor:
         )
 
         def acquire():
-            # Select the election backend from live config.
-            # "lease"    → lease_leadership: transaction-mode-pooler safe,
-            #              CAS on configs.leader_lease, no pinned connection.
-            # "advisory" → pg_advisory_leadership: session advisory lock on a
-            #              dedicated AUTOCOMMIT connection (kept one release
-            #              for rollback; not compatible with transaction-mode
-            #              pooling).
-            from dynastore.modules.db_config.connection_health_config import (
-                _leadership_config,
-            )
-            if _leadership_config.election_backend == "lease":
-                return lease_leadership(ctx.engine, key, name=service.name)
-            return pg_advisory_leadership(ctx.engine, key, name=service.name)
+            # lease_leadership: transaction-mode-pooler safe CAS on
+            # configs.leader_lease; no connection pinned across ticks.
+            return lease_leadership(ctx.engine, key, name=service.name)
 
         # One probe closure shared by both run_leader_loop call sites below.
         # Reads live config on each tick so operators can toggle or retune
@@ -450,18 +433,8 @@ class BackgroundSupervisor:
 
             # Opt-in continuous-tenure regime: acquire the lease ONCE and keep
             # it alive via a background renewal heartbeat instead of the
-            # per-tick acquire/release model below. Only meaningful under the
-            # lease backend (the advisory backend has no renewal primitive —
-            # see LeaseRenewalMode's docstring); silently falls back to the
-            # per-tick path otherwise so flipping election_backend never
-            # strands a HEARTBEAT-mode service leaderless.
-            from dynastore.modules.db_config.connection_health_config import (
-                _leadership_config as _cfg_for_mode,
-            )
-            if (
-                periodic.lease_renewal_mode is LeaseRenewalMode.HEARTBEAT
-                and _cfg_for_mode.election_backend == "lease"
-            ):
+            # per-tick acquire/release model below.
+            if periodic.lease_renewal_mode is LeaseRenewalMode.HEARTBEAT:
                 return self._heartbeat_leader_coro(periodic, ctx, key)
 
             # One-time visibility flag for the lease-TTL tick clamp below.
@@ -482,22 +455,19 @@ class BackgroundSupervisor:
                     name=ctx.name,
                     lock_connection=lock_conn,
                 )
-                # Under the lease backend the lease is acquired with a TTL at
-                # tick start and NOT renewed during the tick. A tick that runs
-                # longer than the TTL would lose its lease mid-flight, opening a
-                # two-leader window. Cap the tick at lease_ttl - skew_margin so
-                # it can never outlive its lease; overlap is bounded to the skew
-                # margin regardless of the service's cadence / tick_timeout. Read
-                # the LIVE config here (not at registration) so the cap tracks
+                # The lease is acquired with a TTL at tick start and NOT
+                # renewed during the tick. A tick that runs longer than the TTL
+                # would lose its lease mid-flight, opening a two-leader window.
+                # Cap the tick at lease_ttl - skew_margin so it can never
+                # outlive its lease; overlap is bounded to the skew margin
+                # regardless of the service's cadence / tick_timeout. Read the
+                # LIVE config here (not at registration) so the cap tracks
                 # hot-reloaded values. Services needing a longer tenure must use
                 # the renewal-heartbeat regime, not a longer cadence.
                 from dynastore.modules.db_config.connection_health_config import (
                     _leadership_config,
                 )
                 cfg = _leadership_config
-                if cfg.election_backend != "lease":
-                    await periodic.tick(leader_ctx)
-                    return
                 configured = (
                     periodic.tick_timeout
                     if periodic.tick_timeout is not None
@@ -559,9 +529,7 @@ class BackgroundSupervisor:
         acquired ONCE per tenure (not per tick) and kept alive by
         :func:`~dynastore.modules.db_config.locking_tools.lease_leadership_with_heartbeat`'s
         background renewal task, so ``tick`` runs on ``cadence_seconds``
-        without releasing leadership in between. Callers reach this only when
-        ``election_backend="lease"`` (checked by the caller) — the advisory
-        backend has no renewal primitive.
+        without releasing leadership in between.
         """
         async def on_tick() -> None:
             leader_ctx = ServiceContext(

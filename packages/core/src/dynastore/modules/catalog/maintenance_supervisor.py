@@ -28,10 +28,9 @@ and this supervisor also drives their ES-side retention (``es_logs_retention``,
 
 Architecture contract
 ---------------------
-- One background loop per process; a pg session-level advisory lock (held
-  via ``pg_advisory_leadership`` on a dedicated AUTOCOMMIT connection —
-  never a pool checkout or an open transaction held across work) ensures
-  exactly one pod fleet-wide performs the jobs.
+- One background loop per process; a lease-table leadership row (held via
+  ``lease_leadership`` — no pinned connection, safe under transaction-mode
+  pooling) ensures exactly one pod fleet-wide performs the jobs.
 - Tick behaviour: reclaim stale jobs → fetch due jobs → for each due job:
   mark_running, run with a bounded per-job statement_timeout, mark_done.
   A job raising an exception records status='error' and lets others proceed

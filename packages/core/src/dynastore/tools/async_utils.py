@@ -583,41 +583,44 @@ async def run_leader_loop(
 
     Each outer iteration:
       1. Calls ``acquire_leadership()`` and enters its context manager
-         (typically a non-blocking advisory-lock acquire).
-      2. The context yields ``(is_leader, lock_connection)``. If ``is_leader``
-         is ``True``, ``on_leader(lock_connection)`` is called with the lock
-         connection so the leader can reuse it for DB work.
-      3. Exits the context (releasing the lock) and sleeps ``cadence_seconds``.
+         (typically a non-blocking lease-table CAS acquire — see
+         ``dynastore.modules.db_config.locking_tools.lease_leadership``).
+      2. The context yields ``(is_leader, lock_connection)``. ``lock_connection``
+         is backend-defined — ``lease_leadership`` always yields ``None`` since
+         it does not pin a connection between yield and release, but the
+         signature stays generic so a future backend could hand one back for
+         the leader to reuse. If ``is_leader`` is ``True``,
+         ``on_leader(lock_connection)`` is called.
+      3. Exits the context (releasing leadership) and sleeps ``cadence_seconds``.
       4. On any exception inside the leadership context, the context is exited
-         (releasing the lock) before sleeping — preventing leader-held resources
-         (e.g. AUTOCOMMIT advisory-lock connections) from staying associated
-         with a poisoned pool slot across retries.
+         (releasing leadership) before sleeping — preventing leader-held
+         resources from staying associated with a poisoned pool slot across
+         retries.
 
     ``on_leader`` receives the lock connection and may run its own inner
     periodic loop, but MUST let exceptions propagate. Swallowing exceptions
-    inside ``on_leader`` keeps the lock held and is the anti-pattern this
+    inside ``on_leader`` keeps leadership held and is the anti-pattern this
     helper exists to prevent.
 
     INVARIANT — no inner per-tick retry loop. ``on_leader`` must fail fast on a
     transient error and let it propagate so this loop resigns (exits the
-    leadership context, releasing the advisory lock) and the lock hands off to
-    another pod. Do NOT wrap the tick body in a retry/backoff loop: the lock is
-    held on a dedicated AUTOCOMMIT connection for the whole leadership tenure,
-    so an inner retry pins that connection — and the leader's pool slot —
-    through the entire backoff, worsening pool pressure exactly when the DB is
-    already struggling. Self-healing belongs to the OUTER loop here (resign →
-    sleep one cadence → re-elect), never the inner tick.
+    leadership context, releasing the lease) and leadership hands off to
+    another pod. Do NOT wrap the tick body in a retry/backoff loop: an inner
+    retry withholds leadership from other pods through the entire backoff,
+    worsening pool pressure exactly when the DB is already struggling.
+    Self-healing belongs to the OUTER loop here (resign → sleep one cadence →
+    re-elect), never the inner tick.
 
     ``acquire_leadership`` MUST yield exactly once on every code path. Do not
-    hand-roll it for Postgres advisory locks — use
-    ``dynastore.modules.db_config.locking_tools.pg_advisory_leadership``,
-    which holds the lock on a dedicated AUTOCOMMIT connection (no transaction
-    pinned across the tenure, no lock leaking into the pool) and never yields
-    from an ``except`` handler (the historical double-yield bug surfaced as
+    hand-roll it — use
+    ``dynastore.modules.db_config.locking_tools.lease_leadership``, which is
+    safe under transaction-mode connection pooling (no connection pinned
+    across the tenure, no lease leaking into the pool) and never yields from
+    an ``except`` handler (the historical double-yield bug surfaced as
     ``RuntimeError: generator didn't stop`` and resigned every cycle).
 
-    ``tick_timeout`` bounds the maximum time the advisory lock is held per
-    tick. If the tick exceeds this timeout, it is cancelled and the lock is
+    ``tick_timeout`` bounds the maximum time leadership is held per tick. If
+    the tick exceeds this timeout, it is cancelled and leadership is
     released, preventing a slow tick from blocking leadership election under
     pool contention or external API latency. Defaults to ``cadence_seconds``
     to ensure the tick completes within one cadence window.
@@ -653,7 +656,7 @@ async def run_leader_loop(
                     await asyncio.wait_for(on_leader(lock_conn), timeout=effective_tick_timeout)
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "%s: tick timed out after %.1fs (advisory lock released); "
+                        "%s: tick timed out after %.1fs (leadership released); "
                         "consider reducing tick workload or increasing tick_timeout.",
                         name, effective_tick_timeout,
                     )

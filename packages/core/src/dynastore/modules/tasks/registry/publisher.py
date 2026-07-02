@@ -230,7 +230,7 @@ class RegistryHeartbeatService(PeriodicService):
     applied uniformly by ``BackgroundSupervisor``:
 
     * ``LEADER_ONLY`` — exactly one pod per service drives the registry writes;
-      the supervisor wraps ``tick()`` in ``pg_advisory_leadership`` so followers
+      the supervisor wraps ``tick()`` in ``lease_leadership`` so followers
       skip. On a non-AsyncEngine (single-process / sync / test) deployment the
       supervisor auto-downgrades to run-everywhere.
     * ``SKIP_EPHEMERAL`` — ephemeral Cloud Run Job pods never start it. They run

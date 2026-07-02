@@ -319,5 +319,5 @@ async def test_probe_cancelled_error_propagates_without_resign():
             pre_tick_probe=_cancel_probe,
         )
 
-    # Lock was acquired and released (finally block in pg_advisory_leadership runs)
+    # Leadership was acquired and released (the acquirer's finally block runs)
     assert tracker.released == 1

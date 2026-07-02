@@ -112,8 +112,8 @@ T = TypeVar("T")
 _held_lock_keys: ContextVar[Optional[Set[str]]] = ContextVar("_held_lock_keys", default=None)
 
 
-# Process-wide registry of SESSION-level advisory locks this pod currently holds
-# (leadership tenures via ``pg_advisory_leadership``). Keyed by the 64-bit lock
+# Process-wide registry of leadership tenures this pod currently holds
+# (via ``lease_leadership`` / ``lease_leadership_with_heartbeat``). Keyed by the 64-bit lock
 # id; the value carries the human ``name`` and the ``time.monotonic()`` acquire
 # stamp so release can log how long the lock was held. This is the observability
 # the operator asked for: a long-lived advisory lock can no longer be acquired
@@ -274,11 +274,11 @@ async def probe_lock_connection_liveness(
         )
         # On a dead TCP socket the probe times out while asyncpg is still
         # awaiting the cancel-ack for the abandoned query. If we leave the
-        # connection in that state, the pg_advisory_unlock issued by
-        # pg_advisory_leadership's finally block blocks on the same dead wire
-        # until the OS TCP timeout fires (~75s), delaying the lock handoff the
-        # probe exists to accelerate. Invalidating the connection now tears the
-        # transport down immediately so the unlock/close path returns promptly.
+        # connection in that state, a caller's release/unlock step on the
+        # same connection blocks on the same dead wire until the OS TCP
+        # timeout fires (~75s), delaying the leadership handoff the probe
+        # exists to accelerate. Invalidating the connection now tears the
+        # transport down immediately so the release path returns promptly.
         # Best-effort: the connection is being resigned regardless.
         try:
             await conn.invalidate()
@@ -407,123 +407,6 @@ def _get_stable_lock_id(key: str) -> int:
 
 
 @asynccontextmanager
-async def pg_advisory_leadership(
-    engine: Optional[DbResource],
-    key: Union[int, str],
-    *,
-    name: str = "leader",
-) -> AsyncGenerator[Tuple[bool, Optional[AsyncConnection]], None]:
-    """Non-blocking leadership election via a PG session advisory lock.
-
-    Canonical leadership context manager for :func:`dynastore.tools.
-    async_utils.run_leader_loop`. Yields ``(is_leader, lock_connection)`` where
-    ``is_leader`` is ``True`` if this process became the leader, and
-    ``lock_connection`` is the dedicated AUTOCOMMIT connection holding the
-    advisory lock (or ``None`` if not leader).
-
-    The lock connection can be reused by the leader for DB work during the
-    tenure, avoiding the need to acquire a second connection from the pool.
-    This is critical for pool-constrained environments (Cloud Run) where
-    holding both a lock connection and a work connection can starve the pool.
-
-    Design invariants (each one fixes a production failure mode):
-
-    * The lock is taken on a **dedicated AUTOCOMMIT connection**, never on a
-      pooled transaction. Session advisory locks belong to the connection; on
-      a pooled one a failed unlock would leak the lock into pool inventory and
-      permanently block leadership fleet-wide. Here the connection is closed
-      in ``finally``, which releases the lock even if the explicit unlock
-      fails — and a long leadership tenure never holds a transaction open.
-    * Failures *before* leadership is yielded (connect, AUTOCOMMIT switch,
-      acquire query) degrade to ``yield (False, None)``: the caller is simply
-      not the leader this round.
-    * Failures *after* ``yield (True, conn)`` (raised in the caller's body, or
-      by the unlock/close steps) propagate so the loop can resign loudly and
-      retry. Never ``yield`` from an ``except`` around the leadership
-      ``yield`` — a second yield makes ``contextlib`` raise
-      ``generator didn't stop``.
-
-    ``key`` may be a 64-bit int used as-is, or a string folded to one via
-    :func:`_get_stable_lock_id`. Requires an :class:`AsyncEngine`; any other
-    engine (or ``None``) yields ``(False, None)`` with a warning, matching the
-    events consumer precedent — single-process sync deployments get no election.
-
-    Known property: if the lock connection dies mid-tenure PG releases the
-    lock and another instance may become leader while this one finishes its
-    tick. Leader-run jobs must stay idempotent under that overlap.
-    """
-    if not isinstance(engine, AsyncEngine):
-        logger.warning(
-            "%s: leadership requires AsyncEngine (got %s); not a leader.",
-            name,
-            type(engine).__name__ if engine is not None else "None",
-        )
-        yield (False, None)
-        return
-    lock_id = key if isinstance(key, int) else _get_stable_lock_id(key)
-    conn_ctx = engine.connect()
-    try:
-        conn = await conn_ctx.__aenter__()
-    except Exception as exc:
-        logger.warning(
-            "%s: leadership connect failed (%s); not a leader.", name, exc
-        )
-        yield (False, None)
-        return
-    try:
-        try:
-            conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
-            acquired = bool(
-                await DQLQuery(
-                    "SELECT pg_try_advisory_lock(:id)",
-                    result_handler=ResultHandler.SCALAR,
-                ).execute(conn, id=lock_id)
-            )
-        except Exception as exc:
-            logger.warning(
-                "%s: leadership acquisition failed (%s); not a leader.",
-                name,
-                exc,
-            )
-            acquired = False
-        if not acquired:
-            yield (False, None)
-            return
-        acquired_at = time.monotonic()
-        _held_advisory_locks[lock_id] = (name, acquired_at)
-        logger.info(
-            "%s: leadership lock acquired (key=%s, advisory_locks_held_now=%d).",
-            name,
-            key,
-            len(_held_advisory_locks),
-        )
-        try:
-            yield (True, conn)
-        finally:
-            _held_advisory_locks.pop(lock_id, None)
-            logger.info(
-                "%s: leadership lock released (key=%s, held=%.1fs, "
-                "advisory_locks_held_now=%d).",
-                name,
-                key,
-                time.monotonic() - acquired_at,
-                len(_held_advisory_locks),
-            )
-            try:
-                await DQLQuery(
-                    "SELECT pg_advisory_unlock(:id)",
-                    result_handler=ResultHandler.NONE,
-                ).execute(conn, id=lock_id)
-            except Exception:
-                pass  # closing the dedicated connection releases the lock
-    finally:
-        try:
-            await conn_ctx.__aexit__(None, None, None)
-        except Exception:
-            pass
-
-
-@asynccontextmanager
 async def lease_leadership(
     engine: Optional[DbResource],
     key: Union[int, str],
@@ -532,7 +415,8 @@ async def lease_leadership(
 ) -> AsyncGenerator[Tuple[bool, Optional[AsyncConnection]], None]:
     """Non-blocking leadership election via a lease table CAS.
 
-    Drop-in replacement for :func:`pg_advisory_leadership` that works under
+    Canonical leader-election context manager for
+    :func:`dynastore.tools.async_utils.run_leader_loop`, safe under
     transaction-mode connection pooling (AlloyDB, PgBouncer transaction mode).
     Each call is a single INSERT … ON CONFLICT statement inside
     :func:`managed_transaction` — the connection is returned to the pool on
@@ -543,10 +427,8 @@ async def lease_leadership(
     yield and release.  Callers that need a DB connection for their tick
     work must acquire one from the pool via :func:`get_engine`.
 
-    The lock identity is the same ``_get_stable_lock_id`` derivation used by
-    :func:`pg_advisory_leadership`, so a cluster can migrate backends without
-    key drift: ``key`` may be a 64-bit int (used as-is) or a string (folded
-    via sha256).
+    The lock identity is folded via ``_get_stable_lock_id``: ``key`` may be a
+    64-bit int (used as-is) or a string (folded via sha256).
 
     Design invariants:
 
@@ -1045,10 +927,10 @@ async def run_startup_ddl_tolerating_lock_timeout(
     itself, etc.) is NOT swallowed — it propagates as before.
 
     Startup-DDL locks only. Never use this for leader-election locks
-    (``pg_advisory_leadership`` / ``lease_leadership`` / the
-    ``configs.leader_lease`` table) — those arbitrate exclusive ownership of
-    ongoing work rather than guarding one-shot idempotent DDL, so silently
-    falling back to "proceed unlocked" would be wrong for them.
+    (``lease_leadership`` / the ``configs.leader_lease`` table) — those
+    arbitrate exclusive ownership of ongoing work rather than guarding
+    one-shot idempotent DDL, so silently falling back to "proceed unlocked"
+    would be wrong for them.
     """
     try:
         async with acquire_startup_lock(engine, lock_key) as locked_conn:

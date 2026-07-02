@@ -171,9 +171,8 @@ def _is_transient_asyncpg_error(exc: Optional[BaseException]) -> bool:
 def _is_autocommit_connection(conn: Any) -> bool:
     """Detect if connection has AUTOCOMMIT isolation level.
 
-    AUTOCOMMIT connections (used by pg_advisory_leadership for advisory locks)
-    have no active PostgreSQL transaction, so attempting begin_nested()
-    (SAVEPOINT) raises NoActiveSQLTransactionError.
+    AUTOCOMMIT connections have no active PostgreSQL transaction, so
+    attempting begin_nested() (SAVEPOINT) raises NoActiveSQLTransactionError.
 
     This function checks SQLAlchemy's execution_options for isolation_level.
     Works for both async (AsyncConnection) and sync (Connection) paths.
@@ -2128,16 +2127,15 @@ async def managed_transaction(db_resource: Optional[DbResource]):
        transaction with ``conn.begin()``.
 
     3. **AUTOCOMMIT connection input**: Connections with isolation_level
-       AUTOCOMMIT (e.g., from :func:`pg_advisory_leadership`) are yielded
-       as-is without opening any explicit transaction. Autocommit semantics
-       mean each statement commits individually; calling ``begin()`` on a
-       connection that already autobegan raises a SQLAlchemy double-begin
-       error. This function detects AUTOCOMMIT mode and skips
+       AUTOCOMMIT are yielded as-is without opening any explicit transaction.
+       Autocommit semantics mean each statement commits individually; calling
+       ``begin()`` on a connection that already autobegan raises a SQLAlchemy
+       double-begin error. This function detects AUTOCOMMIT mode and skips
        ``begin()``/``begin_nested()`` entirely.
 
-    The AUTOCOMMIT handling is critical for LEADER_ONLY background services
-    that reuse the advisory-lock connection for database work during their
-    tick cycle. See :class:`~dynastore.tools.background_service.ServiceContext`
+    The AUTOCOMMIT handling exists for LEADER_ONLY background services that
+    reuse a leader-election connection for database work during their tick
+    cycle. See :class:`~dynastore.tools.background_service.ServiceContext`
     for details on ``lock_connection`` usage.
 
     Args:
@@ -2290,10 +2288,10 @@ async def managed_transaction(db_resource: Optional[DbResource]):
         if isinstance(conn, (AsyncConnection, AsyncSession)):
             if conn.in_transaction():
                 # SPECIAL CASE: AUTOCOMMIT connections
-                # AUTOCOMMIT connections (used by pg_advisory_leadership) have no
-                # active PostgreSQL transaction. SQLAlchemy's in_transaction() may
-                # return True due to autobegin, but begin_nested() (SAVEPOINT) fails
-                # with NoActiveSQLTransactionError. Use begin() instead.
+                # AUTOCOMMIT connections have no active PostgreSQL transaction.
+                # SQLAlchemy's in_transaction() may return True due to
+                # autobegin, but begin_nested() (SAVEPOINT) fails with
+                # NoActiveSQLTransactionError. Use begin() instead.
                 if _is_autocommit_connection(conn):
                     logger.debug(
                         "managed_transaction_autocommit_detected wire_id=%s",
