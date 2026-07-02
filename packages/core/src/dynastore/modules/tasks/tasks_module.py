@@ -57,6 +57,7 @@ from dynastore.tools.background_service import (
 )
 
 from .models import Task, TaskCreate, TaskUpdate
+from .workclass_ddl import render_partition_create_ahead_ddl, render_partition_retention_ddl
 
 logger = logging.getLogger(__name__)
 
@@ -254,98 +255,18 @@ def set_hard_retry_cap(value: int) -> None:
 # These are called by the MaintenanceSupervisor; pg_cron is NOT used.
 # ---------------------------------------------------------------------------
 
-# NOTE: {schema} survives until DDLQuery substitutes it via
-# str.replace("{schema}", value) — NOT str.format — so a doubled brace
-# (\d{{4}}) is NOT collapsed and PostgreSQL would receive the literal
-# "\d{{4}}", which matches no partition and silently disables retention.
-# The regexes below therefore use the single-brace form \d{4}_\d{2}.
-GLOBAL_TASKS_RETENTION_FUNC_DDL = """
-CREATE OR REPLACE FUNCTION "{schema}"."maintain_partitions_{schema}_tasks"() RETURNS void AS $$
-DECLARE
-    row RECORD;
-    cutoff_date DATE;
-    default_deleted BIGINT;
-    prune_count INT;
-    prune_list TEXT;
-BEGIN
-    -- Bound AccessExclusiveLock wait: if a partition is being scanned
-    -- fail this DROP fast and let the next supervisor tick retry.
-    SET LOCAL lock_timeout = '10s';
-    -- 'daily' is not a valid PostgreSQL date_trunc unit; the correct unit is 'day'.
-    cutoff_date := date_trunc('day', NOW()) - INTERVAL '1 month';
-    -- Pre-flight (#2106): announce, at LOG level, how many monthly leaf
-    -- partitions this run will DROP and their names.  The per-partition message
-    -- below is NOTICE, which the server log suppresses at the default
-    -- log_min_messages=WARNING, so without this the deletion is invisible in
-    -- production.  A retention fix applied to a long-running deployment can drop
-    -- several months of accumulated partitions on the first tick; this makes
-    -- that one-time bulk prune observable instead of silent.
-    SELECT count(*), string_agg(c.relname, ', ' ORDER BY c.relname)
-      INTO prune_count, prune_list
-      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE n.nspname = '{schema}' AND c.relkind = 'r'
-        AND c.relname ~ '^tasks_\\d{4}_\\d{2}$'
-        AND to_date(substring(c.relname from '\\d{4}_\\d{2}$'), 'YYYY_MM') < cutoff_date;
-    IF prune_count > 0 THEN
-        RAISE LOG 'partition retention [{schema}.tasks]: dropping % monthly partition(s) older than % : %', prune_count, cutoff_date, prune_list;
-    END IF;
-    FOR row IN SELECT relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = '{schema}' AND c.relkind = 'r' AND c.relname ~ '^tasks_\\d{4}_\\d{2}$' LOOP
-        DECLARE
-            date_str TEXT;
-            part_date DATE;
-        BEGIN
-            date_str := substring(row.relname from '\\d{4}_\\d{2}$');
-            part_date := to_date(date_str, 'YYYY_MM');
-            IF part_date < cutoff_date THEN
-                RAISE NOTICE 'Pruning old partition: {schema}.%', row.relname;
-                EXECUTE format('DROP TABLE "{schema}".%I', row.relname);
-            END IF;
-        EXCEPTION WHEN OTHERS THEN
-            RAISE WARNING 'Failed to process partition {schema}.%: %', row.relname, SQLERRM;
-        END;
-    END LOOP;
-    -- Drain rows from the DEFAULT partition (catches clock-skew / far-future
-    -- timestamps that never land in a monthly partition).  Idempotent: a
-    -- DELETE WHERE nothing matches is a no-op.
-    DELETE FROM "{schema}".tasks_default
-    WHERE timestamp < (NOW() - INTERVAL '1 month');
-    GET DIAGNOSTICS default_deleted = ROW_COUNT;
-    IF default_deleted > 0 THEN
-        RAISE NOTICE 'Pruned % row(s) from {schema}.tasks_default', default_deleted;
-    END IF;
-END;
-$$ LANGUAGE plpgsql;
-"""
+# tasks.tasks partitions are MONTHLY (distinct from the DAILY events/storage
+# partitions in workclass_ddl.py). Both function bodies are rendered by the
+# shared template in workclass_ddl.py — see that module's docstring for why
+# {schema} survives as a literal placeholder and why the regex uses the
+# single-brace form \d{4}_\d{2}.
+GLOBAL_TASKS_RETENTION_FUNC_DDL = render_partition_retention_ddl(
+    table="tasks", granularity="month", retention=1
+)
 
-GLOBAL_TASKS_PARTCREATE_FUNC_DDL = """
-CREATE OR REPLACE FUNCTION "{schema}"."create_partitions_{schema}_tasks"() RETURNS void AS $$
-DECLARE
-    i INT;
-    target_date DATE;
-    start_date TIMESTAMPTZ;
-    end_date TIMESTAMPTZ;
-    part_name TEXT;
-BEGIN
-    FOR i IN 0..3 LOOP
-        target_date := date_trunc('month', NOW()) + (i || ' months')::INTERVAL;
-        start_date := target_date;
-        end_date := target_date + INTERVAL '1 month';
-        part_name := 'tasks_' || to_char(target_date, 'YYYY_MM');
-        IF NOT EXISTS (
-            SELECT 1 FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = '{schema}' AND c.relname = part_name
-        ) THEN
-            EXECUTE format(
-                'CREATE TABLE IF NOT EXISTS "{schema}".%I PARTITION OF "{schema}"."tasks" FOR VALUES FROM (%L) TO (%L)',
-                part_name, start_date::TEXT, end_date::TEXT
-            );
-            RAISE NOTICE 'Created partition: {schema}.%', part_name;
-        END IF;
-    END LOOP;
-END;
-$$ LANGUAGE plpgsql;
-"""
+GLOBAL_TASKS_PARTCREATE_FUNC_DDL = render_partition_create_ahead_ddl(
+    table="tasks", granularity="month", window=4
+)
 
 # DEFAULT partition DDL: absorbs any timestamp outside the monthly partition range
 # so inserts never fail with "no partition of relation found for row".

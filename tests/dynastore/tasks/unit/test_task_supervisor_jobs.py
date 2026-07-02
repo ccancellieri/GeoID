@@ -468,3 +468,26 @@ def test_retention_ddl_partition_regex_is_single_brace():
         r"Retention DDL must not contain doubled braces \d{{4}} — DDLQuery uses "
         "str.replace, so they survive into the SQL and break the regex"
     )
+
+
+def test_global_tasks_ddl_matches_shared_partition_template():
+    """GLOBAL_TASKS_{PARTCREATE,RETENTION}_FUNC_DDL must be exactly what the
+    shared workclass_ddl template renders for (table="tasks",
+    granularity="month", window=4, retention=1) — guards against
+    tasks_module.py drifting from the template it wires up (#2702).
+    """
+    from dynastore.modules.tasks.tasks_module import (
+        GLOBAL_TASKS_PARTCREATE_FUNC_DDL,
+        GLOBAL_TASKS_RETENTION_FUNC_DDL,
+    )
+    from dynastore.modules.tasks.workclass_ddl import (
+        render_partition_create_ahead_ddl,
+        render_partition_retention_ddl,
+    )
+
+    assert GLOBAL_TASKS_PARTCREATE_FUNC_DDL == render_partition_create_ahead_ddl(
+        table="tasks", granularity="month", window=4
+    )
+    assert GLOBAL_TASKS_RETENTION_FUNC_DDL == render_partition_retention_ddl(
+        table="tasks", granularity="month", retention=1
+    )
