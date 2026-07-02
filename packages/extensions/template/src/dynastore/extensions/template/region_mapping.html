@@ -420,10 +420,22 @@
     });
     
     // Helper functions
+    //
+    // Built via DOM, not an HTML string: `props` are vector-tile feature
+    // properties sourced from ingested layer/collection data (tenant-
+    // controlled), so keys/values must reach the tooltip only as text nodes,
+    // never parsed as markup. Leaflet's setContent() accepts a Node just as
+    // well as a string.
     function formatProperties(props) {
-      return Object.entries(props)
-        .map(([k, v]) => `<strong>${k}:</strong> ${v}`)
-        .join('<br>');
+      const frag = document.createDocumentFragment();
+      Object.entries(props).forEach(([k, v], i) => {
+        if (i > 0) frag.appendChild(document.createElement('br'));
+        const strong = document.createElement('strong');
+        strong.textContent = `${k}:`;
+        frag.appendChild(strong);
+        frag.appendChild(document.createTextNode(` ${v}`));
+      });
+      return frag;
     }
 
     function updateAttributes(metadata, idx=0) {

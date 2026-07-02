@@ -131,28 +131,50 @@
 
     function renderActiveLayersList() {
         var list = document.getElementById('active-layers-list');
-        list.innerHTML = '';
+        list.replaceChildren();
         var layers = Object.keys(activeLayers);
 
         if (layers.length === 0) {
-            list.innerHTML = '<div class="text-xs text-slate-500 italic">No active layers</div>';
+            var empty = document.createElement('div');
+            empty.className = 'text-xs text-slate-500 italic';
+            empty.textContent = 'No active layers';
+            list.appendChild(empty);
             return;
         }
 
+        // Built via DOM, not an innerHTML template: layerId/collectionId are
+        // STAC catalog/collection ids (tenant-controlled), so they must reach
+        // the DOM only through textContent/setAttribute, never as HTML markup
+        // or inside an inline event-handler string.
         layers.forEach(function(layerId) {
             var parts = layerId.split(':');
             var collectionId = parts[1];
             var item = document.createElement('div');
             item.className = 'flex items-center justify-between bg-slate-800/50 p-2 rounded text-sm border border-slate-700/50';
-            item.innerHTML = `
-                <span class="text-slate-300 truncate" title="${layerId}"><i class="fa-solid fa-layer-group text-slate-500 mr-2 text-xs"></i>${collectionId}</span>
-                <button onclick="removeLayerFromMap('${layerId}')" class="text-red-400 hover:text-red-300 ml-2" title="Hide layer"><i class="fa-solid fa-eye-slash text-xs"></i></button>
-            `;
+
+            var label = document.createElement('span');
+            label.className = 'text-slate-300 truncate';
+            label.setAttribute('title', layerId);
+            var icon = document.createElement('i');
+            icon.className = 'fa-solid fa-layer-group text-slate-500 mr-2 text-xs';
+            label.appendChild(icon);
+            label.appendChild(document.createTextNode(collectionId));
+
+            var removeBtn = document.createElement('button');
+            removeBtn.className = 'text-red-400 hover:text-red-300 ml-2';
+            removeBtn.setAttribute('title', 'Hide layer');
+            var removeIcon = document.createElement('i');
+            removeIcon.className = 'fa-solid fa-eye-slash text-xs';
+            removeBtn.appendChild(removeIcon);
+            removeBtn.addEventListener('click', function() { removeLayerFromMap(layerId); });
+
+            item.appendChild(label);
+            item.appendChild(removeBtn);
             list.appendChild(item);
         });
     }
 
-    window.removeLayerFromMap = function(layerId) {
+    function removeLayerFromMap(layerId) {
         if (activeLayers[layerId]) {
             map.removeLayer(activeLayers[layerId]);
             delete activeLayers[layerId];
