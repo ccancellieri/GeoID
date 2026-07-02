@@ -479,8 +479,16 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
         # Policies declared via PolicyContributor; IAM forwards centrally.
-        logger.info("Maps Service startup: process pool starting...")
+        import multiprocessing
+
         MapsService.process_pool = ProcessPoolExecutor()
+        logger.info(
+            "Maps Service startup: process pool started (executor=%s, "
+            "mp_start_method=%s, max_workers=%s)",
+            type(MapsService.process_pool).__name__,
+            multiprocessing.get_start_method(allow_none=True),
+            getattr(MapsService.process_pool, "_max_workers", "unknown"),
+        )
         app.state.maps_config = MapsConfig()
         yield
         logger.info("Maps Service shutdown: closing process pool.")
@@ -674,7 +682,14 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
                 transparent, bgcolor,
             )
         except Exception as e:
-            logger.error(f"Render Error: {e}")
+            # Log the exception type and full traceback, not just str(e) — a
+            # bare str() hides whether the failure originates in the pool
+            # machinery (worker spawn, arg pickling), GDAL, or the renderer
+            # itself. The user-facing message stays generic.
+            logger.exception(
+                "Render Error: %r (bbox=%s, collections=%s, crs=%s)",
+                e, bbox_list, valid_collections, crs,
+            )
             raise HTTPException(status_code=500, detail="Failed to render map.") from e
 
         try:
