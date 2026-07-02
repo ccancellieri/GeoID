@@ -803,11 +803,12 @@ async def run_dispatcher(
         f"async_types={capability_map.async_types}, "
         f"sync_types={capability_map.sync_types})."
     )
-    # In-process _run_janitor retired — stuck-task reaping is now handled by
-    # the pg_cron job ``dynastore-task-reaper`` (registered in TasksModule
-    # startup).  Single coordinated executor at the DB side; zero pod
-    # connections, zero leader-election.  See
-    # ``tasks_module.reap_stuck_tasks``.
+    # In-process _run_janitor retired — stuck-task reaping is now driven by
+    # MaintenanceSupervisor's JOB_TASK_REAPER job, which invokes the
+    # ``reap_stuck_tasks`` PL/pgSQL function on a leader-elected cadence
+    # (the old pg_cron job is unscheduled on startup). Single coordinated
+    # executor at the DB side; zero pod connections, zero leader-election
+    # in application code.
 
     heartbeat = BatchedHeartbeat(engine, visibility_timeout=visibility_timeout)
     await heartbeat.start()

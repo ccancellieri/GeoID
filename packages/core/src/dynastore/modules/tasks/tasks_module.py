@@ -952,9 +952,17 @@ class _BackgroundSlotBusy(Exception):
 class StuckPendingWarnerService(PeriodicService):
     """Periodic read-only scan for stuck PENDING tasks (retry_count=0).
 
-    Runs on every pod (RUN_EVERYWHERE) and skips ephemeral Cloud Run Job
-    pods (SKIP_EPHEMERAL) — job pods claim one task and exit, never managing
-    stuck rows. Resolves #2279 for this loop.
+    Elects a single leader pod (LEADER_ONLY) and skips ephemeral Cloud Run
+    Job pods (SKIP_EPHEMERAL) — job pods claim one task and exit, never
+    managing stuck rows. Resolves #2279 for this loop.
+
+    A single pod scanning is sufficient: the redispatch it triggers
+    (``_redispatch_stuck_rows``) emits ``pg_notify('new_task_queued', ...)``,
+    which every pod's QueueListener receives — so cross-pod wakeup still
+    reaches capable dispatchers on other pods even though only the leader
+    runs the scan. Previously RUN_EVERYWHERE, this produced one identical
+    scan per pod per cadence and a redundant ``pg_notify`` per stuck event
+    at full scale.
 
     The scan, log, and redispatch body is implemented in tick() — PeriodicService
     supplies the loop, shutdown handling, and the initial tick. Note that
@@ -964,7 +972,7 @@ class StuckPendingWarnerService(PeriodicService):
     """
 
     name = "stuck_pending_warner"
-    leadership = Leadership.RUN_EVERYWHERE
+    leadership = Leadership.LEADER_ONLY
     pod_policy = PodPolicy.SKIP_EPHEMERAL
     lock_key: Optional[Union[int, str]] = None
 

@@ -126,7 +126,7 @@ class TestStuckPendingWarnerService:
 
         svc = StuckPendingWarnerService(schema="tasks")
         assert svc.name == "stuck_pending_warner"
-        assert svc.leadership is Leadership.RUN_EVERYWHERE
+        assert svc.leadership is Leadership.LEADER_ONLY
         assert svc.pod_policy is PodPolicy.SKIP_EPHEMERAL
         assert svc.lock_key is None
 

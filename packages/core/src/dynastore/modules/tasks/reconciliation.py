@@ -120,9 +120,9 @@ async def reconcile_task_liveness(
 
     Verdict handling reuses :func:`decide_verdict_action` (the same mapping
     ``GcpLivenessReconciler`` uses) and the owner-guarded writers so a
-    concurrent periodic-reconciler pass or pg_cron reaper sweep can never be
-    clobbered — a lost race (writer matches 0 rows) returns ``task``
-    unchanged, same as a probe failure.
+    concurrent periodic-reconciler pass or ``MaintenanceSupervisor``
+    task-reaper sweep can never be clobbered — a lost race (writer matches
+    0 rows) returns ``task`` unchanged, same as a probe failure.
 
     Returns the freshly re-fetched :class:`Task` when a write landed, so the
     caller serializes the up-to-date status; otherwise returns ``task``
@@ -188,9 +188,10 @@ async def reconcile_task_liveness(
         return task
 
     if not acted:
-        # Lost the race to the periodic reconciler / pg_cron reaper between
-        # this probe and the write — the row moved out from under us. Truthful
-        # no-op, same as a probe failure: return the row unchanged.
+        # Lost the race to the periodic reconciler / MaintenanceSupervisor
+        # task-reaper between this probe and the write — the row moved out
+        # from under us. Truthful no-op, same as a probe failure: return
+        # the row unchanged.
         logger.info(
             "reconcile_task_liveness: %s action for task %s matched 0 rows — "
             "lost the race to the periodic reconciler/reaper.",

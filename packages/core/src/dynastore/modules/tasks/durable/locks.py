@@ -18,29 +18,28 @@
 
 """Stable advisory-lock ID derivations for PostgreSQL.
 
-This module provides exactly two derivation functions.  Both are
-intentionally distinct because they serve different PostgreSQL locking
-primitives:
+This module provides exactly two derivation functions.  Both currently
+key transaction-scoped locks (``pg_try_advisory_xact_lock`` /
+``pg_advisory_xact_lock``, released automatically when the surrounding
+transaction commits or rolls back) — there are no session-scoped
+advisory-lock call sites (``pg_advisory_lock`` / ``pg_try_advisory_lock``)
+in this codebase today. The two derivations are kept distinct because
+their call sites are independent and must not collide:
 
 ``stable_lock_id_sha256``
-    Session-scoped leadership election via ``pg_advisory_lock`` /
-    ``pg_try_advisory_lock``.  A session lock is held until the
-    session ends (or the lock is explicitly released).  SHA-256 is
-    used to produce a signed 64-bit integer from the first 8 bytes
-    of the digest.
+    Leadership-election / config-lock callers (e.g. ``db_config``
+    locking).  SHA-256 is used to produce a signed 64-bit integer from
+    the first 8 bytes of the digest.
 
 ``stable_lock_id_blake2b``
-    Transaction-scoped serialization guards via
-    ``pg_try_advisory_xact_lock``.  A transaction lock is released
-    automatically when the surrounding transaction commits or rolls
-    back.  BLAKE2b with digest_size=8 is used and the result is
-    masked to a non-negative 63-bit integer that fits PostgreSQL's
-    signed ``bigint`` type.
+    Task-dispatcher serialization guards.  BLAKE2b with digest_size=8
+    is used and the result is masked to a non-negative 63-bit integer
+    that fits PostgreSQL's signed ``bigint`` type.
 
 **Both output spaces are FROZEN.**  Changing either derivation
 re-keys advisory locks so that, during a rolling deploy, old and new
 pods derive different integers for the same logical lock name.  When
-two pods hold different session advisory locks they both believe they
+two pods hold different xact advisory locks they both believe they
 are the sole leader — a split-brain double-drain scenario where two
 processes independently drain the same queue simultaneously.  Update
 either function only with a coordinated, flag-gated, zero-downtime
@@ -52,14 +51,15 @@ import hashlib
 
 
 def stable_lock_id_sha256(key: str) -> int:
-    """Stable signed 64-bit integer from ``key`` for ``pg_advisory_lock``.
+    """Stable signed 64-bit integer from ``key`` for ``pg_try_advisory_xact_lock``.
 
     Uses SHA-256: takes the first 8 bytes of the digest and interprets
     them as a big-endian *signed* integer so the output can be negative.
     This matches the PostgreSQL ``bigint`` range ``[-2^63, 2^63-1]``.
 
-    Used for session-scoped leadership election.  The output is FROZEN —
-    see module docstring for the split-brain risk of any change.
+    Used for transaction-scoped (``pg_try_advisory_xact_lock``) leadership
+    election.  The output is FROZEN — see module docstring for the
+    split-brain risk of any change.
     """
     hashed = hashlib.sha256(key.encode("utf-8")).digest()
     return int.from_bytes(hashed[:8], byteorder="big", signed=True)
