@@ -27,7 +27,8 @@ Contracts verified:
   - When db_resource is None AND DatabaseProtocol is registered, _fetch_raw_rows
     calls managed_transaction with the protocol engine (not ItemService().engine).
   - When db_resource is None AND DatabaseProtocol is absent (bare import context),
-    _fetch_raw_rows returns {} rather than raising ValueError.
+    _fetch_raw_rows raises rather than silently returning {} (#2731 — a swallowed
+    "no engine" condition made every row in the batch look like a deleted item).
   - read_canonical_index_inputs returns a populated dict when db_resource is None
     but a DatabaseProtocol engine is present.
 """
@@ -73,16 +74,18 @@ def _make_raw_row(geoid: str = "gid-engine-1"):
 
 @pytest.mark.asyncio
 async def test_fetch_raw_rows_uses_db_protocol_engine_when_db_resource_none():
-    """When db_resource is None, _fetch_raw_rows must not return {} just because
+    """When db_resource is None, _fetch_raw_rows must not give up just because
     db_resource was not passed explicitly — it must call _get_db_engine() to
-    resolve an engine from DatabaseProtocol, and only return {} when that also
+    resolve an engine from DatabaseProtocol, and only raise when that also
     yields None.
 
     This test verifies the branch: _get_db_engine() returns a non-None engine,
     so _fetch_raw_rows proceeds to call managed_transaction (which then fails in
-    the test environment and is caught, returning {}). The critical invariant is
-    that _fetch_raw_rows does NOT short-circuit with an empty return before
-    attempting the DB call when a valid engine is available.
+    the test environment since there is no real DB pool, and propagates per
+    #2731 — no bare-except swallow). The critical invariant is that
+    _fetch_raw_rows does NOT short-circuit with an empty return before
+    attempting the DB call when a valid engine is available, and does NOT
+    swallow the subsequent failure into an empty dict either.
     """
     from dynastore.modules.catalog.canonical_index_read import _fetch_raw_rows
 
@@ -91,33 +94,24 @@ async def test_fetch_raw_rows_uses_db_protocol_engine_when_db_resource_none():
 
     # When _get_db_engine returns an engine, _fetch_raw_rows must attempt the
     # managed_transaction call.  In the test environment managed_transaction
-    # will raise (no real DB), which is caught and returns {}.  We verify this
-    # by asserting the function returns {} (not raises) — the key property is
-    # no ValueError("db_resource is None") before the engine is resolved.
+    # raises (no real DB) — that failure must propagate (#2731), never be
+    # folded into an empty dict that looks identical to "no rows found".
     with patch(
         "dynastore.modules.catalog.canonical_index_read._get_db_engine",
         return_value=fake_engine,
     ):
-        # managed_transaction is imported locally inside _fetch_raw_rows, so it
-        # runs against the real query_executor.  Without a real DB pool it
-        # raises; the except block catches it and returns {}.
-        result = await _fetch_raw_rows(
-            "cat1", "col1", ["gid-1"], fake_col_config, db_resource=None,
-        )
-
-    # Result is {} because managed_transaction raised in the test env — but the
-    # important thing is it did NOT raise ValueError("db_resource is None") which
-    # would happen if effective_resource had been None.
-    assert isinstance(result, dict), (
-        "_fetch_raw_rows must return a dict, not raise, when _get_db_engine "
-        "returns a non-None engine (even if the DB call fails in the test env)."
-    )
+        with pytest.raises(Exception):  # noqa: B017 — any DB-layer failure, not ValueError
+            await _fetch_raw_rows(
+                "cat1", "col1", ["gid-1"], fake_col_config, db_resource=None,
+            )
 
 
 @pytest.mark.asyncio
-async def test_fetch_raw_rows_returns_empty_when_no_engine_available():
+async def test_fetch_raw_rows_raises_when_no_engine_available():
     """When db_resource is None and no engine can be resolved, _fetch_raw_rows
-    returns {} instead of raising (to avoid crashing the caller).
+    raises rather than returning {} (#2731 — no DB engine is an infra failure,
+    not a "rows genuinely absent" outcome, and must funnel to retry, not
+    auto_done).
     """
     from dynastore.modules.catalog.canonical_index_read import _fetch_raw_rows
 
@@ -127,14 +121,10 @@ async def test_fetch_raw_rows_returns_empty_when_no_engine_available():
         "dynastore.modules.catalog.canonical_index_read._get_db_engine",
         return_value=None,
     ):
-        result = await _fetch_raw_rows(
-            "cat1", "col1", ["gid-missing"], fake_col_config, db_resource=None,
-        )
-
-    assert result == {}, (
-        "_fetch_raw_rows must return {} when no engine is available, "
-        "not raise ValueError."
-    )
+        with pytest.raises(RuntimeError, match="no DB engine available"):
+            await _fetch_raw_rows(
+                "cat1", "col1", ["gid-missing"], fake_col_config, db_resource=None,
+            )
 
 
 @pytest.mark.asyncio

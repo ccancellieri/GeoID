@@ -150,6 +150,17 @@ class StorageDrainTask(TaskProtocol):
         # driver_ids that have already logged the "empty payload, no
         # id-only marker" anomaly warning this run (#2494 P1 dedup).
         self._empty_payload_warned: set = set()
+        # Split completion counters for this run (#2731): 'indexed' rows went
+        # through a BulkIndexer and were reported passed; 'auto_done' rows were
+        # resolved as done WITHOUT the indexer (canonical row verifiably absent
+        # — a legitimate deleted-item skip); 'retried' rows were funnelled to
+        # backoff for any reason (indexer error, unresolved driver, failed
+        # canonical re-read, canonical doc build failure, an indexer-reported
+        # transient result, or an indexer omission). Reset at the start of
+        # every ``run()``; accumulated by ``drain_once()``.
+        self._run_metrics: Dict[str, int] = {
+            "indexed": 0, "auto_done": 0, "retried": 0,
+        }
 
     async def run(self, payload: TaskPayload) -> TaskReport:
         """Drain ``tasks.storage`` to empty, then return.
@@ -188,6 +199,9 @@ class StorageDrainTask(TaskProtocol):
         # before the bulk dispatch, so this bounds the run's peak memory
         # (#2723 — 1500 MB-scale features OOM-killed the host container).
         batch_size = await self._resolve_batch_size()
+        # Reset the split counters for this run — drain_once accumulates
+        # into self._run_metrics as it classifies each claimed batch (#2731).
+        self._run_metrics = {"indexed": 0, "auto_done": 0, "retried": 0}
         total = 0
         try:
             while True:
@@ -200,9 +214,16 @@ class StorageDrainTask(TaskProtocol):
         finally:
             await engine.dispose()
 
+        # 'drained' stays the total claimed count for backward compat; the
+        # split counters distinguish rows actually written to the index from
+        # rows resolved without ever reaching it, so a completion message can
+        # no longer describe silently-dropped rows as uniformly "processed"
+        # (#2731 — a drain once reported 6096 processed while ~5200 of them
+        # were auto_done id-only rows whose canonical re-read had swallowed
+        # an error, with zero WARNING/ERROR logs).
         report = TaskReport.completed(
             message=f"storage drain completed: {total} row(s) processed",
-            metrics={"drained": total},
+            metrics={"drained": total, **self._run_metrics},
             correlation={"owner_id": owner_id},
         )
 
@@ -285,6 +306,13 @@ class StorageDrainTask(TaskProtocol):
         for row in rows:
             by_driver.setdefault(row["driver_id"], []).append(row)
 
+        # Per-batch classification counters (#2731): logged below and folded
+        # into self._run_metrics so a drain's completion report can never
+        # again describe auto_done/retried rows as uniformly "processed".
+        batch_indexed = 0
+        batch_auto_done = 0
+        batch_retried = 0
+
         for driver_id, driver_rows in by_driver.items():
             indexer = await self._resolve_indexer(driver_id)
             if indexer is None:
@@ -301,6 +329,7 @@ class StorageDrainTask(TaskProtocol):
                     owner_id=owner_id,
                     error=f"indexer not registered: {driver_id}",
                 )
+                batch_retried += len(driver_rows)
                 continue
 
             prepared = await self._prepare_ops(engine=engine, driver_rows=driver_rows)
@@ -314,11 +343,13 @@ class StorageDrainTask(TaskProtocol):
                     engine=engine, task_schema=task_schema,
                     row=row, owner_id=owner_id,
                 )
+            batch_auto_done += len(prepared.auto_done)
             for row, reason in prepared.auto_retry:
                 await self._mark_retry(
                     engine=engine, task_schema=task_schema,
                     row=row, owner_id=owner_id, error=reason,
                 )
+            batch_retried += len(prepared.auto_retry)
 
             if not prepared.ops:
                 continue
@@ -338,15 +369,26 @@ class StorageDrainTask(TaskProtocol):
                     owner_id=owner_id,
                     error=str(exc),
                 )
+                batch_retried += len(prepared.rows_for_ops)
                 continue
 
-            await self._apply_outcomes(
+            outcome_counts = await self._apply_outcomes(
                 engine=engine,
                 task_schema=task_schema,
                 rows=prepared.rows_for_ops,
                 result=result,
                 owner_id=owner_id,
             )
+            batch_indexed += outcome_counts["indexed"]
+            batch_retried += outcome_counts["retried"]
+
+        self._run_metrics["indexed"] += batch_indexed
+        self._run_metrics["auto_done"] += batch_auto_done
+        self._run_metrics["retried"] += batch_retried
+        logger.info(
+            "StorageDrainTask: batch claimed=%d indexed=%d auto_done=%d retried=%d",
+            len(rows), batch_indexed, batch_auto_done, batch_retried,
+        )
 
         return len(rows)
 
@@ -641,6 +683,7 @@ class StorageDrainTask(TaskProtocol):
                 )
                 continue
 
+            group_auto_done = 0
             for row in group_rows:
                 geoid = row.get("entity_id")
                 ci = inputs.get(geoid) if geoid else None
@@ -649,6 +692,7 @@ class StorageDrainTask(TaskProtocol):
                     # enqueued (or the geoid never existed). Skip as
                     # success rather than indexing a stale/absent doc.
                     auto_done.append(row)
+                    group_auto_done += 1
                     continue
                 try:
                     doc = await self._build_canonical_doc(
@@ -665,6 +709,17 @@ class StorageDrainTask(TaskProtocol):
                 op = _dataclass_replace(self._row_to_op(row), payload=doc)
                 ops.append(op)
                 rows_for_ops.append(row)
+
+            # Observability (#2731): auto_done is a legitimate outcome (the
+            # canonical row is verifiably absent, not merely unreadable), but
+            # it must never be silent — the drain that lost ~5200 items on
+            # 2026-07-02 produced zero WARNING/ERROR logs for the entire run.
+            if group_auto_done:
+                logger.info(
+                    "StorageDrainTask: %d id-only row(s) auto_done (canonical "
+                    "row absent) for %s/%s",
+                    group_auto_done, catalog_id, collection_id,
+                )
 
         return _PreparedDriverBatch(
             ops=ops, rows_for_ops=rows_for_ops,
@@ -738,11 +793,19 @@ class StorageDrainTask(TaskProtocol):
         rows: Sequence[Dict[str, Any]],
         result: BulkIndexResult,
         owner_id: str,
-    ) -> None:
-        """Partition rows per BulkIndexResult and apply fenced mark_*."""
+    ) -> Dict[str, int]:
+        """Partition rows per BulkIndexResult and apply fenced mark_*.
+
+        Returns ``{"indexed": n, "retried": n}`` — counts of rows actually
+        marked done via the indexer path / marked for retry, for the
+        per-batch classification summary (#2731). Poison (dead) rows are not
+        included; ``TaskReport.metrics`` only splits indexed/auto_done/retried.
+        """
         rows_by_id: Dict[UUID, Dict[str, Any]] = {
             UUID(str(r["op_id"])): r for r in rows
         }
+        indexed_count = 0
+        retried_count = 0
 
         if result.passed:
             for op_id in result.passed:
@@ -754,6 +817,7 @@ class StorageDrainTask(TaskProtocol):
                         row=row,
                         owner_id=owner_id,
                     )
+                    indexed_count += 1
 
         if result.transient:
             for op_id, reason in result.transient:
@@ -766,6 +830,7 @@ class StorageDrainTask(TaskProtocol):
                         owner_id=owner_id,
                         error=reason,
                     )
+                    retried_count += 1
 
         if result.poison:
             for op_id, _reason in result.poison:
@@ -795,6 +860,9 @@ class StorageDrainTask(TaskProtocol):
                     owner_id=owner_id,
                     error="indexer omitted op_id from BulkIndexResult",
                 )
+                retried_count += 1
+
+        return {"indexed": indexed_count, "retried": retried_count}
 
     async def _apply_retry_all(
         self,

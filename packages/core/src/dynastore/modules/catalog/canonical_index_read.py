@@ -207,94 +207,87 @@ async def _fetch_raw_rows(
     single ``WHERE geoid = ANY(:ids)`` query for the whole batch, avoiding
     N+1 round-trips on ``index_bulk`` calls.
 
-    Rows that are missing (deleted or never written) are simply absent from
-    the returned dict — callers skip those geoids.
+    A geoid absent from the returned dict because the query ran and simply
+    found no matching row (deleted or never written) is the ONLY legitimate
+    "missing" outcome — callers skip those geoids. Anything that prevents the
+    query from running at all (no DB engine, unresolved physical table,
+    connection/mapping errors) is a failure, not an absence, and propagates
+    as an exception (#2731): swallowing it here made every row in the batch
+    look identical to a deleted item, which silently dropped ~5200 items from
+    the ES index on 2026-07-02 when the re-read hit a transient error.
     """
     if not geoids:
         return {}
 
-    try:
-        from sqlalchemy import text as _sa_text
+    from sqlalchemy import text as _sa_text
 
-        from dynastore.modules.catalog.item_service import ItemService
-        from dynastore.modules.db_config.query_executor import managed_transaction
-        from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
-        from dynastore.models.query_builder import FieldSelection, QueryRequest
-        from dynastore.tools.db import validate_sql_identifier
+    from dynastore.modules.catalog.item_service import ItemService
+    from dynastore.modules.db_config.query_executor import managed_transaction
+    from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
+    from dynastore.models.query_builder import FieldSelection, QueryRequest
+    from dynastore.tools.db import validate_sql_identifier
 
-        validate_sql_identifier(catalog_id)
-        validate_sql_identifier(collection_id)
+    validate_sql_identifier(catalog_id)
+    validate_sql_identifier(collection_id)
 
-        item_svc = ItemService()
-        # Resolve the engine to use: prefer the explicitly-passed db_resource,
-        # then the engine on the locally-constructed ItemService (available in
-        # the API process where ItemService is registered with a live pool),
-        # then fall back to the process-wide DatabaseProtocol engine (available
-        # in Cloud Run JOB/worker processes where no ItemService engine is wired).
-        # If none of these yield an engine, managed_transaction raises ValueError
-        # which is caught by the outer except block and returns {} safely.
-        effective_resource = db_resource or item_svc.engine or _get_db_engine()
-        if effective_resource is None:
-            logger.warning(
-                "canonical_index_read._fetch_raw_rows: no DB engine available "
-                "for %s/%s — returning empty result. Ensure DatabaseProtocol is "
-                "registered in this process.",
-                catalog_id, collection_id,
+    item_svc = ItemService()
+    # Resolve the engine to use: prefer the explicitly-passed db_resource,
+    # then the engine on the locally-constructed ItemService (available in
+    # the API process where ItemService is registered with a live pool),
+    # then fall back to the process-wide DatabaseProtocol engine (available
+    # in Cloud Run JOB/worker processes where no ItemService engine is wired).
+    effective_resource = db_resource or item_svc.engine or _get_db_engine()
+    if effective_resource is None:
+        raise RuntimeError(
+            f"canonical_index_read._fetch_raw_rows: no DB engine available for "
+            f"{catalog_id}/{collection_id} — DatabaseProtocol is not registered "
+            f"in this process."
+        )
+    async with managed_transaction(effective_resource) as conn:
+        phys_schema = await item_svc._resolve_physical_schema(
+            catalog_id, db_resource=conn,
+        )
+        phys_table = await item_svc._resolve_physical_table(
+            catalog_id, collection_id, db_resource=conn,
+        )
+        if not phys_schema or not phys_table:
+            raise RuntimeError(
+                f"canonical_index_read._fetch_raw_rows: cannot resolve physical "
+                f"table for {catalog_id}/{collection_id}"
             )
-            return {}
-        async with managed_transaction(effective_resource) as conn:
-            phys_schema = await item_svc._resolve_physical_schema(
-                catalog_id, db_resource=conn,
-            )
-            phys_table = await item_svc._resolve_physical_table(
+
+        if col_config is None:
+            col_config = await item_svc._get_collection_config(
                 catalog_id, collection_id, db_resource=conn,
             )
-            if not phys_schema or not phys_table:
-                logger.warning(
-                    "canonical_index_read: cannot resolve physical table for %s/%s",
-                    catalog_id, collection_id,
-                )
-                return {}
 
-            if col_config is None:
-                col_config = await item_svc._get_collection_config(
-                    catalog_id, collection_id, db_resource=conn,
-                )
-
-            request = QueryRequest(
-                item_ids=[str(g) for g in geoids],
-                limit=len(geoids),
-                select=[FieldSelection(field="*")],
-            )
-            query_ctx: Dict[str, Any] = {
-                "catalog_id": catalog_id,
-                "collection_id": collection_id,
-                "col_config": col_config,
-            }
-            sql, params = await item_svc._apply_query_transformations(
-                request, query_ctx, catalog_id, collection_id, col_config,
-                db_resource=conn, consumer=ConsumerType.GENERIC,
-            )
-            import inspect as _inspect
-
-            result = conn.execute(_sa_text(sql), params or {})
-            if _inspect.isawaitable(result):
-                result = await result
-
-            rows: Dict[str, Dict[str, Any]] = {}
-            for raw in result.mappings():
-                row_dict = dict(raw)
-                geoid = row_dict.get("geoid")
-                if geoid:
-                    rows[str(geoid)] = row_dict
-            return rows
-
-    except Exception as exc:
-        logger.warning(
-            "canonical_index_read._fetch_raw_rows: %s/%s: %s",
-            catalog_id, collection_id, exc,
+        request = QueryRequest(
+            item_ids=[str(g) for g in geoids],
+            limit=len(geoids),
+            select=[FieldSelection(field="*")],
         )
-        return {}
+        query_ctx: Dict[str, Any] = {
+            "catalog_id": catalog_id,
+            "collection_id": collection_id,
+            "col_config": col_config,
+        }
+        sql, params = await item_svc._apply_query_transformations(
+            request, query_ctx, catalog_id, collection_id, col_config,
+            db_resource=conn, consumer=ConsumerType.GENERIC,
+        )
+        import inspect as _inspect
+
+        result = conn.execute(_sa_text(sql), params or {})
+        if _inspect.isawaitable(result):
+            result = await result
+
+        rows: Dict[str, Dict[str, Any]] = {}
+        for raw in result.mappings():
+            row_dict = dict(raw)
+            geoid = row_dict.get("geoid")
+            if geoid:
+                rows[str(geoid)] = row_dict
+        return rows
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +306,11 @@ async def read_canonical_index_inputs(
 
     Returns a dict mapping geoid → :class:`CanonicalIndexInput`.  Geoids
     that are absent in PG (deleted or race) are silently omitted — the
-    caller (ES write boundary) should skip those ops.
+    caller (ES write boundary) should skip those ops. That omission is only
+    ever a legitimate "queried and found nothing" outcome (#2731): any
+    failure to run the underlying query (missing DB engine, unresolved
+    physical table, connection error) raises instead of being folded into
+    the same empty result — see :func:`_fetch_raw_rows`.
 
     No ``ItemsReadPolicy`` is applied: ``id`` in the returned row is always
     the geoid; ``external_id_as_feature_id`` is never flipped; ``expose``
@@ -328,6 +325,11 @@ async def read_canonical_index_inputs(
 
     Returns:
         Dict mapping each found geoid to its :class:`CanonicalIndexInput`.
+
+    Raises:
+        Exception: propagated unchanged when the underlying re-read fails
+            (see :func:`_fetch_raw_rows`) — callers must treat this as
+            "unknown state, retry", never as "rows deleted".
     """
     if not geoids:
         return {}

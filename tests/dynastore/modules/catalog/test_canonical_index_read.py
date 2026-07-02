@@ -395,3 +395,84 @@ async def test_no_read_policy_applied_id_stays_geoid():
     # user_properties must not contain external_id (it's a SYSTEM key).
     props = entry.user_properties or {}
     assert "external_id" not in props
+
+
+# ---------------------------------------------------------------------------
+# #2731 — _fetch_raw_rows must propagate re-read failures, never swallow
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fetch_raw_rows_propagates_query_execution_failure():
+    """A DB error while running the batched SELECT must propagate out of
+    ``_fetch_raw_rows``, not be swallowed into ``{}``.
+
+    Swallowing here made every geoid in the batch look identical to a
+    genuinely deleted row — the drain then classified the whole batch
+    auto_done with zero logging (#2731, ~5200 items silently dropped from
+    the ES index on 2026-07-02).
+    """
+    from contextlib import asynccontextmanager
+
+    from dynastore.modules.catalog.canonical_index_read import _fetch_raw_rows
+
+    fake_conn = MagicMock()
+    fake_conn.execute = MagicMock(side_effect=RuntimeError("simulated connection error"))
+
+    @asynccontextmanager
+    async def _fake_managed_transaction(_resource):
+        yield fake_conn
+
+    fake_col_config = MagicMock()
+
+    with (
+        patch(
+            "dynastore.modules.db_config.query_executor.managed_transaction",
+            new=_fake_managed_transaction,
+        ),
+        patch(
+            "dynastore.modules.catalog.item_service.ItemService._resolve_physical_schema",
+            new=AsyncMock(return_value="public"),
+        ),
+        patch(
+            "dynastore.modules.catalog.item_service.ItemService._resolve_physical_table",
+            new=AsyncMock(return_value="items_col1"),
+        ),
+        patch(
+            "dynastore.modules.catalog.item_service.ItemService._apply_query_transformations",
+            new=AsyncMock(return_value=("SELECT 1", {})),
+        ),
+        patch(
+            "dynastore.modules.catalog.canonical_index_read._get_db_engine",
+            return_value=MagicMock(),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="simulated connection error"):
+            await _fetch_raw_rows(
+                "cat1", "col1", ["gid-err"], fake_col_config, db_resource=MagicMock(),
+            )
+
+
+@pytest.mark.asyncio
+async def test_read_canonical_index_inputs_propagates_fetch_raw_rows_failure():
+    """``read_canonical_index_inputs`` must not fold a ``_fetch_raw_rows``
+    failure into an empty result — callers must see the failure and retry,
+    never treat it as "rows deleted"."""
+    from dynastore.modules.catalog.canonical_index_read import read_canonical_index_inputs
+
+    with (
+        patch(
+            "dynastore.modules.catalog.canonical_index_read._fetch_raw_rows",
+            new=AsyncMock(side_effect=RuntimeError("simulated re-read failure")),
+        ),
+        patch(
+            "dynastore.modules.catalog.canonical_index_read._resolve_sidecars_for",
+            return_value=[],
+        ),
+        patch(
+            "dynastore.modules.catalog.canonical_index_read._get_col_config",
+            new=AsyncMock(return_value=MagicMock()),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="simulated re-read failure"):
+            await read_canonical_index_inputs("cat1", "col1", ["gid-err"])

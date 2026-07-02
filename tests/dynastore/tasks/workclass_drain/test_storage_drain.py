@@ -906,9 +906,18 @@ async def test_id_only_upsert_present_row_indexes_current_state(drain_env, monke
 
 
 @pytest.mark.asyncio
-async def test_id_only_upsert_missing_row_skipped_as_success(drain_env, monkeypatch):
+async def test_id_only_upsert_missing_row_skipped_as_success(
+    drain_env, monkeypatch, caplog,
+):
     """An id-only upsert row whose geoid is ABSENT from canonical PG state
-    is marked done directly — never built into an op sent to the indexer."""
+    is marked done directly — never built into an op sent to the indexer.
+
+    #2731: this is the ONLY legitimate auto_done outcome, and it must be
+    logged — the drain that lost ~5200 items on 2026-07-02 produced zero
+    WARNING/ERROR/INFO logs for the whole run.
+    """
+    import logging as _logging
+
     task_schema, engine = drain_env
     await _seed_id_only_row(engine, task_schema, entity_id="geoid-missing")
 
@@ -923,12 +932,22 @@ async def test_id_only_upsert_missing_row_skipped_as_success(drain_env, monkeypa
     monkeypatch.setattr(task, "_resolve_indexer", _resolve)
 
     owner_id = f"owner:{uuid4()}"
-    count = await task.drain_once(engine=engine, owner_id=owner_id)
+    with caplog.at_level(_logging.INFO):
+        count = await task.drain_once(engine=engine, owner_id=owner_id)
     assert count == 1
     assert fake.calls == [], "no op should reach the indexer for a missing PG row"
 
     rows = await _fetch_rows(engine, task_schema)
     assert rows[0]["status"] == "done", "missing PG row on upsert must skip as success"
+
+    assert any(
+        "auto_done" in r.getMessage() and "tenant_a" in r.getMessage() and "coll_a" in r.getMessage()
+        for r in caplog.records
+    ), "an auto_done row must log an INFO summary naming (catalog, collection, count)"
+    assert any(
+        "claimed=1" in r.getMessage() and "auto_done=1" in r.getMessage()
+        for r in caplog.records
+    ), "the per-batch classification summary must be logged"
 
 
 @pytest.mark.asyncio
@@ -1108,3 +1127,91 @@ async def test_empty_payload_without_marker_does_not_trigger_reread(
 
     rows = await _fetch_rows(engine, task_schema)
     assert rows[0]["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# 9. Split completion metrics (#2731)
+#
+# Pure-unit — no PG required. Mirrors the create_async_engine stubbing
+# pattern in test_drain_engine_url_normalization.py: drain_once is stubbed
+# so run() only exercises the metrics-accumulation and TaskReport wiring.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_reports_split_completion_metrics():
+    """``run()``'s ``TaskReport.metrics`` splits indexed/auto_done/retried
+    alongside the backward-compat ``drained`` total (#2731) — a drain can no
+    longer describe auto_done/retried rows as uniformly "processed"."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from dynastore.tasks.workclass_drain.storage_drain_task import StorageDrainTask
+
+    task = StorageDrainTask()
+    fake_engine = MagicMock()
+    fake_engine.dispose = AsyncMock()
+
+    calls = {"n": 0}
+
+    async def _fake_drain_once(*, engine, owner_id, batch_size=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Simulate one claimed batch: 3 indexed, 2 auto_done, 1 retried.
+            task._run_metrics["indexed"] += 3
+            task._run_metrics["auto_done"] += 2
+            task._run_metrics["retried"] += 1
+            return 6
+        return 0  # drain-to-empty exit
+
+    with (
+        patch("sqlalchemy.ext.asyncio.create_async_engine", return_value=fake_engine),
+        patch.object(task, "drain_once", new=_fake_drain_once),
+    ):
+        report = await task.run(MagicMock())
+
+    assert report.metrics == {
+        "drained": 6, "indexed": 3, "auto_done": 2, "retried": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_resets_split_metrics_between_runs():
+    """A second ``run()`` call must not carry over the previous run's split
+    counters (self._run_metrics is reset at the top of run())."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from dynastore.tasks.workclass_drain.storage_drain_task import StorageDrainTask
+
+    task = StorageDrainTask()
+    fake_engine = MagicMock()
+    fake_engine.dispose = AsyncMock()
+
+    first_calls = {"n": 0}
+
+    async def _first_drain_once(*, engine, owner_id, batch_size=None):
+        first_calls["n"] += 1
+        if first_calls["n"] == 1:
+            task._run_metrics["indexed"] += 10
+            task._run_metrics["auto_done"] += 10
+            task._run_metrics["retried"] += 10
+            return 30
+        return 0
+
+    with (
+        patch("sqlalchemy.ext.asyncio.create_async_engine", return_value=fake_engine),
+        patch.object(task, "drain_once", new=_first_drain_once),
+    ):
+        await task.run(MagicMock())
+
+    async def _second_drain_once(*, engine, owner_id, batch_size=None):
+        return 0  # nothing claimed this run
+
+    with (
+        patch("sqlalchemy.ext.asyncio.create_async_engine", return_value=fake_engine),
+        patch.object(task, "drain_once", new=_second_drain_once),
+    ):
+        report = await task.run(MagicMock())
+
+    assert report.metrics == {
+        "drained": 0, "indexed": 0, "auto_done": 0, "retried": 0,
+    }
