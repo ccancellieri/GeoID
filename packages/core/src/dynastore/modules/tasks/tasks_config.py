@@ -245,15 +245,21 @@ class TasksPluginConfig(ExposableConfigMixin, PluginConfig):
         description=(
             "Aggregate ready-row count across the global tasks.storage "
             "('ready') + tasks.events ('PENDING') outbox tables above which "
-            "the serving-path secondary-write drainers (storage_drain / "
-            "event_drain) prefer the offloaded async_writer Cloud Run Job "
-            "over the in-process BackgroundRunner (#2622). Below the "
-            "threshold the drain stays in-process — light load must not pay "
-            "for a job hop. Read on every dispatch decision via a short-TTL "
-            "cached probe (dynastore.modules.tasks.async_writer_backlog), so "
-            "changes take effect within a few seconds, no restart required. "
-            "Has no effect when no async_writer Cloud Run Job is deployed — "
-            "the offload guard fails open to the in-process path in that case."
+            "the event_drain drainer prefers the offloaded async_writer "
+            "Cloud Run Job over the in-process BackgroundRunner (#2622), and "
+            "above which bulk-ingestion applies cooperative backpressure "
+            "(ingest_backpressure_sleep_seconds). Below the threshold "
+            "event_drain stays in-process — light load must not pay for a "
+            "job hop. No longer governs storage_drain placement (#2732 step "
+            "4): storage_drain always starts in-process and hands off to the "
+            "storage_drain_offload job on its own byte/wall-clock budget "
+            "(storage_drain_inprocess_max_bytes / "
+            "storage_drain_inprocess_max_seconds) instead. Read on every "
+            "dispatch decision via a short-TTL cached probe "
+            "(dynastore.modules.tasks.async_writer_backlog), so changes take "
+            "effect within a few seconds, no restart required. Has no effect "
+            "when no async_writer Cloud Run Job is deployed — the offload "
+            "guard fails open to the in-process path in that case."
         ),
     )
 
@@ -294,6 +300,42 @@ class TasksPluginConfig(ExposableConfigMixin, PluginConfig):
             "value (plus one in-flight canonical-re-read chunk), not by "
             "storage_drain_batch_size x average document size. Read once "
             "per drain run via the platform configs hot-reload path; no "
+            "restart required."
+        ),
+    )
+
+    storage_drain_inprocess_max_bytes: Mutable[int] = Field(
+        default=32 * 1024 * 1024,  # 32 MiB
+        ge=0,
+        description=(
+            "Cumulative hydrated-document byte budget (#2732 step 4) for one "
+            "in-process storage_drain run. storage_drain always starts "
+            "in-process on the catalog API pod and drains slices until it "
+            "either empties the outbox or crosses this budget (or "
+            "storage_drain_inprocess_max_seconds) with rows still remaining "
+            "— whichever comes first. On exceeding either budget the drain "
+            "stops and hands the remainder off to the storage_drain_offload "
+            "job, which carries the async-write workclass marker (#2782) so "
+            "it prefers the async_writer Cloud Run Job whenever one "
+            "advertises the task type, and degrades to running in-process to "
+            "empty when none does (e.g. onprem). ``0`` disables the byte "
+            "budget — the drain always runs in-process to empty, matching "
+            "pre-#2732 behaviour. Read once per drain run via the platform "
+            "configs hot-reload path; no restart required."
+        ),
+    )
+
+    storage_drain_inprocess_max_seconds: Mutable[float] = Field(
+        default=5.0,
+        ge=0.0,
+        description=(
+            "Wall-clock budget (seconds, #2732 step 4) complementing "
+            "storage_drain_inprocess_max_bytes: once a single in-process "
+            "storage_drain run has spent this long draining with rows still "
+            "remaining, it stops and hands the remainder off to the "
+            "storage_drain_offload job, independent of how many hydrated "
+            "bytes were accumulated. ``0`` disables the time budget. Read "
+            "once per drain run via the platform configs hot-reload path; no "
             "restart required."
         ),
     )

@@ -92,11 +92,15 @@ CREATE TABLE IF NOT EXISTS "{schema}".storage (
 """
 
 # Minimal flat tasks table for the trigger test — only the columns written
-# by _enqueue_drain_trigger (verified against GLOBAL_TASKS_TABLE_DDL).
+# by _enqueue_drain_trigger (verified against GLOBAL_TASKS_TABLE_DDL). Column
+# name is catalog_id (matching GLOBAL_TASKS_TABLE_DDL) — a prior schema_name
+# spelling here had drifted from production and made every drain-trigger
+# test in this file fail with UndefinedColumnError before it could even
+# exercise the dedup guard.
 _TASKS_DDL = """
 CREATE TABLE IF NOT EXISTS "{schema}".tasks (
     task_id         UUID            NOT NULL,
-    schema_name     VARCHAR(255)    NOT NULL,
+    catalog_id      VARCHAR(255)    NOT NULL,
     scope           VARCHAR(50)     NOT NULL DEFAULT 'CATALOG',
     caller_id       VARCHAR(255),
     task_type       VARCHAR         NOT NULL,
@@ -1450,3 +1454,373 @@ async def test_run_resets_split_metrics_between_runs():
     assert report.metrics == {
         "drained": 0, "indexed": 0, "auto_done": 0, "retried": 0,
     }
+
+
+# ---------------------------------------------------------------------------
+# 10. In-process byte/wall-clock drain budget handoff (#2732 step 4)
+#
+# StorageDrainTask always starts in-process. If cumulative hydrated bytes or
+# wall-clock elapsed crosses TasksPluginConfig.storage_drain_inprocess_max_bytes
+# / storage_drain_inprocess_max_seconds while backlog rows still remain,
+# run() stops early and hands the remainder off to storage_drain_offload
+# (StorageDrainOffloadTask, which carries the async-write workclass marker
+# and ignores the budget entirely — it always drains to empty).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_hands_off_when_byte_budget_exceeded_with_backlog_remaining():
+    """A single over-budget batch stops the loop immediately (not drain to
+    empty) and calls _handoff_to_offload_job exactly once."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from dynastore.tasks.workclass_drain.storage_drain_task import StorageDrainTask
+
+    task = StorageDrainTask(inprocess_max_bytes=100, inprocess_max_seconds=999.0)
+    fake_engine = MagicMock()
+    fake_engine.dispose = AsyncMock()
+
+    calls = {"n": 0}
+
+    async def _fake_drain_once(*, engine, owner_id, batch_size=None, hydration_byte_budget=None):
+        calls["n"] += 1
+        task._last_batch_bytes = 200  # exceeds the 100-byte budget in one batch
+        return 5  # non-empty — backlog likely remains
+
+    handoff = AsyncMock()
+
+    with (
+        patch("sqlalchemy.ext.asyncio.create_async_engine", return_value=fake_engine),
+        patch.object(task, "drain_once", new=_fake_drain_once),
+        patch.object(task, "_handoff_to_offload_job", new=handoff),
+    ):
+        report = await task.run(MagicMock())
+
+    handoff.assert_awaited_once_with(fake_engine)
+    assert calls["n"] == 1, "must stop after the first over-budget batch, not loop to empty"
+    assert report.metrics["drained"] == 5
+
+
+@pytest.mark.asyncio
+async def test_run_hands_off_when_time_budget_exceeded_with_backlog_remaining():
+    """Slow hydration that blows the wall-clock budget triggers the same
+    handoff, independent of hydrated bytes (kept at 0 throughout)."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from dynastore.tasks.workclass_drain.storage_drain_task import StorageDrainTask
+
+    task = StorageDrainTask(inprocess_max_bytes=0, inprocess_max_seconds=0.02)
+    fake_engine = MagicMock()
+    fake_engine.dispose = AsyncMock()
+
+    calls = {"n": 0}
+
+    async def _fake_drain_once(*, engine, owner_id, batch_size=None, hydration_byte_budget=None):
+        calls["n"] += 1
+        await asyncio.sleep(0.05)  # simulated slow hydration — well over the 0.02s budget
+        return 3
+
+    handoff = AsyncMock()
+
+    with (
+        patch("sqlalchemy.ext.asyncio.create_async_engine", return_value=fake_engine),
+        patch.object(task, "drain_once", new=_fake_drain_once),
+        patch.object(task, "_handoff_to_offload_job", new=handoff),
+    ):
+        await task.run(MagicMock())
+
+    handoff.assert_awaited_once_with(fake_engine)
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_generous_budget_drains_to_empty_without_handoff():
+    """A budget nothing in the run ever crosses drains to empty exactly like
+    the pre-#2732 loop — no handoff is ever attempted."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from dynastore.tasks.workclass_drain.storage_drain_task import StorageDrainTask
+
+    task = StorageDrainTask(inprocess_max_bytes=10**9, inprocess_max_seconds=999.0)
+    fake_engine = MagicMock()
+    fake_engine.dispose = AsyncMock()
+
+    calls = {"n": 0}
+
+    async def _fake_drain_once(*, engine, owner_id, batch_size=None, hydration_byte_budget=None):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            task._last_batch_bytes = 10
+            return 5
+        return 0
+
+    handoff = AsyncMock()
+
+    with (
+        patch("sqlalchemy.ext.asyncio.create_async_engine", return_value=fake_engine),
+        patch.object(task, "drain_once", new=_fake_drain_once),
+        patch.object(task, "_handoff_to_offload_job", new=handoff),
+    ):
+        report = await task.run(MagicMock())
+
+    handoff.assert_not_awaited()
+    assert calls["n"] == 3, "must loop until drain_once reports 0 (drain to empty)"
+    assert report.metrics["drained"] == 10
+
+
+@pytest.mark.asyncio
+async def test_storage_drain_offload_task_ignores_budget_and_drains_to_empty():
+    """StorageDrainOffloadTask (_inprocess_budget_enabled=False) never calls
+    _handoff_to_offload_job, even when hydrated bytes vastly exceed what
+    would trip the base task's budget — it always drains its claimed
+    backlog to empty instead of escaping again."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from dynastore.tasks.workclass_drain.storage_drain_task import (
+        StorageDrainOffloadTask,
+    )
+
+    task = StorageDrainOffloadTask(inprocess_max_bytes=1, inprocess_max_seconds=0.001)
+    assert task._inprocess_budget_enabled is False
+
+    fake_engine = MagicMock()
+    fake_engine.dispose = AsyncMock()
+
+    calls = {"n": 0}
+
+    async def _fake_drain_once(*, engine, owner_id, batch_size=None, hydration_byte_budget=None):
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            task._last_batch_bytes = 10**9  # would blow any base-task budget
+            return 100
+        return 0
+
+    handoff = AsyncMock()
+
+    with (
+        patch("sqlalchemy.ext.asyncio.create_async_engine", return_value=fake_engine),
+        patch.object(task, "drain_once", new=_fake_drain_once),
+        patch.object(task, "_handoff_to_offload_job", new=handoff),
+    ):
+        report = await task.run(MagicMock())
+
+    handoff.assert_not_awaited()
+    assert calls["n"] == 4
+    assert report.metrics["drained"] == 300
+
+
+# ---------------------------------------------------------------------------
+# 11. Live-PG: _handoff_to_offload_job's actual DB effect
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handoff_to_offload_job_inserts_distinct_dedup_key_row(drain_env):
+    """_handoff_to_offload_job enqueues a storage_drain_offload trigger with
+    its own dedup_key — independent of (never blocked by, never blocking) a
+    live storage_drain trigger for the same outbox."""
+    from dynastore.modules.db_config.query_executor import managed_transaction
+    from dynastore.modules.storage.storage_emit import enqueue_storage_op
+    from dynastore.models.protocols.indexing import OutboxRecord
+
+    task_schema, engine = drain_env
+
+    # A live in-process storage_drain trigger already exists (the hot
+    # co-transactional write path).
+    rows = [
+        OutboxRecord(
+            op_id=uuid4(), driver_id="es_driver", driver_instance_id="di",
+            collection_id="coll", op="upsert", item_id="item_1",
+            payload={"x": 1}, idempotency_key="ik_1",
+        ),
+    ]
+    async with managed_transaction(engine) as conn:
+        await enqueue_storage_op(conn, catalog_id=task_schema, rows=rows)
+    assert await _count_tasks(engine, task_schema, task_type="storage_drain") == 1
+
+    task = _make_task(engine, task_schema)
+    await task._handoff_to_offload_job(engine)
+
+    assert await _count_tasks(engine, task_schema, task_type="storage_drain") == 1
+    assert await _count_tasks(engine, task_schema, task_type="storage_drain_offload") == 1
+
+    # A second handoff call while the first offload trigger is still
+    # non-terminal is deduplicated to the same single row.
+    await task._handoff_to_offload_job(engine)
+    assert await _count_tasks(engine, task_schema, task_type="storage_drain_offload") == 1
+
+
+# ---------------------------------------------------------------------------
+# 12. Live-PG: _enqueue_drain_trigger task_type/dedup_key parameterization
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_enqueue_drain_trigger_defaults_emit_storage_drain(drain_env):
+    from dynastore.modules.db_config.query_executor import managed_transaction
+    from dynastore.modules.storage.storage_emit import _enqueue_drain_trigger
+
+    task_schema, engine = drain_env
+    async with managed_transaction(engine) as conn:
+        await _enqueue_drain_trigger(conn)
+
+    assert await _count_tasks(engine, task_schema, task_type="storage_drain") == 1
+    assert await _count_tasks(engine, task_schema, task_type="storage_drain_offload") == 0
+
+
+@pytest.mark.asyncio
+async def test_enqueue_drain_trigger_explicit_kwargs_emit_storage_drain_offload(drain_env):
+    from dynastore.modules.db_config.query_executor import managed_transaction
+    from dynastore.modules.storage.storage_emit import _enqueue_drain_trigger
+
+    task_schema, engine = drain_env
+    async with managed_transaction(engine) as conn:
+        await _enqueue_drain_trigger(
+            conn, task_type="storage_drain_offload", dedup_key="storage_drain_offload",
+        )
+
+    assert await _count_tasks(engine, task_schema, task_type="storage_drain") == 0
+    assert await _count_tasks(engine, task_schema, task_type="storage_drain_offload") == 1
+
+
+@pytest.mark.asyncio
+async def test_enqueue_drain_trigger_dedup_guard_is_per_key(drain_env):
+    """Repeated calls with the SAME custom key coalesce to one row; a
+    DIFFERENT key gets its own independent row."""
+    from dynastore.modules.db_config.query_executor import managed_transaction
+    from dynastore.modules.storage.storage_emit import _enqueue_drain_trigger
+
+    task_schema, engine = drain_env
+    for _ in range(3):
+        async with managed_transaction(engine) as conn:
+            await _enqueue_drain_trigger(
+                conn, task_type="storage_drain_offload", dedup_key="storage_drain_offload",
+            )
+    async with managed_transaction(engine) as conn:
+        await _enqueue_drain_trigger(conn)  # defaults — a distinct key
+
+    assert await _count_tasks(engine, task_schema, task_type="storage_drain_offload") == 1
+    assert await _count_tasks(engine, task_schema, task_type="storage_drain") == 1
+
+
+# ---------------------------------------------------------------------------
+# 13. Live-PG integration: the full run() budget loop end-to-end
+#
+# create_async_engine is patched to return the throwaway drain_env engine
+# (mirrors test_drain_engine_url_normalization.py's stubbing pattern) so
+# run()'s own engine.dispose() call is safe — SQLAlchemy AsyncEngine.dispose()
+# only tears down the pooled connections; the engine itself remains usable
+# for the fixture's teardown query afterwards.
+# ---------------------------------------------------------------------------
+
+
+async def _run_with_engine(task: Any, engine: Any) -> Any:
+    from unittest.mock import MagicMock, patch
+
+    with patch("sqlalchemy.ext.asyncio.create_async_engine", return_value=engine):
+        return await task.run(MagicMock())
+
+
+@pytest.mark.asyncio
+async def test_run_byte_budget_integration_leaves_backlog_and_offload_trigger(
+    drain_env, monkeypatch,
+):
+    """Seeded rows whose hydrated docs exceed the byte budget: run() stops
+    after the first (budget-bounded) claim, leaves the rest 'ready', and
+    enqueues exactly one storage_drain_offload trigger."""
+    from dynastore.models.protocols.indexing import BulkIndexResult
+    from dynastore.tasks.workclass_drain.storage_drain_task import (
+        StorageDrainTask, _estimate_doc_bytes,
+    )
+
+    task_schema, engine = drain_env
+    n = 6
+    entity_ids = [f"geoid-ib{i}" for i in range(n)]
+    for eid in entity_ids:
+        await _seed_id_only_row(engine, task_schema, entity_id=eid)
+
+    heavy = "x" * 2048
+
+    async def _fake_read(*, engine, catalog_id, collection_id, geoids):
+        return {g: _StubCanonicalInput(g) for g in geoids}
+
+    async def _fake_build(*, catalog_id, collection_id, ci):
+        return {"id": ci.row["geoid"], "blob": heavy}
+
+    one_doc_bytes = _estimate_doc_bytes({"id": "geoid-ib0", "blob": heavy})
+
+    # batch_size=2 caps each claim at 2 rows; a budget just over one doc's
+    # size is exceeded by the FIRST claimed pair, so the loop hands off
+    # after processing only 2 of the 6 seeded rows.
+    task = StorageDrainTask(
+        batch_size=2, lease_seconds=300, hydration_byte_budget=10_000_000,
+        inprocess_max_bytes=one_doc_bytes + 50, inprocess_max_seconds=999.0,
+    )
+    monkeypatch.setattr(task, "_read_canonical_inputs", _fake_read)
+    monkeypatch.setattr(task, "_build_canonical_doc", _fake_build)
+
+    fake = _FakeBulkIndexer(
+        lambda ops: BulkIndexResult(passed=[op.op_id for op in ops], transient=[], poison=[])
+    )
+
+    async def _resolve(driver_id: str) -> Any:
+        return fake
+
+    monkeypatch.setattr(task, "_resolve_indexer", _resolve)
+
+    await _run_with_engine(task, engine)
+
+    rows = await _fetch_rows(engine, task_schema)
+    done = [r for r in rows if r["status"] == "done"]
+    ready = [r for r in rows if r["status"] == "ready"]
+    assert len(done) == 2, f"only the first budget-bounded claim should be processed; got {rows}"
+    assert len(ready) == 4, "unclaimed rows must remain untouched ('ready')"
+
+    assert await _count_tasks(engine, task_schema, task_type="storage_drain_offload") == 1
+
+
+@pytest.mark.asyncio
+async def test_run_high_byte_budget_drains_to_empty_no_offload_trigger(
+    drain_env, monkeypatch,
+):
+    """With a budget the whole run never crosses, run() drains every seeded
+    row to 'done' and never enqueues a storage_drain_offload trigger."""
+    from dynastore.models.protocols.indexing import BulkIndexResult
+    from dynastore.tasks.workclass_drain.storage_drain_task import StorageDrainTask
+
+    task_schema, engine = drain_env
+    n = 4
+    entity_ids = [f"geoid-hb{i}" for i in range(n)]
+    for eid in entity_ids:
+        await _seed_id_only_row(engine, task_schema, entity_id=eid)
+
+    heavy = "x" * 256
+
+    async def _fake_read(*, engine, catalog_id, collection_id, geoids):
+        return {g: _StubCanonicalInput(g) for g in geoids}
+
+    async def _fake_build(*, catalog_id, collection_id, ci):
+        return {"id": ci.row["geoid"], "blob": heavy}
+
+    task = StorageDrainTask(
+        batch_size=2, lease_seconds=300, hydration_byte_budget=10_000_000,
+        inprocess_max_bytes=10**9, inprocess_max_seconds=999.0,
+    )
+    monkeypatch.setattr(task, "_read_canonical_inputs", _fake_read)
+    monkeypatch.setattr(task, "_build_canonical_doc", _fake_build)
+
+    fake = _FakeBulkIndexer(
+        lambda ops: BulkIndexResult(passed=[op.op_id for op in ops], transient=[], poison=[])
+    )
+
+    async def _resolve(driver_id: str) -> Any:
+        return fake
+
+    monkeypatch.setattr(task, "_resolve_indexer", _resolve)
+
+    await _run_with_engine(task, engine)
+
+    rows = await _fetch_rows(engine, task_schema)
+    assert {r["status"] for r in rows} == {"done"}
+    assert await _count_tasks(engine, task_schema, task_type="storage_drain_offload") == 0

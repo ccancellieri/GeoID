@@ -73,7 +73,7 @@ from dynastore.models.protocols.indexer import (
     IndexOp,
     merge_bulk_results,
 )
-from dynastore.models.protocols.indexing import IndexableOp, OutboxStore
+from dynastore.models.protocols.indexing import IndexableOp
 from dynastore.modules.storage.routing_config import (
     FailurePolicy,
     OperationDriverEntry,
@@ -1123,14 +1123,19 @@ class IndexDispatcher:
         ctx: IndexContext,
         op: IndexableOp,
     ) -> None:
-        """Translate an :class:`IndexableOp` into an :class:`OutboxRecord`
-        and enqueue via the bulk :class:`OutboxStore` interface.
+        """Enqueue an :class:`IndexableOp` via the legacy singular-enqueue
+        outbox path.
 
         Used by :meth:`_handle_missing` when a driver is absent and the
         routing entry says ``OUTBOX``.  When no outbox is wired, degrade
         to a one-time WARN keyed identically to the missing-warning
         dedupe so operators see exactly one signal per
         ``(driver_id, catalog, collection)``.
+
+        No concrete bulk ``OutboxStore`` (``enqueue_bulk``) implementation is
+        wired in this codebase, so this always falls through to
+        :meth:`_enqueue_or_warn`, which uses the ``IndexOp`` shape
+        internally.
         """
         if self._outbox is None:
             key = ("__no_outbox__", entry.driver_ref, ctx.catalog, ctx.collection)
@@ -1143,35 +1148,6 @@ class IndexDispatcher:
                     entry.driver_ref, ctx.catalog, ctx.collection,
                 )
             return
-        from dynastore.models.protocols.indexing import OutboxRecord
-        record = OutboxRecord(
-            op_id=op.op_id,
-            driver_id=entry.driver_ref,
-            driver_instance_id=op.driver_instance_id,
-            collection_id=op.collection_id,
-            op=op.op,
-            item_id=op.item_id,
-            payload=op.payload,
-            idempotency_key=op.idempotency_key,
-        )
-        # Outbox may implement the bulk OutboxStore Protocol
-        # (``enqueue_bulk``) or only the legacy singular
-        # ``OutboxWriterProtocol.enqueue`` — pick whichever the wired
-        # instance offers so the dispatcher stays compatible with both
-        # during the migration window.  ``OutboxStore`` is
-        # ``@runtime_checkable`` so we narrow via ``isinstance`` rather
-        # than ``getattr`` probing (project rule: Protocols over hasattr).
-        if isinstance(self._outbox, OutboxStore):
-            await self._outbox.enqueue_bulk(
-                None,
-                catalog_id=op.catalog_id,
-                rows=[record],
-            )
-            return
-        # Fall through to the legacy singular-enqueue path, which uses
-        # the IndexOp shape internally.  This shouldn't fire in practice
-        # for IndexableOp callers (they wire OutboxStore), but keeps the
-        # dispatcher resilient mid-migration.
         await self._enqueue_or_warn(entry, ctx, [op])
 
     async def _ensure_or_handle(

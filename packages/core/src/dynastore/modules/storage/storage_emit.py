@@ -107,9 +107,13 @@ async def _enqueue_storage(
 
 
 async def _enqueue_drain_trigger(
-    conn: Any, *, wedge_grace_seconds: Optional[float] = None,
+    conn: Any,
+    *,
+    wedge_grace_seconds: Optional[float] = None,
+    task_type: str = "storage_drain",
+    dedup_key: str = "storage_drain",
 ) -> None:
-    """Insert one global dedup'd ``storage_drain`` PENDING task on ``conn``.
+    """Insert one global dedup'd PENDING drain task on ``conn``.
 
     Co-transactional: the drain row commits if and only if the caller's work
     rows commit. A single global dedup key ensures high write volume coalesces
@@ -122,13 +126,19 @@ async def _enqueue_drain_trigger(
     returns without raising. The storage rows are still committed; the
     drain will run on its next scheduled tick even without this NOTIFY trigger.
 
+    ``task_type`` / ``dedup_key`` (#2732 step 4): both callers below keep the
+    ``"storage_drain"`` default. ``StorageDrainTask._handoff_to_offload_job``
+    passes ``task_type="storage_drain_offload", dedup_key="storage_drain_offload"``
+    instead — its own dedup key so an offload handoff is never blocked by (or
+    blocks) a live in-process ``storage_drain`` trigger.
+
     ``wedge_grace_seconds`` (#2715): shared by both callers — the hot
     co-transactional write path above (always ``None``) and the leader-side
     recovery tick (``dynastore.modules.tasks.drain_spawner``, which passes a
     configured float).
 
     * ``None`` (default): unchanged behaviour. ANY existing non-terminal
-      (PENDING/ACTIVE/CREATED) ``storage_drain`` row blocks a fresh enqueue,
+      (PENDING/ACTIVE/CREATED) row for ``dedup_key`` blocks a fresh enqueue,
       so heavy write traffic never piles up duplicate drains while one is
       healthily in flight.
     * A float: additionally tolerates a WEDGED existing row — a PENDING row
@@ -175,12 +185,17 @@ async def _enqueue_drain_trigger(
         f"INSERT INTO {task_schema}.tasks"
         f" (task_id, catalog_id, scope, task_type, type, execution_mode,"
         f"  inputs, timestamp, status, dedup_key)"
-        f" SELECT :task_id, 'platform', 'platform', 'storage_drain',"
+        f" SELECT :task_id, 'platform', 'platform', :task_type,"
         f"        'task', 'ASYNCHRONOUS', '{{}}'::jsonb, now(), 'PENDING',"
-        f"        'storage_drain'"
+        f"        :dedup_key"
         f" WHERE NOT EXISTS ("
         f"     SELECT 1 FROM {task_schema}.tasks"
-        f"     WHERE dedup_key = 'storage_drain'"
+        # A distinct bind name from the SELECT target-list :dedup_key above —
+        # asyncpg raises AmbiguousParameterError when the SAME named
+        # parameter is reused across an untyped SELECT target position and a
+        # column-comparison position, even though both bind the same Python
+        # value here.
+        f"     WHERE dedup_key = :dedup_key_filter"
         f"       AND catalog_id = 'platform'"
         # Full terminal set (matches the claim query in tasks_module). A
         # DISMISSED (terminal) drain task must NOT block a fresh enqueue —
@@ -192,7 +207,12 @@ async def _enqueue_drain_trigger(
         f"{wedge_tolerant_clause}"
         f" )"
     )
-    params: Dict[str, Any] = {"task_id": generate_uuidv7()}
+    params: Dict[str, Any] = {
+        "task_id": generate_uuidv7(),
+        "task_type": task_type,
+        "dedup_key": dedup_key,
+        "dedup_key_filter": dedup_key,
+    }
     if wedge_grace_seconds is not None:
         params["wedge_grace_seconds"] = wedge_grace_seconds
 

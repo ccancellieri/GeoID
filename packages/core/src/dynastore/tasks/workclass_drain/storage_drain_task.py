@@ -42,11 +42,28 @@ Drain loop
 (one-shot drain-to-empty shape).  The
 dispatcher restarts via LISTEN / periodic catch-up; a single ``run`` call
 only needs to clear the current backlog.
+
+In-process byte/wall-clock budget (#2732 step 4)
+-------------------------------------------------
+``StorageDrainTask`` always starts in-process (catalog API pod). If its
+cumulative hydrated-document byte total or wall-clock elapsed crosses
+``TasksPluginConfig.storage_drain_inprocess_max_bytes`` /
+``storage_drain_inprocess_max_seconds`` with backlog rows still remaining,
+``run()`` stops early and hands the remainder off to
+:class:`StorageDrainOffloadTask` (``task_type`` ``"storage_drain_offload"``),
+a thin subclass that drains to empty with no budget. Unlike the base task,
+``StorageDrainOffloadTask`` carries the async-write workclass marker
+(``dynastore.tasks.workclass_drain.AsyncWriteDrainTaskProtocol.is_async_write_workclass``,
+#2782) — ``offload_required()`` therefore treats it exactly like
+``event_drain``: it always prefers an external executor (the
+``async_writer`` Cloud Run Job) when one advertises the task type, and
+degrades to an in-process ``background`` run when none does (e.g. onprem).
 """
 from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import replace as _dataclass_replace
 from typing import Any, ClassVar, Dict, Iterator, List, Optional, Sequence, Tuple, cast
 from uuid import UUID, uuid4
@@ -58,8 +75,8 @@ from dynastore.models.protocols.indexing import (
     IndexableOp,
 )
 from dynastore.models.tasks import TaskPayload
+from dynastore.tasks.protocols import TaskProtocol
 from dynastore.tasks.report import TaskReport
-from dynastore.tasks.workclass_drain import AsyncWriteDrainTaskProtocol
 from dynastore.tools.db import validate_sql_identifier
 
 logger = logging.getLogger(__name__)
@@ -107,6 +124,21 @@ _DEFAULT_HYDRATION_BYTE_BUDGET: int = 16 * 1024 * 1024
 # BUILT-document dispatch below instead.
 _ID_ONLY_READ_CHUNK_ROWS: int = 50
 
+# Default in-process drain budget (#2732 step 4). Matches
+# TasksPluginConfig.storage_drain_inprocess_max_bytes: the cumulative
+# hydrated-document byte total one in-process StorageDrainTask.run() call
+# will process before handing the remainder off to storage_drain_offload
+# (see StorageDrainOffloadTask below), if the outbox has not already been
+# drained to empty first.
+_DEFAULT_INPROCESS_MAX_BYTES: int = 32 * 1024 * 1024
+
+# Default in-process drain wall-clock budget (#2732 step 4), seconds. Matches
+# TasksPluginConfig.storage_drain_inprocess_max_seconds — complements
+# _DEFAULT_INPROCESS_MAX_BYTES so a run with many small documents (never
+# crossing the byte budget) still hands off rather than holding the catalog
+# API pod's request-serving capacity hostage indefinitely.
+_DEFAULT_INPROCESS_MAX_SECONDS: float = 5.0
+
 
 def _backoff(attempts: int) -> int:
     """Return the backoff in seconds for the given zero-based attempt count."""
@@ -130,7 +162,7 @@ def _chunked(items: List[Dict[str, Any]], size: int) -> Iterator[List[Dict[str, 
         yield items[start : start + size]
 
 
-class StorageDrainTask(AsyncWriteDrainTaskProtocol):
+class StorageDrainTask(TaskProtocol):
     """One-shot drain for the global ``tasks.storage`` index outbox.
 
     Claims ready rows (and stale in_flight rows whose lease expired), fans
@@ -143,15 +175,31 @@ class StorageDrainTask(AsyncWriteDrainTaskProtocol):
     tier-less system task to the ``catalog`` tier — the service that
     co-locates the dispatcher and the secondary-write driver this drain pushes
     to (and where the legacy outbox drain already runs). An operator can
-    repoint it via routing config without a code change. Member of the
-    async-write workclass (``AsyncWriteDrainTaskProtocol``) — on GCP this
-    always offloads to the async-writer Cloud Run Job once one is deployed
-    (#2732); with none deployed it keeps running here.
+    repoint it via routing config without a code change.
+
+    In-process-first placement (#2732 step 4): unlike ``EventDrainTask``,
+    this task deliberately does NOT subclass
+    ``dynastore.tasks.workclass_drain.AsyncWriteDrainTaskProtocol`` and does
+    not carry its ``is_async_write_workclass`` marker — it always starts
+    in-process, bounded by its own byte/wall-clock budget (see ``run()``),
+    rather than unconditionally offloading. Once that budget is exhausted
+    with backlog remaining, it hands the remainder off to
+    :class:`StorageDrainOffloadTask`, which DOES carry the marker.
     """
 
     task_type: ClassVar[str] = "storage_drain"
     priority: int = 100
     affinity_tier: ClassVar[Optional[str]] = None
+    # Explicit opt-out (see class docstring): a plain getattr(..., False) on
+    # an absent attribute would have the same effect, but naming it here
+    # documents the decision rather than leaving it to inference.
+    is_async_write_workclass: ClassVar[bool] = False
+
+    # In-process byte/wall-clock drain budget (#2732 step 4): True on the
+    # base task, so ``run()`` self-escapes to ``storage_drain_offload`` once
+    # the budget is exhausted with backlog remaining. ``StorageDrainOffloadTask``
+    # overrides this to False — the offload variant always drains to empty.
+    _inprocess_budget_enabled: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -160,11 +208,20 @@ class StorageDrainTask(AsyncWriteDrainTaskProtocol):
         batch_size: int = _DEFAULT_BATCH_SIZE,
         lease_seconds: int = _DEFAULT_LEASE_SECONDS,
         hydration_byte_budget: int = _DEFAULT_HYDRATION_BYTE_BUDGET,
+        inprocess_max_bytes: int = _DEFAULT_INPROCESS_MAX_BYTES,
+        inprocess_max_seconds: float = _DEFAULT_INPROCESS_MAX_SECONDS,
     ) -> None:
         self.app_state = app_state
         self.batch_size = batch_size
         self.lease_seconds = lease_seconds
         self.hydration_byte_budget = hydration_byte_budget
+        self.inprocess_max_bytes = inprocess_max_bytes
+        self.inprocess_max_seconds = inprocess_max_seconds
+        # Cumulative hydrated bytes processed by the most recent drain_once()
+        # call — a side channel that keeps drain_once's public return type
+        # ``int`` (row count) unchanged for existing callers/tests, while
+        # still letting run() read the byte cost of that batch (#2732 step 4).
+        self._last_batch_bytes: int = 0
         # driver_id -> resolved BulkIndexer, memoised for this run.
         self._indexer_cache: Dict[str, BulkIndexer] = {}
         # catalog_id -> resolved known-fields set, memoised for this run
@@ -187,10 +244,22 @@ class StorageDrainTask(AsyncWriteDrainTaskProtocol):
         }
 
     async def run(self, payload: TaskPayload) -> TaskReport:
-        """Drain ``tasks.storage`` to empty, then return.
+        """Drain ``tasks.storage``, then return.
 
-        Loops ``drain_once()`` until it reports zero claimed rows.  The
-        dispatcher re-enters via NOTIFY when new rows appear.
+        Loops ``drain_once()`` until it reports zero claimed rows (drain to
+        empty) — the dispatcher re-enters via NOTIFY when new rows appear.
+
+        In-process byte/wall-clock budget (#2732 step 4): when
+        ``self._inprocess_budget_enabled`` (the base task; the
+        ``storage_drain_offload`` subclass disables this and always drains to
+        empty), the loop also tracks cumulative hydrated-document bytes
+        (:attr:`_last_batch_bytes`, set by ``drain_once``) and elapsed
+        wall-clock time. If either configured budget is crossed while rows
+        still remain, the loop stops early and hands the remainder off to the
+        marker-carrying ``storage_drain_offload`` task (see
+        :class:`StorageDrainOffloadTask`) via :meth:`_handoff_to_offload_job`,
+        rather than continuing to hold this request-serving pod's capacity
+        indefinitely.
 
         Returns a :class:`~dynastore.tasks.report.TaskReport` so the runner
         persists structured metrics alongside the human-facing message
@@ -225,10 +294,16 @@ class StorageDrainTask(AsyncWriteDrainTaskProtocol):
         # how much BUILT (hydrated) payload is held before an index_bulk
         # dispatch, independent of batch_size (#2723).
         hydration_byte_budget = await self._resolve_hydration_byte_budget()
+        # Hot-reloaded in-process drain budget (#2732 step 4), resolved once
+        # per run. Only consulted when ``_inprocess_budget_enabled`` (the
+        # ``storage_drain_offload`` subclass never resolves or checks it).
+        inprocess_max_bytes, inprocess_max_seconds = await self._resolve_inprocess_budget()
         # Reset the split counters for this run — drain_once accumulates
         # into self._run_metrics as it classifies each claimed batch (#2731).
         self._run_metrics = {"indexed": 0, "auto_done": 0, "retried": 0}
         total = 0
+        cumulative_bytes = 0
+        start_time = time.monotonic()
         try:
             while True:
                 n = await self.drain_once(
@@ -238,6 +313,19 @@ class StorageDrainTask(AsyncWriteDrainTaskProtocol):
                 total += n
                 if n == 0:
                     break
+
+                if self._inprocess_budget_enabled:
+                    cumulative_bytes += self._last_batch_bytes
+                    elapsed = time.monotonic() - start_time
+                    over_bytes = (
+                        inprocess_max_bytes > 0 and cumulative_bytes >= inprocess_max_bytes
+                    )
+                    over_seconds = (
+                        inprocess_max_seconds > 0 and elapsed >= inprocess_max_seconds
+                    )
+                    if over_bytes or over_seconds:
+                        await self._handoff_to_offload_job(engine)
+                        break
         finally:
             await engine.dispose()
 
@@ -325,6 +413,67 @@ class StorageDrainTask(AsyncWriteDrainTaskProtocol):
             )
         return self.hydration_byte_budget
 
+    async def _resolve_inprocess_budget(self) -> Tuple[int, float]:
+        """Resolve the ``TasksPluginConfig.storage_drain_inprocess_max_bytes``
+        / ``storage_drain_inprocess_max_seconds`` pair, hot-reloaded (#2732
+        step 4).
+
+        Mirrors ``_resolve_batch_size``'s fallback pattern: falls back to the
+        instance defaults (constructor values, themselves matching the field
+        defaults) when the platform configs protocol is unavailable — early
+        startup, lightweight worker contexts, tests.
+        """
+        try:
+            from dynastore.models.protocols.platform_configs import (
+                PlatformConfigsProtocol,
+            )
+            from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+            from dynastore.tools.discovery import get_protocol
+
+            config_mgr = get_protocol(PlatformConfigsProtocol)
+            if config_mgr is not None:
+                cfg = await config_mgr.get_config(TasksPluginConfig)
+                if isinstance(cfg, TasksPluginConfig):
+                    return (
+                        int(cfg.storage_drain_inprocess_max_bytes),
+                        float(cfg.storage_drain_inprocess_max_seconds),
+                    )
+        except Exception:  # noqa: BLE001 — config read is best-effort
+            logger.debug(
+                "StorageDrainTask: storage_drain_inprocess_max_bytes/"
+                "storage_drain_inprocess_max_seconds unavailable — falling "
+                "back to the instance defaults (%d, %.1f).",
+                self.inprocess_max_bytes,
+                self.inprocess_max_seconds,
+                exc_info=True,
+            )
+        return self.inprocess_max_bytes, self.inprocess_max_seconds
+
+    async def _handoff_to_offload_job(self, engine: Any) -> None:
+        """Enqueue the ``storage_drain_offload`` trigger (#2732 step 4).
+
+        Called by ``run()`` once the in-process byte/wall-clock drain budget
+        is exhausted with backlog rows still remaining. Uses its own dedup
+        key so this handoff is never blocked by, and never blocks, a live
+        ``storage_drain`` trigger — the two are independent triggers for the
+        same underlying ``tasks.storage`` outbox, distinguished only by which
+        task claims them next (in-process vs the offloaded job).
+        """
+        from dynastore.modules.db_config.query_executor import managed_transaction
+        from dynastore.modules.storage.storage_emit import _enqueue_drain_trigger
+
+        async with managed_transaction(engine) as conn:
+            await _enqueue_drain_trigger(
+                conn,
+                task_type="storage_drain_offload",
+                dedup_key="storage_drain_offload",
+            )
+        logger.info(
+            "StorageDrainTask: in-process drain budget exhausted with "
+            "backlog remaining — handed off remainder to the "
+            "storage_drain_offload job.",
+        )
+
     async def drain_once(
         self, *, engine: Any, owner_id: str, batch_size: Optional[int] = None,
         hydration_byte_budget: Optional[int] = None,
@@ -362,6 +511,7 @@ class StorageDrainTask(AsyncWriteDrainTaskProtocol):
             batch_size=batch_size if batch_size is not None else self.batch_size,
         )
         if not rows:
+            self._last_batch_bytes = 0
             return 0
 
         effective_byte_budget = (
@@ -381,6 +531,10 @@ class StorageDrainTask(AsyncWriteDrainTaskProtocol):
         batch_indexed = 0
         batch_auto_done = 0
         batch_retried = 0
+        # Cumulative hydrated-document bytes across every driver in this
+        # batch (#2732 step 4) — the run()-level in-process drain budget
+        # signal, surfaced via self._last_batch_bytes below.
+        batch_bytes = 0
 
         for driver_id, driver_rows in by_driver.items():
             indexer = await self._resolve_indexer(driver_id)
@@ -420,10 +574,14 @@ class StorageDrainTask(AsyncWriteDrainTaskProtocol):
             batch_indexed += counts["indexed"]
             batch_auto_done += counts["auto_done"]
             batch_retried += counts["retried"]
+            batch_bytes += counts.get("bytes", 0)
 
         self._run_metrics["indexed"] += batch_indexed
         self._run_metrics["auto_done"] += batch_auto_done
         self._run_metrics["retried"] += batch_retried
+        # Side channel for run()'s in-process drain budget (#2732 step 4) —
+        # drain_once's public return type stays the row count.
+        self._last_batch_bytes = batch_bytes
         logger.info(
             "StorageDrainTask: batch claimed=%d indexed=%d auto_done=%d retried=%d",
             len(rows), batch_indexed, batch_auto_done, batch_retried,
@@ -694,10 +852,13 @@ class StorageDrainTask(AsyncWriteDrainTaskProtocol):
         silently skipped (an unflushed row is simply never marked, so it
         falls back to the normal lease-expiry reclaim path).
 
-        Returns ``{"indexed": n, "auto_done": n, "retried": n}`` — the same
-        split classification as the pre-#2723 single-shot pipeline.
+        Returns ``{"indexed": n, "auto_done": n, "retried": n, "bytes": n}`` —
+        the same split classification as the pre-#2723 single-shot pipeline,
+        plus the cumulative hydrated-document byte total (#2732 step 4) for
+        run()'s in-process drain budget, independent of sub-chunk flush
+        boundaries.
         """
-        counts = {"indexed": 0, "auto_done": 0, "retried": 0}
+        counts = {"indexed": 0, "auto_done": 0, "retried": 0, "bytes": 0}
 
         pending_ops: List[IndexableOp] = []
         pending_rows: List[Dict[str, Any]] = []
@@ -733,9 +894,11 @@ class StorageDrainTask(AsyncWriteDrainTaskProtocol):
             op: IndexableOp, row: Dict[str, Any], doc: Dict[str, Any],
         ) -> None:
             nonlocal pending_bytes
+            doc_bytes = _estimate_doc_bytes(doc)
             pending_ops.append(op)
             pending_rows.append(row)
-            pending_bytes += _estimate_doc_bytes(doc)
+            pending_bytes += doc_bytes
+            counts["bytes"] += doc_bytes
             if pending_bytes >= byte_budget:
                 await _flush()
 
@@ -1104,3 +1267,32 @@ class StorageDrainTask(AsyncWriteDrainTaskProtocol):
                 owner_id=owner_id,
                 claim_version=row["claim_version"],
             )
+
+
+class StorageDrainOffloadTask(StorageDrainTask):
+    """Overflow drain for ``tasks.storage`` (#2732 step 4).
+
+    ``StorageDrainTask`` always starts in-process and hands off to this task
+    once its own in-process byte/wall-clock budget is exhausted with backlog
+    rows still remaining — see ``StorageDrainTask._handoff_to_offload_job``.
+
+    Carries ``is_async_write_workclass = True`` (#2782): unlike the base
+    task, ``offload_required()`` treats this task exactly like
+    ``event_drain`` — placement is unconditional whenever an offload-capable
+    runner (``gcp_cloud_run`` / ``worker_queue``) advertises the task type,
+    with no static routing hint required. Under the cloud preset this runs
+    as the ``async_writer`` Cloud Run Job once one is deployed; with none
+    deployed (or under onprem, where none exists), it degrades to an
+    in-process ``background`` run like any other system task — the fail-open
+    in ``execution._restrict_to_offload_runners``.
+
+    Identical claim/hydrate/dispatch/fence logic to the base task — the only
+    behavioural differences are ``_inprocess_budget_enabled = False`` (this
+    variant never checks or re-triggers the in-process budget, so it always
+    drains its claimed backlog to empty rather than escaping again) and the
+    workclass marker itself.
+    """
+
+    task_type: ClassVar[str] = "storage_drain_offload"
+    is_async_write_workclass: ClassVar[bool] = True
+    _inprocess_budget_enabled: ClassVar[bool] = False

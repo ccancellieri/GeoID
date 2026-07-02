@@ -117,6 +117,7 @@ requeue_dead_letter_tasks = "dynastore.tasks.requeue_dead_letter.task:RequeueDea
 requeue_dead_letter_events = "dynastore.tasks.requeue_dead_letter_events.task:RequeueDeadLetterEventsTask"
 stac_harvest = "dynastore.tasks.stac_harvest.task:StacHarvestTask"
 storage_drain = "dynastore.tasks.workclass_drain.storage_drain_task:StorageDrainTask"
+storage_drain_offload = "dynastore.tasks.workclass_drain.storage_drain_task:StorageDrainOffloadTask"
 event_drain = "dynastore.tasks.workclass_drain.event_drain_task:EventDrainTask"
 collection_hard_delete = "dynastore.tasks.collection_hard_delete.task:CollectionHardDeleteTask"
 webhook_delivery = "dynastore.tasks.webhook_delivery.task:WebhookDeliveryTask"
