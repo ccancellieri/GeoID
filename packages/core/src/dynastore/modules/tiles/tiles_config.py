@@ -139,6 +139,20 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
         description="If True, dynamically generated tiles are saved to the preseed storage for future reuse."
     )
 
+    # --- Live-render hardening (#2813) ---
+    live_tile_timeout_seconds: Mutable[int] = Field(
+        default=30,
+        ge=1,
+        description=(
+            "Per-request PostgreSQL statement timeout (``SET LOCAL "
+            "statement_timeout``) applied while rendering an on-demand MVT "
+            "tile. A query that exceeds this is canceled server-side; "
+            "``get_vector_tile`` treats the cancellation as an empty tile "
+            "(204) instead of surfacing a 500. Mirrors "
+            "``TilesPreseedConfig.preseed_tile_timeout_seconds``."
+        ),
+    )
+
 
 class TilesCachingConfig(PluginConfig):
     """Operator-tunable knobs for the bucket-backed tile cache.

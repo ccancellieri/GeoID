@@ -50,7 +50,12 @@ from dynastore.models.protocols.configs import ConfigsProtocol
 from dynastore.models.protocols.web import WebModuleProtocol, StaticFilesProtocol
 from dynastore.extensions.web.decorators import expose_static
 from dynastore.extensions.tools.db import get_async_engine
-from dynastore.modules.db_config.query_executor import _read_live_fg_acquire_timeout
+from dynastore.modules.db_config.query_executor import (
+    _read_live_fg_acquire_timeout,
+    DQLQuery,
+    ResultHandler,
+)
+from dynastore.modules.db_config.exceptions import QueryExecutionError
 from dynastore.extensions.tools.query import parse_hints_param
 import dynastore.modules.tiles.tiles_module as tms_manager
 from dynastore.tools.geospatial import SimplificationAlgorithm
@@ -74,6 +79,12 @@ from dynastore.modules.tiles.tiles_models import (
 from dynastore.modules.tiles.tms_definitions import BUILTIN_TILE_MATRIX_SETS
 
 logger = logging.getLogger(__name__)
+
+# PostgreSQL pgcode for "query_canceled" — raised when a statement exceeds
+# ``statement_timeout``. Used by ``get_vector_tile`` (#2813) to distinguish a
+# bounded-timeout cancellation (graceful empty tile) from a genuine query
+# failure (500).
+_QUERY_CANCELED_PGCODE = "57014"
 
 # Raster render imports — guarded so the tiles extension can load in
 # environments without rio-tiler (graceful degradation: map-tile routes
@@ -1008,20 +1019,45 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             # Retrieve MVT content via the unified render engine — L1 cache
             # enabled (the live request-serving path); the preseed task
             # renders each tile exactly once and passes use_l1_cache=False.
-            mvt_content = await tiles_engine.render_tile(
-                conn,
-                ctx,
-                str(z),
-                x,
-                y,
-                format=format,
-                use_l1_cache=True,
-                datetime_str=datetime,
-                cql_filter=filter,
-                subset_params=subset,  # type: ignore[arg-type]
-                simplification=simplification,
-                simplification_algorithm=simplification_algorithm,
-            )
+            #
+            # Bound the render query with a per-request SET LOCAL
+            # statement_timeout (#2813) — mirrors the preseed task's
+            # per-zoom-transaction timeout. On PostGIS canceling the
+            # statement (pgcode 57014), treat it as an empty tile (below)
+            # instead of surfacing a 500; any other query failure still
+            # propagates to the generic error handler.
+            statement_timeout_ms = int(tiles_config.live_tile_timeout_seconds * 1000)
+            try:
+                await DQLQuery(
+                    f"SET LOCAL statement_timeout = {statement_timeout_ms}",
+                    result_handler=ResultHandler.NONE,
+                ).execute(conn)
+                mvt_content = await tiles_engine.render_tile(
+                    conn,
+                    ctx,
+                    str(z),
+                    x,
+                    y,
+                    format=format,
+                    use_l1_cache=True,
+                    datetime_str=datetime,
+                    cql_filter=filter,
+                    subset_params=subset,  # type: ignore[arg-type]
+                    simplification=simplification,
+                    simplification_algorithm=simplification_algorithm,
+                )
+            except QueryExecutionError as exc:
+                pgcode = getattr(exc.original_exception, "pgcode", None)
+                if pgcode != _QUERY_CANCELED_PGCODE:
+                    raise
+                logger.warning(
+                    "get_vector_tile: statement timeout (pgcode %s, "
+                    "live_tile_timeout_seconds=%s) catalog=%s collection=%s "
+                    "z=%s x=%s y=%s — serving empty tile instead of 500",
+                    pgcode, tiles_config.live_tile_timeout_seconds,
+                    dataset, collections, z, x, y,
+                )
+                mvt_content = None
 
             # 9. Background Caching
             effective_cache_enabled = cache_enabled and not disable_cache
