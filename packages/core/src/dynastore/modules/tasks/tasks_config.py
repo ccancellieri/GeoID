@@ -211,6 +211,45 @@ class TasksPluginConfig(ExposableConfigMixin, PluginConfig):
         ),
     )
 
+    items_secondary_via_storage_plane: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "#2494 P1: when True, every ASYNC secondary-index WRITE entry "
+            "for items (``IndexContext.entity_type == 'item'``) enqueues an "
+            "id-only obligation onto the ``tasks.storage`` plane instead of "
+            "ever running inline (even inside a task/job run, where it "
+            "would otherwise be absorbed into the running job) or falling "
+            "back to the payload-carrying ``TaskTableOutboxWriter``. The "
+            "``storage_drain`` worker re-reads the canonical PG row at "
+            "replay time, so the queued obligation can never go stale. "
+            "Default False: byte-identical to the pre-#2494 dispatch path, "
+            "so upgrading this service changes nothing until an operator "
+            "opts in. Read on every dispatch via the platform configs "
+            "hot-reload path; no restart required. Scope: entries pinned "
+            "to an access-aware driver (``applies_access_filter=True``, "
+            "e.g. private ES) are ALWAYS excluded regardless of this flag "
+            "— the drain's canonical re-read cannot recover the "
+            "write-time access envelope (_visibility/_owner/_attrs), so "
+            "those entries keep using the legacy dispatch path."
+        ),
+    )
+
+    ingest_backpressure_sleep_seconds: Mutable[float] = Field(
+        default=2.0,
+        ge=0.0,
+        le=60.0,
+        description=(
+            "#2494 P1: bounded sleep applied before a bulk-ingestion batch "
+            "flush when the aggregate tasks.storage/tasks.events outbox "
+            "backlog is high (``async_writer_backlog.backlog_is_high()``, "
+            "gated by ``async_writer_backlog_threshold``). Cooperative "
+            "backpressure only — ingestion keeps running, just slower, "
+            "giving the storage_drain worker room to catch up instead of "
+            "the backlog growing unbounded. Only consulted when "
+            "``items_secondary_via_storage_plane`` is enabled."
+        ),
+    )
+
     @model_validator(mode="after")
     def _enforce_refresh_le_half_ttl(self) -> "TasksPluginConfig":
         if self.capability_publisher_refresh_seconds > self.capability_publisher_ttl_seconds / 2:

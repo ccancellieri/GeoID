@@ -195,7 +195,15 @@ async def _seed_rows(
     claimed_at_offset: Optional[str] = None,  # e.g. "- INTERVAL '10 minutes'"
     claim_version: int = 0,
 ) -> List[str]:
-    """Insert N rows into storage; return list of op_id strings."""
+    """Insert N rows into storage; return list of op_id strings.
+
+    Payload-carrying (``op_payload={"legacy": True}``) so the generic
+    claim/fence/retry/dedup mechanics exercised by most of this file are
+    unaffected by the #2494 P1 id-only re-read path, which keys off the
+    explicit ``STORAGE_PLANE_ID_ONLY_MARKER_KEY`` sentinel on an
+    ``op='upsert'`` row's ``op_payload`` — use :func:`_seed_id_only_row`
+    to seed that shape instead.
+    """
     from dynastore.modules.db_config.query_executor import (
         DQLQuery, ResultHandler, managed_transaction,
     )
@@ -206,13 +214,14 @@ async def _seed_rows(
         if claimed_at_offset is not None:
             claimed_at_expr = f"now() {claimed_at_offset}"
 
+        payload_expr = "'{\"legacy\": true}'::jsonb"
         sql = (
             f"INSERT INTO {task_schema}.storage"
             f" (op_id, day, driver_id, catalog_id, op, status,"
-            f"  claimed_by, claimed_at, claim_version)"
+            f"  claimed_by, claimed_at, claim_version, op_payload)"
             f" VALUES (:op_id, CURRENT_DATE, :driver_id,"
             f"         :catalog_id, 'upsert', :status,"
-            f"         :claimed_by, {claimed_at_expr}, :claim_version)"
+            f"         :claimed_by, {claimed_at_expr}, :claim_version, {payload_expr})"
         )
         async with managed_transaction(engine) as conn:
             await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
@@ -747,3 +756,355 @@ async def test_resolve_indexer_es_driver_is_bulk_indexer(drain_env):
     assert params == ["ops"], (
         f"index_bulk must be the BulkIndexer one-arg contract; got {params}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 8. Canonical re-read for id-only rows (#2494 P1)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_id_only_row(
+    engine: Any,
+    task_schema: str,
+    *,
+    op: str = "upsert",
+    driver_id: str = "es_driver",
+    catalog_id: str = "tenant_a",
+    collection_id: str = "coll_a",
+    entity_id: str,
+) -> str:
+    """Insert one id-only row (explicit id-only sentinel payload,
+    explicit collection/entity)."""
+    from dynastore.modules.db_config.query_executor import (
+        DQLQuery, ResultHandler, managed_transaction,
+    )
+
+    op_id = str(uuid4())
+    sql = (
+        f"INSERT INTO {task_schema}.storage"
+        f" (op_id, day, driver_id, catalog_id, collection_id, entity_id,"
+        f"  op, status, op_payload)"
+        f" VALUES (:op_id, CURRENT_DATE, :driver_id, :catalog_id,"
+        f"         :collection_id, :entity_id, :op, 'ready',"
+        f"         '{{\"_id_only\": true}}'::jsonb)"
+    )
+    async with managed_transaction(engine) as conn:
+        await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
+            conn,
+            op_id=op_id,
+            driver_id=driver_id,
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+            entity_id=entity_id,
+            op=op,
+        )
+    return op_id
+
+
+async def _seed_empty_payload_upsert_row(
+    engine: Any,
+    task_schema: str,
+    *,
+    driver_id: str = "es_driver",
+    catalog_id: str = "tenant_a",
+    collection_id: str = "coll_a",
+    entity_id: str,
+) -> str:
+    """Insert one upsert row with a genuinely EMPTY ``op_payload`` (no
+    id-only marker) — the DDL-default shape, distinct from an id-only row.
+    """
+    from dynastore.modules.db_config.query_executor import (
+        DQLQuery, ResultHandler, managed_transaction,
+    )
+
+    op_id = str(uuid4())
+    sql = (
+        f"INSERT INTO {task_schema}.storage"
+        f" (op_id, day, driver_id, catalog_id, collection_id, entity_id,"
+        f"  op, status, op_payload)"
+        f" VALUES (:op_id, CURRENT_DATE, :driver_id, :catalog_id,"
+        f"         :collection_id, :entity_id, 'upsert', 'ready', '{{}}'::jsonb)"
+    )
+    async with managed_transaction(engine) as conn:
+        await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
+            conn,
+            op_id=op_id,
+            driver_id=driver_id,
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+            entity_id=entity_id,
+        )
+    return op_id
+
+
+class _StubCanonicalInput:
+    """Minimal stand-in for CanonicalIndexInput — only ``row`` is read by
+    the stubbed ``_build_canonical_doc`` in these tests."""
+
+    def __init__(self, geoid: str) -> None:
+        self.row = {"geoid": geoid}
+        self.resolved_sidecars = []
+        self.geometry = None
+        self.bbox = None
+        self.user_properties = None
+        self.access = None
+        self.stac_reserved_members = None
+
+
+def _patch_canonical_reread(monkeypatch, task, *, present: set) -> List[tuple]:
+    """Stub the canonical re-read seam: geoids in ``present`` resolve to a
+    canned CanonicalIndexInput; everything else is absent (missing PG row).
+    Records every ``(catalog_id, collection_id, geoids)`` call so tests can
+    assert on batching.
+    """
+    calls: List[tuple] = []
+
+    async def _fake_read(*, engine, catalog_id, collection_id, geoids):
+        calls.append((catalog_id, collection_id, tuple(sorted(geoids))))
+        return {g: _StubCanonicalInput(g) for g in geoids if g in present}
+
+    async def _fake_build(*, catalog_id, collection_id, ci):
+        return {"id": ci.row["geoid"], "catalog_id": catalog_id, "collection_id": collection_id}
+
+    monkeypatch.setattr(task, "_read_canonical_inputs", _fake_read)
+    monkeypatch.setattr(task, "_build_canonical_doc", _fake_build)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_id_only_upsert_present_row_indexes_current_state(drain_env, monkeypatch):
+    """An id-only upsert row whose geoid IS found in canonical PG state is
+    indexed with the freshly-built canonical document."""
+    from dynastore.models.protocols.indexing import BulkIndexResult
+
+    task_schema, engine = drain_env
+    await _seed_id_only_row(engine, task_schema, entity_id="geoid-1")
+
+    task = _make_task(engine, task_schema)
+    _patch_canonical_reread(monkeypatch, task, present={"geoid-1"})
+
+    fake = _FakeBulkIndexer(
+        lambda ops: BulkIndexResult(passed=[op.op_id for op in ops], transient=[], poison=[])
+    )
+
+    async def _resolve(driver_id: str) -> Any:
+        return fake
+
+    monkeypatch.setattr(task, "_resolve_indexer", _resolve)
+
+    owner_id = f"owner:{uuid4()}"
+    count = await task.drain_once(engine=engine, owner_id=owner_id)
+    assert count == 1
+
+    assert len(fake.calls) == 1
+    ops = fake.calls[0]
+    assert len(ops) == 1
+    assert ops[0].payload == {"id": "geoid-1", "catalog_id": "tenant_a", "collection_id": "coll_a"}
+
+    rows = await _fetch_rows(engine, task_schema)
+    assert rows[0]["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_id_only_upsert_missing_row_skipped_as_success(drain_env, monkeypatch):
+    """An id-only upsert row whose geoid is ABSENT from canonical PG state
+    is marked done directly — never built into an op sent to the indexer."""
+    task_schema, engine = drain_env
+    await _seed_id_only_row(engine, task_schema, entity_id="geoid-missing")
+
+    task = _make_task(engine, task_schema)
+    _patch_canonical_reread(monkeypatch, task, present=set())  # nothing found
+
+    fake = _FakeBulkIndexer(lambda ops: pytest.fail("indexer must not be called"))
+
+    async def _resolve(driver_id: str) -> Any:
+        return fake
+
+    monkeypatch.setattr(task, "_resolve_indexer", _resolve)
+
+    owner_id = f"owner:{uuid4()}"
+    count = await task.drain_once(engine=engine, owner_id=owner_id)
+    assert count == 1
+    assert fake.calls == [], "no op should reach the indexer for a missing PG row"
+
+    rows = await _fetch_rows(engine, task_schema)
+    assert rows[0]["status"] == "done", "missing PG row on upsert must skip as success"
+
+
+@pytest.mark.asyncio
+async def test_id_only_delete_bypasses_reread(drain_env, monkeypatch):
+    """A delete row (even with empty op_payload — the normal shape for a
+    delete) goes straight to the indexer; no canonical re-read is attempted."""
+    from dynastore.models.protocols.indexing import BulkIndexResult
+
+    task_schema, engine = drain_env
+    await _seed_id_only_row(engine, task_schema, op="delete", entity_id="geoid-del")
+
+    task = _make_task(engine, task_schema)
+    reread_calls = _patch_canonical_reread(monkeypatch, task, present={"geoid-del"})
+
+    fake = _FakeBulkIndexer(
+        lambda ops: BulkIndexResult(passed=[op.op_id for op in ops], transient=[], poison=[])
+    )
+
+    async def _resolve(driver_id: str) -> Any:
+        return fake
+
+    monkeypatch.setattr(task, "_resolve_indexer", _resolve)
+
+    owner_id = f"owner:{uuid4()}"
+    count = await task.drain_once(engine=engine, owner_id=owner_id)
+    assert count == 1
+
+    assert reread_calls == [], "delete ops must never trigger a canonical re-read"
+    assert len(fake.calls) == 1
+    assert fake.calls[0][0].op == "delete"
+
+    rows = await _fetch_rows(engine, task_schema)
+    assert rows[0]["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_id_only_batches_one_read_per_catalog_collection_group(drain_env, monkeypatch):
+    """Multiple id-only rows in the same (catalog, collection) group share
+    ONE canonical re-read call; a different group gets its own call."""
+    from dynastore.models.protocols.indexing import BulkIndexResult
+
+    task_schema, engine = drain_env
+    await _seed_id_only_row(
+        engine, task_schema, collection_id="coll_a", entity_id="g1",
+    )
+    await _seed_id_only_row(
+        engine, task_schema, collection_id="coll_a", entity_id="g2",
+    )
+    await _seed_id_only_row(
+        engine, task_schema, collection_id="coll_b", entity_id="g3",
+    )
+
+    task = _make_task(engine, task_schema)
+    reread_calls = _patch_canonical_reread(
+        monkeypatch, task, present={"g1", "g2", "g3"},
+    )
+
+    fake = _FakeBulkIndexer(
+        lambda ops: BulkIndexResult(passed=[op.op_id for op in ops], transient=[], poison=[])
+    )
+
+    async def _resolve(driver_id: str) -> Any:
+        return fake
+
+    monkeypatch.setattr(task, "_resolve_indexer", _resolve)
+
+    owner_id = f"owner:{uuid4()}"
+    count = await task.drain_once(engine=engine, owner_id=owner_id)
+    assert count == 3
+
+    # One batched read per distinct (catalog_id, collection_id) group.
+    assert len(reread_calls) == 2, reread_calls
+    groups = {(c, coll) for c, coll, _ids in reread_calls}
+    assert groups == {("tenant_a", "coll_a"), ("tenant_a", "coll_b")}
+    coll_a_call = next(c for c in reread_calls if c[1] == "coll_a")
+    assert set(coll_a_call[2]) == {"g1", "g2"}
+
+    rows = await _fetch_rows(engine, task_schema)
+    assert {r["status"] for r in rows} == {"done"}
+
+
+@pytest.mark.asyncio
+async def test_id_only_reread_failure_funnels_group_to_retry(drain_env, monkeypatch):
+    """A canonical re-read that raises for a group is a transient infra
+    failure — every row in that group is retried, not dropped or poisoned."""
+    task_schema, engine = drain_env
+    await _seed_id_only_row(engine, task_schema, entity_id="geoid-err")
+
+    task = _make_task(engine, task_schema)
+
+    async def _fake_read(*, engine, catalog_id, collection_id, geoids):
+        raise RuntimeError("simulated PG outage")
+
+    monkeypatch.setattr(task, "_read_canonical_inputs", _fake_read)
+
+    owner_id = f"owner:{uuid4()}"
+    count = await task.drain_once(engine=engine, owner_id=owner_id)
+    assert count == 1
+
+    rows = await _fetch_rows(engine, task_schema)
+    assert rows[0]["status"] == "ready", "re-read failure must retry, not drop"
+    assert rows[0]["attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_payload_carrying_rows_unaffected_by_id_only_path(drain_env, monkeypatch):
+    """A payload-carrying row (non-empty op_payload) goes straight to the
+    indexer exactly as before #2494 — no canonical re-read attempted."""
+    from dynastore.models.protocols.indexing import BulkIndexResult
+
+    task_schema, engine = drain_env
+    # Default _seed_rows now carries a non-empty payload.
+    await _seed_rows(engine, task_schema, n=2)
+
+    task = _make_task(engine, task_schema)
+    reread_calls = _patch_canonical_reread(monkeypatch, task, present=set())
+
+    fake = _FakeBulkIndexer(
+        lambda ops: BulkIndexResult(passed=[op.op_id for op in ops], transient=[], poison=[])
+    )
+
+    async def _resolve(driver_id: str) -> Any:
+        return fake
+
+    monkeypatch.setattr(task, "_resolve_indexer", _resolve)
+
+    owner_id = f"owner:{uuid4()}"
+    count = await task.drain_once(engine=engine, owner_id=owner_id)
+    assert count == 2
+
+    assert reread_calls == [], "payload-carrying rows must never trigger a re-read"
+    assert len(fake.calls) == 1
+    assert len(fake.calls[0]) == 2
+    assert all(op.payload == {"legacy": True} for op in fake.calls[0])
+
+
+@pytest.mark.asyncio
+async def test_empty_payload_without_marker_does_not_trigger_reread(
+    drain_env, monkeypatch, caplog,
+):
+    """An upsert row with a genuinely EMPTY op_payload (the DDL default,
+    no id-only marker) must NOT be classified as id-only — it falls
+    through to the legacy path (built and sent to the indexer as-is,
+    same as pre-#2494), with a WARNING logged for the anomaly."""
+    import logging as _logging
+
+    from dynastore.models.protocols.indexing import BulkIndexResult
+
+    task_schema, engine = drain_env
+    await _seed_empty_payload_upsert_row(engine, task_schema, entity_id="geoid-empty")
+
+    task = _make_task(engine, task_schema)
+    reread_calls = _patch_canonical_reread(monkeypatch, task, present={"geoid-empty"})
+
+    fake = _FakeBulkIndexer(
+        lambda ops: BulkIndexResult(passed=[op.op_id for op in ops], transient=[], poison=[])
+    )
+
+    async def _resolve(driver_id: str) -> Any:
+        return fake
+
+    monkeypatch.setattr(task, "_resolve_indexer", _resolve)
+
+    owner_id = f"owner:{uuid4()}"
+    with caplog.at_level(_logging.WARNING):
+        count = await task.drain_once(engine=engine, owner_id=owner_id)
+    assert count == 1
+
+    assert reread_calls == [], "an unmarked empty payload must not trigger a re-read"
+    assert len(fake.calls) == 1
+    assert len(fake.calls[0]) == 1
+    assert fake.calls[0][0].payload == {}
+    assert any(
+        "EMPTY op_payload and no id-only marker" in r.getMessage()
+        for r in caplog.records
+    ), "an unmarked empty payload must log the anomaly warning"
+
+    rows = await _fetch_rows(engine, task_schema)
+    assert rows[0]["status"] == "done"

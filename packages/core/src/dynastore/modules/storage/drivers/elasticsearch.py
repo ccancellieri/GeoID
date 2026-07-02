@@ -2351,6 +2351,20 @@ class ItemsElasticsearchDriver(
             return BulkResult(total=len(ops))
 
         resp = await es.bulk(body=body, params={"refresh": "false"})
+        # #2494 instrumentation — submitted vs response doc counts so a
+        # divergence (ES silently dropping/coalescing actions) is visible
+        # without cross-referencing the raw response body. DEBUG (review
+        # finding): fires on every ES bulk call regardless of the #2494
+        # storage-plane flag, so INFO would add unconditional log volume
+        # to every deployment running the ES driver.
+        _resp_items = resp.get("items") if isinstance(resp, dict) else None
+        logger.debug(
+            "es_bulk_response submitted_ops=%d bulk_actions=%d "
+            "response_items=%d errors=%s catalog=%s collection=%s",
+            len(ops), len(body) // 2, len(_resp_items or []),
+            resp.get("errors") if isinstance(resp, dict) else None,
+            ctx.catalog, ctx.collection,
+        )
         succeeded, failures = self._tally_bulk_response(
             resp, len(ops),
             driver_name="ItemsElasticsearchDriver",

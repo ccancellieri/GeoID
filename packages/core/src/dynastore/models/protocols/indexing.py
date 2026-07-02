@@ -35,6 +35,16 @@ from typing import (
 )
 from uuid import UUID
 
+# #2494 P1 — the explicit marker key stamped into ``op_payload`` by
+# ``storage_emit.enqueue_storage_op_id_only`` so ``StorageDrainTask``
+# can distinguish a deliberate id-only obligation from a row that merely
+# has an EMPTY payload (the ``tasks.storage`` DDL default, ``'{}'::jsonb``,
+# which a producer can also arrive at by omitting the payload). Detecting
+# id-only status from emptiness alone collides with that DDL default;
+# the explicit key removes the ambiguity. Shared by both call sites so
+# neither can drift from the other.
+STORAGE_PLANE_ID_ONLY_MARKER_KEY: str = "_id_only"
+
 
 @dataclass(frozen=True)
 class IndexableOp:

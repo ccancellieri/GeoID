@@ -1369,6 +1369,257 @@ async def test_async_enqueue_drop_path_b_pg_conn_none_returns_failed():
     assert results["a"].failed == 3
 
 
+# ---------------------------------------------------------------------------
+# #2494 P1 — storage-plane id-only routing gate
+# ---------------------------------------------------------------------------
+
+
+def _item_ctx(*, pg_conn: Optional[object] = object()) -> IndexContext:
+    return IndexContext(
+        catalog="cat-x", collection="col-y", correlation_id="cid-1",
+        pg_conn=pg_conn, entity_type="item",
+    )
+
+
+def _patch_storage_plane_flag(monkeypatch, *, enabled: bool) -> None:
+    import dynastore.modules.storage.index_dispatcher as idx_mod
+
+    async def _flag() -> bool:
+        return enabled
+
+    monkeypatch.setattr(idx_mod, "_storage_plane_routing_enabled", _flag)
+
+
+def _patch_storage_emit_recorder(monkeypatch) -> List[dict]:
+    """Patch enqueue_storage_op_id_only where index_dispatcher imports it
+    from, recording every call instead of touching a database."""
+    import dynastore.modules.storage.storage_emit as storage_emit_mod
+
+    calls: List[dict] = []
+
+    async def _fake_enqueue(conn, *, catalog_id, rows):
+        calls.append({"conn": conn, "catalog_id": catalog_id, "rows": list(rows)})
+
+    monkeypatch.setattr(storage_emit_mod, "enqueue_storage_op_id_only", _fake_enqueue)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_storage_plane_flag_on_item_async_enqueues_id_only_not_in_task_run(monkeypatch):
+    """Flag ON + item-tier ASYNC entry, outside a task run: id-only rows are
+    enqueued via the storage plane and the indexer is never called inline.
+    """
+    assert not in_task_run()
+    _patch_storage_plane_flag(monkeypatch, enabled=True)
+    calls = _patch_storage_emit_recorder(monkeypatch)
+
+    a = _StubIndexer("a")
+    dispatcher = _make_dispatcher(
+        entries=[_async_entry("a")], indexers={"a": a},
+    )
+    ops = [_op(entity_id="i1"), _op(entity_id="i2")]
+    results = await dispatcher.fan_out_bulk(_item_ctx(), ops)
+
+    assert a.bulk_calls == [], "storage-plane routing must never call the indexer inline"
+    assert len(calls) == 1
+    assert calls[0]["catalog_id"] == "cat-x"
+    row_ids = {r.item_id for r in calls[0]["rows"]}
+    assert row_ids == {"i1", "i2"}
+    assert all(r.payload == {} for r in calls[0]["rows"]), "rows must be id-only"
+    assert results["a"].succeeded == 2
+    assert results["a"].failed == 0
+
+
+@pytest.mark.asyncio
+async def test_storage_plane_flag_on_item_async_enqueues_id_only_in_task_run(monkeypatch):
+    """Flag ON + item-tier ASYNC entry, INSIDE a task run: still routed to
+    the storage plane — never absorbed inline (the #2657 runaway path).
+    """
+    _patch_storage_plane_flag(monkeypatch, enabled=True)
+    calls = _patch_storage_emit_recorder(monkeypatch)
+
+    a = _StubIndexer("a")
+    dispatcher = _make_dispatcher(
+        entries=[_async_entry("a")], indexers={"a": a},
+    )
+    ops = [_op(entity_id="i1"), _op(entity_id="i2")]
+    with task_run_scope():
+        results = await dispatcher.fan_out_bulk(_item_ctx(), ops)
+
+    assert a.bulk_calls == [], (
+        "storage-plane routing must never absorb the write inline, even "
+        "inside a task run"
+    )
+    assert len(calls) == 1
+    assert results["a"].succeeded == 2
+
+
+@pytest.mark.asyncio
+async def test_storage_plane_flag_on_uses_tx_factory_when_no_pg_conn(monkeypatch):
+    """When ctx.pg_conn is None (in-task-run inline seam), the enqueue opens
+    a short transaction via tx_factory instead of dropping the write."""
+    _patch_storage_plane_flag(monkeypatch, enabled=True)
+    calls = _patch_storage_emit_recorder(monkeypatch)
+
+    opened: list = []
+
+    class _FakeTx:
+        async def __aenter__(self):
+            opened.append(self)
+            return object()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    a = _StubIndexer("a")
+    dispatcher = _make_dispatcher(entries=[_async_entry("a")], indexers={"a": a})
+    ctx = _item_ctx(pg_conn=None)
+    with task_run_scope():
+        results = await dispatcher.fan_out_bulk(
+            ctx, [_op(entity_id="i1")], tx_factory=_FakeTx,
+        )
+
+    assert len(opened) == 1, "must open exactly one short TX via tx_factory"
+    assert len(calls) == 1
+    assert results["a"].succeeded == 1
+
+
+@pytest.mark.asyncio
+async def test_storage_plane_flag_on_no_conn_no_tx_factory_drops_and_fails(monkeypatch, caplog):
+    """No pg_conn and no tx_factory: the write cannot be made durable —
+    drop with failed=N (mirrors _enqueue_or_warn's drop-path contract)."""
+    import logging as _logging
+
+    _patch_storage_plane_flag(monkeypatch, enabled=True)
+    calls = _patch_storage_emit_recorder(monkeypatch)
+
+    a = _StubIndexer("a")
+    dispatcher = _make_dispatcher(entries=[_async_entry("a")], indexers={"a": a})
+    ctx = _item_ctx(pg_conn=None)
+    with caplog.at_level(_logging.WARNING):
+        results = await dispatcher.fan_out_bulk(ctx, [_op(entity_id="i1")])
+
+    assert calls == []
+    assert a.bulk_calls == []
+    assert results["a"].succeeded == 0
+    assert results["a"].failed == 1
+
+
+@pytest.mark.asyncio
+async def test_storage_plane_flag_off_preserves_legacy_async_outbox_path(monkeypatch):
+    """Flag OFF: byte-identical to the pre-#2494 dispatch — ASYNC entries
+    still go through the payload-carrying TaskTableOutboxWriter."""
+    _patch_storage_plane_flag(monkeypatch, enabled=False)
+    calls = _patch_storage_emit_recorder(monkeypatch)
+
+    a = _StubIndexer("a")
+    writer = _RecordingWriter()
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_async_entry("a")], indexers={"a": a}, outbox=writer,
+    )
+    ops = [_op(entity_id="i1"), _op(entity_id="i2")]
+    results = await dispatcher.fan_out_bulk(_item_ctx(), ops)
+
+    assert calls == [], "flag OFF must never touch the storage-plane id-only path"
+    assert a.bulk_calls == []
+    assert len(writer.rows) >= 1, "legacy outbox path must still fire"
+    assert results["a"].succeeded == 2
+
+
+@pytest.mark.asyncio
+async def test_storage_plane_flag_on_sync_entry_still_indexes_inline(monkeypatch):
+    """SYNC entries are unaffected by the flag: they still dispatch inline."""
+    _patch_storage_plane_flag(monkeypatch, enabled=True)
+    calls = _patch_storage_emit_recorder(monkeypatch)
+
+    a = _StubIndexer("a")
+    dispatcher = _make_dispatcher(
+        entries=[_entry("a", on_failure=FailurePolicy.WARN)],  # write_mode=SYNC
+        indexers={"a": a},
+    )
+    ops = [_op(entity_id="i1"), _op(entity_id="i2")]
+    results = await dispatcher.fan_out_bulk(_item_ctx(), ops)
+
+    assert calls == []
+    assert len(a.bulk_calls) == 1
+    assert results["a"].succeeded == 2
+
+
+@pytest.mark.asyncio
+async def test_storage_plane_flag_on_non_item_entity_type_unaffected(monkeypatch):
+    """The flag is item-scoped: a collection-tier ASYNC dispatch must not
+    be routed into the item-shaped id-only storage plane."""
+    _patch_storage_plane_flag(monkeypatch, enabled=True)
+    calls = _patch_storage_emit_recorder(monkeypatch)
+
+    a = _StubIndexer("a")
+    writer = _RecordingWriter()
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_async_entry("a")], indexers={"a": a}, outbox=writer,
+    )
+    ctx = IndexContext(
+        catalog="cat-x", collection="col-y", correlation_id="cid-1",
+        pg_conn=object(), entity_type="collection",
+    )
+    results = await dispatcher.fan_out_bulk(ctx, [_op(entity_id="i1")])
+
+    assert calls == [], "non-item entity_type must not use the id-only storage plane"
+    assert a.bulk_calls == []
+    assert len(writer.rows) >= 1, "must fall back to the legacy outbox path"
+    assert results["a"].succeeded == 1
+
+
+class _AccessAwareStubIndexer(_StubIndexer):
+    """An ASYNC secondary indexer that carries the same
+    ``applies_access_filter = True`` class marker as the private ES
+    envelope driver — used to pin that the storage-plane gate excludes
+    access-aware entries (review finding: the drain's canonical re-read
+    cannot recover the write-time access envelope)."""
+
+    applies_access_filter = True
+
+
+@pytest.mark.asyncio
+async def test_storage_plane_flag_on_access_aware_entry_excluded(monkeypatch):
+    """An access-aware ASYNC entry (applies_access_filter=True) must NEVER
+    take the id-only storage-plane branch, even with the flag on — the
+    drain cannot recover _visibility/_owner/_attrs from a bare PG re-read.
+    It falls back to the legacy payload-carrying outbox path unchanged.
+    """
+    _patch_storage_plane_flag(monkeypatch, enabled=True)
+    calls = _patch_storage_emit_recorder(monkeypatch)
+
+    a = _AccessAwareStubIndexer("a")
+    writer = _RecordingWriter()
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_async_entry("a")], indexers={"a": a}, outbox=writer,
+    )
+    results = await dispatcher.fan_out_bulk(_item_ctx(), [_op(entity_id="i1")])
+
+    assert calls == [], "an access-aware entry must never use the id-only storage plane"
+    assert a.bulk_calls == [], "ASYNC must still not be absorbed inline"
+    assert len(writer.rows) >= 1, "must fall back to the legacy payload-carrying outbox path"
+    assert results["a"].succeeded == 1
+
+
+@pytest.mark.asyncio
+async def test_storage_plane_dispatch_path_log_mode(monkeypatch, caplog):
+    import logging as _logging
+
+    _patch_storage_plane_flag(monkeypatch, enabled=True)
+    _patch_storage_emit_recorder(monkeypatch)
+
+    a = _StubIndexer("a")
+    dispatcher = _make_dispatcher(entries=[_async_entry("a")], indexers={"a": a})
+    with caplog.at_level(_logging.INFO):
+        await dispatcher.fan_out_bulk(_item_ctx(), [_op(entity_id="i1")])
+
+    rows = _extract_dispatch_path_records(caplog)
+    assert any(r.get("mode") == "storage_plane_id_only_enqueued" for r in rows), rows
+    assert not any(r.get("mode") == "async_outbox_enqueued" for r in rows), rows
+    assert not any(r.get("mode") == "post_commit_inline" for r in rows), rows
+
+
 @pytest.mark.asyncio
 async def test_async_enqueue_drop_path_c_transient_pg_error_returns_failed():
     """Drop path (c): _exec_insert raises a transient PG error.

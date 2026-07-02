@@ -46,10 +46,12 @@ only needs to clear the current backlog.
 from __future__ import annotations
 
 import logging
-from typing import Any, ClassVar, Dict, List, Optional, Sequence, cast
+from dataclasses import replace as _dataclass_replace
+from typing import Any, ClassVar, Dict, List, NamedTuple, Optional, Sequence, Tuple, cast
 from uuid import UUID, uuid4
 
 from dynastore.models.protocols.indexing import (
+    STORAGE_PLANE_ID_ONLY_MARKER_KEY,
     BulkIndexer,
     BulkIndexResult,
     IndexableOp,
@@ -89,6 +91,23 @@ def _backoff(attempts: int) -> int:
     return _BACKOFF_SECONDS[idx]
 
 
+class _PreparedDriverBatch(NamedTuple):
+    """Split of one driver's claimed rows, ready for the outcome pipeline.
+
+    ``ops``/``rows_for_ops`` are parallel to the pre-#2494 behaviour: every
+    op sent to ``indexer.index_bulk`` has its claimed row in
+    ``rows_for_ops`` so ``_apply_outcomes``/``_apply_retry_all`` can map
+    results back. ``auto_done``/``auto_retry`` are resolved WITHOUT calling
+    the indexer at all — a re-read-canonical-state outcome for an id-only
+    row (#2494 P1) that never needs (or cannot survive) a bulk call.
+    """
+
+    ops: List[IndexableOp]
+    rows_for_ops: List[Dict[str, Any]]
+    auto_done: List[Dict[str, Any]]
+    auto_retry: List[Tuple[Dict[str, Any], str]]
+
+
 class StorageDrainTask(TaskProtocol):
     """One-shot drain for the global ``tasks.storage`` index outbox.
 
@@ -121,6 +140,13 @@ class StorageDrainTask(TaskProtocol):
         self.lease_seconds = lease_seconds
         # driver_id -> resolved BulkIndexer, memoised for this run.
         self._indexer_cache: Dict[str, BulkIndexer] = {}
+        # catalog_id -> resolved known-fields set, memoised for this run
+        # (#2494 P1 canonical re-read — shared by every id-only group under
+        # the same catalog).
+        self._known_fields_cache: Dict[str, Any] = {}
+        # driver_ids that have already logged the "empty payload, no
+        # id-only marker" anomaly warning this run (#2494 P1 dedup).
+        self._empty_payload_warned: set = set()
 
     async def run(self, payload: TaskPayload) -> TaskReport:
         """Drain ``tasks.storage`` to empty, then return.
@@ -229,9 +255,28 @@ class StorageDrainTask(TaskProtocol):
                 )
                 continue
 
-            ops = [self._row_to_op(r) for r in driver_rows]
+            prepared = await self._prepare_ops(engine=engine, driver_rows=driver_rows)
+
+            # Rows resolved WITHOUT the indexer (#2494 P1 canonical re-read):
+            # a missing PG row on an id-only upsert is a deleted item — skip
+            # as success; a re-read that itself raised is a transient infra
+            # failure, not a poison classification.
+            for row in prepared.auto_done:
+                await self._mark_done(
+                    engine=engine, task_schema=task_schema,
+                    row=row, owner_id=owner_id,
+                )
+            for row, reason in prepared.auto_retry:
+                await self._mark_retry(
+                    engine=engine, task_schema=task_schema,
+                    row=row, owner_id=owner_id, error=reason,
+                )
+
+            if not prepared.ops:
+                continue
+
             try:
-                result = await indexer.index_bulk(ops)
+                result = await indexer.index_bulk(prepared.ops)
             except Exception as exc:  # noqa: BLE001 — surface every failure
                 logger.warning(
                     "StorageDrainTask[%s]: whole-batch error: %s",
@@ -241,7 +286,7 @@ class StorageDrainTask(TaskProtocol):
                 await self._apply_retry_all(
                     engine=engine,
                     task_schema=task_schema,
-                    rows=driver_rows,
+                    rows=prepared.rows_for_ops,
                     owner_id=owner_id,
                     error=str(exc),
                 )
@@ -250,7 +295,7 @@ class StorageDrainTask(TaskProtocol):
             await self._apply_outcomes(
                 engine=engine,
                 task_schema=task_schema,
-                rows=driver_rows,
+                rows=prepared.rows_for_ops,
                 result=result,
                 owner_id=owner_id,
             )
@@ -458,6 +503,178 @@ class StorageDrainTask(TaskProtocol):
             item_id=row.get("entity_id"),  # entity_id column → IndexableOp.item_id
             payload=dict(row.get("op_payload") or {}),
             idempotency_key=row.get("idempotency_key") or "",
+        )
+
+    # ------------------------------------------------------------------
+    # Canonical re-read for id-only rows (#2494 P1)
+    # ------------------------------------------------------------------
+
+    async def _prepare_ops(
+        self, *, engine: Any, driver_rows: List[Dict[str, Any]],
+    ) -> _PreparedDriverBatch:
+        """Split one driver's claimed rows into indexer-bound ops and
+        directly-resolved outcomes.
+
+        Delete rows and payload-carrying upsert rows convert to
+        ``IndexableOp`` unchanged (:meth:`_row_to_op`). Id-only upsert rows
+        — ``op='upsert'`` whose ``op_payload`` carries the explicit
+        ``{STORAGE_PLANE_ID_ONLY_MARKER_KEY: true}`` sentinel, written by
+        ``IndexDispatcher._enqueue_storage_plane_ids`` when
+        ``TasksPluginConfig.items_secondary_via_storage_plane`` is enabled —
+        are grouped by ``(catalog_id, collection_id)`` and re-read from
+        canonical PG state in ONE batched SELECT per group via
+        :func:`read_canonical_index_inputs`:
+
+        * a resolved geoid becomes an ``IndexableOp`` carrying the
+          freshly-built canonical document;
+        * a geoid absent from PG is treated as a deleted item and marked
+          done directly (last-write-wins — the item is gone, indexing it
+          would be wrong and re-trying it would never succeed);
+        * a group whose re-read itself raises funnels every id-only row in
+          that group to retry (a transient infra failure, not a poison
+          classification — the geoid's existence is simply unknown).
+
+        Detection keys off the explicit marker, NOT payload emptiness: the
+        ``tasks.storage`` DDL default for ``op_payload`` is ALSO
+        ``'{}'::jsonb``, so a genuinely empty (unmarked) upsert payload is
+        legacy shape, not an id-only obligation — it falls through to the
+        normal ``_row_to_op`` conversion below, same as any other
+        payload-carrying row, with a one-time-per-driver WARNING since an
+        unmarked empty payload is unusual post-#2494 (review finding).
+        """
+        ops: List[IndexableOp] = []
+        rows_for_ops: List[Dict[str, Any]] = []
+        auto_done: List[Dict[str, Any]] = []
+        auto_retry: List[Tuple[Dict[str, Any], str]] = []
+
+        id_only_by_group: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        for row in driver_rows:
+            payload = row.get("op_payload") or {}
+            is_id_only = (
+                row["op"] == "upsert"
+                and isinstance(payload, dict)
+                and payload.get(STORAGE_PLANE_ID_ONLY_MARKER_KEY) is True
+            )
+            if is_id_only:
+                key = (row["catalog_id"], row.get("collection_id") or "")
+                id_only_by_group.setdefault(key, []).append(row)
+                continue
+            if row["op"] == "upsert" and not payload:
+                driver_id = row.get("driver_id")
+                if driver_id not in self._empty_payload_warned:
+                    self._empty_payload_warned.add(driver_id)
+                    logger.warning(
+                        "StorageDrainTask: driver_id=%r has an upsert row "
+                        "with an EMPTY op_payload and no id-only marker — "
+                        "treating as a legacy payload-carrying row (empty "
+                        "body). Future occurrences for this driver_id are "
+                        "suppressed this run.",
+                        driver_id,
+                    )
+            ops.append(self._row_to_op(row))
+            rows_for_ops.append(row)
+
+        for (catalog_id, collection_id), group_rows in id_only_by_group.items():
+            geoids = [r["entity_id"] for r in group_rows if r.get("entity_id")]
+            try:
+                inputs = await self._read_canonical_inputs(
+                    engine=engine, catalog_id=catalog_id,
+                    collection_id=collection_id, geoids=geoids,
+                )
+            except Exception as exc:  # noqa: BLE001 — funnel to retry, never drop
+                logger.warning(
+                    "StorageDrainTask: canonical re-read failed for %s/%s "
+                    "(%d id-only row(s)): %s — funnelling to retry.",
+                    catalog_id, collection_id, len(group_rows), exc,
+                )
+                auto_retry.extend(
+                    (r, f"canonical_reread_failed: {exc}") for r in group_rows
+                )
+                continue
+
+            for row in group_rows:
+                geoid = row.get("entity_id")
+                ci = inputs.get(geoid) if geoid else None
+                if ci is None:
+                    # No PG row — item deleted after the obligation was
+                    # enqueued (or the geoid never existed). Skip as
+                    # success rather than indexing a stale/absent doc.
+                    auto_done.append(row)
+                    continue
+                try:
+                    doc = await self._build_canonical_doc(
+                        catalog_id=catalog_id, collection_id=collection_id, ci=ci,
+                    )
+                except Exception as exc:  # noqa: BLE001 — funnel to retry
+                    logger.warning(
+                        "StorageDrainTask: canonical doc build failed for "
+                        "%s/%s/%s: %s — funnelling to retry.",
+                        catalog_id, collection_id, geoid, exc,
+                    )
+                    auto_retry.append((row, f"canonical_doc_build_failed: {exc}"))
+                    continue
+                op = _dataclass_replace(self._row_to_op(row), payload=doc)
+                ops.append(op)
+                rows_for_ops.append(row)
+
+        return _PreparedDriverBatch(
+            ops=ops, rows_for_ops=rows_for_ops,
+            auto_done=auto_done, auto_retry=auto_retry,
+        )
+
+    async def _read_canonical_inputs(
+        self, *, engine: Any, catalog_id: str, collection_id: str,
+        geoids: List[str],
+    ) -> Dict[str, Any]:
+        """Batch-read canonical PG state for ``geoids`` (test seam)."""
+        from dynastore.modules.catalog.canonical_index_read import (
+            read_canonical_index_inputs,
+        )
+
+        return await read_canonical_index_inputs(
+            catalog_id, collection_id, geoids, db_resource=engine,
+        )
+
+    async def _build_canonical_doc(
+        self, *, catalog_id: str, collection_id: str, ci: Any,
+    ) -> Dict[str, Any]:
+        """Assemble the canonical ES doc for one re-read row (test seam).
+
+        ``known_fields`` is per-catalog and memoised for the lifetime of
+        this drain run — every id-only group under the same catalog shares
+        it instead of re-resolving per group.
+
+        Couples this generically-named drain task to the ES-shaped
+        canonical envelope (``build_canonical_index_doc``); today the only
+        ``BulkIndexer`` the drain resolves is the ES adapter
+        (:data:`_ES_ITEMS_DRIVER_ID`), so this is not a behaviour change —
+        a future non-ES ``BulkIndexer`` would need its own re-read
+        strategy here.
+        """
+        from dynastore.modules.elasticsearch.canonical_doc import (
+            build_canonical_index_doc,
+        )
+
+        known_fields = self._known_fields_cache.get(catalog_id)
+        if known_fields is None:
+            from dynastore.modules.elasticsearch.items_projection import (
+                resolve_catalog_known_fields,
+            )
+
+            known_fields = await resolve_catalog_known_fields(catalog_id)
+            self._known_fields_cache[catalog_id] = known_fields
+
+        return build_canonical_index_doc(
+            ci.row,
+            resolved_sidecars=ci.resolved_sidecars,
+            known_fields=known_fields,
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+            geometry=ci.geometry,
+            bbox=ci.bbox,
+            user_properties=ci.user_properties,
+            access=ci.access,
+            stac_reserved_members=ci.stac_reserved_members,
         )
 
     # ------------------------------------------------------------------

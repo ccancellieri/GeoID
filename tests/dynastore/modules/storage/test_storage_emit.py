@@ -254,3 +254,126 @@ async def test_field_mapping(sa_engine, storage_env):
     assert row["status"] == "ready"
     assert row["claim_version"] == 0
     assert row["day"] is not None
+
+
+# ---------------------------------------------------------------------------
+# id-only rows (#2494 P1)
+# ---------------------------------------------------------------------------
+
+
+async def _dispatch_id_only(engine, catalog_id: str, rows) -> None:
+    from dynastore.modules.db_config.query_executor import managed_transaction
+    from dynastore.modules.storage.storage_emit import enqueue_storage_op_id_only
+
+    async with managed_transaction(engine) as conn:
+        await enqueue_storage_op_id_only(conn, catalog_id=catalog_id, rows=rows)
+
+
+@pytest.mark.asyncio
+async def test_id_only_row_shape(sa_engine, storage_env):
+    """Every row is written with the explicit id-only sentinel payload and
+    the id-only fields set, regardless of what payload the caller supplied.
+
+    The sentinel (not bare emptiness) is load-bearing: the ``tasks.storage``
+    DDL default for ``op_payload`` is ALSO ``'{}'::jsonb``, so the drain
+    must be able to tell a deliberate id-only row apart from a payload
+    that merely happens to be empty (review finding, #2494).
+    """
+    from dynastore.models.protocols.indexing import STORAGE_PLANE_ID_ONLY_MARKER_KEY
+    from dynastore.modules.db_config.query_executor import (
+        DQLQuery, ResultHandler, managed_transaction,
+    )
+
+    catalog, task = storage_env
+    # Deliberately pass a non-empty payload — the id-only writer must
+    # ignore it and force op_payload to the sentinel.
+    rows = _records(1)
+    await _dispatch_id_only(sa_engine, catalog, rows)
+
+    async with managed_transaction(sa_engine) as conn:
+        result_rows = await DQLQuery(
+            f'SELECT catalog_id, driver_id, collection_id, op, entity_id, '
+            f'op_payload, idempotency_key FROM "{task}".storage',
+            result_handler=ResultHandler.ALL_DICTS,
+        ).execute(conn)
+
+    assert len(result_rows) == 1
+    row = result_rows[0]
+    assert row["catalog_id"] == catalog
+    assert row["driver_id"] == "elasticsearch_private"
+    assert row["collection_id"] == "my_collection"
+    assert row["op"] == "upsert"
+    assert row["entity_id"] == "item_0"
+    assert row["idempotency_key"] == "ik_0"
+    assert row["op_payload"] == {STORAGE_PLANE_ID_ONLY_MARKER_KEY: True}, (
+        "id-only rows must force op_payload to the explicit sentinel"
+    )
+
+
+@pytest.mark.asyncio
+async def test_id_only_rolls_back_atomically(sa_engine, storage_env):
+    """An outer-transaction abort leaves NO id-only rows in tasks.storage."""
+    from dynastore.modules.db_config.query_executor import managed_transaction
+    from dynastore.modules.storage.storage_emit import enqueue_storage_op_id_only
+
+    catalog, task = storage_env
+    rows = _records(2)
+
+    with pytest.raises(RuntimeError, match="simulated primary write failure"):
+        async with managed_transaction(sa_engine) as conn:
+            await enqueue_storage_op_id_only(conn, catalog_id=catalog, rows=rows)
+            raise RuntimeError("simulated primary write failure")
+
+    assert await _count(sa_engine, task, "storage") == 0
+
+
+@pytest.mark.asyncio
+async def test_id_only_coalesces_two_upserts_same_id_to_one_row(sa_engine, storage_env):
+    """Two upserts of the same id in one enqueue batch collapse to one row."""
+    from uuid import uuid4
+    from dynastore.models.protocols.indexing import OutboxRecord
+
+    catalog, task = storage_env
+    rows = [
+        OutboxRecord(
+            op_id=uuid4(), driver_id="es", driver_instance_id="di",
+            collection_id="coll", op="upsert", item_id="item_x",
+            payload={"v": i}, idempotency_key=f"ik_{i}",
+        )
+        for i in range(2)
+    ]
+    await _dispatch_id_only(sa_engine, catalog, rows)
+    assert await _count(sa_engine, task, "storage") == 1
+
+
+@pytest.mark.asyncio
+async def test_id_only_upsert_then_delete_same_id_collapses_to_delete(sa_engine, storage_env):
+    """An upsert immediately followed by a delete of the same id in one
+    batch collapses to the delete (last op wins)."""
+    from uuid import uuid4
+    from dynastore.modules.db_config.query_executor import (
+        DQLQuery, ResultHandler, managed_transaction,
+    )
+    from dynastore.models.protocols.indexing import OutboxRecord
+
+    catalog, task = storage_env
+    rows = [
+        OutboxRecord(
+            op_id=uuid4(), driver_id="es", driver_instance_id="di",
+            collection_id="coll", op="upsert", item_id="item_y",
+            payload={}, idempotency_key="ik_upsert",
+        ),
+        OutboxRecord(
+            op_id=uuid4(), driver_id="es", driver_instance_id="di",
+            collection_id="coll", op="delete", item_id="item_y",
+            payload={}, idempotency_key="ik_delete",
+        ),
+    ]
+    await _dispatch_id_only(sa_engine, catalog, rows)
+
+    async with managed_transaction(sa_engine) as conn:
+        result_rows = await DQLQuery(
+            f'SELECT op FROM "{task}".storage', result_handler=ResultHandler.ALL_DICTS,
+        ).execute(conn)
+    assert len(result_rows) == 1
+    assert result_rows[0]["op"] == "delete"

@@ -224,6 +224,43 @@ def _merge_index_results(
             accumulated[indexer_id] = bulk_res
 
 
+async def _maybe_apply_ingest_backpressure() -> None:
+    """Cooperative backpressure before a batch flush (#2494 P1).
+
+    No-op unless ``TasksPluginConfig.items_secondary_via_storage_plane`` is
+    enabled — with the flag off, ingestion behaviour is unchanged. When the
+    flag is on and the aggregate tasks.storage/tasks.events outbox backlog
+    is high (``async_writer_backlog.backlog_is_high()``), sleeps for
+    ``TasksPluginConfig.ingest_backpressure_sleep_seconds`` before the
+    caller flushes the next batch, so the storage_drain worker gets room to
+    catch up instead of the backlog growing unbounded under a hot ingestion
+    job. Best-effort: never raises, never blocks ingestion on a config or
+    probe failure.
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.tasks.async_writer_backlog import backlog_is_high
+        from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+        from dynastore.tools.discovery import get_protocol
+
+        config_mgr = get_protocol(PlatformConfigsProtocol)
+        cfg = await config_mgr.get_config(TasksPluginConfig) if config_mgr else None
+        if not isinstance(cfg, TasksPluginConfig) or not cfg.items_secondary_via_storage_plane:
+            return
+        if await backlog_is_high():
+            logger.info(
+                "ingestion: storage-plane outbox backlog high — sleeping "
+                "%.1fs before the next batch flush.",
+                cfg.ingest_backpressure_sleep_seconds,
+            )
+            await asyncio.sleep(cfg.ingest_backpressure_sleep_seconds)
+    except Exception:  # noqa: BLE001 — backpressure is best-effort, never block ingestion
+        logger.debug(
+            "ingestion: backpressure check failed — proceeding without delay.",
+            exc_info=True,
+        )
+
+
 # Per-batch memory budgeting -------------------------------------------------
 #
 # A batch is flushed when EITHER an explicit row cap (database_batch_size) OR an
@@ -999,6 +1036,7 @@ async def run_ingestion_task(
                     len(current_batch) >= row_cap
                     or current_batch_bytes >= mem_budget_bytes
                 ):
+                    await _maybe_apply_ingest_backpressure()
                     upsert_ctx = DriverContext(db_resource=engine)
                     upsert_result = await catalog_module.upsert(
                         catalog_id,
@@ -1027,6 +1065,7 @@ async def run_ingestion_task(
                     current_batch_bytes = 0
 
             if current_batch:
+                await _maybe_apply_ingest_backpressure()
                 upsert_ctx = DriverContext(db_resource=engine)
                 upsert_result = await catalog_module.upsert(
                     catalog_id,

@@ -42,9 +42,12 @@ schema-qualified in identifier position and validated before use.
 """
 import json
 import logging
-from typing import Any, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from dynastore.models.protocols.indexing import OutboxRecord
+from dynastore.models.protocols.indexing import (
+    STORAGE_PLANE_ID_ONLY_MARKER_KEY,
+    OutboxRecord,
+)
 from dynastore.tools.db import validate_sql_identifier
 from dynastore.tools.identifiers import generate_uuidv7
 
@@ -186,6 +189,109 @@ async def _enqueue_drain_trigger(conn: Any) -> None:
             task_schema,
             exc_info=True,
         )
+
+
+async def _enqueue_storage_id_only(
+    conn: Any,
+    *,
+    catalog_id: str,
+    rows: Sequence[OutboxRecord],
+) -> None:
+    """Insert id-only obligations into ``tasks.storage`` (#2494 P1).
+
+    Same INSERT shape as :func:`_enqueue_storage`, except ``op_payload`` is
+    always the explicit sentinel ``{STORAGE_PLANE_ID_ONLY_MARKER_KEY: true}``
+    regardless of ``r.payload`` — the drain (``StorageDrainTask``) re-reads
+    canonical PG state for these rows at replay time instead of indexing a
+    payload snapshot taken at enqueue time (see ``storage_drain_task.py``).
+
+    The marker is an explicit key, not a bare ``{}``: the ``tasks.storage``
+    DDL default for ``op_payload`` is ALSO ``'{}'::jsonb``, so a genuinely
+    empty payload (any producer that omits it) is indistinguishable from an
+    id-only row on emptiness alone. The drain keys off the marker key, not
+    payload emptiness (review finding, #2494).
+    """
+    if not rows:
+        return
+    from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
+    from dynastore.modules.tasks.tasks_module import get_task_schema
+
+    task_schema = get_task_schema()
+    validate_sql_identifier(task_schema)
+    insert_sql = (
+        f"INSERT INTO {task_schema}.storage ("
+        "    op_id, day, catalog_id, driver_id, collection_id,"
+        "    entity_kind, entity_id, op, op_payload, idempotency_key"
+        ") VALUES ("
+        "    :op_id, CURRENT_DATE, :catalog_id, :driver_id,"
+        "    :collection_id, 'item', :entity_id,"
+        "    :op, CAST(:op_payload AS jsonb), :idempotency_key"
+        ")"
+    )
+    id_only_payload = json.dumps({STORAGE_PLANE_ID_ONLY_MARKER_KEY: True})
+    query = DQLQuery(insert_sql, result_handler=ResultHandler.NONE)
+    for r in rows:
+        await query.execute(
+            conn,
+            op_id=str(r.op_id),
+            catalog_id=catalog_id,
+            driver_id=r.driver_id,
+            collection_id=r.collection_id,
+            entity_id=r.item_id,
+            op=r.op,
+            op_payload=id_only_payload,
+            idempotency_key=r.idempotency_key,
+        )
+
+
+def _coalesce_id_only_rows(rows: Sequence[OutboxRecord]) -> List[OutboxRecord]:
+    """Coalesce id-only rows by ``(driver_id, collection_id, item_id)``.
+
+    Last op wins within the batch: two upserts of the same id collapse to
+    one row, and an upsert immediately followed by a delete of the same id
+    (or vice versa) collapses to whichever came last — dict insertion order
+    means "last" is "last in ``rows``". ``catalog_id`` is not part of the
+    key: a single :func:`enqueue_storage_op_id_only` call always writes one
+    catalog's rows, so it is already constant across the batch.
+    """
+    coalesced: Dict[Tuple[str, Optional[str], Optional[str]], OutboxRecord] = {}
+    for r in rows:
+        coalesced[(r.driver_id, r.collection_id, r.item_id)] = r
+    return list(coalesced.values())
+
+
+async def enqueue_storage_op_id_only(
+    conn: Any,
+    *,
+    catalog_id: str,
+    rows: Sequence[OutboxRecord],
+) -> None:
+    """Write id-only obligations into ``tasks.storage`` and enqueue the drain trigger.
+
+    The storage-plane counterpart of :func:`enqueue_storage_op` used by the
+    :class:`~dynastore.modules.storage.index_dispatcher.IndexDispatcher` for
+    ASYNC secondary-index ``WRITE`` entries when
+    ``TasksPluginConfig.items_secondary_via_storage_plane`` is enabled
+    (#2494 P1). Every row's ``op_payload`` is forced to the explicit
+    ``{STORAGE_PLANE_ID_ONLY_MARKER_KEY: true}`` sentinel — the drain
+    re-reads the canonical PG row for each id at replay time instead of
+    replaying a payload snapshot, so the queued obligation can never go
+    stale.
+
+    Rows are coalesced within this call via :func:`_coalesce_id_only_rows`
+    before the INSERT; cross-call duplicates are NOT deduplicated (there is
+    no DB unique index on ``tasks.storage``) — the re-read-canonical-state
+    drain design makes a duplicate a harmless repeat of the same read.
+
+    Rides ``conn`` (the caller's open transaction) for the same atomicity
+    guarantee as :func:`enqueue_storage_op`: a primary-write rollback
+    leaves no rows in either ``tasks.storage`` or ``tasks.tasks``.
+    """
+    coalesced = _coalesce_id_only_rows(rows)
+    if not coalesced:
+        return
+    await _enqueue_storage_id_only(conn, catalog_id=catalog_id, rows=coalesced)
+    await _enqueue_drain_trigger(conn)
 
 
 async def enqueue_storage_op(
