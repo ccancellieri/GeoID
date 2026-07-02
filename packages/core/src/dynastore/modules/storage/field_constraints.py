@@ -27,6 +27,7 @@ not call these helpers.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Iterable, Mapping, Optional, Tuple
 
 from dynastore.models.field_types import CANONICAL_TO_PG_DDL
@@ -37,6 +38,8 @@ from dynastore.modules.storage.errors import (
     UnknownFieldsError,
 )
 from dynastore.modules.storage.schema_types import UniqueConstraint
+
+logger = logging.getLogger(__name__)
 
 
 # System-level fields that always pass the strict-unknown-fields check
@@ -296,8 +299,29 @@ def bridge_schema_to_attribute_sidecar(
             if not isinstance(constraint, UniqueConstraint):
                 continue
             names = constraint.field_names
-            if len(names) >= 2 and all(n in existing for n in names):
+            if len(names) < 2:
+                continue
+            if all(n in existing for n in names):
                 composite_unique.append(list(names))
+                continue
+            # 2+ column UniqueConstraint whose fields did not all materialise
+            # as native columns (JSONB mode, or a field left in the blob):
+            # no CREATE UNIQUE INDEX can be emitted for it, so the composite
+            # uniqueness guarantee the operator declared is silently NOT
+            # enforced. This is a config-authoring trap (#2650) — surface it
+            # loudly rather than dropping the constraint without a trace.
+            # No collection/table identifier is available at this bridge
+            # scope (neither ``ItemsSchema`` nor ``FeatureAttributeSidecarConfig``
+            # carries one), so the warning is field-name-only.
+            missing = [n for n in names if n not in existing]
+            logger.warning(
+                "Composite UniqueConstraint on fields %s cannot be enforced: "
+                "field(s) %s did not materialise as native PostgreSQL "
+                "columns (JSONB-mode or non-columnar field). No unique "
+                "index will be created for this constraint — composite "
+                "uniqueness is NOT enforced.",
+                list(names), missing,
+            )
 
     update: Dict[str, Any] = {}
     if changed:

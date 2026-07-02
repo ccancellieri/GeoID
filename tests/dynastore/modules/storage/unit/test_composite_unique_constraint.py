@@ -64,13 +64,18 @@ def _schema() -> ItemsSchema:
 
 
 class TestBridgeCompositeUnique:
-    def test_composite_constraint_bridged_onto_sidecar(self):
-        bridged = bridge_schema_to_attribute_sidecar(
-            _schema(), FeatureAttributeSidecarConfig()
-        )
+    def test_composite_constraint_bridged_onto_sidecar(self, caplog):
+        with caplog.at_level("WARNING", logger="dynastore.modules.storage.field_constraints"):
+            bridged = bridge_schema_to_attribute_sidecar(
+                _schema(), FeatureAttributeSidecarConfig()
+            )
         assert getattr(bridged, "composite_unique_constraints", None) == [
             ["name", "code"]
         ]
+        # Every field materialized as a column -> no drop -> no warning.
+        assert not any(
+            "cannot be enforced" in r.message for r in caplog.records
+        )
 
     def test_single_field_unique_constraint_not_bridged_as_composite(self):
         schema = ItemsSchema(
@@ -81,15 +86,23 @@ class TestBridgeCompositeUnique:
         )
         assert not getattr(bridged, "composite_unique_constraints", None)
 
-    def test_composite_constraint_skipped_when_columns_not_materialized(self):
+    def test_composite_constraint_skipped_when_columns_not_materialized(self, caplog):
         """Explicit JSONB mode: fields stay in the blob (no columns), so a
-        composite index over them cannot be emitted — bridge skips it."""
+        composite index over them cannot be emitted — bridge skips it and
+        must warn loudly that composite uniqueness is NOT enforced (#2650)."""
         schema = _schema()
-        bridged = bridge_schema_to_attribute_sidecar(
-            schema,
-            FeatureAttributeSidecarConfig(storage_mode=AttributeStorageMode.JSONB),
-        )
+        with caplog.at_level("WARNING", logger="dynastore.modules.storage.field_constraints"):
+            bridged = bridge_schema_to_attribute_sidecar(
+                schema,
+                FeatureAttributeSidecarConfig(storage_mode=AttributeStorageMode.JSONB),
+            )
         assert not getattr(bridged, "composite_unique_constraints", None)
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        message = warnings[0].message
+        assert "name" in message and "code" in message
+        assert "cannot be enforced" in message
+        assert "NOT enforced" in message
 
 
 # ---------------------------------------------------------------------------
