@@ -18,7 +18,7 @@
 
 import logging
 import json
-from typing import Optional, Dict, Any, Type, Union
+from typing import Optional, Dict, Any, Tuple, Type, Union
 from dynastore.tools.cache import cached
 from dynastore.modules.storage.router import invalidate_router_cache
 
@@ -79,6 +79,11 @@ from dynastore.modules.db_config.platform_config_service import (
 )
 from dynastore.modules.db_config.stored_config_read import _validate_stored_config
 from dynastore.modules.db_config.locking_tools import check_table_exists
+from dynastore.modules.db_config.config_version import (
+    decode_config_version,
+    encode_config_version,
+)
+from dynastore.modules.db_config.exceptions import ConfigVersionConflictError
 from dynastore.modules.db_config.typed_store.ddl import (
     CATALOG_CONFIGS_TABLE,
     COLLECTION_CONFIGS_TABLE,
@@ -461,6 +466,79 @@ class ConfigService(ConfigsProtocol):
             return None
         return await getter(class_key)
 
+    async def get_config_versioned(
+        self,
+        config_cls: "Union[str, Type[PluginConfig]]",
+        catalog_id: Optional[str] = None,
+        collection_id: Optional[str] = None,
+        ctx: Optional[DriverContext] = None,
+    ) -> "Tuple[PluginConfig, Optional[str]]":
+        """Versioned read for CAS writes (#2707) — see ConfigsProtocol.
+
+        Platform scope delegates to ``PlatformConfigService.get_config_versioned``.
+        Catalog/collection scope resolves ``config`` through the normal
+        ``get_config`` waterfall, then pairs it with the CAS token read
+        directly from that tier's own row (bypassing
+        ``_catalog_config_cache`` / ``_collection_config_cache`` — the
+        token must reflect the true current row).
+        """
+        cls, class_key = _resolve(config_cls)
+        db_resource = ctx.db_resource if ctx else None
+
+        if catalog_id is None and collection_id is None:
+            platform_svc = self._get_platform_config_service()
+            getter = getattr(platform_svc, "get_config_versioned", None)
+            if getter is None:
+                return await self.get_config(cls, ctx=ctx), None
+            return await getter(
+                cls, ctx=DriverContext(db_resource=db_resource) if db_resource else None
+            )
+
+        resolved = await self.get_config(cls, catalog_id, collection_id, ctx)
+
+        if collection_id is not None:
+            if catalog_id is None:
+                raise ValueError("catalog_id is required when collection_id is provided")
+            validate_sql_identifier(catalog_id)
+            validate_sql_identifier(collection_id)
+            try:
+                resolved_ids = await self._get_catalog_manager().collections.resolve_collection_ids(
+                    catalog_id, collection_id, allow_missing=True
+                )
+                internal_collection_id = resolved_ids.id
+            except Exception:
+                internal_collection_id = collection_id
+            async with managed_transaction(db_resource or self.engine) as conn:
+                phys_schema = await self._get_catalog_manager().resolve_physical_schema(
+                    catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
+                )
+                if not phys_schema or not await check_table_exists(
+                    conn, COLLECTION_CONFIGS_TABLE, phys_schema
+                ):
+                    return resolved, None
+                row = await _cq.select_collection_config_versioned(phys_schema).execute(
+                    conn, collection_id=internal_collection_id, ref_key=class_key
+                )
+            return resolved, (encode_config_version(row["updated_at"]) if row else None)
+
+        # collection_id is None here, and the (catalog_id is None and
+        # collection_id is None) case already returned above — so catalog_id
+        # must be set.
+        assert catalog_id is not None
+        validate_sql_identifier(catalog_id)
+        async with managed_transaction(db_resource or self.engine) as conn:
+            phys_schema = await self._get_catalog_manager().resolve_physical_schema(
+                catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
+            )
+            if not phys_schema or not await check_table_exists(
+                conn, CATALOG_CONFIGS_TABLE, phys_schema
+            ):
+                return resolved, None
+            row = await _cq.select_catalog_config_versioned(phys_schema).execute(
+                conn, ref_key=class_key
+            )
+        return resolved, (encode_config_version(row["updated_at"]) if row else None)
+
     async def get_collection_config_internal_cached(
         self, catalog_id: str, collection_id: str, class_key: str
     ) -> Optional[dict]:
@@ -492,6 +570,7 @@ class ConfigService(ConfigsProtocol):
         collection_id: Optional[str] = None,
         check_immutability: bool = True,
         ctx: Optional[DriverContext] = None,
+        expected_version: Optional[str] = None,
     ) -> "PluginConfig":
         """Persist a config and return it.
 
@@ -500,6 +579,11 @@ class ConfigService(ConfigsProtocol):
         place before the upsert, so callers (and the configs API route)
         get the *effective* stored shape rather than ``None``.  #738/#747
         — returning the config is what replaces the silent ``200 + null``.
+
+        ``expected_version`` (#2707): see ConfigsProtocol — ``None``
+        writes unconditionally; a token from ``get_config_versioned``
+        makes this an atomic compare-and-set at the tier implied by
+        ``(catalog_id, collection_id)``.
         """
         cls, class_key = _resolve(config_cls)
         db_resource = ctx.db_resource if ctx else None
@@ -509,17 +593,20 @@ class ConfigService(ConfigsProtocol):
             await self._set_collection_config(
                 catalog_id, collection_id, cls, config,
                 check_immutability=check_immutability, db_resource=db_resource,
+                expected_version=expected_version,
             )
         elif catalog_id is not None:
             await self._set_catalog_config(
                 catalog_id, cls, config,
                 check_immutability=check_immutability, db_resource=db_resource,
+                expected_version=expected_version,
             )
         else:
             await self._get_platform_config_service().set_config(
                 cls, config,
                 check_immutability=check_immutability,
                 ctx=DriverContext(db_resource=db_resource) if db_resource else None,
+                expected_version=expected_version,
             )
         return config
 
@@ -696,6 +783,7 @@ class ConfigService(ConfigsProtocol):
         config: PluginConfig,
         check_immutability: bool = True,
         db_resource: Optional[DbResource] = None,
+        expected_version: Optional[str] = None,
     ) -> None:
         validate_sql_identifier(catalog_id)
         class_key = cls.class_key()
@@ -729,13 +817,31 @@ class ConfigService(ConfigsProtocol):
             # Phase 2 — validate (pre-persist).
             await run_validate_handlers(cls, config, catalog_id, None, conn)
 
-            await _cq.upsert_catalog_config(phys_schema).execute(
-                conn,
-                ref_key=class_key,
-                class_key=class_key,
-                schema_id=type(config).schema_id(),
-                config_data=_serialized,
-            )
+            if expected_version is not None:
+                rowcount = await _cq.cas_update_catalog_config(phys_schema).execute(
+                    conn,
+                    ref_key=class_key,
+                    class_key=class_key,
+                    schema_id=type(config).schema_id(),
+                    config_data=_serialized,
+                    expected_version=decode_config_version(expected_version),
+                )
+                if rowcount == 0:
+                    raise ConfigVersionConflictError(
+                        f"set_config({class_key!r}) at catalog {catalog_id!r}: "
+                        f"expected_version {expected_version!r} no longer matches "
+                        f"the stored row (or the row is absent) — a concurrent "
+                        f"writer changed it. Re-read via get_config_versioned "
+                        f"and retry."
+                    )
+            else:
+                await _cq.upsert_catalog_config(phys_schema).execute(
+                    conn,
+                    ref_key=class_key,
+                    class_key=class_key,
+                    schema_id=type(config).schema_id(),
+                    config_data=_serialized,
+                )
 
             # Phase 3 — apply (post-persist, best-effort).
             await run_apply_handlers(cls, config, catalog_id, None, conn)
@@ -753,6 +859,7 @@ class ConfigService(ConfigsProtocol):
         config: PluginConfig,
         check_immutability: bool = True,
         db_resource: Optional[DbResource] = None,
+        expected_version: Optional[str] = None,
     ) -> None:
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
@@ -811,14 +918,33 @@ class ConfigService(ConfigsProtocol):
             # Phase 2 — validate (pre-persist).
             await run_validate_handlers(cls, config, catalog_id, internal_collection_id, conn)
 
-            await _cq.upsert_collection_config(phys_schema).execute(
-                conn,
-                collection_id=internal_collection_id,
-                ref_key=class_key,
-                class_key=class_key,
-                schema_id=type(config).schema_id(),
-                config_data=_serialized,
-            )
+            if expected_version is not None:
+                rowcount = await _cq.cas_update_collection_config(phys_schema).execute(
+                    conn,
+                    collection_id=internal_collection_id,
+                    ref_key=class_key,
+                    class_key=class_key,
+                    schema_id=type(config).schema_id(),
+                    config_data=_serialized,
+                    expected_version=decode_config_version(expected_version),
+                )
+                if rowcount == 0:
+                    raise ConfigVersionConflictError(
+                        f"set_config({class_key!r}) at {catalog_id!r}/"
+                        f"{internal_collection_id!r}: expected_version "
+                        f"{expected_version!r} no longer matches the stored row "
+                        f"(or the row is absent) — a concurrent writer changed "
+                        f"it. Re-read via get_config_versioned and retry."
+                    )
+            else:
+                await _cq.upsert_collection_config(phys_schema).execute(
+                    conn,
+                    collection_id=internal_collection_id,
+                    ref_key=class_key,
+                    class_key=class_key,
+                    schema_id=type(config).schema_id(),
+                    config_data=_serialized,
+                )
 
             # Phase 3 — apply (post-persist, best-effort).
             await run_apply_handlers(cls, config, catalog_id, internal_collection_id, conn)

@@ -76,7 +76,12 @@ from dynastore.models.driver_context import DriverContext
 # imported to avoid circular imports
 from dynastore.modules.db_config.exceptions import (
     ConfigValidationError,
+    ConfigVersionConflictError,
     ImmutableConfigError,
+)
+from dynastore.modules.db_config.config_version import (
+    decode_config_version,
+    encode_config_version,
 )
 from dynastore.tools.json import CustomJSONEncoder
 
@@ -548,6 +553,9 @@ list_platform_refs_query = _cq.list_platform_refs
 
 # --- Manager ---
 
+get_platform_config_versioned_query = _cq.get_platform_config_versioned
+cas_update_platform_config_query = _cq.cas_update_platform_config
+
 
 def _serialize_config_for_db(config: "PluginConfig") -> str:
     """Serialize a config to the JSON string persisted in platform_configs.
@@ -659,6 +667,16 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
         config = await self._get_platform_config_internal(cls, db_resource=db_resource)
         if config:
             return config
+        return await self._default_or_raise(cls)
+
+    async def _default_or_raise(self, cls: Type[PluginConfig]) -> PluginConfig:
+        """Construct the code-level default, or raise ``ConfigResolutionError``.
+
+        Shared by :meth:`get_config` and :meth:`get_config_versioned` — no
+        persisted row means "fall through to the class default", and a
+        class that cannot be constructed with zero args is a genuine
+        ops misconfiguration in either path.
+        """
         try:
             return cls()
         except Exception as exc:
@@ -671,6 +689,40 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
                 required_fields=required,
                 scope_tried=["platform", "code_default"],
             ) from exc
+
+    async def get_config_versioned(
+        self,
+        config_cls: Union[str, Type[PluginConfig]],
+        ctx: Optional[DriverContext] = None,
+    ) -> Tuple[PluginConfig, Optional[str]]:
+        """Versioned read for CAS writes (#2707).
+
+        Returns ``(config, version)`` where ``config`` is what
+        :meth:`get_config` would return (platform row overlaid on the code
+        default) and ``version`` is the opaque CAS token for the platform
+        row, or ``None`` when no row is persisted yet — nothing to CAS
+        against, so a subsequent write should go through unconditionally
+        (``expected_version=None``, the default).
+
+        Always reads storage directly, bypassing
+        ``get_platform_config_internal_cached`` — the token must reflect
+        the true current row, never a stale cached one, or a real
+        conflict could be masked (or a phantom one raised).
+        """
+        cls = require_config_class(config_cls)
+        db_resource = ctx.db_resource if ctx else None
+        async with managed_transaction(db_resource or self.engine) as conn:
+            if not await _platform_table_exists(conn):
+                row = None
+            else:
+                row = await get_platform_config_versioned_query.execute(
+                    conn, ref_key=cls.class_key()
+                )
+        if not row:
+            return await self._default_or_raise(cls), None
+        data = row["config_data"]
+        config = data if isinstance(data, cls) else _validate_stored_config(cls, data)
+        return config, encode_config_version(row["updated_at"])
 
     async def _get_platform_config_internal_db(
         self, class_key: str
@@ -706,7 +758,20 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
         config: PluginConfig,
         check_immutability: bool = True,
         ctx: Optional[DriverContext] = None,
+        expected_version: Optional[str] = None,
     ) -> None:
+        """Persist a platform-scope config.
+
+        ``expected_version`` (#2707): when ``None`` (default), writes
+        unconditionally — today's behavior, fully backward compatible.
+        When set to a token obtained from :meth:`get_config_versioned`,
+        the write becomes an atomic compare-and-set: it only lands if the
+        stored row's ``updated_at`` still equals that token. On a lost
+        race (no row, or a concurrent writer already moved it) this
+        raises ``ConfigVersionConflictError`` instead of silently
+        overwriting the concurrent change — the caller should re-read via
+        ``get_config_versioned`` and retry.
+        """
         cls = require_config_class(config_cls)
         class_key = cls.class_key()
         db_resource = ctx.db_resource if ctx else None
@@ -751,13 +816,31 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
             # exclude_unset=True → platform row stores only fields the caller
             # explicitly sent. Class defaults are resolved at read time, so
             # bumping a class default propagates without rewriting this row.
-            await upsert_platform_config_query.execute(
-                conn,
-                ref_key=class_key,
-                class_key=class_key,
-                schema_id=type(config).schema_id(),
-                config_data=_serialized,
-            )
+            if expected_version is not None:
+                rowcount = await cas_update_platform_config_query.execute(
+                    conn,
+                    ref_key=class_key,
+                    class_key=class_key,
+                    schema_id=type(config).schema_id(),
+                    config_data=_serialized,
+                    expected_version=decode_config_version(expected_version),
+                )
+                if rowcount == 0:
+                    raise ConfigVersionConflictError(
+                        f"set_config({class_key!r}): expected_version "
+                        f"{expected_version!r} no longer matches the stored "
+                        f"platform row (or the row is absent) — a concurrent "
+                        f"writer changed it. Re-read via get_config_versioned "
+                        f"and retry."
+                    )
+            else:
+                await upsert_platform_config_query.execute(
+                    conn,
+                    ref_key=class_key,
+                    class_key=class_key,
+                    schema_id=type(config).schema_id(),
+                    config_data=_serialized,
+                )
 
             # Phase 3 — apply (post-persist, best-effort).
             await run_apply_handlers(cls, config, None, None, conn)

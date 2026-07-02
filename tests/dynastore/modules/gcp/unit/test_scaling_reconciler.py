@@ -45,16 +45,37 @@ def _fake_configs(policy: ScalingPolicyConfig, duckdb_cfg=None):
     single-class stub, the pool-autosize actuator needs both
     ``ScalingPolicyConfig`` (the policy) and ``DuckdbEngineConfig`` (the
     actuated resource) resolvable from the same fake.
+
+    ``get_config_versioned`` (#2707) pairs the stored value with a fake
+    monotonic version token — bumped on every ``set_config`` so a caller
+    that re-reads after a write observes a fresh token, mirroring the
+    real ``updated_at``-derived token.
     """
     from dynastore.modules.db_config.engine_config import DuckdbEngineConfig
 
     store = {ScalingPolicyConfig: policy, DuckdbEngineConfig: duckdb_cfg or DuckdbEngineConfig()}
-    set_config = AsyncMock(side_effect=lambda cls, cfg, **_kw: store.__setitem__(cls, cfg) or cfg)
+    versions = {DuckdbEngineConfig: "v0"}
+
+    def _bump_version(cls, cfg, **_kw):
+        store[cls] = cfg
+        versions[cls] = f"v{int(versions.get(cls, 'v0')[1:]) + 1}"
+        return cfg
+
+    set_config = AsyncMock(side_effect=_bump_version)
 
     async def get_config(cls):
         return store[cls]
 
-    return SimpleNamespace(get_config=get_config, set_config=set_config, _store=store)
+    async def get_config_versioned(cls):
+        return store[cls], versions.get(cls)
+
+    return SimpleNamespace(
+        get_config=get_config,
+        get_config_versioned=get_config_versioned,
+        set_config=set_config,
+        _store=store,
+        _versions=versions,
+    )
 
 
 def _fake_backend(doc):
@@ -291,6 +312,108 @@ async def test_duckdb_pool_autosize_respects_cooldown():
     with _patch_cache(mod, _fake_backend(_doc_with_duckdb_pool_and_cpu(0.95, 0.1))):
         await reconciler._reconcile_once()
     assert configs.set_config.await_count == 1  # still one — inside cooldown
+
+
+@pytest.mark.asyncio
+async def test_duckdb_pool_autosize_uses_versioned_read_and_passes_token_to_write():
+    """#2707: the write site reads via ``get_config_versioned`` and threads
+    the token through ``set_config(..., expected_version=...)`` — closing
+    the read-modify-write race the plain re-read mitigation only narrowed."""
+    from dynastore.modules.db_config.engine_config import DuckdbEngineConfig
+    from dynastore.modules.gcp import scaling_reconciler as mod
+
+    platform = SimpleNamespace(
+        get_min_instances=AsyncMock(return_value=2),
+        set_min_instances=AsyncMock(),
+    )
+    policy = ScalingPolicyConfig(
+        enabled=True, scale_out_saturation=0.80, cpu_idle_ceiling=0.30,
+        duckdb_pool_autosize=True, duckdb_pool_step=2, duckdb_pool_size_max=32,
+        duckdb_pool_cooldown_seconds=0,
+    )
+    configs = _fake_configs(policy, duckdb_cfg=DuckdbEngineConfig(pool_size=8))
+    reconciler = GcpScalingReconciler(platform=platform, configs=configs)
+
+    with _patch_cache(mod, _fake_backend(_doc_with_duckdb_pool_and_cpu(0.95, 0.1))):
+        await reconciler._reconcile_once()
+
+    configs.set_config.assert_awaited_once()
+    _, kwargs = configs.set_config.await_args
+    assert kwargs.get("expected_version") == "v0"
+
+
+@pytest.mark.asyncio
+async def test_duckdb_pool_autosize_skips_tick_on_cas_conflict_without_raising():
+    """A concurrent writer wins the CAS race — the actuator must swallow
+    ``ConfigVersionConflictError`` (not treat it as a hard failure) and
+    must not advance ``_last_pool_change_ts``, so the next tick isn't
+    blocked by the cooldown from a bump that never actually landed."""
+    from dynastore.modules.db_config.engine_config import DuckdbEngineConfig
+    from dynastore.modules.db_config.exceptions import ConfigVersionConflictError
+    from dynastore.modules.gcp import scaling_reconciler as mod
+
+    platform = SimpleNamespace(
+        get_min_instances=AsyncMock(return_value=2),
+        set_min_instances=AsyncMock(),
+    )
+    policy = ScalingPolicyConfig(
+        enabled=True, scale_out_saturation=0.80, cpu_idle_ceiling=0.30,
+        duckdb_pool_autosize=True, duckdb_pool_step=2, duckdb_pool_size_max=32,
+        duckdb_pool_cooldown_seconds=0,
+    )
+    configs = _fake_configs(policy, duckdb_cfg=DuckdbEngineConfig(pool_size=8))
+    configs.set_config = AsyncMock(side_effect=ConfigVersionConflictError("lost the race"))
+    reconciler = GcpScalingReconciler(platform=platform, configs=configs)
+
+    with _patch_cache(mod, _fake_backend(_doc_with_duckdb_pool_and_cpu(0.95, 0.1))):
+        await reconciler._reconcile_once()  # must not raise
+
+    configs.set_config.assert_awaited_once()
+    assert reconciler._last_pool_change_ts == 0.0
+
+
+@pytest.mark.asyncio
+async def test_duckdb_pool_autosize_retries_and_succeeds_on_next_tick_after_conflict():
+    """First tick loses the CAS race (skipped, state unchanged); second
+    tick re-reads fresh state and its write lands."""
+    from dynastore.modules.db_config.engine_config import DuckdbEngineConfig
+    from dynastore.modules.db_config.exceptions import ConfigVersionConflictError
+    from dynastore.modules.gcp import scaling_reconciler as mod
+
+    platform = SimpleNamespace(
+        get_min_instances=AsyncMock(return_value=2),
+        set_min_instances=AsyncMock(),
+    )
+    policy = ScalingPolicyConfig(
+        enabled=True, scale_out_saturation=0.80, cpu_idle_ceiling=0.30,
+        duckdb_pool_autosize=True, duckdb_pool_step=2, duckdb_pool_size_max=32,
+        duckdb_pool_cooldown_seconds=0,
+    )
+    configs = _fake_configs(policy, duckdb_cfg=DuckdbEngineConfig(pool_size=8))
+
+    call_count = {"n": 0}
+    real_set_config = configs.set_config
+
+    async def _flaky_set_config(cls, cfg, **kw):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise ConfigVersionConflictError("lost the race")
+        return await real_set_config(cls, cfg, **kw)
+
+    configs.set_config = AsyncMock(side_effect=_flaky_set_config)
+    reconciler = GcpScalingReconciler(platform=platform, configs=configs)
+
+    with _patch_cache(mod, _fake_backend(_doc_with_duckdb_pool_and_cpu(0.95, 0.1))):
+        await reconciler._reconcile_once()  # tick 1: conflict, skipped
+
+    assert configs.set_config.await_count == 1
+    assert configs._store[DuckdbEngineConfig].pool_size == 8  # unchanged
+
+    with _patch_cache(mod, _fake_backend(_doc_with_duckdb_pool_and_cpu(0.95, 0.1))):
+        await reconciler._reconcile_once()  # tick 2: retries, succeeds
+
+    assert configs.set_config.await_count == 2
+    assert configs._store[DuckdbEngineConfig].pool_size == 10
 
 
 @pytest.mark.asyncio

@@ -37,6 +37,7 @@ from typing import Optional, Sequence, Union
 from dynastore.models.protocols.configs import ConfigsProtocol
 from dynastore.models.scaling import ScalingSignal
 from dynastore.models.protocols.platform_scaling import PlatformScalingProtocol
+from dynastore.modules.db_config.exceptions import ConfigVersionConflictError
 from dynastore.modules.scaling.aggregator import (
     collect_live_signals,
     compute_desired_min,
@@ -169,15 +170,19 @@ class GcpScalingReconciler(PeriodicService):
         IS the fan-out, no extra plumbing needed. Fail-soft: a read/write
         error costs one tick, mirroring the rest of this reconciler.
 
-        Read-modify-write note: ``ConfigsProtocol`` exposes no
-        compare-and-set primitive today, so a concurrent operator edit
-        (e.g. to ``threads``, a field this actuator never touches) landing
-        between our read and our write would otherwise be silently
-        reverted by ``model_copy(update=...)``. Mitigated by re-reading and
-        recomputing the bump immediately before the write (see below) — a
-        residual race window remains between that re-read and the
-        ``set_config`` call, which only a real CAS primitive would close
-        (tracked as a follow-up, not built here).
+        Read-modify-write: closed via ``ConfigsProtocol``'s compare-and-set
+        primitive (#2707). The cheap first pass uses the (possibly cached)
+        ``get_config`` value purely to decide whether a bump is due at all —
+        a quiet tick never pays for a direct-storage read. Once a bump is
+        due, ``get_config_versioned`` reads the row straight from storage
+        (bypassing the config cache) and pairs it with a CAS token; the
+        write asserts that token via ``set_config(..., expected_version=...)``.
+        If a concurrent writer (an operator editing ``threads``, or another
+        leader — shouldn't happen under ``LEADER_ONLY`` but the DB doesn't
+        know that) moved the row in between, the write raises
+        ``ConfigVersionConflictError`` instead of silently reverting the
+        concurrent change; this tick is skipped and the next tick re-reads
+        and retries with fresh state.
         """
         if not policy.duckdb_pool_autosize:
             return
@@ -199,8 +204,8 @@ class GcpScalingReconciler(PeriodicService):
             return
 
         # First pass: is a bump due at all? Cheap early-exit so a quiet tick
-        # (flag off already returned above; here: not saturated, CPU not
-        # idle, at the cap, or cooling down) never pays for the re-read below.
+        # (not saturated, CPU not idle, at the cap, or cooling down) never
+        # pays for the versioned direct-storage read below.
         if compute_duckdb_pool_bump(
             signals, policy,
             current_pool_size=current_cfg.pool_size,
@@ -209,17 +214,16 @@ class GcpScalingReconciler(PeriodicService):
         ) is None:
             return
 
-        # Re-read immediately before the write and recompute the bump from
-        # THIS fresh copy — narrows the read-modify-write window to just the
-        # gap between this read and the write call below, and ensures the
-        # update is layered on whatever pool_size (and every other field)
-        # actually holds right now, not the possibly-stale first read.
+        # Versioned read straight from storage (never the config cache) —
+        # the CAS token must reflect the true current row. Recompute the
+        # bump from this fresh copy so the update is layered on whatever
+        # pool_size (and every other field) actually holds right now.
         try:
-            fresh_cfg = await configs.get_config(DuckdbEngineConfig)
+            fresh_cfg, version = await configs.get_config_versioned(DuckdbEngineConfig)
         except Exception:
             logger.debug(
-                "GcpScalingReconciler: DuckdbEngineConfig re-read before "
-                "pool-autosize write failed — skipping this tick.",
+                "GcpScalingReconciler: DuckdbEngineConfig versioned re-read "
+                "before pool-autosize write failed — skipping this tick.",
                 exc_info=True,
             )
             return
@@ -235,7 +239,16 @@ class GcpScalingReconciler(PeriodicService):
 
         updated_cfg = fresh_cfg.model_copy(update={"pool_size": new_size})
         try:
-            await configs.set_config(DuckdbEngineConfig, updated_cfg)
+            await configs.set_config(
+                DuckdbEngineConfig, updated_cfg, expected_version=version,
+            )
+        except ConfigVersionConflictError:
+            logger.info(
+                "GcpScalingReconciler: DuckdbEngineConfig changed concurrently "
+                "since it was read — skipping this tick's pool_size bump; "
+                "the next tick will re-read and retry.",
+            )
+            return
         except Exception:
             logger.error(
                 "GcpScalingReconciler: failed to write DuckdbEngineConfig.pool_size bump",

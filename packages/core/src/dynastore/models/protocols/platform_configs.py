@@ -16,7 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from typing import Protocol, Optional, Type, Union, Dict, runtime_checkable, TYPE_CHECKING
+from typing import Protocol, Optional, Tuple, Type, Union, Dict, runtime_checkable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from dynastore.models.plugin_config import PluginConfig
@@ -51,9 +51,30 @@ class PlatformConfigsProtocol(Protocol):
         config: "PluginConfig",
         check_immutability: bool = True,
         ctx: Optional["DriverContext"] = None,
+        expected_version: Optional[str] = None,
     ) -> None:
         """
         Writes a platform-level configuration.
+
+        ``expected_version`` (#2707): ``None`` (default) writes
+        unconditionally. A token from :meth:`get_config_versioned` makes
+        this an atomic compare-and-set — raises
+        ``dynastore.modules.db_config.exceptions.ConfigVersionConflictError``
+        when the stored row no longer matches.
+        """
+        ...
+
+    async def get_config_versioned(
+        self,
+        config_cls: Union[str, Type["PluginConfig"]],
+        ctx: Optional["DriverContext"] = None,
+    ) -> Tuple["PluginConfig", Optional[str]]:
+        """Versioned read pairing a resolved config with its CAS token (#2707).
+
+        Returns ``(config, version)``. ``version`` is ``None`` when no row
+        is persisted yet (nothing to CAS against). Always reads storage
+        directly — never served from the config cache — so the token can't
+        be stale relative to a concurrent writer.
         """
         ...
 

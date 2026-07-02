@@ -55,6 +55,18 @@ class ConfigValidationError(ValueError):
     """Raised when a configuration body fails Pydantic validation."""
     pass
 
+class ConfigVersionConflictError(ValueError):
+    """Raised by a compare-and-set ``set_config(..., expected_version=...)``
+    write when the stored row's version no longer matches ``expected_version``
+    (a concurrent writer changed or removed it since it was read).
+
+    Maps to HTTP 409, same idiom as ``ImmutableConfigError``. The caller
+    should re-read the config (and its fresh version, via
+    ``get_config_versioned``) and retry rather than treating this as a
+    hard failure — see #2707.
+    """
+    pass
+
 class ConfigResolutionError(DatabaseError):
     """Raised when the config waterfall cannot produce a usable default.
 

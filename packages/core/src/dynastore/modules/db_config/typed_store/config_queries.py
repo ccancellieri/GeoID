@@ -86,6 +86,28 @@ list_platform_refs = DQLQuery(
     result_handler=ResultHandler.ALL_DICTS,
 )
 
+# --- CAS (compare-and-set) reads/writes (#2707) -----------------------------
+# ``updated_at`` is already a NOT NULL column on every config table — it
+# doubles as an opaque optimistic-concurrency token (see
+# ``dynastore.modules.db_config.config_version``) without any schema change.
+
+get_platform_config_versioned = DQLQuery(
+    f"SELECT config_data, updated_at FROM {CONFIGS_SCHEMA}.platform_configs WHERE ref_key = :ref_key;",
+    result_handler=ResultHandler.ONE_DICT,
+)
+
+cas_update_platform_config = DQLQuery(
+    f"""
+    UPDATE {CONFIGS_SCHEMA}.platform_configs SET
+        class_key   = :class_key,
+        schema_id   = :schema_id,
+        config_data = CAST(:config_data AS jsonb),
+        updated_at  = NOW()
+    WHERE ref_key = :ref_key AND updated_at = :expected_version;
+    """,
+    result_handler=ResultHandler.ROWCOUNT,
+)
+
 upsert_platform_config = DQLQuery(
     f"""
     INSERT INTO {CONFIGS_SCHEMA}.platform_configs (ref_key, class_key, schema_id, config_data, updated_at)
@@ -165,6 +187,36 @@ def select_catalog_config_for_update(phys_schema: str) -> DQLQuery:
     return DQLQuery(
         f'SELECT config_data FROM "{phys_schema}".{CATALOG_CONFIGS_TABLE} WHERE ref_key = :ref_key FOR UPDATE;',
         result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+    )
+
+
+def select_catalog_config_versioned(phys_schema: str) -> DQLQuery:
+    """SELECT config_data + updated_at (CAS token) for a single ref_key, no lock."""
+    validate_sql_identifier(phys_schema)
+    return DQLQuery(
+        f'SELECT config_data, updated_at FROM "{phys_schema}".{CATALOG_CONFIGS_TABLE} WHERE ref_key = :ref_key;',
+        result_handler=ResultHandler.ONE_DICT,
+    )
+
+
+def cas_update_catalog_config(phys_schema: str) -> DQLQuery:
+    """Atomic ``UPDATE ... WHERE ref_key = :ref_key AND updated_at = :expected_version``.
+
+    ``rowcount == 0`` means the row was absent or a concurrent writer
+    already moved ``updated_at`` past ``expected_version`` — the caller
+    (``ConfigService._set_catalog_config``) raises ``ConfigVersionConflictError``.
+    """
+    validate_sql_identifier(phys_schema)
+    return DQLQuery(
+        f"""
+        UPDATE "{phys_schema}".{CATALOG_CONFIGS_TABLE} SET
+            class_key   = :class_key,
+            schema_id   = :schema_id,
+            config_data = CAST(:config_data AS jsonb),
+            updated_at  = NOW()
+        WHERE ref_key = :ref_key AND updated_at = :expected_version;
+        """,
+        result_handler=ResultHandler.ROWCOUNT,
     )
 
 
@@ -252,6 +304,38 @@ def select_collection_config_for_update(phys_schema: str) -> DQLQuery:
     return DQLQuery(
         f'SELECT config_data FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} WHERE collection_id = :collection_id AND ref_key = :ref_key FOR UPDATE;',
         result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+    )
+
+
+def select_collection_config_versioned(phys_schema: str) -> DQLQuery:
+    """SELECT config_data + updated_at (CAS token) for (collection_id, ref_key), no lock."""
+    validate_sql_identifier(phys_schema)
+    return DQLQuery(
+        f'SELECT config_data, updated_at FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} '
+        f'WHERE collection_id = :collection_id AND ref_key = :ref_key;',
+        result_handler=ResultHandler.ONE_DICT,
+    )
+
+
+def cas_update_collection_config(phys_schema: str) -> DQLQuery:
+    """Atomic ``UPDATE ... WHERE (collection_id, ref_key) = (...) AND updated_at = :expected_version``.
+
+    ``rowcount == 0`` means the row was absent or a concurrent writer
+    already moved ``updated_at`` past ``expected_version`` — the caller
+    (``ConfigService._set_collection_config``) raises ``ConfigVersionConflictError``.
+    """
+    validate_sql_identifier(phys_schema)
+    return DQLQuery(
+        f"""
+        UPDATE "{phys_schema}".{COLLECTION_CONFIGS_TABLE} SET
+            class_key   = :class_key,
+            schema_id   = :schema_id,
+            config_data = CAST(:config_data AS jsonb),
+            updated_at  = NOW()
+        WHERE collection_id = :collection_id AND ref_key = :ref_key
+            AND updated_at = :expected_version;
+        """,
+        result_handler=ResultHandler.ROWCOUNT,
     )
 
 

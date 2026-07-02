@@ -681,6 +681,22 @@ class ImmutableConfigExceptionHandler(ExceptionHandler):
         )
 
 
+class ConfigVersionConflictExceptionHandler(ExceptionHandler):
+    """Maps ``ConfigVersionConflictError`` (CAS write lost the race) to HTTP 409."""
+
+    def can_handle(self, exception: Exception) -> bool:
+        from dynastore.modules.db_config.exceptions import ConfigVersionConflictError
+
+        return isinstance(exception, ConfigVersionConflictError)
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exception)
+        )
+
+
 class PluginNotFoundExceptionHandler(ExceptionHandler):
     """Handles plugin not found errors."""
 
@@ -969,6 +985,7 @@ class ExceptionHandlerRegistry:
         self.register(AssetSidecarRejectedExceptionHandler())
         self.register(CollectionNotAliveExceptionHandler())  # 404/410/503 — write gate
         self.register(ImmutableConfigExceptionHandler())
+        self.register(ConfigVersionConflictExceptionHandler())  # 409 — CAS write lost the race
         self.register(PluginNotFoundExceptionHandler())
         self.register(ConfigResolutionExceptionHandler())  # 500 — ops misconfig
         self.register(ConfigValidationExceptionHandler())
