@@ -262,6 +262,43 @@ class TestLifecycleMethods:
         assert "items_hub" in called_tables
 
     @pytest.mark.asyncio
+    async def test_drop_storage_records_collection_tolerates_absent_geometry_table(self):
+        """#2655: a RECORDS collection created after this fix never had a
+        geometries sidecar table provisioned. drop_storage still issues a
+        DROP for the full registered-type superset (IF EXISTS makes the
+        absent geometries table a no-op) — deletion must not fail on it."""
+        import dynastore.modules.db_config.shared_queries as sq
+
+        driver = ItemsPostgresqlDriver()
+        mock_conn = AsyncMock()
+        mock_execute = AsyncMock()
+
+        with (
+            patch.object(
+                driver, "resolve_physical_table", new_callable=AsyncMock,
+                return_value="records_hub"
+            ),
+            patch.object(
+                driver, "_resolve_schema", new_callable=AsyncMock,
+                return_value="cat1_schema"
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.pg_sidecars.registry"
+                ".SidecarRegistry.get_available_types",
+                return_value=["attributes", "geometries"],
+            ),
+            patch.object(sq.delete_table_query, "execute", mock_execute),
+        ):
+            # No exception even though "records_hub_geometries" was never
+            # created — the query itself is DROP TABLE IF EXISTS.
+            await driver.drop_storage("cat1", "records_col", db_resource=mock_conn)
+
+        called_tables = [kw["table"] for _, kw in mock_execute.call_args_list]
+        assert "records_hub_geometries" in called_tables
+        assert "records_hub_attributes" in called_tables
+        assert "records_hub" in called_tables
+
+    @pytest.mark.asyncio
     async def test_drop_storage_catalog(self):
         """Catalog-level call (collection_id=None) is a no-op: no DDL, no service calls."""
         driver = ItemsPostgresqlDriver()

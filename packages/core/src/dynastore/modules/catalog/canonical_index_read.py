@@ -26,8 +26,9 @@ The result feeds :func:`~dynastore.modules.elasticsearch.canonical_doc.build_can
 at the ES write boundary so the indexed document has the correct canonical
 envelope shape.
 
-Internal seams (_fetch_raw_rows, _resolve_sidecars_for, _get_col_config)
-are kept module-private but importable for test-injection via ``patch``.
+Internal seams (_fetch_raw_rows, _resolve_sidecars_for, _get_col_config,
+_resolve_collection_type) are kept module-private but importable for
+test-injection via ``patch``.
 """
 
 from __future__ import annotations
@@ -193,6 +194,36 @@ async def _resolve_sidecars_for(col_config: Any, catalog_id: str, collection_id:
         return []
 
 
+async def _resolve_collection_type(
+    catalog_id: str, collection_id: str,
+) -> tuple[Optional[str], Optional[bool]]:
+    """Resolve ``(CollectionInfo.kind, allow_geometry)`` for a collection.
+
+    #2655: same lookup ``_resolve_sidecars_for`` and
+    ``ItemsPostgresqlDriver._get_effective_driver_config`` already use.
+    Kept separate from ``_resolve_sidecars_for`` (rather than folding the
+    tuple into its return value) so that value's existing ``List[Any]``
+    contract — relied on by test mocks — stays unchanged. ``ConfigsProtocol``
+    caches ``CollectionInfo`` lookups, so this second fetch is cheap.
+    """
+    try:
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.modules.catalog.catalog_config import CollectionInfo
+        from dynastore.tools.discovery import get_protocol
+
+        configs = get_protocol(ConfigsProtocol)
+        ct = await configs.get_config(
+            CollectionInfo, catalog_id=catalog_id, collection_id=collection_id,
+        ) if configs else CollectionInfo()
+        return ct.kind.value, ct.allow_geometry
+    except Exception as exc:
+        logger.warning(
+            "canonical_index_read._resolve_collection_type: %s/%s: %s",
+            catalog_id, collection_id, exc,
+        )
+        return None, None
+
+
 async def _fetch_raw_rows(
     catalog_id: str,
     collection_id: str,
@@ -336,6 +367,7 @@ async def read_canonical_index_inputs(
 
     col_config = await _get_col_config(catalog_id, collection_id, db_resource=db_resource)
     resolved_sidecars = await _resolve_sidecars_for(col_config, catalog_id, collection_id)
+    collection_type, allow_geometry = await _resolve_collection_type(catalog_id, collection_id)
     raw_rows = await _fetch_raw_rows(
         catalog_id, collection_id, geoids, col_config, db_resource=db_resource,
     )
@@ -344,6 +376,7 @@ async def read_canonical_index_inputs(
     for geoid, row in raw_rows.items():
         geometry, bbox, user_properties, stac_reserved_members = _extract_feature_parts(
             row, col_config, resolved_sidecars, catalog_id, collection_id,
+            collection_type=collection_type, allow_geometry=allow_geometry,
         )
         result[geoid] = CanonicalIndexInput(
             row=row,
@@ -369,6 +402,9 @@ def _extract_feature_parts(
     resolved_sidecars: List[Any],
     catalog_id: str,
     collection_id: str,
+    *,
+    collection_type: Optional[str] = None,
+    allow_geometry: Optional[bool] = None,
 ) -> tuple[Optional[Dict[str, Any]], Optional[List[float]], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """Extract geometry, bbox, user-only properties, and STAC reserved members from a raw PG row.
 
@@ -386,6 +422,14 @@ def _extract_feature_parts(
        in the canonical doc, not in ``properties``.
     3. Also exclude known sidecar internal columns that may have leaked
        into properties via the JSONB fallback loop in the attributes sidecar.
+
+    ``collection_type`` / ``allow_geometry`` (#2655, both optional) thread
+    the real ``CollectionInfo.kind`` resolved by the caller into
+    ``ItemService.map_row_to_feature`` — same resolution
+    ``_resolve_sidecars_for`` above already uses — so a RECORDS row is
+    mapped without resolving a geometry sidecar. Harmless either way: the
+    geometry sidecar only acts when ``"geom"`` is present in ``row``, and
+    the SELECT that produced ``row`` never projects it for RECORDS.
 
     Geometry is converted to a plain dict (no Pydantic type info).
     """
@@ -417,6 +461,7 @@ def _extract_feature_parts(
     # read_policy=None → no id-flip, no expose filtering.
     feature = item_svc.map_row_to_feature(
         row, col_config, read_policy=None,
+        collection_type=collection_type, allow_geometry=allow_geometry,
     )
 
     # Geometry: convert from Pydantic geometry to plain dict.

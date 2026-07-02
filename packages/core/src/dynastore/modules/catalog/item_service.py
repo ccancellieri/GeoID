@@ -450,6 +450,8 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         lang: str = "en",
         context: Optional[FeaturePipelineContext] = None,
         read_policy: Optional[Any] = None,
+        collection_type: Optional[str] = None,
+        allow_geometry: Optional[bool] = None,
     ) -> Feature:
         """
         Canonical row-to-Feature mapper. Runs each configured sidecar's
@@ -476,6 +478,20 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         ``read_policy`` (optional) is published into context as
         ``_items_read_policy`` so sidecars can consult wire-shape decisions
         (e.g. external_id-as-feature-id) without re-fetching configs per row.
+
+        ``collection_type`` / ``allow_geometry`` (#2655, both optional) let a
+        caller that already knows the real ``CollectionInfo.kind`` thread it
+        into the internal ``_effective_sidecars`` resolution — the same
+        resolution ``collection_has_geometry()`` and
+        ``ItemsPostgresqlDriver._get_effective_driver_config`` use — so a
+        RECORDS row is mapped without resolving a geometry sidecar it will
+        never have data for. Left unset (the default for every current
+        caller), resolution is unchanged: ``_effective_sidecars`` falls back
+        to its own ``"VECTOR"`` default, exactly as before this parameter
+        existed. This is safe either way because the geometry sidecar's row
+        mapping only acts when a ``"geom"`` key is present in ``row`` — the
+        SELECT/JOIN that produces ``row`` is already gated on the real
+        collection type upstream (``_get_effective_driver_config``).
         """
 
         if not row:
@@ -524,8 +540,14 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         from dynastore.modules.storage.drivers.pg_sidecars.base import (
             SidecarProtocol,
         )
+        _effective_sidecars_kwargs: Dict[str, Any] = {}
+        if collection_type is not None:
+            _effective_sidecars_kwargs["collection_type"] = collection_type
+        if allow_geometry is not None:
+            _effective_sidecars_kwargs["context"] = {"allow_geometry": allow_geometry}
         sidecar_configs = _effective_sidecars(
             col_config, catalog_id="", collection_id="",
+            **_effective_sidecars_kwargs,
         )
         # Note: ``stac_metadata`` is now a first-class sidecar with its
         # own DDL/JOIN/SELECT (PR-G2). When the stac extension is loaded,
