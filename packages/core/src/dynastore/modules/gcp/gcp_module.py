@@ -807,6 +807,43 @@ class GCPModule(
                         "(%s). MaintenanceSupervisor task_reaper remains the backstop.", e,
                         exc_info=True,
                     )
+
+                # --- Liveness backstop (#2771) ---
+                # RUN_EVERYWHERE watchdog for the LEADER_ONLY reconciler above:
+                # heals lapsed-lease rows the reconciler failed to reach because
+                # the leader loop never elected (e.g. #2333 DB-pool churn).
+                # Registered under the same job-runner gate as the reconciler —
+                # a service that never owns gcp_cloud_run_ rows has nothing to
+                # back up.
+                try:
+                    from dynastore.modules.gcp.liveness_reconciler import (
+                        GcpLivenessBackstop,
+                    )
+                    _gcp_supervisor.register(
+                        GcpLivenessBackstop(
+                            cadence_seconds=getattr(
+                                cfg, "liveness_backstop_interval_seconds", None
+                            ),
+                            stale_multiplier=getattr(
+                                cfg, "liveness_backstop_stale_multiplier", None
+                            ),
+                            extend_visibility_seconds=getattr(
+                                cfg, "liveness_extend_visibility_seconds", 300
+                            ),
+                            unknown_grace_seconds=getattr(
+                                cfg, "liveness_unknown_grace_seconds", 180
+                            ),
+                        )
+                    )
+                    logger.info("GCP Module: liveness backstop registered.")
+                except Exception as e:
+                    logger.error(
+                        "GCP Module: failed to register liveness backstop "
+                        "(%s). A starved leader loop will leave lapsed rows "
+                        "un-probed until MaintenanceSupervisor task_reaper reaps "
+                        "them blindly.", e,
+                        exc_info=True,
+                    )
             # --- Autoscaling reconciler (scaling P0 control loop) ---
             # Always registered (cheap no-op tick): ScalingPolicyConfig.enabled
             # defaults to False, so the tick returns immediately until an

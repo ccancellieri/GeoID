@@ -233,6 +233,23 @@ class GcpModuleConfig(ExposableConfigMixin, PluginConfig):
                     "cover the spawn→capture gap before leaving it to the "
                     "MaintenanceSupervisor task_reaper job."
     )
+    liveness_backstop_interval_seconds: Mutable[int] = Field(
+        default=60,
+        description="How often (seconds) the RUN_EVERYWHERE liveness backstop "
+                    "(#2771) scans for lapsed-lease Cloud Run task rows the "
+                    "LEADER_ONLY liveness reconciler has failed to reach. Runs on "
+                    "every pod regardless of leader election, so it keeps healing "
+                    "stuck jobs even when the leader loop is starved."
+    )
+    liveness_backstop_stale_multiplier: Mutable[float] = Field(
+        default=3.0,
+        description="A lapsed-lease row only trips the backstop once its lease has "
+                    "been expired for at least this many multiples of "
+                    "liveness_reconciler_interval_seconds — long enough that a "
+                    "healthy reconciler would certainly have already reached it, so "
+                    "ordinary cadence jitter between reconciler passes never fires "
+                    "the backstop."
+    )
 
     # --- GCS retry and per-bucket circuit breaker ---
     gcs_retry_max_attempts: Mutable[int] = Field(

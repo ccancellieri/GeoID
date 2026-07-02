@@ -370,6 +370,15 @@ class GcpLivenessReconciler(PeriodicService):
             )
         return False
 
+    async def _reconcile_row_public(self, row: Dict[str, Any]) -> Optional[ReconcileOutcome]:
+        """Public alias of :meth:`_reconcile_row` for :class:`GcpLivenessBackstop`.
+
+        Both classes live in this module and share the verdict→action policy;
+        the alias avoids a private-member reach-across while keeping
+        ``_reconcile_row`` itself unchanged for the primary tick path.
+        """
+        return await self._reconcile_row(row)
+
     async def _reconcile_row(self, row: Dict[str, Any]) -> Optional[ReconcileOutcome]:
         """Probe the owning runner for ``row`` and act on the verdict.
 
@@ -581,3 +590,129 @@ class GcpLivenessReconciler(PeriodicService):
                     task_id,
                 )
             return ReconcileOutcome(verdict)
+
+
+class GcpLivenessBackstop(PeriodicService):
+    """RUN_EVERYWHERE watchdog that heals lapsed rows a starved leader misses (#2771).
+
+    ``GcpLivenessReconciler`` is ``LEADER_ONLY``: exactly one pod drives its
+    writes, and every other pod skips its tick until the advisory/lease lock
+    is free. If the leader loop never elects — e.g. the DB-pool-churn
+    scenario in #2333, where every ``acquire_leadership()`` attempt trips a
+    transient connection error — the reconciler's pass silently never runs.
+    Lapsed-lease Cloud Run task rows then sit un-probed with no operator
+    signal until someone notices a job stuck ``RUNNING`` for days.
+
+    This service ticks on every pod, independent of leader election, so a
+    starved leader loop can no longer take the whole backstop down with it.
+
+    Detection is symptom-based rather than tied to one election backend (the
+    lease-table backend persists a row a follower could inspect; the
+    advisory backend does not). A lapsed-lease row only trips the backstop
+    once it has been expired for at least ``stale_multiplier *
+    liveness_reconciler_interval_seconds`` — long enough that a healthy
+    reconciler tick would certainly have reached it already, so ordinary
+    cadence jitter between reconciler passes never fires this path. When the
+    primary reconciler is healthy, this tick's scan finds nothing past the
+    staleness bar and is a cheap no-op indexed SELECT.
+
+    Once starvation is confirmed for the pass, every currently lapsed row is
+    reconciled (not only the stale ones that tripped detection) via
+    :meth:`GcpLivenessReconciler._reconcile_row_public` — the same probe +
+    :func:`~dynastore.modules.tasks.reconciliation.decide_verdict_action` +
+    owner-guarded write path the primary reconciler and the on-demand #2620
+    read-path trigger both use, so this is wiring, not new verdict policy.
+
+    Concurrent execution across pods during a real starvation event is
+    tolerated by the same race-handling the reconciler already documents:
+    every write is owner_id-guarded, so a pod that loses the race to another
+    pod (or to the MaintenanceSupervisor task_reaper) gets a truthful no-op,
+    not a double-write. No additional advisory lock is taken here on
+    purpose — the failure mode this backstop exists for is exactly a DB
+    under lock/connection pressure, and adding another lock acquisition to
+    the recovery path would trade a correctness gap for a liveness gap.
+    """
+
+    name = "gcp_liveness_backstop"
+    leadership = Leadership.RUN_EVERYWHERE
+    pod_policy = PodPolicy.SKIP_EPHEMERAL
+
+    def __init__(
+        self,
+        *,
+        cadence_seconds: Optional[float] = None,
+        stale_multiplier: Optional[float] = None,
+        extend_visibility_seconds: Optional[int] = None,
+        unknown_grace_seconds: Optional[int] = None,
+    ) -> None:
+        _, _, cfg_interval, cfg_visibility, cfg_unknown_grace = resolve_leadership_config()
+        self._primary_interval_seconds: float = cfg_interval
+        self.cadence_seconds = float(
+            cadence_seconds if cadence_seconds is not None else max(cfg_interval * 3.0, 60.0)
+        )
+        self._stale_multiplier: float = float(
+            stale_multiplier if stale_multiplier is not None else 3.0
+        )
+        self._extend_visibility_seconds: Optional[int] = extend_visibility_seconds
+        self._unknown_grace_seconds: Optional[int] = unknown_grace_seconds
+
+    async def tick(self, ctx: ServiceContext) -> None:
+        try:
+            await self._reconcile_if_starved(ctx.engine)
+        except Exception as e:  # noqa: BLE001 — one bad pass must not kill the loop
+            logger.error(
+                "GcpLivenessBackstop: pass failed: %s", e, exc_info=True,
+            )
+
+    async def _reconcile_if_starved(self, engine: Any) -> None:
+        rows = await tasks_module.select_lapsed_gcp_tasks(engine)
+        if not rows:
+            return
+
+        now = datetime.now(timezone.utc)
+        stale_cutoff = now - timedelta(
+            seconds=self._primary_interval_seconds * self._stale_multiplier
+        )
+        starved = [
+            row for row in rows
+            if row.get("locked_until") is not None and row["locked_until"] <= stale_cutoff
+        ]
+        if not starved:
+            # Rows exist but none are stale enough to prove the primary
+            # reconciler missed them — ordinary inter-pass jitter.
+            return
+
+        oldest_lapsed_s = max(
+            (now - row["locked_until"]).total_seconds() for row in starved
+        )
+        logger.warning(
+            "liveness_backstop_starvation_detected service=%s scanned=%d "
+            "starved=%d oldest_lapsed_s=%.0f — the LEADER_ONLY reconciler "
+            "appears to have missed at least %.0f cycle(s); reconciling directly.",
+            _SERVICE_NAME_FOR_METRICS, len(rows), len(starved),
+            oldest_lapsed_s, self._stale_multiplier,
+        )
+
+        reconciler = GcpLivenessReconciler(
+            engine,
+            extend_visibility_seconds=self._extend_visibility_seconds,
+            unknown_grace_seconds=self._unknown_grace_seconds,
+        )
+        healed = 0
+        for row in rows:
+            try:
+                outcome = await reconciler._reconcile_row_public(row)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — one bad row must not stop the rest
+                logger.warning(
+                    "GcpLivenessBackstop: failed to reconcile task %s: %s",
+                    row.get("task_id"), e,
+                )
+                continue
+            if outcome is not None:
+                healed += 1
+        logger.info(
+            "liveness_backstop_pass service=%s scanned=%d healed=%d",
+            _SERVICE_NAME_FOR_METRICS, len(rows), healed,
+        )
