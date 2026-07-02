@@ -349,7 +349,11 @@ async def test_stac_collection_items_default_uses_es_fastpath(monkeypatch):
     monkeypatch.setattr(svc, "_get_catalogs_service",
                         _acoro(SimpleNamespace(get_collection=_acoro({"id": "col"}))),
                         raising=False)
-    monkeypatch.setattr(svc, "_get_stac_config", _acoro(SimpleNamespace()), raising=False)
+    monkeypatch.setattr(
+        svc, "_get_stac_config",
+        _acoro(SimpleNamespace(default_limit=10, max_limit=1000)),
+        raising=False,
+    )
 
     await svc.get_stac_collection_items(
         catalog_id="cat",
@@ -398,7 +402,11 @@ async def test_stac_collection_items_geometry_exact_skips_es_fastpath(monkeypatc
     monkeypatch.setattr(svc, "_get_catalogs_service",
                         _acoro(SimpleNamespace(get_collection=_acoro({"id": "col"}))),
                         raising=False)
-    monkeypatch.setattr(svc, "_get_stac_config", _acoro(SimpleNamespace()), raising=False)
+    monkeypatch.setattr(
+        svc, "_get_stac_config",
+        _acoro(SimpleNamespace(default_limit=10, max_limit=1000)),
+        raising=False,
+    )
 
     await svc.get_stac_collection_items(
         catalog_id="cat",
