@@ -242,3 +242,51 @@ def test_apply_catalog_preset_invalid_params_body_returns_422():
         json={"stac_level": "BOGUS_LEVEL"},
     )
     assert resp.status_code == 422, resp.text
+
+
+# ---------------------------------------------------------------------------
+# Dry-run params body — mirrors the apply endpoint (#2711)
+#
+# The dry-run endpoints used to hardcode ``NoParams()``, so a preview always
+# ran a different operation than the corresponding apply and a preset with
+# required params (e.g. ``region_mapping``'s ``column``) could not be
+# previewed at all. These tests use ``region_mapping`` — a COLLECTION-tier
+# preset with a required ``column`` param and no DB dependency in ``dry_run``
+# when ``CatalogsProtocol`` is unregistered — to prove the caller-supplied
+# body now reaches the plan, with the same 422 semantics as apply.
+# ---------------------------------------------------------------------------
+
+def test_dry_run_collection_preset_uses_caller_params():
+    """The dry-run plan reflects the caller-supplied ``column``, not a
+    hardcoded ``NoParams()`` preview of a different operation."""
+    import dynastore.extensions.region_mapping.presets.region_mapping  # noqa: F401
+
+    client = TestClient(_app())
+    resp = client.post(
+        "/configs/catalogs/cat-a/collections/col-1/presets/region_mapping/dry-run",
+        json={"column": "iso3"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["preset_name"] == "region_mapping"
+    claim_targets = {e["target"] for e in body["entries"] if e["kind"] == "upsert_claim"}
+    assert "iso3" in claim_targets
+
+
+def test_dry_run_collection_preset_invalid_params_body_returns_422():
+    """A body missing the required ``column`` field returns 422 — the same
+    status the apply endpoint returns for the identical body."""
+    import dynastore.extensions.region_mapping.presets.region_mapping  # noqa: F401
+
+    client = TestClient(_app())
+    dry_run_resp = client.post(
+        "/configs/catalogs/cat-a/collections/col-1/presets/region_mapping/dry-run",
+        json={"alias": "iso_a3"},
+    )
+    apply_resp = client.post(
+        "/configs/catalogs/cat-a/collections/col-1/presets/region_mapping",
+        json={"alias": "iso_a3"},
+    )
+    assert dry_run_resp.status_code == 422, dry_run_resp.text
+    assert dry_run_resp.status_code == apply_resp.status_code
+    assert dry_run_resp.json() == apply_resp.json()
