@@ -783,29 +783,65 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
             sort_fields = {s.field for s in (request.sort or [])} if hasattr(request, "sort") and request.sort else set()
             all_needed = requested | filter_fields | sort_fields
 
+            # #2829: a GROUP BY request must not pull in auxiliary columns
+            # (identity, attribute, statistics) that are neither grouped nor
+            # aggregated — PostgreSQL rejects any SELECT-list column that
+            # isn't. When ``group_by`` is set, ``_include`` narrows inclusion
+            # to exactly those field names and ignores ``default`` (the
+            # ordinary per-field requested/filter/sort/wildcard/empty-select
+            # rule below, preserved as-is for the non-grouped case).
+            group_by_fields = set(request.group_by) if request.group_by else None
+
+            def _include(*names: str, default: bool) -> bool:
+                if group_by_fields is not None:
+                    return any(n in group_by_fields for n in names)
+                return default
+
             # 1. Identity Columns (null-object: field name present → column enabled)
-            if self.config.external_id_field is not None and (
-                self.config.external_id_field in all_needed
-                or "id" in all_needed
-                or "*" in requested
-                or not requested
+            if self.config.external_id_field is not None and _include(
+                self.config.external_id_field,
+                "id",
+                default=(
+                    self.config.external_id_field in all_needed
+                    or "id" in all_needed
+                    or "*" in requested
+                    or not requested
+                ),
             ):
                 fields.append(f"{alias}.{self.config.external_id_field}")
 
-            if self.config.asset_id_field is not None and (
-                self.config.asset_id_field in all_needed or "*" in requested
+            if self.config.asset_id_field is not None and _include(
+                self.config.asset_id_field,
+                default=(
+                    self.config.asset_id_field in all_needed or "*" in requested
+                ),
             ):
                 fields.append(f"{alias}.{self.config.asset_id_field}")
 
             # 2. Attribute Columns
             storage_mode = self.resolved_storage_mode
             if storage_mode == AttributeStorageMode.JSONB:
-                fields.append(f"{alias}.{self.config.jsonb_column_name}")
+                # Skip the raw blob passthrough for a GROUP BY request (#2829):
+                # map_row_to_feature's JSONB branch merges every key of this
+                # column into properties, which is meaningless for a grouped
+                # result set and — because the requested fields already reach
+                # SELECT via their own dynamically-resolved JSONB extraction
+                # expressions — also an ungrouped column PostgreSQL rejects
+                # ("column ... must appear in the GROUP BY clause").
+                if group_by_fields is None:
+                    fields.append(f"{alias}.{self.config.jsonb_column_name}")
             else:
                 # Relational mode: return selectively
                 if self.config.attribute_schema:
                     for attr in self.config.attribute_schema:
-                        if attr.name in all_needed or "*" in requested or not requested:
+                        if _include(
+                            attr.name,
+                            default=(
+                                attr.name in all_needed
+                                or "*" in requested
+                                or not requested
+                            ),
+                        ):
                             fields.append(f'{alias}."{attr.name}"')
 
             # 3. Attribute Statistics (ATTRIBUTE_STAT overlay) — COLUMNAR per
@@ -813,11 +849,14 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
             # Gated like the geometries sidecar's geom_stats projection. #1074
             for stat in self._columnar_stat_fields():
                 stat_key = stat.resolved_name
-                if stat_key not in all_needed and "*" not in requested:
+                if not _include(
+                    stat_key, default=(stat_key in all_needed or "*" in requested)
+                ):
                     continue
                 fields.append(f'{alias}."{stat_key}"')
-            if self._has_jsonb_stats() and (
-                "attribute_stats" in all_needed or "*" in requested
+            if self._has_jsonb_stats() and _include(
+                "attribute_stats",
+                default=("attribute_stats" in all_needed or "*" in requested),
             ):
                 fields.append(f"{alias}.attribute_stats")
         else:

@@ -346,6 +346,8 @@ class ItemsElasticsearchEnvelopeDriver(
         offset: int = 0,
         db_resource: Optional[Any] = None,
     ) -> AsyncIterator[Feature]:
+        self._reject_unsupported_group_by(request)
+
         from dynastore.models.protocols.entity_transform import (
             TransformChainContext,
         )

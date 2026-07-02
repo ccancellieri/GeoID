@@ -214,6 +214,13 @@ class ItemMetadataSidecar(SidecarProtocol):
         include_all: bool = False,
     ) -> List[str]:
         """Return SELECT fields for item metadata."""
+        if request is not None and getattr(request, "group_by", None):
+            # #2829: none of title/description/keywords is aggregatable, and
+            # this sidecar has no per-field selective mode (it always
+            # returns all three together) — never contribute them to a
+            # GROUP BY request, or an ungrouped column would violate
+            # PostgreSQL's GROUP BY rule.
+            return []
         alias = sidecar_alias or f"sc_{self.sidecar_id}"
         return [
             f"{alias}.title AS item_title",

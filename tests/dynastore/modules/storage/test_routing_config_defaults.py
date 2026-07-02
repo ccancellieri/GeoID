@@ -159,6 +159,42 @@ def test_default_items_filtered_search_resolves_es_first():
     assert resolve(frozenset({Hint.JOIN})) == ["items_postgresql_driver"]
 
 
+def test_default_items_read_group_by_resolves_pg():
+    """A plain browse (``_pick_operation`` → READ, no search-triggering
+    filter) carrying an explicit ``Hint.GROUP_BY`` must resolve to PG the
+    same way a SEARCH-routed group_by request does (#2829) — Elasticsearch
+    has no GROUP BY implementation. Mirrors
+    ``test_default_items_filtered_search_resolves_es_first``'s matcher but
+    against the real ``Operation.READ`` entries (ES listed first by default)."""
+    from dynastore.modules.storage.hints import Hint
+    from dynastore.modules.storage.routing_config import (
+        ItemsRoutingConfig, Operation,
+    )
+    cfg = ItemsRoutingConfig()
+    read = cfg.operations[Operation.READ]
+    es = next(e for e in read if e.driver_ref == "items_elasticsearch_driver")
+    pg = next(e for e in read if e.driver_ref == "items_postgresql_driver")
+    assert Hint.GROUP_BY in pg.hints
+    assert Hint.GROUP_BY not in es.hints
+
+    def resolve(requested):
+        if not requested:
+            return [e.driver_ref for e in read]
+        matched = [
+            (i, e) for i, e in enumerate(read)
+            if requested.issubset(frozenset(e.hints))
+        ]
+        matched.sort(key=lambda t: (-len(t[1].hints), t[0]))
+        return [e.driver_ref for _, e in matched]
+
+    # Unhinted READ keeps declared order — ES first.
+    assert resolve(frozenset()) == [
+        "items_elasticsearch_driver", "items_postgresql_driver",
+    ]
+    # group_by is relational-only → PG even though ES is listed first for READ.
+    assert resolve(frozenset({Hint.GROUP_BY})) == ["items_postgresql_driver"]
+
+
 def test_collection_routing_default_write_is_pg_fatal():
     from dynastore.modules.storage.routing_config import (
         CollectionRoutingConfig, FailurePolicy, Operation, WriteMode,

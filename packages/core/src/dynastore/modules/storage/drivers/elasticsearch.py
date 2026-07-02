@@ -408,6 +408,24 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         """
         raise NotImplementedError
 
+    @staticmethod
+    def _reject_unsupported_group_by(request: Optional[QueryRequest]) -> None:
+        """Raise loudly when ``request`` carries a ``group_by`` (#2829).
+
+        None of the three ES items drivers (public STAC, private, envelope)
+        implement GROUP BY / DISTINCT — they read a plain page scan. Dispatch
+        now derives ``Hint.GROUP_BY`` from such requests so they route to a
+        capable driver (PostgreSQL) before reaching here, but a caller
+        invoking ``read_entities`` directly must not silently get back a
+        plausible-looking but wrong (ungrouped) result set.
+        """
+        if request is not None and request.group_by:
+            raise ValueError(
+                "Elasticsearch items driver does not support "
+                "QueryRequest.group_by; route this query to a "
+                "GROUP_BY-capable driver (e.g. PostgreSQL)."
+            )
+
     def _collection_routing(self, collection_id: Optional[str]) -> Optional[str]:
         """Resolve the ES ``_routing`` key for collection-scoped data ops.
 
@@ -1872,6 +1890,8 @@ class ItemsElasticsearchDriver(
         offset: int = 0,
         db_resource: Optional[Any] = None,
     ) -> AsyncIterator[Feature]:
+        self._reject_unsupported_group_by(request)
+
         from dynastore.modules.storage.routing_config import (
             get_output_transformers_for_search,
         )

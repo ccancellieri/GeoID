@@ -302,6 +302,7 @@ class ItemsElasticsearchPrivateDriver(
         offset: int = 0,
         db_resource: Optional[Any] = None,
     ) -> AsyncIterator[Feature]:
+        self._reject_unsupported_group_by(request)
 
         index_name = self._items_index_name(catalog_id)
         es = self._get_client()

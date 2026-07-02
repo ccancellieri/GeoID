@@ -851,25 +851,57 @@ class GeometriesSidecar(SidecarProtocol):
             sort_fields = {s.field for s in (request.sort or [])} if hasattr(request, "sort") and request.sort else set()
             all_needed = requested | filter_fields | sort_fields
 
-            if not skip_geom and (
-                self.config.geom_column in all_needed
-                or "geometry" in all_needed
-                or "*" in requested
-                or not requested
+            # #2829: a GROUP BY request must not pull in geometry/bbox/H3/S2/
+            # statistics columns that are neither grouped nor aggregated —
+            # PostgreSQL rejects any SELECT-list column that isn't. When
+            # ``group_by`` is set, ``_include`` narrows inclusion to exactly
+            # those field names and ignores ``default`` (the ordinary
+            # per-field requested/filter/sort/wildcard/empty-select rule
+            # below, preserved as-is for the non-grouped case).
+            group_by_fields = set(request.group_by) if request.group_by else None
+
+            def _include(*names: str, default: bool) -> bool:
+                if group_by_fields is not None:
+                    return any(n in group_by_fields for n in names)
+                return default
+
+            if not skip_geom and _include(
+                self.config.geom_column,
+                "geometry",
+                default=(
+                    self.config.geom_column in all_needed
+                    or "geometry" in all_needed
+                    or "*" in requested
+                    or not requested
+                ),
             ):
                 fields.append(f"ST_AsGeoJSON({alias}.{self.config.geom_column})::jsonb as {self.config.geom_column}")
 
-            if self.config.bbox_column and ("bbox" in all_needed or self.config.bbox_column in all_needed or "*" in requested):
+            if self.config.bbox_column and _include(
+                "bbox",
+                self.config.bbox_column,
+                default=(
+                    "bbox" in all_needed
+                    or self.config.bbox_column in all_needed
+                    or "*" in requested
+                ),
+            ):
                 fields.append(f"ST_AsGeoJSON({alias}.{self.config.bbox_column})::jsonb as {self.config.bbox_column}")
 
             if self.config.h3_resolutions:
                 for res in self.config.h3_resolutions:
-                    if f"h3_res{res}" in all_needed or "*" in requested:
+                    if _include(
+                        f"h3_res{res}",
+                        default=(f"h3_res{res}" in all_needed or "*" in requested),
+                    ):
                         fields.append(f"{alias}.h3_res{res} as h3_res{res}")
 
             if self.config.s2_resolutions:
                 for res in self.config.s2_resolutions:
-                    if f"s2_res{res}" in all_needed or "*" in requested:
+                    if _include(
+                        f"s2_res{res}",
+                        default=(f"s2_res{res}" in all_needed or "*" in requested),
+                    ):
                         fields.append(f"{alias}.s2_res{res} as s2_res{res}")
 
             # Add Statistics if requested — overlay-driven, COLUMNAR fields
@@ -877,14 +909,17 @@ class GeometriesSidecar(SidecarProtocol):
             # ``geom_stats`` column.
             for f in self._columnar_fields():
                 key = f.resolved_name
-                if key not in all_needed and "*" not in requested:
+                if not _include(
+                    key, default=(key in all_needed or "*" in requested)
+                ):
                     continue
                 if f.kind == ComputedKind.CENTROID:
                     fields.append(self._centroid_select_field(f, alias))
                 else:
                     fields.append(f"{alias}.{key} as {_quote_ident(key)}")
-            if self._has_jsonb_stats() and (
-                "geom_stats" in all_needed or "*" in requested
+            if self._has_jsonb_stats() and _include(
+                "geom_stats",
+                default=("geom_stats" in all_needed or "*" in requested),
             ):
                 fields.append(f"{alias}.geom_stats as geom_stats")
 

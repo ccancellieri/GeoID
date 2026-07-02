@@ -691,7 +691,22 @@ class QueryOptimizer:
         select_fields = []
 
         if any(sel.field == "*" for sel in query.select):
-            select_fields.append("h.*")
+            # #2829: a wildcard select is the DEFAULT ``QueryRequest.select``
+            # (the ``select`` validator coerces any falsy value, including an
+            # omitted/empty list, to ``[FieldSelection(field="*")]``), so a
+            # caller building ``QueryRequest(group_by=[...])`` without
+            # separately naming the grouped field lands here — not in the
+            # dead-code "empty select" branch below. ``h.*`` unconditionally
+            # expands to every hub column (geoid, deleted_at, ...), none of
+            # which are grouped, so it — and the sidecar wildcard expansion a
+            # few lines down — must be skipped for a GROUP BY request. Sidecar
+            # columns instead come from the narrowed "selective mode" (see
+            # ``get_select_fields``'s ``group_by``-aware gating), which
+            # restricts to exactly the grouped fields; the group_by projection
+            # guarantee below fills in anything neither h.* nor a sidecar
+            # contributes (e.g. a JSONB-dynamic field with no static column).
+            if not query.group_by:
+                select_fields.append("h.*")
             # Collect the set of fields explicitly overridden by non-* FieldSelections
             # AND by raw_selects entries (used by the MVT transform to inject
             # ``ST_AsMVTGeom(...) AS geom``), so sidecar expansion can skip them
@@ -710,7 +725,8 @@ class QueryOptimizer:
                 if sidecar:
                     sc_alias = f"sc_{sidecar.sidecar_id}"
                     for f in sidecar.get_select_fields(
-                        request=query, sidecar_alias=sc_alias, include_all=True
+                        request=query, sidecar_alias=sc_alias,
+                        include_all=not query.group_by,
                     ):
                         logical_name = _extract_alias(f)
                         if logical_name in explicit_field_names:
@@ -756,11 +772,30 @@ class QueryOptimizer:
         else:
             # Always check if geoid is explicitly requested or aggregation implies it
             has_aggregations = any(sel.aggregation for sel in query.select)
-            if not has_aggregations and "geoid" not in [s.field for s in query.select]:
-                # Only add geoid implicit selection if no aggregations (don't break GROUP BY)
+            if (
+                not has_aggregations
+                and not query.group_by
+                and "geoid" not in [s.field for s in query.select]
+            ):
+                # Only add the implicit geoid selection when nothing forces a
+                # GROUP BY — an explicit `query.group_by` builds its own GROUP
+                # BY clause below from exactly the requested fields, and an
+                # ungrouped h.geoid slipped into SELECT alongside it violates
+                # PostgreSQL's GROUP BY rule (#2829): "column h.geoid must
+                # appear in the GROUP BY clause or be used in an aggregate
+                # function".
                 select_fields.append("h.geoid")
 
             for sel in query.select:
+                if query.group_by and sel.field not in query.group_by and not sel.aggregation:
+                    # #2829: a selected field that is neither grouped nor
+                    # aggregated cannot appear in SELECT alongside an explicit
+                    # GROUP BY — PostgreSQL rejects it ("column ... must
+                    # appear in the GROUP BY clause or be used in an
+                    # aggregate function"). Drop it from the projection
+                    # rather than erroring on the combination.
+                    continue
+
                 if sel.field == "geoid":
                     select_fields.append("h.geoid")
                     continue
@@ -802,6 +837,29 @@ class QueryOptimizer:
                 # Apply alias
                 alias = sel.alias or sel.field
                 select_fields.append(f"{expr} as {_quote_alias(alias)}")
+
+        # #2829: every GROUP BY field must reach the SELECT list, even when
+        # the caller did not also name it in ``query.select`` (e.g. the
+        # region-mapping-style distinct-values read: ``select=[]``,
+        # ``group_by=["region"]`` — group by a property without separately
+        # re-selecting it). Without this, such a request built an empty (or
+        # group_by-field-less) SELECT list — a SQL syntax error, not merely
+        # a grouping error. Fields already reaching SELECT via an explicit
+        # ``FieldSelection`` (checked by output alias, matching the explicit
+        # form's own ``<expr> as "<name>"`` rendering) are not duplicated.
+        if query.group_by:
+            already_selected = {_extract_alias(f) for f in select_fields}
+            for gb_field in query.group_by:
+                if gb_field in already_selected:
+                    continue
+                if gb_field == "geoid":
+                    select_fields.append("h.geoid")
+                elif gb_field in self.field_index:
+                    _, gb_field_def = self.field_index[gb_field]
+                    select_fields.append(
+                        f"{gb_field_def.sql_expression} as {_quote_alias(gb_field)}"
+                    )
+                already_selected.add(gb_field)
 
         if query.raw_selects:
             select_fields.extend(query.raw_selects)
@@ -1055,7 +1113,14 @@ class QueryOptimizer:
                     feature_id_expr = f"COALESCE({sc_alias}.{sidecar.feature_id_field_name}, h.geoid::text)"
                     break
 
-        if not any("AS id" in f or f.rstrip().endswith(" id") for f in select_fields):
+        # Skip the implicit "AS id" projection for a GROUP BY request (#2829):
+        # ``feature_id_expr`` is a per-row identity (h.geoid, or a COALESCE
+        # against it) that is neither one of the requested group_by fields nor
+        # aggregated, so PostgreSQL rejects it the same way it rejects the
+        # implicit geoid selection above.
+        if not query.group_by and not any(
+            "AS id" in f or f.rstrip().endswith(" id") for f in select_fields
+        ):
             select_fields.append(f"{feature_id_expr} AS id")
 
         # Filter by item_ids using the resolved feature-ID expression.

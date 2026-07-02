@@ -735,7 +735,15 @@ class ItemsRoutingConfig(_RoutingConfigBase):
                 ),
                 OperationDriverEntry(
                     driver_ref="items_postgresql_driver",
-                    hints={Hint.GEOMETRY_EXACT, Hint.TILES, Hint.JOIN},
+                    # Hint.GROUP_BY mirrors the SEARCH PG entry below: a plain
+                    # browse with a group_by (_pick_operation → READ, no
+                    # search-triggering filter) must resolve to PG the same
+                    # way a SEARCH-routed group_by request does — Elasticsearch
+                    # has no GROUP BY implementation (#2829).
+                    hints={
+                        Hint.GEOMETRY_EXACT, Hint.TILES, Hint.JOIN,
+                        Hint.GROUP_BY,
+                    },
                     on_failure=FailurePolicy.FATAL,
                     source="auto",
                 ),

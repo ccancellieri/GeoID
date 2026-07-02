@@ -871,6 +871,15 @@ class ItemsIcebergDriver(TypedDriver[ItemsIcebergDriverConfig], ModuleProtocol):
         # (geoid#1643). The restore_transform_chain is wired only on
         # Elasticsearch read paths; the routing-config validator emits a WARN
         # if output_transformers are declared against a non-ES driver.
+        if request is not None and request.group_by:
+            # #2829: this driver declares Hint.GROUP_BY in supported_hints but
+            # does not implement grouping — raise rather than silently return
+            # an ungrouped scan that looks like a valid result.
+            raise ValueError(
+                "ItemsIcebergDriver does not support QueryRequest.group_by; "
+                "route this query to a GROUP_BY-capable driver (e.g. PostgreSQL)."
+            )
+
         loc = await self._get_location_async(catalog_id, collection_id)
         if not loc:
             return

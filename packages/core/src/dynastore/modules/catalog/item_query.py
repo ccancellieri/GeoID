@@ -103,6 +103,26 @@ def _pick_operation(request: Optional[QueryRequest]) -> str:
     return Operation.READ
 
 
+def _derive_hints_from_request(
+    request: Optional[QueryRequest], hints: "FrozenSet[Hint]" = frozenset(),
+) -> "FrozenSet[Hint]":
+    """Union caller-supplied ``hints`` with hints implied by the request shape.
+
+    A non-empty ``request.group_by`` adds :attr:`Hint.GROUP_BY` so driver
+    resolution (:func:`dynastore.modules.storage.router.get_driver`) prefers a
+    GROUP_BY-capable entry — the default routing config declares it only on
+    the PostgreSQL entry — instead of dispatching to whatever driver SEARCH/
+    READ would otherwise pick (typically Elasticsearch), which silently
+    ignores ``group_by`` (#2829). Shared by every dispatch entry point that
+    forwards a ``QueryRequest`` to :func:`_try_driver_dispatch`.
+    """
+    from dynastore.modules.storage.hints import Hint
+
+    if request is not None and request.group_by:
+        return frozenset(hints) | {Hint.GROUP_BY}
+    return frozenset(hints)
+
+
 def is_query_fallback_driver(driver: Any) -> bool:
     """True when a resolved items driver is the read-primary PG fallback.
 
@@ -1554,7 +1574,7 @@ class ItemQueryMixin:
         offset = request.offset if request and request.offset else 0
         driver_response = await _try_driver_dispatch(
             catalog_id, collection_id, operation, request, limit, offset,
-            hints=hints,
+            hints=_derive_hints_from_request(request, hints),
         )
         if driver_response is not None:
             return driver_response
@@ -1807,6 +1827,7 @@ class ItemQueryMixin:
         offset = request.offset if request and request.offset else 0
         driver_response = await _try_driver_dispatch(
             catalog_id, collection_id, Operation.SEARCH, request, limit, offset,
+            hints=_derive_hints_from_request(request),
         )
         if driver_response is not None:
             # Collect the async stream into a list (search_items contract returns List).
