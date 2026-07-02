@@ -22,7 +22,9 @@ Drives deadline-insensitive periodic jobs off ``tasks.maintenance_schedule``
 (jobs 4–12 from the #1911 spec), replacing ALL pg_cron registrations:
 events DLQ/reaper/alert, IAM prune, and the three task-queue jobs (stuck-task
 reaper, partition-create, retention). Tenant-logs / system-logs prune were
-retired with PG log persistence (#2749) — logs are Elasticsearch-only now.
+retired with PG log persistence (#2749) — logs are Elasticsearch-only now,
+and this supervisor also drives their ES-side retention (``es_logs_retention``,
+#2797), the one job in this module with no PG work of its own.
 
 Architecture contract
 ---------------------
@@ -148,6 +150,7 @@ JOB_EVENTS_RETENTION = "events_retention"
 JOB_STORAGE_PARTITION_CREATE = "storage_partition_create"
 JOB_STORAGE_RETENTION = "storage_retention"
 JOB_HEALTH_ALERT = "health_alert"
+JOB_ES_LOGS_RETENTION = "es_logs_retention"
 
 # Obsolete supervisor job names retired by #1807 renames. An environment that
 # booted a prior build holds these rows in tasks.maintenance_schedule;
@@ -202,6 +205,7 @@ _CADENCE_EVENTS_RETENTION = 86400          # daily
 _CADENCE_STORAGE_PARTITION_CREATE = 86400    # daily
 _CADENCE_STORAGE_RETENTION = 86400           # daily
 _CADENCE_HEALTH_ALERT = 300                  # every 5 minutes
+_CADENCE_ES_LOGS_RETENTION = 86400           # daily
 
 # Bounded-batch DELETE size — no single DELETE removes more than this many rows.
 _PRUNE_BATCH = 1000
@@ -734,6 +738,29 @@ async def _run_health_alert(conn: Any) -> int:
 
 
 # ---------------------------------------------------------------------------
+# ES log index retention (#2797)
+# ---------------------------------------------------------------------------
+
+
+async def _run_es_logs_retention() -> int:
+    """Delete monthly ES log indices older than ``LogServiceConfig.retention_months``.
+
+    ES-only work — no PG connection involved, unlike every other job in this
+    dispatch table. ``retention_months`` is re-read on every tick (mirrors
+    ``_run_health_alert``'s ``load_health_alert_config()`` — Mutable fields
+    are meant to take effect without a restart), not captured once at
+    startup like the task reaper's ``hard_cap``. Lazy-imported so
+    ``modules/catalog`` stays importable on a SCOPE without
+    ``module_elasticsearch`` installed.
+    """
+    from dynastore.modules.catalog.log_service_config import load as load_log_service_config
+    from dynastore.modules.elasticsearch.log_retention import run_es_logs_retention
+
+    cfg = await load_log_service_config()
+    return await run_es_logs_retention(cfg.retention_months)
+
+
+# ---------------------------------------------------------------------------
 # Job dispatch table
 # ---------------------------------------------------------------------------
 
@@ -766,6 +793,8 @@ async def _dispatch_job(job_name: str, conn: Any, config: dict[str, Any]) -> int
         return await _run_storage_retention(conn)
     if job_name == JOB_HEALTH_ALERT:
         return await _run_health_alert(conn)
+    if job_name == JOB_ES_LOGS_RETENTION:
+        return await _run_es_logs_retention()
     raise ValueError(f"maintenance_supervisor: unknown job_name {job_name!r}")
 
 
@@ -999,6 +1028,7 @@ async def register_supervisor_jobs(engine: Any) -> None:
         (JOB_STORAGE_PARTITION_CREATE, _CADENCE_STORAGE_PARTITION_CREATE),
         (JOB_STORAGE_RETENTION, _CADENCE_STORAGE_RETENTION),
         (JOB_HEALTH_ALERT, _CADENCE_HEALTH_ALERT),
+        (JOB_ES_LOGS_RETENTION, _CADENCE_ES_LOGS_RETENTION),
     ]
     async with managed_transaction(engine) as conn:
         for job_name, cadence in jobs:

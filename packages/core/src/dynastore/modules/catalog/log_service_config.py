@@ -79,6 +79,19 @@ class LogServiceConfig(PluginConfig):
         ),
     )
 
+    retention_months: Mutable[int] = Field(
+        default=6,
+        ge=1,
+        le=60,
+        description=(
+            "Number of full calendar months of monthly ES log indices "
+            "(`{prefix}-logs-YYYY.MM`) to retain. The `es_logs_retention` "
+            "maintenance-supervisor job drops indices whose month is older "
+            "than this window (#2797). Read hot on each job tick, same as "
+            "buffer_max_size."
+        ),
+    )
+
 
 # Auto-registers via PluginConfig.__init_subclass__.
 

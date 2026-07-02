@@ -57,6 +57,7 @@ from dynastore.modules.catalog.db_init.maintenance_schedule import (
     _RECLAIM_STALE_JOBS,
 )
 from dynastore.modules.catalog.maintenance_supervisor import (
+    JOB_ES_LOGS_RETENTION,
     JOB_IAM_PRUNE,
     JOB_STORAGE_PARTITION_CREATE,
     JOB_STORAGE_RETENTION,
@@ -66,6 +67,7 @@ from dynastore.modules.catalog.maintenance_supervisor import (
     JOB_EVENTS_PARTITION_CREATE,
     JOB_EVENTS_RETENTION,
     MaintenanceSupervisor,
+    _CADENCE_ES_LOGS_RETENTION,
     _CADENCE_IAM_PRUNE,
     _CADENCE_TASK_PARTITION_CREATE,
     _CADENCE_TASK_REAPER,
@@ -73,6 +75,8 @@ from dynastore.modules.catalog.maintenance_supervisor import (
     _STALE_AFTER_SECONDS,
     _SUPERSEDED_CRON_JOBS,
     _SUPERSEDED_TENANT_LOG_PREFIX,
+    _dispatch_job,
+    _run_es_logs_retention,
     _run_health_alert,
     _run_iam_prune,
     build_supervisor_config,
@@ -478,7 +482,8 @@ def test_build_supervisor_config_provides_task_reaper_hard_cap():
 
 @pytest.mark.asyncio
 async def test_register_supervisor_jobs_upserts_all_expected_jobs():
-    """register_supervisor_jobs upserts all 9 jobs (iam + 3 task + 4 events/storage partition+retention + health)."""
+    """register_supervisor_jobs upserts all 10 jobs (iam + 3 task + 4 events/storage
+    partition+retention + health + es_logs_retention)."""
     engine = _fake_engine()
     upserted: list[tuple[str, int]] = []
 
@@ -528,9 +533,11 @@ async def test_register_supervisor_jobs_upserts_all_expected_jobs():
         JOB_STORAGE_PARTITION_CREATE,
         JOB_STORAGE_RETENTION,
         JOB_HEALTH_ALERT,
+        JOB_ES_LOGS_RETENTION,
     ])
 
     cadence_map = dict(upserted)
+    assert cadence_map[JOB_ES_LOGS_RETENTION] == _CADENCE_ES_LOGS_RETENTION
     assert cadence_map[JOB_IAM_PRUNE] == _CADENCE_IAM_PRUNE
     assert cadence_map[JOB_TASK_REAPER] == _CADENCE_TASK_REAPER
     assert cadence_map[JOB_TASK_PARTITION_CREATE] == _CADENCE_TASK_PARTITION_CREATE
@@ -955,5 +962,56 @@ async def test_run_health_alert_no_alerts_when_no_errors():
             alerts = await _run_health_alert(conn)
 
     assert alerts == 0, f"Expected 0 alerts, got {alerts}"
+
+
+# ---------------------------------------------------------------------------
+# es_logs_retention job (#2797) — ES-only, no PG connection needed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_job_es_logs_retention_calls_run_es_logs_retention():
+    """_dispatch_job routes JOB_ES_LOGS_RETENTION to _run_es_logs_retention,
+    ignoring the conn/config args every other job branch uses."""
+    conn = AsyncMock()
+    with patch(
+        "dynastore.modules.catalog.maintenance_supervisor._run_es_logs_retention",
+        new=AsyncMock(return_value=3),
+    ) as mock_run:
+        rows = await _dispatch_job(JOB_ES_LOGS_RETENTION, conn, {"hard_cap": 5})
+
+    assert rows == 3
+    mock_run.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_run_es_logs_retention_reads_config_and_delegates():
+    """_run_es_logs_retention loads LogServiceConfig fresh (hot-reloadable,
+    like HealthAlertConfig) and forwards retention_months to the ES driver."""
+    from dynastore.modules.catalog.log_service_config import LogServiceConfig
+
+    cfg = LogServiceConfig(retention_months=9)
+
+    with (
+        patch(
+            "dynastore.modules.catalog.log_service_config.load",
+            new=AsyncMock(return_value=cfg),
+        ),
+        patch(
+            "dynastore.modules.elasticsearch.log_retention.run_es_logs_retention",
+            new=AsyncMock(return_value=2),
+        ) as mock_run,
+    ):
+        rows = await _run_es_logs_retention()
+
+    assert rows == 2
+    mock_run.assert_awaited_once_with(9)
+
+
+def test_es_logs_retention_job_registered_in_dispatch_table():
+    """JOB_ES_LOGS_RETENTION must be a known job name, not fall through to
+    the ValueError branch of _dispatch_job."""
+    assert JOB_ES_LOGS_RETENTION == "es_logs_retention"
+    assert _CADENCE_ES_LOGS_RETENTION == 86400
 
 

@@ -36,7 +36,12 @@ if TYPE_CHECKING:
 
 from dynastore.models.protocols.logs import LogBackendProtocol
 from .client import get_client, get_index_prefix
-from .mappings import LOG_INDEX_SETTINGS, LOG_MAPPING, get_log_index_name
+from .mappings import (
+    LOG_INDEX_SETTINGS,
+    LOG_MAPPING,
+    get_log_index_name,
+    get_log_read_index_target,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,23 +55,41 @@ def _scrub_pii(text: Optional[str]) -> str:
     return text
 
 
+def _scrub_pii_deep(value: Any) -> Any:
+    """Recursively apply :func:`_scrub_pii` to every string leaf of *value*.
+
+    ``request_context`` is a nested dict (headers, query params, URL) that
+    can carry the same free-text PII patterns ``message`` is scrubbed for
+    (#2798) — a shallow scrub would miss anything not at the top level.
+    """
+    if isinstance(value, str):
+        return _scrub_pii(value)
+    if isinstance(value, dict):
+        return {k: _scrub_pii_deep(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub_pii_deep(v) for v in value]
+    return value
+
+
 class ElasticsearchLogBackend(LogBackendProtocol):
     """Batch log writer to OpenSearch/Elasticsearch."""
 
     def __init__(self):
         self._prefix = None
-        # Set once the index is confirmed to exist (created by us or found
-        # already present). Avoids an indices.exists() round-trip on every
-        # batch — the index is never dropped by this backend at runtime, so
-        # a positive result stays valid for the life of the process.
-        self._index_ensured = False
+        # Names of monthly indices confirmed to exist (created by us or
+        # found already present). Avoids an indices.exists() round-trip on
+        # every batch — once ensured, a given month's index is never dropped
+        # by this backend at runtime, so a positive result stays valid for
+        # the rest of that month. Keyed per-index (not a single bool) since
+        # the active index name rolls over every calendar month (#2797).
+        self._ensured_indices: set = set()
 
     @property
     def name(self) -> str:
         return "elasticsearch"
 
     async def _ensure_index(self, es, index_name: str) -> None:
-        if self._index_ensured:
+        if index_name in self._ensured_indices:
             return
         if not await es.indices.exists(index=index_name):
             await es.indices.create(
@@ -74,7 +97,7 @@ class ElasticsearchLogBackend(LogBackendProtocol):
                 body={"mappings": LOG_MAPPING, "settings": LOG_INDEX_SETTINGS},
             )
             logger.info("Created log index '%s'.", index_name)
-        self._index_ensured = True
+        self._ensured_indices.add(index_name)
 
     async def write_batch(self, entries: "List[LogEntryCreate]") -> Dict[str, Any]:
         """Write a batch of log entries to ES via bulk API."""
@@ -111,6 +134,17 @@ class ElasticsearchLogBackend(LogBackendProtocol):
                     "message": _scrub_pii(entry.message),
                     "timestamp": entry_ts,
                 }
+                # Structured caller-attached fields (#2798) — exception
+                # handlers stash these under `details`; older call sites use
+                # the key `traceback` instead of `stacktrace`, so accept both
+                # rather than silently dropping their payload.
+                details = getattr(entry, "details", None) or {}
+                stacktrace = details.get("stacktrace") or details.get("traceback")
+                if stacktrace:
+                    doc["stacktrace"] = _scrub_pii(stacktrace)
+                request_context = details.get("request_context")
+                if request_context:
+                    doc["request_context"] = _scrub_pii_deep(request_context)
                 action: Dict[str, Any] = {"_index": index_name}
                 if entry_id:
                     action["_id"] = entry_id
@@ -158,23 +192,16 @@ class ElasticsearchLogBackend(LogBackendProtocol):
         index, query error) — reads degrade silently, matching
         ``write_batch``'s "skipped" posture.
 
-        Note: the current mapping does not index ``details`` /
-        ``stacktrace`` / ``request_context`` — only ``message`` survives.
-        Callers get those keys back as ``None``.
+        Reads span every monthly log index plus the pre-#2797 flat index
+        (``get_log_read_index_target``, #2797) — ``ignore_unavailable=True``
+        means a month with no writes yet (or a fresh cluster with no log
+        index at all) yields an empty result instead of an error.
         """
         es = get_client()
         if es is None:
             return []
 
-        index_name = get_log_index_name(get_index_prefix())
-        if not self._index_ensured:
-            try:
-                if not await es.indices.exists(index=index_name):
-                    return []
-                self._index_ensured = True
-            except Exception as exc:
-                logger.warning("ElasticsearchLogBackend.search_logs: exists check failed: %s", exc)
-                return []
+        index_target = get_log_read_index_target(get_index_prefix())
 
         must: List[Dict[str, Any]] = []
         if catalog_id:
@@ -204,7 +231,9 @@ class ElasticsearchLogBackend(LogBackendProtocol):
         }
 
         try:
-            resp = await es.search(index=index_name, body=body)
+            resp = await es.search(
+                index=index_target, body=body, params={"ignore_unavailable": "true"}
+            )
         except Exception as exc:
             logger.warning("ElasticsearchLogBackend.search_logs failed: %s", exc)
             return []
@@ -224,29 +253,44 @@ class ElasticsearchLogBackend(LogBackendProtocol):
                     "message": src.get("message"),
                     "timestamp": src.get("timestamp"),
                     "details": None,
-                    "stacktrace": None,
-                    "request_context": None,
+                    "stacktrace": src.get("stacktrace"),
+                    "request_context": src.get("request_context"),
                 }
             )
         return results
 
     async def get_log(self, log_id: str) -> Optional[Dict[str, Any]]:
         """Fetch a single log entry by its ES document id (the same ``id``
-        ``search_logs`` returns). Returns ``None`` if unavailable or not found."""
+        ``search_logs`` returns). Returns ``None`` if unavailable or not found.
+
+        A monthly-indexed doc's exact index name isn't known from the id
+        alone (#2797), so this is a size-1 ``ids`` query against
+        :func:`~.mappings.get_log_read_index_target` rather than a
+        single-index ``GET`` — that also naturally covers the pre-#2797 flat
+        index.
+        """
         es = get_client()
         if es is None:
             return None
 
-        index_name = get_log_index_name(get_index_prefix())
+        index_target = get_log_read_index_target(get_index_prefix())
         try:
-            resp = await es.get(index=index_name, id=log_id)
+            resp = await es.search(
+                index=index_target,
+                body={"query": {"ids": {"values": [log_id]}}, "size": 1},
+                params={"ignore_unavailable": "true"},
+            )
         except Exception as exc:
             logger.debug("ElasticsearchLogBackend.get_log: %s not found (%s)", log_id, exc)
             return None
 
-        src = resp.get("_source", {})
+        hits = resp.get("hits", {}).get("hits", [])
+        if not hits:
+            return None
+        hit = hits[0]
+        src = hit.get("_source", {})
         return {
-            "id": resp.get("_id"),
+            "id": hit.get("_id"),
             "catalog_id": src.get("catalog_id"),
             "collection_id": src.get("collection_id"),
             "event_type": src.get("event_type"),
@@ -255,6 +299,6 @@ class ElasticsearchLogBackend(LogBackendProtocol):
             "message": src.get("message"),
             "timestamp": src.get("timestamp"),
             "details": None,
-            "stacktrace": None,
-            "request_context": None,
+            "stacktrace": src.get("stacktrace"),
+            "request_context": src.get("request_context"),
         }

@@ -42,7 +42,8 @@ Design philosophy (post-#887):
     entries are unaffected (they carry no ``container`` attribute and
     continue to land in ``properties``).
 """
-from typing import Any, Dict, List
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 from dynastore.modules.elasticsearch.items_projection import (
     LANGUAGE_ANALYZERS,
@@ -846,9 +847,43 @@ def get_assets_index_name(prefix: str, catalog_id: str) -> str:
 
 
 
-def get_log_index_name(prefix: str) -> str:
-    """Return the name of the logs index."""
-    return f"{prefix}-logs"
+_LOG_INDEX_MONTH_FORMAT = "%Y.%m"
+
+
+def get_log_index_name(prefix: str, when: Optional[datetime] = None) -> str:
+    """Return the monthly log index active at *when* (default: now, UTC).
+
+    Logs write to one index per calendar month — ``{prefix}-logs-YYYY.MM``
+    (#2797) — so a single month's volume never bloats one segment set and
+    whole months can be dropped by the ``es_logs_retention`` maintenance job
+    (``modules/catalog/maintenance_supervisor.py``). Read/search call sites
+    must never target this directly — use :func:`get_log_index_pattern` (or
+    :func:`get_log_read_index_target` to also cover the pre-#2797 flat
+    index) so a query sees every live month.
+    """
+    ts = when or datetime.now(timezone.utc)
+    return f"{prefix}-logs-{ts.strftime(_LOG_INDEX_MONTH_FORMAT)}"
+
+
+def get_log_index_pattern(prefix: str) -> str:
+    """Wildcard spanning every monthly log index for *prefix*.
+
+    Used by the retention job, which only ever needs to enumerate/delete
+    monthly indices — the pre-#2797 flat ``{prefix}-logs`` index (if still
+    present) never matches this pattern and is never touched here.
+    """
+    return f"{prefix}-logs-*"
+
+
+def get_log_read_index_target(prefix: str) -> str:
+    """Index target for log reads/searches: every monthly index, plus the
+    pre-#2797 flat ``{prefix}-logs`` index (comma-separated multi-target).
+
+    The flat index name has no trailing ``-YYYY.MM``, so it does not match
+    :func:`get_log_index_pattern`'s wildcard — any pre-#2797 docs it still
+    holds would otherwise silently vanish from search/get results.
+    """
+    return f"{prefix}-logs,{get_log_index_pattern(prefix)}"
 
 
 LOG_MAPPING: Dict[str, Any] = {
@@ -861,6 +896,14 @@ LOG_MAPPING: Dict[str, Any] = {
         "is_system": {"type": "boolean"},
         "message": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
         "timestamp": {"type": "date"},
+        # Retrieval-only (#2798): never tokenized/searched, just stored so the
+        # `log_reference` deep link on a 5xx response can show the traceback
+        # that motivated the lookup.
+        "stacktrace": {"type": "text", "index": False},
+        # method/path/status/caller id, etc. `flattened` is the same
+        # unknown-tail idiom used by the items/collections `extras` lane —
+        # ES-only; _backend_compat rewrites it to `flat_object` on OpenSearch.
+        "request_context": {"type": "flattened"},
     },
 }
 

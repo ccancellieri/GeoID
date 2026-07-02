@@ -226,19 +226,30 @@ class ElasticsearchModule(ModuleProtocol):
             # available when the logs extension is installed in this SCOPE.
             if importlib.util.find_spec("dynastore.extensions.logs") is not None:
                 from dynastore.modules.elasticsearch.log_backend import ElasticsearchLogBackend
-                from dynastore.modules.elasticsearch.mappings import LOG_MAPPING, get_log_index_name
+                from dynastore.modules.elasticsearch.mappings import (
+                    LOG_INDEX_SETTINGS,
+                    LOG_MAPPING,
+                    get_log_index_name,
+                )
 
                 log_backend = ElasticsearchLogBackend()
                 from dynastore.tools.discovery import register_plugin
                 register_plugin(log_backend)
 
-                # Ensure log index exists
+                # Ensure this month's log index exists (#2797: monthly
+                # indices — get_log_index_name() defaults to "now", so this
+                # warms up the current month at every boot; write_batch also
+                # ensures it lazily should this run straddle a month
+                # rollover).
                 es_for_log = es_client.get_client()
                 if es_for_log is not None:
                     index_name = get_log_index_name(es_client.get_index_prefix())
                     try:
                         if not await es_for_log.indices.exists(index=index_name):
-                            await es_for_log.indices.create(index=index_name, body={"mappings": LOG_MAPPING})
+                            await es_for_log.indices.create(
+                                index=index_name,
+                                body={"mappings": LOG_MAPPING, "settings": LOG_INDEX_SETTINGS},
+                            )
                             logger.info("ElasticsearchModule: Created log index '%s'.", index_name)
                     except Exception as exc:
                         logger.warning(
