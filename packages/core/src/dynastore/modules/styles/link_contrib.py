@@ -132,17 +132,15 @@ class StylesLinkContributor:
 
 
 def _styles_list_href(ref: ResourceRef) -> str:
-    base = (ref.base_url or "").rstrip("/")
     return (
-        f"{base}/styles/catalogs/{ref.catalog_id}"
+        f"{ref.base}/styles/catalogs/{ref.catalog_id}"
         f"/collections/{ref.collection_id}/styles"
     )
 
 
 def _style_href(ref: ResourceRef, style_id: str) -> str:
-    base = (ref.base_url or "").rstrip("/")
     return (
-        f"{base}/styles/catalogs/{ref.catalog_id}"
+        f"{ref.base}/styles/catalogs/{ref.catalog_id}"
         f"/collections/{ref.collection_id}/styles/{style_id}"
     )
 

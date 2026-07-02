@@ -23,6 +23,16 @@ from pydantic import BaseModel, Field, ConfigDict
 import uuid
 
 class Link(BaseModel):
+    """OGC API Tiles link entry.
+
+    Deliberately distinct from the canonical ``dynastore.models.shared_models.Link``:
+    ``title`` here is a plain ``str``, not a ``LocalizedText``. The Tile Matrix
+    Set / tileset wire responses must never emit a language-keyed dict for a
+    link title — see ``tests/dynastore/extensions/tiles/unit/test_tms_link_wire_shape.py``.
+    Swapping to the canonical model would require routing every Tiles response
+    through the ``resolve_links``/i18n pipeline first; left as a follow-up.
+    """
+
     href: str
     rel: str
     type: Optional[str] = None

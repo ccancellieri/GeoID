@@ -41,6 +41,8 @@ from typing import (
     Literal,
     Mapping,
     Protocol,
+    Sequence,
+    Tuple,
     runtime_checkable,
 )
 
@@ -82,3 +84,70 @@ class LinkContributor(Protocol):
     priority: int
 
     def contribute_links(self, ref: ResourceRef) -> AsyncIterator[AnchoredLink]: ...
+
+
+class _ResourceRootLinkContributor:
+    """``LinkContributor`` for a collection-scoped ``resource_root`` link.
+
+    Built by :func:`make_resource_root_contributor` — see there for the
+    contract this class implements.
+    """
+
+    def __init__(
+        self,
+        *,
+        rel: str,
+        path_template: str,
+        methods: Sequence[Tuple[str, str]],
+        priority: int,
+    ) -> None:
+        self._rel = rel
+        self._path_template = path_template
+        self._methods = tuple(methods)
+        self.priority = priority
+
+    async def contribute_links(self, ref: ResourceRef) -> AsyncIterator[AnchoredLink]:
+        if ref.item_id is not None:
+            return  # resource_root links of this shape are collection-scoped
+        href = self._path_template.format(
+            base=ref.base, catalog_id=ref.catalog_id, collection_id=ref.collection_id,
+        )
+        for method, title in self._methods:
+            yield AnchoredLink(
+                anchor="resource_root",
+                rel=self._rel,
+                href=href,
+                title=title,
+                media_type="application/json",
+                extras={"method": method},
+            )
+
+
+def make_resource_root_contributor(
+    *,
+    rel: str,
+    path_template: str,
+    methods: Sequence[Tuple[str, str]],
+    priority: int,
+) -> LinkContributor:
+    """Build a ``LinkContributor`` for a simple, collection-scoped resource_root link.
+
+    Several extensions (Joins, the legacy DWH join surface, …) advertise one
+    endpoint per collection as a ``resource_root`` link and differ only in
+    ``rel``, ``href``, per-method ``title``, and priority. This factory covers
+    that shape so each extension only supplies its own values instead of
+    re-implementing the ``item_id`` guard and href assembly.
+
+    Args:
+        rel: The link relation to emit for every yielded link.
+        path_template: An ``str.format`` template rendered with ``base``
+            (``ref.base``), ``catalog_id``, and ``collection_id``.
+        methods: Ordered ``(http_method, title)`` pairs; one ``AnchoredLink``
+            is yielded per pair, all sharing the same ``rel`` and ``href``,
+            with ``extras={"method": http_method}``.
+        priority: The contributor's ``priority`` (matches the owning
+            extension's registration priority).
+    """
+    return _ResourceRootLinkContributor(
+        rel=rel, path_template=path_template, methods=methods, priority=priority,
+    )

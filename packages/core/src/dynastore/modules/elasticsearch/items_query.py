@@ -35,6 +35,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
+from dynastore.tools.ogc_common import parse_rfc3339_interval
+
 
 @dataclass(frozen=True)
 class EnvelopeFields:
@@ -128,13 +130,17 @@ def parse_sort(
 
 
 def parse_datetime_filter(datetime_str: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Convert a STAC datetime string to an ES range filter."""
+    """Convert a STAC datetime string to an ES range filter.
+
+    A bare instant (no ``"/"``) intentionally keeps its own term-or-lte-range
+    "should" query below rather than going through the shared interval split
+    — that behavior is specific to this driver. Only the ``"/"``-interval
+    branch reuses the shared ``".."``-open-bound parsing.
+    """
     if not datetime_str:
         return None
     if "/" in datetime_str:
-        parts = datetime_str.split("/")
-        gte = None if parts[0] == ".." else parts[0]
-        lte = None if parts[1] == ".." else parts[1]
+        gte, lte = parse_rfc3339_interval(datetime_str)
         r: Dict[str, Any] = {}
         if gte:
             r["gte"] = gte

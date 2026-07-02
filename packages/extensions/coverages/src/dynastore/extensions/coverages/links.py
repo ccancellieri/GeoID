@@ -27,6 +27,21 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from dynastore.models.protocols.link_contrib import AnchoredLink
+
+
+def _link_dict(link: AnchoredLink) -> Dict[str, Any]:
+    """Render an ``AnchoredLink`` as the coverage-metadata wire shape.
+
+    ``title`` is omitted (rather than emitted empty) to keep the wire shape
+    identical to the pre-``AnchoredLink`` raw-dict links, which never carried
+    a title.
+    """
+    d: Dict[str, Any] = {"rel": link.rel, "type": link.media_type, "href": link.href}
+    if link.title:
+        d["title"] = link.title
+    return d
+
 
 def build_coverage_links(
     *,
@@ -39,24 +54,27 @@ def build_coverage_links(
     cov_base = f"{base}/coverages/catalogs/{catalog_id}/collections/{collection_id}/coverage"
     styles_base = f"{base}/styles/catalogs/{catalog_id}/collections/{collection_id}/styles"
 
-    links: List[Dict[str, Any]] = [
-        {"rel": "self", "type": "application/json", "href": f"{cov_base}/metadata"},
-        {"rel": "data", "type": "image/tiff;application=geotiff", "href": cov_base},
-        {"rel": "describedby", "type": "application/json", "href": f"{cov_base}/domainset"},
-        {"rel": "describedby", "type": "application/json", "href": f"{cov_base}/rangetype"},
-        {"rel": "styles", "type": "application/json", "href": styles_base},
+    def _root(rel: str, media_type: str, href: str) -> AnchoredLink:
+        return AnchoredLink(
+            anchor="resource_root", rel=rel, href=href, title="", media_type=media_type,
+        )
+
+    links: List[AnchoredLink] = [
+        _root("self", "application/json", f"{cov_base}/metadata"),
+        _root("data", "image/tiff;application=geotiff", cov_base),
+        _root("describedby", "application/json", f"{cov_base}/domainset"),
+        _root("describedby", "application/json", f"{cov_base}/rangetype"),
+        _root("styles", "application/json", styles_base),
     ]
     if default_style_id:
         style_href = f"{styles_base}/{default_style_id}"
-        links.append({"rel": "style", "type": "application/json", "href": style_href})
-        links.append({
-            "rel": "style",
-            "type": "application/vnd.ogc.sld+xml;version=1.1",
-            "href": style_href,
-        })
-        links.append({
-            "rel": "http://www.opengis.net/def/rel/ogc/1.0/map",
-            "type": "image/png",
-            "href": f"{base}/maps/catalogs/{catalog_id}/collections/{collection_id}/map?style={default_style_id}",
-        })
-    return links
+        links.append(_root("style", "application/json", style_href))
+        links.append(_root("style", "application/vnd.ogc.sld+xml;version=1.1", style_href))
+        links.append(
+            _root(
+                "http://www.opengis.net/def/rel/ogc/1.0/map",
+                "image/png",
+                f"{base}/maps/catalogs/{catalog_id}/collections/{collection_id}/map?style={default_style_id}",
+            )
+        )
+    return [_link_dict(link) for link in links]

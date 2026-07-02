@@ -54,6 +54,16 @@ class ResourceRef:
     lang: Optional[str] = None
     extras: Mapping[str, Any] = field(default_factory=dict)
 
+    @property
+    def base(self) -> str:
+        """``base_url`` with any trailing slash stripped, tolerating ``None``.
+
+        Producers building hrefs from ``ref.base_url`` repeatedly did
+        ``(ref.base_url or "").rstrip("/")`` inline; this centralizes that
+        normalization so the rule lives in one place.
+        """
+        return (self.base_url or "").rstrip("/")
+
 
 @dataclass(frozen=True)
 class AssetLink:

@@ -29,6 +29,8 @@ from __future__ import annotations
 
 from typing import Optional, Tuple
 
+from dynastore.tools.ogc_common import parse_rfc3339_interval
+
 
 def parse_datetime_param(value: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     """Parse EDR datetime param → (start, end).
@@ -36,11 +38,4 @@ def parse_datetime_param(value: Optional[str]) -> Tuple[Optional[str], Optional[
     Returns (None, None) when value is empty.
     For instants returns (value, value).
     """
-    if not value:
-        return None, None
-    if "/" in value:
-        parts = value.split("/", 1)
-        start = parts[0] if parts[0] != ".." else None
-        end = parts[1] if parts[1] != ".." else None
-        return start, end
-    return value, value
+    return parse_rfc3339_interval(value)

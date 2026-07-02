@@ -27,6 +27,7 @@ from dynastore.modules.dggs.h3_indexer import (
     is_valid_cell,
     rect_bound_for_cell,
 )
+from dynastore.tools.ogc_common import parse_rfc3339_interval
 
 
 def bbox_for_zone(zone_id: str) -> Tuple[float, float, float, float]:
@@ -144,42 +145,24 @@ def _parse_datetime_filters(datetime_str: str) -> List[FilterCondition]:
             )
         ]
 
-    start_str, end_str = datetime_str.split("/")
-
-    start_dt = isoparse(start_str) if start_str != ".." else None
-    end_dt = isoparse(end_str) if end_str != ".." else None
+    start_str, end_str = parse_rfc3339_interval(datetime_str)
 
     filters = []
 
-    if start_dt and end_dt:
+    if start_str:
         filters.append(
             FilterCondition(
                 field="datetime",
                 operator=FilterOperator.GTE,
-                value=start_dt,
+                value=isoparse(start_str),
             )
         )
+    if end_str:
         filters.append(
             FilterCondition(
                 field="datetime",
                 operator=FilterOperator.LTE,
-                value=end_dt,
-            )
-        )
-    elif start_dt:
-        filters.append(
-            FilterCondition(
-                field="datetime",
-                operator=FilterOperator.GTE,
-                value=start_dt,
-            )
-        )
-    elif end_dt:
-        filters.append(
-            FilterCondition(
-                field="datetime",
-                operator=FilterOperator.LTE,
-                value=end_dt,
+                value=isoparse(end_str),
             )
         )
 

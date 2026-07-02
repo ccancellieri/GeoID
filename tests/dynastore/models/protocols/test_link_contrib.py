@@ -24,6 +24,7 @@ from dynastore.models.protocols.asset_contrib import ResourceRef
 from dynastore.models.protocols.link_contrib import (
     AnchoredLink,
     LinkContributor,
+    make_resource_root_contributor,
 )
 
 
@@ -68,3 +69,43 @@ def test_anchor_documents_supported_values():
             title="t",
             media_type="application/json",
         )
+
+
+@pytest.mark.asyncio
+async def test_resource_root_contributor_factory_yields_one_link_per_method():
+    contributor = make_resource_root_contributor(
+        rel="join",
+        path_template="{base}/join/catalogs/{catalog_id}/collections/{collection_id}/join",
+        methods=(("GET", "describe"), ("POST", "execute")),
+        priority=180,
+    )
+    assert isinstance(contributor, LinkContributor)
+    assert contributor.priority == 180
+
+    ref = ResourceRef(catalog_id="cat1", collection_id="col1", base_url="http://ex/")
+    links = [link async for link in contributor.contribute_links(ref)]
+
+    assert [link.title for link in links] == ["describe", "execute"]
+    assert [link.extras["method"] for link in links] == ["GET", "POST"]
+    for link in links:
+        assert link.anchor == "resource_root"
+        assert link.rel == "join"
+        assert link.href == "http://ex/join/catalogs/cat1/collections/col1/join"
+
+
+@pytest.mark.asyncio
+async def test_resource_root_contributor_factory_skips_item_scoped_refs():
+    contributor = make_resource_root_contributor(
+        rel="dwh-join",
+        path_template="{base}/dwh/catalogs/{catalog_id}/join",
+        methods=(("POST", "legacy join"),),
+        priority=100,
+    )
+    ref = ResourceRef(catalog_id="cat1", collection_id="col1", item_id="item1")
+    links = [link async for link in contributor.contribute_links(ref)]
+    assert links == []
+
+
+def test_resource_ref_base_strips_trailing_slash_and_tolerates_none():
+    assert ResourceRef(catalog_id="c", collection_id="col", base_url="http://ex/").base == "http://ex"
+    assert ResourceRef(catalog_id="c", collection_id="col", base_url="").base == ""
