@@ -1293,6 +1293,14 @@ class ItemsElasticsearchDriver(
         Batch-level via ``on_batch_conflict``:
         - REFUSE (``refuse_batch``): raise ``ConflictError`` if any external_id
           already exists.
+
+        Returns the subset of the input Features that ES actually
+        acknowledged (#2799) — not every item this driver attempted to
+        submit. ES's ``_bulk`` endpoint is per-item, so a rejection
+        elsewhere in the same request does not imply every other document
+        was indexed; a full rejection (unrecovered by the geo_shape ladder)
+        raises ``EsBulkWriteError`` instead, whose ``.acknowledged``
+        attribute carries the same accounting for that call.
         """
         from datetime import datetime, timezone
 
@@ -1572,10 +1580,22 @@ class ItemsElasticsearchDriver(
             # geometry before it is reported as a failure — this is also the
             # bulk reindex path's rejection point (reindex_collection_into_index
             # calls write_entities), so the retry benefits both callers.
-            await raise_on_bulk_errors_with_ladder(
-                es, resp, index_name, submitted_ids, doc_by_id,
-                routing=collection_id,
+            #
+            # ES's ``_bulk`` endpoint is per-item — a rejection elsewhere in
+            # the same request does not mean every other id in ``submitted_ids``
+            # was actually indexed. Only report the ids ES (or the ladder)
+            # actually acknowledged (#2799); ``written`` above is a pre-submit
+            # list built before the bulk call and must not be returned as-is.
+            acknowledged_ids = set(
+                await raise_on_bulk_errors_with_ladder(
+                    es, resp, index_name, submitted_ids, doc_by_id,
+                    routing=collection_id,
+                )
             )
+            written = [
+                item for item, doc_id in zip(written, submitted_ids)
+                if doc_id in acknowledged_ids
+            ]
 
         return written
 

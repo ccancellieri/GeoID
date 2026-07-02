@@ -98,7 +98,7 @@ def raise_on_bulk_errors(
     bulk_resp: Any,
     index_name: str,
     ids: "List[str]",
-) -> None:
+) -> "List[str]":
     """Check a ``_bulk`` response for per-doc errors and enforce the invariant.
 
     Must be called AFTER :func:`maybe_raise_bulk_mapping_mismatch` so
@@ -113,8 +113,9 @@ def raise_on_bulk_errors(
        or ``on_failure=IGNORE``).
     2. Collect all failures and raise a single
        :class:`~dynastore.modules.storage.errors.EsBulkWriteError` carrying the
-       full ``(id, reason)`` list so the dispatcher's ``on_failure`` policy can
-       route the batch to OUTBOX or propagate as FATAL.
+       full ``(id, reason)`` list — plus the acknowledged ids on
+       ``.acknowledged`` (#2799) — so the dispatcher's ``on_failure`` policy
+       can route the batch to OUTBOX or propagate as FATAL.
 
     Parameters
     ----------
@@ -126,18 +127,25 @@ def raise_on_bulk_errors(
         The submitted document ids in the same order as ``bulk_resp["items"]``.
         Used to correlate failures back to the original documents when ES
         omits ``_id`` from an error entry.
+
+    Returns
+    -------
+    List of ids ES actually acknowledged (``2xx``, no error). When no
+    document is rejected this is simply ``ids``; on a partial rejection
+    (raised as :class:`~dynastore.modules.storage.errors.EsBulkWriteError`)
+    the same list is available on the exception's ``.acknowledged``.
     """
     if not isinstance(bulk_resp, dict) or not bulk_resp.get("errors"):
-        return
+        return list(ids)
 
     from dynastore.modules.elasticsearch.bulk_classify import classify_bulk_response
     from dynastore.modules.storage.errors import EsBulkWriteError
 
-    _passed, transient, poison = classify_bulk_response(bulk_resp, ids)
+    passed, transient, poison = classify_bulk_response(bulk_resp, ids)
     all_failures: List[Tuple[str, str]] = list(transient) + list(poison)
 
     if not all_failures:
-        return
+        return passed
 
     for doc_id, reason in all_failures:
         logger.error(
@@ -149,6 +157,7 @@ def raise_on_bulk_errors(
         f"ES bulk write to '{index_name}' rejected {len(all_failures)} "
         f"document(s) — see ERROR logs above for per-doc details.",
         failures=all_failures,
+        acknowledged=passed,
     )
 
 
@@ -160,7 +169,7 @@ async def raise_on_bulk_errors_with_ladder(
     doc_by_id: "Dict[str, Dict[str, Any]]",
     *,
     routing: Optional[str] = None,
-) -> None:
+) -> "List[str]":
     """Same contract as :func:`raise_on_bulk_errors`, plus a degradation-
     ladder retry (#2769) for poison-classified rejections before raising.
 
@@ -169,9 +178,9 @@ async def raise_on_bulk_errors_with_ladder(
     :func:`~dynastore.modules.elasticsearch.geo_shape_ladder.retry_doc_with_ladder`
     — progressively coarser geometry resubmitted as single-document
     ``index`` calls. A doc that lands on a rung is WARNING-logged (with the
-    rung name) and dropped from the failure set entirely; a doc with no
-    geometry to degrade, or that exhausts every rung, keeps its original
-    rejection and is ERROR-logged / raised exactly as
+    rung name) and counted as **acknowledged** (it now exists on a coarser
+    rung); a doc with no geometry to degrade, or that exhausts every rung,
+    keeps its original rejection and is ERROR-logged / raised exactly as
     :func:`raise_on_bulk_errors` would have done.
 
     ``doc_by_id`` supplies the just-submitted document for each id so the
@@ -181,15 +190,25 @@ async def raise_on_bulk_errors_with_ladder(
 
     Must be called AFTER :func:`maybe_raise_bulk_mapping_mismatch` — same
     ordering requirement as :func:`raise_on_bulk_errors`.
+
+    Returns
+    -------
+    List of ids ES actually acknowledged — the ``passed`` classification
+    plus any poison id recovered on a ladder rung. On a partial rejection
+    (raised as :class:`~dynastore.modules.storage.errors.EsBulkWriteError`)
+    the same list is available on the exception's ``.acknowledged`` (#2799)
+    — callers MUST use it instead of assuming every non-failed id in the
+    request succeeded, since a rejected sub-chunk is not all-or-nothing.
     """
     if not isinstance(bulk_resp, dict) or not bulk_resp.get("errors"):
-        return
+        return list(ids)
 
     from dynastore.modules.elasticsearch.bulk_classify import classify_bulk_response
     from dynastore.modules.elasticsearch.geo_shape_ladder import retry_doc_with_ladder
     from dynastore.modules.storage.errors import EsBulkWriteError
 
-    _passed, transient, poison = classify_bulk_response(bulk_resp, ids)
+    passed, transient, poison = classify_bulk_response(bulk_resp, ids)
+    acknowledged: List[str] = list(passed)
 
     remaining_poison: List[Tuple[str, str]] = []
     for doc_id, reason in poison:
@@ -202,6 +221,7 @@ async def raise_on_bulk_errors_with_ladder(
                 reason=reason, routing=routing,
             )
         if recovered:
+            acknowledged.append(doc_id)
             logger.warning(
                 "ES bulk write: doc id=%s in index=%s recovered on degraded "
                 "geometry rung=%s after rejection (%s)",
@@ -212,7 +232,7 @@ async def raise_on_bulk_errors_with_ladder(
 
     all_failures: List[Tuple[str, str]] = list(transient) + remaining_poison
     if not all_failures:
-        return
+        return acknowledged
 
     for doc_id, reason in all_failures:
         logger.error(
@@ -224,4 +244,5 @@ async def raise_on_bulk_errors_with_ladder(
         f"ES bulk write to '{index_name}' rejected {len(all_failures)} "
         f"document(s) — see ERROR logs above for per-doc details.",
         failures=all_failures,
+        acknowledged=acknowledged,
     )

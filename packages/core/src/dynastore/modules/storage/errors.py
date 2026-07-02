@@ -153,6 +153,15 @@ class EsBulkWriteError(Exception):
         submitted id when ES omits ``_id`` from the error entry).
         ``reason`` is a compact ``"{status} {err_type}: {err_reason}"``
         string built by the classifier.
+    acknowledged:
+        List of ids ES actually acknowledged (``2xx``, no error — including
+        ids recovered by the geo_shape degradation ladder) among the ids
+        submitted in the same ``_bulk`` call that raised this error. A
+        rejected sub-chunk is not an all-or-nothing outcome: ES's ``_bulk``
+        endpoint is per-item, so some documents in the same request as a
+        rejection are still indexed. Callers crediting a batch as "written"
+        MUST use this list rather than assuming every non-failed id
+        succeeded (#2799).
     """
 
     def __init__(
@@ -160,9 +169,11 @@ class EsBulkWriteError(Exception):
         message: str,
         *,
         failures: list[tuple[str, str]] | None = None,
+        acknowledged: list[str] | None = None,
     ) -> None:
         super().__init__(message)
         self.failures: list[tuple[str, str]] = failures or []
+        self.acknowledged: list[str] = acknowledged or []
 
 
 class UniqueConstraintViolationError(Exception):

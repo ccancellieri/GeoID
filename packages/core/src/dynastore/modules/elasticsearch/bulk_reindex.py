@@ -55,13 +55,18 @@ logger = logging.getLogger(__name__)
 class ReindexResult:
     """Outcome of a :func:`reindex_collection_into_index` run.
 
-    ``total_written`` counts only documents ES actually accepted.
+    ``total_written`` counts only documents ES actually acknowledged
+    (#2799) — never a batch-size arithmetic estimate.
     ``rejected_docs`` collects the ``(id, reason)`` pairs for documents
     ES rejected per-doc (already logged at ERROR by
-    :func:`~dynastore.modules.elasticsearch._mapping_errors.raise_on_bulk_errors`)
+    :func:`~dynastore.modules.elasticsearch._mapping_errors.raise_on_bulk_errors_with_ladder`)
     — the run keeps going past a rejected sub-chunk rather than aborting,
     so a handful of known-bad documents (e.g. the geo_shape divergence
     class, #2044) no longer hold the rest of the collection hostage.
+    It also carries a synthetic ``"<unacknowledged:...>"`` entry for any
+    document a sub-chunk read but neither ES nor the ladder ever
+    confirmed nor explicitly rejected, so ``total_written + rejected``
+    always equals the number of documents read from the source.
     """
 
     total_written: int
@@ -340,11 +345,16 @@ async def reindex_collection_into_index(
 
     Per-doc write rejections do not abort the run:
     :class:`~dynastore.modules.storage.errors.EsBulkWriteError` is caught per
-    sub-chunk. ES's ``_bulk`` endpoint is per-item — the non-rejected documents
-    in a sub-chunk are already indexed by the time the error surfaces, so
-    ``total_written`` is credited for them and only the rejected ids (already
-    logged at ERROR with their per-doc reason by ``raise_on_bulk_errors``) are
-    collected into the result and the run continues with the next sub-chunk.
+    sub-chunk. ES's ``_bulk`` endpoint is per-item, so a rejection elsewhere
+    in a sub-chunk does not mean every other document was indexed (#2799):
+    ``total_written`` is credited only from ``exc.acknowledged`` — the ids ES
+    (or the geo_shape ladder) actually confirmed — and the rejected ids
+    (already logged at ERROR with their per-doc reason by
+    ``raise_on_bulk_errors_with_ladder``) are collected into the result. Any
+    id in the sub-chunk that lands in neither bucket (e.g. a write-policy
+    skip inside ``write_entities`` that predates the ``_bulk`` call) is
+    logged loudly and also folded into ``rejected_docs`` so the run's
+    self-report always satisfies ``total_written + rejected == docs read``.
     Any other exception from ``write_entities`` still propagates immediately —
     only known per-doc ES rejections are treated as recoverable.
 
@@ -467,24 +477,59 @@ async def reindex_collection_into_index(
                 batch_count = len(written) if written is not None else len(sub_chunk)
             except EsBulkWriteError as exc:
                 # ES's _bulk endpoint is per-item: by the time this error
-                # surfaces the HTTP request already completed and the
-                # non-rejected documents in the sub-chunk are indexed —
-                # only ``exc.failures`` were not. Each rejected doc's
-                # reason is already logged at ERROR by
-                # raise_on_bulk_errors; one summary line per sub-chunk here
-                # avoids double-logging every id. Skip and keep going —
-                # a handful of known-bad documents must not hold the rest
-                # of the collection hostage (#2764).
-                batch_count = max(len(sub_chunk) - len(exc.failures), 0)
+                # surfaces the HTTP request already completed and some
+                # non-rejected documents in the sub-chunk may be indexed —
+                # but NOT necessarily all of them (#2799): a sub-chunk is not
+                # all-or-nothing, so crediting ``len(sub_chunk) -
+                # len(exc.failures)`` as written silently over-counted
+                # documents that were neither acknowledged nor explicitly
+                # rejected. Credit only ``exc.acknowledged`` — the ids ES (or
+                # the geo_shape ladder) actually confirmed. Each rejected
+                # doc's reason is already logged at ERROR by
+                # raise_on_bulk_errors_with_ladder; one summary line per
+                # sub-chunk here avoids double-logging every id. Skip and
+                # keep going — a handful of known-bad documents must not
+                # hold the rest of the collection hostage (#2764).
+                batch_count = len(exc.acknowledged)
                 rejected_docs.extend(exc.failures)
                 logger.error(
                     "reindex_collection_into_index: %d of %d document(s) rejected by "
                     "ES for %s/%s at offset %d — skipping the rejected docs and "
                     "continuing (per-doc reasons already logged above). "
-                    "%d written from this sub-chunk.",
+                    "%d acknowledged from this sub-chunk.",
                     len(exc.failures), len(sub_chunk), catalog_id, collection_id,
                     offset, batch_count,
                 )
+                # Reconcile: exc.acknowledged and exc.failures only cover the
+                # ids actually SUBMITTED to ES (write_entities may have
+                # skipped some sub_chunk docs earlier, e.g. a write-policy
+                # conflict) — but ANY gap between the two accounting-sourced
+                # docs and the number of docs this sub-chunk actually read
+                # must be surfaced rather than silently dropped, so the run's
+                # self-report keeps the invariant `acknowledged +
+                # reported-failures == docs read`. A false positive here
+                # (e.g. from a legitimate write-policy skip) is strictly
+                # preferable to a silent loss going unreported again.
+                unaccounted = len(sub_chunk) - batch_count - len(exc.failures)
+                if unaccounted > 0:
+                    logger.error(
+                        "reindex_collection_into_index: %d document(s) in this "
+                        "sub-chunk for %s/%s at offset %d were neither "
+                        "acknowledged by ES nor explicitly rejected (%d "
+                        "acknowledged, %d explicitly rejected, %d read) — "
+                        "counting them as unacknowledged so the run's "
+                        "self-report stays truthful.",
+                        unaccounted, catalog_id, collection_id, offset,
+                        batch_count, len(exc.failures), len(sub_chunk),
+                    )
+                    rejected_docs.extend(
+                        (
+                            f"<unacknowledged:{catalog_id}/{collection_id}@offset={offset}#{i}>",
+                            "unacknowledged: ES bulk write neither confirmed nor "
+                            "explicitly rejected this document",
+                        )
+                        for i in range(unaccounted)
+                    )
             except Exception:
                 logger.error(
                     "reindex_collection_into_index: write_entities raised for %s/%s "

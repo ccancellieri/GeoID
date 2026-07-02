@@ -530,6 +530,129 @@ async def test_reindex_rejected_subchunk_does_not_abort_run():
 
 
 @pytest.mark.asyncio
+async def test_reindex_credits_only_acknowledged_ids_on_silent_sibling_drop():
+    """#2799: the id-level reconcile audit found that ES's ``_bulk`` response
+    can acknowledge FEWER docs than ``len(sub_chunk) - len(failures)`` —
+    sibling documents in the same rejected sub-chunk silently failed to
+    persist while the old formula still credited them as written. Crediting
+    must come from ``exc.acknowledged`` only, and the shortfall must be
+    reported, not silently dropped."""
+    reader = _FakeReader(
+        {"col1": [_make_feature(f"f{i}") for i in range(1, 5)]}  # f1..f4
+    )
+
+    from dynastore.modules.storage.errors import EsBulkWriteError
+    # ES explicitly rejected f2; only f1 and f3 were actually acknowledged —
+    # f4 vanished from the bulk response entirely (the silent-sibling-drop
+    # case), so it is neither acknowledged nor an explicit failure.
+    err = EsBulkWriteError(
+        "bulk failure",
+        failures=[("f2", "400 document_parsing_exception: known geo_shape divergence")],
+        acknowledged=["f1", "f3"],
+    )
+    writer = _FakeWriter(raise_on_write=err, fail_calls=1)
+
+    async def _get_config(model, *, catalog_id, collection_id=None):
+        return _make_routing_config()
+
+    fake_configs = type("C", (), {"get_config": staticmethod(_get_config)})()
+
+    def _get_protocol(proto):
+        name = getattr(proto, "__name__", str(proto))
+        if "ConfigsProtocol" in name:
+            return fake_configs
+        return None
+
+    with patch("dynastore.tools.discovery.get_protocol", side_effect=_get_protocol):
+        async with _build_router_patches(reader, writer):
+            with patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.add_index_to_public_alias",
+                return_value=None,
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_tenant_items_index",
+                return_value="dynastore-cat1-items",
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_index_prefix",
+                return_value="dynastore",
+            ):
+                from dynastore.modules.elasticsearch.bulk_reindex import reindex_collection_into_index
+                # page_size=4 keeps all 4 docs in a single sub-chunk/one
+                # write_entities call so the whole silent-drop is exercised
+                # inside one EsBulkWriteError.
+                result = await reindex_collection_into_index("cat1", "col1", page_size=4)
+
+    # Only the two truly-acknowledged docs are credited — never the
+    # over-count of len(sub_chunk) - len(failures) == 3 the old formula
+    # would have produced.
+    assert result.total_written == 2
+    # f2 (explicit ES rejection) + f4 (unaccounted/silently dropped).
+    assert result.rejected == 2
+    assert ("f2", "400 document_parsing_exception: known geo_shape divergence") in result.rejected_docs
+    unaccounted = [r for r in result.rejected_docs if r[0] != "f2"]
+    assert len(unaccounted) == 1
+    assert "unacknowledged" in unaccounted[0][1]
+    # Self-report invariant: acknowledged + reported-failures == docs read.
+    assert result.total_written + result.rejected == 4
+
+
+@pytest.mark.asyncio
+async def test_reindex_ladder_recovered_docs_are_credited_as_written():
+    """#2799/#2769: a doc recovered by the geo_shape degradation ladder is
+    reported on ``EsBulkWriteError.acknowledged`` (or not raised at all when
+    every rejection recovers) — the reindex accounting must credit it as
+    written, not fold it into ``rejected_docs`` just because ES's raw
+    response initially rejected it."""
+    reader = _FakeReader(
+        {"col1": [_make_feature("f1"), _make_feature("f2"), _make_feature("f3")]}
+    )
+
+    from dynastore.modules.storage.errors import EsBulkWriteError
+    # f1 passed cleanly, f2 recovered on a degraded geometry rung (so it is
+    # acknowledged despite originating as a poison rejection), f3 exhausted
+    # every rung and is still a real failure.
+    err = EsBulkWriteError(
+        "bulk failure",
+        failures=[("f3", "400 document_parsing_exception: still invalid after ladder")],
+        acknowledged=["f1", "f2"],
+    )
+    writer = _FakeWriter(raise_on_write=err, fail_calls=1)
+
+    async def _get_config(model, *, catalog_id, collection_id=None):
+        return _make_routing_config()
+
+    fake_configs = type("C", (), {"get_config": staticmethod(_get_config)})()
+
+    def _get_protocol(proto):
+        name = getattr(proto, "__name__", str(proto))
+        if "ConfigsProtocol" in name:
+            return fake_configs
+        return None
+
+    with patch("dynastore.tools.discovery.get_protocol", side_effect=_get_protocol):
+        async with _build_router_patches(reader, writer):
+            with patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.add_index_to_public_alias",
+                return_value=None,
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_tenant_items_index",
+                return_value="dynastore-cat1-items",
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_index_prefix",
+                return_value="dynastore",
+            ):
+                from dynastore.modules.elasticsearch.bulk_reindex import reindex_collection_into_index
+                result = await reindex_collection_into_index("cat1", "col1", page_size=3)
+
+    assert result.total_written == 2  # f1 + f2 (ladder-recovered)
+    assert result.rejected == 1  # only f3, the truly-exhausted rejection
+    assert result.rejected_docs == [
+        ("f3", "400 document_parsing_exception: still invalid after ladder")
+    ]
+    # No unaccounted/silent gap — acknowledged + failures == docs read.
+    assert result.total_written + result.rejected == 3
+
+
+@pytest.mark.asyncio
 async def test_reindex_generic_write_failure_propagates():
     """Any write_entities exception (not just EsBulkWriteError) propagates."""
     reader = _FakeReader({"col1": [_make_feature("f1")]})
