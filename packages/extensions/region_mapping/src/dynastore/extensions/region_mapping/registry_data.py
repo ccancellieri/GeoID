@@ -174,6 +174,13 @@ def build_registry_routing_configs() -> Tuple[
             Operation.READ: [
                 OperationDriverEntry(driver_ref="items_postgresql_driver"),
             ],
+            # SEARCH must be pinned too: every claim lookup goes through
+            # search_items, and an unpinned SEARCH falls back to the
+            # deployment default (ES) — which this registry never writes to,
+            # so reads would come back empty.
+            Operation.SEARCH: [
+                OperationDriverEntry(driver_ref="items_postgresql_driver"),
+            ],
         },
     )
     return catalog_routing, collection_routing, items_routing

@@ -279,6 +279,7 @@ async def test_apply_sets_pg_only_routing_configs() -> None:
     for entries in items_routing.operations.values():
         for entry in entries:
             assert entry.driver_ref == "items_postgresql_driver"
+    assert Operation.SEARCH in items_routing.operations
 
 
 @pytest.mark.asyncio
