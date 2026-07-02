@@ -29,6 +29,7 @@ from sqlalchemy import text
 
 from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler, DbResource
 from dynastore.modules.db_config.exceptions import ResourceNotFoundError
+from dynastore.modules.db_config.core_metadata_ddl import core_metadata_columns
 from dynastore.tools.cache import cached
 from .models import PlatformNotebookCreate
 
@@ -37,8 +38,7 @@ logger = logging.getLogger(__name__)
 PLATFORM_NOTEBOOKS_DDL = """
 CREATE TABLE IF NOT EXISTS notebooks.platform_notebooks (
     notebook_id    VARCHAR NOT NULL PRIMARY KEY,
-    title          JSONB NOT NULL,
-    description    JSONB,
+    %s
     tags           JSONB DEFAULT '[]'::jsonb,
     content        JSONB NOT NULL,
     metadata       JSONB DEFAULT '{}'::jsonb,
@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS notebooks.platform_notebooks (
     updated_at     TIMESTAMPTZ DEFAULT NOW(),
     deleted_at     TIMESTAMPTZ DEFAULT NULL
 );
-"""
+""" % core_metadata_columns(title_required=True)
 
 
 def _serialize_localized(value) -> Optional[str]:

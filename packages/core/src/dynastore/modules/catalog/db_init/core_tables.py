@@ -44,6 +44,7 @@ from dynastore.modules.db_config.query_executor import (
     DDLQuery,
     DbResource,
 )
+from dynastore.modules.db_config.core_metadata_ddl import core_metadata_columns
 
 logger = logging.getLogger(__name__)
 
@@ -55,15 +56,14 @@ logger = logging.getLogger(__name__)
 CATALOG_METADATA_CORE_DDL = """
 CREATE TABLE IF NOT EXISTS catalog.catalog_core (
     catalog_id     VARCHAR PRIMARY KEY REFERENCES catalog.catalogs(id) ON DELETE CASCADE,
-    title          JSONB,
-    description    JSONB,
+    %s
     keywords       JSONB,
     license        JSONB,
     extra_metadata JSONB,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-"""
+""" % core_metadata_columns(title_required=False)
 
 # Freshness columns (``created_at`` / ``updated_at``) for the canonical
 # INDEX / BACKUP propagation contract live directly on the
@@ -79,15 +79,14 @@ CREATE TABLE IF NOT EXISTS catalog.catalog_core (
 TENANT_METADATA_CORE_DDL = """
 CREATE TABLE IF NOT EXISTS {schema}.collection_core (
     collection_id  VARCHAR PRIMARY KEY,
-    title          JSONB,
-    description    JSONB,
+    %s
     keywords       JSONB,
     license        JSONB,
     extra_metadata JSONB,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-"""
+""" % core_metadata_columns(title_required=False)
 
 # ---------------------------------------------------------------------------
 # Orchestration

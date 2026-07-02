@@ -30,6 +30,7 @@ from sqlalchemy import text
 
 from dynastore.modules.db_config.exceptions import ResourceNotFoundError
 from dynastore.modules.db_config.query_executor import DDLQuery, DQLQuery, ResultHandler
+from dynastore.modules.db_config.core_metadata_ddl import core_metadata_columns
 
 from .models import NotebookCreate
 
@@ -39,8 +40,7 @@ NOTEBOOKS_DDL = """
 CREATE TABLE IF NOT EXISTS {schema}.notebooks (
     notebook_id VARCHAR NOT NULL,
     catalog_id VARCHAR NOT NULL,
-    title JSONB,
-    description JSONB,
+    %s
     tags JSONB DEFAULT '[]'::jsonb,
     content JSONB NOT NULL,
     metadata JSONB DEFAULT '{}'::jsonb,
@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS {schema}.notebooks (
     copied_from VARCHAR DEFAULT NULL,
     PRIMARY KEY (notebook_id)
 );
-"""
+""" % core_metadata_columns(title_required=True)
 
 
 async def init_notebooks_storage(conn, schema: str, catalog_id: str) -> None:
