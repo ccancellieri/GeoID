@@ -879,7 +879,8 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         # --- Caching Support ---
 
         _pc = await configs_svc.get_config(
-            FeaturesPluginConfig, catalog_id=catalog_id, ctx=DriverContext(db_resource=conn
+            FeaturesPluginConfig, catalog_id=catalog_id, collection_id=collection_id,
+            ctx=DriverContext(db_resource=conn
         ))
         assert isinstance(_pc, FeaturesPluginConfig)
         plugin_config: FeaturesPluginConfig = _pc

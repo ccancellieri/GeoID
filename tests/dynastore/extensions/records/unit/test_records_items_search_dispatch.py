@@ -340,3 +340,43 @@ async def test_get_records_skips_dispatch_for_free_text_q(monkeypatch):
 
     assert called["dispatch"] is False
     assert catalogs.stream_called is True
+
+
+@pytest.mark.asyncio
+async def test_get_records_threads_collection_id_into_plugin_config_lookup(monkeypatch):
+    """#2717: a collection-scoped ``RecordsPluginConfig`` override (e.g. a
+    tighter ``default_limit``/``max_limit``) must actually be consulted — the
+    lookup has to carry ``collection_id``, not just ``catalog_id``, mirroring
+    the STAC ``_get_stac_config`` reference pattern."""
+    from dynastore.extensions.records.config import RecordsPluginConfig
+
+    svc = RecordsService.__new__(RecordsService)
+    catalogs = _FakeCatalogs(stream_features=[], total=0)
+
+    async def _get_catalogs():
+        return catalogs
+
+    monkeypatch.setattr(svc, "_get_catalogs_service", _get_catalogs, raising=False)
+
+    config_calls: list = []
+
+    async def _get_configs():
+        class _Cfg:
+            async def get_config(self, cls, catalog_id=None, collection_id=None, ctx=None):
+                config_calls.append(
+                    {"catalog_id": catalog_id, "collection_id": collection_id}
+                )
+                return RecordsPluginConfig()
+
+        return _Cfg()
+
+    monkeypatch.setattr(svc, "_get_configs_service", _get_configs, raising=False)
+
+    async def _decline(**kwargs):
+        return None
+
+    monkeypatch.setattr(_query_mod, "maybe_dispatch_items_to_search_driver", _decline)
+
+    await svc.get_records(**_get_records_defaults(catalog_id="cat", collection_id="col"))
+
+    assert {"catalog_id": "cat", "collection_id": "col"} in config_calls

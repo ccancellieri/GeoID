@@ -105,13 +105,17 @@ class _FakeCatalogs:
         )
 
 
-def _wire(monkeypatch, svc, catalogs):
+def _wire(monkeypatch, svc, catalogs, config_calls=None):
     async def _get_catalogs():
         return catalogs
 
     async def _get_configs():
         class _Cfg:
-            async def get_config(self, cls, catalog_id=None, ctx=None):
+            async def get_config(self, cls, catalog_id=None, collection_id=None, ctx=None):
+                if config_calls is not None:
+                    config_calls.append(
+                        {"catalog_id": catalog_id, "collection_id": collection_id}
+                    )
                 # cache_on_demand defaults False → no storage cache path
                 return FeaturesPluginConfig()
 
@@ -312,3 +316,19 @@ async def test_get_items_serves_non_4326_crs_via_items_protocol(monkeypatch):
 
     assert [f["id"] for f in body["features"]] == ["pg-1"]
     assert catalogs.stream_called is True
+
+
+@pytest.mark.asyncio
+async def test_get_items_threads_collection_id_into_plugin_config_lookup(monkeypatch):
+    """#2717: a collection-scoped ``FeaturesPluginConfig`` override (e.g. a
+    tighter ``default_limit``/``max_limit``) must actually be consulted — the
+    lookup has to carry ``collection_id``, not just ``catalog_id``, mirroring
+    the STAC ``_get_stac_config`` reference pattern."""
+    svc = OGCFeaturesService.__new__(OGCFeaturesService)
+    catalogs = _FakeCatalogs(stream_features=[], total=0)
+    config_calls: list = []
+    _wire(monkeypatch, svc, catalogs, config_calls=config_calls)
+
+    await _call_get_items(svc, catalog_id="cat", collection_id="col")
+
+    assert config_calls == [{"catalog_id": "cat", "collection_id": "col"}]

@@ -500,7 +500,7 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         from dynastore.extensions.tools.pagination import resolve_page_limit
 
         records_config = await self._get_plugin_config(
-            RecordsPluginConfig, catalog_id=catalog_id,
+            RecordsPluginConfig, catalog_id=catalog_id, collection_id=collection_id,
         )
         limit = resolve_page_limit(
             limit,

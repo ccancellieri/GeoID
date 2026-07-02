@@ -126,7 +126,7 @@ def _wire(monkeypatch, svc, catalogs, valid_props=("title", "rainfall_mm", "coun
 
     async def _get_configs():
         class _Cfg:
-            async def get_config(self, cls, catalog_id=None, ctx=None):
+            async def get_config(self, cls, catalog_id=None, collection_id=None, ctx=None):
                 return FeaturesPluginConfig()
 
         return _Cfg()
