@@ -289,7 +289,7 @@ async def test_dispatcher_path_takes_over_predecessor_claim():
     ), patch(
         "dynastore.modules.gcp.tools.jobs.load_job_config",
         AsyncMock(return_value={
-            "elasticsearch_indexer": "dynastore-elasticsearch-indexer"
+            "elasticsearch_indexer": "dynastore-async-writer"
         }),
     ), patch(
         "dynastore.modules.gcp.tools.jobs.run_cloud_run_job_async", run_job_mock

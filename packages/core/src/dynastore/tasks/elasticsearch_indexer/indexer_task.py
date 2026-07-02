@@ -27,7 +27,7 @@ on the unified ``ElasticsearchIndexerRequest`` payload:
 Registers under ``task_type = "elasticsearch_indexer"`` so the dispatcher's
 :class:`BackgroundRunner` can claim it in-process AND
 :class:`GcpJobRunner` can claim it (the deployed
-``dynastore-elasticsearch-indexer`` Cloud Run Job advertises
+``dynastore-async-writer`` Cloud Run Job advertises
 ``TASK_TYPE=elasticsearch_indexer``). Selection between the two runners is
 made by ``ExecutionEngine.execute()`` based on the requested mode and which
 runner reports ``can_handle`` first.

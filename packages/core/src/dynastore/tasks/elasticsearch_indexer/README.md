@@ -24,7 +24,7 @@ Inputs ([`indexer_models.py:ElasticsearchIndexerRequest`](indexer_models.py)):
 
 Both runners can claim it:
 - **`BackgroundRunner`** — runs in-process via the FastAPI background tasks pool. Use `Prefer: respond-sync` for inline execution or `Prefer: respond-async` for fire-and-poll.
-- **`GcpJobRunner`** — spawns the deployed `dynastore-elasticsearch-indexer` Cloud Run Job (which advertises `TASK_TYPE=elasticsearch_indexer` in its env).
+- **`GcpJobRunner`** — spawns the deployed `dynastore-async-writer` Cloud Run Job (which advertises `TASK_TYPE=elasticsearch_indexer` in its env).
 
 `ExecutionEngine.execute()` selects between them by mode and runner availability. The dispatcher class is a thin adapter; the actual bulk-index logic lives in [`modules/elasticsearch/bulk_reindex.py`](../../modules/elasticsearch/bulk_reindex.py) so extensions can call it directly without going through the task layer.
 
@@ -49,14 +49,15 @@ Dispatched via the index dispatcher (`modules/storage/index_dispatcher.py`) for 
 ## One-shot job
 
 Bulk reindex for large catalogs runs as a dedicated one-shot worker job rather
-than inline, so it can use a longer timeout and more memory. A deployment defines
-it with the `worker_task_elasticsearch_indexer` scope, for example:
+than inline, so it can use a longer timeout and more memory. This task type is
+one of several hosted by the generic async-writer job, which a deployment
+defines with the `worker_task_async_writer` scope, for example:
 
 ```yaml
-elasticsearch-indexer:
+geospatial-async-writer:
   type: "job"
   env:
-    SCOPE: "worker_task_elasticsearch_indexer"
+    SCOPE: "worker_task_async_writer"
     TASK_TIMEOUT: 7200    # 2 hours
     RAM: "2Gi"
     MAX_RETRIES: 2

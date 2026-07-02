@@ -431,11 +431,6 @@ worker_task_dimensions_materialize = ["dynastore[task_base,module_db,module_cata
 # never drains (#2718). Same dual-engine pairing as
 # worker_task_dimensions_materialize (#2472).
 worker_task_async_writer = ["dynastore[task_base,module_db,module_catalog,elasticsearch,task_elasticsearch_indexer_deps,outbox_drain,module_storage_postgresql]"]
-# Back-compat alias: `worker_task_elasticsearch_indexer` was this SCOPE's name
-# before #2622 generalized it beyond Elasticsearch. Kept as a pure alias so
-# `pip install dynastore[worker_task_elasticsearch_indexer]` (still used by
-# the dynastore repo's deploy config) keeps resolving to the same deps.
-worker_task_elasticsearch_indexer = ["dynastore[worker_task_async_writer]"]
 # stac_harvest: I/O-bound streaming harvest of a remote STAC catalog into a
 # target dynastore catalog. task_base (sync psycopg2 engine) like ingestion and
 # every other driver-heavy worker — the task reads its engine via get_engine()

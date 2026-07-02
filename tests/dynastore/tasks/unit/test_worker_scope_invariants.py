@@ -95,26 +95,12 @@ def test_async_writer_scope_includes_catalog() -> None:
     has an implementor in the Cloud Run Job container.
 
     `worker_task_elasticsearch_indexer` was renamed to `worker_task_async_writer`
-    (#2622) when the job was generalized beyond Elasticsearch; the old name is
-    kept as a pure alias (see `test_elasticsearch_indexer_alias_resolves_to_async_writer`)."""
+    (#2622) when the job was generalized beyond Elasticsearch; the back-compat
+    alias was retired once the last consumer moved to the new name (#2673)."""
     _assert_scope_has_module_catalog(
         "worker_task_async_writer",
         "Without it, BulkCatalog/CollectionReindexTask crashes when calling "
         "get_protocol(CatalogsProtocol).",
-    )
-
-
-def test_elasticsearch_indexer_alias_resolves_to_async_writer() -> None:
-    """`worker_task_elasticsearch_indexer` is a pure back-compat alias (#2622)
-    for `worker_task_async_writer` — pins the contract so a future edit can't
-    silently diverge the two and break `pip install
-    dynastore[worker_task_elasticsearch_indexer]` (still used by the
-    dynastore repo's deploy config)."""
-    line = _scope_definition("worker_task_elasticsearch_indexer")
-    assert _extract_dynastore_extras(line) == {"worker_task_async_writer"}, (
-        "worker_task_elasticsearch_indexer must remain a pure "
-        "dynastore[worker_task_async_writer] alias. Current definition: "
-        f"{line!r}"
     )
 
 
@@ -383,7 +369,7 @@ def test_worker_service_and_scope_worker_agree_on_task_membership() -> None:
     other. (This is a *consistency* check, not a *completeness* check —
     some `worker_task_*` are intentionally excluded from both because they
     only run as their own dedicated Cloud Run Job images, e.g.
-    `worker_task_elasticsearch_indexer` and `worker_task_ingestion`.)"""
+    `worker_task_async_writer` and `worker_task_ingestion`.)"""
     scope_names = set(_all_worker_task_scope_names())
     worker_service_extras = _extract_dynastore_extras(
         _meta_extra_definition("worker_service")
