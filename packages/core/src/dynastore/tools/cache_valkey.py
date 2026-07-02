@@ -86,6 +86,32 @@ logger = logging.getLogger(__name__)
 # ``CacheModule`` lifespan plumbs through to every constructor.
 _VALKEY_CIRCUIT_BREAKER_DEFAULT = 3
 
+
+def _is_moved_error(exc: BaseException) -> bool:
+    """True when ``exc`` is a Valkey ``MOVED`` ``ResponseError``.
+
+    Lazily imports ``valkey.exceptions`` (mirrors this module's existing
+    lazy-import pattern for the optional ``valkey`` dependency) rather
+    than duck-typing on the exception's class name.
+    """
+    try:
+        from valkey.exceptions import ResponseError
+    except ImportError:
+        return False
+    return isinstance(exc, ResponseError) and str(exc).upper().startswith("MOVED")
+
+
+def _is_standalone_client(client: Any) -> bool:
+    """Cheap sync duck-type check for "not a ``ValkeyCluster`` client".
+
+    Mirrors the ``nodes_manager`` / ``get_primaries`` check
+    ``ValkeyCacheBackend.topology()`` already uses to distinguish a
+    standalone ``Valkey`` client from a ``ValkeyCluster`` one.
+    """
+    return getattr(client, "nodes_manager", None) is None or not hasattr(
+        client, "get_primaries"
+    )
+
 # ---------------------------------------------------------------------------
 #  Valkey INFO section → field mapping (used by ValkeyCacheBackend.info())
 # ---------------------------------------------------------------------------
@@ -283,6 +309,40 @@ def build_discovery_port_remap(
     return _remap
 
 
+def resolve_valkey_target(
+    *,
+    url: Optional[str] = None,
+    discovery_host: Optional[str] = None,
+    discovery_port: int = 6379,
+    cluster_mode: bool = False,
+) -> str:
+    """Human-readable ``host:port (mode)`` connection target for logging.
+
+    Used by ``CacheModule``'s (re)connect banners (#2812 follow-up — the
+    reconnect line used to omit the resolved endpoint, which hid endpoint
+    drift for days). Never leaks credentials embedded in ``url``: only the
+    hostname/port are extracted, never userinfo or query string.
+
+    Discovery endpoint (cluster mode) takes precedence, matching
+    ``build_valkey_client``'s own precedence. Falls back to parsing
+    ``host:port`` out of ``url``, then to an explicit "unresolved" marker.
+    """
+    mode = "cluster" if cluster_mode else "standalone"
+    if discovery_host:
+        return f"{discovery_host}:{discovery_port} ({mode})"
+    if url:
+        from urllib.parse import urlsplit
+
+        try:
+            parsed = urlsplit(url)
+            host = parsed.hostname or "?"
+            port = parsed.port or discovery_port
+            return f"{host}:{port} ({mode})"
+        except Exception:
+            return f"<unparseable-url> ({mode})"
+    return f"<unresolved> ({mode})"
+
+
 def build_valkey_client(
     *,
     url: Optional[str] = None,
@@ -344,6 +404,17 @@ def build_valkey_client(
             "(`pip install 'dynastore[module_cache]'` — provides msgpack + valkey). "
             f"Original error: {e}"
         ) from e
+
+    # Stashed on the built client (below) as ``_ds_resolved_target`` so
+    # ``CacheModule``'s connect/reconnect banners can log the resolved
+    # endpoint without re-deriving it from the (possibly secret-backed)
+    # connection params (#2812 follow-up).
+    resolved_target = resolve_valkey_target(
+        url=url,
+        discovery_host=discovery_host,
+        discovery_port=discovery_port,
+        cluster_mode=cluster_mode,
+    )
 
     pool_kwargs: Dict[str, Any] = {"decode_responses": False}
 
@@ -432,6 +503,13 @@ def build_valkey_client(
                 "`discovery_host` or `url` must be provided."
             )
         _logger.debug("build_valkey_client: ValkeyCluster created successfully, returning")
+        # Best-effort stash — some clients (e.g. exotic test doubles) don't
+        # accept new attributes; the resolved target is a logging aid, not
+        # load-bearing, so failure here must never break client construction.
+        try:
+            setattr(client, "_ds_resolved_target", resolved_target)
+        except Exception:  # noqa: BLE001
+            pass
         return client, None
 
     # Standalone
@@ -444,6 +522,10 @@ def build_valkey_client(
     )
     pool = avalkey.ConnectionPool.from_url(url, **pool_kwargs)
     client = avalkey.Valkey(connection_pool=pool)
+    try:
+        setattr(client, "_ds_resolved_target", resolved_target)
+    except Exception:  # noqa: BLE001
+        pass
     _logger.debug("build_valkey_client: Valkey client created successfully, returning")
     return client, pool
 
@@ -603,6 +685,10 @@ class ValkeyCacheBackend:
         self._circuit_breaker_threshold = (
             circuit_breaker_threshold or _VALKEY_CIRCUIT_BREAKER_DEFAULT
         )
+        # #2812 follow-up: rate-limit the MOVED-on-standalone WARNING to
+        # once per backend instance (a reconnect/rebuild creates a fresh
+        # instance and re-arms it) instead of once per failing command.
+        self._moved_warned: bool = False
 
     @property
     def name(self) -> str:
@@ -616,8 +702,35 @@ class ValkeyCacheBackend:
         """Prefix a cache key for Valkey namespace isolation."""
         return f"{self._prefix}{key}"
 
-    def _record_failure(self) -> None:
-        """Increment failure counter and trip circuit breaker if threshold exceeded."""
+    def _record_failure(self, exc: Optional[BaseException] = None) -> None:
+        """Increment failure counter and trip circuit breaker if threshold exceeded.
+
+        ``exc`` (#2812 follow-up): when the failure is a ``MOVED``
+        ``ResponseError`` on a standalone client — meaning the configured
+        endpoint is actually running in cluster mode, the same root cause
+        as the #2812 outage — logs one hard WARNING naming the endpoint.
+        Detection only: no client rebuild, no config mutation (client
+        rebuild-on-MOVED is #2743's scope). Rate-limited to once per
+        backend instance so a MOVED storm produces one signal, not
+        per-command spam.
+        """
+        if (
+            exc is not None
+            and not self._moved_warned
+            and _is_standalone_client(self._client)
+            and _is_moved_error(exc)
+        ):
+            self._moved_warned = True
+            target = getattr(self._client, "_ds_resolved_target", "<unknown>")
+            logger.warning(
+                "CACHE ENDPOINT MISMATCH: standalone Valkey client at %s "
+                "received a MOVED response — this endpoint is running in "
+                "CLUSTER mode, not standalone. Correct "
+                "ValkeyEngineConfig (cluster_mode=true, discovery_host) via "
+                "PATCH /configs/plugins/valkey_engine_config. Detection "
+                "only; the client is not rebuilt automatically.",
+                target,
+            )
         self._consecutive_failures += 1
         if self._consecutive_failures >= self._circuit_breaker_threshold:
             logger.error(
@@ -651,8 +764,8 @@ class ValkeyCacheBackend:
             if raw is None:
                 return None
             return _deserialize(raw)
-        except Exception:
-            self._record_failure()
+        except Exception as exc:
+            self._record_failure(exc)
             logger.warning(
                 "ValkeyCacheBackend.get failed (key=%s)", self._key(key), exc_info=True
             )
@@ -679,8 +792,8 @@ class ValkeyCacheBackend:
             result = await self._client.set(self._key(key), serialized, **kwargs)
             self._record_success()
             return bool(result)
-        except Exception:
-            self._record_failure()
+        except Exception as exc:
+            self._record_failure(exc)
             logger.warning(
                 "ValkeyCacheBackend.set failed (key=%s)", self._key(key), exc_info=True
             )
@@ -714,8 +827,8 @@ class ValkeyCacheBackend:
             if tags is not None:
                 return False  # Tag-based invalidation not supported
             return False
-        except Exception:
-            self._record_failure()
+        except Exception as exc:
+            self._record_failure(exc)
             logger.warning(
                 "ValkeyCacheBackend.clear failed (key=%s namespace=%s)",
                 self._key(key) if key is not None else None,
@@ -729,8 +842,8 @@ class ValkeyCacheBackend:
             result = bool(await self._client.exists(self._key(key)))
             self._record_success()
             return result
-        except Exception:
-            self._record_failure()
+        except Exception as exc:
+            self._record_failure(exc)
             logger.warning(
                 "ValkeyCacheBackend.exists failed (key=%s)",
                 self._key(key),
@@ -799,8 +912,8 @@ class ValkeyCacheBackend:
                 "ValkeyCacheBackend.get_count: non-integer payload at key=%s", full
             )
             return None
-        except Exception:
-            self._record_failure()
+        except Exception as exc:
+            self._record_failure(exc)
             logger.warning(
                 "ValkeyCacheBackend.get_count failed (key=%s)", full, exc_info=True
             )
@@ -821,8 +934,8 @@ class ValkeyCacheBackend:
                 await self._client.pexpire(full, int(ttl * 1000))
             self._record_success()
             return int(new_value)
-        except Exception:
-            self._record_failure()
+        except Exception as exc:
+            self._record_failure(exc)
             logger.warning(
                 "ValkeyCacheBackend.incr failed (key=%s)", full, exc_info=True
             )
@@ -858,8 +971,8 @@ class ValkeyCacheBackend:
             new_value = int(result[0])
             allowed = bool(int(result[1]))
             return (new_value, allowed)
-        except Exception:
-            self._record_failure()
+        except Exception as exc:
+            self._record_failure(exc)
             logger.warning(
                 "ValkeyCacheBackend.incr_if_below failed (key=%s)", full, exc_info=True
             )
@@ -873,8 +986,8 @@ class ValkeyCacheBackend:
             result = await self._client.pexpireat(full, int(ts * 1000))
             self._record_success()
             return bool(result)
-        except Exception:
-            self._record_failure()
+        except Exception as exc:
+            self._record_failure(exc)
             logger.warning(
                 "ValkeyCacheBackend.expireat failed (key=%s)", full, exc_info=True
             )
@@ -903,8 +1016,8 @@ class ValkeyCacheBackend:
         try:
             new_len = await self._client.rpush(full, *values)
             self._record_success()
-        except Exception:
-            self._record_failure()
+        except Exception as exc:
+            self._record_failure(exc)
             logger.warning(
                 "ValkeyCacheBackend.rpush_trimmed failed (key=%s)", full, exc_info=True
             )
@@ -918,8 +1031,8 @@ class ValkeyCacheBackend:
             try:
                 await self._client.ltrim(full, -max_len, -1)
                 self._record_success()
-            except Exception:
-                self._record_failure()
+            except Exception as exc:
+                self._record_failure(exc)
                 logger.warning(
                     "ValkeyCacheBackend.rpush_trimmed: ltrim failed (key=%s)",
                     full, exc_info=True,
@@ -931,8 +1044,8 @@ class ValkeyCacheBackend:
         try:
             result = await self._client.lpop(full, count)
             self._record_success()
-        except Exception:
-            self._record_failure()
+        except Exception as exc:
+            self._record_failure(exc)
             logger.warning(
                 "ValkeyCacheBackend.lpop_many failed (key=%s)", full, exc_info=True
             )
@@ -947,8 +1060,8 @@ class ValkeyCacheBackend:
             result = bool(await self._client.ping())
             self._record_success()
             return result
-        except Exception:
-            self._record_failure()
+        except Exception as exc:
+            self._record_failure(exc)
             logger.warning("ValkeyCacheBackend.ping failed", exc_info=True)
             return False
 

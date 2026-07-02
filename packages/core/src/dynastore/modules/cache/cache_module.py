@@ -390,6 +390,12 @@ async def _on_valkey_engine_config_change(
         # 3. Re-get the engine (lazy re-init with the freshly-stamped config).
         try:
             client = await engine_cache.get("valkey_engine")
+            # ``build_valkey_client`` stashes the resolved host:port/discovery
+            # endpoint on the client so the reconnect banner below reports the
+            # actual endpoint instead of omitting it (#2812 follow-up — the
+            # reconnect line used to log no host at all, which hid the
+            # endpoint drift that caused the outage for days).
+            _target = getattr(client, "_ds_resolved_target", "<engine>")
         except Exception as e:
             _dur_ms = int((asyncio.get_event_loop().time() - _t0) * 1000)
             logger.error(
@@ -431,8 +437,9 @@ async def _on_valkey_engine_config_change(
             else:
                 mode = info.get("server", {}).get("redis_mode") or "standalone"
             logger.info(
-                "CacheModule (reconnect): Valkey OK — version=%s mode=%s "
+                "CacheModule (reconnect): Valkey OK — host=%s version=%s mode=%s "
                 "redis_mode=%s primaries=%d replicas=%d",
+                _target,
                 version,
                 mode,
                 info.get("server", {}).get("redis_mode", "<absent>"),
@@ -485,14 +492,15 @@ async def _on_valkey_engine_config_change(
             )
             _dur_ms = int((asyncio.get_event_loop().time() - _t0) * 1000)
             logger.error(
-                "CacheModule (reconnect): Valkey probe failed (%s). "
+                "CacheModule (reconnect): Valkey probe failed at %s (%s). "
                 "Cache degrades to L1-only.",
+                _target,
                 _reason,
             )
             logger.info(
-                "CACHE RECONNECT: success=false stage=probe "
+                "CACHE RECONNECT: success=false stage=probe host=%s "
                 "duration_ms=%d error=%s",
-                _dur_ms, type(exc).__name__,
+                _target, _dur_ms, type(exc).__name__,
             )
             return
 
@@ -519,11 +527,12 @@ async def _on_valkey_engine_config_change(
         _LOCAL_FALLBACK_LOGGED = False
         _dur_ms = int((asyncio.get_event_loop().time() - _t0) * 1000)
         logger.info(
-            "CACHE BACKEND: VALKEY (reconnected) — version=%s mode=%s", version, mode
+            "CACHE BACKEND: VALKEY (reconnected) — host=%s version=%s mode=%s",
+            _target, version, mode,
         )
         logger.info(
-            "CACHE RECONNECT: success=true version=%s mode=%s duration_ms=%d",
-            version, mode, _dur_ms,
+            "CACHE RECONNECT: success=true host=%s version=%s mode=%s duration_ms=%d",
+            _target, version, mode, _dur_ms,
         )
 
 
@@ -948,6 +957,12 @@ class CacheModule(ModuleProtocol):
         # Engine-driven mode: wrap the pre-built client.
         if engine_mode and client is not None:
             from dynastore.tools.cache_valkey import ValkeyCacheBackend
+
+            # ``build_valkey_client`` stashes the resolved host:port/discovery
+            # endpoint on the client so the connect banner below reports the
+            # actual endpoint rather than the "<engine>" placeholder (#2812
+            # follow-up).
+            _safe_url = getattr(client, "_ds_resolved_target", "<engine>")
 
             backend = ValkeyCacheBackend(
                 client=client,
