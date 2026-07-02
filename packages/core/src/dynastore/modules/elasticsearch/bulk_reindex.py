@@ -35,18 +35,41 @@ from __future__ import annotations
 
 import json as _json
 import logging
-from typing import Any, Iterator, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Iterator, List, Optional, Tuple
 
 # Module-level imports give tests a stable patch target:
 #   ``dynastore.modules.elasticsearch.bulk_reindex.<name>``.
 # The router does not import from bulk_reindex so there is no cycle.
 from dynastore.modules.storage.router import get_items_search_driver, get_write_drivers
 from dynastore.modules.storage.hints import Hint
+from dynastore.modules.storage.errors import EsBulkWriteError
 from dynastore.modules.elasticsearch.aliases import add_index_to_public_alias
 from dynastore.modules.elasticsearch.mappings import get_tenant_items_index
 from dynastore.modules.elasticsearch.client import get_index_prefix
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ReindexResult:
+    """Outcome of a :func:`reindex_collection_into_index` run.
+
+    ``total_written`` counts only documents ES actually accepted.
+    ``rejected_docs`` collects the ``(id, reason)`` pairs for documents
+    ES rejected per-doc (already logged at ERROR by
+    :func:`~dynastore.modules.elasticsearch._mapping_errors.raise_on_bulk_errors`)
+    — the run keeps going past a rejected sub-chunk rather than aborting,
+    so a handful of known-bad documents (e.g. the geo_shape divergence
+    class, #2044) no longer hold the rest of the collection hostage.
+    """
+
+    total_written: int
+    rejected_docs: List[Tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def rejected(self) -> int:
+        return len(self.rejected_docs)
 
 
 def get_es_client():
@@ -267,7 +290,7 @@ async def reindex_collection_into_index(
     driver_hint: Optional[str] = None,
     reader_ref: Optional[str] = None,
     page_size: Optional[int] = None,
-) -> int:
+) -> ReindexResult:
     """Stream every item of a collection from the routing-resolved source-of-truth
     reader and bulk-write it via the routing-resolved secondary-index writer.
 
@@ -296,13 +319,20 @@ async def reindex_collection_into_index(
     when omitted (``None``), the writer's ``preferred_chunk_size`` is used as the
     default, falling back to ``_DEFAULT_READ_PAGE_SIZE`` when neither is set.
 
-    Write failures propagate: :class:`~dynastore.modules.storage.errors.EsBulkWriteError`
-    (and any other exception from ``write_entities``) are re-raised after logging the
-    failure count so the task can surface them and apply its ``on_failure`` policy.
-    The returned count reflects only successfully written documents.
+    Per-doc write rejections do not abort the run:
+    :class:`~dynastore.modules.storage.errors.EsBulkWriteError` is caught per
+    sub-chunk. ES's ``_bulk`` endpoint is per-item — the non-rejected documents
+    in a sub-chunk are already indexed by the time the error surfaces, so
+    ``total_written`` is credited for them and only the rejected ids (already
+    logged at ERROR with their per-doc reason by ``raise_on_bulk_errors``) are
+    collected into the result and the run continues with the next sub-chunk.
+    Any other exception from ``write_entities`` still propagates immediately —
+    only known per-doc ES rejections are treated as recoverable.
 
     Alias enrolment: the writer's index is enrolled in the public alias once before
-    streaming begins (idempotent; best-effort).
+    streaming begins (idempotent; best-effort) — so the alias swap that makes the
+    successfully-written documents searchable happens regardless of any per-doc
+    rejections encountered later in the run.
 
     Args:
         catalog_id: Catalog owning the collection.
@@ -318,13 +348,14 @@ async def reindex_collection_into_index(
             if it declares one, else ``_DEFAULT_READ_PAGE_SIZE``.
 
     Returns:
-        Number of documents successfully written to the target index.
+        :class:`ReindexResult` carrying the count of successfully written documents
+        plus any per-doc rejections encountered along the way.
 
     Raises:
         ValueError: If routing cannot resolve a valid reader/writer pair.
         RuntimeError: If required protocols are unavailable.
-        :class:`~dynastore.modules.storage.errors.EsBulkWriteError`: On ES bulk-write
-            rejection (propagated from the writer driver).
+        Exception: Any non-:class:`EsBulkWriteError` exception from ``write_entities``
+            still propagates (e.g. transport errors, mapping mismatches).
     """
     # --- Resolve reader: source-of-truth READ driver. ---
     # An explicit reader_ref (file-backed collections) takes precedence; otherwise
@@ -363,7 +394,7 @@ async def reindex_collection_into_index(
             catalog_id,
             collection_id,
         )
-        return 0
+        return ReindexResult(total_written=0)
 
     # --- Alias enrolment (idempotent). ---
     # Enrol the writer's index in the public alias so /search returns results
@@ -391,6 +422,7 @@ async def reindex_collection_into_index(
 
     total_written = 0
     offset = 0
+    rejected_docs: List[Tuple[str, str]] = []
 
     while True:
         # Collect a chunk from the reader.
@@ -414,6 +446,26 @@ async def reindex_collection_into_index(
             try:
                 written = await writer.write_entities(catalog_id, collection_id, sub_chunk)
                 batch_count = len(written) if written is not None else len(sub_chunk)
+            except EsBulkWriteError as exc:
+                # ES's _bulk endpoint is per-item: by the time this error
+                # surfaces the HTTP request already completed and the
+                # non-rejected documents in the sub-chunk are indexed —
+                # only ``exc.failures`` were not. Each rejected doc's
+                # reason is already logged at ERROR by
+                # raise_on_bulk_errors; one summary line per sub-chunk here
+                # avoids double-logging every id. Skip and keep going —
+                # a handful of known-bad documents must not hold the rest
+                # of the collection hostage (#2764).
+                batch_count = max(len(sub_chunk) - len(exc.failures), 0)
+                rejected_docs.extend(exc.failures)
+                logger.error(
+                    "reindex_collection_into_index: %d of %d document(s) rejected by "
+                    "ES for %s/%s at offset %d — skipping the rejected docs and "
+                    "continuing (per-doc reasons already logged above). "
+                    "%d written from this sub-chunk.",
+                    len(exc.failures), len(sub_chunk), catalog_id, collection_id,
+                    offset, batch_count,
+                )
             except Exception:
                 logger.error(
                     "reindex_collection_into_index: write_entities raised for %s/%s "
@@ -428,4 +480,4 @@ async def reindex_collection_into_index(
             break
         offset += chunk_size
 
-    return total_written
+    return ReindexResult(total_written=total_written, rejected_docs=rejected_docs)

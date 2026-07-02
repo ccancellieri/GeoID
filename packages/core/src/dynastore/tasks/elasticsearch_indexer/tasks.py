@@ -156,6 +156,8 @@ class BulkCatalogReindexTask(TaskProtocol):
             )
 
         total_indexed = 0
+        total_rejected = 0
+        rejected_docs: list = []
         offset, batch = 0, 50
         while True:
             collections = await catalogs_proto.list_collections(
@@ -167,16 +169,21 @@ class BulkCatalogReindexTask(TaskProtocol):
                 collection_id = getattr(collection, "id", None)
                 if not collection_id:
                     continue
-                count = await _reindex_collection(
+                result = await _reindex_collection(
                     catalog_id,
                     collection_id,
                     driver_hint=driver_hint,
                     page_size=inputs.page_size,
                 )
-                total_indexed += count
+                total_indexed += result.total_written
+                total_rejected += result.rejected
+                rejected_docs.extend(
+                    {"collection_id": collection_id, "id": doc_id, "reason": reason}
+                    for doc_id, reason in result.rejected_docs
+                )
                 logger.info(
-                    "BulkCatalogReindexTask: %s/%s — %d docs indexed.",
-                    catalog_id, collection_id, count,
+                    "BulkCatalogReindexTask: %s/%s — %d docs indexed, %d rejected.",
+                    catalog_id, collection_id, result.total_written, result.rejected,
                 )
             if len(collections) < batch:
                 break
@@ -185,6 +192,8 @@ class BulkCatalogReindexTask(TaskProtocol):
         return {
             "catalog_id": catalog_id,
             "total_indexed": total_indexed,
+            "rejected": total_rejected,
+            "rejected_docs": rejected_docs,
             "status": "done",
         }
 
@@ -238,7 +247,7 @@ class BulkCollectionReindexTask(TaskProtocol):
                 "for %s/%s: %s", catalog_id, collection_id, exc,
             )
 
-        count = await _reindex_collection(
+        result = await _reindex_collection(
             catalog_id,
             collection_id,
             driver_hint=driver_hint,
@@ -248,6 +257,11 @@ class BulkCollectionReindexTask(TaskProtocol):
         return {
             "catalog_id": catalog_id,
             "collection_id": collection_id,
-            "total_indexed": count,
+            "total_indexed": result.total_written,
+            "rejected": result.rejected,
+            "rejected_docs": [
+                {"id": doc_id, "reason": reason}
+                for doc_id, reason in result.rejected_docs
+            ],
             "status": "done",
         }
