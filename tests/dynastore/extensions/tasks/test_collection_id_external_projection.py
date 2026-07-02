@@ -191,3 +191,70 @@ class TestGetTaskScopedUncachedProjectsCollectionId:
         task = await svc._get_task_scoped_uncached(task_id, "cat", MagicMock())
 
         assert task.collection_id == _EXTERNAL_COLLECTION_ID
+
+    @pytest.mark.asyncio
+    async def test_scoped_get_matches_physical_collection_id_against_external_url_id(
+        self, monkeypatch
+    ):
+        """#2777: a task spawned by internal machinery stores the *physical*
+        collection id on its row. A legitimate collection-scoped poll using
+        the *external* URL id must NOT 404 — the cross-check has to resolve
+        the stored physical id to external before comparing."""
+        import uuid
+        from unittest.mock import MagicMock
+
+        import dynastore.extensions.tasks.tasks_service as svc
+
+        catalogs_svc = _fake_catalogs_service()
+        monkeypatch.setattr(svc, "get_protocol", lambda _p: catalogs_svc)
+
+        task_id = uuid.uuid4()
+        stored = _task(_INTERNAL_COLLECTION_ID)  # physical id, as spawned internally
+
+        async def fake_schema(catalog_id, conn):
+            return _CATALOG_ID
+
+        async def fake_uncached(conn, tid):
+            return stored
+
+        monkeypatch.setattr(svc.tasks_module, "_resolve_catalog_schema", fake_schema)
+        monkeypatch.setattr(svc.tasks_module, "get_task_by_id_unscoped", fake_uncached)
+
+        task = await svc._get_task_scoped_uncached(
+            task_id, "cat", MagicMock(), collection_id=_EXTERNAL_COLLECTION_ID
+        )
+
+        assert task.collection_id == _EXTERNAL_COLLECTION_ID
+
+    @pytest.mark.asyncio
+    async def test_scoped_get_still_404s_on_genuinely_different_collection(
+        self, monkeypatch
+    ):
+        """A physical-id-stored task that resolves to a DIFFERENT collection
+        than the URL's external id must still 404."""
+        import uuid
+        from unittest.mock import MagicMock
+
+        import dynastore.extensions.tasks.tasks_service as svc
+        from fastapi import HTTPException
+
+        catalogs_svc = _fake_catalogs_service(resolution="a-different-collection")
+        monkeypatch.setattr(svc, "get_protocol", lambda _p: catalogs_svc)
+
+        task_id = uuid.uuid4()
+        stored = _task(_INTERNAL_COLLECTION_ID)
+
+        async def fake_schema(catalog_id, conn):
+            return _CATALOG_ID
+
+        async def fake_uncached(conn, tid):
+            return stored
+
+        monkeypatch.setattr(svc.tasks_module, "_resolve_catalog_schema", fake_schema)
+        monkeypatch.setattr(svc.tasks_module, "get_task_by_id_unscoped", fake_uncached)
+
+        with pytest.raises(HTTPException) as ei:
+            await svc._get_task_scoped_uncached(
+                task_id, "cat", MagicMock(), collection_id=_EXTERNAL_COLLECTION_ID
+            )
+        assert ei.value.status_code == 404

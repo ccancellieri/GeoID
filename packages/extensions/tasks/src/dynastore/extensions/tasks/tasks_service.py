@@ -171,10 +171,21 @@ async def _get_task_scoped_uncached(
 
     The ``task.collection_id`` cross-check (#2685) is deliberately kept
     OUTSIDE the schema-resolvable gate: it compares the task row's own
-    ``collection_id`` field against the URL's literal ``collection_id``, with
-    no catalog/schema resolution involved, so it stays correct even once the
-    catalog is torn down. Only the listing-visibility re-check (hidden
-    collection ⇒ 404) needs a resolvable catalog, same as the catalog one.
+    ``collection_id`` against the URL's literal ``collection_id``, so it
+    stays correct even once the catalog is torn down. Only the
+    listing-visibility re-check (hidden collection ⇒ 404) needs a resolvable
+    catalog, same as the catalog one.
+
+    #2777: internal machinery (index_propagation, storage_drain,
+    cascade_cleanup, ...) stores the *physical* collection id on the task
+    row at spawn time, but ``collection_id`` here is always the *external*
+    URL id (#2710) — a raw comparison would spuriously 404 those tasks. The
+    row is projected to its external id via ``_project_collection_external_ids``
+    (the same ``CollectionsProtocol.resolve_collection_external_id`` mapping
+    the catalog/collection CRUD read path relies on) before comparing, so
+    both sides are in the same id space. That projection fails open (stored
+    value untouched) when the mapping is unavailable, so it needs no
+    resolvable-schema gate of its own.
     """
     task = await tasks_module.get_task_by_id_unscoped(conn, task_id)
     if not task:
@@ -182,6 +193,8 @@ async def _get_task_scoped_uncached(
             status_code=404,
             detail=f"Task with ID '{task_id}' not found in catalog '{catalog_id}'.",
         )
+
+    await _project_collection_external_ids([task])
 
     if collection_id is not None and task.collection_id and task.collection_id != collection_id:
         raise HTTPException(
