@@ -333,6 +333,88 @@ async def test_reindex_raises_when_no_secondary_index_writer():
 
 
 # ---------------------------------------------------------------------------
+# Tests: read-page / write-chunk size resolution (#2750)
+# ---------------------------------------------------------------------------
+
+def test_resolve_read_page_explicit_value_wins_over_writer_preference():
+    """An operator-supplied page_size governs verbatim, even when smaller
+    than the writer's preferred_chunk_size — the read page must never be
+    silently overridden upward (the #2750 regression)."""
+    from dynastore.modules.elasticsearch.bulk_reindex import _resolve_read_page
+
+    assert _resolve_read_page(50, 500) == 50
+
+
+def test_resolve_read_page_none_falls_back_to_writer_preference():
+    """page_size=None defers to the writer's preferred_chunk_size when it
+    declares one."""
+    from dynastore.modules.elasticsearch.bulk_reindex import _resolve_read_page
+
+    assert _resolve_read_page(None, 500) == 500
+
+
+def test_resolve_read_page_none_and_no_writer_preference_uses_default():
+    """page_size=None with no writer preference (0) falls back to the
+    module default."""
+    from dynastore.modules.elasticsearch.bulk_reindex import (
+        _DEFAULT_READ_PAGE_SIZE,
+        _resolve_read_page,
+    )
+
+    assert _resolve_read_page(None, 0) == _DEFAULT_READ_PAGE_SIZE
+
+
+def test_resolve_read_page_custom_default_override():
+    """The default parameter is honoured when both page_size and the writer
+    preference are absent."""
+    from dynastore.modules.elasticsearch.bulk_reindex import _resolve_read_page
+
+    assert _resolve_read_page(None, 0, default=42) == 42
+
+
+@pytest.mark.asyncio
+async def test_reindex_explicit_page_size_survives_larger_writer_preference():
+    """End-to-end: an explicit small page_size reaches reader.read_entities
+    verbatim even when the writer declares a larger preferred_chunk_size —
+    the read page must not be widened by the writer preference."""
+    features = [_make_feature(f"f{i}") for i in range(3)]
+    reader = _FakeReader({"col1": features})
+    writer = _FakeWriter()
+    writer.preferred_chunk_size = 500  # writer prefers a much larger chunk
+
+    async def _get_config(model, *, catalog_id, collection_id=None):
+        return _make_routing_config()
+
+    fake_configs = type("C", (), {"get_config": staticmethod(_get_config)})()
+
+    def _get_protocol(proto):
+        name = getattr(proto, "__name__", str(proto))
+        if "ConfigsProtocol" in name:
+            return fake_configs
+        return None
+
+    with patch("dynastore.tools.discovery.get_protocol", side_effect=_get_protocol):
+        async with _build_router_patches(reader, writer):
+            with patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.add_index_to_public_alias",
+                return_value=None,
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_tenant_items_index",
+                return_value="dynastore-cat1-items",
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_index_prefix",
+                return_value="dynastore",
+            ):
+                from dynastore.modules.elasticsearch.bulk_reindex import reindex_collection_into_index
+                total = await reindex_collection_into_index("cat1", "col1", page_size=50)
+
+    assert total == 3
+    # The read page passed to read_entities must be the explicit 50, not
+    # max(50, writer.preferred_chunk_size)=500.
+    assert reader._calls[0][2] == 50
+
+
+# ---------------------------------------------------------------------------
 # Tests: streaming and chunk delivery
 # ---------------------------------------------------------------------------
 

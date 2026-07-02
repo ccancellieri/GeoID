@@ -69,10 +69,14 @@ def test_elasticsearch_indexer_request_validates_minimal() -> None:
 
 def test_elasticsearch_indexer_request_validates_full() -> None:
     r = ElasticsearchIndexerRequest(
-        catalog_id="cat_a", collection_id="col_a", driver="elasticsearch"
+        catalog_id="cat_a",
+        collection_id="col_a",
+        driver="elasticsearch",
+        page_size=50,
     )
     assert r.collection_id == "col_a"
     assert r.driver == "elasticsearch"
+    assert r.page_size == 50
 
 
 def test_get_definition_returns_canonical_id() -> None:
@@ -97,7 +101,7 @@ async def test_run_with_collection_id_dispatches_to_collection_task() -> None:
     `elasticsearch_bulk_reindex_collection`)."""
     task = ElasticsearchIndexerTask(app_state=object())
     payload = _make_payload(
-        {"catalog_id": "cat_a", "collection_id": "col_a"}
+        {"catalog_id": "cat_a", "collection_id": "col_a", "page_size": 50}
     )
 
     fake_collection_task = AsyncMock()
@@ -114,6 +118,7 @@ async def test_run_with_collection_id_dispatches_to_collection_task() -> None:
     sub_payload = fake_collection_task.run.call_args.args[0]
     assert sub_payload.inputs["catalog_id"] == "cat_a"
     assert sub_payload.inputs["collection_id"] == "col_a"
+    assert sub_payload.inputs["page_size"] == 50
 
 
 @pytest.mark.asyncio

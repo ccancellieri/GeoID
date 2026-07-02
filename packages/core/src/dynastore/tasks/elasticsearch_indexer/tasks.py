@@ -70,13 +70,16 @@ logger = logging.getLogger(__name__)
 class BulkCatalogReindexInputs(BaseModel):
     catalog_id: str
     driver: Optional[str] = None
-    page_size: int = Field(
-        default=2000,
+    page_size: Optional[int] = Field(
+        default=None,
         description=(
-            "Items per read page (and write chunk) for each collection reindex. "
-            "The effective ES _bulk request size is max(page_size, writer.preferred_chunk_size). "
-            "Raise for high-throughput reindexing; lower if the container runs out of memory on "
-            "geometry-heavy collections."
+            "Items per read page for each collection reindex. When given, this value "
+            "governs the read page verbatim — it is never overridden by the writer's "
+            "preference. When omitted, defaults to the writer's preferred_chunk_size "
+            "if it declares one, else a module default. Lower this for geometry-heavy "
+            "collections where large read pages risk long-lived queries and connection "
+            "drops; the ES _bulk write is independently byte-bounded regardless of this "
+            "value."
         ),
     )
 
@@ -85,13 +88,16 @@ class BulkCollectionReindexInputs(BaseModel):
     catalog_id: str
     collection_id: str
     driver: Optional[str] = None
-    page_size: int = Field(
-        default=2000,
+    page_size: Optional[int] = Field(
+        default=None,
         description=(
-            "Items per read page (and write chunk) for this collection reindex. "
-            "The effective ES _bulk request size is max(page_size, writer.preferred_chunk_size). "
-            "Raise for high-throughput reindexing; lower if the container runs out of memory on "
-            "geometry-heavy collections."
+            "Items per read page for this collection reindex. When given, this value "
+            "governs the read page verbatim — it is never overridden by the writer's "
+            "preference. When omitted, defaults to the writer's preferred_chunk_size "
+            "if it declares one, else a module default. Lower this for geometry-heavy "
+            "collections where large read pages risk long-lived queries and connection "
+            "drops; the ES _bulk write is independently byte-bounded regardless of this "
+            "value."
         ),
     )
 

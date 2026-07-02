@@ -20,6 +20,7 @@ Inputs ([`indexer_models.py:ElasticsearchIndexerRequest`](indexer_models.py)):
 | `catalog_id` | yes | Catalog to reindex into the per-tenant items index |
 | `collection_id` | no  | If set, reindex only this collection; otherwise the whole catalog |
 | `driver` | no | Restrict reindex to a single secondary driver |
+| `page_size` | no | Rows per canonical-storage read page, honored verbatim; omit to defer to the ES writer's preferred chunk size |
 
 Both runners can claim it:
 - **`BackgroundRunner`** — runs in-process via the FastAPI background tasks pool. Use `Prefer: respond-sync` for inline execution or `Prefer: respond-async` for fire-and-poll.

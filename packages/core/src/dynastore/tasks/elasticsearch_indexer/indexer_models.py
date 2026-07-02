@@ -47,3 +47,13 @@ class ElasticsearchIndexerRequest(BaseModel):
             "regular ES driver). Omit to reindex through every active driver."
         ),
     )
+    page_size: Optional[int] = Field(
+        None,
+        gt=0,
+        description=(
+            "Rows fetched from canonical storage per read page. An explicit "
+            "value is honored verbatim; use a small page for geometry-heavy "
+            "collections. Omit to defer to the ES writer's preferred chunk "
+            "size (falling back to the module default)."
+        ),
+    )

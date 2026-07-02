@@ -88,6 +88,7 @@ class ElasticsearchIndexerTask(
                 catalog_id=request.catalog_id,
                 collection_id=request.collection_id,
                 driver=request.driver,
+                page_size=request.page_size,
             )
             sub_payload: TaskPayload = TaskPayload(
                 task_id=payload.task_id,
@@ -100,6 +101,7 @@ class ElasticsearchIndexerTask(
         sub_inputs = BulkCatalogReindexInputs(
             catalog_id=request.catalog_id,
             driver=request.driver,
+            page_size=request.page_size,
         )
         sub_payload = TaskPayload(
             task_id=payload.task_id,

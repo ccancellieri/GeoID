@@ -199,6 +199,37 @@ def _select_writer(
 _MAX_BULK_BYTES: int = 8 * 1024 * 1024  # 8 MB
 
 
+_DEFAULT_READ_PAGE_SIZE: int = 2000
+
+
+def _resolve_read_page(
+    page_size: Optional[int],
+    writer_chunk: int,
+    default: int = _DEFAULT_READ_PAGE_SIZE,
+) -> int:
+    """Resolve the read-page (and write-chunk) size for a reindex run.
+
+    The read page and the write chunk are unrelated concerns: the write
+    side is already byte-bounded downstream by :func:`_iter_byte_bounded_chunks`,
+    so the writer's ``preferred_chunk_size`` adds nothing there. The read
+    side is the fragile one for geometry-heavy collections (large rows,
+    long-lived queries), so an operator-supplied ``page_size`` must govern
+    the read page verbatim rather than being silently overridden upward.
+
+    Resolution order:
+
+    1. ``page_size`` explicitly given (not ``None``) — used verbatim.
+    2. ``page_size`` is ``None`` — fall back to the writer's
+       ``preferred_chunk_size`` when it declares one (> 0).
+    3. Neither is available — fall back to *default*.
+    """
+    if page_size is not None:
+        return page_size
+    if writer_chunk > 0:
+        return writer_chunk
+    return default
+
+
 def _iter_byte_bounded_chunks(
     items: List[Any],
     max_bytes: int,
@@ -235,7 +266,7 @@ async def reindex_collection_into_index(
     *,
     driver_hint: Optional[str] = None,
     reader_ref: Optional[str] = None,
-    page_size: int = 2000,
+    page_size: Optional[int] = None,
 ) -> int:
     """Stream every item of a collection from the routing-resolved source-of-truth
     reader and bulk-write it via the routing-resolved secondary-index writer.
@@ -260,8 +291,10 @@ async def reindex_collection_into_index(
     equals the reader this function raises ``ValueError`` immediately — a reindex that
     reads and writes to the same driver is a no-op at best and a data hazard at worst.
 
-    Chunks are sized to ``max(page_size, writer.preferred_chunk_size)`` when the writer
-    declares a preference; otherwise ``page_size`` governs.
+    The read page (and write chunk, before byte-bounded sub-chunking) is sized via
+    :func:`_resolve_read_page`: an explicitly supplied ``page_size`` governs verbatim;
+    when omitted (``None``), the writer's ``preferred_chunk_size`` is used as the
+    default, falling back to ``_DEFAULT_READ_PAGE_SIZE`` when neither is set.
 
     Write failures propagate: :class:`~dynastore.modules.storage.errors.EsBulkWriteError`
     (and any other exception from ``write_entities``) are re-raised after logging the
@@ -280,8 +313,9 @@ async def reindex_collection_into_index(
         reader_ref: Optional ``driver_ref`` override that selects the READ source
             directly (e.g. ``"items_duckdb_driver"`` for a file-backed collection).
             Takes precedence over the GEOMETRY_EXACT hint resolution.
-        page_size: Items per read page (and write chunk, unless the writer declares
-            a larger ``preferred_chunk_size``).
+        page_size: Items per read page. When given, governs the read page verbatim.
+            When omitted (``None``), defaults to the writer's ``preferred_chunk_size``
+            if it declares one, else ``_DEFAULT_READ_PAGE_SIZE``.
 
     Returns:
         Number of documents successfully written to the target index.
@@ -345,9 +379,10 @@ async def reindex_collection_into_index(
             catalog_id, collection_id, exc,
         )
 
-    # --- Determine chunk size from the writer's preference. ---
+    # --- Determine chunk size: explicit page_size wins verbatim; otherwise
+    #     fall back to the writer's preference, then the module default. ---
     writer_chunk = getattr(writer, "preferred_chunk_size", 0)
-    chunk_size = max(page_size, writer_chunk) if writer_chunk > 0 else page_size
+    chunk_size = _resolve_read_page(page_size, writer_chunk)
 
     logger.info(
         "reindex_collection_into_index: %s/%s  reader=%s  writer=%s  chunk_size=%d",
