@@ -24,6 +24,13 @@ test here constructs its ``PresetContext`` with ``iam=None`` / ``policy=None``
 (the ``_make_ctx`` default), which doubles as coverage that ``apply()`` /
 ``revoke()`` never touch those fields and so succeed unchanged on an
 IAM-less deployment.
+
+``get_catalog_model`` mocks that represent an already-provisioned catalog
+must set ``provisioning_status="ready"`` (see ``_ready_catalog``) — ``apply()``
+now polls it via ``wait_for_catalog_ready`` (#2747) between the catalog
+create/fetch and the collection create, so a bare ``MagicMock()`` whose
+``.provisioning_status`` auto-vivifies into a fresh mock would never compare
+equal to ``"ready"`` and the poll would hang until its timeout.
 """
 from __future__ import annotations
 
@@ -31,6 +38,10 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+
+def _ready_catalog() -> MagicMock:
+    return MagicMock(provisioning_status="ready")
 
 
 def _make_ctx(catalogs: Any = None, config: Any = None) -> Any:
@@ -63,7 +74,10 @@ async def test_apply_creates_catalog_and_collection_bucket_free_when_absent() ->
     from dynastore.modules.storage.hints import Hint
 
     catalogs = MagicMock()
-    catalogs.get_catalog_model = AsyncMock(return_value=None)
+    # 1st call: absent (drives the create_catalog branch). 2nd call: the
+    # wait_for_catalog_ready poll right after, observing the newly-created
+    # catalog as ready.
+    catalogs.get_catalog_model = AsyncMock(side_effect=[None, _ready_catalog()])
     catalogs.get_collection = AsyncMock(return_value=None)
     catalogs.create_catalog = AsyncMock(return_value=MagicMock())
     catalogs.create_collection = AsyncMock(return_value=MagicMock())
@@ -99,7 +113,7 @@ async def test_apply_leaves_existing_catalog_and_collection_untouched() -> None:
     )
 
     catalogs = MagicMock()
-    catalogs.get_catalog_model = AsyncMock(return_value=MagicMock())
+    catalogs.get_catalog_model = AsyncMock(return_value=_ready_catalog())
     catalogs.get_collection = AsyncMock(return_value=MagicMock())
     catalogs.create_catalog = AsyncMock()
     catalogs.create_collection = AsyncMock()
@@ -131,9 +145,12 @@ async def test_apply_recovers_from_concurrent_catalog_create_race() -> None:
 
     catalogs = MagicMock()
     # 1st get_catalog_model: absent (race not yet visible to us). create_catalog
-    # loses the race. 2nd get_catalog_model (inside the except handler):
-    # the peer's catalog is now visible.
-    catalogs.get_catalog_model = AsyncMock(side_effect=[None, MagicMock()])
+    # loses the race. 2nd get_catalog_model (inside the except handler): the
+    # peer's catalog is now visible. 3rd get_catalog_model: the
+    # wait_for_catalog_ready poll observing it as ready.
+    catalogs.get_catalog_model = AsyncMock(
+        side_effect=[None, _ready_catalog(), _ready_catalog()],
+    )
     catalogs.create_catalog = AsyncMock(side_effect=UniqueViolationError("catalog already exists"))
     catalogs.get_collection = AsyncMock(return_value=MagicMock())
     catalogs.create_collection = AsyncMock()
@@ -145,7 +162,7 @@ async def test_apply_recovers_from_concurrent_catalog_create_race() -> None:
         REGION_MAPPINGS_REGISTRY_PRESET.params_model(), "platform", ctx,
     )
 
-    assert catalogs.get_catalog_model.await_count == 2
+    assert catalogs.get_catalog_model.await_count == 3
     catalogs.create_collection.assert_not_awaited()  # collection already existed per stub
 
 
@@ -157,7 +174,7 @@ async def test_apply_recovers_from_concurrent_collection_create_race() -> None:
     from dynastore.modules.db_config.exceptions import UniqueViolationError
 
     catalogs = MagicMock()
-    catalogs.get_catalog_model = AsyncMock(return_value=MagicMock())
+    catalogs.get_catalog_model = AsyncMock(return_value=_ready_catalog())
     catalogs.get_collection = AsyncMock(side_effect=[None, MagicMock()])
     catalogs.create_collection = AsyncMock(side_effect=UniqueViolationError("collection already exists"))
     catalogs.create_catalog = AsyncMock()
@@ -203,7 +220,7 @@ async def test_apply_reraises_collection_race_recovery_when_still_absent() -> No
     from dynastore.modules.db_config.exceptions import UniqueViolationError
 
     catalogs = MagicMock()
-    catalogs.get_catalog_model = AsyncMock(return_value=MagicMock())
+    catalogs.get_catalog_model = AsyncMock(return_value=_ready_catalog())
     catalogs.get_collection = AsyncMock(side_effect=[None, None])
     catalogs.create_collection = AsyncMock(side_effect=UniqueViolationError("boom"))
     catalogs.create_catalog = AsyncMock()
@@ -234,7 +251,7 @@ async def test_apply_sets_pg_only_routing_configs() -> None:
     )
 
     catalogs = MagicMock()
-    catalogs.get_catalog_model = AsyncMock(return_value=MagicMock())
+    catalogs.get_catalog_model = AsyncMock(return_value=_ready_catalog())
     catalogs.get_collection = AsyncMock(return_value=MagicMock())
     config = MagicMock()
     config.set_config = AsyncMock()
@@ -290,7 +307,7 @@ async def test_apply_sets_catalog_lookup_audience_public() -> None:
     from dynastore.modules.iam.audience_configs import CatalogLookupAudience
 
     catalogs = MagicMock()
-    catalogs.get_catalog_model = AsyncMock(return_value=MagicMock())
+    catalogs.get_catalog_model = AsyncMock(return_value=_ready_catalog())
     catalogs.get_collection = AsyncMock(return_value=MagicMock())
     config = MagicMock()
     config.set_config = AsyncMock()

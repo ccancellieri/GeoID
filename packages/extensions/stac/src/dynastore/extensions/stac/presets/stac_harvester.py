@@ -41,13 +41,12 @@ Re-applying re-syncs idempotently.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
 from typing import Any, ClassVar, Optional, Tuple, Type
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from dynastore.extensions.tools.catalog_readiness import wait_for_catalog_ready
 from dynastore.modules.storage.presets.preset import (
     AppliedDescriptor,
     PresetContext,
@@ -75,43 +74,6 @@ _LEGACY_BACKEND_TO_DRIVERS = {
 # for dispatcher pickup latency, not an expectation that it takes this long.
 _CATALOG_READY_POLL_INTERVAL_S = 1.0
 _CATALOG_READY_TIMEOUT_S = 60.0
-
-
-async def _wait_for_catalog_ready(catalogs: Any, catalog_id: str) -> None:
-    """Bounded poll of ``catalog_id`` until ``provisioning_status == 'ready'``.
-
-    Guards against submitting the harvest job while the target catalog's
-    tenant schema does not exist yet: ``_ensure_collection`` in the
-    ``stac_harvest`` task swallows a missing-schema write as a soft
-    per-collection error, so a harvest that races an in-flight
-    ``catalog_provision`` task would otherwise "succeed" silently with zero
-    items instead of failing loudly.
-
-    Raises ``RuntimeError`` — loudly, never silently — when the catalog
-    reaches a terminal ``failed`` status or the poll budget is exhausted
-    before ``ready`` is observed.
-    """
-    deadline = time.monotonic() + _CATALOG_READY_TIMEOUT_S
-    while True:
-        model = await catalogs.get_catalog_model(catalog_id)
-        status = getattr(model, "provisioning_status", "ready") if model is not None else None
-        if status == "ready":
-            return
-        if status == "failed":
-            raise RuntimeError(
-                f"stac_harvester: target_catalog {catalog_id!r} provisioning "
-                "failed — refusing to submit the harvest job against a "
-                "catalog whose tenant schema was never created."
-            )
-        if time.monotonic() >= deadline:
-            raise RuntimeError(
-                f"stac_harvester: target_catalog {catalog_id!r} did not reach "
-                f"'ready' within {_CATALOG_READY_TIMEOUT_S:.0f}s of creation — "
-                "refusing to submit the harvest job against a catalog whose "
-                "tenant schema may not exist yet.  Retry the preset apply "
-                "once the catalog finishes provisioning."
-            )
-        await asyncio.sleep(_CATALOG_READY_POLL_INTERVAL_S)
 
 
 # ---------------------------------------------------------------------------
@@ -363,8 +325,16 @@ class _StacHarvesterPreset:
 
             # Whether just-created or created concurrently by a peer, wait
             # for catalog_core (tenant schema) to finish before the harvest
-            # job's first write — see _wait_for_catalog_ready.
-            await _wait_for_catalog_ready(ctx.catalogs, target_catalog)
+            # job's first write.  ``_ensure_collection`` in the
+            # ``stac_harvest`` task swallows a missing-schema write as a soft
+            # per-collection error, so a harvest that races an in-flight
+            # ``catalog_provision`` task would otherwise "succeed" silently
+            # with zero items instead of failing loudly.
+            await wait_for_catalog_ready(
+                target_catalog, catalogs_svc=ctx.catalogs, caller="stac_harvester",
+                timeout_s=_CATALOG_READY_TIMEOUT_S,
+                poll_interval_s=_CATALOG_READY_POLL_INTERVAL_S,
+            )
 
         from dynastore.modules.processes.processes_module import execute_process
         from dynastore.modules.processes import models as _proc_models

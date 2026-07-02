@@ -32,11 +32,19 @@ Usage::
 
     catalog = await require_catalog_ready(catalog_id)        # discovers CatalogsProtocol
     catalog = await require_catalog_ready(catalog_id, catalogs_svc=svc)  # explicit
+
+Also home to :func:`wait_for_catalog_ready`, a bounded *poll* (as opposed to
+``require_catalog_ready``'s immediate fail-fast) for callers — preset
+``apply()`` bodies, background tasks — that create a catalog with
+``Hint.DEFER`` and then need its tenant schema to exist before their own
+next write, rather than surfacing a 409 to an end user.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import Any, Optional
 
 from fastapi import HTTPException
@@ -52,6 +60,16 @@ READY = "ready"
 PROVISIONING = "provisioning"
 FAILED = "failed"
 CONFLICT = "conflict"
+
+# Bounded wait for a just-created catalog's core provisioning (tenant PG
+# schema) to finish.  Even a ``Hint.DEFER`` create still enqueues an async
+# ``catalog_provision`` task for the non-deferrable ``catalog_core`` step —
+# ``create_catalog`` returns before that task runs.  ``catalog_core`` only
+# creates a PG schema (no external network calls), so it is normally fast;
+# this budget is generous headroom for dispatcher pickup latency, not an
+# expectation that it takes this long.
+_CATALOG_READY_POLL_INTERVAL_S = 1.0
+_CATALOG_READY_TIMEOUT_S = 60.0
 
 
 async def require_catalog_ready(
@@ -188,3 +206,54 @@ async def require_collection_ready(
         )
 
     await svc.ensure_alive(catalog_id, collection_id)
+
+
+async def wait_for_catalog_ready(
+    catalog_id: str,
+    *,
+    catalogs_svc: Optional[CatalogsProtocol] = None,
+    caller: str = "",
+    timeout_s: float = _CATALOG_READY_TIMEOUT_S,
+    poll_interval_s: float = _CATALOG_READY_POLL_INTERVAL_S,
+) -> None:
+    """Bounded poll of ``catalog_id`` until ``provisioning_status == 'ready'``.
+
+    For callers that create a catalog with ``Hint.DEFER`` and then need its
+    tenant schema to exist before their own next write (a preset's
+    ``apply()``, a background task) — as opposed to :func:`require_catalog_ready`,
+    which fails fast with an HTTP 409 for an inbound request that hits a
+    catalog someone else is provisioning.
+
+    Raises ``RuntimeError`` — loudly, never silently — when the catalog
+    reaches a terminal ``failed`` status or the poll budget is exhausted
+    before ``ready`` is observed.  ``caller`` is included in the error
+    message to identify which code path timed out.
+    """
+    svc = catalogs_svc if catalogs_svc is not None else get_protocol(CatalogsProtocol)
+    if svc is None:
+        raise RuntimeError(
+            f"{caller}: CatalogsProtocol not available — cannot wait for "
+            f"catalog {catalog_id!r} to become ready."
+        )
+
+    label = f"{caller}: " if caller else ""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        model = await svc.get_catalog_model(catalog_id)
+        status = getattr(model, "provisioning_status", READY) if model is not None else None
+        if status == READY:
+            return
+        if status == FAILED:
+            raise RuntimeError(
+                f"{label}target catalog {catalog_id!r} provisioning failed — "
+                "refusing to proceed against a catalog whose tenant schema "
+                "was never created."
+            )
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"{label}catalog {catalog_id!r} did not reach 'ready' within "
+                f"{timeout_s:.0f}s of creation — refusing to proceed against "
+                "a catalog whose tenant schema may not exist yet.  Retry "
+                "once the catalog finishes provisioning."
+            )
+        await asyncio.sleep(poll_interval_s)

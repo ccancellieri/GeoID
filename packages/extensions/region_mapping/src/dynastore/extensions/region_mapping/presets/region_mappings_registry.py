@@ -64,6 +64,7 @@ from typing import ClassVar, Tuple, Type
 
 from pydantic import BaseModel
 
+from dynastore.extensions.tools.catalog_readiness import wait_for_catalog_ready
 from dynastore.modules.db_config.exceptions import UniqueViolationError
 from dynastore.modules.iam.audience_configs import CatalogLookupAudience
 from dynastore.modules.storage.hints import Hint
@@ -146,6 +147,18 @@ async def ensure_registry_provisioned(ctx: PresetContext) -> None:
             existing_catalog = await ctx.catalogs.get_catalog_model(REGISTRY_CATALOG_ID)
             if existing_catalog is None:
                 raise
+
+    # Even a Hint.DEFER create only enqueues the async catalog_provision
+    # task for the non-deferrable catalog_core step (the tenant PG schema
+    # and its `collections` table) — create_catalog returns before that task
+    # runs. Wait for it here, the same way stac_harvester's target_catalog
+    # create does, so the create_collection below doesn't race a schema that
+    # doesn't exist yet (#2747: first apply on a fresh deployment 500ed with
+    # "relation ...collections does not exist", self-healing only because a
+    # retry landed after the task had finished).
+    await wait_for_catalog_ready(
+        REGISTRY_CATALOG_ID, catalogs_svc=ctx.catalogs, caller="region_mappings_registry",
+    )
 
     existing_collection = await ctx.catalogs.get_collection(
         REGISTRY_CATALOG_ID, MAPPINGS_COLLECTION_ID,
