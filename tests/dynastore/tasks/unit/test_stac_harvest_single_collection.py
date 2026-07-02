@@ -188,3 +188,83 @@ async def test_catalog_harvest_applies_at_catalog_scope():
     assert applied == ["catalog:cat-7"]
     assert stats.collections_seen == 1
     assert stats.collections_written == 1
+
+
+# ---------------------------------------------------------------------------
+# StacHarvestTask.run — total-failure guard
+# ---------------------------------------------------------------------------
+
+
+class _Payload:
+    """Minimal stand-in for TaskPayload — ``run`` only reads ``.inputs``."""
+
+    def __init__(self, inputs: Dict[str, Any]) -> None:
+        self.inputs = {"inputs": inputs}
+
+
+def _run_task_with_stats(stats: harvest_task.HarvestStats):
+    """Build a StacHarvestTask with everything external mocked and return
+    the coroutine for ``run`` with ``run_harvest`` pinned to ``stats``."""
+    task = object.__new__(harvest_task.StacHarvestTask)
+    task.app_state = None
+    task.engine = object()
+
+    payload = _Payload(
+        {"catalog_url": "https://src", "target_catalog": "cat-7", "drivers": "es"}
+    )
+
+    return patch.multiple(
+        harvest_task,
+        run_harvest=AsyncMock(return_value=stats),
+    ), patch(
+        "dynastore.tools.discovery.get_protocol",
+        side_effect=lambda proto: AsyncMock(),
+    ), task, payload
+
+
+@pytest.mark.asyncio
+async def test_run_raises_when_every_collection_failed_and_nothing_written():
+    """collections_seen > 0 with zero writes and per-collection errors is a
+    total failure — the task must fail, not report success with empty stats."""
+    stats = harvest_task.HarvestStats(
+        collections_seen=1970,
+        errors=[f"collection:c{i}" for i in range(3)],
+    )
+    run_patch, proto_patch, task, payload = _run_task_with_stats(stats)
+
+    with run_patch, proto_patch:
+        with pytest.raises(RuntimeError, match="nothing harvested"):
+            await task.run(payload)
+
+
+@pytest.mark.asyncio
+async def test_run_partial_failure_stays_successful_with_error_count():
+    """Some collections written + some errors is a partial failure — the run
+    succeeds and the summary carries the error count."""
+    stats = harvest_task.HarvestStats(
+        collections_seen=10,
+        collections_written=7,
+        items_written=100,
+        errors=["collection:bad1", "collection:bad2"],
+    )
+    run_patch, proto_patch, task, payload = _run_task_with_stats(stats)
+
+    with run_patch, proto_patch:
+        result = await task.run(payload)
+
+    assert result is not None
+    assert "errors=2" in result["message"]
+    assert result["collections_written"] == 7
+
+
+@pytest.mark.asyncio
+async def test_run_empty_source_is_not_a_failure():
+    """Zero collections seen (empty source) has nothing to fail on."""
+    stats = harvest_task.HarvestStats()
+    run_patch, proto_patch, task, payload = _run_task_with_stats(stats)
+
+    with run_patch, proto_patch:
+        result = await task.run(payload)
+
+    assert result is not None
+    assert result["collections_seen"] == 0

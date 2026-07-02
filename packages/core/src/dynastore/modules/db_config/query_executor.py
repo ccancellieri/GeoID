@@ -2457,11 +2457,16 @@ async def best_effort_savepoint(
 
     Wraps the body in a SAVEPOINT via ``conn.begin_nested()`` when the
     connection supports one, so a tolerated failure rolls back only the
-    body's own statements and the outer transaction stays healthy. When
-    ``conn`` has no ``begin_nested`` (e.g. a raw driver connection), the body
-    still runs — and failures are still classified by ``tolerate`` — but
-    without SAVEPOINT isolation, matching every call site's existing
-    defensive fallback for connection types that don't support nesting.
+    body's own statements and the outer transaction stays healthy. Works for
+    both async (``AsyncConnection``/``AsyncSession``) and sync connections:
+    the SAVEPOINT is driven manually, like :func:`managed_transaction` above,
+    because ``async with begin_nested()`` on a sync connection raises before
+    the body ever runs (job images use sync engines). When ``conn`` has no
+    ``begin_nested`` (e.g. a raw driver connection), or entering the
+    SAVEPOINT itself fails, the body still runs — and failures are still
+    classified by ``tolerate`` — but without SAVEPOINT isolation, matching
+    every call site's existing defensive fallback for connection types that
+    don't support nesting.
 
     ``tolerate`` classifies the exception: return ``True`` to swallow it (the
     yielded :class:`SavepointOutcome` records it in ``.error``), or ``False``
@@ -2472,22 +2477,60 @@ async def best_effort_savepoint(
     that helper always propagates the body's exception (it has no
     swallow-and-continue mode), and its poisoned-connection/autocommit
     detection targets a different set of callers than the five best-effort
-    sites this consolidates. Using a plain ``begin_nested()`` context here
-    keeps the behavior identical to what those sites already relied on.
+    sites this consolidates. Driving ``begin_nested()`` directly here keeps
+    the behavior identical to what those sites already relied on.
     """
     outcome = SavepointOutcome()
     begin_nested = getattr(conn, "begin_nested", None)
+
+    savepoint = None
+    if begin_nested is not None:
+        try:
+            candidate = begin_nested()
+            # Async connections/sessions return a startable awaitable
+            # (awaiting it emits the SAVEPOINT); sync ones emit it eagerly
+            # and return the transaction object directly.
+            savepoint = await candidate if inspect.isawaitable(candidate) else candidate
+        except Exception:
+            # Best-effort: a SAVEPOINT we cannot open (aborted outer tx,
+            # driver quirk) must not prevent the body from running — the
+            # body's own failure, if any, is what `tolerate` classifies.
+            logger.warning(
+                "best_effort_savepoint: begin_nested() failed; running body "
+                "without SAVEPOINT isolation",
+                exc_info=True,
+            )
+            savepoint = None
     try:
-        if begin_nested is not None:
-            async with begin_nested():
-                yield outcome
-        else:
-            yield outcome
+        yield outcome
     except BaseException as exc:  # noqa: BLE001 - classification delegated to `tolerate`
+        if savepoint is not None:
+            try:
+                rolled_back = savepoint.rollback()
+                if inspect.isawaitable(rolled_back):
+                    await rolled_back
+            except Exception:
+                # Outer tx already aborted or wire-level error state — the
+                # caller's managed_transaction issues the real ROLLBACK.
+                pass
         if tolerate(exc):
             outcome.error = exc
             return
         raise
+    else:
+        if savepoint is not None:
+            try:
+                committed = savepoint.commit()
+                if inspect.isawaitable(committed):
+                    await committed
+            except BaseException as exc:  # noqa: BLE001 - same classification as the body
+                # Matches the old ``async with``'s __aexit__-commit behavior:
+                # a RELEASE failure is classified by `tolerate` like any body
+                # failure.
+                if tolerate(exc):
+                    outcome.error = exc
+                    return
+                raise
 
 
 _T = TypeVar("_T")

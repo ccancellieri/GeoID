@@ -790,8 +790,23 @@ class StacHarvestTask(
             f"collections={stats.collections_written}/{stats.collections_seen} "
             f"items_written={stats.items_written} items_failed={stats.items_failed} "
             f"virtual_assets={stats.virtual_assets_written} "
+            f"errors={len(stats.errors)} "
             f"drivers={request.drivers.value}"
         )
+        if (
+            stats.collections_seen > 0
+            and stats.collections_written == 0
+            and stats.items_written == 0
+            and stats.errors
+        ):
+            # Every collection errored and nothing was written: reporting
+            # "successful" here masks a total write failure behind soft
+            # per-collection errors. Partial failure stays successful (the
+            # summary carries the error count); total failure must not.
+            raise RuntimeError(
+                f"stac_harvest: nothing harvested — {summary}; "
+                f"first errors: {stats.errors[:5]}"
+            )
         return {
             "message": summary,
             "collections_written": stats.collections_written,
