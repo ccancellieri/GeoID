@@ -61,11 +61,10 @@ def _maybe_bust_router(cls: Type["PluginConfig"], catalog_id: Optional[str], col
         return
     invalidate_router_cache(catalog_id, collection_id)
 from dynastore.modules.db_config.query_executor import (
-    DQLQuery,
-    ResultHandler,
     managed_transaction,
     DbResource,
 )
+from dynastore.modules.db_config.shared_queries import list_page_with_count
 from dynastore.models.driver_context import DriverContext
 from dynastore.tools.db import validate_sql_identifier
 from dynastore.tools.json import CustomJSONEncoder
@@ -857,14 +856,10 @@ class ConfigService(ConfigsProtocol):
                 if not await check_table_exists(conn, COLLECTION_CONFIGS_TABLE, phys_schema):
                     return {"total": 0, "results": []}
 
-                rows = await _cq.list_collection_configs_paginated(phys_schema).execute(
-                    conn,
-                    collection_id=internal_collection_id,
-                    limit=limit,
-                    offset=offset,
+                rows, total = await _cq.list_collection_configs_paginated(
+                    conn, phys_schema, internal_collection_id, limit, offset
                 )
 
-            total = rows[0]["total_count"] if rows else 0
             results = []
             for r in rows:
                 ck: str = r["class_key"]
@@ -890,11 +885,10 @@ class ConfigService(ConfigsProtocol):
                 if not await check_table_exists(conn, CATALOG_CONFIGS_TABLE, phys_schema):
                     return {"total": 0, "results": []}
 
-                rows = await _cq.list_catalog_configs_paginated(phys_schema).execute(
-                    conn, limit=limit, offset=offset
+                rows, total = await _cq.list_catalog_configs_paginated(
+                    conn, phys_schema, limit, offset
                 )
 
-            total = rows[0]["total_count"] if rows else 0
             results = []
             for r in rows:
                 ck: str = r["class_key"]
@@ -1437,17 +1431,17 @@ class ConfigService(ConfigsProtocol):
 
                 sql += " ORDER BY level, collection_id, class_key LIMIT :limit OFFSET :offset;"
 
-                rows = await DQLQuery(
-                    sql, result_handler=ResultHandler.ALL_DICTS
-                ).execute(
+                rows, total = await list_page_with_count(
                     conn,
-                    collection_id=internal_collection_id,
-                    query=f"%{query}%" if query else None,
+                    sql,
+                    {
+                        "collection_id": internal_collection_id,
+                        "query": f"%{query}%" if query else None,
+                    },
                     limit=limit,
                     offset=offset,
                 )
 
-                total = rows[0]["total_count"] if rows else 0
                 results = []
                 for r in rows:
                     class_key: str = r["class_key"]

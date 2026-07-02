@@ -20,9 +20,10 @@ import json
 import logging
 import uuid
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from dynastore.modules.db_config.query_executor import DbResource, DQLQuery, ResultHandler
+from dynastore.modules.db_config.shared_queries import list_page_with_count
 from .models import MovingFeature, MovingFeatureCreate, MovingFeatureUpdate, TemporalGeometry, TemporalGeometryCreate, TemporalGeometryUpdate
 
 logger = logging.getLogger(__name__)
@@ -73,15 +74,13 @@ _get_mf_query = DQLQuery(
     result_handler=ResultHandler.ONE_DICT,
 )
 
-_list_mf_query = DQLQuery(
-    """
-    SELECT * FROM moving_features.moving_features
+_LIST_MF_SQL = """
+    SELECT COUNT(*) OVER() AS total_count, *
+    FROM moving_features.moving_features
     WHERE catalog_id = :catalog_id AND collection_id = :collection_id
     ORDER BY created_at DESC
     LIMIT :limit OFFSET :offset;
-    """,
-    result_handler=ResultHandler.ALL_DICTS,
-)
+    """
 
 _delete_mf_query = DQLQuery(
     """
@@ -196,31 +195,29 @@ _list_tg_between_query = DQLQuery(
     result_handler=ResultHandler.ALL_DICTS,
 )
 
-_list_mf_by_bbox_query = DQLQuery(
-    """
-    SELECT DISTINCT mf.* FROM moving_features.moving_features mf
-    JOIN moving_features.temporal_geometries tg ON mf.id = tg.mf_id AND mf.catalog_id = tg.catalog_id
-    WHERE mf.catalog_id = :catalog_id AND mf.collection_id = :collection_id
-      AND tg.bbox_geom IS NOT NULL
-      AND tg.bbox_geom && ST_MakeEnvelope(:min_lon, :min_lat, :max_lon, :max_lat, 4326)
-    ORDER BY mf.created_at DESC
+_LIST_MF_BY_BBOX_SQL = """
+    SELECT COUNT(*) OVER() AS total_count, sub.* FROM (
+        SELECT DISTINCT mf.* FROM moving_features.moving_features mf
+        JOIN moving_features.temporal_geometries tg ON mf.id = tg.mf_id AND mf.catalog_id = tg.catalog_id
+        WHERE mf.catalog_id = :catalog_id AND mf.collection_id = :collection_id
+          AND tg.bbox_geom IS NOT NULL
+          AND tg.bbox_geom && ST_MakeEnvelope(:min_lon, :min_lat, :max_lon, :max_lat, 4326)
+    ) sub
+    ORDER BY sub.created_at DESC
     LIMIT :limit OFFSET :offset;
-    """,
-    result_handler=ResultHandler.ALL_DICTS,
-)
+    """
 
-_list_mf_by_geometry_query = DQLQuery(
-    """
-    SELECT DISTINCT mf.* FROM moving_features.moving_features mf
-    JOIN moving_features.temporal_geometries tg ON mf.id = tg.mf_id AND mf.catalog_id = tg.catalog_id
-    WHERE mf.catalog_id = :catalog_id AND mf.collection_id = :collection_id
-      AND tg.bbox_geom IS NOT NULL
-      AND ST_Intersects(tg.bbox_geom, ST_GeomFromText(:geometry_wkt, 4326))
-    ORDER BY mf.created_at DESC
+_LIST_MF_BY_GEOMETRY_SQL = """
+    SELECT COUNT(*) OVER() AS total_count, sub.* FROM (
+        SELECT DISTINCT mf.* FROM moving_features.moving_features mf
+        JOIN moving_features.temporal_geometries tg ON mf.id = tg.mf_id AND mf.catalog_id = tg.catalog_id
+        WHERE mf.catalog_id = :catalog_id AND mf.collection_id = :collection_id
+          AND tg.bbox_geom IS NOT NULL
+          AND ST_Intersects(tg.bbox_geom, ST_GeomFromText(:geometry_wkt, 4326))
+    ) sub
+    ORDER BY sub.created_at DESC
     LIMIT :limit OFFSET :offset;
-    """,
-    result_handler=ResultHandler.ALL_DICTS,
-)
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -281,15 +278,17 @@ async def list_moving_features(
     collection_id: str,
     limit: int = 100,
     offset: int = 0,
-) -> List[MovingFeature]:
-    rows = await _list_mf_query.execute(
+) -> Tuple[List[MovingFeature], int]:
+    """Page moving features in a collection. Returns ``(features, total)``."""
+    rows, total = await list_page_with_count(
         conn,
-        catalog_id=catalog_id,
-        collection_id=collection_id,
+        _LIST_MF_SQL,
+        {"catalog_id": catalog_id, "collection_id": collection_id},
         limit=limit,
         offset=offset,
     )
-    return [mf for mf in (_mf_from_row(r) for r in rows if r) if mf is not None]
+    features = [mf for mf in (_mf_from_row(r) for r in rows if r) if mf is not None]
+    return features, total
 
 
 async def list_moving_features_by_bbox(
@@ -302,19 +301,24 @@ async def list_moving_features_by_bbox(
     max_lat: float,
     limit: int = 100,
     offset: int = 0,
-) -> List[MovingFeature]:
-    rows = await _list_mf_by_bbox_query.execute(
+) -> Tuple[List[MovingFeature], int]:
+    """Page moving features intersecting a bbox. Returns ``(features, total)``."""
+    rows, total = await list_page_with_count(
         conn,
-        catalog_id=catalog_id,
-        collection_id=collection_id,
-        min_lon=min_lon,
-        min_lat=min_lat,
-        max_lon=max_lon,
-        max_lat=max_lat,
+        _LIST_MF_BY_BBOX_SQL,
+        {
+            "catalog_id": catalog_id,
+            "collection_id": collection_id,
+            "min_lon": min_lon,
+            "min_lat": min_lat,
+            "max_lon": max_lon,
+            "max_lat": max_lat,
+        },
         limit=limit,
         offset=offset,
     )
-    return [mf for mf in (_mf_from_row(r) for r in rows if r) if mf is not None]
+    features = [mf for mf in (_mf_from_row(r) for r in rows if r) if mf is not None]
+    return features, total
 
 
 async def list_moving_features_by_geometry(
@@ -324,16 +328,17 @@ async def list_moving_features_by_geometry(
     geometry_wkt: str,
     limit: int = 100,
     offset: int = 0,
-) -> List[MovingFeature]:
-    rows = await _list_mf_by_geometry_query.execute(
+) -> Tuple[List[MovingFeature], int]:
+    """Page moving features intersecting a geometry. Returns ``(features, total)``."""
+    rows, total = await list_page_with_count(
         conn,
-        catalog_id=catalog_id,
-        collection_id=collection_id,
-        geometry_wkt=geometry_wkt,
+        _LIST_MF_BY_GEOMETRY_SQL,
+        {"catalog_id": catalog_id, "collection_id": collection_id, "geometry_wkt": geometry_wkt},
         limit=limit,
         offset=offset,
     )
-    return [mf for mf in (_mf_from_row(r) for r in rows if r) if mf is not None]
+    features = [mf for mf in (_mf_from_row(r) for r in rows if r) if mf is not None]
+    return features, total
 
 
 async def delete_moving_feature(

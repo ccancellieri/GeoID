@@ -84,21 +84,21 @@ get_custom_crs_by_name_query = DQLQuery(
     result_handler=ResultHandler.ONE_OR_NONE
 )
 
-# List all CRS for a catalog
-list_custom_crs_query = DQLQuery(
-    """
-    SELECT * FROM crs.crs_definitions 
-    WHERE catalog_id = :catalog_id 
-    ORDER BY created_at DESC 
+# List all CRS for a catalog. Paged via list_page_with_count (modules/db_config/
+# shared_queries.py) — the COUNT(*) OVER() window is merged into the page query
+# so the caller gets the total match count in the same round trip.
+LIST_CUSTOM_CRS_SQL = """
+    SELECT COUNT(*) OVER() AS total_count, *
+    FROM crs.crs_definitions
+    WHERE catalog_id = :catalog_id
+    ORDER BY created_at DESC
     LIMIT :limit OFFSET :offset;
-    """,
-    result_handler=ResultHandler.ALL_DICTS
-)
+    """
 
 # Search functionality: Looks inside the JSONB structure for matches in 'name', 'description', or 'scope'
-search_custom_crs_query = DQLQuery(
-    """
-    SELECT * FROM crs.crs_definitions
+SEARCH_CUSTOM_CRS_SQL = """
+    SELECT COUNT(*) OVER() AS total_count, *
+    FROM crs.crs_definitions
     WHERE
         catalog_id = :catalog_id AND (
             definition->>'name' ILIKE :search_term OR
@@ -107,6 +107,4 @@ search_custom_crs_query = DQLQuery(
         )
     ORDER BY created_at DESC
     LIMIT :limit OFFSET :offset;
-    """,
-    result_handler=ResultHandler.ALL_DICTS
-)
+    """

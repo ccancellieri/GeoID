@@ -33,6 +33,7 @@ from sqlalchemy import text
 
 from dynastore.models.shared_models import Link
 from dynastore.modules.db_config.query_executor import DbResource, DQLQuery, ResultHandler
+from dynastore.modules.db_config.shared_queries import list_page_with_count
 
 from .models import (
     DataStream,
@@ -78,18 +79,29 @@ _get_system_query = DQLQuery(
     result_handler=ResultHandler.ONE_DICT,
 )
 
-_list_systems_query = DQLQuery(
-    """
-    SELECT id, catalog_id, system_id, name, description, type,
+_LIST_SYSTEMS_SQL = """
+    SELECT COUNT(*) OVER() AS total_count,
+           id, catalog_id, system_id, name, description, type,
            ST_AsGeoJSON(geometry)::jsonb AS geometry,
            properties, stac_collection_id, created_at, updated_at
     FROM consys.systems
     WHERE catalog_id = :catalog_id
     ORDER BY system_id
     LIMIT :limit OFFSET :offset;
-    """,
-    result_handler=ResultHandler.ALL_DICTS,
-)
+    """
+
+_LIST_SYSTEMS_BY_BBOX_SQL = """
+    SELECT COUNT(*) OVER() AS total_count,
+           id, catalog_id, system_id, name, description, type,
+           ST_AsGeoJSON(geometry)::jsonb AS geometry,
+           properties, stac_collection_id, created_at, updated_at
+    FROM consys.systems
+    WHERE catalog_id = :catalog_id
+      AND geometry IS NOT NULL
+      AND ST_Intersects(geometry, ST_MakeEnvelope(:xmin, :ymin, :xmax, :ymax, 4326))
+    ORDER BY system_id
+    LIMIT :limit OFFSET :offset;
+    """
 
 _delete_system_query = DQLQuery(
     "DELETE FROM consys.systems WHERE catalog_id = :catalog_id AND id = :system_uuid;",
@@ -359,38 +371,23 @@ async def list_systems(
     limit: int = 100,
     offset: int = 0,
     bbox: Optional[Tuple[float, float, float, float]] = None,
-) -> List[System]:
+) -> Tuple[List[System], int]:
+    """Page systems for a catalog. Returns ``(systems, total)``."""
     if bbox is not None:
         xmin, ymin, xmax, ymax = bbox
-        bbox_query = DQLQuery(
-            """
-            SELECT id, catalog_id, system_id, name, description, type,
-                   ST_AsGeoJSON(geometry)::jsonb AS geometry,
-                   properties, stac_collection_id, created_at, updated_at
-            FROM consys.systems
-            WHERE catalog_id = :catalog_id
-              AND geometry IS NOT NULL
-              AND ST_Intersects(geometry, ST_MakeEnvelope(:xmin, :ymin, :xmax, :ymax, 4326))
-            ORDER BY system_id
-            LIMIT :limit OFFSET :offset;
-            """,
-            result_handler=ResultHandler.ALL_DICTS,
-        )
-        rows = await bbox_query.execute(
+        rows, total = await list_page_with_count(
             conn,
-            catalog_id=catalog_id,
-            xmin=xmin,
-            ymin=ymin,
-            xmax=xmax,
-            ymax=ymax,
+            _LIST_SYSTEMS_BY_BBOX_SQL,
+            {"catalog_id": catalog_id, "xmin": xmin, "ymin": ymin, "xmax": xmax, "ymax": ymax},
             limit=limit,
             offset=offset,
         )
     else:
-        rows = await _list_systems_query.execute(
-            conn, catalog_id=catalog_id, limit=limit, offset=offset
+        rows, total = await list_page_with_count(
+            conn, _LIST_SYSTEMS_SQL, {"catalog_id": catalog_id}, limit=limit, offset=offset
         )
-    return [s for r in rows if (s := _system_from_row(r)) is not None]
+    systems = [s for r in rows if (s := _system_from_row(r)) is not None]
+    return systems, total
 
 
 async def update_system(

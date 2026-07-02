@@ -108,12 +108,10 @@ async def test_catalog_list_configs_tolerates_legacy_key_and_warns(monkeypatch, 
     svc_mod, _mgr = _wire_common_mocks(monkeypatch, svc)
 
     row = {
-        "total_count": 1,
         "class_key": _EvolvedShapeConfig.class_key(),
         "config_data": _legacy_row(),
     }
-    mock_query = MagicMock()
-    mock_query.return_value.execute = AsyncMock(return_value=[row])
+    mock_query = AsyncMock(return_value=([row], 1))
     monkeypatch.setattr(svc_mod._cq, "list_catalog_configs_paginated", mock_query)
 
     with caplog.at_level(
@@ -140,12 +138,10 @@ async def test_collection_list_configs_tolerates_legacy_key(monkeypatch):
     )
 
     row = {
-        "total_count": 1,
         "class_key": _EvolvedShapeConfig.class_key(),
         "config_data": _legacy_row(),
     }
-    mock_query = MagicMock()
-    mock_query.return_value.execute = AsyncMock(return_value=[row])
+    mock_query = AsyncMock(return_value=([row], 1))
     monkeypatch.setattr(svc_mod._cq, "list_collection_configs_paginated", mock_query)
 
     result = await svc.list_configs(

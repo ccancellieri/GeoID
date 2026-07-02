@@ -81,8 +81,8 @@ def _mock_catalogs_proto(
 
 def _mock_crs_proto(crs_obj=None) -> MagicMock:
     svc = MagicMock()
-    svc.list_crs = AsyncMock(return_value=[])
-    svc.search_crs = AsyncMock(return_value=[])
+    svc.list_crs = AsyncMock(return_value=([], 0))
+    svc.search_crs = AsyncMock(return_value=([], 0))
     svc.create_crs = AsyncMock(return_value=crs_obj or MagicMock())
     svc.update_crs = AsyncMock(return_value=crs_obj or MagicMock())
     svc.get_crs_by_name = AsyncMock(return_value=crs_obj)
@@ -182,7 +182,9 @@ class TestListCrsEndpoint:
             limit=20,
             offset=0,
         )
-        assert result == []
+        assert result.crs == []
+        assert result.numberMatched == 0
+        assert result.numberReturned == 0
 
     @pytest.mark.asyncio
     async def test_unknown_catalog_raises_404(self, monkeypatch):

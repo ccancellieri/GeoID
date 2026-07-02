@@ -69,6 +69,14 @@ class System(SystemBase):
     model_config = ConfigDict(from_attributes=True)
 
 
+class SystemList(BaseModel):
+    """Paginated collection of connected systems for a catalog."""
+
+    systems: List[System] = Field(..., description="Systems returned for this page.")
+    numberMatched: int = Field(..., description="Total systems matching the query across all pages.")
+    numberReturned: int = Field(..., description="Systems returned in this page.")
+
+
 # ---------------------------------------------------------------------------
 # Deployment
 # ---------------------------------------------------------------------------

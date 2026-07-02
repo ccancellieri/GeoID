@@ -19,7 +19,7 @@
 # src/dynastore/modules/csr/crs_module.py
 
 import logging
-from typing import Optional, List, AsyncGenerator
+from typing import Optional, List, Tuple, AsyncGenerator
 from contextlib import asynccontextmanager
 
 from dynastore.modules import ModuleProtocol, get_protocol
@@ -28,6 +28,7 @@ from dynastore.modules.db_config.query_executor import managed_transaction
 from dynastore.modules.db_config.query_executor import DbResource
 from dynastore.modules.db_config import maintenance_tools
 from dynastore.modules.db_config.partition_tools import ensure_partition_exists
+from dynastore.modules.db_config.shared_queries import list_page_with_count
 from .models import CRS, CRSCreate
 from . import queries
 
@@ -120,22 +121,24 @@ class CRSModule(ModuleProtocol, CRSProtocol):
         )
         return CRS(**result) if result else None
 
-    async def list_crs(self, conn: DbResource, catalog_id: str, limit: int = 20, offset: int = 0) -> List[CRS]:
-        """Lists all CRS definitions for a specific catalog."""
-        results = await queries.list_custom_crs_query.execute(
-            conn, catalog_id=catalog_id, limit=limit, offset=offset
+    async def list_crs(self, conn: DbResource, catalog_id: str, limit: int = 20, offset: int = 0) -> Tuple[List[CRS], int]:
+        """Lists all CRS definitions for a specific catalog. Returns ``(crs_list, total)``."""
+        rows, total = await list_page_with_count(
+            conn, queries.LIST_CUSTOM_CRS_SQL, {"catalog_id": catalog_id}, limit=limit, offset=offset
         )
-        return [CRS(**row) for row in results]
+        return [CRS(**row) for row in rows], total
 
-    async def search_crs(self, conn: DbResource, catalog_id: str, search_term: str, limit: int = 20, offset: int = 0) -> List[CRS]:
-        """
-        Searches for CRS definitions.
-        """
+    async def search_crs(self, conn: DbResource, catalog_id: str, search_term: str, limit: int = 20, offset: int = 0) -> Tuple[List[CRS], int]:
+        """Searches for CRS definitions. Returns ``(crs_list, total)``."""
         wildcard_search = f"%{search_term}%"
-        results = await queries.search_custom_crs_query.execute(
-            conn, catalog_id=catalog_id, search_term=wildcard_search, limit=limit, offset=offset
+        rows, total = await list_page_with_count(
+            conn,
+            queries.SEARCH_CUSTOM_CRS_SQL,
+            {"catalog_id": catalog_id, "search_term": wildcard_search},
+            limit=limit,
+            offset=offset,
         )
-        return [CRS(**row) for row in results]
+        return [CRS(**row) for row in rows], total
 
     async def delete_crs(self, conn: DbResource, catalog_id: str, crs_uri: str) -> bool:
         """Deletes a CRS definition."""

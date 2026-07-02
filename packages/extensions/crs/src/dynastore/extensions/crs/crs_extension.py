@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-from typing import List, Optional
+from typing import Optional
 import pyproj as _pyproj_scope_gate  # noqa: F401  # SCOPE gate: extension_crs requires module_crs (pyproj)
 _ = _pyproj_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status, Request, FastAPI
@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.tools.db import get_async_connection
 
-from dynastore.modules.crs.models import CRS, CRSCreate, CRSDefinition, CRSLink, GlobalCRSList
+from dynastore.modules.crs.models import CRS, CRSCreate, CRSDefinition, CRSLink, CustomCRSList, GlobalCRSList
 
 from dynastore.models.protocols import CatalogsProtocol
 from dynastore.models.protocols.crs import CRSProtocol
@@ -129,14 +129,14 @@ class CRSExtension(ExtensionProtocol):
             "/catalogs/{catalog_id}",
             self.list_crs_endpoint,
             methods=["GET"],
-            response_model=List[CRS],
+            response_model=CustomCRSList,
             summary="List All CRS Definitions (OGC aligned path)",
         )
         self.router.add_api_route(
             "/catalogs/{catalog_id}/search",
             self.search_crs_endpoint,
             methods=["GET"],
-            response_model=List[CRS],
+            response_model=CustomCRSList,
             summary="Search CRS Definitions (OGC aligned path)",
         )
         self.router.add_api_route(
@@ -254,10 +254,11 @@ class CRSExtension(ExtensionProtocol):
         conn: AsyncConnection = Depends(get_async_connection),
         limit: int = Query(20, ge=1, le=1000),
         offset: int = Query(0, ge=0)
-    ):
+    ) -> CustomCRSList:
         internal_id = await self._resolve_internal_catalog_id(catalog_id, conn)
-        results = await self.crs.list_crs(conn, internal_id, limit, offset)
-        return [c.model_copy(update={"catalog_id": catalog_id}) for c in results]
+        results, total = await self.crs.list_crs(conn, internal_id, limit, offset)
+        crs_list = [c.model_copy(update={"catalog_id": catalog_id}) for c in results]
+        return CustomCRSList(crs=crs_list, numberMatched=total, numberReturned=len(crs_list))
 
     async def search_crs_endpoint(
         self,
@@ -266,10 +267,11 @@ class CRSExtension(ExtensionProtocol):
         conn: AsyncConnection = Depends(get_async_connection),
         limit: int = Query(20, ge=1, le=1000),
         offset: int = Query(0, ge=0)
-    ):
+    ) -> CustomCRSList:
         internal_id = await self._resolve_internal_catalog_id(catalog_id, conn)
-        results = await self.crs.search_crs(conn, internal_id, q, limit, offset)
-        return [c.model_copy(update={"catalog_id": catalog_id}) for c in results]
+        results, total = await self.crs.search_crs(conn, internal_id, q, limit, offset)
+        crs_list = [c.model_copy(update={"catalog_id": catalog_id}) for c in results]
+        return CustomCRSList(crs=crs_list, numberMatched=total, numberReturned=len(crs_list))
 
     async def get_crs_by_name_endpoint(
         self,

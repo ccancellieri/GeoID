@@ -18,7 +18,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol, Optional, List, Any, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, Optional, List, Any, Tuple, runtime_checkable
 
 if TYPE_CHECKING:
     from dynastore.modules.db_config.query_executor import DbResource
@@ -39,6 +39,6 @@ class CRSProtocol(Protocol):
 
     async def get_crs_by_name(self, conn: DbResource, catalog_id: str, crs_name: str) -> Optional[Any]: ...
 
-    async def list_crs(self, conn: DbResource, catalog_id: str, limit: int = 20, offset: int = 0) -> List[Any]: ...
+    async def list_crs(self, conn: DbResource, catalog_id: str, limit: int = 20, offset: int = 0) -> Tuple[List[Any], int]: ...
 
-    async def search_crs(self, conn: DbResource, catalog_id: str, search_term: str, limit: int = 20, offset: int = 0) -> List[Any]: ...
+    async def search_crs(self, conn: DbResource, catalog_id: str, search_term: str, limit: int = 20, offset: int = 0) -> Tuple[List[Any], int]: ...

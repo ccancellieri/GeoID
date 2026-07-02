@@ -68,6 +68,35 @@ get_items_paginated_reprojected_query = GeoDQLQuery(
 # --- Standalone Utility Functions ---
 
 
+async def list_page_with_count(
+    conn: DbResource,
+    sql: str,
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    limit: int,
+    offset: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Run a merged ``COUNT(*) OVER()`` + ``LIMIT/OFFSET`` page query and
+    split the total from the page rows.
+
+    ``sql`` must select ``COUNT(*) OVER() AS total_count`` alongside the page
+    columns and end with ``ORDER BY ... LIMIT :limit OFFSET :offset`` — the
+    caller owns the table/WHERE/ORDER BY (this is the SQL-side counterpart to
+    ``extensions/tools/pagination.py``'s link builder, not a query builder).
+    Count and page come back in a single round trip, so there is nothing to
+    run concurrently and no shared-connection deadlock risk.
+
+    Returns ``(rows, total)`` with ``total_count`` stripped from each row.
+    An empty page returns ``([], 0)``.
+    """
+    query = DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS)
+    rows = await query.execute(conn, limit=limit, offset=offset, **(params or {}))
+    if not rows:
+        return [], 0
+    total = rows[0]["total_count"]
+    return [{k: v for k, v in row.items() if k != "total_count"} for row in rows], total
+
+
 async def get_table_column_names(conn: DbResource, schema: str, table: str) -> Set[str]:
     """Retrieves all column names for a table, used for building dynamic filters."""
     result = await get_table_column_names_query.execute(

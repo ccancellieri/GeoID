@@ -20,12 +20,13 @@
 
 import uuid
 import logging
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import json
 
 from sqlalchemy import text
 
 from dynastore.modules.db_config.query_executor import DbResource, DQLQuery, ResultHandler
+from dynastore.modules.db_config.shared_queries import list_page_with_count
 from .models import Style, StyleCreate, StyleUpdate, Link, StyleSheet
 
 logger = logging.getLogger(__name__)
@@ -51,15 +52,13 @@ _get_style_by_id_and_collection_query = DQLQuery(
     result_handler=ResultHandler.ONE_DICT,
 )
 
-_list_styles_query = DQLQuery(
-    """
-    SELECT * FROM styles.styles
+_LIST_STYLES_SQL = """
+    SELECT COUNT(*) OVER() AS total_count, *
+    FROM styles.styles
     WHERE catalog_id = :catalog_id AND collection_id = :collection_id
     ORDER BY style_id
     LIMIT :limit OFFSET :offset;
-    """,
-    result_handler=ResultHandler.ALL_DICTS,
-)
+    """
 
 _list_all_styles_query = DQLQuery(
     """
@@ -205,20 +204,21 @@ async def list_styles_for_collection(
     limit: int = 100,
     offset: int = 0,
     external_catalog_id: Optional[str] = None,
-) -> List[Style]:
+) -> Tuple[List[Style], int]:
     """Lists styles for a specific collection (paginated).
 
     ``catalog_id`` must be the immutable internal catalog id.
     ``external_catalog_id`` is used in the response and link hrefs.
+    Returns ``(styles, total)``.
     """
-    raw_rows = await _list_styles_query.execute(
+    raw_rows, total = await list_page_with_count(
         conn,
-        catalog_id=catalog_id,
-        collection_id=collection_id,
+        _LIST_STYLES_SQL,
+        {"catalog_id": catalog_id, "collection_id": collection_id},
         limit=limit,
         offset=offset,
     )
-    return [
+    styles = [
         s
         for s in (
             _enrich_style_from_row(row, external_catalog_id=external_catalog_id)
@@ -226,6 +226,7 @@ async def list_styles_for_collection(
         )
         if s is not None
     ]
+    return styles, total
 
 
 async def list_all_styles(

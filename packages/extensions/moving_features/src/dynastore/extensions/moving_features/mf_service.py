@@ -50,6 +50,7 @@ from dynastore.modules.moving_features.db import delete_temporal_geometries_by_m
 from dynastore.modules.moving_features.models import (
     MovingFeature,
     MovingFeatureCreate,
+    MovingFeatureList,
     MovingFeatureUpdate,
     TemporalGeometry,
     TemporalGeometryCreate,
@@ -131,7 +132,7 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
             col + "/items",
             self.list_moving_features,
             methods=["GET"],
-            response_model=List[MovingFeature],
+            response_model=MovingFeatureList,
             summary="List moving features in a collection",
         )
         self.router.add_api_route(
@@ -287,7 +288,7 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
             description="Geometry filter (WKT format, WGS84). Filters trajectories intersecting this geometry.",
         ),
         request_hints: FrozenSet = Depends(parse_hints_param),
-    ) -> List[MovingFeature]:
+    ) -> MovingFeatureList:
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
         if not await catalog_module.get_collection(catalog_id, collection_id):
@@ -311,7 +312,7 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
 
-            results = await mf_db.list_moving_features_by_bbox(
+            results, total = await mf_db.list_moving_features_by_bbox(
                 conn,
                 internal_id,
                 collection_id,
@@ -322,7 +323,10 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
                 limit=limit,
                 offset=offset,
             )
-            return [f.model_copy(update={"catalog_id": catalog_id}) for f in results]
+            features = [f.model_copy(update={"catalog_id": catalog_id}) for f in results]
+            return MovingFeatureList(
+                features=features, numberMatched=total, numberReturned=len(features)
+            )
 
         if intersects:
             try:
@@ -339,7 +343,7 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
                     detail=f"Invalid geometry WKT: {str(e)}",
                 ) from e
 
-            results = await mf_db.list_moving_features_by_geometry(
+            results, total = await mf_db.list_moving_features_by_geometry(
                 conn,
                 internal_id,
                 collection_id,
@@ -347,10 +351,16 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
                 limit=limit,
                 offset=offset,
             )
-            return [f.model_copy(update={"catalog_id": catalog_id}) for f in results]
+            features = [f.model_copy(update={"catalog_id": catalog_id}) for f in results]
+            return MovingFeatureList(
+                features=features, numberMatched=total, numberReturned=len(features)
+            )
 
-        results = await mf_db.list_moving_features(conn, internal_id, collection_id, limit, offset)
-        return [f.model_copy(update={"catalog_id": catalog_id}) for f in results]
+        results, total = await mf_db.list_moving_features(conn, internal_id, collection_id, limit, offset)
+        features = [f.model_copy(update={"catalog_id": catalog_id}) for f in results]
+        return MovingFeatureList(
+            features=features, numberMatched=total, numberReturned=len(features)
+        )
 
     async def create_moving_feature(
         self,

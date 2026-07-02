@@ -62,6 +62,7 @@ from dynastore.modules.styles.models import (
     SLDContent,
     Style,
     StyleCreate,
+    StyleList,
     StyleUpdate,
 )
 from dynastore.tools.db import validate_sql_identifier
@@ -223,7 +224,7 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
             col_prefix,
             self.list_styles,
             methods=["GET"],
-            response_model=List[Style],
+            response_model=StyleList,
             summary="List styles for a collection",
         )
         self.router.add_api_route(
@@ -369,7 +370,7 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
         request_hints: FrozenSet = Depends(parse_hints_param),
-    ) -> List[Style]:
+    ) -> StyleList:
         # Accepted for uniform cross-protocol routing-hints support; this route
         # reads style metadata rows and performs no vector-geometry read.
         validate_sql_identifier(catalog_id)
@@ -380,7 +381,7 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
 
         internal_catalog_id = await self._resolve_internal_catalog_id(catalog_id)
 
-        return await styles_db.list_styles_for_collection(
+        styles, total = await styles_db.list_styles_for_collection(
             conn,
             internal_catalog_id,
             collection_id,
@@ -388,6 +389,7 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
             offset,
             external_catalog_id=catalog_id,
         )
+        return StyleList(styles=styles, numberMatched=total, numberReturned=len(styles))
 
     async def get_style(
         self,

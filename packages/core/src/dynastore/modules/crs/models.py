@@ -147,6 +147,14 @@ class CRSLink(BaseModel):
     title: Optional[str] = Field(None, description="A human-readable label for the link.")
 
 
+class CustomCRSList(BaseModel):
+    """Paginated collection of tenant-registered CRS definitions for a catalog."""
+
+    crs: List[CRS] = Field(..., description="CRS definitions returned for this page.")
+    numberMatched: int = Field(..., description="Total CRS matching the query across all pages.")
+    numberReturned: int = Field(..., description="CRS returned in this page.")
+
+
 class GlobalCRSList(BaseModel):
     """Paginated catalogue of global authority CRS resolvable at platform scope.
 

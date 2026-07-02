@@ -132,3 +132,11 @@ class MovingFeature(MovingFeatureCreate):
     model_config = ConfigDict(from_attributes=True)
 
 
+class MovingFeatureList(BaseModel):
+    """Paginated collection of moving features for a catalog/collection pair."""
+
+    features: List[MovingFeature] = Field(..., description="Moving features returned for this page.")
+    numberMatched: int = Field(..., description="Total moving features matching the query across all pages.")
+    numberReturned: int = Field(..., description="Moving features returned in this page.")
+
+

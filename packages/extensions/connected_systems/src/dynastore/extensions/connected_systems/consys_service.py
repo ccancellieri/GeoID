@@ -48,6 +48,7 @@ from dynastore.modules.connected_systems.models import (
     ObservationCreate,
     System,
     SystemCreate,
+    SystemList,
     SystemUpdate,
 )
 from dynastore.tools.db import validate_sql_identifier
@@ -119,7 +120,7 @@ class ConnectedSystemsService(
             "/systems",
             self.list_systems,
             methods=["GET"],
-            response_model=List[System],
+            response_model=SystemList,
             summary="List connected systems (sensors, stations) for a catalog",
         )
         self.router.add_api_route(
@@ -246,12 +247,13 @@ class ConnectedSystemsService(
         # Accepted for uniform protocol consistency; connected-systems reads go through
         # a dedicated SQL path that does not yet implement the hints routing layer.
         request_hints: FrozenSet = Depends(parse_hints_param),
-    ) -> List[System]:
+    ) -> SystemList:
         validate_sql_identifier(catalog_id)
         await self._require_catalog_ready(catalog_id)
         internal_id = await self._resolve_internal_catalog_id(catalog_id)
-        results = await consys_db.list_systems(conn, internal_id, limit=limit, offset=offset)
-        return [s.model_copy(update={"catalog_id": catalog_id}) for s in results]
+        results, total = await consys_db.list_systems(conn, internal_id, limit=limit, offset=offset)
+        systems = [s.model_copy(update={"catalog_id": catalog_id}) for s in results]
+        return SystemList(systems=systems, numberMatched=total, numberReturned=len(systems))
 
     async def create_system(
         self,

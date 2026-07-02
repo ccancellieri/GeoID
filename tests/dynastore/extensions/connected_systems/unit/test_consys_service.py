@@ -343,13 +343,12 @@ def test_deployments_geometry_gist_index_ddl():
 @pytest.mark.asyncio
 async def test_list_systems_calls_query():
     from dynastore.modules.connected_systems import db as consys_db
+    from dynastore.modules.db_config.query_executor import DQLQuery
 
     conn = AsyncMock()
-    with patch.object(
-        consys_db._list_systems_query, "execute", new_callable=AsyncMock, return_value=[]
-    ):
+    with patch.object(DQLQuery, "execute", new_callable=AsyncMock, return_value=[]):
         result = await consys_db.list_systems(conn, "cat1", limit=10, offset=0)
-    assert result == []
+    assert result == ([], 0)
 
 
 @pytest.mark.asyncio
@@ -438,8 +437,8 @@ async def test_list_systems_with_bbox():
         assert "ST_Intersects" in call_args
         assert "ST_MakeEnvelope" in call_args
         mock_execute.assert_called_once()
-    
-    assert result == []
+
+    assert result == ([], 0)
 
 
 @pytest.mark.asyncio
@@ -553,3 +552,36 @@ def test_datastream_create_model():
         system_id=uuid.uuid4(),
     )
     assert ds.observed_property == "precipitation"
+
+
+# ---------------------------------------------------------------------------
+# list_systems endpoint — numberMatched wiring (#2699)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_list_systems_endpoint_wires_number_matched():
+    """GET /consys/systems must report numberMatched/numberReturned, not a
+    bare array — the endpoint-level fix for issue #2699."""
+    from dynastore.extensions.connected_systems.consys_service import ConnectedSystemsService
+    from dynastore.modules.connected_systems.models import System, SystemList
+
+    svc = ConnectedSystemsService()
+    svc._require_catalog_ready = AsyncMock(return_value=None)
+    svc._resolve_internal_catalog_id = AsyncMock(return_value="internal-cat1")
+
+    page = [
+        System(id=__import__("uuid").uuid4(), system_id="s1", name="Station 1", catalog_id="internal-cat1"),
+        System(id=__import__("uuid").uuid4(), system_id="s2", name="Station 2", catalog_id="internal-cat1"),
+    ]
+    with patch(
+        "dynastore.extensions.connected_systems.consys_service.consys_db.list_systems",
+        new_callable=AsyncMock,
+        return_value=(page, 7),
+    ):
+        result = await svc.list_systems(catalog_id="cat1", limit=2, offset=0, conn=AsyncMock())
+
+    assert isinstance(result, SystemList)
+    assert result.numberMatched == 7
+    assert result.numberReturned == 2
+    assert [s.system_id for s in result.systems] == ["s1", "s2"]
+    assert all(s.catalog_id == "cat1" for s in result.systems)

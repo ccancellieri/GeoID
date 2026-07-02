@@ -52,7 +52,10 @@ Usage example::
 
 from __future__ import annotations
 
-from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
+from typing import Any, Dict, List, Tuple
+
+from dynastore.modules.db_config.query_executor import DbResource, DQLQuery, ResultHandler
+from dynastore.modules.db_config.shared_queries import list_page_with_count
 from dynastore.tools.db import validate_sql_identifier
 from dynastore.modules.db_config.typed_store.ddl import (
     CONFIGS_SCHEMA,
@@ -200,18 +203,18 @@ def list_catalog_configs(phys_schema: str) -> DQLQuery:
     )
 
 
-def list_catalog_configs_paginated(phys_schema: str) -> DQLQuery:
-    """SELECT with window COUNT + ORDER BY ref_key, LIMIT/OFFSET pagination."""
+async def list_catalog_configs_paginated(
+    conn: DbResource, phys_schema: str, limit: int, offset: int
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Page catalog-level configs, ordered by ref_key. Returns ``(rows, total)``."""
     validate_sql_identifier(phys_schema)
-    return DQLQuery(
-        f"""
+    sql = f"""
         SELECT COUNT(*) OVER() AS total_count, ref_key, class_key, config_data
         FROM "{phys_schema}".{CATALOG_CONFIGS_TABLE}
         ORDER BY ref_key
         LIMIT :limit OFFSET :offset;
-        """,
-        result_handler=ResultHandler.ALL_DICTS,
-    )
+    """
+    return await list_page_with_count(conn, sql, limit=limit, offset=offset)
 
 
 # --- collection_configs -------------------------------------------------------
@@ -278,16 +281,21 @@ def delete_collection_config(phys_schema: str) -> DQLQuery:
     )
 
 
-def list_collection_configs_paginated(phys_schema: str) -> DQLQuery:
-    """SELECT with window COUNT + ORDER BY ref_key for a given collection_id."""
+async def list_collection_configs_paginated(
+    conn: DbResource, phys_schema: str, collection_id: str, limit: int, offset: int
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Page collection-level configs for one collection, ordered by ref_key.
+
+    Returns ``(rows, total)``.
+    """
     validate_sql_identifier(phys_schema)
-    return DQLQuery(
-        f"""
+    sql = f"""
         SELECT COUNT(*) OVER() AS total_count, ref_key, class_key, config_data
         FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE}
         WHERE collection_id = :collection_id
         ORDER BY ref_key
         LIMIT :limit OFFSET :offset;
-        """,
-        result_handler=ResultHandler.ALL_DICTS,
+    """
+    return await list_page_with_count(
+        conn, sql, {"collection_id": collection_id}, limit=limit, offset=offset
     )

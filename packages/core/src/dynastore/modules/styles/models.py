@@ -113,3 +113,11 @@ class Style(StyleBase):
     links: List[Link] = Field(default_factory=list, description="Links related to the style, including self-referencing links.")
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class StyleList(BaseModel):
+    """Paginated collection of styles for a collection."""
+
+    styles: List[Style] = Field(..., description="Styles returned for this page.")
+    numberMatched: int = Field(..., description="Total styles matching the query across all pages.")
+    numberReturned: int = Field(..., description="Styles returned in this page.")
