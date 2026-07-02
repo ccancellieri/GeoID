@@ -79,14 +79,26 @@ class ValkeyUsageCounter:
         # Construction is lazy — the cache manager isn't necessarily
         # initialized when the IAM module registers drivers at import
         # time. ``_get_backend`` resolves on first use.
+        # An explicitly injected backend is pinned and never re-resolved.
         self._backend: Optional[CountingCacheBackend] = backend
+        self._pinned: bool = backend is not None
+        self._backend_gen: int = -1  # _backend_generation at resolution time
 
     def _get_backend(self) -> CountingCacheBackend:
-        if self._backend is not None:
-            return self._backend
-        from dynastore.tools.cache import get_cache_manager
+        from dynastore.tools import cache as cache_tools
 
-        active: CacheBackend = get_cache_manager().get_async_backend()
+        # A live reconnect (configs PATCH) closes the old client and
+        # registers a fresh backend under the same name, bumping the
+        # generation counter. Re-resolve on generation change so this
+        # driver doesn't keep calling a backend whose connection pool
+        # has been aclose()'d — the same idiom @cached uses.
+        if self._backend is not None and (
+            self._pinned or self._backend_gen == cache_tools._backend_generation
+        ):
+            return self._backend
+
+        generation = cache_tools._backend_generation
+        active: CacheBackend = cache_tools.get_cache_manager().get_async_backend()
         if not isinstance(active, CountingCacheBackend):
             raise RuntimeError(
                 f"ValkeyUsageCounter: active cache backend '{active.name}' does "
@@ -94,6 +106,7 @@ class ValkeyUsageCounter:
                 "have skipped this driver."
             )
         self._backend = active
+        self._backend_gen = generation
         return active
 
     # ------------------------------------------------------------------

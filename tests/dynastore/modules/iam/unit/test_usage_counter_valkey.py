@@ -208,3 +208,47 @@ class TestDelegation:
         # ttl in the recorded ``incr`` call must be None.
         incr_call = next(c for c in backend.calls if c[0] == "incr")
         assert incr_call[3] is None
+
+
+# ---------------------------------------------------------------------------
+# Backend resolution — generation-aware re-resolve after live reconnect.
+# ---------------------------------------------------------------------------
+
+
+class TestBackendResolution:
+    def _fresh_manager(self, monkeypatch):
+        from dynastore.tools import cache as cache_tools
+
+        manager = cache_tools.CacheManager()
+        monkeypatch.setattr(cache_tools, "_cache_manager", manager)
+        return manager, cache_tools
+
+    def test_injected_backend_is_pinned_across_generations(self):
+        from dynastore.tools import cache as cache_tools
+
+        backend = _FakeCountingBackend()
+        driver = ValkeyUsageCounter(backend=backend)
+        cache_tools._notify_backend_change()
+        assert driver._get_backend() is backend
+
+    def test_lazy_backend_memoized_while_generation_unchanged(self, monkeypatch):
+        manager, _ = self._fresh_manager(monkeypatch)
+        backend = _FakeCountingBackend()
+        manager.register_backend(backend)
+        driver = ValkeyUsageCounter()
+        assert driver._get_backend() is backend
+        assert driver._get_backend() is backend
+
+    def test_lazy_backend_reresolves_after_backend_swap(self, monkeypatch):
+        # A live reconnect closes + unregisters the old backend and registers
+        # a fresh instance under the same name; the driver must follow.
+        manager, _ = self._fresh_manager(monkeypatch)
+        old = _FakeCountingBackend()
+        manager.register_backend(old)
+        driver = ValkeyUsageCounter()
+        assert driver._get_backend() is old
+
+        new = _FakeCountingBackend()
+        manager.unregister_backend(old)
+        manager.register_backend(new)
+        assert driver._get_backend() is new

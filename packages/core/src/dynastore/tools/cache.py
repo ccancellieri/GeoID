@@ -1091,9 +1091,27 @@ class CacheManager:
     def unregister_backend(
         self, backend: Union[CacheBackend, SyncCacheBackend]
     ) -> None:
-        """Unregister a backend (e.g. on circuit breaker trip)."""
-        self._async_backends.pop(backend.name, None)
-        self._sync_backends.pop(backend.name, None)
+        """Unregister a backend (e.g. on circuit breaker trip).
+
+        Removal is identity-checked: backend names are class-level
+        constants (every ``ValkeyCacheBackend`` is named ``"valkey"``),
+        so popping by name alone would let a stale instance's late
+        circuit-breaker trip rip out a healthy replacement that a live
+        reconnect just registered under the same name.
+        """
+        removed = False
+        if self._async_backends.get(backend.name) is backend:
+            del self._async_backends[backend.name]
+            removed = True
+        if self._sync_backends.get(backend.name) is backend:
+            del self._sync_backends[backend.name]
+            removed = True
+        if not removed:
+            logger.info(
+                "Ignored unregister for superseded cache backend instance: %s",
+                backend.name,
+            )
+            return
         logger.warning("Unregistered cache backend: %s", backend.name)
         _notify_backend_change()
 
