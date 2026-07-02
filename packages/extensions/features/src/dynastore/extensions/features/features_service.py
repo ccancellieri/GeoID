@@ -395,6 +395,23 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
             if not final_name or final_name in ("geoid", "geom"):
                 continue
             names.add(final_name)
+
+        # Accept the same bounded canonical system/stats lanes the
+        # Queryables endpoint advertises (refs #2230, #2235's
+        # ``canonical_queryable_properties`` SSOT), so ``?properties=area``
+        # is not rejected as unknown just because this collection's own
+        # field definitions don't declare it. Mirrors the ``setdefault``
+        # merge in ``ogc_generator.create_queryables_response`` — a
+        # per-collection field of the same name still wins acceptance,
+        # this only widens the set. A collection whose driver never
+        # populates a given canonical field simply returns it absent (no
+        # error, no match) — per-collection stats gating is a separate,
+        # already-tracked remainder item.
+        from dynastore.modules.elasticsearch.mappings import (
+            canonical_queryable_properties,
+        )
+
+        names |= canonical_queryable_properties().keys()
         return names
 
     async def get_landing_page(

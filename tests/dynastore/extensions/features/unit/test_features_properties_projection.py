@@ -260,6 +260,67 @@ async def test_properties_unknown_name_400(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_properties_accepts_canonical_stats_and_system_fields(monkeypatch):
+    """The ``properties`` query parameter must accept the same canonical
+    ``system``/``stats`` lanes the Queryables endpoint advertises (refs
+    #2230), even though this collection's own field definitions don't
+    declare them — mirrors the ``setdefault`` merge in
+    ``create_queryables_response`` (#2235)."""
+    import dynastore.extensions.features.features_service as _features_service_mod
+    from dynastore.extensions.features.features_service import OGCFeaturesService
+    from dynastore.models.protocols.field_definition import FieldDefinition
+
+    class _FakeItemsProtocol:
+        async def get_collection_fields(self, catalog_id, collection_id):
+            return {
+                "title": FieldDefinition(name="title", data_type="string"),
+            }
+
+    monkeypatch.setattr(
+        _features_service_mod,
+        "get_protocol",
+        lambda proto: _FakeItemsProtocol(),
+    )
+
+    svc = OGCFeaturesService.__new__(OGCFeaturesService)
+    valid = await svc._resolve_property_names("cat", "col")
+    assert "title" in valid
+    # Canonical stats/system names, absent from the fake field defs, are
+    # still accepted.
+    assert "area" in valid
+    assert "validity" in valid
+    assert "geometry_hash" in valid
+
+
+@pytest.mark.asyncio
+async def test_properties_selects_canonical_field_end_to_end(monkeypatch):
+    """``?properties=area`` (a canonical stats field, not one of the
+    collection's own field defs) is accepted and, when present on the
+    streamed feature, survives the projection."""
+    svc = OGCFeaturesService.__new__(OGCFeaturesService)
+    catalogs = _FakeCatalogs(
+        stream_features=[_feature("f-1", props={"title": "f-1", "area": 42.0})],
+        total=1,
+    )
+
+    async def _resolve_props(catalog_id, collection_id):
+        # Real resolver behaviour: declared fields + canonical lanes.
+        from dynastore.modules.elasticsearch.mappings import (
+            canonical_queryable_properties,
+        )
+
+        return {"title"} | canonical_queryable_properties().keys()
+
+    _wire(monkeypatch, svc, catalogs)
+    monkeypatch.setattr(svc, "_resolve_property_names", _resolve_props, raising=False)
+
+    resp = await _call_get_items(svc, properties="area")
+    body = json.loads(await _read_body(resp))
+    feat = body["features"][0]
+    assert feat["properties"] == {"area": 42.0}
+
+
+@pytest.mark.asyncio
 async def test_properties_threaded_into_query_request_select(monkeypatch):
     """Validated names are placed onto ``QueryRequest.select`` so PG/ES drivers
     that honour projection can narrow the read."""

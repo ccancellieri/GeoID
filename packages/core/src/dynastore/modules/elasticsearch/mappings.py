@@ -299,12 +299,35 @@ def _es_type_to_json_schema(es_def: Dict[str, Any]) -> Dict[str, Any]:
     if t == "date":
         return {"type": "string", "format": "date-time"}
     if t == "date_range":
-        # JSON Schema has no native temporal-range type; advertise it as a
-        # date-time string filterable with temporal operators.
+        # JSON Schema has no native temporal-range type. Advertise the same
+        # ``[start, end]`` RFC 3339 interval shape already used for
+        # collection/catalog extents (see
+        # ``shared_models.TemporalExtent.interval``) instead of a scalar
+        # date-time, so a client can tell this is a range with an open
+        # (``null``) end, not a single instant (refs #2230). It remains
+        # filterable via CQL2 temporal operators (``t_before``, ``t_after``,
+        # ``t_intersects``, ``t_disjoint``, ``t_during``, ``t_equals``, …)
+        # against the flat property name.
         return {
-            "type": "string",
-            "format": "date-time",
-            "description": "Temporal validity range; filter with temporal operators.",
+            "type": "object",
+            "properties": {
+                "interval": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "items": {"type": ["string", "null"], "format": "date-time"},
+                    },
+                },
+            },
+            "description": (
+                "Temporal validity range as an [start, end] RFC 3339 interval "
+                "(null = open-ended); filter with CQL2 temporal operators "
+                "(t_before, t_after, t_intersects, t_disjoint, t_during, "
+                "t_equals, ...)."
+            ),
         }
     if t in ("double", "float", "half_float", "scaled_float"):
         return {"type": "number"}

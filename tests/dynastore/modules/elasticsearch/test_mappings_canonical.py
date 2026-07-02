@@ -577,10 +577,30 @@ def test_canonical_queryable_types_mapped_correctly() -> None:
     # date -> string/date-time
     assert q["transaction_time"]["type"] == "string"
     assert q["transaction_time"]["format"] == "date-time"
-    # date_range (validity) -> string/date-time with range note
-    assert q["validity"]["type"] == "string"
-    assert q["validity"]["format"] == "date-time"
+    # date_range (validity) -> object interval, not a scalar date-time
+    assert q["validity"]["type"] == "object"
+    assert "interval" in q["validity"]["properties"]
     # geo_point -> object
     assert q["centroid"]["type"] == "object"
     # every fragment carries a default title
     assert q["area"]["title"] == "area"
+
+
+def test_canonical_queryable_validity_is_a_range_not_a_scalar() -> None:
+    """``validity`` is a ``date_range`` at the ES layer — its queryable
+    fragment must expose an interval shape (mirroring
+    ``TemporalExtent.interval``: an array of ``[start, end]`` RFC 3339
+    pairs, ``null`` = open-ended) instead of a single date-time scalar
+    (refs #2230)."""
+    from dynastore.modules.elasticsearch.mappings import canonical_queryable_properties
+    frag = canonical_queryable_properties()["validity"]
+    assert frag["type"] == "object"
+    interval = frag["properties"]["interval"]
+    assert interval["type"] == "array"
+    assert interval["items"]["type"] == "array"
+    assert interval["items"]["minItems"] == 2
+    assert interval["items"]["maxItems"] == 2
+    assert interval["items"]["items"]["type"] == ["string", "null"]
+    assert interval["items"]["items"]["format"] == "date-time"
+    # Description documents the CQL2 temporal relation operators.
+    assert "t_intersects" in frag["description"]
