@@ -41,7 +41,6 @@ The extension declares OGC API - Dimensions conformance as a
 """
 
 import logging
-import os
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -842,28 +841,32 @@ class DimensionsExtension(ExtensionProtocol, OGCServiceMixin):
             len(DIMENSIONS),
         )
 
+        # Register the cold-boot contributor that applies the
+        # ``common_dimensions`` default preset exactly once per DB (first-run
+        # initialisation). This replaces the deprecated
+        # ``DIMENSIONS_MATERIALIZE_ON_BOOT`` env flag: dimensions are now
+        # provisioned through the standard preset/cold-boot machinery instead
+        # of a bespoke in-lifespan materialisation toggle. Guarded against the
+        # duplicate-name ValueError so re-instantiation (tests, multi-app
+        # construction) is a no-op rather than a hard error.
+        from dynastore.modules.presets.cold_boot import register_cold_boot_contributor
+        from .cold_boot_contributor import DimensionsColdBootContributor
+        try:
+            register_cold_boot_contributor(DimensionsColdBootContributor())
+        except ValueError:
+            logger.debug(
+                "DimensionsColdBootContributor already registered; "
+                "skipping duplicate.",
+            )
+
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
-        # Heavy dimension materialisation used to run on every pod boot.
-        # On Cloud Run that blocked readiness and stormed the DB at scale.
-        # The work now lives in the `dimensions_materialize` OGC Process
-        # task — trigger it explicitly once per deploy (manually or via a
-        # deploy hook). The lifespan only keeps the fallback for local/dev
-        # convenience, gated by an env flag (default off).
-        on_boot = os.getenv("DIMENSIONS_MATERIALIZE_ON_BOOT", "").lower() in (
-            "1", "true", "yes", "on",
-        )
-        if on_boot:
-            logger.info(
-                "DIMENSIONS_MATERIALIZE_ON_BOOT=1 — running in-lifespan "
-                "materialisation. Prefer the dimensions_materialize task "
-                "for production.",
-            )
-            await materialize_all_dimensions(self._dimensions)
-        else:
-            logger.info(
-                "DimensionsExtension: lifespan materialisation skipped "
-                "(set DIMENSIONS_MATERIALIZE_ON_BOOT=1 to enable). Trigger "
-                "the 'dimensions_materialize' OGC Process to populate.",
-            )
+        # Dimension members are provisioned by the ``common_dimensions``
+        # default preset, applied once per DB on cold-boot by
+        # ``DimensionsColdBootContributor`` (registered in ``__init__``). The
+        # preset registers the RECORDS skeletons and triggers the idempotent
+        # ``dimensions_materialize`` OGC Process to fill members — so the
+        # extension no longer materialises anything directly in its lifespan.
+        # The deprecated ``DIMENSIONS_MATERIALIZE_ON_BOOT`` env flag has been
+        # removed; nothing here gates on the environment any more.
         yield
