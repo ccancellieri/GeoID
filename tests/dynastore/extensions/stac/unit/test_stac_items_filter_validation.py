@@ -107,7 +107,10 @@ async def test_mapped_filter_param_reaches_create_item_collection(monkeypatch):
     svc = STACService.__new__(STACService)
     catalogs = SimpleNamespace(get_collection=_acoro({"id": "col-a"}))
     monkeypatch.setattr(svc, "_get_catalogs_service", _acoro(catalogs))
-    monkeypatch.setattr(svc, "_get_stac_config", _acoro(SimpleNamespace()))
+    monkeypatch.setattr(
+        svc, "_get_stac_config",
+        _acoro(SimpleNamespace(default_limit=10, max_limit=1000)),
+    )
     monkeypatch.setattr(stac_service_mod, "managed_transaction", _fake_txn)
 
     async def _valid_names(catalog_id, collection_id):
@@ -148,7 +151,10 @@ async def test_canonical_queryable_name_accepted_as_filter(monkeypatch):
     svc = STACService.__new__(STACService)
     catalogs = SimpleNamespace(get_collection=_acoro({"id": "col-a"}))
     monkeypatch.setattr(svc, "_get_catalogs_service", _acoro(catalogs))
-    monkeypatch.setattr(svc, "_get_stac_config", _acoro(SimpleNamespace()))
+    monkeypatch.setattr(
+        svc, "_get_stac_config",
+        _acoro(SimpleNamespace(default_limit=10, max_limit=1000)),
+    )
     monkeypatch.setattr(stac_service_mod, "managed_transaction", _fake_txn)
 
     async def _valid_names(catalog_id, collection_id):

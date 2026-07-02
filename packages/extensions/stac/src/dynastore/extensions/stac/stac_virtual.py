@@ -75,7 +75,15 @@ class StacVirtualMixin(_Host):
         collection_id: str,
         request: Request,
         engine=Depends(get_async_engine),
-        limit: int = Query(10, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of assets to return. Omitted falls back to "
+                "the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
     ):
         """
@@ -98,6 +106,13 @@ class StacVirtualMixin(_Host):
         async with managed_transaction(engine) as conn:
             stac_config = await self._get_stac_config(
                 catalog_id, collection_id, db_resource=conn
+            )
+
+            from dynastore.extensions.tools.pagination import resolve_page_limit
+            limit = resolve_page_limit(
+                limit,
+                default_limit=stac_config.default_limit,
+                max_limit=stac_config.max_limit,
             )
 
             if not stac_config.asset_tracking.enabled:
@@ -258,7 +273,15 @@ class StacVirtualMixin(_Host):
         asset_id: str,
         request: Request,
         engine=Depends(get_async_engine),
-        limit: int = Query(10, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of collections to return. Omitted falls back "
+                "to the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
     ):
         """Lists every collection in *catalog_id* where *asset_id* has rows,
@@ -273,6 +296,14 @@ class StacVirtualMixin(_Host):
         catalogs_svc = await self._get_catalogs_service()
 
         async with managed_transaction(engine) as conn:
+            stac_config = await self._get_stac_config(catalog_id, db_resource=conn)
+            from dynastore.extensions.tools.pagination import resolve_page_limit
+            limit = resolve_page_limit(
+                limit,
+                default_limit=stac_config.default_limit,
+                max_limit=stac_config.max_limit,
+            )
+
             phys_schema = await catalogs_svc.resolve_physical_schema(
                 catalog_id, ctx=DriverContext(db_resource=conn)
             )
@@ -377,7 +408,15 @@ class StacVirtualMixin(_Host):
         asset_id: str,
         request: Request,
         engine=Depends(get_async_engine),
-        limit: int = Query(10, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of items to return. Omitted falls back to the "
+                "configured default; a value above the configured maximum is "
+                "clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         language: str = Depends(get_language),
     ):
@@ -402,6 +441,13 @@ class StacVirtualMixin(_Host):
         async with managed_transaction(engine) as conn:
             stac_config = await self._get_stac_config(
                 catalog_id, collection_id, db_resource=conn
+            )
+
+            from dynastore.extensions.tools.pagination import resolve_page_limit
+            limit = resolve_page_limit(
+                limit,
+                default_limit=stac_config.default_limit,
+                max_limit=stac_config.max_limit,
             )
 
             # Use ItemsProtocol.stream_items to leverage standard filtering and sidecar logic
@@ -786,7 +832,15 @@ class StacVirtualMixin(_Host):
         request: Request,
         engine=Depends(get_async_engine),
         parent_value: Optional[str] = Query(None),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of hierarchy members to return. Omitted falls "
+                "back to the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
     ):
         """
         Virtual View: Returns a STAC collection representation of a hierarchy level.
@@ -817,6 +871,13 @@ class StacVirtualMixin(_Host):
                 await config_manager.get_config(
                     StacPluginConfig, catalog_id, collection_id, ctx=DriverContext(db_resource=conn
                 )),
+            )
+
+            from dynastore.extensions.tools.pagination import resolve_page_limit
+            limit = resolve_page_limit(
+                limit,
+                default_limit=stac_config.default_limit,
+                max_limit=stac_config.max_limit,
             )
 
             if not stac_config.hierarchy or not stac_config.hierarchy.enabled:
@@ -968,7 +1029,15 @@ class StacVirtualMixin(_Host):
         request: Request,
         engine=Depends(get_async_engine),
         parent_value: Optional[str] = Query(None),
-        limit: int = Query(10, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of items to return. Omitted falls back to the "
+                "configured default; a value above the configured maximum is "
+                "clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         language: str = Depends(get_language),
     ):
@@ -1004,6 +1073,13 @@ class StacVirtualMixin(_Host):
                 await config_service.get_config(
                     StacPluginConfig, catalog_id, collection_id, ctx=DriverContext(db_resource=conn
                 )),
+            )
+
+            from dynastore.extensions.tools.pagination import resolve_page_limit
+            limit = resolve_page_limit(
+                limit,
+                default_limit=stac_config.default_limit,
+                max_limit=stac_config.max_limit,
             )
 
             if not stac_config.hierarchy or not stac_config.hierarchy.enabled:
@@ -1233,8 +1309,10 @@ class StacVirtualMixin(_Host):
         if aggregation_results:
             coll_dict["aggregations"] = aggregation_results
 
-        # Paging links
+        # Paging links. ``search_items`` resolves/clamps ``search_request.limit``
+        # in place before returning — it is never None past this point.
         offset = search_request.offset
+        assert search_request.limit is not None
         limit = search_request.limit
         base_url = get_url(request, remove_qp=True)
         if (offset + limit) < total_count:

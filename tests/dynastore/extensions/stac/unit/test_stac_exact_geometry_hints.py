@@ -100,7 +100,10 @@ async def test_handler_passes_exact_hints_when_geometry_exact(monkeypatch):
 
     catalogs = SimpleNamespace(get_collection=_acoro({"id": "col-a"}))
     monkeypatch.setattr(svc, "_get_catalogs_service", _acoro(catalogs))
-    monkeypatch.setattr(svc, "_get_stac_config", _acoro(SimpleNamespace()))
+    monkeypatch.setattr(
+        svc, "_get_stac_config",
+        _acoro(SimpleNamespace(default_limit=10, max_limit=1000)),
+    )
     monkeypatch.setattr(stac_service_mod, "managed_transaction", _fake_txn)
 
     # With GEOMETRY_EXACT hint, ES dispatch is skipped (wants_exact=True)
@@ -145,7 +148,10 @@ async def test_handler_passes_empty_hints_by_default(monkeypatch):
 
     catalogs = SimpleNamespace(get_collection=_acoro({"id": "col-a"}))
     monkeypatch.setattr(svc, "_get_catalogs_service", _acoro(catalogs))
-    monkeypatch.setattr(svc, "_get_stac_config", _acoro(SimpleNamespace()))
+    monkeypatch.setattr(
+        svc, "_get_stac_config",
+        _acoro(SimpleNamespace(default_limit=10, max_limit=1000)),
+    )
     monkeypatch.setattr(stac_service_mod, "managed_transaction", _fake_txn)
 
     # Default path: dispatch may be called and returns a sentinel

@@ -766,8 +766,15 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         catalog_id: str,
         collection_id: str,
         conn: AsyncConnection = Depends(get_async_connection),
-        limit: int = Query(
-            10, ge=1, le=1000, description="The maximum number of features to return."
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "The maximum number of features to return. Omitted falls back "
+                "to the configured default; a value above the configured "
+                "maximum is clamped, not rejected (OGC API - Features Part 1 "
+                "Core /req/core/fc-limit-response-1)."
+            ),
         ),
         offset: int = Query(
             0, ge=0, description="The offset of the first feature to return."
@@ -876,6 +883,16 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         ))
         assert isinstance(_pc, FeaturesPluginConfig)
         plugin_config: FeaturesPluginConfig = _pc
+
+        # Resolve default/clamp the page size against the configured policy
+        # (OGC API - Features Part 1 Core /req/core/fc-limit-response-1): an
+        # over-max ``limit`` is capped, never rejected.
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+        limit = resolve_page_limit(
+            limit,
+            default_limit=plugin_config.default_limit,
+            max_limit=plugin_config.max_limit,
+        )
 
         if plugin_config.cache_on_demand:
             cached = await ondemand_cache_lookup(

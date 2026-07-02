@@ -248,6 +248,50 @@ async def test_get_items_threads_cql_filter_into_query_request(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_items_over_max_limit_clamps_instead_of_erroring(monkeypatch):
+    """OGC API - Features Part 1 Core /req/core/fc-limit-response-1: a
+    ``limit`` above the configured maximum (1000 by default) is clamped, not
+    rejected. The handler itself never sees a value above 1000 (FastAPI's
+    ``le=`` gate — removed — used to 422 here instead)."""
+    svc = OGCFeaturesService.__new__(OGCFeaturesService)
+    catalogs = _FakeCatalogs(stream_features=[], total=0)
+    _wire(monkeypatch, svc, catalogs)
+
+    resp = await _call_get_items(svc, limit=5000, offset=0)
+    assert resp.status_code == 200
+
+    req = catalogs.stream_kwargs["request"]
+    assert req.limit == 1000
+
+
+@pytest.mark.asyncio
+async def test_get_items_omitted_limit_uses_configured_default(monkeypatch):
+    """``limit=None`` (query param omitted) falls back to the configured
+    default (10), not an unbounded scan."""
+    svc = OGCFeaturesService.__new__(OGCFeaturesService)
+    catalogs = _FakeCatalogs(stream_features=[], total=0)
+    _wire(monkeypatch, svc, catalogs)
+
+    await _call_get_items(svc, limit=None, offset=0)
+
+    req = catalogs.stream_kwargs["request"]
+    assert req.limit == 10
+
+
+@pytest.mark.asyncio
+async def test_get_items_in_range_limit_is_unchanged(monkeypatch):
+    """Existing in-range behaviour is preserved."""
+    svc = OGCFeaturesService.__new__(OGCFeaturesService)
+    catalogs = _FakeCatalogs(stream_features=[], total=0)
+    _wire(monkeypatch, svc, catalogs)
+
+    await _call_get_items(svc, limit=250, offset=0)
+
+    req = catalogs.stream_kwargs["request"]
+    assert req.limit == 250
+
+
+@pytest.mark.asyncio
 async def test_get_items_serves_non_4326_crs_via_items_protocol(monkeypatch):
     """A non-4326 output CRS reprojection is a PG-capable path; the listing
     still streams through the items protocol (the router/driver handles the

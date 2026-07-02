@@ -57,8 +57,14 @@ def test_paging_optional_and_clamped():
     assert req.paging.limit == 500
     with pytest.raises(ValidationError):
         JoinRequest(**_minimal_request_dict(), paging={"limit": 0, "offset": 0})
-    with pytest.raises(ValidationError):
-        JoinRequest(**_minimal_request_dict(), paging={"limit": 100000, "offset": 0})
+    # An over-max ``limit`` is no longer rejected at the model layer (OGC API
+    # - Features Part 1 Core /req/core/fc-limit-response-1: over-max SHALL
+    # NOT error). ``joins_service._resolve_paging`` clamps it to
+    # ``MAX_PAGE_LIMIT`` at request-handling time instead.
+    req_over_max = JoinRequest(
+        **_minimal_request_dict(), paging={"limit": 100000, "offset": 0}
+    )
+    assert req_over_max.paging.limit == 100000
 
 
 def test_output_format_enum_validated():

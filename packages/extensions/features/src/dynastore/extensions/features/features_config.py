@@ -36,6 +36,21 @@ class FeaturesPluginConfig(ExposableConfigMixin, PluginConfig):
     )
     
     storage_priority: Mutable[List[str]] = Field(
-        default=["bucket"], 
+        default=["bucket"],
         description="Priority list of storage providers to use for saving cached responses."
+    )
+
+    # Pagination policy (OGC API - Features Part 1 Core, /req/core/fc-limit-*)
+    default_limit: Mutable[int] = Field(
+        default=10,
+        ge=1,
+        description="Page size used for GET /items when ``limit`` is omitted.",
+    )
+    max_limit: Mutable[int] = Field(
+        default=1000,
+        ge=1,
+        description=(
+            "Maximum page size for GET /items. A requested ``limit`` above "
+            "this value is clamped, never rejected (fc-limit-response-1)."
+        ),
     )

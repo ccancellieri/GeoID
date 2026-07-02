@@ -219,6 +219,98 @@ async def test_get_records_skips_dispatch_for_cql_filter(monkeypatch):
     assert catalogs.stream_called is True
 
 
+def _get_records_defaults(**overrides) -> dict:
+    """Full default kwarg set for a direct ``get_records`` call — a direct
+    call bypasses FastAPI's ``Query()``/``Depends()`` resolution, so every
+    parameter needs an explicit value (omitted ones would otherwise arrive
+    as the raw ``Query``/``Depends`` sentinel objects)."""
+    kwargs = dict(
+        request=_make_request(),
+        catalog_id="cat", collection_id="col",
+        conn=None, limit=10, offset=0,
+        filter=None, filter_lang="cql2-text", filter_crs=None,
+        properties=None, skip_geometry=None, return_geometry=None,
+        sortby=None, bbox=None, q=None,
+        request_hints=frozenset(),
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+@pytest.mark.asyncio
+async def test_get_records_over_max_limit_clamps_instead_of_erroring(monkeypatch):
+    """OGC API - Features Part 1 Core /req/core/fc-limit-response-1: a
+    ``limit`` above the configured maximum (1000 by default) is clamped, not
+    rejected. No ``ConfigsProtocol`` is registered in this test — the
+    resilient ``_get_plugin_config`` fallback supplies the code-level
+    ``RecordsPluginConfig()`` defaults."""
+    svc = RecordsService.__new__(RecordsService)
+    catalogs = _FakeCatalogs(stream_features=[], total=0)
+
+    async def _get_catalogs():
+        return catalogs
+
+    monkeypatch.setattr(svc, "_get_catalogs_service", _get_catalogs, raising=False)
+
+    captured = {}
+
+    async def _decline(**kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(_query_mod, "maybe_dispatch_items_to_search_driver", _decline)
+
+    await svc.get_records(**_get_records_defaults(limit=5000))
+
+    assert captured["limit"] == 1000
+
+
+@pytest.mark.asyncio
+async def test_get_records_omitted_limit_uses_configured_default(monkeypatch):
+    svc = RecordsService.__new__(RecordsService)
+    catalogs = _FakeCatalogs(stream_features=[], total=0)
+
+    async def _get_catalogs():
+        return catalogs
+
+    monkeypatch.setattr(svc, "_get_catalogs_service", _get_catalogs, raising=False)
+
+    captured = {}
+
+    async def _decline(**kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(_query_mod, "maybe_dispatch_items_to_search_driver", _decline)
+
+    await svc.get_records(**_get_records_defaults(limit=None))
+
+    assert captured["limit"] == 10
+
+
+@pytest.mark.asyncio
+async def test_get_records_in_range_limit_is_unchanged(monkeypatch):
+    svc = RecordsService.__new__(RecordsService)
+    catalogs = _FakeCatalogs(stream_features=[], total=0)
+
+    async def _get_catalogs():
+        return catalogs
+
+    monkeypatch.setattr(svc, "_get_catalogs_service", _get_catalogs, raising=False)
+
+    captured = {}
+
+    async def _decline(**kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(_query_mod, "maybe_dispatch_items_to_search_driver", _decline)
+
+    await svc.get_records(**_get_records_defaults(limit=250))
+
+    assert captured["limit"] == 250
+
+
 @pytest.mark.asyncio
 async def test_get_records_skips_dispatch_for_free_text_q(monkeypatch):
     """Free-text ``q`` folds into a CQL ILIKE → PG path, never dispatch."""

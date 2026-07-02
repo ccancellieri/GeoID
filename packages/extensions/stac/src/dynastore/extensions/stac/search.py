@@ -86,7 +86,12 @@ class ItemSearchRequest(BaseModel):
     intersects: Optional[Dict[str, Any]] = None
     filter: Optional[Union[AttributeFilter, QueryFilter]] = None
     filter_lang: str = "cql2-json"
-    limit: int = Field(10, ge=1, le=1000)
+    # ``None`` means "use the configured default"; any supplied value is
+    # clamped to the configured maximum rather than rejected (OGC API -
+    # Features Part 1 Core /req/core/fc-limit-response-1). Resolved in
+    # ``search_items()`` against ``StacPluginConfig.default_limit`` /
+    # ``max_limit``.
+    limit: Optional[int] = Field(None, ge=1)
     offset: int = Field(0, ge=0)
     aggregations: Optional[List[AggregationRule]] = Field(None, alias="aggregate")
     sortby: Optional[List[str]] = Field(
@@ -117,7 +122,9 @@ class CollectionSearchRequest(BaseModel):
             "GET form accepts a comma-separated string; POST accepts a list."
         ),
     )
-    limit: int = Field(10, ge=1, le=1000)
+    # See ``ItemSearchRequest.limit`` — same "clamp, don't reject" contract,
+    # resolved in ``search_collections()``.
+    limit: Optional[int] = Field(None, ge=1)
     offset: int = Field(0, ge=0)
     sortby: Optional[str] = Field(
         None,
@@ -710,6 +717,17 @@ async def search_items(
     assert catalogs is not None, "CatalogsProtocol not registered"
     assert search_request.catalog_id is not None, "search_request.catalog_id required"
     cat_id: str = search_request.catalog_id
+
+    # Resolve default/clamp the page size against the configured policy
+    # (OGC API - Features Part 1 Core /req/core/fc-limit-response-1): an
+    # over-max ``limit`` is capped, never rejected. Must run before any
+    # downstream use of ``search_request.limit`` (dispatch, SQL LIMIT, links).
+    from dynastore.extensions.tools.pagination import resolve_page_limit
+    search_request.limit = resolve_page_limit(
+        search_request.limit,
+        default_limit=stac_config.default_limit,
+        max_limit=stac_config.max_limit,
+    )
 
     # An unscoped request is rewritten to explicitly scope all collections of
     # the catalog so the routing-aware dispatch below can serve it; see
@@ -1483,8 +1501,22 @@ async def search_items(
 
 
 async def search_collections(
-    db_resource: DbResource, search_request: CollectionSearchRequest
+    db_resource: DbResource,
+    search_request: CollectionSearchRequest,
+    *,
+    default_limit: int = 10,
+    max_limit: int = 1000,
 ) -> Tuple[List[Collection], int]:
+    # Resolve default/clamp the page size against the configured policy
+    # (OGC API - Features Part 1 Core /req/core/fc-limit-response-1): an
+    # over-max ``limit`` is capped, never rejected. Callers pass the
+    # ``StacPluginConfig`` policy; the literal fallbacks above only apply to
+    # (test) callers that don't.
+    from dynastore.extensions.tools.pagination import resolve_page_limit
+    search_request.limit = resolve_page_limit(
+        search_request.limit, default_limit=default_limit, max_limit=max_limit,
+    )
+
     # Listing visibility: this search builds its own SQL (it does not go
     # through the routed collection drivers), so it translates the
     # request's constraints itself — the catalog-level constraint narrows

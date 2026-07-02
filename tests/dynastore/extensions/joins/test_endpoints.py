@@ -25,6 +25,31 @@ def _build_service():
     return JoinsService()
 
 
+def test_resolve_paging_clamps_over_max_instead_of_erroring():
+    """OGC API - Features Part 1 Core /req/core/fc-limit-response-1: a
+    ``?limit=`` above ``MAX_PAGE_LIMIT`` is clamped, not rejected. The
+    ``Query(ge=1, le=MAX_PAGE_LIMIT)`` gate that used to 422 here was
+    removed; ``_resolve_paging`` is now the sole enforcement point."""
+    from dynastore.extensions.joins.joins_service import (
+        DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, _resolve_paging,
+    )
+    from dynastore.modules.joins.models import JoinRequest
+
+    body = JoinRequest(
+        secondary={"driver": "registered", "ref": "my-bq-collection"},
+        join={"primary_column": "uid", "secondary_column": "user_id"},
+    )
+
+    over_max = _resolve_paging(body, limit=MAX_PAGE_LIMIT * 2, offset=None)
+    assert over_max.limit == MAX_PAGE_LIMIT
+
+    omitted = _resolve_paging(body, limit=None, offset=None)
+    assert omitted.limit == DEFAULT_PAGE_LIMIT
+
+    in_range = _resolve_paging(body, limit=250, offset=None)
+    assert in_range.limit == 250
+
+
 @pytest.mark.asyncio
 async def test_describe_lists_registered_driver():
     from unittest.mock import MagicMock

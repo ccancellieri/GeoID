@@ -17,7 +17,9 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 from dynastore.models.plugin_config import PluginConfig
+from dynastore.models.mutability import Mutable
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
+from pydantic import Field
 from typing import ClassVar, Tuple
 
 
@@ -25,4 +27,28 @@ class RecordsPluginConfig(ExposableConfigMixin, PluginConfig):
     """Service-exposure config for the records extension."""
     _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "records")
 
-    # `enabled` inherited from ExposableConfigMixin — no further fields.
+    # `enabled` inherited from ExposableConfigMixin.
+
+    # --- Pagination policy (OGC API - Features Part 1 Core, /req/core/fc-limit-*) ---
+    default_limit: Mutable[int] = Field(
+        default=10,
+        ge=1,
+        description="Page size for GET .../items (records) when ``limit`` is omitted.",
+    )
+    listing_default_limit: Mutable[int] = Field(
+        default=100,
+        ge=1,
+        description=(
+            "Page size for the catalogs/collections listing endpoints when "
+            "``limit`` is omitted."
+        ),
+    )
+    max_limit: Mutable[int] = Field(
+        default=1000,
+        ge=1,
+        description=(
+            "Maximum page size, shared by catalogs/collections/records "
+            "listings. A requested ``limit`` above this value is clamped, "
+            "never rejected (fc-limit-response-1)."
+        ),
+    )

@@ -60,8 +60,9 @@ from dynastore.modules.storage.router import resolve_drivers
 logger = logging.getLogger(__name__)
 
 # Default and ceiling for a single /join page, mirroring OGC API - Features
-# `limit` semantics (Features Part 1, Req 19). Kept in sync with PagingSpec's
-# own field bounds (default=100, le=10000).
+# `limit` semantics (Features Part 1 Core, /req/core/fc-limit-response-1: an
+# over-max ``limit`` is clamped by ``_resolve_paging`` below, never rejected).
+# PagingSpec's own ``limit`` field shares the same default (100).
 DEFAULT_PAGE_LIMIT = 100
 MAX_PAGE_LIMIT = 10_000
 
@@ -333,9 +334,10 @@ async def _execute_primary_join(
             await inner.aclose()
 
     # Request limit+1 matched features so the (limit+1)th item acts as a peek
-    # for the `next` link decision.  PagingSpec.model_construct bypasses the
-    # le=10000 validator because this is an internal peek value; the page
-    # exposed to the client is trimmed to paging.limit below.
+    # for the `next` link decision.  PagingSpec.model_construct bypasses field
+    # validation because this is an internal peek value (paging.limit is
+    # already clamped by `_resolve_paging`); the page exposed to the client
+    # is trimmed to paging.limit below.
     peek_paging = PagingSpec.model_construct(
         limit=paging.limit + 1, offset=paging.offset,
     )
@@ -466,8 +468,13 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
         body: JoinRequest = Body(...),
         request_hints: FrozenSet = Depends(parse_hints_param),
         limit: Annotated[Optional[int], Query(
-            ge=1, le=MAX_PAGE_LIMIT,
-            description="Page size; overrides body.paging.limit when present.",
+            ge=1,
+            description=(
+                "Page size; overrides body.paging.limit when present. A "
+                "value above the configured maximum is clamped, not "
+                "rejected (OGC API - Features Part 1 Core "
+                "/req/core/fc-limit-response-1) — see ``_resolve_paging``."
+            ),
         )] = None,
         offset: Annotated[Optional[int], Query(
             ge=0,

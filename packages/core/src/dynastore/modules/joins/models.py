@@ -235,8 +235,11 @@ class PagingSpec(BaseModel):
     limit: int = Field(
         default=100,
         ge=1,
-        le=10000,
-        description="Max joined features to return (1–10 000).",
+        description=(
+            "Max joined features to return. A value above the configured "
+            "maximum (10 000 by default) is clamped, not rejected — see "
+            "``joins_service._resolve_paging``."
+        ),
     )
     offset: int = Field(
         default=0,

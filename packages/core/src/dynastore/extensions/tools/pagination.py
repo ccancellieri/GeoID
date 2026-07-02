@@ -18,11 +18,29 @@
 
 """Shared pagination link builder for OGC-protocol extensions."""
 
-from typing import List
+from typing import List, Optional
 
 from fastapi import Request
 
 from dynastore.models.shared_models import Link
+
+
+def resolve_page_limit(
+    limit: Optional[int], *, default_limit: int, max_limit: int
+) -> int:
+    """Resolve the effective page ``limit`` from a request value + policy.
+
+    ``limit is None`` (parameter omitted) falls back to ``default_limit``.
+    Any supplied value is clamped to ``[1, max_limit]`` rather than
+    rejected — OGC API - Features Part 1 Core, requirement
+    ``/req/core/fc-limit-response-1``: a ``limit`` larger than the maximum
+    SHALL NOT result in an error, the maximum is used instead. ``default_limit``
+    and ``max_limit`` normally come from the caller's plugin config
+    (``FeaturesPluginConfig`` / ``StacPluginConfig`` / ``RecordsPluginConfig``),
+    so operators can tune page-size policy without a code change.
+    """
+    eff = default_limit if limit is None else limit
+    return max(1, min(eff, max_limit))
 
 
 def build_pagination_links(

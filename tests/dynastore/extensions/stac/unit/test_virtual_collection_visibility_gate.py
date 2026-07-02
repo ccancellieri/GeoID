@@ -133,7 +133,10 @@ async def test_get_virtual_asset_list_iam_off_reaches_service(monkeypatch):
     svc = _svc()
     monkeypatch.setattr(stac_virtual_mod, "managed_transaction", _fake_txn)
 
-    stac_config = SimpleNamespace(asset_tracking=SimpleNamespace(enabled=False))
+    stac_config = SimpleNamespace(
+        asset_tracking=SimpleNamespace(enabled=False),
+        default_limit=10, max_limit=1000,
+    )
     monkeypatch.setattr(svc, "_get_stac_config", _acoro(stac_config))
 
     assets_stub = SimpleNamespace()
@@ -150,6 +153,7 @@ async def test_get_virtual_asset_list_iam_off_reaches_service(monkeypatch):
                 collection_id="anycol",
                 request=_request(),
                 engine=object(),
+                limit=10,
             )
 
     assert exc_info.value.status_code == 404
@@ -236,7 +240,10 @@ async def test_get_virtual_asset_items_iam_off_reaches_service(monkeypatch):
     via maybe_dispatch_items_to_search_driver returning an empty result."""
     svc = _svc()
     monkeypatch.setattr(stac_virtual_mod, "managed_transaction", _fake_txn)
-    monkeypatch.setattr(svc, "_get_stac_config", _acoro(SimpleNamespace()))
+    monkeypatch.setattr(
+        svc, "_get_stac_config",
+        _acoro(SimpleNamespace(default_limit=10, max_limit=1000)),
+    )
 
     catalogs_stub = SimpleNamespace(
         get_collection_config=AsyncMock(return_value=SimpleNamespace()),
@@ -300,7 +307,7 @@ async def test_get_virtual_hierarchy_collection_iam_off_reaches_service(monkeypa
     monkeypatch.setattr(stac_virtual_mod, "managed_transaction", _fake_txn)
 
     # get_config returns a config with hierarchy disabled → 404 for that reason.
-    cfg_stub = SimpleNamespace(hierarchy=None)
+    cfg_stub = SimpleNamespace(hierarchy=None, default_limit=10, max_limit=1000)
     config_mgr = SimpleNamespace(get_config=AsyncMock(return_value=cfg_stub))
     monkeypatch.setattr(stac_virtual_mod, "get_protocol", lambda _p: config_mgr)
 
@@ -312,6 +319,7 @@ async def test_get_virtual_hierarchy_collection_iam_off_reaches_service(monkeypa
                 collection_id="anycol",
                 request=_request(),
                 engine=object(),
+                limit=100,
             )
 
     assert exc_info.value.status_code == 404
@@ -347,7 +355,7 @@ async def test_get_virtual_hierarchy_items_iam_off_reaches_service(monkeypatch):
     svc = _svc()
     monkeypatch.setattr(stac_virtual_mod, "managed_transaction", _fake_txn)
 
-    cfg_stub = SimpleNamespace(hierarchy=None)
+    cfg_stub = SimpleNamespace(hierarchy=None, default_limit=10, max_limit=1000)
     configs_stub = SimpleNamespace(get_config=AsyncMock(return_value=cfg_stub))
     monkeypatch.setattr(svc, "_get_configs_service", _acoro(configs_stub))
 
@@ -360,6 +368,7 @@ async def test_get_virtual_hierarchy_items_iam_off_reaches_service(monkeypatch):
                 request=_request(),
                 engine=object(),
                 language="en",
+                limit=10,
             )
 
     assert exc_info.value.status_code == 404

@@ -518,7 +518,15 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
     async def list_stac_catalogs(
         self,
         request: Request,
-        limit: int = Query(100, ge=1, le=10000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of catalogs to return. Omitted falls back to "
+                "the configured default; a value above the configured maximum "
+                "is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         language: str = Depends(get_language),
         request_hints: FrozenSet = Depends(parse_hints_param),
@@ -531,6 +539,15 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         catalog picker (GET /admin/catalogs) is the surface that narrows
         the list per caller.
         """
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        platform_stac_config = await self._get_plugin_config(StacPluginConfig)
+        limit = resolve_page_limit(
+            limit,
+            default_limit=platform_stac_config.catalogs_default_limit,
+            max_limit=platform_stac_config.catalogs_max_limit,
+        )
+
         catalogs_svc = await self._get_catalogs_service()
         catalogs = await catalogs_svc.list_catalogs(limit=limit, offset=offset, lang=language)
 
@@ -599,7 +616,15 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
                 "collection id, title, and description."
             ),
         ),
-        limit: int = Query(10, ge=1, le=1000, description="Maximum number of collections to return."),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of collections to return. Omitted falls back "
+                "to the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0, description="Number of collections to skip."),
         sortby: Optional[str] = Query(
             None,
@@ -633,7 +658,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
 
         # Detect whether any Collection Search params were supplied
         has_search_params = any([bbox, datetime, q, sortby])
-        if not has_search_params and limit == 10 and offset == 0:
+        if not has_search_params and limit is None and offset == 0:
             # Plain listing — no search parameters
             try:
                 collections = await stac_generator.create_collections_catalog(
@@ -674,7 +699,12 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
 
         try:
             async with managed_transaction(engine) as conn:
-                collections_list, total_count = await search_collections(conn, search_req)
+                stac_config = await self._get_stac_config(catalog_id, db_resource=conn)
+                collections_list, total_count = await search_collections(
+                    conn, search_req,
+                    default_limit=stac_config.default_limit,
+                    max_limit=stac_config.max_limit,
+                )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -916,7 +946,15 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         collection_id: str,
         request: Request,
         engine=Depends(get_async_engine),
-        limit: int = Query(10, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of items to return. Omitted falls back to the "
+                "configured default; a value above the configured maximum is "
+                "clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         filter: Optional[str] = Query(None, description="CQL2-Text filter expression"),
         language: str = Depends(get_language),
@@ -972,6 +1010,13 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
 
             stac_config = await self._get_stac_config(
                 catalog_id, collection_id, db_resource=conn
+            )
+
+            from dynastore.extensions.tools.pagination import resolve_page_limit
+            limit = resolve_page_limit(
+                limit,
+                default_limit=stac_config.default_limit,
+                max_limit=stac_config.max_limit,
             )
 
             # ── Routing-aware items SEARCH-driver dispatch (#1047, #1311) ─────
@@ -1425,7 +1470,15 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         ),
         ids: Optional[str] = Query(None, description="Comma-separated Item IDs."),
         collections: Optional[str] = Query(None, description="Comma-separated Collection IDs."),
-        limit: int = Query(10, ge=1, le=1000, description="Maximum number of items to return."),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of items to return. Omitted falls back to the "
+                "configured default; a value above the configured maximum is "
+                "clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0, description="Number of items to skip."),
         filter: Optional[str] = Query(
             None,
@@ -1565,6 +1618,10 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+        # ``search_items`` resolves/clamps ``search_request.limit`` in place
+        # before returning — it is never None past this point.
+        assert search_request.limit is not None
+
         from dynastore.models.shared_models import OutputFormatEnum
         if f in (OutputFormatEnum.GEOPARQUET, "geoparquet", "parquet"):
             from dynastore.tools.file_io import write_geoparquet
@@ -1625,6 +1682,10 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
                 # 400 instead of a 500, matching the ``/items`` filter path.
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+        # ``search_items`` resolves/clamps ``search_request.limit`` in place
+        # before returning — it is never None past this point.
+        assert search_request.limit is not None
+
         from dynastore.models.shared_models import OutputFormatEnum
         if f in (OutputFormatEnum.GEOPARQUET, "geoparquet", "parquet"):
             from dynastore.tools.file_io import write_geoparquet
@@ -1663,7 +1724,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         intersects: Optional[Dict[str, Any]],
         datetime: Optional[str],
         sortby: Optional[List[str]],
-        limit: int,
+        limit: Optional[int],
         offset: int,
         language: str,
     ):
@@ -1679,6 +1740,14 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         """
         from dynastore.modules.elasticsearch.global_search import (
             search_public_items,
+        )
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        platform_stac_config = await self._get_plugin_config(StacPluginConfig)
+        limit = resolve_page_limit(
+            limit,
+            default_limit=platform_stac_config.default_limit,
+            max_limit=platform_stac_config.max_limit,
         )
 
         page = await search_public_items(
@@ -1737,7 +1806,15 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         ),
         ids: Optional[str] = Query(None, description="Comma-separated Item IDs."),
         collections: Optional[str] = Query(None, description="Comma-separated Collection IDs."),
-        limit: int = Query(10, ge=1, le=1000, description="Maximum number of items to return."),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of items to return. Omitted falls back to the "
+                "configured default; a value above the configured maximum is "
+                "clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0, description="Number of items to skip."),
         sortby: Optional[str] = Query(
             None,
@@ -1841,7 +1918,20 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
     ):
         try:
             async with managed_transaction(engine) as conn:
-                collections, total_count = await search_collections(conn, search_req)
+                configs_svc = await self._get_configs_service()
+                # ``catalog_id`` may be unset (cross-catalog collection search):
+                # ``get_config`` falls back through the platform tier, exactly
+                # the desired policy for that case.
+                stac_config = await configs_svc.get_config(
+                    StacPluginConfig,
+                    catalog_id=search_req.catalog_id,
+                    ctx=DriverContext(db_resource=conn),
+                )
+                collections, total_count = await search_collections(
+                    conn, search_req,
+                    default_limit=stac_config.default_limit,
+                    max_limit=stac_config.max_limit,
+                )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 

@@ -290,7 +290,15 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
     async def list_catalogs(
         self,
         language: str = Depends(get_language),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of catalogs to return. Omitted falls back to "
+                "the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
     ):
         """List catalogs available to the Records service (web-browser nav).
@@ -300,6 +308,16 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         ``/stac/catalogs``) so the browser renders a label instead of the raw
         multilingual object.
         """
+        from .config import RecordsPluginConfig
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        records_config = await self._get_plugin_config(RecordsPluginConfig)
+        limit = resolve_page_limit(
+            limit,
+            default_limit=records_config.listing_default_limit,
+            max_limit=records_config.max_limit,
+        )
+
         catalogs_svc = await self._get_catalogs_service()
         catalogs = await catalogs_svc.list_catalogs(limit=limit, offset=offset)
         return {
@@ -319,10 +337,30 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         catalog_id: str,
         request: Request,
         language: str = Depends(get_language),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of collections to return. Omitted falls back "
+                "to the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> rm.RecordsCatalogCollections:
+        from .config import RecordsPluginConfig
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        records_config = await self._get_plugin_config(
+            RecordsPluginConfig, catalog_id=catalog_id,
+        )
+        limit = resolve_page_limit(
+            limit,
+            default_limit=records_config.listing_default_limit,
+            max_limit=records_config.max_limit,
+        )
+
         catalogs_svc = await self._get_catalogs_service()
 
         all_collections = await catalogs_svc.list_collections(
@@ -388,7 +426,15 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         collection_id: str,
         language: str = Depends(get_language),
         conn: AsyncConnection = Depends(get_async_connection),
-        limit: int = Query(10, ge=1, le=1000, description="Maximum number of records to return."),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of records to return. Omitted falls back to "
+                "the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0, description="Offset of the first record to return."),
         filter: Optional[str] = Query(
             None,
@@ -449,6 +495,18 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         collection_meta = await catalogs_svc.get_collection(catalog_id, collection_id, lang="en")
         if not collection_meta:
             raise HTTPException(status_code=404, detail=f"Collection '{collection_id}' not found.")
+
+        from .config import RecordsPluginConfig
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        records_config = await self._get_plugin_config(
+            RecordsPluginConfig, catalog_id=catalog_id,
+        )
+        limit = resolve_page_limit(
+            limit,
+            default_limit=records_config.default_limit,
+            max_limit=records_config.max_limit,
+        )
 
         from dynastore.extensions.tools.query import (
             parse_ogc_query_request,

@@ -360,3 +360,42 @@ class StacPluginConfig(ExposableConfigMixin, PluginConfig):
             "cache is in place and the deployment can afford the latency."
         ),
     )
+
+    # --- Pagination policy (OGC API - Features Part 1 Core, /req/core/fc-limit-*) ---
+    #
+    # Two pairs, mirroring the two distinct page-size policies already in
+    # code: items/search-style listings default to a small page with a
+    # protective ceiling, while the platform-wide /catalogs listing defaults
+    # larger with a higher ceiling (mirrors the Joins extension's own
+    # 100/10 000 pair for the same "listing a small root resource" shape).
+    default_limit: Mutable[int] = Field(
+        default=10,
+        ge=1,
+        description=(
+            "Page size for items/search-style STAC listings (collection "
+            "items, item search, collection search, virtual assets/hierarchy) "
+            "when ``limit`` is omitted."
+        ),
+    )
+    max_limit: Mutable[int] = Field(
+        default=1000,
+        ge=1,
+        description=(
+            "Maximum page size for items/search-style STAC listings. A "
+            "requested ``limit`` above this value is clamped, never rejected "
+            "(fc-limit-response-1)."
+        ),
+    )
+    catalogs_default_limit: Mutable[int] = Field(
+        default=100,
+        ge=1,
+        description="Page size for GET /stac/catalogs when ``limit`` is omitted.",
+    )
+    catalogs_max_limit: Mutable[int] = Field(
+        default=10_000,
+        ge=1,
+        description=(
+            "Maximum page size for GET /stac/catalogs. A requested ``limit`` "
+            "above this value is clamped, never rejected (fc-limit-response-1)."
+        ),
+    )

@@ -88,7 +88,10 @@ async def test_get_stac_collection_items_dispatches_with_request(monkeypatch):
         get_collection=_acoro({"id": "col-a"}),
     )
     monkeypatch.setattr(svc, "_get_catalogs_service", _acoro(catalogs))
-    monkeypatch.setattr(svc, "_get_stac_config", _acoro(SimpleNamespace()))
+    monkeypatch.setattr(
+        svc, "_get_stac_config",
+        _acoro(SimpleNamespace(default_limit=10, max_limit=1000)),
+    )
     monkeypatch.setattr(stac_service_mod, "managed_transaction", _fake_txn)
 
     seen: dict = {}
@@ -139,7 +142,10 @@ async def test_get_stac_collection_items_skips_dispatch_with_filter(monkeypatch)
 
     catalogs = SimpleNamespace(get_collection=_acoro({"id": "col-a"}))
     monkeypatch.setattr(svc, "_get_catalogs_service", _acoro(catalogs))
-    monkeypatch.setattr(svc, "_get_stac_config", _acoro(SimpleNamespace()))
+    monkeypatch.setattr(
+        svc, "_get_stac_config",
+        _acoro(SimpleNamespace(default_limit=10, max_limit=1000)),
+    )
     monkeypatch.setattr(stac_service_mod, "managed_transaction", _fake_txn)
 
     called = {"dispatch": False}
@@ -187,7 +193,10 @@ async def test_get_virtual_asset_items_dispatches_with_request(monkeypatch):
 
     catalogs = SimpleNamespace(get_collection_config=_acoro(SimpleNamespace()))
     monkeypatch.setattr(svc, "_get_catalogs_service", _acoro(catalogs))
-    monkeypatch.setattr(svc, "_get_stac_config", _acoro(SimpleNamespace()))
+    monkeypatch.setattr(
+        svc, "_get_stac_config",
+        _acoro(SimpleNamespace(default_limit=10, max_limit=1000)),
+    )
     monkeypatch.setattr(stac_virtual_mod, "managed_transaction", _fake_txn)
 
     # An ItemsProtocol whose stream_items would explode — proving the SEARCH
