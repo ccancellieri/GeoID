@@ -21,6 +21,7 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, FrozenSet, List, Union, Any, Optional
 
 import jsonschema as _jsonschema_scope_gate  # noqa: F401  # SCOPE gate: extension_processes requires jsonschema
@@ -1310,6 +1311,61 @@ async def get_job_logs_collection(
     return await _job_logs_response(task, limit=limit, cursor=cursor, order=order, request=request)
 
 
+# Best-effort liveness-reconcile budget for list endpoints (#2818): a page
+# of healthy jobs must pay zero probe latency, so only rows that LOOK lapsed
+# (mirrors reconcile_task_liveness's own guard — ACTIVE/RUNNING status with a
+# locked_until already in the past) are probed, and at most this many per
+# request so a page full of lapsed rows still bounds total added latency to
+# _LIST_RECONCILE_MAX_PROBES * reconcile_task_liveness's own per-probe budget.
+_LIST_RECONCILE_MAX_PROBES = 5
+_LIST_RECONCILE_STATUSES = frozenset({TaskStatusEnum.ACTIVE, TaskStatusEnum.RUNNING})
+
+
+async def _reconcile_lapsed_list_tasks(
+    conn: AsyncConnection, tasks: List[Task], *, schema: str
+) -> List[Task]:
+    """Heal stale-``running`` rows on a jobs list page.
+
+    ``get_job_status`` / ``_get_job_internal`` already self-heal a single job
+    on read via :func:`reconcile_task_liveness`; the list endpoints built
+    ``StatusInfo`` straight off ``tasks_module.list_tasks`` and never healed,
+    so a job discovered via the documented ``GET /jobs`` path could show a
+    stale ``running`` status forever between periodic reconciler passes.
+    Shared by ``list_jobs`` / ``list_jobs_catalog`` / ``list_jobs_collection``
+    so the probing policy lives in exactly one place.
+
+    Mirrors the single-job path's semantics — same reconciler, same
+    per-probe timeout budget — but pre-filters to rows that look lapsed
+    (avoiding a wasted call on the common case of an all-healthy page) and
+    caps the number of probes so total added latency stays bounded no matter
+    how many lapsed rows a page contains. A probe failure/timeout is
+    swallowed by ``reconcile_task_liveness`` itself; on top of that this
+    helper never lets a probe error fail the list request — the original row
+    is kept and logged.
+    """
+    now = datetime.now(timezone.utc)
+    probes_left = _LIST_RECONCILE_MAX_PROBES
+    healed: List[Task] = []
+    for task in tasks:
+        if (
+            probes_left > 0
+            and task.status in _LIST_RECONCILE_STATUSES
+            and task.locked_until is not None
+            and task.locked_until < now
+        ):
+            probes_left -= 1
+            try:
+                task = await reconcile_task_liveness(conn, task, schema=schema)
+            except Exception as e:  # noqa: BLE001 — best-effort; never fail the list
+                logger.warning(
+                    "reconcile_task_liveness failed for job %s during list: %s "
+                    "— serving unreconciled status.",
+                    task.task_id, e,
+                )
+        healed.append(task)
+    return healed
+
+
 # --- OGC Part 1: List Jobs (GET /jobs) at 3 scopes ---
 
 @router.get(
@@ -1342,6 +1398,7 @@ async def list_jobs(
     )
 
     tasks = await tasks_module.list_tasks(conn, schema="public", limit=limit, offset=offset, kind="process")
+    tasks = await _reconcile_lapsed_list_tasks(conn, tasks, schema="public")
     jobs = [_task_to_status_info(t, request) for t in tasks]
     links = [
         models.Link(
@@ -1411,6 +1468,7 @@ async def list_jobs_catalog(
 
     schema = await _resolve_catalog_schema(catalog_id, conn)
     tasks = await tasks_module.list_tasks(conn, schema=schema, limit=limit, offset=offset, kind="process")
+    tasks = await _reconcile_lapsed_list_tasks(conn, tasks, schema=schema)
     jobs = [_task_to_status_info(t, request) for t in tasks]
     links = [
         models.Link(
@@ -1488,6 +1546,7 @@ async def list_jobs_collection(
         kind="process",
         collection_id=collection_id,
     )
+    tasks = await _reconcile_lapsed_list_tasks(conn, tasks, schema=schema)
     jobs = [_task_to_status_info(t, request) for t in tasks]
     links = [
         models.Link(
