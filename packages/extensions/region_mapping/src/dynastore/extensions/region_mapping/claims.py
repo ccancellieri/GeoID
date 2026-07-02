@@ -22,30 +22,51 @@ region_mapping extension (dynastore#443/#448/#2821).
 Holds no persistence dependency of its own — ``mapping_id``/``claim_ci``
 computation is pure, and the two ``fetch_*`` helpers below read the
 *source* collection (the collection being claimed, e.g. a country-boundary
-layer) via ``CatalogsProtocol``, never the registry itself. Registry
-persistence (the ``region_mapping.mappings`` table) lives in
-``registry_queries.py`` / ``registry_store.py``.
+layer), never the registry itself. Registry persistence (the
+``region_mapping.mappings`` table) lives in ``registry_queries.py`` /
+``registry_store.py``.
+
+``fetch_distinct_region_ids`` deliberately bypasses ``CatalogsProtocol``'s
+item-query surface (``search_items``/``stream_items``) and the
+storage-driver routing it triggers: the registry and its reads are
+detached by design, and PostgreSQL is the system of record for every
+collection's rows regardless of which driver serves live traffic. It
+issues a dedicated SQL query straight at the source collection's physical
+attributes table instead.
 """
 from __future__ import annotations
 
 import re
 from collections import OrderedDict
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from dynastore.models.query_builder import FieldSelection, QueryRequest, SortOrder
 from dynastore.models.protocols.catalogs import CatalogsProtocol
+from dynastore.models.protocols.configs import ConfigsProtocol
+from dynastore.modules.db_config.query_executor import (
+    DQLQuery,
+    ResultHandler,
+    managed_transaction,
+)
+from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
+from dynastore.modules.storage.drivers.pg_sidecars import (
+    FeatureAttributeSidecar,
+    FeatureAttributeSidecarConfig,
+    SidecarRegistry,
+    driver_sidecars,
+    sidecar_table_name,
+)
+from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
+    AttributeStorageMode,
+)
 from dynastore.tools.cache import cached
+from dynastore.tools.db import validate_column_identifier, validate_sql_identifier
 from dynastore.tools.discovery import get_protocol
+from dynastore.tools.protocol_helpers import get_engine
 
 ROLE_PRIMARY = "primary"
 ROLE_ALIAS = "alias"
 
 WORLD_BBOX: Tuple[float, float, float, float] = (-180.0, -90.0, 180.0, 90.0)
-
-# regionIds cardinality can run into the thousands for country/admin
-# boundary layers — bounded offset loop below structurally bypasses the
-# HTTP 1000-item response cap.
-REGION_IDS_PAGE_SIZE = 5000
 
 _REGEX_METACHARS = re.compile(r"[.^$*+?{}\[\]\\|()]")
 _SLUG_INVALID = re.compile(r"[^a-z0-9_]+")
@@ -90,11 +111,14 @@ def compute_claim_set(
     The claim set is ``{column, canonical_alias, *extra_aliases,
     "{catalog_id}_{canonical_alias}"}`` where ``canonical_alias`` is
     ``alias`` or, when unset, ``column`` itself. Deduplicated
-    case-insensitively (``casefold``); the entry equal to
-    ``canonical_alias`` is ``role="primary"``, every other member is
-    ``role="alias"``.
+    case-insensitively (``casefold``); the entry whose ``casefold()``
+    matches ``canonical_alias``'s is ``role="primary"``, every other member
+    is ``role="alias"`` -- exactly one primary always results, even when
+    ``column`` (or an ``extra_alias``) differs from ``canonical_alias``
+    only by case.
     """
     canonical_alias = alias or column
+    canonical_alias_ci = canonical_alias.casefold()
     candidates = [column, canonical_alias, *extra_aliases, f"{catalog_id}_{canonical_alias}"]
 
     claims: "OrderedDict[str, Tuple[str, str]]" = OrderedDict()
@@ -103,7 +127,7 @@ def compute_claim_set(
         claim_ci = candidate.casefold()
         if claim_ci in claims:
             continue
-        role = ROLE_PRIMARY if candidate == canonical_alias else ROLE_ALIAS
+        role = ROLE_PRIMARY if claim_ci == canonical_alias_ci else ROLE_ALIAS
         claims[claim_ci] = (candidate, role)
     return claims
 
@@ -141,41 +165,87 @@ async def fetch_collection_bbox(catalog_id: str, collection_id: str) -> List[flo
     return list(bbox)  # type: ignore[arg-type]
 
 
+def _find_attributes_sidecar(
+    col_config: ItemsPostgresqlDriverConfig,
+) -> Optional[FeatureAttributeSidecarConfig]:
+    return next(
+        (
+            sc for sc in driver_sidecars(col_config)
+            if isinstance(sc, FeatureAttributeSidecarConfig)
+        ),
+        None,
+    )
+
+
 @cached(maxsize=128, ttl=120, namespace="region_mapping_region_ids")
 async def fetch_distinct_region_ids(
     src_catalog: str, src_collection: str, region_prop: str,
 ) -> List[str]:
     """Sorted distinct values of ``region_prop`` in the source collection.
 
-    Uses ``GROUP BY`` (== DISTINCT), driver-agnostic, in a bounded internal
-    offset loop so it structurally bypasses the HTTP 1000-item response cap
-    — regionIds cardinality can run into the thousands for country/admin
-    boundary layers.
+    Issues one server-side ``SELECT DISTINCT`` straight against the source
+    collection's physical attributes table, resolving ``region_prop`` to
+    either a promoted columnar column or a JSONB-document key from the
+    collection's persisted driver config (collections are all-columnar or
+    all-JSONB, never mixed — see ``AttributeStorageMode``). Soft-deleted
+    rows are excluded via the hub's ``deleted_at`` column, mirroring the
+    item read path's lifecycle predicate.
     """
     catalogs = get_protocol(CatalogsProtocol)
-    if catalogs is None:
+    configs = get_protocol(ConfigsProtocol)
+    if catalogs is None or configs is None:
         return []
-    values: set = set()
-    offset = 0
-    while True:
-        features = await catalogs.search_items(
-            src_catalog,
-            src_collection,
-            QueryRequest(
-                select=[FieldSelection(field=region_prop)],
-                group_by=[region_prop],
-                sort=[SortOrder(field=region_prop)],
-                limit=REGION_IDS_PAGE_SIZE,
-                offset=offset,
-            ),
-        )
-        if not features:
-            break
-        for feature in features:
-            value = (feature.properties or {}).get(region_prop)
-            if value is not None:
-                values.add(str(value))
-        if len(features) < REGION_IDS_PAGE_SIZE:
-            break
-        offset += REGION_IDS_PAGE_SIZE
-    return sorted(values)
+
+    phys_schema = await catalogs.resolve_physical_schema(src_catalog, allow_missing=True)
+    col_config = await configs.get_config(
+        ItemsPostgresqlDriverConfig,
+        catalog_id=src_catalog,
+        collection_id=src_collection,
+    )
+    phys_table = col_config.physical_table
+    if not phys_schema or not phys_table:
+        return []
+
+    attrs_config = _find_attributes_sidecar(col_config)
+    if attrs_config is None:
+        return []
+    attrs_sidecar = SidecarRegistry.get_sidecar(attrs_config, lenient=True)
+    if not isinstance(attrs_sidecar, FeatureAttributeSidecar):
+        return []
+
+    schema = validate_sql_identifier(phys_schema)
+    hub_table = validate_sql_identifier(phys_table)
+    attrs_table = validate_sql_identifier(
+        sidecar_table_name(phys_table, attrs_config.sidecar_id)
+    )
+
+    params: Dict[str, Any] = {}
+    if attrs_sidecar.resolved_storage_mode == AttributeStorageMode.COLUMNAR:
+        declared = {attr.name for attr in (attrs_config.attribute_schema or [])}
+        if region_prop not in declared:
+            # Claimed property isn't a materialised column on this
+            # columnar collection — nothing to read.
+            return []
+        col = validate_column_identifier(region_prop)
+        value_expr = f's."{col}"'
+    else:
+        jsonb_col = validate_column_identifier(attrs_config.jsonb_column_name)
+        value_expr = f's."{jsonb_col}" ->> :region_prop'
+        params["region_prop"] = region_prop
+
+    sql = (
+        f'SELECT DISTINCT {value_expr} AS region_value '
+        f'FROM "{schema}"."{hub_table}" h '
+        f'JOIN "{schema}"."{attrs_table}" s ON s.geoid = h.geoid '
+        f'WHERE h.deleted_at IS NULL AND {value_expr} IS NOT NULL '
+        f'ORDER BY region_value'
+    )
+
+    engine = get_engine()
+    if engine is None:
+        return []
+    async with managed_transaction(engine) as conn:
+        values = await DQLQuery(
+            sql, result_handler=ResultHandler.ALL_SCALARS,
+        ).execute(conn, **params)
+    return sorted(str(v) for v in (values or []))

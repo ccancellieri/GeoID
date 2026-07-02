@@ -21,7 +21,7 @@ claim-computation kernel + source-collection read helpers (dynastore#2821).
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 from unittest.mock import MagicMock
 
 import pytest
@@ -72,6 +72,42 @@ def test_compute_claim_set_casefold_dedup() -> None:
 
     assert len(claims) == 2
     assert "country" in claims  # casefolded key
+
+
+def test_compute_claim_set_column_casefold_equals_alias_has_one_primary() -> None:
+    """Column and (defaulted-from-column) alias differing only by case must
+    still produce exactly one primary row (dynastore#2821 regression): the
+    role is decided case-insensitively, not by exact string equality, and
+    the claim text kept is the first-seen candidate's spelling."""
+    from dynastore.extensions.region_mapping.claims import ROLE_PRIMARY, compute_claim_set
+
+    claims = compute_claim_set(
+        catalog_id="fao", collection_id="countries",
+        column="GAUL1_CODE", alias="gaul1_code", extra_aliases=[],
+    )
+
+    primaries = [
+        (claim, role) for claim, role in claims.values() if role == ROLE_PRIMARY
+    ]
+    assert len(primaries) == 1
+    # "GAUL1_CODE" is the first candidate built (column before canonical_alias),
+    # so its spelling wins the slot even though role resolution is
+    # case-insensitive.
+    assert primaries[0][0] == "GAUL1_CODE"
+
+
+def test_compute_claim_set_extra_alias_casefold_equals_canonical_has_one_primary() -> None:
+    """An extra_alias that casefold-equals the canonical alias must not
+    steal the primary slot nor create a second primary."""
+    from dynastore.extensions.region_mapping.claims import ROLE_PRIMARY, compute_claim_set
+
+    claims = compute_claim_set(
+        catalog_id="fao", collection_id="countries",
+        column="adm0_code", alias="Country", extra_aliases=["country"],
+    )
+
+    primaries = [claim for claim, role in claims.values() if role == ROLE_PRIMARY]
+    assert primaries == ["Country"]
 
 
 def test_compute_claim_set_exactly_one_primary() -> None:
@@ -148,31 +184,22 @@ def test_is_degenerate_bbox(bbox, expected) -> None:
 
 # ---------------------------------------------------------------------------
 # fetch_collection_bbox / fetch_distinct_region_ids -- source-collection
-# reads via CatalogsProtocol (unrelated to registry persistence).
+# reads (unrelated to registry persistence). ``fetch_distinct_region_ids``
+# now issues a dedicated SQL query directly against the source collection's
+# physical attributes table (bypassing CatalogsProtocol's item-query surface
+# entirely), so only its guard clauses are unit-tested here; the query itself
+# is covered by a real-PG integration test.
 # ---------------------------------------------------------------------------
-
-
-def _feature(properties: Dict[str, Any]) -> MagicMock:
-    f = MagicMock()
-    f.properties = properties
-    return f
 
 
 class _StubCatalogs:
     def __init__(
         self,
-        region_id_pages: Optional[List[List[str]]] = None,
         collection_extent_bbox: Optional[List[float]] = None,
+        physical_schema: Optional[str] = "cat_schema",
     ) -> None:
-        self._region_id_pages = region_id_pages or []
         self._collection_extent_bbox = collection_extent_bbox
-
-    async def search_items(self, catalog_id: str, collection_id: str, request: Any) -> List[MagicMock]:
-        offset = request.offset or 0
-        page_index = offset // (request.limit or 1)
-        if page_index >= len(self._region_id_pages):
-            return []
-        return [_feature({request.select[0].field: v}) for v in self._region_id_pages[page_index]]
+        self._physical_schema = physical_schema
 
     async def get_collection(self, catalog_id: str, collection_id: str) -> Optional[MagicMock]:
         collection = MagicMock()
@@ -181,6 +208,31 @@ class _StubCatalogs:
         else:
             collection.extent.spatial.bbox = [self._collection_extent_bbox]
         return collection
+
+    async def resolve_physical_schema(self, catalog_id: str, **kwargs: Any) -> Optional[str]:
+        return self._physical_schema
+
+
+class _StubConfigs:
+    def __init__(self, col_config: Any) -> None:
+        self._col_config = col_config
+
+    async def get_config(self, config_cls: Any, **kwargs: Any) -> Any:
+        return self._col_config
+
+
+def _protocol_router(*, catalogs: Any = None, configs: Any = None):
+    from dynastore.models.protocols.catalogs import CatalogsProtocol
+    from dynastore.models.protocols.configs import ConfigsProtocol
+
+    def _get(protocol_type: Any) -> Any:
+        if protocol_type is CatalogsProtocol:
+            return catalogs
+        if protocol_type is ConfigsProtocol:
+            return configs
+        return None
+
+    return _get
 
 
 @pytest.fixture(autouse=True)
@@ -218,21 +270,77 @@ async def test_fetch_collection_bbox_falls_back_to_world_bounds(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
-async def test_fetch_distinct_region_ids_sorted_and_deduped(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_fetch_distinct_region_ids_no_protocols_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from dynastore.extensions.region_mapping import claims
 
-    catalogs = _StubCatalogs(region_id_pages=[["ITA", "FRA", "ITA", "DEU"]])
-    monkeypatch.setattr(claims, "get_protocol", lambda _t: catalogs)
+    monkeypatch.setattr(claims, "get_protocol", _protocol_router())
 
     values = await claims.fetch_distinct_region_ids("fao", "countries", "adm0_code")
-    assert values == ["DEU", "FRA", "ITA"]
+    assert values == []
 
 
 @pytest.mark.asyncio
-async def test_fetch_distinct_region_ids_no_catalogs_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_fetch_distinct_region_ids_no_physical_table_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from dynastore.extensions.region_mapping import claims
+    from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
 
-    monkeypatch.setattr(claims, "get_protocol", lambda _t: None)
+    catalogs = _StubCatalogs()
+    configs = _StubConfigs(ItemsPostgresqlDriverConfig())  # physical_table unset -> pending collection
+    monkeypatch.setattr(
+        claims, "get_protocol", _protocol_router(catalogs=catalogs, configs=configs),
+    )
 
     values = await claims.fetch_distinct_region_ids("fao", "countries", "adm0_code")
+    assert values == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_distinct_region_ids_no_attributes_sidecar_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dynastore.extensions.region_mapping import claims
+    from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
+
+    catalogs = _StubCatalogs()
+    col_config = ItemsPostgresqlDriverConfig(physical_table="t_abc123", sidecars=[])
+    configs = _StubConfigs(col_config)
+    monkeypatch.setattr(
+        claims, "get_protocol", _protocol_router(catalogs=catalogs, configs=configs),
+    )
+
+    values = await claims.fetch_distinct_region_ids("fao", "countries", "adm0_code")
+    assert values == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_distinct_region_ids_columnar_rejects_undeclared_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A columnar collection whose ``attribute_schema`` doesn't declare the
+    claimed property has nothing to read -- guard clause short-circuits
+    before any SQL is built."""
+    from dynastore.extensions.region_mapping import claims
+    from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
+    from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
+        AttributeSchemaEntry,
+        AttributeStorageMode,
+        FeatureAttributeSidecarConfig,
+    )
+
+    attrs = FeatureAttributeSidecarConfig(
+        storage_mode=AttributeStorageMode.COLUMNAR,
+        attribute_schema=[AttributeSchemaEntry(name="adm0_code")],
+    )
+    col_config = ItemsPostgresqlDriverConfig(physical_table="t_abc123", sidecars=[attrs])
+    catalogs = _StubCatalogs()
+    configs = _StubConfigs(col_config)
+    monkeypatch.setattr(
+        claims, "get_protocol", _protocol_router(catalogs=catalogs, configs=configs),
+    )
+
+    values = await claims.fetch_distinct_region_ids("fao", "countries", "not_declared")
     assert values == []
