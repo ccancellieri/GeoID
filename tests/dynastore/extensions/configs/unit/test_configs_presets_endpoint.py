@@ -249,26 +249,72 @@ def test_apply_catalog_preset_invalid_params_body_returns_422():
 #
 # The dry-run endpoints used to hardcode ``NoParams()``, so a preview always
 # ran a different operation than the corresponding apply and a preset with
-# required params (e.g. ``region_mapping``'s ``column``) could not be
-# previewed at all. These tests use ``region_mapping`` — a COLLECTION-tier
-# preset with a required ``column`` param and no DB dependency in ``dry_run``
-# when ``CatalogsProtocol`` is unregistered — to prove the caller-supplied
-# body now reaches the plan, with the same 422 semantics as apply.
+# required params could not be previewed at all. ``_DummyCollectionPreset``
+# below is a test-only COLLECTION-tier preset with a required ``column``
+# param and no DB dependency in ``dry_run`` (registered lazily, once per
+# process, the same way extension presets self-register on import) — it
+# proves the caller-supplied body now reaches the plan, with the same 422
+# semantics as apply.
 # ---------------------------------------------------------------------------
+
+
+def _register_dummy_collection_preset() -> None:
+    from typing import ClassVar, List, Tuple, Type
+
+    from pydantic import BaseModel, Field
+
+    from dynastore.modules.storage.presets.preset import (
+        AppliedDescriptor,
+        PresetContext,
+        PresetPlan,
+        PresetPlanEntry,
+    )
+    from dynastore.modules.storage.presets.protocol import PresetTier
+    from dynastore.modules.storage.presets.registry import get_preset, register_preset
+
+    class _DummyCollectionPresetParams(BaseModel):
+        column: str = Field(...)
+
+    class _DummyCollectionPreset:
+        name: ClassVar[str] = "test_dummy_collection_preset"
+        description: ClassVar[str] = "Test-only collection preset with a required param."
+        keywords: ClassVar[Tuple[str, ...]] = ()
+        tier: ClassVar[PresetTier] = PresetTier.COLLECTION
+        catalog_scopable: ClassVar[bool] = False
+        params_model: ClassVar[Type[BaseModel]] = _DummyCollectionPresetParams
+
+        async def dry_run(self, params: BaseModel, scope: str, ctx: PresetContext) -> PresetPlan:
+            p = _DummyCollectionPresetParams.model_validate(params.model_dump())
+            entries: List[PresetPlanEntry] = [
+                PresetPlanEntry(kind="upsert_claim", target=p.column, detail={}),
+            ]
+            return PresetPlan(preset_name=self.name, scope_key=scope, entries=tuple(entries))
+
+        async def apply(self, params: BaseModel, scope: str, ctx: PresetContext) -> AppliedDescriptor:
+            return AppliedDescriptor(payload={})
+
+        async def revoke(self, applied_descriptor: AppliedDescriptor, ctx: PresetContext) -> None:
+            return None
+
+    try:
+        get_preset(_DummyCollectionPreset.name)
+    except KeyError:
+        register_preset(_DummyCollectionPreset())
+
 
 def test_dry_run_collection_preset_uses_caller_params():
     """The dry-run plan reflects the caller-supplied ``column``, not a
     hardcoded ``NoParams()`` preview of a different operation."""
-    import dynastore.extensions.region_mapping.presets.region_mapping  # noqa: F401
+    _register_dummy_collection_preset()
 
     client = TestClient(_app())
     resp = client.post(
-        "/configs/catalogs/cat-a/collections/col-1/presets/region_mapping/dry-run",
+        "/configs/catalogs/cat-a/collections/col-1/presets/test_dummy_collection_preset/dry-run",
         json={"column": "iso3"},
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["preset_name"] == "region_mapping"
+    assert body["preset_name"] == "test_dummy_collection_preset"
     claim_targets = {e["target"] for e in body["entries"] if e["kind"] == "upsert_claim"}
     assert "iso3" in claim_targets
 
@@ -276,15 +322,15 @@ def test_dry_run_collection_preset_uses_caller_params():
 def test_dry_run_collection_preset_invalid_params_body_returns_422():
     """A body missing the required ``column`` field returns 422 — the same
     status the apply endpoint returns for the identical body."""
-    import dynastore.extensions.region_mapping.presets.region_mapping  # noqa: F401
+    _register_dummy_collection_preset()
 
     client = TestClient(_app())
     dry_run_resp = client.post(
-        "/configs/catalogs/cat-a/collections/col-1/presets/region_mapping/dry-run",
+        "/configs/catalogs/cat-a/collections/col-1/presets/test_dummy_collection_preset/dry-run",
         json={"alias": "iso_a3"},
     )
     apply_resp = client.post(
-        "/configs/catalogs/cat-a/collections/col-1/presets/region_mapping",
+        "/configs/catalogs/cat-a/collections/col-1/presets/test_dummy_collection_preset",
         json={"alias": "iso_a3"},
     )
     assert dry_run_resp.status_code == 422, dry_run_resp.text

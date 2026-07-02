@@ -1,0 +1,22 @@
+{
+  "regionWmsMap": {
+    {%- for m in mappings %}
+    {{ m.key | tojson }}: {
+      "layerName": "default",
+      "server": {{ m.server | tojson }},
+      "serverType": "MVT",
+      "serverSubdomains": [],
+      "serverMinZoom": 0,
+      "serverMaxNativeZoom": 12,
+      "serverMaxZoom": 28,
+      "regionProp": {{ m.region_prop | tojson }},
+      "uniqueIdProp": {{ m.region_prop | tojson }},
+      "aliases": {{ m.aliases | tojson }},
+      "digits": 255,
+      "description": {{ m.title | tojson }},
+      "regionIdsFile": {{ m.region_ids_file | tojson }},
+      "bbox": {{ m.bbox | tojson }}
+    }{% if not loop.last %},{% endif %}
+    {%- endfor %}
+  }
+}
