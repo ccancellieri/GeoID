@@ -193,6 +193,52 @@ class TasksPluginConfig(ExposableConfigMixin, PluginConfig):
         ),
     )
 
+    drain_spawn_interval_seconds: Mutable[float] = Field(
+        default=120.0,
+        ge=5.0,
+        le=3600.0,
+        description=(
+            "Interval (seconds) between leader-side RECOVERY ticks for the "
+            "event_drain / storage_drain outboxes (#2715). Every event/item "
+            "write already co-transactionally enqueues its own dedup'd drain "
+            "trigger on the same connection as the work row "
+            "(events_emit._enqueue_event_drain_trigger / "
+            "storage_emit._enqueue_drain_trigger) — this tick does NOT "
+            "replace that path. It exists because the trigger's dedup guard "
+            "blocks a fresh INSERT for as long as ANY non-terminal row "
+            "exists, including one that can no longer make progress (a "
+            "crash-looping task, or an ACTIVE row whose owner died); once "
+            "wedged, that single row silently blocks every subsequent "
+            "write's trigger with no other write arriving to retry it. Each "
+            "tick is a no-op unless the corresponding outbox actually has "
+            "undrained work (a cheap EXISTS probe), and even then only "
+            "unblocks a demonstrably WEDGED existing row — see "
+            "drain_recovery_wedge_grace_seconds. Read at startup; changing "
+            "requires a pod restart to take effect (same model as "
+            "retention_sweep_interval_seconds)."
+        ),
+    )
+
+    drain_recovery_wedge_grace_seconds: Mutable[float] = Field(
+        default=300.0,
+        ge=30.0,
+        le=3600.0,
+        description=(
+            "Grace window (seconds) the drain-spawner recovery tick (#2715) "
+            "grants an existing non-terminal event_drain/storage_drain row "
+            "before treating it as WEDGED and no longer letting it block a "
+            "fresh dedup'd INSERT. A PENDING row is wedged once it has sat "
+            "unclaimed longer than this window (no live dispatcher capable "
+            "of running it); an ACTIVE row is wedged once its own claim "
+            "lease (locked_until) has already expired, independent of this "
+            "value — the owning worker died mid-run. A live PENDING row "
+            "(within the window) or a live ACTIVE row (lease not yet "
+            "expired) still blocks, exactly as the hot co-transactional "
+            "write path always has. Read on every recovery tick via the "
+            "platform configs hot-reload path; no restart required."
+        ),
+    )
+
     async_writer_backlog_threshold: Mutable[int] = Field(
         default=2000,
         ge=0,

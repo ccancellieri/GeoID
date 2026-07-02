@@ -106,7 +106,9 @@ async def _enqueue_storage(
         )
 
 
-async def _enqueue_drain_trigger(conn: Any) -> None:
+async def _enqueue_drain_trigger(
+    conn: Any, *, wedge_grace_seconds: Optional[float] = None,
+) -> None:
     """Insert one global dedup'd ``storage_drain`` PENDING task on ``conn``.
 
     Co-transactional: the drain row commits if and only if the caller's work
@@ -119,12 +121,50 @@ async def _enqueue_drain_trigger(conn: Any) -> None:
     environments that only provision storage): emits a DEBUG log and
     returns without raising. The storage rows are still committed; the
     drain will run on its next scheduled tick even without this NOTIFY trigger.
+
+    ``wedge_grace_seconds`` (#2715): shared by both callers — the hot
+    co-transactional write path above (always ``None``) and the leader-side
+    recovery tick (``dynastore.modules.tasks.drain_spawner``, which passes a
+    configured float).
+
+    * ``None`` (default): unchanged behaviour. ANY existing non-terminal
+      (PENDING/ACTIVE/CREATED) ``storage_drain`` row blocks a fresh enqueue,
+      so heavy write traffic never piles up duplicate drains while one is
+      healthily in flight.
+    * A float: additionally tolerates a WEDGED existing row — a PENDING row
+      older than ``wedge_grace_seconds`` (no dispatcher ever claimed it) or
+      an ACTIVE row whose lease has already expired (``locked_until`` in the
+      past — the owning worker died mid-run and the general stuck-task
+      reaper has not yet caught up). Such a row can no longer make progress
+      on its own, so it must not permanently silence the drain trigger for
+      every future write/tick — this is the root cause behind #2715: a
+      single crash-looping ``storage_drain`` task blocked every subsequent
+      co-transactional enqueue via this exact guard. A LIVE PENDING row
+      (still within its claim grace window) or a live ACTIVE row (lease not
+      yet expired) still blocks, exactly as before — this only unblocks a
+      demonstrably wedged row, never a healthy in-flight drain.
     """
     from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
     from dynastore.modules.tasks.tasks_module import get_task_schema
 
     task_schema = get_task_schema()
     validate_sql_identifier(task_schema)
+
+    # When a grace window is supplied, a blocking row only counts as "live"
+    # (still blocking) if it is a PENDING row within its claim grace window
+    # or an ACTIVE row whose lease has not yet expired. Any other
+    # non-terminal status (e.g. CREATED) is conservatively left blocking.
+    wedge_tolerant_clause = (
+        ""
+        if wedge_grace_seconds is None
+        else (
+            " AND ("
+            "     (status = 'PENDING' AND timestamp > now() - make_interval(secs => :wedge_grace_seconds))"
+            "  OR (status = 'ACTIVE' AND locked_until > now())"
+            "  OR status NOT IN ('PENDING', 'ACTIVE')"
+            " )"
+        )
+    )
 
     # execution_mode uses the column-correct value 'ASYNCHRONOUS' (the column
     # DEFAULT and the value recognised by the dispatcher). The spec draft used
@@ -144,10 +184,15 @@ async def _enqueue_drain_trigger(conn: Any) -> None:
         # DISMISSED (terminal) drain task must NOT block a fresh enqueue —
         # otherwise the co-transactional NOTIFY trigger stays silenced until
         # manual cleanup. CREATED/PENDING/ACTIVE are non-terminal and DO block
-        # (one live drain suffices).
+        # (one live drain suffices) unless wedge_tolerant_clause narrows that
+        # further to demonstrably-live rows only.
         f"       AND status NOT IN ('COMPLETED', 'FAILED', 'DISMISSED', 'DEAD_LETTER')"
+        f"{wedge_tolerant_clause}"
         f" )"
     )
+    params: Dict[str, Any] = {"task_id": generate_uuidv7()}
+    if wedge_grace_seconds is not None:
+        params["wedge_grace_seconds"] = wedge_grace_seconds
     try:
         # Use a nested transaction (SAVEPOINT) so a missing-tasks-table error
         # does not abort the outer PG transaction carrying the storage rows.
@@ -165,7 +210,7 @@ async def _enqueue_drain_trigger(conn: Any) -> None:
             try:
                 async with begin_nested():
                     await DQLQuery(insert_sql, result_handler=ResultHandler.NONE).execute(
-                        conn, task_id=generate_uuidv7()
+                        conn, **params
                     )
             except Exception:  # noqa: BLE001
                 logger.debug(
@@ -180,7 +225,7 @@ async def _enqueue_drain_trigger(conn: Any) -> None:
             # production always uses SA AsyncConnection so this branch
             # is a defensive fallback only.
             await DQLQuery(insert_sql, result_handler=ResultHandler.NONE).execute(
-                conn, task_id=generate_uuidv7()
+                conn, **params
             )
     except Exception:  # noqa: BLE001
         # Last-resort catch: savepoint setup itself failed.

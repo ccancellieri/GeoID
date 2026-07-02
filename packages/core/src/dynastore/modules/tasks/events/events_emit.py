@@ -100,7 +100,9 @@ def _events_insert_query(task_schema: str) -> "DQLQuery":
     return query
 
 
-async def _enqueue_event_drain_trigger(conn: Any) -> None:
+async def _enqueue_event_drain_trigger(
+    conn: Any, *, wedge_grace_seconds: Optional[float] = None,
+) -> None:
     """Insert one global dedup'd ``event_drain`` PENDING task on ``conn``.
 
     Co-transactional: the drain row commits if and only if the caller's event
@@ -115,6 +117,19 @@ async def _enqueue_event_drain_trigger(conn: Any) -> None:
     transaction carrying the event row, and any failure is logged at DEBUG and
     swallowed.  The event row still commits; the drain runs on its next
     scheduled tick even without this NOTIFY.
+
+    ``wedge_grace_seconds`` (#2715): shared by both callers — the hot
+    co-transactional write path above (always ``None``) and the leader-side
+    recovery tick (``dynastore.modules.tasks.drain_spawner``, which passes a
+    configured float). Mirrors ``storage_emit._enqueue_drain_trigger``'s
+    parameter exactly:
+
+    * ``None`` (default): unchanged behaviour — ANY existing non-terminal
+      (PENDING/ACTIVE/CREATED) ``event_drain`` row blocks a fresh enqueue.
+    * A float: additionally tolerates a WEDGED existing row — a PENDING row
+      older than ``wedge_grace_seconds`` or an ACTIVE row whose lease
+      (``locked_until``) has already expired. A live row still blocks,
+      exactly as before.
     """
     from dynastore.modules.db_config.query_executor import (  # noqa: PLC0415
         DQLQuery,
@@ -134,6 +149,20 @@ async def _enqueue_event_drain_trigger(conn: Any) -> None:
     # a NULL here would crash dispatch before the drain ever runs.
     caller_id = current_caller_id()
 
+    # See storage_emit._enqueue_drain_trigger's docstring for the identical
+    # wedge-tolerance rationale.
+    wedge_tolerant_clause = (
+        ""
+        if wedge_grace_seconds is None
+        else (
+            " AND ("
+            "     (status = 'PENDING' AND timestamp > now() - make_interval(secs => :wedge_grace_seconds))"
+            "  OR (status = 'ACTIVE' AND locked_until > now())"
+            "  OR status NOT IN ('PENDING', 'ACTIVE')"
+            " )"
+        )
+    )
+
     insert_sql = (
         f"INSERT INTO {task_schema}.tasks"
         f" (task_id, catalog_id, scope, caller_id, task_type, type,"
@@ -149,15 +178,19 @@ async def _enqueue_event_drain_trigger(conn: Any) -> None:
         # drain task (incl. DISMISSED) must NOT block a fresh enqueue, or the
         # co-transactional NOTIFY stays silenced until manual cleanup.
         f"       AND status NOT IN ('COMPLETED', 'FAILED', 'DISMISSED', 'DEAD_LETTER')"
+        f"{wedge_tolerant_clause}"
         f" )"
     )
+    params: Dict[str, Any] = {"task_id": generate_uuidv7(), "caller_id": caller_id}
+    if wedge_grace_seconds is not None:
+        params["wedge_grace_seconds"] = wedge_grace_seconds
     try:
         begin_nested = getattr(conn, "begin_nested", None)
         if begin_nested is not None:
             try:
                 async with begin_nested():
                     await DQLQuery(insert_sql, result_handler=ResultHandler.NONE).execute(
-                        conn, task_id=generate_uuidv7(), caller_id=caller_id
+                        conn, **params
                     )
             except Exception:  # noqa: BLE001
                 logger.debug(
@@ -168,7 +201,7 @@ async def _enqueue_event_drain_trigger(conn: Any) -> None:
                 )
         else:
             await DQLQuery(insert_sql, result_handler=ResultHandler.NONE).execute(
-                conn, task_id=generate_uuidv7(), caller_id=caller_id
+                conn, **params
             )
     except Exception:  # noqa: BLE001
         logger.debug(

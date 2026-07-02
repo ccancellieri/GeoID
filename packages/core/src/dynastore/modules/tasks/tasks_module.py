@@ -693,6 +693,7 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                 sweep_interval = 60.0
                 sweep_min_age = 300.0
                 retention_sweep_interval = 86400.0
+                drain_spawn_interval = 120.0
                 config_mgr = get_protocol(PlatformConfigsProtocol)
                 if config_mgr:
                     try:
@@ -706,6 +707,7 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                             sweep_interval = tasks_config.proactive_sweep_interval_seconds
                             sweep_min_age = tasks_config.proactive_sweep_min_age_seconds
                             retention_sweep_interval = tasks_config.retention_sweep_interval_seconds
+                            drain_spawn_interval = tasks_config.drain_spawn_interval_seconds
                     except Exception as e:
                         logger.warning(f"TasksModule: Failed to load TasksPluginConfig, defaulting to {poll_interval}s / hard_cap={hard_cap}: {e}")
 
@@ -880,6 +882,7 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                 from dynastore.modules.tasks.registry.publisher import (
                     RegistryHeartbeatService,
                 )
+                from dynastore.modules.tasks.drain_spawner import DrainSpawnerService
                 from dynastore.modules.db_config.instance import (
                     get_service_name as _get_service_name,
                 )
@@ -904,6 +907,9 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                 )
                 supervisor.register(
                     TaskRetentionService(interval_s=retention_sweep_interval)
+                )
+                supervisor.register(
+                    DrainSpawnerService(interval_s=drain_spawn_interval)
                 )
                 # Async capability-sentinel refresh. Initial publish already ran
                 # synchronously above (before the supervisor starts) so
