@@ -138,6 +138,22 @@ class IamCatalogScopedOwner(BaseResourceOwner):
                         catalog_id, drop_exc,
                     )
 
+            # Every catalog-scoped grant that fed CatalogMembershipHandler
+            # (modules/iam/conditions.py) is now gone. get_membership_cached
+            # (extensions/iam/membership_cache.py) keys its 60s-TTL cache on
+            # iam_rule_version() — the platform "iam" binding-version counter
+            # — so without this bump a principal whose membership was cached
+            # before the delete keeps passing catalog_membership_required for
+            # up to the rest of that TTL window. Bump both counters, mirroring
+            # PostgresIamStorage._bump_binding_version /
+            # PostgresPolicyStorage._bump_binding_version — every other write
+            # to iam.policies / iam grants already does this; a catalog
+            # hard-delete removing those rows out from under the cache must
+            # too (#2674).
+            from dynastore.modules.iam.phantom_token import bump_binding_version
+            await bump_binding_version(catalog_id)
+            await bump_binding_version("iam")
+
             logger.info(
                 "IamCatalogScopedOwner: deleted iam.policies rows for partition_key=%r.",
                 catalog_id,

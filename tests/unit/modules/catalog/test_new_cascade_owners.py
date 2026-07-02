@@ -127,6 +127,50 @@ class TestIamCatalogScopedOwner:
             outcome = await owner.cleanup_one(ref, CleanupMode.HARD)
         assert outcome == CleanupOutcome.RETRY
 
+    @pytest.mark.asyncio
+    async def test_cleanup_one_hard_bumps_binding_version(self) -> None:
+        """#2674 review: a hard-delete's iam.policies cleanup must bump both
+        the catalog's own binding-version counter and the platform "iam"
+        counter, mirroring PostgresIamStorage._bump_binding_version /
+        PostgresPolicyStorage._bump_binding_version. Without this,
+        get_membership_cached keeps serving a since-revoked member's cached
+        ALLOW for up to its 60s TTL after the catalog is gone."""
+        owner = self._make_owner()
+        ref = CleanupRef(
+            kind="iam_policies", locator=_CATALOG_ID,
+            owner_id="iam.catalog_scoped",
+            metadata={"partition_key": _CATALOG_ID},
+        )
+
+        fake_conn = MagicMock()
+
+        class _FakeTxn:
+            async def __aenter__(self):
+                return fake_conn
+
+            async def __aexit__(self, *exc: Any) -> bool:
+                return False
+
+        fake_dql_cls = MagicMock()
+        fake_dql_cls.return_value.execute = AsyncMock(return_value=None)
+        bump_mock = AsyncMock()
+
+        with (
+            patch("dynastore.tools.protocol_helpers.get_engine", return_value=MagicMock()),
+            patch(
+                "dynastore.modules.db_config.query_executor.managed_transaction",
+                return_value=_FakeTxn(),
+            ),
+            patch("dynastore.modules.db_config.query_executor.DQLQuery", fake_dql_cls),
+            patch("dynastore.modules.iam.phantom_token.bump_binding_version", bump_mock),
+        ):
+            outcome = await owner.cleanup_one(ref, CleanupMode.HARD)
+
+        assert outcome == CleanupOutcome.DONE
+        bump_mock.assert_any_await(_CATALOG_ID)
+        bump_mock.assert_any_await("iam")
+        assert bump_mock.await_count == 2
+
     def test_register_owners_adds_to_registry(self) -> None:
         from dynastore.modules.iam.cascade_owner import register_owners, IamCatalogScopedOwner
         reg = CascadeCleanupRegistry()

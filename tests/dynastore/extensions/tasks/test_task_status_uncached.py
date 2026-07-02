@@ -27,6 +27,12 @@ whole cache TTL — leaving the status link the async hard-delete advertises via
 ``Location`` unable to ever observe ``COMPLETED``. The scoped route must
 therefore use the uncached helper, mirroring the OGC Processes job-status route,
 while still scoping the lookup to the catalog's tenant schema.
+
+Also covers #2674: once the catalog registry row has been fully purged by its
+own deprovision task, ``_resolve_catalog_schema`` can no longer resolve it at
+all (raises ``ValueError``). The helper must tolerate that and still serve the
+task's terminal payload instead of turning it into a 404 indistinguishable
+from "task never existed".
 """
 
 from __future__ import annotations
@@ -96,11 +102,94 @@ async def test_catalog_task_status_scopes_to_catalog_schema(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_catalog_task_status_hidden_catalog_is_404(monkeypatch):
+    """A task that DOES resolve and match the URL's catalog schema is still
+    a 404 when the caller may not see that catalog (listing-visibility deny).
+    Pins the branch that only runs _assert_catalog_visible while the schema
+    is resolvable — this must not regress into an unconditional skip."""
+    task_id = uuid.uuid4()
+    matching = _task(TaskStatusEnum.COMPLETED, "s_cat")
+    visible_calls = {"n": 0}
+
+    async def fake_schema(catalog_id, conn):
+        return "s_cat"
+
+    async def fake_uncached(conn, tid):
+        return matching  # belongs to s_cat — schema check passes
+
+    async def fake_visible(catalog_id):
+        visible_calls["n"] += 1
+        raise HTTPException(
+            status_code=404, detail=f"Catalog '{catalog_id}' not found."
+        )
+
+    monkeypatch.setattr(svc.tasks_module, "_resolve_catalog_schema", fake_schema)
+    monkeypatch.setattr(svc.tasks_module, "get_task_by_id_unscoped", fake_uncached)
+    monkeypatch.setattr(svc, "_assert_catalog_visible", fake_visible)
+
+    with pytest.raises(HTTPException) as ei:
+        await svc._get_task_scoped_uncached(task_id, "cat", MagicMock())
+    assert ei.value.status_code == 404
+    assert visible_calls["n"] == 1
+
+
+@pytest.mark.asyncio
 async def test_catalog_task_status_missing_task_is_404(monkeypatch):
     task_id = uuid.uuid4()
 
     async def fake_schema(catalog_id, conn):
         return "s_cat"
+
+    async def fake_uncached(conn, tid):
+        return None
+
+    monkeypatch.setattr(svc.tasks_module, "_resolve_catalog_schema", fake_schema)
+    monkeypatch.setattr(svc.tasks_module, "get_task_by_id_unscoped", fake_uncached)
+
+    with pytest.raises(HTTPException) as ei:
+        await svc._get_task_scoped_uncached(task_id, "cat", MagicMock())
+    assert ei.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_catalog_task_status_readable_after_catalog_hard_deleted(monkeypatch):
+    """#2674: once the catalog is fully torn down, schema resolution raises
+    ValueError — the terminal task status must still be served, not 404'd."""
+    task_id = uuid.uuid4()
+    finished = _task(TaskStatusEnum.COMPLETED, "s_cat")
+    visible_calls = {"n": 0}
+
+    async def fake_schema(catalog_id, conn):
+        raise ValueError(f"Catalog '{catalog_id}' not found.")
+
+    async def fake_uncached(conn, tid):
+        assert tid == task_id
+        return finished
+
+    async def fake_visible(catalog_id):  # must NOT be reached — nothing to check
+        visible_calls["n"] += 1
+
+    monkeypatch.setattr(svc.tasks_module, "_resolve_catalog_schema", fake_schema)
+    monkeypatch.setattr(svc.tasks_module, "get_task_by_id_unscoped", fake_uncached)
+    monkeypatch.setattr(svc, "_assert_catalog_visible", fake_visible)
+
+    task = await svc._get_task_scoped_uncached(task_id, "cat", MagicMock())
+
+    assert task.status == TaskStatusEnum.COMPLETED
+    assert visible_calls["n"] == 0, (
+        "listing-visibility has nothing to re-derive once the catalog is gone"
+    )
+
+
+@pytest.mark.asyncio
+async def test_catalog_task_status_unknown_task_after_catalog_deleted_still_404(
+    monkeypatch,
+):
+    """A genuinely-unknown task_id must still 404, even once the catalog is gone."""
+    task_id = uuid.uuid4()
+
+    async def fake_schema(catalog_id, conn):
+        raise ValueError(f"Catalog '{catalog_id}' not found.")
 
     async def fake_uncached(conn, tid):
         return None

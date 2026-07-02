@@ -124,8 +124,19 @@ async def _assert_collection_visible(catalog_id: str, collection_id: str) -> Non
 async def _get_task_scoped_uncached(
     task_id: uuid.UUID, catalog_id: str, conn: AsyncConnection
 ) -> Task:
-    """Resolve the catalog's tenant schema, then read the task UNCACHED and
-    verify it belongs to that schema.
+    """Resolve ``task_id`` FIRST, then cross-check it against ``catalog_id``.
+
+    Task-id-first is intentional (#2674): a hard-deleted catalog's registry
+    row is fully purged (a ``catalog.catalogs`` DELETE, not just a tombstone)
+    by the time its own ``catalog_provision`` deprovision task reaches a
+    terminal state (COMPLETED/FAILED). Resolving the catalog's tenant schema
+    BEFORE the task turned a legitimate terminal-status poll into an
+    unconditional 404, indistinguishable from "task never existed" —
+    genuinely unknown task ids still 404 below.
+
+    ``task_id`` is a globally-unique UUIDv7, so an unscoped read plus an
+    explicit schema check (when the catalog can still be resolved) is safe.
+    Mirrors the OGC Processes job-status route.
 
     Uncached on purpose. A task's terminal status is written by the
     BackgroundRunner that owns completion, which runs on whichever instance
@@ -134,19 +145,45 @@ async def _get_task_scoped_uncached(
     cross-instance flip, so the cached read pins the task at its creation-time
     status (e.g. ``ACTIVE``) for the whole cache TTL. The async hard-delete
     advertises this route via its ``Location``/monitor link, so a cached read
-    would leave callers unable to ever observe ``COMPLETED``. ``task_id`` is a
-    globally-unique UUIDv7, so an unscoped read plus an explicit schema check is
-    safe. Mirrors the OGC Processes job-status route.
+    would leave callers unable to ever observe ``COMPLETED``.
+
+    When the catalog can no longer be resolved at all — the deprovision task
+    has finished dropping the registry row — the schema cross-check and the
+    listing-visibility re-check below are both skipped: there is no
+    surviving id mapping left to derive either from. The task's terminal
+    payload is then served on the strength of the perimeter ``tasks_read`` +
+    ``catalog_membership_required`` IAM policy that already authorized this
+    request to reach the handler at all (see the PR description for the
+    tradeoff this accepts). ``IamCatalogScopedOwner.cleanup_one`` bumps the
+    IAM binding-version counter as part of the same deprovision cascade so a
+    revoked member's cached membership stops passing that perimeter check
+    promptly rather than riding out the full cache TTL, but a residual
+    window still exists between the cascade starting to remove catalog-scoped
+    grants and that bump landing — bounded by the cascade cleanup task's own
+    latency, not by the membership cache's TTL.
     """
-    schema = await tasks_module._resolve_catalog_schema(catalog_id, conn)
     task = await tasks_module.get_task_by_id_unscoped(conn, task_id)
-    if not task or task.catalog_id != schema:
+    if not task:
         raise HTTPException(
             status_code=404,
             detail=f"Task with ID '{task_id}' not found in catalog '{catalog_id}'.",
         )
+
     try:
-        task = await reconcile_task_liveness(conn, task, schema=schema)
+        schema: Optional[str] = await tasks_module._resolve_catalog_schema(catalog_id, conn)
+    except ValueError:
+        schema = None
+
+    if schema is not None:
+        if task.catalog_id != schema:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Task with ID '{task_id}' not found in catalog '{catalog_id}'.",
+            )
+        await _assert_catalog_visible(catalog_id)
+
+    try:
+        task = await reconcile_task_liveness(conn, task, schema=task.catalog_id or "")
     except Exception as e:  # noqa: BLE001 — best-effort; never turn a 200 into a 500
         logger.warning(
             "reconcile_task_liveness failed for task %s: %s — serving unreconciled status.",
@@ -575,8 +612,12 @@ class TasksService(ExtensionProtocol):
         conn: AsyncConnection = Depends(get_async_connection),
     ) -> Task:
         """Uncached read — see _get_task_scoped_uncached for rationale.
-        Requires tasks_read + catalog membership."""
-        await _assert_catalog_visible(catalog_id)
+
+        Requires tasks_read + catalog membership, enforced at the IAM
+        perimeter. The listing-visibility re-check (404 for hidden catalogs)
+        happens inside the helper, conditional on the catalog still being
+        resolvable — see _get_task_scoped_uncached for the post-hard-delete
+        tradeoff (#2674)."""
         return await _get_task_scoped_uncached(task_id, catalog_id, conn)
 
     # ------------------------------------------------------------------
