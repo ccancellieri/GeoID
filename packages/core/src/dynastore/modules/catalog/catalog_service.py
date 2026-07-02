@@ -1907,12 +1907,35 @@ class CatalogService(CatalogsProtocol):
             if conflict is not None:
                 raise CatalogRenameConflictError(new_external_id)
 
+            # Lifecycle: BEFORE -> UPDATE -> AFTER, same shape as
+            # update_catalog's CATALOG_UPDATE/AFTER_CATALOG_UPDATE bracket.
+            # A listener failure must not corrupt the rename — emit_event
+            # defaults to raise_on_error=False, so sync listener exceptions
+            # are logged and swallowed rather than propagated.
+            await emit_event(
+                CatalogEventType.BEFORE_CATALOG_UPDATE,
+                catalog_id=internal_id,
+                db_resource=conn,
+                operation="rename",
+                old_external_id=prev_external_id,
+                new_external_id=new_external_id,
+            )
+
             await DQLQuery(
                 "UPDATE catalog.catalogs "
                 "SET external_id = :new_external_id, updated_at = NOW() "
                 "WHERE id = :id AND deleted_at IS NULL;",
                 result_handler=ResultHandler.ROWCOUNT,
             ).execute(conn, new_external_id=new_external_id, id=internal_id)
+
+            await emit_event(
+                CatalogEventType.AFTER_CATALOG_UPDATE,
+                catalog_id=internal_id,
+                db_resource=conn,
+                operation="rename",
+                old_external_id=prev_external_id,
+                new_external_id=new_external_id,
+            )
 
         # Invalidate both prev and new external_id cache entries, and the model cache.
         _invalidate_catalog_external_id_cache(prev_external_id)

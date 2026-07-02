@@ -1687,6 +1687,16 @@ class CollectionService:
             if not exists:
                 return None
 
+            # Mirrors CatalogService.update_catalog's CATALOG_UPDATE emit
+            # placement (signals mutation intent before the write lands).
+            await emit_event(
+                CatalogEventType.COLLECTION_UPDATE,
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+                db_resource=conn,
+                operation="metadata_update",
+            )
+
             # Fan-out metadata writes via the collection-metadata router.
             from dynastore.modules.catalog.collection_router import (
                 upsert_collection_metadata as _route_upsert_metadata,
@@ -1698,6 +1708,16 @@ class CollectionService:
             await _route_upsert_metadata(
                 catalog_id, collection_id, metadata_payload,
                 db_resource=conn,
+            )
+
+            # Mirrors CatalogService.update_catalog's AFTER_CATALOG_UPDATE
+            # emit placement (fires once the write is persisted).
+            await emit_event(
+                CatalogEventType.AFTER_COLLECTION_UPDATE,
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+                db_resource=conn,
+                operation="metadata_update",
             )
 
             # Fetch the post-write state inside the TX so the caller's
@@ -1787,12 +1807,38 @@ class CollectionService:
             if conflict is not None:
                 raise CollectionRenameConflictError(catalog_internal_id, new_external_id)
 
+            # Lifecycle: BEFORE -> UPDATE -> AFTER, mirroring the
+            # BEFORE/AFTER_COLLECTION_HARD_DELETION bracket used by
+            # delete_collection. A listener failure must not corrupt the
+            # rename — emit_event defaults to raise_on_error=False, so sync
+            # listener exceptions are logged and swallowed rather than
+            # propagated.
+            await emit_event(
+                CatalogEventType.BEFORE_COLLECTION_UPDATE,
+                catalog_id=catalog_internal_id,
+                collection_id=collection_internal_id,
+                db_resource=conn,
+                operation="rename",
+                old_external_id=prev_external_id,
+                new_external_id=new_external_id,
+            )
+
             await DQLQuery(
                 f'UPDATE "{phys_schema}".collections '
                 "SET external_id = :new_external_id, updated_at = NOW() "
                 "WHERE id = :id AND deleted_at IS NULL;",
                 result_handler=ResultHandler.ROWCOUNT,
             ).execute(conn, new_external_id=new_external_id, id=collection_internal_id)
+
+            await emit_event(
+                CatalogEventType.AFTER_COLLECTION_UPDATE,
+                catalog_id=catalog_internal_id,
+                collection_id=collection_internal_id,
+                db_resource=conn,
+                operation="rename",
+                old_external_id=prev_external_id,
+                new_external_id=new_external_id,
+            )
 
         # Invalidate both prev and new external_id cache entries and the model cache.
         _invalidate_collection_external_id_cache(catalog_internal_id, prev_external_id)
