@@ -941,6 +941,8 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             OGC_RESERVED_QUERY_PARAMS,
             combine_cql_filters,
             maybe_dispatch_items_to_search_driver,
+            reject_unknown_filter_params,
+            resolve_queryable_property_names,
         )
         from dynastore.modules.storage.hints import Hint
 
@@ -949,6 +951,17 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             for key, value in request.query_params.items()
             if key not in OGC_RESERVED_QUERY_PARAMS and value != ""
         }
+        # Reject an unmapped filter name before it is folded into CQL and
+        # dispatched: the SEARCH-driver fast path below has no CQL-parser
+        # validation seam, so an unknown name would otherwise be silently
+        # dropped from the ES query while a count computed elsewhere
+        # disagreed with the (unfiltered) listing (#2682, same fix as the
+        # OGC Features ``/items`` endpoint).
+        if extra_filters:
+            valid_names = await resolve_queryable_property_names(
+                catalog_id, collection_id
+            )
+            reject_unknown_filter_params(extra_filters, valid_names)
         cql_filter = combine_cql_filters(filter, extra_filters)
 
         async with managed_transaction(engine) as conn:

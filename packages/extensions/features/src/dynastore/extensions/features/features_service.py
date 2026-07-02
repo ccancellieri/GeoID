@@ -368,51 +368,18 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
     ) -> set:
         """Return the set of valid property names for a collection.
 
-        Reuses :pymeth:`ItemsProtocol.get_collection_fields` (the same source
-        the Queryables endpoint consumes) so the ``properties`` query
-        parameter is validated against exactly the catalogue's published
-        queryable surface — no parallel validator. Each field's exposed name
-        is its ``alias`` (preferred) or ``name``.
-
-        Returns an empty set when the protocol is unavailable; the caller
-        treats that as "permissive" and skips validation rather than failing
-        every request when the introspection backend is offline.
+        Thin wrapper around the shared
+        :func:`dynastore.extensions.tools.query.resolve_queryable_property_names`
+        — the SSOT also used to validate the ad-hoc ``?{property}={value}``
+        filter shorthand below and the STAC items endpoint's equivalent
+        filter validation — kept as an instance method so existing callers
+        (and tests that patch it) are unaffected.
         """
-        items_svc = get_protocol(ItemsProtocol)
-        if items_svc is None:
-            return set()
-        try:
-            all_fields = await items_svc.get_collection_fields(
-                catalog_id, collection_id
-            )
-        except Exception:
-            return set()
-        names: set = set()
-        for fd in all_fields.values():
-            if not getattr(fd, "expose", True):
-                continue
-            final_name = getattr(fd, "alias", None) or getattr(fd, "name", None)
-            if not final_name or final_name in ("geoid", "geom"):
-                continue
-            names.add(final_name)
-
-        # Accept the same bounded canonical system/stats lanes the
-        # Queryables endpoint advertises (refs #2230, #2235's
-        # ``canonical_queryable_properties`` SSOT), so ``?properties=area``
-        # is not rejected as unknown just because this collection's own
-        # field definitions don't declare it. Mirrors the ``setdefault``
-        # merge in ``ogc_generator.create_queryables_response`` — a
-        # per-collection field of the same name still wins acceptance,
-        # this only widens the set. A collection whose driver never
-        # populates a given canonical field simply returns it absent (no
-        # error, no match) — per-collection stats gating is a separate,
-        # already-tracked remainder item.
-        from dynastore.modules.elasticsearch.mappings import (
-            canonical_queryable_properties,
+        from dynastore.extensions.tools.query import (
+            resolve_queryable_property_names,
         )
 
-        names |= canonical_queryable_properties().keys()
-        return names
+        return await resolve_queryable_property_names(catalog_id, collection_id)
 
     async def get_landing_page(
         self, request: Request, language: str = Depends(get_language)
@@ -945,35 +912,24 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
             # empty list, which the post-fetch projection honours.
             select_fields: Optional[List[str]] = None
             project_only_mandatory = False
+            requested_properties: List[str] = []
             if isinstance(properties, str):
-                requested = [p.strip() for p in properties.split(",") if p.strip()]
-                if properties == "" or not requested:
+                requested_properties = [
+                    p.strip() for p in properties.split(",") if p.strip()
+                ]
+                if properties == "" or not requested_properties:
                     project_only_mandatory = True
                     select_fields = []
                 else:
-                    valid = await self._resolve_property_names(
-                        catalog_id, collection_id
-                    )
-                    if valid:
-                        unknown = [p for p in requested if p not in valid]
-                        if unknown:
-                            raise HTTPException(
-                                status_code=400,
-                                detail=(
-                                    f"Unknown properties: {', '.join(sorted(unknown))}. "
-                                    f"Available: {', '.join(sorted(valid))}."
-                                ),
-                            )
-                    select_fields = requested
+                    select_fields = requested_properties
 
             # Single-field equality shorthand: any query parameter that is not a
             # reserved OGC parameter is treated as a `?{property}={value}` filter
-            # on the collection's attributes. The property name is validated
-            # against the collection's queryable fields downstream (unknown →
-            # 400) and the value is bound as a query parameter — never
-            # interpolated into SQL.
+            # on the collection's attributes. The value is bound as a query
+            # parameter — never interpolated into SQL.
             from dynastore.extensions.tools.query import (
                 OGC_RESERVED_QUERY_PARAMS,
+                reject_unknown_filter_params,
             )
 
             extra_filters = {
@@ -981,6 +937,28 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
                 for key, value in request.query_params.items()
                 if key not in OGC_RESERVED_QUERY_PARAMS and value != ""
             }
+
+            # Validate ``properties`` names and the ad-hoc ``?{property}=``
+            # filter names against the same queryable surface, resolved once
+            # and shared by both checks. An unknown filter name must 400
+            # here — before any driver dispatch — so ``numberMatched`` and
+            # the returned features always describe the same selection;
+            # resolving it downstream in the CQL/driver layer let the PG
+            # path 400 while a SEARCH driver silently dropped the unmapped
+            # predicate and served an unfiltered listing (#2682).
+            if requested_properties or extra_filters:
+                valid = await self._resolve_property_names(catalog_id, collection_id)
+                if valid and requested_properties:
+                    unknown = [p for p in requested_properties if p not in valid]
+                    if unknown:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"Unknown properties: {', '.join(sorted(unknown))}. "
+                                f"Available: {', '.join(sorted(valid))}."
+                            ),
+                        )
+                reject_unknown_filter_params(extra_filters, valid)
 
             # OGC Features /items prefers exact, full-precision geometry. The
             # routing hint EXACT_READ_HINTS passed to dispatch_or_stream_items

@@ -320,6 +320,78 @@ OGC_RESERVED_QUERY_PARAMS: frozenset = frozenset({
 })
 
 
+async def resolve_queryable_property_names(catalog_id: str, collection_id: str) -> set:
+    """Return the set of valid queryable property names for a collection.
+
+    Single source of truth for validating any request parameter that names a
+    collection attribute against exactly the surface the ``/queryables``
+    endpoint advertises — the collection's own field definitions (via
+    :pymeth:`ItemsProtocol.get_collection_fields`) merged with
+    ``canonical_queryable_properties()`` (the bounded canonical system/stats
+    lanes, refs #2230/#2235). Shared by the OGC Features ``properties=``
+    projection parameter and the OGC Features / STAC ad-hoc
+    ``?{property}={value}`` filter shorthand — no parallel validator.
+
+    Returns an empty set when the introspection protocol is unavailable; the
+    caller treats that as "permissive" and skips validation rather than
+    failing every request when the introspection backend is offline.
+    """
+    from dynastore.models.protocols import ItemsProtocol
+    from dynastore.tools.discovery import get_protocol
+
+    items_svc = get_protocol(ItemsProtocol)
+    if items_svc is None:
+        return set()
+    try:
+        all_fields = await items_svc.get_collection_fields(catalog_id, collection_id)
+    except Exception:
+        return set()
+    names: set = set()
+    for fd in all_fields.values():
+        if not getattr(fd, "expose", True):
+            continue
+        final_name = getattr(fd, "alias", None) or getattr(fd, "name", None)
+        if not final_name or final_name in ("geoid", "geom"):
+            continue
+        names.add(final_name)
+
+    from dynastore.modules.elasticsearch.mappings import canonical_queryable_properties
+
+    names |= canonical_queryable_properties().keys()
+    return names
+
+
+def reject_unknown_filter_params(extra_filters: Dict[str, str], valid_names: set) -> None:
+    """Reject ad-hoc ``?{property}={value}`` filter params outside ``valid_names``.
+
+    Skips validation when ``valid_names`` is empty (introspection unavailable
+    — see :func:`resolve_queryable_property_names`), the same permissive
+    fallback the ``properties=`` projection check uses. Otherwise raises
+    ``HTTPException`` (400) naming every offending parameter.
+
+    This must run before the shorthand is folded into a CQL filter and
+    dispatched to a driver: the PG driver's ``parse_cql_filter`` already 400s
+    on an unmapped property name, but the ES SEARCH driver silently dropped
+    the unmapped predicate and served the unfiltered listing while the count
+    path independently collapsed to zero — the count and the returned
+    features must always describe the same selection (#2682). Validating
+    here, once, ahead of dispatch keeps both paths consistent regardless of
+    which driver ends up serving the request.
+    """
+    if not valid_names or not extra_filters:
+        return
+    unknown = sorted(k for k in extra_filters if k not in valid_names)
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown filter parameter(s): {', '.join(unknown)}. Not a "
+                "queryable property of this collection — see '/queryables' "
+                "for the supported filter names."
+            ),
+        )
+
+
 def _cql_escape_literal(value: str) -> str:
     """Escape a value for embedding inside a single-quoted CQL2 string literal.
 
