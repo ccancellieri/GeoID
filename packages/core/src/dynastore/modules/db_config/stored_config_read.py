@@ -24,11 +24,17 @@ loading. See :func:`_validate_stored_config` for the rationale.
 """
 
 import logging
-from typing import Type
+import types
+import typing
+from typing import Any, Type, Union
+
+from pydantic import BaseModel
 
 from dynastore.models.plugin_config import PluginConfig
 
 logger = logging.getLogger(__name__)
+
+_UNION_ORIGINS = (Union, types.UnionType)
 
 
 def _validate_stored_config(cls: Type[PluginConfig], data: dict) -> PluginConfig:
@@ -44,15 +50,81 @@ def _validate_stored_config(cls: Type[PluginConfig], data: dict) -> PluginConfig
     were split into ``scale_out_/scale_in_cooldown_seconds``. On read we drop
     unknown keys with a warning so a schema evolution degrades gracefully.
     Shared by the platform, catalog, and collection tier read paths.
+
+    The tolerance recurses into nested sub-models: several config fields
+    (e.g. ``ItemsReadPolicy.feature_type``, ``ItemsWritePolicy.derive``)
+    embed ``BaseModel``s that independently set ``extra="forbid"``
+    (``dynastore.modules.storage.computed_fields``). Without descending into
+    them, drift inside a nested model still hard-fails even though the
+    top-level dict looks clean (#2640).
     """
-    known = set(cls.model_fields)
-    unknown = [k for k in data if k not in known]
-    if unknown:
-        logger.warning(
-            "Dropping %d legacy key(s) %s from stored %s config; a field was "
-            "renamed or removed since this row was written. PATCH the config to "
-            "rewrite it cleanly and silence this warning.",
-            len(unknown), sorted(unknown), cls.__name__,
-        )
-        data = {k: v for k, v in data.items() if k in known}
-    return cls.model_validate(data)
+    return cls.model_validate(_strip_extra_forbid(cls, data))
+
+
+def _strip_extra_forbid(cls: Type[BaseModel], data: dict, *, path: str = "") -> dict:
+    """Drop keys ``cls`` no longer declares from ``data`` (only when ``cls``
+    itself sets ``extra="forbid"``), then recurse into every declared field
+    to reach nested ``extra="forbid"`` sub-models regardless of ``cls``'s own
+    extra policy.
+    """
+    data = dict(data)
+    if cls.model_config.get("extra") == "forbid":
+        known = set(cls.model_fields)
+        unknown = [k for k in data if k not in known]
+        if unknown:
+            label = cls.__name__ if not path else f"{cls.__name__} (nested field {path!r})"
+            logger.warning(
+                "Dropping %d legacy key(s) %s from stored %s config; a field was "
+                "renamed or removed since this row was written. PATCH the config to "
+                "rewrite it cleanly and silence this warning.",
+                len(unknown), sorted(unknown), label,
+            )
+            data = {k: v for k, v in data.items() if k in known}
+
+    for name, field in cls.model_fields.items():
+        if name in data:
+            field_path = f"{path}.{name}" if path else name
+            data[name] = _strip_nested(field.annotation, data[name], path=field_path)
+    return data
+
+
+def _strip_nested(annotation: Any, value: Any, *, path: str) -> Any:
+    """Walk ``annotation`` alongside ``value`` and strip unknown keys out of
+    any nested ``BaseModel`` dict it finds (directly, through ``Optional``/
+    ``Union``, or through ``List``/``Dict`` containers).
+    """
+    if value is None:
+        return value
+
+    origin = typing.get_origin(annotation)
+
+    if origin in _UNION_ORIGINS:
+        for arg in typing.get_args(annotation):
+            if arg is type(None):
+                continue
+            return _strip_nested(arg, value, path=path)
+        return value
+
+    if origin is list and isinstance(value, list):
+        args = typing.get_args(annotation)
+        if not args:
+            return value
+        item_type = args[0]
+        return [
+            _strip_nested(item_type, item, path=f"{path}[{i}]")
+            for i, item in enumerate(value)
+        ]
+
+    if origin is dict and isinstance(value, dict):
+        args = typing.get_args(annotation)
+        if len(args) != 2:
+            return value
+        value_type = args[1]
+        return {
+            k: _strip_nested(value_type, v, path=f"{path}.{k}") for k, v in value.items()
+        }
+
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel) and isinstance(value, dict):
+        return _strip_extra_forbid(annotation, value, path=path)
+
+    return value
