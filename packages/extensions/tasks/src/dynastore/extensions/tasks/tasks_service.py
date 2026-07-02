@@ -122,9 +122,13 @@ async def _assert_collection_visible(catalog_id: str, collection_id: str) -> Non
 
 
 async def _get_task_scoped_uncached(
-    task_id: uuid.UUID, catalog_id: str, conn: AsyncConnection
+    task_id: uuid.UUID,
+    catalog_id: str,
+    conn: AsyncConnection,
+    collection_id: Optional[str] = None,
 ) -> Task:
-    """Resolve ``task_id`` FIRST, then cross-check it against ``catalog_id``.
+    """Resolve ``task_id`` FIRST, then cross-check it against ``catalog_id``
+    (and, when scoped, ``collection_id``).
 
     Task-id-first is intentional (#2674): a hard-deleted catalog's registry
     row is fully purged (a ``catalog.catalogs`` DELETE, not just a tombstone)
@@ -149,24 +153,41 @@ async def _get_task_scoped_uncached(
 
     When the catalog can no longer be resolved at all — the deprovision task
     has finished dropping the registry row — the schema cross-check and the
-    listing-visibility re-check below are both skipped: there is no
-    surviving id mapping left to derive either from. The task's terminal
-    payload is then served on the strength of the perimeter ``tasks_read`` +
-    ``catalog_membership_required`` IAM policy that already authorized this
-    request to reach the handler at all (see the PR description for the
-    tradeoff this accepts). ``IamCatalogScopedOwner.cleanup_one`` bumps the
-    IAM binding-version counter as part of the same deprovision cascade so a
-    revoked member's cached membership stops passing that perimeter check
-    promptly rather than riding out the full cache TTL, but a residual
-    window still exists between the cascade starting to remove catalog-scoped
-    grants and that bump landing — bounded by the cascade cleanup task's own
-    latency, not by the membership cache's TTL.
+    listing-visibility re-checks below (both catalog- and, when scoped,
+    collection-level) are all skipped: there is no surviving id mapping left
+    to derive any of them from. The task's terminal payload is then served on
+    the strength of the perimeter ``tasks_read`` + ``catalog_membership_required``
+    IAM policy that already authorized this request to reach the handler at
+    all (see the PR description for the tradeoff this accepts).
+    ``IamCatalogScopedOwner.cleanup_one`` bumps the IAM binding-version
+    counter as part of the same deprovision cascade so a revoked member's
+    cached membership stops passing that perimeter check promptly rather
+    than riding out the full cache TTL, but a residual window still exists
+    between the cascade starting to remove catalog-scoped grants and that
+    bump landing — bounded by the cascade cleanup task's own latency, not by
+    the membership cache's TTL.
+
+    The ``task.collection_id`` cross-check (#2685) is deliberately kept
+    OUTSIDE the schema-resolvable gate: it compares the task row's own
+    ``collection_id`` field against the URL's literal ``collection_id``, with
+    no catalog/schema resolution involved, so it stays correct even once the
+    catalog is torn down. Only the listing-visibility re-check (hidden
+    collection ⇒ 404) needs a resolvable catalog, same as the catalog one.
     """
     task = await tasks_module.get_task_by_id_unscoped(conn, task_id)
     if not task:
         raise HTTPException(
             status_code=404,
             detail=f"Task with ID '{task_id}' not found in catalog '{catalog_id}'.",
+        )
+
+    if collection_id is not None and task.collection_id and task.collection_id != collection_id:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Task '{task_id}' does not belong to "
+                f"collection '{collection_id}'."
+            ),
         )
 
     try:
@@ -181,6 +202,8 @@ async def _get_task_scoped_uncached(
                 detail=f"Task with ID '{task_id}' not found in catalog '{catalog_id}'.",
             )
         await _assert_catalog_visible(catalog_id)
+        if collection_id is not None:
+            await _assert_collection_visible(catalog_id, collection_id)
 
     try:
         task = await reconcile_task_liveness(conn, task, schema=task.catalog_id or "")
@@ -677,20 +700,17 @@ class TasksService(ExtensionProtocol):
         task_id: uuid.UUID,
         conn: AsyncConnection = Depends(get_async_connection),
     ) -> Task:
-        """Uncached, scoped to both catalog and collection.
-        Requires tasks_read + catalog membership."""
-        await _assert_catalog_visible(catalog_id)
-        await _assert_collection_visible(catalog_id, collection_id)
-        task = await _get_task_scoped_uncached(task_id, catalog_id, conn)
-        if task.collection_id and task.collection_id != collection_id:
-            raise HTTPException(
-                status_code=404,
-                detail=(
-                    f"Task '{task_id}' does not belong to "
-                    f"collection '{collection_id}'."
-                ),
-            )
-        return task
+        """Uncached read — see _get_task_scoped_uncached for rationale.
+
+        Requires tasks_read + catalog membership, enforced at the IAM
+        perimeter. The collection cross-check and the listing-visibility
+        re-checks (404 for hidden catalog/collection) happen inside the
+        helper, the latter conditional on the catalog still being
+        resolvable — see _get_task_scoped_uncached for the post-hard-delete
+        tradeoff (#2685, following #2674/#2683)."""
+        return await _get_task_scoped_uncached(
+            task_id, catalog_id, conn, collection_id=collection_id
+        )
 
     # ------------------------------------------------------------------
     # 7. POST /task — spawn system scope

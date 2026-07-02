@@ -33,6 +33,12 @@ own deprovision task, ``_resolve_catalog_schema`` can no longer resolve it at
 all (raises ``ValueError``). The helper must tolerate that and still serve the
 task's terminal payload instead of turning it into a 404 indistinguishable
 from "task never existed".
+
+Also covers #2685: the same helper, called with ``collection_id`` set (the
+collection-scoped route), must apply the same tolerance — the durable
+``task.collection_id`` cross-check still runs post-teardown, but the
+listing-visibility re-check for the collection is skipped once the catalog
+can no longer be resolved, mirroring the catalog-level behavior from #2674.
 """
 
 from __future__ import annotations
@@ -47,8 +53,13 @@ import dynastore.extensions.tasks.tasks_service as svc
 from dynastore.models.tasks import Task, TaskStatusEnum
 
 
-def _task(status: TaskStatusEnum, catalog_id: str) -> Task:
-    return Task(task_type="collection_hard_delete", status=status, catalog_id=catalog_id)
+def _task(status: TaskStatusEnum, catalog_id: str, collection_id: str | None = None) -> Task:
+    return Task(
+        task_type="collection_hard_delete",
+        status=status,
+        catalog_id=catalog_id,
+        collection_id=collection_id,
+    )
 
 
 @pytest.mark.asyncio
@@ -199,4 +210,130 @@ async def test_catalog_task_status_unknown_task_after_catalog_deleted_still_404(
 
     with pytest.raises(HTTPException) as ei:
         await svc._get_task_scoped_uncached(task_id, "cat", MagicMock())
+    assert ei.value.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Collection-scoped route (#2685) — same helper, collection_id set
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_collection_task_status_hidden_collection_is_404(monkeypatch):
+    """A task that resolves and matches both catalog and collection is still
+    a 404 when the caller may not see that collection (listing-visibility
+    deny). Pins the branch that only runs _assert_collection_visible while
+    the schema is resolvable — must not regress into an unconditional skip."""
+    task_id = uuid.uuid4()
+    matching = _task(TaskStatusEnum.COMPLETED, "s_cat", collection_id="coll")
+    visible_calls = {"n": 0}
+
+    async def fake_schema(catalog_id, conn):
+        return "s_cat"
+
+    async def fake_uncached(conn, tid):
+        return matching
+
+    async def fake_catalog_visible(catalog_id):
+        return None
+
+    async def fake_collection_visible(catalog_id, collection_id):
+        visible_calls["n"] += 1
+        raise HTTPException(
+            status_code=404,
+            detail=f"Collection '{collection_id}' not found in catalog '{catalog_id}'.",
+        )
+
+    monkeypatch.setattr(svc.tasks_module, "_resolve_catalog_schema", fake_schema)
+    monkeypatch.setattr(svc.tasks_module, "get_task_by_id_unscoped", fake_uncached)
+    monkeypatch.setattr(svc, "_assert_catalog_visible", fake_catalog_visible)
+    monkeypatch.setattr(svc, "_assert_collection_visible", fake_collection_visible)
+
+    with pytest.raises(HTTPException) as ei:
+        await svc._get_task_scoped_uncached(task_id, "cat", MagicMock(), collection_id="coll")
+    assert ei.value.status_code == 404
+    assert visible_calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_collection_task_status_wrong_collection_is_404(monkeypatch):
+    """A task whose durable collection_id differs from the URL's is a 404,
+    independent of catalog resolvability."""
+    task_id = uuid.uuid4()
+    other_collection = _task(TaskStatusEnum.COMPLETED, "s_cat", collection_id="other")
+
+    async def fake_schema(catalog_id, conn):
+        return "s_cat"
+
+    async def fake_uncached(conn, tid):
+        return other_collection
+
+    monkeypatch.setattr(svc.tasks_module, "_resolve_catalog_schema", fake_schema)
+    monkeypatch.setattr(svc.tasks_module, "get_task_by_id_unscoped", fake_uncached)
+
+    with pytest.raises(HTTPException) as ei:
+        await svc._get_task_scoped_uncached(task_id, "cat", MagicMock(), collection_id="coll")
+    assert ei.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_collection_task_status_readable_after_catalog_hard_deleted(monkeypatch):
+    """#2685: once the catalog is fully torn down, schema resolution raises
+    ValueError — the terminal task status for a matching collection must
+    still be served, not 404'd, and the listing-visibility re-checks must
+    not run since there's nothing left to re-derive them from."""
+    task_id = uuid.uuid4()
+    finished = _task(TaskStatusEnum.COMPLETED, "s_cat", collection_id="coll")
+    catalog_visible_calls = {"n": 0}
+    collection_visible_calls = {"n": 0}
+
+    async def fake_schema(catalog_id, conn):
+        raise ValueError(f"Catalog '{catalog_id}' not found.")
+
+    async def fake_uncached(conn, tid):
+        assert tid == task_id
+        return finished
+
+    async def fake_catalog_visible(catalog_id):
+        catalog_visible_calls["n"] += 1
+
+    async def fake_collection_visible(catalog_id, collection_id):
+        collection_visible_calls["n"] += 1
+
+    monkeypatch.setattr(svc.tasks_module, "_resolve_catalog_schema", fake_schema)
+    monkeypatch.setattr(svc.tasks_module, "get_task_by_id_unscoped", fake_uncached)
+    monkeypatch.setattr(svc, "_assert_catalog_visible", fake_catalog_visible)
+    monkeypatch.setattr(svc, "_assert_collection_visible", fake_collection_visible)
+
+    task = await svc._get_task_scoped_uncached(
+        task_id, "cat", MagicMock(), collection_id="coll"
+    )
+
+    assert task.status == TaskStatusEnum.COMPLETED
+    assert catalog_visible_calls["n"] == 0
+    assert collection_visible_calls["n"] == 0, (
+        "listing-visibility has nothing to re-derive once the catalog is gone"
+    )
+
+
+@pytest.mark.asyncio
+async def test_collection_task_status_wrong_collection_still_404_after_catalog_deleted(
+    monkeypatch,
+):
+    """The durable collection cross-check must still catch a mismatched
+    collection_id even after the catalog is torn down."""
+    task_id = uuid.uuid4()
+    other_collection = _task(TaskStatusEnum.COMPLETED, "s_cat", collection_id="other")
+
+    async def fake_schema(catalog_id, conn):
+        raise ValueError(f"Catalog '{catalog_id}' not found.")
+
+    async def fake_uncached(conn, tid):
+        return other_collection
+
+    monkeypatch.setattr(svc.tasks_module, "_resolve_catalog_schema", fake_schema)
+    monkeypatch.setattr(svc.tasks_module, "get_task_by_id_unscoped", fake_uncached)
+
+    with pytest.raises(HTTPException) as ei:
+        await svc._get_task_scoped_uncached(task_id, "cat", MagicMock(), collection_id="coll")
     assert ei.value.status_code == 404
