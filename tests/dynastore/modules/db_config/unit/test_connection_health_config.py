@@ -39,6 +39,7 @@ from dynastore.modules.db_config.connection_health_config import (
     resolve_leadership_config,
     resolve_slow_pool_acquire_threshold,
     resolve_max_concurrent_connection_retries,
+    resolve_pool_saturation_retry_after_seconds,
 )
 
 
@@ -89,6 +90,21 @@ class TestConfigClasses:
         assert ConnectionHealthConfig(max_concurrent_connection_retries=1).max_concurrent_connection_retries == 1
         assert ConnectionHealthConfig(max_concurrent_connection_retries=32).max_concurrent_connection_retries == 32
 
+    def test_pool_saturation_retry_after_seconds_default(self):
+        config = ConnectionHealthConfig()
+        assert config.pool_saturation_retry_after_seconds == 5
+
+    def test_pool_saturation_retry_after_seconds_bounds(self):
+        """ge=1 and le=300 are enforced by Pydantic."""
+        with pytest.raises(Exception):
+            ConnectionHealthConfig(pool_saturation_retry_after_seconds=0)
+        with pytest.raises(Exception):
+            ConnectionHealthConfig(pool_saturation_retry_after_seconds=301)
+
+    def test_pool_saturation_retry_after_seconds_valid_range(self):
+        assert ConnectionHealthConfig(pool_saturation_retry_after_seconds=1).pool_saturation_retry_after_seconds == 1
+        assert ConnectionHealthConfig(pool_saturation_retry_after_seconds=300).pool_saturation_retry_after_seconds == 300
+
 
 class TestResolveReadsSnapshot:
     """``resolve_*`` returns the validated class defaults out of the box."""
@@ -119,3 +135,15 @@ class TestResolveReadsSnapshot:
             assert resolve_max_concurrent_connection_retries() == 7
         finally:
             chc._max_concurrent_connection_retries = original
+
+    def test_pool_saturation_retry_after_seconds_default(self):
+        assert resolve_pool_saturation_retry_after_seconds() == 5
+
+    def test_pool_saturation_retry_after_seconds_reads_module_global(self):
+        import dynastore.modules.db_config.connection_health_config as chc
+        original = chc._pool_saturation_retry_after_seconds
+        try:
+            chc._pool_saturation_retry_after_seconds = 10
+            assert resolve_pool_saturation_retry_after_seconds() == 10
+        finally:
+            chc._pool_saturation_retry_after_seconds = original

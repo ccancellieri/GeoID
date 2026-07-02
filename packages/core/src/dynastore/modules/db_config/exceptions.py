@@ -97,6 +97,32 @@ class DatabaseConnectionError(DatabaseError):
     """Raised when the connection to the database cannot be established or is lost."""
     pass
 
+
+class PoolSaturationError(DatabaseError):
+    """Raised when the bounded pool-acquire wait elapses before a connection
+    frees up (#1894).
+
+    ``engine.connect()`` blocks for at most ``DBConfig.pool_acquire_timeout``
+    (default 30s) before SQLAlchemy raises a bare ``sqlalchemy.exc.TimeoutError``
+    on a saturated pool. Left unmapped, that exception falls through the HTTP
+    boundary's exception-handler registry as an opaque 500. This typed
+    wrapper carries a ``retry_after`` hint (seconds, read from the
+    hot-reloadable ``ConnectionHealthConfig.pool_saturation_retry_after_seconds``
+    at raise time) so ``extensions/tools/exception_handlers.py`` can map it to
+    a clean HTTP 503 + Retry-After instead — telling the client "the pool is
+    momentarily saturated, back off and retry" rather than "something broke."
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        original_exception: Exception | None = None,
+        retry_after: int = 5,
+    ) -> None:
+        super().__init__(message, original_exception=original_exception)
+        self.retry_after = retry_after
+
 # --- Specific PostgreSQL Errors based on pgcode ---
 
 class TableNotFoundError(DatabaseError):

@@ -265,6 +265,38 @@ class TableNotFoundExceptionHandler(ExceptionHandler):
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
 
 
+class PoolSaturationExceptionHandler(ExceptionHandler):
+    """Maps ``PoolSaturationError`` (DB pool-acquire timeout) to HTTP 503.
+
+    Raised by ``query_executor._acquire_async_engine_connection`` when the
+    bounded pool-acquire wait (``DBConfig.pool_acquire_timeout``, #1894)
+    elapses before a free connection becomes available. Without this
+    handler the exception falls through to the generic ``DatabaseErrorHandler``
+    below as an opaque 500. Instead this maps it to HTTP 503 + Retry-After —
+    "the pool is momentarily saturated, back off and retry" rather than
+    "something broke". Registered ahead of ``DatabaseErrorHandler`` so this
+    more specific mapping wins.
+    """
+
+    def can_handle(self, exception: Exception) -> bool:
+        from dynastore.modules.db_config.exceptions import PoolSaturationError
+
+        return isinstance(exception, PoolSaturationError)
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        from dynastore.modules.db_config.exceptions import PoolSaturationError
+
+        assert isinstance(exception, PoolSaturationError)
+        logger.warning("Database pool saturated: %s", exception)
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection pool saturated, try again shortly.",
+            headers={"Retry-After": str(exception.retry_after)},
+        )
+
+
 class DatabaseErrorHandler(ExceptionHandler):
     """Handles database errors with a sanitized HTTP response.
 
@@ -951,6 +983,7 @@ class ExceptionHandlerRegistry:
         self.register(GcpInternalErrorHandler())  # GcpInternalError → 500 with message preserved
         self.register(DatabaseInputExceptionHandler())  # Catch DB input errors (400)
         self.register(TableNotFoundExceptionHandler())  # 404 — missing PG hub table, not a server error
+        self.register(PoolSaturationExceptionHandler())  # 503 — bounded pool-acquire timeout (#1894)
         self.register(DatabaseErrorHandler())  # Surface original DB exception details for better debugging
         self.register(ValidationExceptionHandler())  # Generic - must be last
 

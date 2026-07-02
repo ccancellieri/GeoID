@@ -171,6 +171,13 @@ _max_background_db_concurrency: int = 2
 # the tile read path to fail fast instead of waiting 30 s on a saturated pool.
 _foreground_pool_acquire_timeout_s: float = 3.0
 
+# Fallback for the pool-saturation Retry-After hint (seconds). Mirrors the
+# default of ConnectionHealthConfig.pool_saturation_retry_after_seconds. Used
+# when a foreground DB pool-acquire hits the bounded pool_acquire_timeout
+# (#1894) and query_executor.PoolSaturationError needs a Retry-After value
+# but the live config service is unavailable.
+_pool_saturation_retry_after_seconds: int = 5
+
 
 def resolve_connection_retry_config() -> Tuple[int, float, float, float]:
     """Return the current ``(max_retries, base_delay, max_delay, jitter)``."""
@@ -274,6 +281,17 @@ def resolve_foreground_pool_acquire_timeout() -> float:
     directly.
     """
     return _foreground_pool_acquire_timeout_s
+
+
+def resolve_pool_saturation_retry_after_seconds() -> int:
+    """Return the fallback Retry-After hint (seconds) for a saturated DB pool.
+
+    Used as the fallback when the config service is unavailable. The live
+    path reads ``ConnectionHealthConfig.pool_saturation_retry_after_seconds``
+    from the central cached getter. Tests may replace
+    ``_pool_saturation_retry_after_seconds`` directly.
+    """
+    return _pool_saturation_retry_after_seconds
 
 
 # ---------------------------------------------------------------------------
@@ -426,5 +444,23 @@ class ConnectionHealthConfig(PluginConfig):
             "all other routes keep the full pool_acquire_timeout. "
             "Hot-reloadable — changes take effect immediately without a pod restart. "
             "Must be in [0.5, 15.0] seconds."
+        ),
+    )
+
+    pool_saturation_retry_after_seconds: Mutable[int] = Field(
+        default=5,
+        ge=1,
+        le=300,
+        description=(
+            "Retry-After hint (seconds) returned to a client whose request hit "
+            "a saturated DB connection pool -- the bounded pool_acquire_timeout "
+            "(30 s by default, DB_POOL_ACQUIRE_TIMEOUT) elapsed before a free "
+            "connection became available. Rather than let the raw pool-acquire "
+            "timeout bubble up as an opaque HTTP 500, "
+            "query_executor.PoolSaturationError carries this value and "
+            "extensions/tools/exception_handlers.py maps it to HTTP 503 + this "
+            "Retry-After header, telling the client to back off and retry "
+            "shortly (#1894). Hot-reloadable -- changes take effect immediately "
+            "without a pod restart. Must be in [1, 300]."
         ),
     )

@@ -36,6 +36,7 @@ from dynastore.modules.db_config.connection_health_config import (
     resolve_max_background_db_concurrency,
     resolve_max_concurrent_connection_retries,
     resolve_pool_hygiene_reacquire_attempts,
+    resolve_pool_saturation_retry_after_seconds,
     resolve_provisioning_retry_config,
     resolve_read_disconnect_retry_attempts,
     resolve_slow_pool_acquire_threshold,
@@ -59,6 +60,7 @@ from sqlalchemy.exc import (
     OperationalError,
     PendingRollbackError,
     InvalidRequestError,
+    TimeoutError as SAPoolTimeoutError,
 )
 from geoalchemy2.shape import to_shape
 from geoalchemy2.elements import WKBElement, WKTElement
@@ -85,6 +87,7 @@ from .exceptions import (
     QueryExecutionError,
     PGCODE_EXCEPTION_MAP,
     DatabaseConnectionError,
+    PoolSaturationError,
 )
 
 # InternalClientError carries asyncpg's "cannot switch to state N" — a wire
@@ -1641,6 +1644,32 @@ async def _read_live_fg_acquire_timeout() -> float:
     return resolve_foreground_pool_acquire_timeout()
 
 
+async def _read_live_pool_saturation_retry_after() -> int:
+    """Read ``ConnectionHealthConfig.pool_saturation_retry_after_seconds`` live.
+
+    Per-call read from the central cached config getter (#1894) so operators
+    can tune the Retry-After hint returned on a saturated DB pool without a
+    pod restart. Falls back to
+    :func:`resolve_pool_saturation_retry_after_seconds` when the config
+    service is unavailable.
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.db_config.connection_health_config import (
+            ConnectionHealthConfig,
+        )
+        from dynastore.tools.discovery import get_protocol
+
+        svc = get_protocol(PlatformConfigsProtocol)
+        if svc is not None:
+            cfg = await svc.get_config(ConnectionHealthConfig)
+            if isinstance(cfg, ConnectionHealthConfig):
+                return cfg.pool_saturation_retry_after_seconds
+    except Exception:
+        pass
+    return resolve_pool_saturation_retry_after_seconds()
+
+
 @asynccontextmanager
 async def background_managed_transaction(db_resource: Optional[DbResource]):
     """Like :func:`managed_transaction` but gated by the background semaphore.
@@ -1955,6 +1984,25 @@ async def _acquire_async_engine_connection(engine: AsyncEngine) -> AsyncConnecti
     t0 = time.monotonic()
     try:
         conn = await engine.connect()
+    except SAPoolTimeoutError as exc:
+        # The pool's bounded acquire wait (DBConfig.pool_acquire_timeout,
+        # #1894) elapsed with no free connection. Not in
+        # _TRANSIENT_CONNECT_EXCEPTIONS, so retry_on_transient_connect does
+        # not retry it — a saturated pool must fail fast, not wedge. Wrap in
+        # PoolSaturationError (carrying a live-config Retry-After hint) so
+        # the HTTP boundary maps it to a clean 503 instead of an opaque 500.
+        wait_s = time.monotonic() - t0
+        logger.warning(
+            "db_pool_acquire failed service=%s wait_seconds=%.4f saturated=true%s",
+            _SERVICE_NAME_FOR_METRICS, wait_s, _acquire_scope_suffix(),
+        )
+        retry_after = await _read_live_pool_saturation_retry_after()
+        raise PoolSaturationError(
+            f"Database connection pool saturated after waiting {wait_s:.1f}s "
+            "for a free connection.",
+            original_exception=exc,
+            retry_after=retry_after,
+        ) from exc
     except BaseException:
         wait_s = time.monotonic() - t0
         logger.info(
