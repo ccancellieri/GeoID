@@ -253,6 +253,50 @@ class TestDeferrableProvisioners:
         assert reg._provisioners["plain"].deferrable is False
 
 
+class TestReprovisionDefeatsDefer:
+    """KNOWN GAP (un-fao/GeoID#2678): ``defer`` is a request-time flag only —
+    a checklist built with ``defer=True`` simply excludes deferrable
+    provisioners rather than recording that they were intentionally held
+    back.  A later rebuild with the default ``defer=False`` (what a generic
+    ``catalog_provision`` reprovision run uses unless it is explicitly told
+    the catalog was deferred) folds the deferrable provisioners back in.
+
+    This characterises the *current* registry behaviour so a future fix
+    (persisting a terminal ``deferred`` checklist state) has a red test to
+    turn green.  It is a pre-existing platform gap, not something introduced
+    or fixed by any single preset's use of ``Hint.DEFER``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_deferred_checklist_has_no_trace_of_the_held_back_step(self):
+        reg = ProvisioningRegistry()
+        reg.register("catalog_core", _active, priority=0)
+        reg.register("gcp_bucket", _active, priority=100, deferrable=True)
+
+        deferred_checklist = await reg.build_checklist("cat", defer=True)
+
+        # Bucket-free intent has no persisted marker — the key is simply absent.
+        assert deferred_checklist == {"catalog_core": STEP_PENDING}
+        assert "gcp_bucket" not in deferred_checklist
+
+    @pytest.mark.asyncio
+    async def test_undeferred_rebuild_resurrects_the_held_back_provisioner(self):
+        reg = ProvisioningRegistry()
+        reg.register("catalog_core", _active, priority=0)
+        reg.register("gcp_bucket", _active, priority=100, deferrable=True)
+
+        await reg.build_checklist("cat", defer=True)  # simulates the deferred create
+
+        # A generic reprovision run (defer defaults False) has no way to know
+        # gcp_bucket was ever deferred — it comes right back.
+        rebuilt = await reg.active_provisioners("cat", defer=False)
+        keys = [p.key for group in rebuilt for p in group]
+        assert "gcp_bucket" in keys, (
+            "documents un-fao/GeoID#2678 — remove this assertion once "
+            "deferred state is persisted and reprovision honours it"
+        )
+
+
 class TestBackwardCompatRegister:
     """Two-argument register(key, is_active) keeps working unchanged."""
 

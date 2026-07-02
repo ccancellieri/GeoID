@@ -39,7 +39,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
-def _make_ctx(db: Any = None, principal: Any = None) -> Any:
+def _make_ctx(db: Any = None, principal: Any = None, catalogs: Any = None) -> Any:
     from dynastore.modules.storage.presets.preset import PresetContext
 
     return PresetContext(
@@ -52,7 +52,7 @@ def _make_ctx(db: Any = None, principal: Any = None) -> Any:
         libs=None,
         principal=principal,
         scope="catalog:test-cat",
-        catalogs=None,
+        catalogs=catalogs,
     )
 
 
@@ -200,6 +200,281 @@ async def test_preset_apply_raises_without_db() -> None:
         await STAC_HARVESTER_PRESET.apply(params, "catalog:test-cat", ctx)
 
 
+# ---------------------------------------------------------------------------
+# 1b. Preset apply() — bucket-free target_catalog creation (defer hint)
+# ---------------------------------------------------------------------------
+
+
+def _ready_model() -> MagicMock:
+    return MagicMock(provisioning_status="ready")
+
+
+def _provisioning_model() -> MagicMock:
+    return MagicMock(provisioning_status="provisioning")
+
+
+def _failed_model() -> MagicMock:
+    return MagicMock(provisioning_status="failed")
+
+
+@pytest.mark.asyncio
+async def test_preset_apply_creates_missing_target_catalog_bucket_free() -> None:
+    """When target_catalog does not exist yet, apply() creates it with
+    hints=frozenset({Hint.DEFER}) so no GCS bucket is provisioned for a
+    harvest-only catalog, then waits for it to reach 'ready' before
+    submitting the harvest job."""
+    from dynastore.extensions.stac.presets.stac_harvester import (
+        STAC_HARVESTER_PRESET,
+        StacHarvesterParams,
+    )
+    from dynastore.modules.storage.hints import Hint
+
+    catalogs = MagicMock()
+    # 1st call: existence check (absent). 2nd call: readiness poll (ready
+    # immediately — no need to actually sleep in this test).
+    catalogs.get_catalog_model = AsyncMock(side_effect=[None, _ready_model()])
+    catalogs.create_catalog = AsyncMock(return_value=MagicMock())
+
+    ctx = _make_ctx(catalogs=catalogs)
+    params = StacHarvesterParams(
+        url="https://example.test/stac", target_catalog="fresh-harvest-cat",
+    )
+
+    async def _fake_execute(process_id: str, exec_request: Any, **_kw: Any) -> MagicMock:
+        return MagicMock(jobID="job-defer")
+
+    with patch(
+        "dynastore.modules.processes.processes_module.execute_process",
+        _fake_execute,
+    ):
+        await STAC_HARVESTER_PRESET.apply(params, "catalog:test-cat", ctx)
+
+    assert catalogs.get_catalog_model.await_count == 2
+    for call in catalogs.get_catalog_model.await_args_list:
+        assert call.args == ("fresh-harvest-cat",)
+    catalogs.create_catalog.assert_awaited_once()
+    call = catalogs.create_catalog.await_args
+    assert call.args[0]["id"] == "fresh-harvest-cat"
+    assert call.kwargs["hints"] == frozenset({Hint.DEFER})
+
+
+@pytest.mark.asyncio
+async def test_preset_apply_leaves_existing_target_catalog_untouched() -> None:
+    """When target_catalog already exists (and is ready), apply() must not
+    call create_catalog — an already-provisioned catalog's storage state is
+    never changed by this preset."""
+    from dynastore.extensions.stac.presets.stac_harvester import (
+        STAC_HARVESTER_PRESET,
+        StacHarvesterParams,
+    )
+
+    catalogs = MagicMock()
+    catalogs.get_catalog_model = AsyncMock(return_value=_ready_model())  # already exists + ready
+    catalogs.create_catalog = AsyncMock()
+
+    ctx = _make_ctx(catalogs=catalogs)
+    params = StacHarvesterParams(
+        url="https://example.test/stac", target_catalog="existing-cat",
+    )
+
+    async def _fake_execute(process_id: str, exec_request: Any, **_kw: Any) -> MagicMock:
+        return MagicMock(jobID="job-existing")
+
+    with patch(
+        "dynastore.modules.processes.processes_module.execute_process",
+        _fake_execute,
+    ):
+        await STAC_HARVESTER_PRESET.apply(params, "catalog:test-cat", ctx)
+
+    catalogs.create_catalog.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_preset_apply_waits_for_catalog_ready_before_submitting_harvest() -> None:
+    """apply() must poll get_catalog_model until provisioning_status=='ready'
+    — and NOT submit the harvest job while the newly-created catalog's tenant
+    schema (catalog_core) is still an in-flight async task.  Regression guard
+    for the create/harvest race: a harvest that wins the race would otherwise
+    "succeed" silently with zero items."""
+    from dynastore.extensions.stac.presets.stac_harvester import (
+        STAC_HARVESTER_PRESET,
+        StacHarvesterParams,
+    )
+
+    execute_calls: list[str] = []
+
+    catalogs = MagicMock()
+    # absent -> still provisioning -> still provisioning -> ready.
+    catalogs.get_catalog_model = AsyncMock(
+        side_effect=[None, _provisioning_model(), _provisioning_model(), _ready_model()]
+    )
+    catalogs.create_catalog = AsyncMock(return_value=MagicMock())
+
+    ctx = _make_ctx(catalogs=catalogs)
+    params = StacHarvesterParams(
+        url="https://example.test/stac", target_catalog="slow-provision-cat",
+    )
+
+    async def _fake_execute(process_id: str, exec_request: Any, **_kw: Any) -> MagicMock:
+        execute_calls.append(process_id)
+        return MagicMock(jobID="job-waited")
+
+    import dynastore.extensions.stac.presets.stac_harvester as harvester_mod
+
+    with patch(
+        "dynastore.modules.processes.processes_module.execute_process",
+        _fake_execute,
+    ), patch.object(harvester_mod, "_CATALOG_READY_POLL_INTERVAL_S", 0.01):
+        await STAC_HARVESTER_PRESET.apply(params, "catalog:test-cat", ctx)
+
+    # 1 existence check + 3 readiness polls (provisioning, provisioning, ready).
+    assert catalogs.get_catalog_model.await_count == 4
+    assert execute_calls == ["stac_harvest"]  # only submitted once ready
+
+
+@pytest.mark.asyncio
+async def test_preset_apply_raises_loudly_on_readiness_timeout() -> None:
+    """apply() must raise RuntimeError (not silently proceed) when the target
+    catalog never reaches 'ready' within the poll budget — never submits the
+    harvest job against a catalog whose tenant schema may not exist."""
+    from dynastore.extensions.stac.presets.stac_harvester import (
+        STAC_HARVESTER_PRESET,
+        StacHarvesterParams,
+    )
+    import dynastore.extensions.stac.presets.stac_harvester as harvester_mod
+
+    execute_calls: list[str] = []
+
+    catalogs = MagicMock()
+    # Always absent-then-provisioning: existence check absent, then every
+    # readiness poll reports 'provisioning' forever.
+    catalogs.get_catalog_model = AsyncMock(
+        side_effect=[None] + [_provisioning_model() for _ in range(1000)]
+    )
+    catalogs.create_catalog = AsyncMock(return_value=MagicMock())
+
+    ctx = _make_ctx(catalogs=catalogs)
+    params = StacHarvesterParams(
+        url="https://example.test/stac", target_catalog="never-ready-cat",
+    )
+
+    async def _fake_execute(process_id: str, exec_request: Any, **_kw: Any) -> MagicMock:
+        execute_calls.append(process_id)
+        return MagicMock(jobID="should-not-happen")
+
+    # Force the timeout branch to trip on the very first poll iteration
+    # instead of a real 60s wait.
+    with patch.object(harvester_mod, "_CATALOG_READY_TIMEOUT_S", -1.0), patch(
+        "dynastore.modules.processes.processes_module.execute_process",
+        _fake_execute,
+    ):
+        with pytest.raises(RuntimeError, match="did not reach 'ready'"):
+            await STAC_HARVESTER_PRESET.apply(params, "catalog:test-cat", ctx)
+
+    assert execute_calls == []  # harvest must never be submitted
+
+
+@pytest.mark.asyncio
+async def test_preset_apply_raises_loudly_when_catalog_provisioning_failed() -> None:
+    """apply() must raise RuntimeError immediately (no need to wait out the
+    full timeout) when the target catalog's provisioning reaches 'failed'."""
+    from dynastore.extensions.stac.presets.stac_harvester import (
+        STAC_HARVESTER_PRESET,
+        StacHarvesterParams,
+    )
+
+    execute_calls: list[str] = []
+
+    catalogs = MagicMock()
+    catalogs.get_catalog_model = AsyncMock(side_effect=[None, _failed_model()])
+    catalogs.create_catalog = AsyncMock(return_value=MagicMock())
+
+    ctx = _make_ctx(catalogs=catalogs)
+    params = StacHarvesterParams(
+        url="https://example.test/stac", target_catalog="broken-cat",
+    )
+
+    async def _fake_execute(process_id: str, exec_request: Any, **_kw: Any) -> MagicMock:
+        execute_calls.append(process_id)
+        return MagicMock(jobID="should-not-happen")
+
+    with patch(
+        "dynastore.modules.processes.processes_module.execute_process",
+        _fake_execute,
+    ):
+        with pytest.raises(RuntimeError, match="provisioning failed"):
+            await STAC_HARVESTER_PRESET.apply(params, "catalog:test-cat", ctx)
+
+    assert execute_calls == []
+
+
+@pytest.mark.asyncio
+async def test_preset_apply_continues_against_winner_on_concurrent_create_conflict() -> None:
+    """When create_catalog raises UniqueViolationError (a peer apply won the
+    create race for the same target_catalog), apply() must catch it, re-poll
+    for readiness against the peer's catalog, and still submit the harvest
+    job — never abort an idempotent apply on a benign create race."""
+    from dynastore.extensions.stac.presets.stac_harvester import (
+        STAC_HARVESTER_PRESET,
+        StacHarvesterParams,
+    )
+    from dynastore.modules.db_config.exceptions import UniqueViolationError
+
+    execute_calls: list[str] = []
+
+    catalogs = MagicMock()
+    # Existence check: absent (race not yet visible to us). Readiness poll
+    # (after the conflict): the peer's catalog is already ready.
+    catalogs.get_catalog_model = AsyncMock(side_effect=[None, _ready_model()])
+    catalogs.create_catalog = AsyncMock(
+        side_effect=UniqueViolationError("Catalog 'raced-cat' already exists")
+    )
+
+    ctx = _make_ctx(catalogs=catalogs)
+    params = StacHarvesterParams(
+        url="https://example.test/stac", target_catalog="raced-cat",
+    )
+
+    async def _fake_execute(process_id: str, exec_request: Any, **_kw: Any) -> MagicMock:
+        execute_calls.append(process_id)
+        return MagicMock(jobID="job-raced")
+
+    with patch(
+        "dynastore.modules.processes.processes_module.execute_process",
+        _fake_execute,
+    ):
+        descriptor = await STAC_HARVESTER_PRESET.apply(params, "catalog:test-cat", ctx)
+
+    catalogs.create_catalog.assert_awaited_once()
+    assert execute_calls == ["stac_harvest"]
+    assert descriptor.payload["job_id"] == "job-raced"
+
+
+@pytest.mark.asyncio
+async def test_preset_apply_skips_catalog_ensure_when_catalogs_protocol_absent() -> None:
+    """When PresetContext.catalogs is None (e.g. a caller that never wired the
+    catalogs service), apply() must still submit the harvest job — the
+    bucket-free-create step is best-effort, not a hard dependency."""
+    from dynastore.extensions.stac.presets.stac_harvester import (
+        STAC_HARVESTER_PRESET,
+        StacHarvesterParams,
+    )
+
+    ctx = _make_ctx(catalogs=None)
+    params = StacHarvesterParams(url="https://example.test/stac")
+
+    async def _fake_execute(process_id: str, exec_request: Any, **_kw: Any) -> MagicMock:
+        return MagicMock(jobID="job-no-catalogs")
+
+    with patch(
+        "dynastore.modules.processes.processes_module.execute_process",
+        _fake_execute,
+    ):
+        descriptor = await STAC_HARVESTER_PRESET.apply(params, "catalog:test-cat", ctx)
+
+    assert descriptor.payload["job_id"] == "job-no-catalogs"
+
+
 def test_preset_params_rejects_non_http_url() -> None:
     """StacHarvesterParams must reject URLs that are not http(s)."""
     from dynastore.extensions.stac.presets.stac_harvester import StacHarvesterParams
@@ -244,7 +519,8 @@ def test_preset_registered_in_registry() -> None:
 
 
 def test_preset_dry_run_returns_trigger_task_entry() -> None:
-    """dry_run() returns a PresetPlan with a trigger_task entry for stac_harvest."""
+    """dry_run() returns a PresetPlan with a trigger_task entry for stac_harvest,
+    plus a create_catalog entry disclosing the bucket-free-create side effect."""
     import asyncio
     from dynastore.extensions.stac.presets.stac_harvester import (
         STAC_HARVESTER_PRESET,
@@ -259,12 +535,17 @@ def test_preset_dry_run_returns_trigger_task_entry() -> None:
     )
 
     assert plan.preset_name == "stac_harvester"
-    assert len(plan.entries) == 1
-    entry = plan.entries[0]
-    assert entry.kind == "trigger_task"
-    assert entry.target == "stac_harvest"
-    assert entry.detail["inputs"]["catalog_url"] == "https://example.test/stac"
-    assert entry.detail["inputs"]["target_catalog"] == "test-cat"
+    assert len(plan.entries) == 2
+
+    create_entry = next(e for e in plan.entries if e.kind == "create_catalog")
+    assert create_entry.target == "test-cat"
+    assert create_entry.detail["if_absent"] is True
+    assert create_entry.detail["hints"] == ["defer"]
+
+    task_entry = next(e for e in plan.entries if e.kind == "trigger_task")
+    assert task_entry.target == "stac_harvest"
+    assert task_entry.detail["inputs"]["catalog_url"] == "https://example.test/stac"
+    assert task_entry.detail["inputs"]["target_catalog"] == "test-cat"
 
 
 # ---------------------------------------------------------------------------
