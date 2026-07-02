@@ -362,6 +362,7 @@ class CatalogsProtocol(ItemCrudProtocol, ItemQueryProtocol, ItemIntrospectionPro
         ctx: Optional["DriverContext"] = None,
         q: Optional[str] = None,
         ids: Optional[Set[str]] = None,
+        include_unready: bool = False,
     ) -> List["Catalog"]:
         """
         Lists all catalogs.
@@ -369,6 +370,11 @@ class CatalogsProtocol(ItemCrudProtocol, ItemQueryProtocol, ItemIntrospectionPro
         ``ids`` — restrict results to these catalog ids; applied before
         pagination so that LIMIT/OFFSET are consistent with the filtered
         result set.  ``None`` means no restriction (all catalogs).
+
+        ``include_unready`` — when ``False`` (default) catalogs that have
+        never reached ``ready`` are excluded (#2676). Reserved for internal/
+        administrative callers; every public listing/search path leaves this
+        at the default.
         """
         ...
 

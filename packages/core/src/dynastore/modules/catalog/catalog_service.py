@@ -477,10 +477,31 @@ _CONTROL_PLANE_CATALOG_FIELDS: FrozenSet[str] = frozenset({
 # (which regenerates the internal id and retries up to 5 times on PK clash only).
 # A unique violation on external_id is a genuine user conflict and bubbles as
 # UniqueViolationError → HTTP 409.
+#
+# ``first_ready_at`` always starts NULL here (#2676) even though
+# ``provisioning_status`` is passed in as 'ready' — that value is a
+# placeholder ``create_catalog`` sets before the provisioning checklist is
+# built (see ``_create_catalog_async``); it is not yet known at INSERT time
+# whether the checklist will be empty (row truly stays 'ready') or non-empty
+# (an UPDATE right after flips it to 'provisioning'). Stamping here from the
+# placeholder would wrongly mark every catalog "ever ready" at birth,
+# including ones about to enter their first provisioning pass. The
+# empty-checklist ("born ready") case is stamped explicitly by
+# ``_create_catalog_async`` once the checklist outcome is known; every other
+# case is stamped later by the checklist finalizer (``mark_provisioning_step``).
 _create_catalog_strict_query = DQLQuery(
-    "INSERT INTO catalog.catalogs (id, external_id, provisioning_status) "
-    "VALUES (:id, :external_id, :provisioning_status);",
+    "INSERT INTO catalog.catalogs (id, external_id, provisioning_status, first_ready_at) "
+    "VALUES (:id, :external_id, :provisioning_status, NULL);",
     result_handler=ResultHandler.ROWCOUNT,
+)
+
+# #2676: stamps first_ready_at for a catalog whose checklist turned out
+# empty (no active provisioner) — it stays 'ready' from creation and never
+# passes through the checklist finalizer that stamps everyone else.
+_stamp_first_ready_at_query = DQLQuery(
+    "UPDATE catalog.catalogs "
+    "SET first_ready_at = COALESCE(first_ready_at, NOW()) WHERE id = :id;",
+    result_handler=ResultHandler.NONE,
 )
 
 # #1175: store the materialised provisioning checklist and flip the catalog to
@@ -512,8 +533,26 @@ _get_catalog_query = DQLQuery(
     result_handler=ResultHandler.ONE_DICT,
 )
 
+# ``first_ready_at IS NOT NULL`` (#2676) hides catalogs still on their first
+# provisioning pass — mirrors the collection-side ``lifecycle_status IS NULL``
+# gate (#2194/#2308), but keyed on a monotonic marker rather than the live
+# (re-enterable) ``provisioning_status``: a catalog that has gone ready once
+# stays listed through any later reprovision/deferred-backfill cycle. Used by
+# ``list_catalogs`` for every public listing/search caller.
 _list_catalogs_query = DQLQuery(
-    "SELECT * FROM catalog.catalogs WHERE deleted_at IS NULL ORDER BY id LIMIT :limit OFFSET :offset;",
+    "SELECT * FROM catalog.catalogs "
+    "WHERE deleted_at IS NULL AND first_ready_at IS NOT NULL "
+    "ORDER BY id LIMIT :limit OFFSET :offset;",
+    result_handler=ResultHandler.ALL_DICTS,
+)
+
+# Internal/administrative variant — bypasses the ever-ready gate so GC,
+# reconcile, and repair tooling still see catalogs mid-first-provisioning.
+# Selected only when ``list_catalogs(include_unready=True)``.
+_list_catalogs_query_include_unready = DQLQuery(
+    "SELECT * FROM catalog.catalogs "
+    "WHERE deleted_at IS NULL "
+    "ORDER BY id LIMIT :limit OFFSET :offset;",
     result_handler=ResultHandler.ALL_DICTS,
 )
 
@@ -1471,6 +1510,11 @@ class CatalogService(CatalogsProtocol):
                     type="task",
                 )
                 await create_task(conn, task_request, committed_internal_id)
+            else:
+                # Empty checklist (on-prem / no active provisioner): the row
+                # stays 'ready' from creation and never reaches the checklist
+                # finalizer — stamp first_ready_at here instead (#2676).
+                await _stamp_first_ready_at_query.execute(conn, id=catalog_model.id)
 
             _invalidate_catalog_model_cache(catalog_model.id)
             _invalidate_catalog_external_id_cache(external_id)
@@ -1559,6 +1603,11 @@ class CatalogService(CatalogsProtocol):
         # would otherwise re-attach (and serialize / leak) it — drop it here so
         # the model stays clean.
         data.pop("physical_schema", None)
+        # ``first_ready_at`` (#2676) is control-plane state consulted only by
+        # ``list_catalogs``'s SQL predicate — ``provisioning_status`` remains
+        # the public-facing progress field, same treatment as
+        # ``provisioning_checklist`` above.
+        data.pop("first_ready_at", None)
         return Catalog.model_validate(data)
 
     def _list_catalog_store_driver_types(self) -> List[type]:
@@ -2043,12 +2092,26 @@ class CatalogService(CatalogsProtocol):
         ctx: Optional["DriverContext"] = None,
         q: Optional[str] = None,
         ids: Optional[Set[str]] = None,
+        include_unready: bool = False,
     ) -> List[Catalog]:
         """List all catalogs.
 
         ``ids`` — restrict results to these catalog ids; applied before
         pagination so LIMIT/OFFSET reflect the filtered set.  ``None``
         means no restriction.
+
+        ``include_unready`` — when ``False`` (default), catalogs that have
+        never reached ``ready`` (``first_ready_at IS NULL``) are excluded
+        (#2676). This is a monotonic marker, not the live
+        ``provisioning_status``: a catalog that reset to ``provisioning``
+        for a reprovision or deferred-storage backfill (see
+        ``reset_checklist_for_reprovision``) keeps its ``first_ready_at``
+        and stays listed throughout. Pass ``True`` only for internal /
+        administrative callers (GC sweeps, disaster-recovery reconcile,
+        repair tooling) that must observe catalogs still on their first
+        provisioning pass — mirrors the collection-side
+        ``lifecycle_status IS NULL`` gate (#2194/#2308). A direct
+        ``get_catalog``/``get_catalog_model`` by id is never filtered.
 
         Listing visibility: when the request published a caller snapshot
         (``RequestVisibility``), the listing is transparently narrowed to
@@ -2073,6 +2136,11 @@ class CatalogService(CatalogsProtocol):
             if not ids:
                 return []
 
+        ready_clause = "" if include_unready else "AND first_ready_at IS NOT NULL "
+        ready_clause_aliased = (
+            "" if include_unready else "AND c.first_ready_at IS NOT NULL "
+        )
+
         db_resource = ctx.db_resource if ctx else None
         async with managed_transaction(get_catalog_engine(db_resource)) as conn:
             if not q:
@@ -2080,6 +2148,7 @@ class CatalogService(CatalogsProtocol):
                     sql = (
                         "SELECT * FROM catalog.catalogs "
                         "WHERE deleted_at IS NULL AND id = ANY(:ids) "
+                        f"{ready_clause}"
                         "ORDER BY id LIMIT :limit OFFSET :offset;"
                     )
                     query = DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS)
@@ -2087,7 +2156,12 @@ class CatalogService(CatalogsProtocol):
                         conn, limit=limit, offset=offset, ids=list(ids)
                     )
                 else:
-                    results = await _list_catalogs_query.execute(
+                    query = (
+                        _list_catalogs_query_include_unready
+                        if include_unready
+                        else _list_catalogs_query
+                    )
+                    results = await query.execute(
                         conn, limit=limit, offset=offset
                     )
             else:
@@ -2103,7 +2177,8 @@ class CatalogService(CatalogsProtocol):
                     "SELECT c.* FROM catalog.catalogs c "
                     "LEFT JOIN catalog.catalog_core m "
                     "  ON m.catalog_id = c.id "
-                    f"WHERE c.deleted_at IS NULL{ids_clause} AND ("
+                    f"WHERE c.deleted_at IS NULL{ids_clause} "
+                    f"{ready_clause_aliased}AND ("
                     "  c.id ILIKE :q "
                     "  OR m.title->>'en' ILIKE :q "
                     "  OR m.description->>'en' ILIKE :q"
@@ -2938,6 +3013,12 @@ class CatalogService(CatalogsProtocol):
         OUTSIDE the PG transaction so that slow non-PG I/O (e.g. ES
         refresh=wait_for) never holds a BEGIN open long enough to trigger
         idle_in_transaction_session_timeout (#1895).
+
+        A transition to ``'ready'`` also stamps ``first_ready_at`` the first
+        time it happens (#2676) — ``COALESCE`` makes the write a no-op on any
+        later transition, so a reprovision cycle that returns to 'ready' never
+        moves the marker. ``list_catalogs`` gates public listings on this
+        monotonic marker rather than the live (re-enterable) status.
         """
         db_resource = ctx.db_resource if ctx else None
         engine = get_catalog_engine(db_resource)
@@ -2945,7 +3026,12 @@ class CatalogService(CatalogsProtocol):
         # Phase 1 — short PG transaction: write the authoritative row and
         # return immediately.  The transaction is committed before any
         # non-PG fan-out driver is called.
-        sql = "UPDATE catalog.catalogs SET provisioning_status = :status WHERE id = :id RETURNING id;"
+        sql = (
+            "UPDATE catalog.catalogs SET provisioning_status = :status, "
+            "first_ready_at = CASE WHEN CAST(:status AS VARCHAR) = 'ready' "
+            "THEN COALESCE(first_ready_at, NOW()) ELSE first_ready_at END "
+            "WHERE id = :id RETURNING id;"
+        )
 
         async def _do_update(conn: Any) -> Any:
             return await DQLQuery(sql, result_handler=ResultHandler.ONE_DICT).execute(
@@ -3019,10 +3105,16 @@ class CatalogService(CatalogsProtocol):
             checklist[key] = step_status
             new_status = evaluate_checklist(checklist)
             if new_status is not None:
+                # #2676: a transition to 'ready' stamps first_ready_at the
+                # first time it happens; COALESCE makes a later reprovision
+                # cycle's 'ready' transition a no-op on the marker.
                 await DQLQuery(
                     "UPDATE catalog.catalogs "
                     "SET provisioning_checklist = CAST(:cl AS jsonb), "
-                    "provisioning_status = :st WHERE id = :id;",
+                    "provisioning_status = :st, "
+                    "first_ready_at = CASE WHEN CAST(:st AS VARCHAR) = 'ready' "
+                    "THEN COALESCE(first_ready_at, NOW()) ELSE first_ready_at END "
+                    "WHERE id = :id;",
                     result_handler=ResultHandler.NONE,
                 ).execute(conn, id=catalog_id, cl=json.dumps(checklist), st=new_status)
             else:
@@ -3114,10 +3206,15 @@ class CatalogService(CatalogsProtocol):
                 checklist[key] = terminal_status
             new_status = evaluate_checklist(checklist)
             if new_status is not None:
+                # #2676: same monotonic first_ready_at stamp as
+                # mark_provisioning_step's terminal write.
                 await DQLQuery(
                     "UPDATE catalog.catalogs "
                     "SET provisioning_checklist = CAST(:cl AS jsonb), "
-                    "provisioning_status = :st WHERE id = :id;",
+                    "provisioning_status = :st, "
+                    "first_ready_at = CASE WHEN CAST(:st AS VARCHAR) = 'ready' "
+                    "THEN COALESCE(first_ready_at, NOW()) ELSE first_ready_at END "
+                    "WHERE id = :id;",
                     result_handler=ResultHandler.NONE,
                 ).execute(conn, id=catalog_id, cl=json.dumps(checklist), st=new_status)
             else:

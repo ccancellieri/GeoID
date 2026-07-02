@@ -90,7 +90,12 @@ async def _iter_catalog_ids(
     offset = 0
     page = 100
     while True:
-        rows = await catalogs_svc.list_catalogs(limit=page, offset=offset)
+        # include_unready=True (#2676): this is a disaster-recovery drift
+        # sweep, not a public listing — it must see catalogs still on their
+        # first provisioning pass, not just ever-ready ones.
+        rows = await catalogs_svc.list_catalogs(
+            limit=page, offset=offset, include_unready=True,
+        )
         if not rows:
             break
         out.extend(c.id for c in rows)

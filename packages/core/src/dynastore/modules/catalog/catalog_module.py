@@ -190,6 +190,7 @@ CREATE TABLE IF NOT EXISTS catalog.catalogs (
     external_id VARCHAR NOT NULL,
     provisioning_status VARCHAR(50) NOT NULL DEFAULT 'ready',
     provisioning_checklist JSONB DEFAULT NULL,
+    first_ready_at TIMESTAMPTZ DEFAULT NULL,
     deleted_at TIMESTAMPTZ DEFAULT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -864,9 +865,11 @@ class CatalogModule(ModuleProtocol):
         ctx: Optional[DriverContext] = None,
         q: Optional[str] = None,
         ids: Optional[Set[str]] = None,
+        include_unready: bool = False,
     ) -> List[Catalog]:
         return await self._cs.list_catalogs(
-            limit=limit, offset=offset, lang=lang, ctx=ctx, q=q, ids=ids
+            limit=limit, offset=offset, lang=lang, ctx=ctx, q=q, ids=ids,
+            include_unready=include_unready,
         )
 
     async def search_catalogs(
