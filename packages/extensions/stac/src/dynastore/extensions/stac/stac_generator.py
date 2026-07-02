@@ -1536,11 +1536,26 @@ async def create_item_collection(
         params = {**preserved, "limit": limit, "offset": page_offset}
         return f"{self_href}?{urlencode(params)}"
 
-    collection_dict.setdefault("links", []).append(
+    collection_dict.setdefault("links", [])
+    collection_dict["links"].append(
         {
             "rel": "self",
             "href": _page_href(offset),
             "type": "application/geo+json",
+        }
+    )
+    collection_dict["links"].append(
+        {
+            "rel": "root",
+            "href": f"{get_root_url(request)}/stac",
+            "type": "application/json",
+        }
+    )
+    collection_dict["links"].append(
+        {
+            "rel": "collection",
+            "href": f"{get_root_url(request)}/stac/catalogs/{public_catalog_id}/collections/{public_collection_id}",
+            "type": "application/json",
         }
     )
 
@@ -1619,22 +1634,44 @@ async def create_search_results_collection(
     item_collection = pystac.ItemCollection(items=[item for item in stac_items if item])
     collection_dict = item_collection.to_dict()
 
-    # Per STAC spec, POST search responses should not have next/prev links
-    # but should provide context for the client to form the next request.
-    # The 'context' object is deprecated in STAC API 1.0.0 for ItemCollection
-    # in favor of numberMatched/numberReturned at the top level.
-    # We will add them here.
     collection_dict["numberMatched"] = total_count
     collection_dict["numberReturned"] = len(stac_items)
 
-    # Add a 'self' link to allow clients to repeat the search
-    # (Note: GET request with parameters would be more standard here)
+    # Add 'self'/'root' links, and — mirroring the OGC Features items response
+    # — a 'next' link while more results remain past this page, so a GET
+    # search response is paginable the same way collection items are.
     self_href = get_url(request)
-    collection_dict.setdefault("links", []).append(
+    links = collection_dict.setdefault("links", [])
+    links.append(
         pystac.Link(
             rel="self", target=self_href, media_type="application/geo+json"
         ).to_dict()
     )
+    links.append(
+        {
+            "rel": "root",
+            "href": f"{get_root_url(request)}/stac",
+            "type": "application/json",
+        }
+    )
+    if (offset + limit) < total_count:
+        from urllib.parse import urlencode
+
+        base_href = get_url(request, remove_qp=True)
+        preserved = {
+            k: v
+            for k, v in request.query_params.items()
+            if k not in ("limit", "offset")
+        }
+        next_params = {**preserved, "limit": limit, "offset": offset + limit}
+        links.append(
+            {
+                "rel": "next",
+                "href": f"{base_href}?{urlencode(next_params)}",
+                "type": "application/geo+json",
+                "title": "Next page",
+            }
+        )
 
     return collection_dict
 

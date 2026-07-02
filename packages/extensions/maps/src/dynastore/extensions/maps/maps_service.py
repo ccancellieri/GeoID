@@ -145,7 +145,18 @@ async def _get_style_to_render(conn: AsyncConnection, dataset: str, collection_i
     return None # No compatible stylesheet format found in the style record
 
 async def _validate_collections_helper(conn, dataset, requested_collections):
-    """Shared helper to check logical and physical existence of collections."""
+    """Shared helper to check logical and physical existence of collections.
+
+    ``collection_id`` is not guaranteed to be the physical table name — the
+    PostgreSQL driver config carries a separately-resolved ``physical_table``
+    (see ``CollectionService.resolve_physical_table``; every other physical
+    read/write path in the codebase resolves it explicitly instead of
+    assuming ``physical_table == collection_id``). Querying
+    ``information_schema.tables`` with the raw collection id verbatim, as
+    this helper used to, false-negatives on any collection whose physical
+    table name diverges from its id and 404s a render that the direct-by-id
+    read paths (items, tiles) serve correctly.
+    """
     catalogs_svc = get_protocol(CatalogsProtocol)
     if not catalogs_svc:
         return []
@@ -163,9 +174,12 @@ async def _validate_collections_helper(conn, dataset, requested_collections):
     physical_table_results = []
     for i, coll_id in enumerate(requested_collections):
         if collection_metadata_results[i]:
+            physical_table = await catalogs_svc.resolve_physical_table(
+                dataset, coll_id, db_resource=conn
+            )
             physical_table_results.append(
                 await shared_queries.table_exists_query.execute(
-                    conn, schema=dataset, table=coll_id
+                    conn, schema=dataset, table=physical_table or coll_id
                 )
             )
         else:

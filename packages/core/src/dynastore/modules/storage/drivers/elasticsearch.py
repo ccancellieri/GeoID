@@ -417,6 +417,41 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         """
         return collection_id
 
+    async def _resolve_internal_ids(
+        self, catalog_id: str, collection_id: Optional[str] = None
+    ) -> Tuple[str, Optional[str]]:
+        """Resolve external ``catalog_id``/``collection_id`` to their immutable
+        internal ids.
+
+        The write path stores INTERNAL ids in ``_source`` and the per-tenant
+        index name is ``{prefix}-items-{catalog_id}`` (:meth:`_items_index_name`)
+        — so a caller-supplied EXTERNAL id (the common case: STAC/OGC path
+        params) must be resolved before it is used to compute the index name
+        or a ``collection`` term filter, or the query silently targets the
+        wrong (non-existent) index / matches zero docs.
+        ``ItemsElasticsearchDriver.read_entities`` has always done this
+        resolution inline; ``count_entities`` / ``compute_extents`` /
+        ``aggregate`` share this helper so all four ops resolve identically.
+        Passthrough (unchanged input) when ``CatalogsProtocol`` is
+        unavailable or the id is already internal (``allow_missing=True``).
+        """
+        from dynastore.tools.discovery import get_protocol
+        from dynastore.models.protocols import CatalogsProtocol
+
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is None:
+            return catalog_id, collection_id
+        internal_cat = await catalogs.resolve_catalog_id(catalog_id, allow_missing=True)
+        if internal_cat is not None:
+            catalog_id = internal_cat
+        if collection_id is not None:
+            internal_col = await catalogs.collections.resolve_collection_id(
+                catalog_id, collection_id, allow_missing=True
+            )
+            if internal_col is not None:
+                collection_id = internal_col
+        return catalog_id, collection_id
+
     async def index_available(self, catalog_id: str) -> bool:
         """Whether this driver's backing items index exists for ``catalog_id``.
 
@@ -787,6 +822,14 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         es = get_client()
         if es is None:
             return 0
+        # Resolve external ids to internal before computing the index name /
+        # collection scope — mirrors read_entities, whose omission here left
+        # count_entities querying a differently-named (non-existent) index
+        # for an external catalog_id, silently returning 0 via
+        # ignore_unavailable while read_entities served real hits.
+        catalog_id, collection_id = await self._resolve_internal_ids(
+            catalog_id, collection_id
+        )
         # ``_query_request_to_es`` returns an enveloped ``{"query": ...}``;
         # ``es_count_items`` adds its own collection scope, so it wants the
         # inner query only (a double envelope is a malformed count body).
@@ -819,6 +862,9 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         es = get_client()
         if es is None:
             return None
+        catalog_id, collection_id = await self._resolve_internal_ids(
+            catalog_id, collection_id
+        )
         return await es_extents(
             es,
             self._items_index_name(catalog_id),
@@ -842,6 +888,9 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         es = get_client()
         if es is None:
             return None
+        catalog_id, collection_id = await self._resolve_internal_ids(
+            catalog_id, collection_id
+        )
         query = (
             self._query_request_to_es(request, self._envelope_fields)
             if request is not None

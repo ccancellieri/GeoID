@@ -74,24 +74,38 @@ async def get_features_for_rendering(
             4326,
         )
 
-    async def _resolve_collection_meta(collection: str) -> tuple[List[str], int]:
+    async def _resolve_collection_meta(collection: str) -> tuple[str, List[str], int]:
         drv = await get_driver(Operation.READ, schema, collection)
+        # ``collection_id`` is not guaranteed to be the physical table name —
+        # resolve it the same way every other physical read/write path does
+        # (see ``CatalogsProtocol.resolve_physical_table`` / GeoID #2325).
+        # Querying/rendering against the raw collection id verbatim
+        # false-negatives (or renders an empty/wrong table) whenever the
+        # physical table diverges from the collection id.
+        physical_table = collection
+        if hasattr(drv, "resolve_physical_table"):
+            resolved = await drv.resolve_physical_table(  # type: ignore[attr-defined]
+                schema, collection, db_resource=conn
+            )
+            physical_table = resolved or collection
         cols, cfg = await asyncio.gather(
-            shared_queries.get_table_column_names(conn, schema, collection),
+            shared_queries.get_table_column_names(conn, schema, physical_table),
             drv.get_driver_config(schema, collection),
         )
-        return cols, _resolve_source_srid(cfg)
+        return physical_table, cols, _resolve_source_srid(cfg)
 
     # Single-collection (the hot path) keeps its previous one-pass shape; the
     # multi-collection path resolves metadata for every arm in parallel and
     # asserts homogeneity before building the UNION.
     if len(collections) == 1:
-        table_columns, source_srid = await _resolve_collection_meta(collections[0])
+        physical_table, table_columns, source_srid = await _resolve_collection_meta(collections[0])
+        physical_tables = [physical_table]
     else:
         metas = await asyncio.gather(*(_resolve_collection_meta(c) for c in collections))
-        table_columns, source_srid = metas[0]
+        physical_tables = [m[0] for m in metas]
+        table_columns, source_srid = metas[0][1], metas[0][2]
         base_cols = set(table_columns)
-        for collection, (cols, srid) in zip(collections[1:], metas[1:]):
+        for collection, (_, cols, srid) in zip(collections[1:], metas[1:]):
             if set(cols) != base_cols:
                 raise ValueError(
                     f"Heterogeneous multi-collection map request: column sets differ "
@@ -131,19 +145,21 @@ async def get_features_for_rendering(
     # We add a CASE to prevent division by zero or a zero tolerance, which causes a PostGIS error.
     resolution_sql = f"GREATEST( (ST_XMax({source_envelope_sql}) - ST_XMin({source_envelope_sql})) / GREATEST(:img_width, 1), 1e-9 )"
 
-    union_queries = []   
-    for collection in collections:
+    union_queries = []
+    for collection, physical_table in zip(collections, physical_tables):
         # We simplify the geometry in PostGIS before sending it to Python.
         # This significantly boosts performance for large datasets.
+        # ``layer`` stays the (external-facing) collection id; the FROM
+        # clause uses the resolved physical table, which may diverge from it.
         union_queries.append(f"""
-            SELECT 
-                '{collection}' as layer, 
+            SELECT
+                '{collection}' as layer,
                 ST_AsBinary(
                     ST_SimplifyPreserveTopology(geom, {resolution_sql})
-                ) as geom, 
-                geoid, 
+                ) as geom,
+                geoid,
                 attributes
-            FROM "{schema}"."{collection}" 
+            FROM "{schema}"."{physical_table}"
             WHERE {spatial_filter} AND ({where_clause})
         """)
 

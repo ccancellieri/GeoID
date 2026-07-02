@@ -326,6 +326,112 @@ class TestDataSideOpsRouteThroughSeam:
         assert kwargs["routing"] is None
 
 
+class _FakeCollectionsSvc:
+    """Stub for ``CatalogsProtocol.collections`` — external → internal only."""
+
+    def __init__(self, collection_map):
+        self._map = collection_map
+
+    async def resolve_collection_id(self, catalog_id, collection_id, allow_missing=False):
+        return self._map.get(collection_id)
+
+
+class _FakeCatalogsProtocol:
+    """Stub ``CatalogsProtocol`` resolving a fixed external → internal id map,
+    mirroring the real ``resolve_catalog_id`` / ``collections.resolve_collection_id``
+    contract (``None`` on miss, passthrough left to the caller)."""
+
+    def __init__(self, catalog_map, collection_map):
+        self._catalog_map = catalog_map
+        self.collections = _FakeCollectionsSvc(collection_map)
+
+    async def resolve_catalog_id(self, catalog_id, allow_missing=False):
+        return self._catalog_map.get(catalog_id)
+
+
+class TestDataSideOpsResolveExternalIds:
+    """count_entities / compute_extents / aggregate must resolve an EXTERNAL
+    catalog_id/collection_id to internal before computing the index name —
+    exactly like read_entities already does (#2325) — so a count/extent
+    request targets the SAME index a sibling read_entities call would.
+    Before the fix these three ops used the raw (external) id verbatim,
+    silently hitting a differently-named index and returning an empty/zero
+    result while read_entities (correctly resolved) returned real hits.
+    """
+
+    @pytest.mark.asyncio
+    async def test_count_entities_resolves_external_catalog_and_collection_id(self):
+        fake_catalogs = _FakeCatalogsProtocol(
+            catalog_map={"gaulb": "c_internal123"},
+            collection_map={"gaul_level_1": "col_internal456"},
+        )
+        driver = ItemsElasticsearchDriver()
+        es = MagicMock()
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.tools.discovery.get_protocol", return_value=fake_catalogs,
+        ), patch(
+            "dynastore.modules.elasticsearch.items_es_ops.es_count_items",
+            new=AsyncMock(return_value=3103),
+        ) as mock_count:
+            result = await driver.count_entities("gaulb", "gaul_level_1")
+
+        assert result == 3103
+        args, kwargs = mock_count.call_args
+        # Second positional arg is the index name — must be built from the
+        # INTERNAL catalog id (matches what read_entities would target),
+        # not the raw external path-param id.
+        index_name = args[1]
+        assert "c_internal123" in index_name
+        assert "gaulb" not in index_name
+        assert kwargs["collection"] == "col_internal456"
+        assert kwargs["routing"] == "col_internal456"
+
+    @pytest.mark.asyncio
+    async def test_count_entities_passthrough_when_already_internal_or_unmapped(self):
+        """No CatalogsProtocol registered (or id unmapped) — behaves exactly
+        as before: the raw id is used verbatim (existing passthrough tests
+        above must keep passing unmodified)."""
+        driver = ItemsElasticsearchDriver()
+        es = MagicMock()
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.tools.discovery.get_protocol", return_value=None,
+        ), patch(
+            "dynastore.modules.elasticsearch.items_es_ops.es_count_items",
+            new=AsyncMock(return_value=7),
+        ) as mock_count:
+            await driver.count_entities("cat1", "col1")
+
+        args, kwargs = mock_count.call_args
+        assert args[1] == driver._items_index_name("cat1")
+        assert kwargs["collection"] == "col1"
+
+    @pytest.mark.asyncio
+    async def test_compute_extents_resolves_external_catalog_id(self):
+        fake_catalogs = _FakeCatalogsProtocol(
+            catalog_map={"gaulb": "c_internal123"},
+            collection_map={"gaul_level_1": "col_internal456"},
+        )
+        driver = ItemsElasticsearchDriver()
+        es = MagicMock()
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.tools.discovery.get_protocol", return_value=fake_catalogs,
+        ), patch(
+            "dynastore.modules.elasticsearch.items_es_ops.es_extents",
+            new=AsyncMock(return_value={"spatial": {"bbox": [[1, 2, 3, 4]]}}),
+        ) as mock_extents:
+            await driver.compute_extents("gaulb", "gaul_level_1")
+
+        args, kwargs = mock_extents.call_args
+        assert "c_internal123" in args[1]
+        assert kwargs["collection"] == "col_internal456"
+
+
 class TestQueryRequestToEs:
     def test_empty_request(self):
         from dynastore.models.query_builder import QueryRequest
