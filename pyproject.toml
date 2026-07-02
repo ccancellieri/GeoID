@@ -139,7 +139,7 @@ extension_template = ["dynastore[extension_base]", "attrs>=25.3.0", "aiohttp>=3.
 extension_processes = ["dynastore[extension_base]", "jsonschema", "dynastore-ext-processes"]
 extension_features = ["dynastore[extension_base,geospatial_core,geospatial_io]", "pygeofilter[backend-sqlalchemy]", "dynastore-ext-features"]
 extension_tiles = ["dynastore[extension_base,module_tiles]", "dynastore-ext-tiles"]
-extension_tiles_raster = ["dynastore[extension_tiles,module_styles]", "rio-tiler>=9.0", "rasterio>=1.4", "lxml>=4.9", "dynastore-ext-tiles"]
+extension_tiles_raster = ["dynastore[extension_tiles,module_styles]", "rio-tiler>=9.0", "rasterio>=1.4.3", "lxml>=4.9", "dynastore-ext-tiles"]
 extension_volumes = ["dynastore[extension_base,geospatial_core]", "shapely>=2.0", "pyproj>=3.0.0", "cjio>=0.10.1", "dynastore-ext-volumes"]
 extension_tasks = ["dynastore[extension_base,module_tasks]", "dynastore-ext-tasks"]
 extension_proxy = ["dynastore[extension_base,module_proxy]", "dynastore-ext-proxy"]

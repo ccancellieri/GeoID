@@ -18,7 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 raster = [
     "rio-tiler>=9.0",
-    "rasterio>=1.4",
+    "rasterio>=1.4.3",
     "lxml>=4.9",
 ]
 
