@@ -262,18 +262,39 @@ class TasksPluginConfig(ExposableConfigMixin, PluginConfig):
         ge=1,
         le=10_000,
         description=(
-            "Rows storage_drain claims (and hydrates) per drain cycle. "
-            "Id-only obligations (#2494 P1) are re-read from canonical PG "
-            "state and built into full documents for the WHOLE claimed "
-            "batch before the bulk dispatch, so peak memory scales with "
-            "batch_size x document size — 1500 multi-MB geometries "
-            "OOM-killed both the serving workers and the 2Gi async_writer "
-            "job (#2723). The default of 100 bounds the hydration spike for "
-            "MB-scale features while keeping small-feature throughput "
-            "reasonable (the drain loops until the outbox is empty either "
-            "way). Read once per drain run via the platform configs "
-            "hot-reload path; no restart required. Byte-aware capping "
-            "remains open under #2723."
+            "Rows storage_drain claims per drain cycle (and the outer bound "
+            "on canonical re-read grouping for id-only obligations, #2494 "
+            "P1). Row count alone says nothing about payload weight — see "
+            "storage_drain_hydration_byte_budget for the mechanism that "
+            "actually bounds hydration memory (#2723). Read once per drain "
+            "run via the platform configs hot-reload path; no restart "
+            "required."
+        ),
+    )
+
+    storage_drain_hydration_byte_budget: Mutable[int] = Field(
+        default=16 * 1024 * 1024,  # 16 MiB
+        ge=65_536,  # 64 KiB floor — a smaller budget thrashes on a single doc
+        description=(
+            "Byte budget (#2723) bounding how much HYDRATED payload "
+            "storage_drain accumulates before dispatching an index_bulk "
+            "call and applying outcomes. storage_drain_batch_size (#2726) "
+            "bounds ROW COUNT claimed per cycle, but row count says nothing "
+            "about payload weight: id-only obligations (#2494 P1) re-read "
+            "canonical PG state and rebuild a full document per row, and "
+            "MB-scale geometries (e.g. GAUL polygons) could still OOM a "
+            "2Gi container well before storage_drain_batch_size rows "
+            "accumulated. Hydration now streams: each built document's "
+            "JSON-encoded size is estimated as it is produced and added to "
+            "a running total for the pending (not yet dispatched) "
+            "sub-chunk; as soon as that total reaches this budget, the "
+            "sub-chunk is sent to index_bulk and its outcomes applied "
+            "immediately, before any further row in the same claimed batch "
+            "is hydrated. Peak resident hydrated payload is bounded by this "
+            "value (plus one in-flight canonical-re-read chunk), not by "
+            "storage_drain_batch_size x average document size. Read once "
+            "per drain run via the platform configs hot-reload path; no "
+            "restart required."
         ),
     )
 

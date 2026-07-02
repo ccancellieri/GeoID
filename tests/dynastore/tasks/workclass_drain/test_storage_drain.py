@@ -1215,6 +1215,156 @@ async def test_empty_payload_without_marker_does_not_trigger_reread(
 
 
 # ---------------------------------------------------------------------------
+# 8b. Byte-budgeted hydration sub-chunking (#2723)
+#
+# Bounds peak hydrated-payload memory independent of storage_drain_batch_size
+# (row count only, #2726): as documents are built they are dispatched to
+# index_bulk in sub-chunks capped by TasksPluginConfig
+# .storage_drain_hydration_byte_budget, instead of the whole claimed batch
+# being materialized before a single _bulk call.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_hydration_byte_budget_splits_dispatch_into_multiple_sub_chunks(
+    drain_env, monkeypatch,
+):
+    """A byte budget smaller than the claimed batch's total hydrated size
+    splits dispatch into multiple index_bulk calls — hydration must never
+    materialize the whole batch before the first _bulk call leaves."""
+    from dynastore.models.protocols.indexing import BulkIndexResult
+    from dynastore.tasks.workclass_drain.storage_drain_task import (
+        StorageDrainTask, _estimate_doc_bytes,
+    )
+
+    task_schema, engine = drain_env
+    n = 5
+    entity_ids = [f"geoid-hb{i}" for i in range(n)]
+    for eid in entity_ids:
+        await _seed_id_only_row(engine, task_schema, entity_id=eid)
+
+    heavy = "x" * 1024  # ~1 KiB per hydrated document
+
+    async def _fake_read(*, engine, catalog_id, collection_id, geoids):
+        return {g: _StubCanonicalInput(g) for g in geoids}
+
+    async def _fake_build(*, catalog_id, collection_id, ci):
+        return {"id": ci.row["geoid"], "blob": heavy}
+
+    one_doc_bytes = _estimate_doc_bytes({"id": "geoid-hb0", "blob": heavy})
+    # Just above one document's size: the 1st doc in a sub-chunk never
+    # crosses the budget alone, the 2nd always does — forces pairs.
+    budget = one_doc_bytes + 50
+
+    task = StorageDrainTask(batch_size=10, lease_seconds=300, hydration_byte_budget=budget)
+    monkeypatch.setattr(task, "_read_canonical_inputs", _fake_read)
+    monkeypatch.setattr(task, "_build_canonical_doc", _fake_build)
+
+    fake = _FakeBulkIndexer(
+        lambda ops: BulkIndexResult(passed=[op.op_id for op in ops], transient=[], poison=[])
+    )
+
+    async def _resolve(driver_id: str) -> Any:
+        return fake
+
+    monkeypatch.setattr(task, "_resolve_indexer", _resolve)
+
+    owner_id = f"owner:{uuid4()}"
+    count = await task.drain_once(engine=engine, owner_id=owner_id)
+    assert count == n
+
+    # Never one shot: the whole batch must never reach the indexer as a
+    # single call (that is the exact #2723 OOM shape).
+    assert len(fake.calls) > 1, "hydration must be sub-chunked, not one shot"
+    assert not any(len(call) == n for call in fake.calls)
+    assert sum(len(call) for call in fake.calls) == n
+
+    # Peak materialized per call stays bounded: a chunk's accumulated bytes
+    # never exceed budget by more than one document's worth (the doc whose
+    # append triggered the flush).
+    for call in fake.calls:
+        total = sum(_estimate_doc_bytes(op.payload) for op in call)
+        assert total <= budget + one_doc_bytes, (
+            f"sub-chunk of {len(call)} row(s) totalled {total} bytes, "
+            f"budget={budget}"
+        )
+
+    rows = await _fetch_rows(engine, task_schema)
+    assert {r["status"] for r in rows} == {"done"}
+
+
+@pytest.mark.asyncio
+async def test_hydration_sub_chunk_failure_isolates_retry_to_that_chunk(
+    drain_env, monkeypatch,
+):
+    """A sub-chunk that fails ``index_bulk`` retries only ITS rows — rows in
+    an earlier, already-flushed sub-chunk keep their 'done' outcome (no
+    double-indexing) and no claimed row is silently skipped (#2723
+    crash/partial-failure safety)."""
+    from dynastore.models.protocols.indexing import BulkIndexResult
+    from dynastore.tasks.workclass_drain.storage_drain_task import (
+        StorageDrainTask, _estimate_doc_bytes,
+    )
+
+    task_schema, engine = drain_env
+    n = 4
+    entity_ids = [f"geoid-fc{i}" for i in range(n)]
+    for eid in entity_ids:
+        await _seed_id_only_row(engine, task_schema, entity_id=eid)
+
+    heavy = "x" * 1024
+
+    async def _fake_read(*, engine, catalog_id, collection_id, geoids):
+        return {g: _StubCanonicalInput(g) for g in geoids}
+
+    async def _fake_build(*, catalog_id, collection_id, ci):
+        return {"id": ci.row["geoid"], "blob": heavy}
+
+    one_doc_bytes = _estimate_doc_bytes({"id": "geoid-fc0", "blob": heavy})
+    budget = one_doc_bytes + 50  # forces pairs, same shape as the test above
+
+    task = StorageDrainTask(batch_size=10, lease_seconds=300, hydration_byte_budget=budget)
+    monkeypatch.setattr(task, "_read_canonical_inputs", _fake_read)
+    monkeypatch.setattr(task, "_build_canonical_doc", _fake_build)
+
+    class _FailSecondCallIndexer:
+        def __init__(self) -> None:
+            self.calls: List[Any] = []
+
+        async def index_bulk(self, ops: Any) -> Any:
+            ops_list = list(ops)
+            self.calls.append(ops_list)
+            if len(self.calls) == 2:
+                raise RuntimeError("simulated ES outage")
+            return BulkIndexResult(
+                passed=[op.op_id for op in ops_list], transient=[], poison=[],
+            )
+
+    fake = _FailSecondCallIndexer()
+
+    async def _resolve(driver_id: str) -> Any:
+        return fake
+
+    monkeypatch.setattr(task, "_resolve_indexer", _resolve)
+
+    owner_id = f"owner:{uuid4()}"
+    count = await task.drain_once(engine=engine, owner_id=owner_id)
+    assert count == n
+    assert len(fake.calls) >= 2, "budget must split this batch into >=2 sub-chunks"
+
+    rows = await _fetch_rows(engine, task_schema)
+    done = [r for r in rows if r["status"] == "done"]
+    retried = [r for r in rows if r["status"] == "ready"]
+
+    # Every claimed row lands in exactly one bucket — none skipped, none
+    # double-counted between done and retried.
+    assert len(done) + len(retried) == n
+    assert len(retried) == len(fake.calls[1]), "only the failing sub-chunk's rows retry"
+    for r in retried:
+        assert r["attempts"] == 1
+
+
+# ---------------------------------------------------------------------------
 # 9. Split completion metrics (#2731)
 #
 # Pure-unit — no PG required. Mirrors the create_async_engine stubbing
@@ -1238,7 +1388,7 @@ async def test_run_reports_split_completion_metrics():
 
     calls = {"n": 0}
 
-    async def _fake_drain_once(*, engine, owner_id, batch_size=None):
+    async def _fake_drain_once(*, engine, owner_id, batch_size=None, hydration_byte_budget=None):
         calls["n"] += 1
         if calls["n"] == 1:
             # Simulate one claimed batch: 3 indexed, 2 auto_done, 1 retried.
@@ -1273,7 +1423,7 @@ async def test_run_resets_split_metrics_between_runs():
 
     first_calls = {"n": 0}
 
-    async def _first_drain_once(*, engine, owner_id, batch_size=None):
+    async def _first_drain_once(*, engine, owner_id, batch_size=None, hydration_byte_budget=None):
         first_calls["n"] += 1
         if first_calls["n"] == 1:
             task._run_metrics["indexed"] += 10
@@ -1288,7 +1438,7 @@ async def test_run_resets_split_metrics_between_runs():
     ):
         await task.run(MagicMock())
 
-    async def _second_drain_once(*, engine, owner_id, batch_size=None):
+    async def _second_drain_once(*, engine, owner_id, batch_size=None, hydration_byte_budget=None):
         return 0  # nothing claimed this run
 
     with (

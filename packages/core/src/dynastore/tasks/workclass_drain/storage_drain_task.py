@@ -45,9 +45,10 @@ only needs to clear the current backlog.
 """
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import replace as _dataclass_replace
-from typing import Any, ClassVar, Dict, List, NamedTuple, Optional, Sequence, Tuple, cast
+from typing import Any, ClassVar, Dict, Iterator, List, Optional, Sequence, Tuple, cast
 from uuid import UUID, uuid4
 
 from dynastore.models.protocols.indexing import (
@@ -73,10 +74,39 @@ _BACKOFF_SECONDS: List[int] = [1, 5, 30, 5 * 60, 30 * 60]
 _DEFAULT_LEASE_SECONDS: int = 300
 
 # Default claim batch size. Matches TasksPluginConfig.storage_drain_batch_size:
-# id-only rows (#2494 P1) hydrate to full canonical documents for the whole
-# claimed batch before the bulk dispatch, so the claim size bounds peak memory.
-# The previous 1500 OOM-killed 2Gi containers on MB-scale geometries (#2723).
+# it bounds ROW COUNT claimed per cycle (and the outer size of each id-only
+# canonical-re-read group, #2494 P1) — see _DEFAULT_HYDRATION_BYTE_BUDGET
+# below for the mechanism that actually bounds hydration memory (#2723).
+# The previous default of 1500 OOM-killed 2Gi containers on MB-scale
+# geometries before byte-budgeted sub-chunking existed.
 _DEFAULT_BATCH_SIZE: int = 100
+
+# Fallback size (bytes) attributed to a hydrated document that cannot be
+# JSON-estimated (e.g. a non-JSON-serializable value slipped through). Large
+# enough to force an isolating flush rather than silently accumulating an
+# unmeasured object indefinitely.
+_UNESTIMATED_DOC_BYTES: int = 8 * 1024 * 1024  # 8 MiB
+
+# Default hydration byte budget (#2723). Matches
+# TasksPluginConfig.storage_drain_hydration_byte_budget: bounds how much
+# BUILT (hydrated) payload storage_drain accumulates before dispatching an
+# index_bulk call, independent of storage_drain_batch_size (row count only).
+# 16 MiB keeps a 2Gi container's peak hydration spike well under its memory
+# limit even for MB-scale GAUL polygons, while still batching enough small
+# documents per _bulk call for reasonable ES throughput.
+_DEFAULT_HYDRATION_BYTE_BUDGET: int = 16 * 1024 * 1024
+
+# Row-count cap on a single canonical-re-read SELECT for one id-only group
+# (#2723): read_canonical_index_inputs batches ALL geoids handed to it into
+# one query, materializing every row's raw geometry at once. A group can
+# hold up to storage_drain_batch_size rows sharing one (catalog_id,
+# collection_id) — for MB-scale GAUL polygons that alone can spike memory
+# even though the group is already row-count-bounded. This fixed, small
+# sub-chunk keeps a single PG round trip's raw-row materialization bounded,
+# independent of the (adaptive) hydration byte budget, which governs the
+# BUILT-document dispatch below instead.
+_ID_ONLY_READ_CHUNK_ROWS: int = 50
+
 
 def _backoff(attempts: int) -> int:
     """Return the backoff in seconds for the given zero-based attempt count."""
@@ -84,21 +114,20 @@ def _backoff(attempts: int) -> int:
     return _BACKOFF_SECONDS[idx]
 
 
-class _PreparedDriverBatch(NamedTuple):
-    """Split of one driver's claimed rows, ready for the outcome pipeline.
+def _estimate_doc_bytes(doc: Dict[str, Any]) -> int:
+    """Estimate a hydrated doc's wire size via the same JSON encoding the ES
+    bulk indexer will eventually produce. Used only to decide sub-chunk
+    flush boundaries (#2723) — not for exact accounting."""
+    try:
+        return len(json.dumps(doc, default=str).encode("utf-8"))
+    except Exception:  # noqa: BLE001 — an unestimable doc still forces a flush
+        return _UNESTIMATED_DOC_BYTES
 
-    ``ops``/``rows_for_ops`` are parallel to the pre-#2494 behaviour: every
-    op sent to ``indexer.index_bulk`` has its claimed row in
-    ``rows_for_ops`` so ``_apply_outcomes``/``_apply_retry_all`` can map
-    results back. ``auto_done``/``auto_retry`` are resolved WITHOUT calling
-    the indexer at all — a re-read-canonical-state outcome for an id-only
-    row (#2494 P1) that never needs (or cannot survive) a bulk call.
-    """
 
-    ops: List[IndexableOp]
-    rows_for_ops: List[Dict[str, Any]]
-    auto_done: List[Dict[str, Any]]
-    auto_retry: List[Tuple[Dict[str, Any], str]]
+def _chunked(items: List[Dict[str, Any]], size: int) -> Iterator[List[Dict[str, Any]]]:
+    """Yield ``items`` in fixed-size slices (last slice may be shorter)."""
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
 
 
 class StorageDrainTask(TaskProtocol):
@@ -127,10 +156,12 @@ class StorageDrainTask(TaskProtocol):
         *,
         batch_size: int = _DEFAULT_BATCH_SIZE,
         lease_seconds: int = _DEFAULT_LEASE_SECONDS,
+        hydration_byte_budget: int = _DEFAULT_HYDRATION_BYTE_BUDGET,
     ) -> None:
         self.app_state = app_state
         self.batch_size = batch_size
         self.lease_seconds = lease_seconds
+        self.hydration_byte_budget = hydration_byte_budget
         # driver_id -> resolved BulkIndexer, memoised for this run.
         self._indexer_cache: Dict[str, BulkIndexer] = {}
         # catalog_id -> resolved known-fields set, memoised for this run
@@ -184,11 +215,13 @@ class StorageDrainTask(TaskProtocol):
         # Stable owner_id for the lifetime of this run — used as the
         # ``claimed_by`` stamp and the CAS guard on terminal writes.
         owner_id = f"storage_drain:{uuid4()}"
-        # Hot-reloaded claim size, resolved once per run: id-only rows
-        # hydrate to full canonical documents for the whole claimed batch
-        # before the bulk dispatch, so this bounds the run's peak memory
-        # (#2723 — 1500 MB-scale features OOM-killed the host container).
+        # Hot-reloaded claim size, resolved once per run — bounds ROW COUNT
+        # claimed per cycle (#2726).
         batch_size = await self._resolve_batch_size()
+        # Hot-reloaded hydration byte budget, resolved once per run — bounds
+        # how much BUILT (hydrated) payload is held before an index_bulk
+        # dispatch, independent of batch_size (#2723).
+        hydration_byte_budget = await self._resolve_hydration_byte_budget()
         # Reset the split counters for this run — drain_once accumulates
         # into self._run_metrics as it classifies each claimed batch (#2731).
         self._run_metrics = {"indexed": 0, "auto_done": 0, "retried": 0}
@@ -197,6 +230,7 @@ class StorageDrainTask(TaskProtocol):
             while True:
                 n = await self.drain_once(
                     engine=engine, owner_id=owner_id, batch_size=batch_size,
+                    hydration_byte_budget=hydration_byte_budget,
                 )
                 total += n
                 if n == 0:
@@ -258,19 +292,55 @@ class StorageDrainTask(TaskProtocol):
             )
         return self.batch_size
 
+    async def _resolve_hydration_byte_budget(self) -> int:
+        """Resolve ``TasksPluginConfig.storage_drain_hydration_byte_budget``,
+        hot-reloaded (#2723).
+
+        Mirrors ``_resolve_batch_size``'s fallback pattern: falls back to the
+        instance default (constructor value, itself matching the field
+        default) when the platform configs protocol is unavailable — early
+        startup, lightweight worker contexts, tests.
+        """
+        try:
+            from dynastore.models.protocols.platform_configs import (
+                PlatformConfigsProtocol,
+            )
+            from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+            from dynastore.tools.discovery import get_protocol
+
+            config_mgr = get_protocol(PlatformConfigsProtocol)
+            if config_mgr is not None:
+                cfg = await config_mgr.get_config(TasksPluginConfig)
+                if isinstance(cfg, TasksPluginConfig):
+                    return int(cfg.storage_drain_hydration_byte_budget)
+        except Exception:  # noqa: BLE001 — config read is best-effort
+            logger.debug(
+                "StorageDrainTask: storage_drain_hydration_byte_budget "
+                "unavailable — falling back to the instance default (%d).",
+                self.hydration_byte_budget,
+                exc_info=True,
+            )
+        return self.hydration_byte_budget
+
     async def drain_once(
         self, *, engine: Any, owner_id: str, batch_size: Optional[int] = None,
+        hydration_byte_budget: Optional[int] = None,
     ) -> int:
         """Claim one batch, process, apply fenced outcomes; return rows handled.
 
         ``batch_size`` overrides the instance default for this cycle (the
         hot-reloaded ``TasksPluginConfig.storage_drain_batch_size`` value,
         resolved once per run); ``None`` keeps ``self.batch_size`` so
-        internal callers and existing tests are unaffected.
+        internal callers and existing tests are unaffected. ``hydration_byte_budget``
+        does the same for ``TasksPluginConfig.storage_drain_hydration_byte_budget``
+        (#2723) — the byte budget bounding hydrated-payload sub-chunks; ``None``
+        keeps ``self.hydration_byte_budget``.
 
-        Whole-batch indexer exception: every row is funnelled to the
-        retry path so a flaky indexer can never lose data.  Per-row
-        poison classification is the indexer's responsibility.
+        Sub-chunk indexer exception: a sub-chunk that raises funnels only ITS
+        rows to the retry path (#2723) — a flaky indexer can never lose data,
+        and one bad sub-chunk no longer forces a retry of rows that would
+        otherwise have indexed successfully.  Per-row poison classification
+        is the indexer's responsibility.
 
         If a ``driver_id`` in the claimed batch cannot be resolved to a
         ``BulkIndexer``, those rows are treated as transient-retry so
@@ -290,6 +360,12 @@ class StorageDrainTask(TaskProtocol):
         )
         if not rows:
             return 0
+
+        effective_byte_budget = (
+            hydration_byte_budget
+            if hydration_byte_budget is not None
+            else self.hydration_byte_budget
+        )
 
         # Group claimed rows by driver_id for bulk dispatch.
         by_driver: Dict[str, List[Dict[str, Any]]] = {}
@@ -325,55 +401,22 @@ class StorageDrainTask(TaskProtocol):
                 batch_retried += len(driver_rows)
                 continue
 
-            prepared = await self._prepare_ops(engine=engine, driver_rows=driver_rows)
-
-            # Rows resolved WITHOUT the indexer (#2494 P1 canonical re-read):
-            # a missing PG row on an id-only upsert is a deleted item — skip
-            # as success; a re-read that itself raised is a transient infra
-            # failure, not a poison classification.
-            for row in prepared.auto_done:
-                await self._mark_done(
-                    engine=engine, task_schema=task_schema,
-                    row=row, owner_id=owner_id,
-                )
-            batch_auto_done += len(prepared.auto_done)
-            for row, reason in prepared.auto_retry:
-                await self._mark_retry(
-                    engine=engine, task_schema=task_schema,
-                    row=row, owner_id=owner_id, error=reason,
-                )
-            batch_retried += len(prepared.auto_retry)
-
-            if not prepared.ops:
-                continue
-
-            try:
-                result = await indexer.index_bulk(prepared.ops)
-            except Exception as exc:  # noqa: BLE001 — surface every failure
-                logger.warning(
-                    "StorageDrainTask[%s]: whole-batch error: %s",
-                    driver_id,
-                    exc,
-                )
-                await self._apply_retry_all(
-                    engine=engine,
-                    task_schema=task_schema,
-                    rows=prepared.rows_for_ops,
-                    owner_id=owner_id,
-                    error=str(exc),
-                )
-                batch_retried += len(prepared.rows_for_ops)
-                continue
-
-            outcome_counts = await self._apply_outcomes(
+            # Streams hydration + dispatch in byte-budgeted sub-chunks
+            # (#2723) — never materializes more hydrated payload than
+            # ``effective_byte_budget`` at once, regardless of how many
+            # rows this driver claimed.
+            counts = await self._process_driver_rows(
                 engine=engine,
                 task_schema=task_schema,
-                rows=prepared.rows_for_ops,
-                result=result,
+                driver_id=driver_id,
+                indexer=indexer,
+                driver_rows=driver_rows,
                 owner_id=owner_id,
+                byte_budget=effective_byte_budget,
             )
-            batch_indexed += outcome_counts["indexed"]
-            batch_retried += outcome_counts["retried"]
+            batch_indexed += counts["indexed"]
+            batch_auto_done += counts["auto_done"]
+            batch_retried += counts["retried"]
 
         self._run_metrics["indexed"] += batch_indexed
         self._run_metrics["auto_done"] += batch_auto_done
@@ -579,30 +622,55 @@ class StorageDrainTask(TaskProtocol):
     # Canonical re-read for id-only rows (#2494 P1)
     # ------------------------------------------------------------------
 
-    async def _prepare_ops(
-        self, *, engine: Any, driver_rows: List[Dict[str, Any]],
-    ) -> _PreparedDriverBatch:
-        """Split one driver's claimed rows into indexer-bound ops and
-        directly-resolved outcomes.
+    async def _process_driver_rows(
+        self,
+        *,
+        engine: Any,
+        task_schema: str,
+        driver_id: str,
+        indexer: BulkIndexer,
+        driver_rows: List[Dict[str, Any]],
+        owner_id: str,
+        byte_budget: int,
+    ) -> Dict[str, int]:
+        """Hydrate and dispatch one driver's claimed rows in byte-budgeted
+        sub-chunks (#2723).
+
+        Streams rather than batch-building: every row is converted to an
+        ``IndexableOp`` (payload-carrying rows directly; id-only rows via
+        the canonical re-read + doc build below, #2494 P1) and appended to
+        a pending sub-chunk. As soon as the pending sub-chunk's estimated
+        JSON-encoded size reaches ``byte_budget``, it is dispatched to
+        ``indexer.index_bulk`` and its outcomes applied immediately —
+        BEFORE any further row in this driver's claimed batch is hydrated.
+        Peak resident hydrated payload is therefore bounded by
+        ``byte_budget``, independent of how many rows were claimed
+        (``storage_drain_batch_size``, #2726 — row count only) or how many
+        MB-scale documents (e.g. GAUL polygons) they hydrate to.
 
         Delete rows and payload-carrying upsert rows convert to
-        ``IndexableOp`` unchanged (:meth:`_row_to_op`). Id-only upsert rows
-        — ``op='upsert'`` whose ``op_payload`` carries the explicit
-        ``{STORAGE_PLANE_ID_ONLY_MARKER_KEY: true}`` sentinel, written by
-        ``IndexDispatcher._enqueue_storage_plane_ids`` when
-        ``TasksPluginConfig.items_secondary_via_storage_plane`` is enabled —
-        are grouped by ``(catalog_id, collection_id)`` and re-read from
-        canonical PG state in ONE batched SELECT per group via
-        :func:`read_canonical_index_inputs`:
+        ``IndexableOp`` unchanged (:meth:`_row_to_op`) — their payload is
+        already resident from the claim SELECT, so this is cheap. Id-only
+        upsert rows — ``op='upsert'`` whose ``op_payload`` carries the
+        explicit ``{STORAGE_PLANE_ID_ONLY_MARKER_KEY: true}`` sentinel,
+        written by ``IndexDispatcher._enqueue_storage_plane_ids`` when
+        ``TasksPluginConfig.items_secondary_via_storage_plane`` is enabled
+        — are grouped by ``(catalog_id, collection_id)``. Each group's
+        canonical re-read (:func:`read_canonical_index_inputs`) stays
+        batched, but in fixed ``_ID_ONLY_READ_CHUNK_ROWS``-sized read
+        chunks rather than the whole group at once, so a single PG round
+        trip never materializes an unbounded number of raw (pre-JSON)
+        geometry rows either:
 
         * a resolved geoid becomes an ``IndexableOp`` carrying the
           freshly-built canonical document;
         * a geoid absent from PG is treated as a deleted item and marked
           done directly (last-write-wins — the item is gone, indexing it
           would be wrong and re-trying it would never succeed);
-        * a group whose re-read itself raises funnels every id-only row in
-          that group to retry (a transient infra failure, not a poison
-          classification — the geoid's existence is simply unknown).
+        * a read chunk whose re-read itself raises funnels every id-only
+          row in that chunk to retry (a transient infra failure, not a
+          poison classification — the geoid's existence is simply
+          unknown).
 
         Detection keys off the explicit marker, NOT payload emptiness: the
         ``tasks.storage`` DDL default for ``op_payload`` is ALSO
@@ -611,11 +679,62 @@ class StorageDrainTask(TaskProtocol):
         normal ``_row_to_op`` conversion below, same as any other
         payload-carrying row, with a one-time-per-driver WARNING since an
         unmarked empty payload is unusual post-#2494 (review finding).
+
+        Crash/partial-failure safety: a sub-chunk that fails
+        ``index_bulk`` funnels only ITS rows to retry; rows in a sub-chunk
+        already flushed keep their (already applied) outcome, and rows not
+        yet reached when this coroutine is cancelled or the process dies
+        simply stay claimed 'in_flight' — fenced by (claimed_by,
+        claim_version) — until the lease expires and a future drain cycle
+        reclaims and re-hydrates them. No row is ever double marked-done
+        (the CAS fence in :meth:`_mark_done`/:meth:`_mark_retry`) or
+        silently skipped (an unflushed row is simply never marked, so it
+        falls back to the normal lease-expiry reclaim path).
+
+        Returns ``{"indexed": n, "auto_done": n, "retried": n}`` — the same
+        split classification as the pre-#2723 single-shot pipeline.
         """
-        ops: List[IndexableOp] = []
-        rows_for_ops: List[Dict[str, Any]] = []
-        auto_done: List[Dict[str, Any]] = []
-        auto_retry: List[Tuple[Dict[str, Any], str]] = []
+        counts = {"indexed": 0, "auto_done": 0, "retried": 0}
+
+        pending_ops: List[IndexableOp] = []
+        pending_rows: List[Dict[str, Any]] = []
+        pending_bytes = 0
+
+        async def _flush() -> None:
+            nonlocal pending_ops, pending_rows, pending_bytes
+            if not pending_ops:
+                return
+            ops, rows = pending_ops, pending_rows
+            pending_ops, pending_rows, pending_bytes = [], [], 0
+            try:
+                result = await indexer.index_bulk(ops)
+            except Exception as exc:  # noqa: BLE001 — surface every failure
+                logger.warning(
+                    "StorageDrainTask[%s]: sub-chunk error (%d row(s)): %s",
+                    driver_id, len(rows), exc,
+                )
+                await self._apply_retry_all(
+                    engine=engine, task_schema=task_schema, rows=rows,
+                    owner_id=owner_id, error=str(exc),
+                )
+                counts["retried"] += len(rows)
+                return
+            outcome_counts = await self._apply_outcomes(
+                engine=engine, task_schema=task_schema, rows=rows,
+                result=result, owner_id=owner_id,
+            )
+            counts["indexed"] += outcome_counts["indexed"]
+            counts["retried"] += outcome_counts["retried"]
+
+        async def _append(
+            op: IndexableOp, row: Dict[str, Any], doc: Dict[str, Any],
+        ) -> None:
+            nonlocal pending_bytes
+            pending_ops.append(op)
+            pending_rows.append(row)
+            pending_bytes += _estimate_doc_bytes(doc)
+            if pending_bytes >= byte_budget:
+                await _flush()
 
         id_only_by_group: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
         for row in driver_rows:
@@ -630,7 +749,6 @@ class StorageDrainTask(TaskProtocol):
                 id_only_by_group.setdefault(key, []).append(row)
                 continue
             if row["op"] == "upsert" and not payload:
-                driver_id = row.get("driver_id")
                 if driver_id not in self._empty_payload_warned:
                     self._empty_payload_warned.add(driver_id)
                     logger.warning(
@@ -641,53 +759,65 @@ class StorageDrainTask(TaskProtocol):
                         "suppressed this run.",
                         driver_id,
                     )
-            ops.append(self._row_to_op(row))
-            rows_for_ops.append(row)
+            await _append(self._row_to_op(row), row, payload)
 
         for (catalog_id, collection_id), group_rows in id_only_by_group.items():
-            geoids = [r["entity_id"] for r in group_rows if r.get("entity_id")]
-            try:
-                inputs = await self._read_canonical_inputs(
-                    engine=engine, catalog_id=catalog_id,
-                    collection_id=collection_id, geoids=geoids,
-                )
-            except Exception as exc:  # noqa: BLE001 — funnel to retry, never drop
-                logger.warning(
-                    "StorageDrainTask: canonical re-read failed for %s/%s "
-                    "(%d id-only row(s)): %s — funnelling to retry.",
-                    catalog_id, collection_id, len(group_rows), exc,
-                )
-                auto_retry.extend(
-                    (r, f"canonical_reread_failed: {exc}") for r in group_rows
-                )
-                continue
-
             group_auto_done = 0
-            for row in group_rows:
-                geoid = row.get("entity_id")
-                ci = inputs.get(geoid) if geoid else None
-                if ci is None:
-                    # No PG row — item deleted after the obligation was
-                    # enqueued (or the geoid never existed). Skip as
-                    # success rather than indexing a stale/absent doc.
-                    auto_done.append(row)
-                    group_auto_done += 1
-                    continue
+            for row_chunk in _chunked(group_rows, _ID_ONLY_READ_CHUNK_ROWS):
+                geoids = [r["entity_id"] for r in row_chunk if r.get("entity_id")]
                 try:
-                    doc = await self._build_canonical_doc(
-                        catalog_id=catalog_id, collection_id=collection_id, ci=ci,
+                    inputs = await self._read_canonical_inputs(
+                        engine=engine, catalog_id=catalog_id,
+                        collection_id=collection_id, geoids=geoids,
                     )
-                except Exception as exc:  # noqa: BLE001 — funnel to retry
+                except Exception as exc:  # noqa: BLE001 — funnel to retry, never drop
                     logger.warning(
-                        "StorageDrainTask: canonical doc build failed for "
-                        "%s/%s/%s: %s — funnelling to retry.",
-                        catalog_id, collection_id, geoid, exc,
+                        "StorageDrainTask: canonical re-read failed for %s/%s "
+                        "(%d id-only row(s)): %s — funnelling to retry.",
+                        catalog_id, collection_id, len(row_chunk), exc,
                     )
-                    auto_retry.append((row, f"canonical_doc_build_failed: {exc}"))
+                    for row in row_chunk:
+                        await self._mark_retry(
+                            engine=engine, task_schema=task_schema, row=row,
+                            owner_id=owner_id,
+                            error=f"canonical_reread_failed: {exc}",
+                        )
+                    counts["retried"] += len(row_chunk)
                     continue
-                op = _dataclass_replace(self._row_to_op(row), payload=doc)
-                ops.append(op)
-                rows_for_ops.append(row)
+
+                for row in row_chunk:
+                    geoid = row.get("entity_id")
+                    ci = inputs.get(geoid) if geoid else None
+                    if ci is None:
+                        # No PG row — item deleted after the obligation was
+                        # enqueued (or the geoid never existed). Skip as
+                        # success rather than indexing a stale/absent doc.
+                        await self._mark_done(
+                            engine=engine, task_schema=task_schema,
+                            row=row, owner_id=owner_id,
+                        )
+                        counts["auto_done"] += 1
+                        group_auto_done += 1
+                        continue
+                    try:
+                        doc = await self._build_canonical_doc(
+                            catalog_id=catalog_id, collection_id=collection_id, ci=ci,
+                        )
+                    except Exception as exc:  # noqa: BLE001 — funnel to retry
+                        logger.warning(
+                            "StorageDrainTask: canonical doc build failed for "
+                            "%s/%s/%s: %s — funnelling to retry.",
+                            catalog_id, collection_id, geoid, exc,
+                        )
+                        await self._mark_retry(
+                            engine=engine, task_schema=task_schema, row=row,
+                            owner_id=owner_id,
+                            error=f"canonical_doc_build_failed: {exc}",
+                        )
+                        counts["retried"] += 1
+                        continue
+                    op = _dataclass_replace(self._row_to_op(row), payload=doc)
+                    await _append(op, row, doc)
 
             # Observability (#2731): auto_done is a legitimate outcome (the
             # canonical row is verifiably absent, not merely unreadable), but
@@ -700,10 +830,8 @@ class StorageDrainTask(TaskProtocol):
                     group_auto_done, catalog_id, collection_id,
                 )
 
-        return _PreparedDriverBatch(
-            ops=ops, rows_for_ops=rows_for_ops,
-            auto_done=auto_done, auto_retry=auto_retry,
-        )
+        await _flush()
+        return counts
 
     async def _read_canonical_inputs(
         self, *, engine: Any, catalog_id: str, collection_id: str,
