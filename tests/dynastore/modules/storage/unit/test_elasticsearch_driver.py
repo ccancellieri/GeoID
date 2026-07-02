@@ -936,6 +936,135 @@ class TestWriteEntitiesTenantIndex:
         assert es.bulk_calls == []
 
     @pytest.mark.asyncio
+    async def test_refuse_policy_skip_is_surfaced_in_written_skipped(self):
+        """#2826: a REFUSE-on-conflict pre-submit skip must be visible on the
+        returned list's ``.skipped`` attribute — not just absorbed into a
+        silently-shorter ``written``, with no accounting anywhere."""
+        from dynastore.modules.storage.driver_config import (
+            ItemsWritePolicy, WriteConflictPolicy,
+        )
+
+        es = _StubEs(exists=True)
+        es.count_result = {"count": 1}
+        from dynastore.modules.storage import DeriveSpec
+        policy = ItemsWritePolicy(
+            on_conflict=WriteConflictPolicy.REFUSE,
+            derive=DeriveSpec(external_id="properties.ext_id"),
+        )
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.modules.elasticsearch.client.get_index_prefix",
+            return_value="dynastore",
+        ), patch.object(
+            ItemsElasticsearchDriver, "_resolve_write_policy",
+            AsyncMock(return_value=policy),
+        ), patch.object(
+            ItemsElasticsearchDriver, "_enforce_field_constraints",
+            AsyncMock(return_value=None),
+        ), patch(
+            "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+            new=AsyncMock(side_effect=_fake_canonical_inputs),
+        ):
+            driver = ItemsElasticsearchDriver()
+            written = await driver.write_entities(
+                "cat1", "col1",
+                [self._feature("f1", external_id="EXT-1")],
+            )
+
+        assert written == []
+        assert written.skipped == [("EXT-1", "refused_on_conflict")]
+
+    @pytest.mark.asyncio
+    async def test_missing_id_row_skip_is_surfaced_in_written_skipped(self):
+        """#2826: a row with no resolvable id (no top-level id, no geoid, no
+        external_id) is skipped before the ``_bulk`` call — the skip must
+        land on ``.skipped``, not just an ERROR log line."""
+        from dynastore.modules.storage.driver_config import (
+            ItemsWritePolicy, WriteConflictPolicy,
+        )
+
+        es = _StubEs(exists=True)
+        policy = ItemsWritePolicy(on_conflict=WriteConflictPolicy.UPDATE)
+        no_id_item = {
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
+            "properties": {},
+        }
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.modules.elasticsearch.client.get_index_prefix",
+            return_value="dynastore",
+        ), patch.object(
+            ItemsElasticsearchDriver, "_resolve_write_policy",
+            AsyncMock(return_value=policy),
+        ), patch.object(
+            ItemsElasticsearchDriver, "_enforce_field_constraints",
+            AsyncMock(return_value=None),
+        ):
+            driver = ItemsElasticsearchDriver()
+            written = await driver.write_entities("cat1", "col1", [no_id_item])
+
+        assert written == []
+        assert written.skipped == [(None, "missing_id")]
+        assert es.bulk_calls == []
+
+    @pytest.mark.asyncio
+    async def test_mixed_batch_written_and_skipped_both_present(self):
+        """#2826: a batch with one REFUSE-skipped item and one normally
+        written item must return both — the write side unaffected, the skip
+        side fully accounted for."""
+        from dynastore.modules.storage.driver_config import (
+            ItemsWritePolicy, WriteConflictPolicy,
+        )
+        from dynastore.modules.storage import DeriveSpec
+
+        class _SelectiveStubEs(_StubEs):
+            """count() returns exists=True only for EXT-EXISTS."""
+
+            async def count(self, *, body=None, index=None, params=None, **kwargs):
+                terms = body["query"]["bool"]["filter"]
+                ext_id = next(
+                    t["term"]["external_id"] for t in terms if "term" in t and "external_id" in t["term"]
+                )
+                return {"count": 1 if ext_id == "EXT-EXISTS" else 0}
+
+        es = _SelectiveStubEs(exists=True)
+        policy = ItemsWritePolicy(
+            on_conflict=WriteConflictPolicy.REFUSE,
+            derive=DeriveSpec(external_id="properties.ext_id"),
+        )
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.modules.elasticsearch.client.get_index_prefix",
+            return_value="dynastore",
+        ), patch.object(
+            ItemsElasticsearchDriver, "_resolve_write_policy",
+            AsyncMock(return_value=policy),
+        ), patch.object(
+            ItemsElasticsearchDriver, "_enforce_field_constraints",
+            AsyncMock(return_value=None),
+        ), patch(
+            "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+            new=AsyncMock(side_effect=_fake_canonical_inputs),
+        ):
+            driver = ItemsElasticsearchDriver()
+            written = await driver.write_entities(
+                "cat1", "col1",
+                [
+                    self._feature("f1", external_id="EXT-EXISTS"),
+                    self._feature("f2", external_id="EXT-NEW"),
+                ],
+            )
+
+        assert len(written) == 1
+        assert written[0].id == "f2"
+        assert written.skipped == [("EXT-EXISTS", "refused_on_conflict")]
+        assert len(es.bulk_calls) == 1
+
+    @pytest.mark.asyncio
     async def test_new_version_policy_appends_timestamp_to_doc_id(self):
         from dynastore.modules.storage.driver_config import (
             ItemsWritePolicy, WriteConflictPolicy,

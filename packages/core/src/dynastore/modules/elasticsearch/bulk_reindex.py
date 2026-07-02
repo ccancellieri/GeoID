@@ -65,8 +65,11 @@ class ReindexResult:
     class, #2044) no longer hold the rest of the collection hostage.
     It also carries a synthetic ``"<unacknowledged:...>"`` entry for any
     document a sub-chunk read but neither ES nor the ladder ever
-    confirmed nor explicitly rejected, so ``total_written + rejected``
-    always equals the number of documents read from the source.
+    confirmed nor explicitly rejected, and a ``(id, reason)`` entry —
+    ``reason`` one of ``"refused_on_conflict"`` / ``"missing_id"`` — for
+    every document the writer skipped BEFORE submitting to ES at all
+    (#2826), so ``total_written + rejected`` always equals the number of
+    documents read from the source.
     """
 
     total_written: int
@@ -358,6 +361,15 @@ async def reindex_collection_into_index(
     Any other exception from ``write_entities`` still propagates immediately —
     only known per-doc ES rejections are treated as recoverable.
 
+    A write-policy skip inside ``write_entities`` can also fire on the
+    SUCCESS path — no ``EsBulkWriteError`` raised at all, e.g.
+    ``on_conflict=REFUSE`` skipping an already-existing doc, or a source row
+    with no resolvable id (#2826). The writer surfaces these via a
+    ``.skipped`` attribute on the returned list (``(id, reason)`` pairs,
+    ``id`` is ``None`` when the reason IS the missing id); this function
+    folds them into ``rejected_docs`` the same way, so the invariant holds
+    on both paths.
+
     Alias enrolment: the writer's index is enrolled in the public alias once before
     streaming begins (idempotent; best-effort) — so the alias swap that makes the
     successfully-written documents searchable happens regardless of any per-doc
@@ -475,6 +487,34 @@ async def reindex_collection_into_index(
             try:
                 written = await writer.write_entities(catalog_id, collection_id, sub_chunk)
                 batch_count = len(written) if written is not None else len(sub_chunk)
+                # #2826: the writer can skip a document BEFORE it is ever
+                # submitted to ES's ``_bulk`` call (REFUSE on-conflict, no
+                # resolvable id) without raising — ``written`` is simply
+                # shorter, with no signal beyond a driver-side log line.
+                # Drivers that track this (currently the public ES items
+                # driver) surface it via ``.skipped`` on the returned list;
+                # fold each entry into ``rejected_docs`` here so the same
+                # ``total_written + rejected == docs read`` invariant the
+                # exception path already guarantees (#2799/#2825) also holds
+                # on the success path.
+                presubmit_skips = getattr(written, "skipped", None) or []
+                if presubmit_skips:
+                    rejected_docs.extend(
+                        (
+                            doc_id if doc_id is not None
+                            else f"<presubmit-skip:{catalog_id}/{collection_id}@offset={offset}>",
+                            reason,
+                        )
+                        for doc_id, reason in presubmit_skips
+                    )
+                    logger.error(
+                        "reindex_collection_into_index: %d document(s) in this "
+                        "sub-chunk for %s/%s at offset %d were skipped by the "
+                        "writer before submission to ES (%s) — folded into "
+                        "rejected_docs so the run's self-report stays truthful.",
+                        len(presubmit_skips), catalog_id, collection_id, offset,
+                        ", ".join(sorted({reason for _, reason in presubmit_skips})),
+                    )
             except EsBulkWriteError as exc:
                 # ES's _bulk endpoint is per-item: by the time this error
                 # surfaces the HTTP request already completed and some

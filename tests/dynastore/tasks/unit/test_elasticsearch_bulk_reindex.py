@@ -126,6 +126,16 @@ class _FakeReader:
             yield f
 
 
+class _ListWithSkipped(list):
+    """Test double for ``_WrittenWithPresubmitSkips`` (#2826) — mirrors the
+    real ES driver's ``.skipped`` attribute so ``reindex_collection_into_index``
+    can be exercised without depending on the real ES driver internals."""
+
+    def __init__(self, items, skipped):
+        super().__init__(items)
+        self.skipped = skipped
+
+
 class _FakeWriter:
     """Fake CollectionItemsStore implementing write_entities."""
 
@@ -133,15 +143,32 @@ class _FakeWriter:
     preferred_chunk_size: int = 0
     is_item_indexer: bool = True  # marks as secondary-index / ES-like target
 
-    def __init__(self, raise_on_write: Optional[Exception] = None, fail_calls: int = -1):
+    def __init__(
+        self,
+        raise_on_write: Optional[Exception] = None,
+        fail_calls: int = -1,
+        presubmit_skip_ids: Optional[set] = None,
+        presubmit_missing_id_count: int = 0,
+    ):
         """``fail_calls``: -1 (default) raises ``raise_on_write`` on every call
         (matches the pre-#2764 "always fails" contract). A positive N raises
         only for the first N calls, then succeeds — used to simulate a single
-        rejected sub-chunk followed by recovery."""
+        rejected sub-chunk followed by recovery.
+
+        ``presubmit_skip_ids``: ids to drop before "submission" (simulating
+        a REFUSE on-conflict pre-submit skip, #2826) — reported on
+        ``.skipped`` as ``(id, "refused_on_conflict")``.
+
+        ``presubmit_missing_id_count``: drop this many leading entities from
+        each call regardless of id (simulating a row with no resolvable id)
+        — reported on ``.skipped`` as ``(None, "missing_id")``.
+        """
         self._raise = raise_on_write
         self._fail_calls = fail_calls
         self._call_count = 0
         self.written_batches: list = []
+        self._presubmit_skip_ids = presubmit_skip_ids or set()
+        self._presubmit_missing_id_count = presubmit_missing_id_count
 
     async def write_entities(self, catalog_id, collection_id, entities, **kwargs):
         self._call_count += 1
@@ -149,8 +176,23 @@ class _FakeWriter:
             self._fail_calls == -1 or self._call_count <= self._fail_calls
         ):
             raise self._raise
-        self.written_batches.append(list(entities))
-        return list(entities)
+        entities = list(entities)
+        skipped: list = []
+        remaining = entities
+        for _ in range(min(self._presubmit_missing_id_count, len(remaining))):
+            remaining.pop(0)
+            skipped.append((None, "missing_id"))
+        kept = []
+        for e in remaining:
+            eid = e["id"] if isinstance(e, dict) else getattr(e, "id", None)
+            if eid in self._presubmit_skip_ids:
+                skipped.append((eid, "refused_on_conflict"))
+            else:
+                kept.append(e)
+        self.written_batches.append(kept)
+        if skipped:
+            return _ListWithSkipped(kept, skipped)
+        return kept
 
 
 class _FakeResolvedDriver:
@@ -649,6 +691,139 @@ async def test_reindex_ladder_recovered_docs_are_credited_as_written():
         ("f3", "400 document_parsing_exception: still invalid after ladder")
     ]
     # No unaccounted/silent gap — acknowledged + failures == docs read.
+    assert result.total_written + result.rejected == 3
+
+
+@pytest.mark.asyncio
+async def test_reindex_folds_presubmit_refuse_skip_into_rejected_docs():
+    """#2826: a writer that skips a document BEFORE submission (REFUSE
+    on-conflict) — no ``EsBulkWriteError`` raised at all — must have that
+    skip folded into ``rejected_docs``, not silently absorbed into a
+    shorter ``total_written`` with no accounting."""
+    reader = _FakeReader(
+        {"col1": [_make_feature("f1"), _make_feature("f2")]}
+    )
+    writer = _FakeWriter(presubmit_skip_ids={"f1"})
+
+    async def _get_config(model, *, catalog_id, collection_id=None):
+        return _make_routing_config()
+
+    fake_configs = type("C", (), {"get_config": staticmethod(_get_config)})()
+
+    def _get_protocol(proto):
+        name = getattr(proto, "__name__", str(proto))
+        if "ConfigsProtocol" in name:
+            return fake_configs
+        return None
+
+    with patch("dynastore.tools.discovery.get_protocol", side_effect=_get_protocol):
+        async with _build_router_patches(reader, writer):
+            with patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.add_index_to_public_alias",
+                return_value=None,
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_tenant_items_index",
+                return_value="dynastore-cat1-items",
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_index_prefix",
+                return_value="dynastore",
+            ):
+                from dynastore.modules.elasticsearch.bulk_reindex import reindex_collection_into_index
+                result = await reindex_collection_into_index("cat1", "col1")
+
+    # f1 was skipped pre-submit, f2 was written — no exception anywhere.
+    assert result.total_written == 1
+    assert result.rejected == 1
+    assert result.rejected_docs == [("f1", "refused_on_conflict")]
+    # Self-report invariant: acknowledged + reported-skips == docs read.
+    assert result.total_written + result.rejected == 2
+
+
+@pytest.mark.asyncio
+async def test_reindex_folds_presubmit_missing_id_skip_into_rejected_docs():
+    """#2826: a writer that skips a row with no resolvable id before
+    submission must fold it into ``rejected_docs`` with a synthetic id
+    (the real id is genuinely unknown) and the ``missing_id`` reason."""
+    reader = _FakeReader({"col1": [_make_feature("f1")]})
+    writer = _FakeWriter(presubmit_missing_id_count=1)
+
+    async def _get_config(model, *, catalog_id, collection_id=None):
+        return _make_routing_config()
+
+    fake_configs = type("C", (), {"get_config": staticmethod(_get_config)})()
+
+    def _get_protocol(proto):
+        name = getattr(proto, "__name__", str(proto))
+        if "ConfigsProtocol" in name:
+            return fake_configs
+        return None
+
+    with patch("dynastore.tools.discovery.get_protocol", side_effect=_get_protocol):
+        async with _build_router_patches(reader, writer):
+            with patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.add_index_to_public_alias",
+                return_value=None,
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_tenant_items_index",
+                return_value="dynastore-cat1-items",
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_index_prefix",
+                return_value="dynastore",
+            ):
+                from dynastore.modules.elasticsearch.bulk_reindex import reindex_collection_into_index
+                result = await reindex_collection_into_index("cat1", "col1")
+
+    assert result.total_written == 0
+    assert result.rejected == 1
+    assert len(result.rejected_docs) == 1
+    doc_id, reason = result.rejected_docs[0]
+    assert reason == "missing_id"
+    assert doc_id is not None  # synthetic placeholder, not a bare None
+    assert "presubmit-skip" in doc_id
+    assert result.total_written + result.rejected == 1
+
+
+@pytest.mark.asyncio
+async def test_reindex_mixed_batch_presubmit_skip_and_written_both_counted():
+    """#2826: a sub-chunk with both a pre-submit skip and normally-written
+    documents must count both correctly — the write side is unaffected by
+    the skip accounting fix."""
+    reader = _FakeReader(
+        {"col1": [_make_feature(f"f{i}") for i in range(1, 4)]}  # f1..f3
+    )
+    writer = _FakeWriter(presubmit_skip_ids={"f2"})
+
+    async def _get_config(model, *, catalog_id, collection_id=None):
+        return _make_routing_config()
+
+    fake_configs = type("C", (), {"get_config": staticmethod(_get_config)})()
+
+    def _get_protocol(proto):
+        name = getattr(proto, "__name__", str(proto))
+        if "ConfigsProtocol" in name:
+            return fake_configs
+        return None
+
+    with patch("dynastore.tools.discovery.get_protocol", side_effect=_get_protocol):
+        async with _build_router_patches(reader, writer):
+            with patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.add_index_to_public_alias",
+                return_value=None,
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_tenant_items_index",
+                return_value="dynastore-cat1-items",
+            ), patch(
+                "dynastore.modules.elasticsearch.bulk_reindex.get_index_prefix",
+                return_value="dynastore",
+            ):
+                from dynastore.modules.elasticsearch.bulk_reindex import reindex_collection_into_index
+                result = await reindex_collection_into_index("cat1", "col1")
+
+    assert result.total_written == 2  # f1 + f3
+    assert result.rejected == 1  # f2, pre-submit skip
+    assert result.rejected_docs == [("f2", "refused_on_conflict")]
+    written_ids = sorted(f["id"] for batch in writer.written_batches for f in batch)
+    assert written_ids == ["f1", "f3"]
     assert result.total_written + result.rejected == 3
 
 

@@ -1164,6 +1164,34 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         return body, params
 
 
+class _WrittenWithPresubmitSkips(List[Feature]):
+    """``List[Feature]`` subclass carrying pre-submit skip accounting (#2826).
+
+    ``write_entities`` can drop an input item before it is ever submitted to
+    ES's ``_bulk`` call — a ``REFUSE`` on-conflict policy skip, or a row with
+    no resolvable id — and previously returned a plain, silently-shorter
+    list with no signal beyond a debug/error log line. ``reindex_collection_
+    into_index`` needs that gap to fold it into ``rejected_docs`` so
+    ``total_written + rejected`` still equals the number of documents read
+    (the same invariant #2799/#2825 established for the ``_bulk`` exception
+    path).
+
+    ``skipped`` holds ``(doc_id, reason)`` pairs, ``doc_id`` is ``None`` when
+    the skip reason IS the absence of a resolvable id. Behaves exactly like
+    a plain list for every existing caller (``len()``, iteration, ``==``,
+    ``extend()``) — only a caller that explicitly reads ``.skipped`` sees a
+    difference.
+    """
+
+    def __init__(
+        self,
+        items: List[Feature],
+        skipped: List[Tuple[Optional[str], str]],
+    ) -> None:
+        super().__init__(items)
+        self.skipped: List[Tuple[Optional[str], str]] = skipped
+
+
 # ---------------------------------------------------------------------------
 # ItemsElasticsearchDriver — public STAC items index
 # ---------------------------------------------------------------------------
@@ -1301,6 +1329,16 @@ class ItemsElasticsearchDriver(
         was indexed; a full rejection (unrecovered by the geo_shape ladder)
         raises ``EsBulkWriteError`` instead, whose ``.acknowledged``
         attribute carries the same accounting for that call.
+
+        When one or more input items are skipped BEFORE submission to
+        ``_bulk`` (``REFUSE`` on-conflict, or a row with no resolvable id),
+        the returned list is a :class:`_WrittenWithPresubmitSkips` — a
+        transparent ``list`` subclass whose ``.skipped`` attribute carries
+        ``(doc_id, reason)`` pairs for each pre-submit skip (#2826), so
+        callers doing accounting reconciliation (e.g.
+        ``reindex_collection_into_index``) can fold them into their own
+        rejected/skipped totals instead of the gap being silently absorbed
+        into a shorter list.
         """
         from datetime import datetime, timezone
 
@@ -1394,6 +1432,12 @@ class ItemsElasticsearchDriver(
 
         written: List = []
         prepped_bulk: list = []
+        # Pre-submit skips (#2826) — items dropped before ever reaching the
+        # ``_bulk`` call (REFUSE on-conflict, no resolvable id). Folded onto
+        # the returned list's ``.skipped`` attribute so callers doing
+        # write/rejected reconciliation (reindex) see the gap instead of it
+        # being absorbed into a silently-shorter ``written``.
+        skipped: List[Tuple[Optional[str], str]] = []
 
         for item, stac_doc, geoid_for_id in zip(items, item_stac_docs, item_geoids):
             # Resolve external_id from the configured ComputedField path.
@@ -1428,6 +1472,7 @@ class ItemsElasticsearchDriver(
                         "ES write_entities(REFUSE): external_id '%s' exists — skipped",
                         external_id,
                     )
+                    skipped.append((base_id, "refused_on_conflict"))
                     continue
 
             # NEW_VERSION: each version gets a unique doc_id. Store validity window.
@@ -1513,6 +1558,7 @@ class ItemsElasticsearchDriver(
                     "— this item will NOT be indexed in Elasticsearch.",
                     catalog_id, collection_id,
                 )
+                skipped.append((base_id, "missing_id"))
                 continue
 
             # NEW_VERSION: append timestamp suffix to the doc_id (not to the
@@ -1597,6 +1643,8 @@ class ItemsElasticsearchDriver(
                 if doc_id in acknowledged_ids
             ]
 
+        if skipped:
+            return _WrittenWithPresubmitSkips(written, skipped)
         return written
 
     async def _enforce_field_constraints(
