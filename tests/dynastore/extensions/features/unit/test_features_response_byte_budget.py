@@ -111,7 +111,9 @@ def _wire(monkeypatch, svc, catalogs, plugin_config: FeaturesPluginConfig):
 
     async def _get_configs():
         class _Cfg:
-            async def get_config(self, cls, catalog_id=None, ctx=None):
+            async def get_config(
+                self, cls, catalog_id=None, collection_id=None, ctx=None
+            ):
                 return plugin_config
 
         return _Cfg()

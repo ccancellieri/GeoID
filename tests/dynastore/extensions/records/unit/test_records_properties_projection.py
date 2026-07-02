@@ -158,7 +158,9 @@ def _call_get_records(svc, **overrides):
         skip_geometry=None,
         return_geometry=None,
         sortby=None,
+        bbox=None,
         q=None,
+        request_hints=frozenset(),
     )
     kwargs.update(overrides)
     return svc.get_records(**kwargs)

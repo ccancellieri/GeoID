@@ -141,11 +141,7 @@ async def test_get_records_uses_search_dispatch_when_available(monkeypatch):
         _query_mod, "maybe_dispatch_items_to_search_driver", _fake_dispatch
     )
 
-    resp = await svc.get_records(
-        request=_make_request(),
-        catalog_id="cat", collection_id="col",
-        conn=None, limit=10, offset=0, filter=None, sortby=None, q=None,
-    )
+    resp = await svc.get_records(**_get_records_defaults())
 
     import json
     body = json.loads(bytes(resp.body))
@@ -174,11 +170,7 @@ async def test_get_records_falls_back_to_pg_when_dispatch_declines(monkeypatch):
         _query_mod, "maybe_dispatch_items_to_search_driver", _decline
     )
 
-    resp = await svc.get_records(
-        request=_make_request(),
-        catalog_id="cat", collection_id="col",
-        conn=None, limit=10, offset=0, filter=None, sortby=None, q=None,
-    )
+    resp = await svc.get_records(**_get_records_defaults())
 
     import json
     body = json.loads(bytes(resp.body))
@@ -208,12 +200,7 @@ async def test_get_records_skips_dispatch_for_cql_filter(monkeypatch):
         _query_mod, "maybe_dispatch_items_to_search_driver", _spy
     )
 
-    await svc.get_records(
-        request=_make_request(),
-        catalog_id="cat", collection_id="col",
-        conn=None, limit=10, offset=0,
-        filter="title = 'x'", sortby=None, q=None,
-    )
+    await svc.get_records(**_get_records_defaults(filter="title = 'x'"))
 
     assert called["dispatch"] is False  # short-circuited before dispatch
     assert catalogs.stream_called is True
@@ -332,11 +319,7 @@ async def test_get_records_skips_dispatch_for_free_text_q(monkeypatch):
         _query_mod, "maybe_dispatch_items_to_search_driver", _spy
     )
 
-    await svc.get_records(
-        request=_make_request(),
-        catalog_id="cat", collection_id="col",
-        conn=None, limit=10, offset=0, filter=None, sortby=None, q="rainfall",
-    )
+    await svc.get_records(**_get_records_defaults(q="rainfall"))
 
     assert called["dispatch"] is False
     assert catalogs.stream_called is True

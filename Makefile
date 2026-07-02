@@ -14,8 +14,12 @@ help:
 	@echo "  make test-coverage     Run full suite with coverage report"
 	@echo "  make clean             Remove pytest cache and coverage artefacts"
 
+# Derive the install set from the filesystem so added/retired extensions
+# never drift out of sync with this list.
+EXTENSION_DIRS := $(dir $(wildcard packages/extensions/*/pyproject.toml))
+
 dev-sync:
-	uv pip install -e packages/core/ packages/extensions/admin/ packages/extensions/assets/ packages/extensions/auth/ packages/extensions/catalog_status/ packages/extensions/configs/ packages/extensions/connected_systems/ packages/extensions/coverages/ packages/extensions/crs/ packages/extensions/dggs/ packages/extensions/dimensions/ packages/extensions/dwh/ packages/extensions/edr/ packages/extensions/events/ packages/extensions/features/ packages/extensions/gcp/ packages/extensions/gdal/ packages/extensions/geoid/ packages/extensions/httpx/ packages/extensions/iam/ packages/extensions/logs/ packages/extensions/maps/ packages/extensions/moving_features/ packages/extensions/notebooks/ packages/extensions/processes/ packages/extensions/proxy/ packages/extensions/records/ packages/extensions/renders/ packages/extensions/stac/ packages/extensions/stats/ packages/extensions/styles/ packages/extensions/tasks/ packages/extensions/template/ packages/extensions/tiles/ packages/extensions/volumes/ packages/extensions/web/ packages/extensions/wfs/
+	uv pip install -e packages/core/ $(addprefix -e ,$(EXTENSION_DIRS))
 
 db-up:
 	$(COMPOSE) up -d db
