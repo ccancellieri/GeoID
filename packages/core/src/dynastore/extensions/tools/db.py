@@ -21,6 +21,7 @@ from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncConnection
 from fastapi import Request
 
+from dynastore.modules.db_config.query_executor import managed_transaction
 from dynastore.tools.discovery import get_protocol
 from dynastore.models.protocols import DatabaseProtocol
 
@@ -53,6 +54,12 @@ async def get_async_connection(
     """
     engine = get_async_engine(request)
 
-    # .begin() starts a transaction and handles commit/rollback automatically.
-    async with engine.begin() as conn:
+    # managed_transaction adds pool hygiene on acquire (pre-ping recovery,
+    # transient-connect retry, poisoned-slot eviction, shielded rollback
+    # drain) and raises PoolSaturationError on acquire timeout, which the
+    # shared exception handlers map to HTTP 503.
+    async with managed_transaction(engine) as conn:
+        # managed_transaction is dual-mode (sync/async engines, connections,
+        # sessions); with an AsyncEngine input it always yields AsyncConnection.
+        assert isinstance(conn, AsyncConnection)
         yield conn
