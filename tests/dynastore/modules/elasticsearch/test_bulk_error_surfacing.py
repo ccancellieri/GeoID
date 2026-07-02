@@ -419,16 +419,19 @@ class TestItemsElasticsearchDriverWriteEntities:
                 return_value=mock_es,
             ),
             patch(
-                "dynastore.modules.elasticsearch.items_projection.resolve_catalog_known_fields",
-                new=AsyncMock(return_value=[]),
+                "dynastore.modules.storage.drivers.elasticsearch.resolve_catalog_known_fields",
+                new=AsyncMock(return_value={}),
             ),
             patch(
-                "dynastore.modules.elasticsearch.items_projection.project_item_for_es",
-                side_effect=lambda doc, _fields: doc,
+                "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+                new=AsyncMock(return_value={}),
             ),
             patch.object(
                 ItemsElasticsearchDriver, "get_driver_config",
-                new=AsyncMock(return_value=MagicMock(simplify_geometry=False, simplify_target_bytes=None)),
+                new=AsyncMock(return_value=MagicMock(
+                    simplify_geometry=False, simplify_target_bytes=None,
+                    snap_to_grid=False, snap_grid_size=1e-5,
+                )),
             ),
             patch.object(
                 ItemsElasticsearchDriver, "_enforce_field_constraints",
@@ -448,8 +451,8 @@ class TestItemsElasticsearchDriverWriteEntities:
                 return_value="test-items-cat1",
             ),
             patch(
-                "dynastore.tools.geometry_simplify.maybe_simplify_for_es",
-                side_effect=lambda doc, simplify: (doc, 1.0, "none"),
+                "dynastore.modules.storage.drivers.elasticsearch.maybe_simplify_for_es",
+                side_effect=lambda doc, **kw: (doc, 1.0, "none"),
             ),
             caplog.at_level(logging.ERROR),
         ):
@@ -481,16 +484,19 @@ class TestItemsElasticsearchDriverWriteEntities:
                 return_value=mock_es,
             ),
             patch(
-                "dynastore.modules.elasticsearch.items_projection.resolve_catalog_known_fields",
-                new=AsyncMock(return_value=[]),
+                "dynastore.modules.storage.drivers.elasticsearch.resolve_catalog_known_fields",
+                new=AsyncMock(return_value={}),
             ),
             patch(
-                "dynastore.modules.elasticsearch.items_projection.project_item_for_es",
-                side_effect=lambda doc, _fields: doc,
+                "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+                new=AsyncMock(return_value={}),
             ),
             patch.object(
                 ItemsElasticsearchDriver, "get_driver_config",
-                new=AsyncMock(return_value=MagicMock(simplify_geometry=False, simplify_target_bytes=None)),
+                new=AsyncMock(return_value=MagicMock(
+                    simplify_geometry=False, simplify_target_bytes=None,
+                    snap_to_grid=False, snap_grid_size=1e-5,
+                )),
             ),
             patch.object(
                 ItemsElasticsearchDriver, "_enforce_field_constraints",
@@ -510,8 +516,8 @@ class TestItemsElasticsearchDriverWriteEntities:
                 return_value="test-items-cat1",
             ),
             patch(
-                "dynastore.tools.geometry_simplify.maybe_simplify_for_es",
-                side_effect=lambda doc, simplify: (doc, 1.0, "none"),
+                "dynastore.modules.storage.drivers.elasticsearch.maybe_simplify_for_es",
+                side_effect=lambda doc, **kw: (doc, 1.0, "none"),
             ),
         ):
             result = await driver.write_entities("cat1", "col1", items)
@@ -559,7 +565,7 @@ class TestPrivateDriverWriteEntities:
             ),
             patch(
                 "dynastore.tools.geometry_simplify.maybe_simplify_for_es",
-                side_effect=lambda doc, simplify: (doc, 1.0, "none"),
+                side_effect=lambda doc, **kw: (doc, 1.0, "none"),
             ),
             caplog.at_level(logging.ERROR),
         ):
@@ -637,7 +643,7 @@ class TestEnvelopeDriverWriteEntities:
             patch.object(driver, "_build_doc", side_effect=lambda item, **kw: dict(item)),
             patch(
                 "dynastore.tools.geometry_simplify.maybe_simplify_for_es",
-                side_effect=lambda doc, simplify: (doc, 1.0, "none"),
+                side_effect=lambda doc, **kw: (doc, 1.0, "none"),
             ),
             caplog.at_level(logging.ERROR),
         ):
@@ -705,7 +711,14 @@ class TestCircuitBreakerOutboxEnqueue:
             breaker=breaker,
         )
 
-        ctx = IndexContext(catalog="cat1", collection="col1", correlation_id="cid")
+        # ``pg_conn`` must be a live handle for ``_enqueue_or_warn`` to
+        # actually enqueue (drop path (b), #2686): without one the durable
+        # write can't be made transactional with the caller's TX, so the
+        # dispatcher degrades to WARN instead of enqueuing.
+        ctx = IndexContext(
+            catalog="cat1", collection="col1", correlation_id="cid",
+            pg_conn=object(),
+        )
         ops = [
             IndexOp(op_type="upsert", entity_type="item", entity_id="i1"),
         ]

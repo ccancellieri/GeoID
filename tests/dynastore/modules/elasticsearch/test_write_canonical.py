@@ -1150,6 +1150,9 @@ class TestGeometrySimplificationCanonicalNested:
 
         mock_config = MagicMock()
         mock_config.simplify_geometry = True
+        mock_config.simplify_target_bytes = 1_048_576
+        mock_config.snap_to_grid = False
+        mock_config.snap_grid_size = 1e-5
         mock_config.external_id_path = MagicMock(return_value=None)
         mock_config.on_batch_conflict = None
         mock_config.on_conflict = None
@@ -1185,7 +1188,7 @@ class TestGeometrySimplificationCanonicalNested:
             ),
             patch(
                 "dynastore.modules.storage.drivers.elasticsearch.maybe_simplify_for_es",
-                side_effect=lambda doc, simplify: (doc, self._FACTOR, self._MODE),
+                side_effect=lambda doc, **kw: (doc, self._FACTOR, self._MODE),
             ),
         ):
             await driver.write_entities("cat1", "col1", [feature])
@@ -1234,6 +1237,9 @@ class TestGeometrySimplificationCanonicalNested:
 
         mock_config = MagicMock()
         mock_config.simplify_geometry = False
+        mock_config.simplify_target_bytes = 1_048_576
+        mock_config.snap_to_grid = False
+        mock_config.snap_grid_size = 1e-5
         mock_config.external_id_path = MagicMock(return_value=None)
         mock_config.on_batch_conflict = None
         mock_config.on_conflict = None
@@ -1269,7 +1275,7 @@ class TestGeometrySimplificationCanonicalNested:
             ),
             patch(
                 "dynastore.modules.storage.drivers.elasticsearch.maybe_simplify_for_es",
-                side_effect=lambda doc, simplify: (doc, 1.0, "none"),
+                side_effect=lambda doc, **kw: (doc, 1.0, "none"),
             ),
         ):
             await driver.write_entities("cat1", "col1", [feature])
@@ -1332,7 +1338,7 @@ class TestGeometrySimplificationCanonicalNested:
             ),
             patch(
                 "dynastore.modules.storage.drivers.elasticsearch.maybe_simplify_for_es",
-                side_effect=lambda doc, simplify: (doc, self._FACTOR, self._MODE),
+                side_effect=lambda doc, **kw: (doc, self._FACTOR, self._MODE),
             ),
         ):
             from dynastore.models.protocols.indexer import BulkResult
@@ -1395,7 +1401,7 @@ class TestGeometrySimplificationCanonicalNested:
             ),
             patch(
                 "dynastore.modules.storage.drivers.elasticsearch.maybe_simplify_for_es",
-                side_effect=lambda doc, simplify: (doc, self._FACTOR, self._MODE),
+                side_effect=lambda doc, **kw: (doc, self._FACTOR, self._MODE),
             ),
         ):
             await driver.index(ctx, op)
