@@ -16,11 +16,15 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Unit tests for CatalogService.reset_checklist_for_reprovision (#2395).
+"""Unit tests for CatalogService.reset_checklist_for_reprovision (#2395, #2678).
 
-The reprovision trigger resets the to-be-rerun checklist steps to 'pending' and
-flips the catalog to 'provisioning' so its status transitions monotonically
-back to 'ready'. All DB I/O is mocked.
+The reprovision trigger resets the to-be-rerun checklist steps to 'pending'.
+Since un-fao/GeoID#2678 it also has to (a) leave ``deferred`` steps alone
+unless the caller explicitly opts back in, and (b) only flip the catalog to
+'provisioning' when the resulting checklist actually has unsatisfied work —
+otherwise a generic reprovision sweep touching an already-``ready`` catalog
+would wedge it in 'provisioning' forever (nothing left pending for the
+executor task to run, so nothing ever flips it back). All DB I/O is mocked.
 """
 
 from __future__ import annotations
@@ -32,11 +36,13 @@ import pytest
 
 from dynastore.modules.catalog.provisioning_registry import (
     STEP_COMPLETE,
+    STEP_DEFERRED,
     STEP_DEGRADED,
     STEP_FAILED,
     STEP_PENDING,
     STEP_SKIPPED,
     STATUS_PROVISIONING,
+    STATUS_READY,
 )
 
 
@@ -53,7 +59,24 @@ def _txn_ctx(conn):
     return ctx
 
 
-async def _run_reset(checklist, *, force=False):
+class _CapturingQuery:
+    """Stand-in for the inline ``DQLQuery`` the terminal UPDATE builds.
+
+    Mirrors the pattern used by the ``mark_provisioning_step`` /
+    ``drain_pending_checklist_steps`` first_ready_at tests.
+    """
+
+    captured_sql: list = []
+    captured_kwargs: list = []
+
+    def __init__(self, sql, result_handler=None, **_kw):
+        type(self).captured_sql.append(sql)
+
+    async def execute(self, *_a, **kwargs):
+        type(self).captured_kwargs.append(kwargs)
+
+
+async def _run_reset(checklist, *, force=False, include_deferred=False, ensure_keys=None):
     """Invoke reset_checklist_for_reprovision; return (result, written_kwargs)."""
     svc = _make_service()
     conn = MagicMock()
@@ -66,8 +89,9 @@ async def _run_reset(checklist, *, force=False):
             else None
         )
     )
-    set_q = MagicMock()
-    set_q.execute = AsyncMock()
+
+    _CapturingQuery.captured_sql = []
+    _CapturingQuery.captured_kwargs = []
 
     with (
         patch(
@@ -75,8 +99,8 @@ async def _run_reset(checklist, *, force=False):
             get_q,
         ),
         patch(
-            "dynastore.modules.catalog.catalog_service._set_provisioning_checklist_query",
-            set_q,
+            "dynastore.modules.catalog.catalog_service.DQLQuery",
+            new=_CapturingQuery,
         ),
         patch(
             "dynastore.modules.catalog.catalog_service.managed_transaction",
@@ -87,9 +111,14 @@ async def _run_reset(checklist, *, force=False):
             return_value=MagicMock(),
         ),
     ):
-        result = await svc.reset_checklist_for_reprovision("c_x", force=force)
+        result = await svc.reset_checklist_for_reprovision(
+            "c_x",
+            force=force,
+            include_deferred=include_deferred,
+            ensure_keys=ensure_keys,
+        )
 
-    written = set_q.execute.await_args.kwargs if set_q.execute.await_args else None
+    written = _CapturingQuery.captured_kwargs[0] if _CapturingQuery.captured_kwargs else None
     return result, written
 
 
@@ -108,8 +137,9 @@ class TestResetChecklistForReprovision:
             "gcp_bucket": STEP_PENDING,
             "gcp_eventing": STEP_PENDING,
         }
-        assert written["status"] == STATUS_PROVISIONING
-        assert json.loads(written["checklist"]) == result
+        # Genuine unsatisfied work remains -> status stays 'provisioning'.
+        assert written["st"] == STATUS_PROVISIONING
+        assert json.loads(written["cl"]) == result
 
     @pytest.mark.asyncio
     async def test_skipped_steps_are_kept(self):
@@ -122,7 +152,7 @@ class TestResetChecklistForReprovision:
         checklist = {"catalog_core": STEP_COMPLETE, "gcp_bucket": STEP_SKIPPED}
         result, written = await _run_reset(checklist, force=True)
         assert result == {"catalog_core": STEP_PENDING, "gcp_bucket": STEP_PENDING}
-        assert written["status"] == STATUS_PROVISIONING
+        assert written["st"] == STATUS_PROVISIONING
 
     @pytest.mark.asyncio
     async def test_missing_row_returns_empty_and_writes_nothing(self):
@@ -135,3 +165,67 @@ class TestResetChecklistForReprovision:
         result, written = await _run_reset({})
         assert result == {}
         assert written is None
+
+
+class TestDeferredStepsSurviveReprovision:
+    """un-fao/GeoID#2678 — a 'deferred' step is left alone by a generic
+    reprovision run (this is the fix for the catalog-wide sweep resurrecting
+    a bucket the operator intentionally held back)."""
+
+    @pytest.mark.asyncio
+    async def test_deferred_left_untouched_by_default(self):
+        checklist = {"catalog_core": STEP_COMPLETE, "gcp_bucket": STEP_DEFERRED}
+        result, _written = await _run_reset(checklist)
+        assert result == {"catalog_core": STEP_COMPLETE, "gcp_bucket": STEP_DEFERRED}
+
+    @pytest.mark.asyncio
+    async def test_force_does_not_resurrect_deferred(self):
+        # force=True replays already-satisfied steps but must NOT touch a
+        # deferred one — force and deferred are orthogonal knobs.
+        checklist = {"catalog_core": STEP_COMPLETE, "gcp_bucket": STEP_DEFERRED}
+        result, _written = await _run_reset(checklist, force=True)
+        assert result == {"catalog_core": STEP_PENDING, "gcp_bucket": STEP_DEFERRED}
+
+    @pytest.mark.asyncio
+    async def test_include_deferred_resets_deferred_to_pending(self):
+        checklist = {"catalog_core": STEP_COMPLETE, "gcp_bucket": STEP_DEFERRED}
+        result, written = await _run_reset(checklist, include_deferred=True)
+        assert result == {"catalog_core": STEP_COMPLETE, "gcp_bucket": STEP_PENDING}
+        assert written["st"] == STATUS_PROVISIONING
+
+    @pytest.mark.asyncio
+    async def test_ensure_keys_does_not_disturb_existing_deferred_entry(self):
+        # A generic reprovision run's active_provisioners() includes the
+        # deferrable provisioner (defer=False default), so it lands in
+        # ensure_keys — but the key is already present as 'deferred', so the
+        # fold-in must not clobber it back to 'pending'.
+        checklist = {"catalog_core": STEP_COMPLETE, "gcp_bucket": STEP_DEFERRED}
+        result, _written = await _run_reset(
+            checklist, ensure_keys=["catalog_core", "gcp_bucket"]
+        )
+        assert result == {"catalog_core": STEP_COMPLETE, "gcp_bucket": STEP_DEFERRED}
+
+
+class TestResetDoesNotWedgeAlreadySatisfiedCatalog:
+    """un-fao/GeoID#2678 — forcing status='provisioning' unconditionally would
+    wedge a catalog that has nothing left to do (a generic sweep touching an
+    already-'ready' catalog): the executor would find zero unsatisfied steps
+    to run and never call mark_provisioning_step to flip it back."""
+
+    @pytest.mark.asyncio
+    async def test_all_terminal_good_writes_ready_not_provisioning(self):
+        checklist = {
+            "catalog_core": STEP_COMPLETE,
+            "gcp_bucket": STEP_DEFERRED,
+            "gcp_eventing": STEP_SKIPPED,
+        }
+        result, written = await _run_reset(checklist)
+        assert result == checklist
+        assert written["st"] == STATUS_READY
+
+    @pytest.mark.asyncio
+    async def test_any_remaining_pending_still_writes_provisioning(self):
+        checklist = {"catalog_core": STEP_COMPLETE, "gcp_bucket": STEP_FAILED}
+        result, written = await _run_reset(checklist)
+        assert result == {"catalog_core": STEP_COMPLETE, "gcp_bucket": STEP_PENDING}
+        assert written["st"] == STATUS_PROVISIONING

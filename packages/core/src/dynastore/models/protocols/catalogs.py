@@ -315,15 +315,19 @@ class CatalogsProtocol(ItemCrudProtocol, ItemQueryProtocol, ItemIntrospectionPro
         *,
         force: bool = False,
         ensure_keys: Optional[Iterable[str]] = None,
+        include_deferred: bool = False,
         ctx: Optional["DriverContext"] = None,
     ) -> Dict[str, str]:
         """Reset the checklist for a reprovision and set status='provisioning' (#2395).
 
         With ``force=False`` every step that is not already ``complete`` /
         ``skipped`` is reset to ``pending`` (re-run only what failed); with
-        ``force=True`` every step is reset (full replay). ``ensure_keys`` adds
-        any provisioner key not already in the checklist as ``pending`` (folds
-        in previously-deferred steps on an explicit provision run). Returns
+        ``force=True`` every step is reset (full replay). ``deferred`` steps
+        (un-fao/GeoID#2678) are always left alone unless ``include_deferred=
+        True`` explicitly opts them back into ``pending`` — ``force`` alone
+        never resurrects a held-back provisioner. ``ensure_keys`` adds any
+        provisioner key not already in the checklist as ``pending`` (folds in
+        previously-deferred steps on an explicit provision run). Returns
         the new checklist, or ``{}`` when there is no checklist to reprovision.
         """
         ...

@@ -21,13 +21,17 @@ when the backing GCS bucket is missing for a catalog marked ready.
 
 Two separate cases when ``get_storage_identifier`` returns ``None``:
 
-1. **Deferred catalog** (``gcp_bucket`` not in checklist): the catalog was
-   created bucket-free via ``?hints=defer`` and never provisioned.
+1. **Deferred catalog** (``gcp_bucket`` absent from the checklist, or present
+   with the terminal ``"deferred"`` state — un-fao/GeoID#2678): the catalog
+   was created bucket-free via ``?hints=defer`` and never provisioned.
    ``mark_provisioning_step`` must NOT be called (no false demotion) and
-   ``GcpStorageDeferredError`` (HTTP 409) must be raised.
+   ``GcpStorageDeferredError`` (HTTP 409) must be raised. The absent-key form
+   covers a catalog created before #2678 landed (no persisted marker to read);
+   the ``"deferred"`` state form covers one created after.
 
-2. **Stale ready state** (``gcp_bucket`` IS in checklist): the bucket went
-   missing after provisioning — the stored status is stale.
+2. **Stale ready state** (``gcp_bucket`` IS in checklist as ``complete`` /
+   any non-``"deferred"`` terminal state): the bucket went missing after
+   provisioning — the stored status is stale.
    ``mark_provisioning_step(catalog_id, "gcp_bucket", "failed")`` must be
    called (best-effort) and ``GcpFailedDependencyError`` (HTTP 424) must be
    raised.
@@ -226,16 +230,17 @@ async def test_missing_bucket_without_catalogs_protocol_still_raises():
 
 @pytest.mark.asyncio
 async def test_deferred_catalog_raises_409_and_does_not_demote():
-    """A catalog whose checklist has NO 'gcp_bucket' entry (deferred at create)
-    must raise ``GcpStorageDeferredError`` and must NOT call
-    ``mark_provisioning_step`` — the catalog is intentionally bucket-free."""
+    """A catalog whose checklist has NO 'gcp_bucket' entry (deferred at
+    create, before un-fao/GeoID#2678's persisted marker landed) must raise
+    ``GcpStorageDeferredError`` and must NOT call ``mark_provisioning_step``
+    — the catalog is intentionally bucket-free."""
     host = _Host(bucket_name=None, provisioning_status="ready")
     fake_cat = _fake_catalog("ready")
 
     catalogs_mock = MagicMock()
     catalogs_mock.get_catalog = AsyncMock(return_value=fake_cat)
     catalogs_mock.mark_provisioning_step = AsyncMock(return_value=True)
-    # Checklist lacks 'gcp_bucket' — deferred catalog
+    # Checklist lacks 'gcp_bucket' — deferred catalog (pre-#2678 create)
     catalogs_mock.get_provisioning_checklist = AsyncMock(
         return_value={"catalog_core": "complete"}
     )
@@ -265,6 +270,46 @@ async def test_deferred_catalog_raises_409_and_does_not_demote():
     assert "cat-deferred" in msg
     assert "catalog_provision" in msg
     assert "virtual" in msg.lower()
+
+
+@pytest.mark.asyncio
+async def test_deferred_state_catalog_raises_409_and_does_not_demote():
+    """un-fao/GeoID#2678: a catalog whose checklist has 'gcp_bucket': 'deferred'
+    (the persisted marker written by a post-fix ``?hints=defer`` create) is
+    ALSO deferred, not stale — must raise ``GcpStorageDeferredError`` and must
+    NOT call ``mark_provisioning_step``."""
+    host = _Host(bucket_name=None, provisioning_status="ready")
+    fake_cat = _fake_catalog("ready")
+
+    catalogs_mock = MagicMock()
+    catalogs_mock.get_catalog = AsyncMock(return_value=fake_cat)
+    catalogs_mock.mark_provisioning_step = AsyncMock(return_value=True)
+    # 'gcp_bucket' IS present, marked 'deferred' — still a deferred catalog,
+    # not a stale-ready one.
+    catalogs_mock.get_provisioning_checklist = AsyncMock(
+        return_value={"catalog_core": "complete", "gcp_bucket": "deferred"}
+    )
+
+    from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
+
+    def _proto(proto):
+        if proto is CatalogsProtocol:
+            return catalogs_mock
+        if proto is ConfigsProtocol:
+            return None
+        return None
+
+    with patch(_GET_PROTOCOL, side_effect=_proto):
+        with pytest.raises(GcpStorageDeferredError) as exc_info:
+            await host.initiate_upload(
+                catalog_id="cat-deferred-marked",
+                asset_def=_fake_asset_def(),
+                filename="data.tif",
+            )
+
+    # Must NOT demote — the catalog is deliberately bucket-free.
+    catalogs_mock.mark_provisioning_step.assert_not_awaited()
+    assert "cat-deferred-marked" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------

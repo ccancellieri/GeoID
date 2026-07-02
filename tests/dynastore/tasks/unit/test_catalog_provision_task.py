@@ -59,6 +59,7 @@ def _make_payload(
     collection_id: str | None = None,
     force: bool = False,
     defer: bool = False,
+    include_deferred: bool = False,
 ) -> Any:
     from dynastore.tasks.catalog_provision.task import CatalogProvisionInputs
     from dynastore.models.tasks import TaskPayload
@@ -70,6 +71,7 @@ def _make_payload(
         collection_id=collection_id,
         force=force,
         defer=defer,
+        include_deferred=include_deferred,
     )
     return TaskPayload(task_id=uuid.uuid4(), caller_id="test", inputs=inputs)
 
@@ -932,7 +934,9 @@ class TestRoutingMatrix:
 # ---------------------------------------------------------------------------
 
 
-async def _run_with(groups, *, checklist=None, force=False, operation="provision"):
+async def _run_with(
+    groups, *, checklist=None, force=False, operation="provision", include_deferred=False
+):
     """Invoke run() with the given provisioner groups and checklist.
 
     Returns (result, mock_catalogs, emit_mock).
@@ -940,7 +944,7 @@ async def _run_with(groups, *, checklist=None, force=False, operation="provision
     from unittest.mock import patch as _patch
 
     task = _make_task()
-    payload = _make_payload(force=force, operation=operation)
+    payload = _make_payload(force=force, operation=operation, include_deferred=include_deferred)
     mock_catalogs = _mock_catalogs(checklist=checklist)
 
     with _patch(
@@ -1065,3 +1069,81 @@ class TestReprovisionChecklistAware:
         assert sorted(ran) == ["catalog_core", "gcp_bucket"]
         assert result["groups_run"] == 2
         emit_mock.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Deferred steps survive a generic reprovision (un-fao/GeoID#2678)
+# ---------------------------------------------------------------------------
+
+
+class TestReprovisionRespectsDeferred:
+    """A 'deferred' checklist entry (a provisioner intentionally held back by
+    a ``?hints=defer`` create) must not run on a generic reprovision — even
+    though ``active_provisioners`` reports it as active — unless the task is
+    explicitly told ``include_deferred=True``."""
+
+    @pytest.mark.asyncio
+    async def test_deferred_step_does_not_run_by_default(self):
+        ran: List[str] = []
+
+        def make_hook(name: str):
+            async def hook(**ctx):
+                ran.append(name)
+            return hook
+
+        core = _make_provisioner("catalog_core", priority=0, provision_fn=make_hook("catalog_core"))
+        bucket = _make_provisioner("gcp_bucket", priority=1, provision_fn=make_hook("gcp_bucket"))
+        groups = [[core], [bucket]]
+        checklist = {"catalog_core": "complete", "gcp_bucket": "deferred"}
+
+        result, mock_catalogs, emit_mock = await _run_with(groups, checklist=checklist)
+
+        assert ran == [], "the deferred provisioner must not run on a generic reprovision"
+        assert result["groups_run"] == 0
+        emit_mock.assert_not_awaited()
+        reset_kwargs = mock_catalogs.reset_checklist_for_reprovision.call_args.kwargs
+        assert reset_kwargs["include_deferred"] is False
+
+    @pytest.mark.asyncio
+    async def test_deferred_step_runs_when_include_deferred(self):
+        ran: List[str] = []
+
+        async def hook(**ctx):
+            ran.append("gcp_bucket")
+
+        bucket = _make_provisioner("gcp_bucket", priority=1, provision_fn=hook)
+        groups = [[bucket]]
+        checklist = {"gcp_bucket": "deferred"}
+
+        result, mock_catalogs, _emit = await _run_with(
+            groups, checklist=checklist, include_deferred=True
+        )
+
+        assert ran == ["gcp_bucket"]
+        assert result["groups_run"] == 1
+        reset_kwargs = mock_catalogs.reset_checklist_for_reprovision.call_args.kwargs
+        assert reset_kwargs["include_deferred"] is True
+
+    @pytest.mark.asyncio
+    async def test_force_alone_does_not_run_deferred_step(self):
+        """force=True replays satisfied steps but must not resurrect a
+        deferred one on its own — only include_deferred=True does that."""
+        ran: List[str] = []
+
+        def make_hook(name: str):
+            async def hook(**ctx):
+                ran.append(name)
+            return hook
+
+        core = _make_provisioner("catalog_core", priority=0, provision_fn=make_hook("catalog_core"))
+        bucket = _make_provisioner("gcp_bucket", priority=1, provision_fn=make_hook("gcp_bucket"))
+        groups = [[core], [bucket]]
+        checklist = {"catalog_core": "complete", "gcp_bucket": "deferred"}
+
+        result, _cat, _emit = await _run_with(groups, checklist=checklist, force=True)
+
+        assert ran == ["catalog_core"], (
+            "force replays 'catalog_core' (already complete) but must still "
+            "skip the deferred 'gcp_bucket'"
+        )
+        assert result["groups_run"] == 1

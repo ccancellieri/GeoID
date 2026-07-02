@@ -36,6 +36,7 @@ from dynastore.modules.catalog.provisioning_registry import (
     STATUS_FAILED,
     STATUS_READY,
     STEP_COMPLETE,
+    STEP_DEFERRED,
     STEP_FAILED,
     STEP_PENDING,
     STEP_SKIPPED,
@@ -62,6 +63,15 @@ class TestEvaluateChecklist:
 
     def test_all_skipped_is_ready(self):
         assert evaluate_checklist({"a": STEP_SKIPPED}) == STATUS_READY
+
+    def test_complete_plus_deferred_is_ready(self):
+        # 'deferred' counts as terminal-good too (un-fao/GeoID#2678) — a
+        # deferred-at-birth catalog must still reach 'ready' on its
+        # non-deferred steps alone.
+        assert evaluate_checklist({"a": STEP_COMPLETE, "b": STEP_DEFERRED}) == STATUS_READY
+
+    def test_all_deferred_is_ready(self):
+        assert evaluate_checklist({"a": STEP_DEFERRED}) == STATUS_READY
 
     def test_any_failed_is_failed(self):
         assert evaluate_checklist({"a": STEP_COMPLETE, "b": STEP_FAILED}) == STATUS_FAILED
@@ -212,11 +222,15 @@ class TestDeferrableProvisioners:
 
     @pytest.mark.asyncio
     async def test_deferrable_held_back_when_defer(self):
+        # un-fao/GeoID#2678: the deferred provisioner is NOT held back from
+        # the checklist entirely — it is recorded with the terminal
+        # "deferred" state so a later reprovision run can recognise the
+        # intentional hold-back instead of resurrecting it.
         reg = ProvisioningRegistry()
         reg.register("catalog_core", _active, priority=0)
         reg.register("gcp_bucket", _active, priority=100, deferrable=True)
         checklist = await reg.build_checklist("cat", defer=True)
-        assert checklist == {"catalog_core": STEP_PENDING}
+        assert checklist == {"catalog_core": STEP_PENDING, "gcp_bucket": STEP_DEFERRED}
 
     @pytest.mark.asyncio
     async def test_non_deferrable_unaffected_by_defer(self):
@@ -225,8 +239,19 @@ class TestDeferrableProvisioners:
         reg.register("catalog_core", _active, priority=0)
         reg.register("gcp_bucket", _active, priority=100, deferrable=True)
         checklist = await reg.build_checklist("cat", defer=True)
-        assert "catalog_core" in checklist
-        assert "gcp_bucket" not in checklist
+        assert checklist["catalog_core"] == STEP_PENDING
+        assert checklist["gcp_bucket"] == STEP_DEFERRED
+
+    @pytest.mark.asyncio
+    async def test_inactive_deferrable_still_excluded_when_deferred(self):
+        # A deferrable provisioner that is not active for this catalog at all
+        # (predicate returns False) must not appear in the checklist even as
+        # "deferred" — "deferred" only marks work that would have run.
+        reg = ProvisioningRegistry()
+        reg.register("catalog_core", _active, priority=0)
+        reg.register("gcp_bucket", _inactive, priority=100, deferrable=True)
+        checklist = await reg.build_checklist("cat", defer=True)
+        assert checklist == {"catalog_core": STEP_PENDING}
 
     @pytest.mark.asyncio
     async def test_active_provisioners_include_deferrable_by_default(self):
@@ -253,48 +278,54 @@ class TestDeferrableProvisioners:
         assert reg._provisioners["plain"].deferrable is False
 
 
-class TestReprovisionDefeatsDefer:
-    """KNOWN GAP (un-fao/GeoID#2678): ``defer`` is a request-time flag only —
-    a checklist built with ``defer=True`` simply excludes deferrable
-    provisioners rather than recording that they were intentionally held
-    back.  A later rebuild with the default ``defer=False`` (what a generic
-    ``catalog_provision`` reprovision run uses unless it is explicitly told
-    the catalog was deferred) folds the deferrable provisioners back in.
-
-    This characterises the *current* registry behaviour so a future fix
-    (persisting a terminal ``deferred`` checklist state) has a red test to
-    turn green.  It is a pre-existing platform gap, not something introduced
-    or fixed by any single preset's use of ``Hint.DEFER``.
+class TestDeferredStatePersistsAcrossReprovision:
+    """FIXED (un-fao/GeoID#2678): a checklist built with ``defer=True`` now
+    records a terminal ``deferred`` entry for each held-back provisioner
+    instead of omitting the key entirely. The registry layer alone cannot
+    prevent a later ``active_provisioners(defer=False)`` call from listing
+    the deferrable provisioner as active again — that is expected, since
+    "active" answers "does this catalog need this provisioner at all", not
+    "was it already handled". What matters is that the *checklist* — the
+    thing that is actually persisted to PG and consulted by
+    ``reset_checklist_for_reprovision`` — carries the "deferred" marker so
+    the reprovision layer (tested separately in
+    ``test_reset_checklist_for_reprovision.py`` and
+    ``test_catalog_provision_task.py``) can recognise the intentional
+    hold-back and leave it alone.
     """
 
     @pytest.mark.asyncio
-    async def test_deferred_checklist_has_no_trace_of_the_held_back_step(self):
+    async def test_deferred_checklist_records_the_held_back_step(self):
         reg = ProvisioningRegistry()
         reg.register("catalog_core", _active, priority=0)
         reg.register("gcp_bucket", _active, priority=100, deferrable=True)
 
         deferred_checklist = await reg.build_checklist("cat", defer=True)
 
-        # Bucket-free intent has no persisted marker — the key is simply absent.
-        assert deferred_checklist == {"catalog_core": STEP_PENDING}
-        assert "gcp_bucket" not in deferred_checklist
+        # Bucket-free intent IS persisted — the key is present as "deferred",
+        # not silently absent.
+        assert deferred_checklist == {
+            "catalog_core": STEP_PENDING,
+            "gcp_bucket": STEP_DEFERRED,
+        }
 
     @pytest.mark.asyncio
-    async def test_undeferred_rebuild_resurrects_the_held_back_provisioner(self):
+    async def test_active_provisioners_still_reports_deferrable_as_active(self):
+        # active_provisioners answers a different question than the
+        # checklist: "is this provisioner active for this catalog at all"
+        # (used by the executor to decide what CAN run), independent of
+        # whether a specific run should actually run it. The reprovision-time
+        # gating on the persisted "deferred" checklist state lives in
+        # CatalogProvisionTask / reset_checklist_for_reprovision, not here.
         reg = ProvisioningRegistry()
         reg.register("catalog_core", _active, priority=0)
         reg.register("gcp_bucket", _active, priority=100, deferrable=True)
 
         await reg.build_checklist("cat", defer=True)  # simulates the deferred create
 
-        # A generic reprovision run (defer defaults False) has no way to know
-        # gcp_bucket was ever deferred — it comes right back.
         rebuilt = await reg.active_provisioners("cat", defer=False)
         keys = [p.key for group in rebuilt for p in group]
-        assert "gcp_bucket" in keys, (
-            "documents un-fao/GeoID#2678 — remove this assertion once "
-            "deferred state is persisted and reprovision honours it"
-        )
+        assert "gcp_bucket" in keys
 
 
 class TestBackwardCompatRegister:

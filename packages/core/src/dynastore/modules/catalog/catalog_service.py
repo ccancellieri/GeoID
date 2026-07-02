@@ -3299,15 +3299,27 @@ class CatalogService(CatalogsProtocol):
         *,
         force: bool = False,
         ensure_keys: Optional[Iterable[str]] = None,
+        include_deferred: bool = False,
         ctx: Optional["DriverContext"] = None,
     ) -> dict[str, str]:
         """Reset the checklist for a reprovision and set status='provisioning' (#2395).
 
         Used by the reprovision trigger before re-enqueuing ``catalog_provision``.
         With ``force=False`` every step that is not already satisfied
-        (``complete`` / ``skipped``) is reset to ``pending``; satisfied steps are
-        left untouched so the executor re-runs only what failed. With
-        ``force=True`` every step is reset to ``pending`` (full replay).
+        (``complete`` / ``skipped``) is reset to ``pending``; satisfied steps
+        are left untouched so the executor re-runs only what failed. With
+        ``force=True`` every step (other than ``deferred``, see below) is
+        reset to ``pending`` regardless of its current state (full replay).
+
+        ``deferred`` steps (un-fao/GeoID#2678 — a provisioner intentionally
+        held back by a ``?hints=defer`` create) are left untouched by
+        default — including under ``force=True`` — so a generic reprovision
+        run never resurrects a held-back provisioner by accident. ``force``
+        and ``deferred`` are orthogonal knobs: ``force`` replays already-
+        satisfied steps, ``include_deferred`` opts a held-back step back in.
+        Pass ``include_deferred=True`` to reset every ``deferred`` step to
+        ``pending`` too (this is what the ``catalog_provision`` task's
+        ``include_deferred=True`` input threads through).
 
         ``ensure_keys`` lists provisioner keys the executor is about to run.
         Any key not already in the stored checklist is added as ``pending``.
@@ -3329,12 +3341,25 @@ class CatalogService(CatalogsProtocol):
         (e.g. on-prem / no active provisioners) — nothing to reprovision. The
         read is row-locked (``FOR UPDATE``) so it serialises with concurrent
         provisioner step marks.
+
+        A reset that leaves every step terminal-good (e.g. a generic sweep
+        touching a catalog that was already fully ``ready``/``deferred``, with
+        nothing genuinely failed to replay) does NOT force the status to
+        ``provisioning`` — it re-evaluates the checklist and writes the status
+        that actually holds. Forcing ``provisioning`` unconditionally would
+        wedge the catalog there forever: the executor task would find no
+        unsatisfied steps to run and never call ``mark_provisioning_step`` to
+        flip it back (un-fao/GeoID#2678 — this is exactly what a "reprovision
+        every catalog" sweep hits on an already-``ready`` deferred-at-birth
+        catalog).
         """
         from dynastore.modules.catalog.provisioning_registry import (
             STEP_PENDING,
             STEP_COMPLETE,
             STEP_SKIPPED,
+            STEP_DEFERRED,
             STATUS_PROVISIONING,
+            evaluate_checklist,
         )
 
         db_resource = ctx.db_resource if ctx else None
@@ -3350,6 +3375,12 @@ class CatalogService(CatalogsProtocol):
                 else (json.loads(raw) if isinstance(raw, str) else dict(raw))
             )
             for key, state in list(checklist.items()):
+                if state == STEP_DEFERRED and not include_deferred:
+                    # Held back on purpose (un-fao/GeoID#2678): only an
+                    # explicit include_deferred=True un-defers it — ``force``
+                    # is an orthogonal "replay satisfied steps too" knob and
+                    # must not accidentally resurrect a deferred provisioner.
+                    continue
                 if force or state not in (STEP_COMPLETE, STEP_SKIPPED):
                     checklist[key] = STEP_PENDING
             # Fold in any newly-active steps the executor will run (deferred GCP
@@ -3360,12 +3391,20 @@ class CatalogService(CatalogsProtocol):
                     checklist[key] = STEP_PENDING
             if not checklist:
                 return {}
-            await _set_provisioning_checklist_query.execute(
-                conn,
-                id=catalog_id,
-                status=STATUS_PROVISIONING,
-                checklist=json.dumps(checklist),
-            )
+            # evaluate_checklist can only return STATUS_READY or None here —
+            # every step that was 'failed' was just reset to 'pending' above,
+            # so no 'failed' state survives into this checklist.
+            new_status = evaluate_checklist(checklist)
+            final_status = new_status if new_status is not None else STATUS_PROVISIONING
+            await DQLQuery(
+                "UPDATE catalog.catalogs "
+                "SET provisioning_checklist = CAST(:cl AS jsonb), "
+                "provisioning_status = :st, "
+                "first_ready_at = CASE WHEN CAST(:st AS VARCHAR) = 'ready' "
+                "THEN COALESCE(first_ready_at, NOW()) ELSE first_ready_at END "
+                "WHERE id = :id;",
+                result_handler=ResultHandler.NONE,
+            ).execute(conn, id=catalog_id, cl=json.dumps(checklist), st=final_status)
         return checklist
 
 

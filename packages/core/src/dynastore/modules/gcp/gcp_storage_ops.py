@@ -221,15 +221,24 @@ class GcpStorageOpsMixin:
 
         bucket_name = await self.get_storage_identifier(catalog_id)
         if not bucket_name:
-            # Distinguish a deliberately deferred catalog (no gcp_bucket step in
-            # the checklist → never provisioned) from a stale ready state (the
-            # step IS in the checklist but the bucket is gone).
+            # Distinguish a deliberately deferred catalog from a stale ready
+            # state (the step IS in the checklist, marked done, but the
+            # bucket is gone). Since un-fao/GeoID#2678 a ``?hints=defer``
+            # create records the held-back step as "deferred" (a terminal
+            # checklist state), rather than omitting the key — but a catalog
+            # created before that fix landed still has the key simply
+            # absent, so both are treated as deferred here.
+            from dynastore.modules.catalog.provisioning_registry import (
+                STEP_DEFERRED,
+            )
+
             checklist = {}
             try:
                 checklist = await catalogs_provider.get_provisioning_checklist(catalog_id) or {}
             except Exception:
                 checklist = {}
-            if "gcp_bucket" not in checklist:
+            gcp_bucket_state = checklist.get("gcp_bucket")
+            if gcp_bucket_state is None or gcp_bucket_state == STEP_DEFERRED:
                 # Storage was deferred at create (?hints=defer) and never
                 # provisioned — the catalog is intentionally bucket-free, not
                 # broken. Don't demote; tell the caller to provision on demand.

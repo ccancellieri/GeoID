@@ -92,6 +92,17 @@ class CatalogProvisionInputs(BaseModel):
     # on the provisioning registry. Ignored for deprovision, which always tears
     # down every provisioner including the deferrable ones.
     defer: bool = False
+    # Explicit opt back in to a provisioner previously held back by a
+    # ``?hints=defer`` create (un-fao/GeoID#2678). The checklist marks a
+    # held-back provisioner's step ``"deferred"`` — a terminal-good state a
+    # generic reprovision run leaves untouched by default, so the same catalog
+    # can be reprovisioned (e.g. to retry a genuinely failed step) without
+    # accidentally resurrecting a bucket the operator meant to keep off.
+    # Set ``include_deferred=True`` to run the held-back provisioners on this
+    # run and flip their checklist entries back to ``pending``. Ignored for
+    # deprovision, which always tears down every provisioner including
+    # deferred ones.
+    include_deferred: bool = False
     # Deprovision context (#2340): config snapshot captured before any
     # deprovision hook runs. Required for deprovision operations so
     # external-resource cleanup (GCP bucket, eventing) can act on the
@@ -127,6 +138,7 @@ class CatalogProvisionTask(TaskProtocol):
         collection_id = inputs.collection_id
         force = inputs.force
         defer = inputs.defer
+        include_deferred = inputs.include_deferred
         config_snapshot = inputs.config_snapshot
 
         if not catalog_id:
@@ -219,7 +231,10 @@ class CatalogProvisionTask(TaskProtocol):
         # 'pending' and flip the catalog status to 'provisioning' so the
         # status transitions monotonically (failed → provisioning → ready)
         # rather than staying on 'failed' while new steps complete.
-        # With force=True every step is reset unconditionally (full replay).
+        # With force=True every step is reset unconditionally (full replay),
+        # EXCEPT a ``deferred`` step (un-fao/GeoID#2678), which is left alone
+        # unless ``include_deferred=True`` — a held-back provisioner must
+        # never be resurrected by a generic reprovision run, forced or not.
         # ``ensure_keys`` adds any active provisioner not yet in the checklist —
         # the deferred GCP steps on an explicit provision of a ``?hints=defer``
         # catalog, whose create seeded only ``catalog_core``. When the checklist
@@ -227,7 +242,10 @@ class CatalogProvisionTask(TaskProtocol):
         if operation == "provision":
             ensure_keys = [p.key for group in groups for p in group]
             await catalogs.reset_checklist_for_reprovision(
-                catalog_id, force=force, ensure_keys=ensure_keys
+                catalog_id,
+                force=force,
+                ensure_keys=ensure_keys,
+                include_deferred=include_deferred,
             )
 
         # Reprovision only what failed (#2395). For a ``provision`` run that is
@@ -239,17 +257,30 @@ class CatalogProvisionTask(TaskProtocol):
         # on a max_retries replay the completed steps are skipped instead of
         # relying on every hook honouring IF-NOT-EXISTS. Deprovision always
         # runs every teardown hook, so the filter is provision-only.
-        if operation == "provision" and not force:
+        #
+        # A ``deferred`` step (un-fao/GeoID#2678) is ALSO dropped here —
+        # regardless of ``force`` — unless ``include_deferred=True``: the reset
+        # above deliberately left it ``deferred`` rather than ``pending``, so
+        # this filter must exclude it from ``groups`` too or the held-back
+        # provisioner would still run despite its checklist entry staying
+        # untouched.
+        if operation == "provision":
             from dynastore.modules.catalog.provisioning_registry import (
                 STEP_COMPLETE,
                 STEP_SKIPPED,
+                STEP_DEFERRED,
             )
+
+            def _is_satisfied(state: str) -> bool:
+                if state == STEP_DEFERRED:
+                    return not include_deferred
+                if force:
+                    return False
+                return state in (STEP_COMPLETE, STEP_SKIPPED)
 
             checklist = await catalogs.get_provisioning_checklist(catalog_id)
             satisfied = {
-                key
-                for key, state in checklist.items()
-                if state in (STEP_COMPLETE, STEP_SKIPPED)
+                key for key, state in checklist.items() if _is_satisfied(state)
             }
             if satisfied:
                 groups = [

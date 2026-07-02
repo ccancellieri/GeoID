@@ -47,14 +47,21 @@ Model
   synchronously, or later from its async task — via
   ``CatalogsProtocol.mark_provisioning_step``.
 - :func:`evaluate_checklist` is the terminal rule (the "default last" step):
-  when every item is terminal-good (``complete``/``skipped``) the catalog
-  becomes ``ready``; any ``failed`` item makes it ``failed``; otherwise it stays
-  ``provisioning``.
+  when every item is terminal-good (``complete``/``skipped``/``deferred``) the
+  catalog becomes ``ready``; any ``failed`` item makes it ``failed``; otherwise
+  it stays ``provisioning``.
 
 ``skipped`` vs ``failed``: a provisioner that, at execution time, discovers it
 is not actually able to act for this deployment (e.g. GCP enabled by config but
 the host has no usable credentials) marks its step ``skipped`` so the catalog
 still becomes ready. ``failed`` is reserved for a genuine provisioning error.
+
+``deferred`` (un-fao/GeoID#2678): a ``deferrable`` provisioner intentionally
+held back by a ``?hints=defer`` create. Unlike ``skipped`` (the provisioner
+decided at execution time it has nothing to do), ``deferred`` means "there
+IS work, it was deliberately not run yet" — a distinction
+``reset_checklist_for_reprovision`` uses to leave it alone on a generic
+reprovision run instead of folding it back in as ``pending``.
 """
 
 from __future__ import annotations
@@ -72,6 +79,7 @@ __all__ = [
     "STEP_FAILED",
     "STEP_SKIPPED",
     "STEP_DEGRADED",
+    "STEP_DEFERRED",
     "STATUS_PROVISIONING",
     "STATUS_DELETING",
     "STATUS_READY",
@@ -95,6 +103,15 @@ STEP_SKIPPED = "skipped"
 # still reaches ``ready`` — the feature is unavailable but storage/STAC works.
 # Operators can repair via POST /catalog/catalogs/{id}/reprovision.
 STEP_DEGRADED = "degraded"
+# ``deferred``: a ``deferrable`` provisioner that was intentionally held back
+# by a ``?hints=defer`` create (un-fao/GeoID#2678). Terminal-good like
+# ``skipped`` — it never blocks readiness — but distinct so
+# ``reset_checklist_for_reprovision`` can tell "never ran, on purpose" from
+# "ran and finished"/"not applicable" and leave it alone on a generic
+# reprovision run instead of folding it back in as ``pending``. A caller that
+# wants the deferred work to actually run opts back in explicitly (the
+# ``catalog_provision`` task's ``include_deferred=True`` input).
+STEP_DEFERRED = "deferred"
 
 # Catalog-level ``provisioning_status`` values this module drives.
 STATUS_PROVISIONING = "provisioning"
@@ -109,7 +126,9 @@ SCOPE_COLLECTION = "collection"
 
 # Terminal-good states: catalog flips to ``ready`` when all steps are in this set.
 # ``degraded`` is intentionally included — a degraded step must not block readiness.
-_TERMINAL_GOOD = frozenset({STEP_COMPLETE, STEP_SKIPPED, STEP_DEGRADED})
+# ``deferred`` is included too — a deferred-at-birth catalog must still reach
+# ``ready`` on its non-deferred steps alone (un-fao/GeoID#2678).
+_TERMINAL_GOOD = frozenset({STEP_COMPLETE, STEP_SKIPPED, STEP_DEGRADED, STEP_DEFERRED})
 
 # ``async (catalog_id, conn) -> bool``
 ProvisionerPredicate = Callable[[str, Optional[Any]], Awaitable[bool]]
@@ -181,14 +200,16 @@ def evaluate_checklist(checklist: Optional[Dict[str, str]]) -> Optional[str]:
 
     Returns:
         - :data:`STATUS_READY` when there are no items, or every item is
-          terminal-good (``complete``/``skipped``/``degraded``);
+          terminal-good (``complete``/``skipped``/``degraded``/``deferred``);
         - :data:`STATUS_FAILED` when any item is ``failed``;
         - ``None`` when at least one item is still ``pending`` (no change —
           the catalog stays ``provisioning``).
 
     ``degraded`` steps are terminal-good: the catalog becomes usable for
     storage/STAC even when a best-effort provisioning step (e.g. eventing)
-    could not complete.
+    could not complete. ``deferred`` steps are terminal-good too: a
+    ``?hints=defer`` create must still reach ``ready`` on its non-deferred
+    steps alone (un-fao/GeoID#2678).
     """
     if not checklist:
         return STATUS_READY
@@ -312,28 +333,37 @@ class ProvisioningRegistry:
         They are evaluated in ``(priority, key)`` order so the resulting dict's
         insertion order is deterministic.
 
-        By default every active provisioner participates. When ``defer`` is
-        ``True`` (a ``?hints=defer`` create) the ``deferrable`` provisioners are
-        held back so the catalog reaches ``ready`` on its core steps alone and
-        can be configured before storage provisioning runs; the explicit
-        provision task then builds the checklist with ``defer=False`` to include
-        them.
+        By default every active provisioner participates and maps to
+        ``"pending"``. When ``defer`` is ``True`` (a ``?hints=defer`` create) an
+        active ``deferrable`` provisioner is NOT held back from the checklist
+        — it is recorded with the terminal ``"deferred"`` state instead
+        (un-fao/GeoID#2678). Persisting the decision this way, rather than
+        simply omitting the key, is what lets a later generic reprovision run
+        (:meth:`CatalogsProtocol.reset_checklist_for_reprovision`) recognise
+        the provisioner was intentionally held back and leave it alone instead
+        of folding it back in as ``pending``.
 
-        Every active provisioner's key maps to ``"pending"``. A predicate that
-        raises is treated as inactive (logged) — a misbehaving provisioner must
-        never block catalog readiness.
+        A predicate that raises is treated as inactive (logged) — a
+        misbehaving provisioner must never block catalog readiness.
         """
         checklist: Dict[str, str] = {}
-        for provisioner in self._sorted_provisioners(scope, defer=defer):
+        for provisioner in sorted(
+            (p for p in self._provisioners.values() if p.scope == scope),
+            key=lambda p: (p.priority, p.key),
+        ):
             try:
-                if await provisioner.is_active(catalog_id, conn):
-                    checklist[provisioner.key] = STEP_PENDING
+                if not await provisioner.is_active(catalog_id, conn):
+                    continue
             except Exception:  # noqa: BLE001 — a bad predicate can't wedge readiness
                 logger.warning(
                     "Provisioner '%s' is_active predicate failed for catalog '%s'; "
                     "treating as inactive.",
                     provisioner.key, catalog_id, exc_info=True,
                 )
+                continue
+            checklist[provisioner.key] = (
+                STEP_DEFERRED if (defer and provisioner.deferrable) else STEP_PENDING
+            )
         return checklist
 
     async def active_provisioners(
