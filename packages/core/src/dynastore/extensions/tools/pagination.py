@@ -43,6 +43,19 @@ def resolve_page_limit(
     return max(1, min(eff, max_limit))
 
 
+def _paged_link(request: Request, offset: int, rel: str, media_type: str) -> Link:
+    """Build a single ``rel`` link at the given ``offset``, preserving every
+    other query parameter of the current request. Shared by
+    :func:`build_pagination_links` (prev/next) and :func:`build_next_link`
+    (byte-budget-corrected next).
+    """
+    base_url = str(request.url).split("?")[0]
+    params = dict(request.query_params)
+    params["offset"] = str(offset)
+    href = f"{base_url}?{'&'.join(f'{k}={v}' for k, v in params.items())}"
+    return Link(href=href, rel=rel, type=media_type)
+
+
 def build_pagination_links(
     request: Request,
     offset: int,
@@ -62,34 +75,46 @@ def build_pagination_links(
     Returns:
         List of Link objects containing at minimum a ``self`` link,
         plus ``prev`` and/or ``next`` when applicable.
-    """
-    base_url = str(request.url).split("?")[0]
-    query_params = dict(request.query_params)
 
+    Note: the ``next`` link built here assumes the page actually returned
+    ``limit`` items. A caller whose page can be cut short by something other
+    than the SQL ``LIMIT`` (e.g. a response byte budget) must replace it with
+    :func:`build_next_link`, computed from the number of items actually
+    served.
+    """
     links: List[Link] = [
         Link(href=str(request.url), rel="self", type=media_type),
     ]
 
     if offset > 0:
-        prev_params = query_params.copy()
-        prev_params["offset"] = str(max(0, offset - limit))
-        links.append(
-            Link(
-                href=f"{base_url}?{'&'.join(f'{k}={v}' for k, v in prev_params.items())}",
-                rel="prev",
-                type=media_type,
-            )
-        )
+        links.append(_paged_link(request, max(0, offset - limit), "prev", media_type))
 
     if (offset + limit) < total_count:
-        next_params = query_params.copy()
-        next_params["offset"] = str(offset + limit)
-        links.append(
-            Link(
-                href=f"{base_url}?{'&'.join(f'{k}={v}' for k, v in next_params.items())}",
-                rel="next",
-                type=media_type,
-            )
-        )
+        links.append(_paged_link(request, offset + limit, "next", media_type))
 
     return links
+
+
+def build_next_link(
+    request: Request,
+    offset: int,
+    returned_count: int,
+    total_count: Optional[int],
+    media_type: str = "application/geo+json",
+) -> Optional[Link]:
+    """Build a ``next`` link from the ACTUAL number of items served on this
+    page, rather than the requested ``limit``.
+
+    ``offset + returned_count`` resumes exactly where this page stopped
+    serving items — correct both for the ordinary case (page cut short only
+    by the SQL ``LIMIT``, i.e. the natural end of the result set) and for a
+    page cut short by a response byte budget (fewer items served than
+    ``limit`` even though more still match). Returns ``None`` when there is
+    nothing left to return, or ``total_count`` is unknown.
+    """
+    if total_count is None:
+        return None
+    next_offset = offset + returned_count
+    if next_offset >= total_count:
+        return None
+    return _paged_link(request, next_offset, "next", media_type)

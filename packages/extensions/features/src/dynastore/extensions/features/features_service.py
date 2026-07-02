@@ -1070,43 +1070,54 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
                 _projection_set = set(select_fields)
 
             async def _ogc_post_process(items):
-                async for feature in items:
-                    if feature.properties:
-                        # Map validity → start_datetime / end_datetime
-                        _map_validity_to_ogc(feature.properties)
+                # ``finally`` propagates an early close (e.g. the response
+                # byte-budget cutoff in ``_stream_ogc_json``, #2681) down to
+                # ``items`` — the raw driver stream — so its underlying DB
+                # connection/transaction is released promptly instead of
+                # waiting on garbage collection. ``async for`` alone does not
+                # close the iterable it wraps on an early ``aclose()``.
+                try:
+                    async for feature in items:
+                        if feature.properties:
+                            # Map validity → start_datetime / end_datetime
+                            _map_validity_to_ogc(feature.properties)
 
-                        # Per-feature property projection — applied uniformly
-                        # regardless of which driver served the listing.
-                        if _projection_set is not None:
-                            for key in list(feature.properties.keys()):
-                                if key not in _projection_set:
-                                    feature.properties.pop(key, None)
+                            # Per-feature property projection — applied uniformly
+                            # regardless of which driver served the listing.
+                            if _projection_set is not None:
+                                for key in list(feature.properties.keys()):
+                                    if key not in _projection_set:
+                                        feature.properties.pop(key, None)
 
-                    # ``skipGeometry`` normalises Feature.geometry to ``null``
-                    # at the service boundary. PG already drops the SELECT and
-                    # ES adds ``geometry`` to ``_source.excludes``, so this is
-                    # the safety net for hits that arrived from any path that
-                    # missed the push-down (multi-driver pipelines, mocks, or
-                    # cached/legacy index shapes). RFC 7946 explicitly permits
-                    # ``"geometry": null`` on a Feature.
-                    if skip_geom_bool:
-                        feature.geometry = None
+                        # ``skipGeometry`` normalises Feature.geometry to ``null``
+                        # at the service boundary. PG already drops the SELECT and
+                        # ES adds ``geometry`` to ``_source.excludes``, so this is
+                        # the safety net for hits that arrived from any path that
+                        # missed the push-down (multi-driver pipelines, mocks, or
+                        # cached/legacy index shapes). RFC 7946 explicitly permits
+                        # ``"geometry": null`` on a Feature.
+                        if skip_geom_bool:
+                            feature.geometry = None
 
-                    # Add OGC self/collection links
-                    feature_id = feature.id
-                    feature.links = [
-                        Link(
-                            href=f"{collection_url}/items/{feature_id}",
-                            rel="self",
-                            type="application/geo+json",
-                        ),
-                        Link(
-                            href=collection_url,
-                            rel="collection",
-                            type="application/json",
-                        ),
-                    ]
-                    yield feature
+                        # Add OGC self/collection links
+                        feature_id = feature.id
+                        feature.links = [
+                            Link(
+                                href=f"{collection_url}/items/{feature_id}",
+                                rel="self",
+                                type="application/geo+json",
+                            ),
+                            Link(
+                                href=collection_url,
+                                rel="collection",
+                                type="application/json",
+                            ),
+                        ]
+                        yield feature
+                finally:
+                    aclose = getattr(items, "aclose", None)
+                    if aclose is not None:
+                        await aclose()
 
             query_response.items = _ogc_post_process(query_response.items)
 
@@ -1120,6 +1131,8 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
                 target_srid=target_crs_srid or 4326,
                 links=links,
                 language=language,
+                offset=offset,
+                max_response_bytes=plugin_config.max_response_bytes,
             )
         except Exception as e:
             return handle_or_raise(

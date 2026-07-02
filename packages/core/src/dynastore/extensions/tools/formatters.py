@@ -109,25 +109,40 @@ async def _stream_ogc_json(
     items: AsyncIterator[Any],
     metadata: OGCResponseMetadata,
     output_format: OutputFormatEnum = OutputFormatEnum.GEOJSON,
+    max_response_bytes: Optional[int] = None,
+    request: Optional[Request] = None,
+    offset: Optional[int] = None,
 ) -> AsyncIterator[bytes]:
-    """Unified generator for streaming OGC GeoJSON or plain JSON."""
+    """Unified generator for streaming OGC GeoJSON or plain JSON.
+
+    ``max_response_bytes`` (#2681) bounds process memory on collections with
+    very large geometries: once the serialized ``features`` bytes cross this
+    budget, the loop stops pulling more items instead of streaming the rest
+    of the page — a page-size ceiling ``limit``/``max_limit`` alone cannot
+    provide, since a handful of huge multipolygons can already exceed it.
+    ``request``/``offset`` (both required together) let this cut-short page
+    still carry a correct ``next`` link: the precomputed ``next`` link in
+    ``metadata.links`` assumes the full ``limit`` was served, so it is
+    replaced with one built from the ACTUAL number of items returned
+    (:func:`build_next_link`). Callers that omit ``request``/``offset``
+    (e.g. WFS, which does not pass a byte budget) keep the legacy
+    precomputed links untouched.
+
+    The ``links`` member is emitted after the ``features`` array (JSON
+    member order carries no meaning per RFC 8259) so the corrected ``next``
+    link can be computed from the count actually streamed.
+    """
     is_geojson = output_format == OutputFormatEnum.GEOJSON
-    
+
     yield b'{"type":"FeatureCollection"' if is_geojson else b'{"items":['
-    
-    if metadata.links:
-        links_data = [l.model_dump(exclude_none=True) if hasattr(l, "model_dump") else l for l in metadata.links]
-        yield b',"links":' + orjson.dumps(links_data)
-        
+
     if is_geojson:
         yield b',"features":['
-    
+
     is_first = True
     returned_count = 0
+    bytes_emitted = 0
     async for item in items:
-        if not is_first:
-            yield b","
-
         if hasattr(item, "model_dump"):
             feat_dict = item.model_dump(exclude_none=True, by_alias=True)
             # RFC 7946: a GeoJSON Feature MUST carry a ``geometry`` member,
@@ -144,17 +159,58 @@ async def _stream_ogc_json(
         else:
             feat_dict = item
 
-        yield orjson.dumps(feat_dict, default=orjson_default)
+        chunk = orjson.dumps(feat_dict, default=orjson_default)
+        if not is_first:
+            yield b","
+            bytes_emitted += 1
+        yield chunk
+        bytes_emitted += len(chunk)
         is_first = False
         returned_count += 1
-        
-    yield b']' # Close features or items array
-    
+
+        if max_response_bytes is not None and bytes_emitted >= max_response_bytes:
+            # Byte budget reached: stop pulling more items rather than
+            # materialising/serialising the rest of the page (#2681). Close
+            # the source iterator so the underlying DB stream/transaction is
+            # released promptly instead of waiting on garbage collection.
+            aclose = getattr(items, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:
+                    logger.debug(
+                        "byte-budget cutoff: source aclose() failed", exc_info=True
+                    )
+            break
+
+    yield b']'  # Close features or items array
+
+    links_data = None
+    if metadata.links:
+        links_data = cast(
+            "List[dict]",
+            [
+                l.model_dump(exclude_none=True) if hasattr(l, "model_dump") else l
+                for l in metadata.links
+            ],
+        )
+        if request is not None and offset is not None:
+            from dynastore.extensions.tools.pagination import build_next_link
+
+            links_data = [l for l in links_data if l.get("rel") != "next"]
+            next_link = build_next_link(
+                request, offset, returned_count, metadata.numberMatched,
+            )
+            if next_link is not None:
+                links_data.append(next_link.model_dump(exclude_none=True))
+    if links_data:
+        yield b',"links":' + orjson.dumps(links_data)
+
     if metadata.numberMatched is not None:
         yield b',"numberMatched":' + str(metadata.numberMatched).encode()
-    
+
     yield b',"numberReturned":' + str(returned_count).encode()
-    
+
     ts = metadata.timeStamp or datetime.now(timezone.utc)
     yield b',"timeStamp":"' + ts.isoformat().replace("+00:00", "Z").encode() + b'"}'
 
@@ -166,9 +222,15 @@ def format_response(
     target_srid: int = 4326,
     encoding: str = "utf-8",
     metadata: Optional[OGCResponseMetadata] = None,
+    max_response_bytes: Optional[int] = None,
+    offset: Optional[int] = None,
 ) -> StreamingResponse:
     """
     Dynamically formats a stream of features into the specified output format.
+
+    ``max_response_bytes``/``offset`` (#2681) are forwarded to
+    :func:`_stream_ogc_json` for the GeoJSON/JSON streaming path only — see
+    its docstring for the byte-budget and corrected-``next``-link contract.
     """
     formatter = format_map.get(output_format)
     if not formatter:
@@ -176,18 +238,29 @@ def format_response(
 
     # 1. Handle JSON/GeoJSON streaming (Preferred async path)
     if output_format in (OutputFormatEnum.GEOJSON, OutputFormatEnum.JSON):
-        # Ensure it's an AsyncIterator
+        # Ensure it's an AsyncIterator. ``finally`` propagates an early
+        # close (the byte-budget cutoff in ``_stream_ogc_json``, #2681)
+        # down to ``it`` — ``async for`` alone does not close the iterable
+        # it wraps when this generator itself is closed early.
         async def _as_async_iter(it):
             if hasattr(it, '__aiter__'):
-                async for x in it: yield x
+                try:
+                    async for x in it: yield x
+                finally:
+                    aclose = getattr(it, "aclose", None)
+                    if aclose is not None:
+                        await aclose()
             else:
                 for x in it: yield x
-        
+
         return StreamingResponse(
             _stream_ogc_json(
-                _as_async_iter(features), 
+                _as_async_iter(features),
                 metadata or OGCResponseMetadata(),
-                output_format=output_format
+                output_format=output_format,
+                max_response_bytes=max_response_bytes,
+                request=request,
+                offset=offset,
             ),
             media_type=formatter["media_type"]
         )

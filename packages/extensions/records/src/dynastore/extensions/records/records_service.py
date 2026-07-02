@@ -657,6 +657,20 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         if select_fields is not None:
             projection_set = set(select_fields)
 
+        # Response byte budget (#2681): ``get_records`` materialises the full
+        # page before responding (no streaming path here, unlike Features'
+        # ``stream_ogc_features``), so a page of large geometries can exceed
+        # process memory well under ``max_limit``. Stop accumulating once the
+        # serialized records cross the configured budget; always keep at
+        # least one record so the page is never empty and pagination can
+        # still advance.
+        max_response_bytes = records_config.max_response_bytes
+        response_bytes = 0
+        if max_response_bytes is not None:
+            import orjson
+
+            from dynastore.tools.json import orjson_default
+
         records: List[rm.Record] = []
         async for feature in query_response:
             if projection_set is not None:
@@ -675,14 +689,45 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
                     feature.geometry = None
                 except Exception:
                     pass
-            records.append(gen.db_row_to_record(
+            record = gen.db_row_to_record(
                 feature, catalog_id, collection_id, root_url, layer_config,
                 read_policy=read_policy, geometry_enabled=geometry_enabled,
-            ))
+            )
+            records.append(record)
 
-        # Pagination links
-        from dynastore.extensions.tools.pagination import build_pagination_links
-        links = build_pagination_links(request, offset, limit, count)
+            if max_response_bytes is not None:
+                response_bytes += len(orjson.dumps(
+                    record.model_dump(exclude_none=True, by_alias=True),
+                    default=orjson_default,
+                ))
+                if response_bytes >= max_response_bytes:
+                    aclose = getattr(query_response.items, "aclose", None)
+                    if aclose is not None:
+                        try:
+                            await aclose()
+                        except Exception:
+                            logger.debug(
+                                "byte-budget cutoff: source aclose() failed",
+                                exc_info=True,
+                            )
+                    break
+
+        # Pagination links. ``next`` is built from the ACTUAL number of
+        # records served (not the requested ``limit``): a byte-budget
+        # cutoff can serve fewer, and ``offset + len(records)`` is correct
+        # whether the page ended naturally (last page) or was cut short by
+        # bytes — both cases resume exactly where this page left off.
+        from dynastore.extensions.tools.pagination import (
+            build_next_link,
+            build_pagination_links,
+        )
+        links = [
+            l for l in build_pagination_links(request, offset, limit, count)
+            if l.rel != "next"
+        ]
+        next_link = build_next_link(request, offset, len(records), count)
+        if next_link is not None:
+            links.append(next_link)
 
         result = rm.RecordCollection(
             type="FeatureCollection",

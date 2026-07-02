@@ -20,7 +20,7 @@ from dynastore.models.plugin_config import PluginConfig
 from dynastore.models.mutability import Mutable
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
 from pydantic import Field
-from typing import ClassVar, Tuple
+from typing import ClassVar, Optional, Tuple
 
 
 class RecordsPluginConfig(ExposableConfigMixin, PluginConfig):
@@ -50,5 +50,23 @@ class RecordsPluginConfig(ExposableConfigMixin, PluginConfig):
             "Maximum page size, shared by catalogs/collections/records "
             "listings. A requested ``limit`` above this value is clamped, "
             "never rejected (fc-limit-response-1)."
+        ),
+    )
+
+    # Response byte budget (#2681): bounds page-assembly memory regardless
+    # of how many/how large the matched geometries are. A `limit` ceiling
+    # alone cannot do this — a handful of large geometries can already
+    # exceed process memory well under `max_limit`.
+    max_response_bytes: Mutable[Optional[int]] = Field(
+        default=10_000_000,
+        ge=1,
+        examples=[10_000_000, 50_000_000],
+        description=(
+            "Byte budget for a single GET .../items GeoJSON response. Once "
+            "the serialized records cross this size the page is cut short "
+            "and a ``next`` link is returned that resumes exactly where the "
+            "page left off; ``numberReturned`` reflects what was actually "
+            "served, ``numberMatched`` is unaffected. ``null`` disables the "
+            "budget (unbounded page, previous behaviour)."
         ),
     )

@@ -755,6 +755,8 @@ def stream_ogc_features(
     target_srid: int = 4326,
     links: Optional[List[Any]] = None,
     language: str = "en",
+    offset: Optional[int] = None,
+    max_response_bytes: Optional[int] = None,
 ) -> StreamingResponse:
     """
     Unified streaming response for OGC Features/WFS/DWH.
@@ -762,6 +764,16 @@ def stream_ogc_features(
     ``language`` controls how ``Link.title`` values (``LocalizedText``) are
     resolved before writing to the wire.  Default ``'en'`` collapses each
     title to a plain string; ``'*'`` preserves the full multi-language dict.
+
+    ``offset``/``max_response_bytes`` (#2681): pass both to enable a
+    config-driven response byte budget — once the serialized ``features``
+    bytes cross ``max_response_bytes`` the GeoJSON/JSON page is cut short and
+    the precomputed ``next`` link in ``links`` is replaced with one built
+    from the number of items actually served (see
+    :func:`dynastore.extensions.tools.formatters._stream_ogc_json`).
+    ``numberReturned`` always reflects what was actually streamed;
+    ``numberMatched`` is unaffected. Omit both (the default) to keep the
+    unbounded legacy behaviour.
     """
     from datetime import datetime, timezone
     from dynastore.extensions.tools.response_i18n import resolve_links
@@ -790,4 +802,6 @@ def stream_ogc_features(
         collection_id=collection_id,
         target_srid=target_srid,
         metadata=ogc_metadata,
+        max_response_bytes=max_response_bytes,
+        offset=offset,
     )
