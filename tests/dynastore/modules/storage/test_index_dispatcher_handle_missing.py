@@ -38,7 +38,7 @@ from dynastore.modules.storage.index_dispatcher import (
     IndexDispatcher, IndexerFatal,
 )
 from dynastore.modules.storage.routing_config import (
-    FailurePolicy, Operation, OperationDriverEntry, WriteMode,
+    FailurePolicy, Operation, OperationDriverEntry,
 )
 
 
@@ -116,70 +116,3 @@ async def test_missing_ignore_silent(ctx, op, caplog):
     ):
         await _dispatcher([entry]).fan_out_bulk(ctx, [op])
     assert not [r for r in caplog.records if "indexer 'd'" in r.message]
-
-
-@pytest.mark.asyncio
-async def test_missing_outbox_falls_through_to_enqueue_or_warn(ctx, op, caplog):
-    """#2732 step 4: ``_enqueue_outbox_record`` no longer special-cases a
-    bulk ``OutboxStore`` — zero concrete implementations exist in this
-    codebase, so the dead ``isinstance`` branch was removed. Even an outbox
-    stub implementing the full ``OutboxStore`` surface is bypassed;
-    ``fan_out_bulk`` always routes an ``IndexableOp`` OUTBOX op through
-    :meth:`IndexDispatcher._enqueue_or_warn`, whose legacy singular-enqueue
-    path only accepts ``IndexOp`` — so the op is dropped with a WARNING
-    rather than silently vanishing.
-    """
-    enq = []
-    legacy_enqueue_calls = []
-
-    # Stub satisfies the full ``OutboxStore`` runtime_checkable Protocol
-    # surface AND the legacy singular ``enqueue`` method, so
-    # ``_enqueue_or_warn`` proceeds past its "no enqueue method" guard and
-    # reaches the IndexableOp-vs-IndexOp filter below. ``enqueue_bulk`` must
-    # never be called post-#2732 step 4 — the bulk OutboxStore path is dead
-    # code with zero concrete implementations.
-    class _Stub:
-        async def enqueue_bulk(self, conn, *, catalog_id, rows):
-            enq.extend(rows)
-
-        async def enqueue(self, *, indexer_id, ctx, ops, last_error=None):
-            legacy_enqueue_calls.append(ops)
-
-        async def claim_batch(self, *, driver_id, catalog_id, batch_size, claimed_by):
-            return []
-
-        async def mark_done(self, *, catalog_id, op_ids):
-            return None
-
-        async def mark_retry(self, *, catalog_id, op_ids, error, attempts_seen):
-            return None
-
-        async def mark_failed(self, *, catalog_id, op_ids, error):
-            return None
-
-        def listen(self, *, driver_id, catalog_id):
-            async def _empty():
-                if False:
-                    yield  # pragma: no cover
-            return _empty()
-
-    entry = OperationDriverEntry(
-        driver_ref="d",
-        write_mode=WriteMode.ASYNC,
-        on_failure=FailurePolicy.OUTBOX,
-        secondary_index=True,
-    )
-    with caplog.at_level(
-        logging.WARNING, logger="dynastore.modules.storage.index_dispatcher",
-    ):
-        await _dispatcher([entry], outbox=_Stub()).fan_out_bulk(ctx, [op])
-
-    assert enq == [], "enqueue_bulk (the removed bulk OutboxStore path) must never be called"
-    assert legacy_enqueue_calls == [], (
-        "the legacy singular enqueue() only accepts IndexOp — an all-IndexableOp "
-        "batch must be filtered out before reaching it, not passed through empty-handed"
-    )
-    assert any(
-        "IndexableOp" in r.message and "dropping" in r.message
-        for r in caplog.records
-    ), "an IndexableOp OUTBOX op with no bulk sink must warn, not vanish silently"

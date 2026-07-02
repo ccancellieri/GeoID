@@ -1153,10 +1153,11 @@ class IndexDispatcher:
 
         WARN dedupes per ``(driver_id, catalog, collection)`` so a
         deliberately-omitted driver doesn't flood the log on every op.
-        OUTBOX path requires the new :class:`IndexableOp` shape; legacy
-        :class:`IndexOp` callers fall back to the existing
-        :meth:`_enqueue_or_warn` path so the singular-``enqueue`` outbox
-        writer still receives them.
+        OUTBOX path degrades through :meth:`_enqueue_or_warn` for both
+        :class:`IndexableOp` and legacy :class:`IndexOp` shapes — the
+        singular-``enqueue`` outbox writer only accepts ``IndexOp``, so an
+        all-``IndexableOp`` batch is filtered out and dropped with a
+        warning there.
         """
         policy = entry.on_failure
         if policy == FailurePolicy.FATAL:
@@ -1168,13 +1169,7 @@ class IndexDispatcher:
                 ),
             )
         if policy == FailurePolicy.OUTBOX:
-            if isinstance(op, IndexableOp):
-                await self._enqueue_outbox_record(entry, ctx, op)
-            else:
-                # Legacy IndexOp path — degrade through the existing
-                # enqueue-or-warn helper so behaviour is unchanged for
-                # callers still on the older value type.
-                await self._enqueue_or_warn(entry, ctx, [op])
+            await self._enqueue_or_warn(entry, ctx, [op])
             return
         if policy == FailurePolicy.WARN:
             key = (entry.driver_ref, ctx.catalog, ctx.collection)
@@ -1188,39 +1183,6 @@ class IndexDispatcher:
                 )
             return
         # IGNORE — silent.
-
-    async def _enqueue_outbox_record(
-        self,
-        entry: OperationDriverEntry,
-        ctx: IndexContext,
-        op: IndexableOp,
-    ) -> None:
-        """Enqueue an :class:`IndexableOp` via the legacy singular-enqueue
-        outbox path.
-
-        Used by :meth:`_handle_missing` when a driver is absent and the
-        routing entry says ``OUTBOX``.  When no outbox is wired, degrade
-        to a one-time WARN keyed identically to the missing-warning
-        dedupe so operators see exactly one signal per
-        ``(driver_id, catalog, collection)``.
-
-        No concrete bulk ``OutboxStore`` (``enqueue_bulk``) implementation is
-        wired in this codebase, so this always falls through to
-        :meth:`_enqueue_or_warn`, which uses the ``IndexOp`` shape
-        internally.
-        """
-        if self._outbox is None:
-            key = ("__no_outbox__", entry.driver_ref, ctx.catalog, ctx.collection)
-            if key not in self._missing_warning_emitted:
-                self._missing_warning_emitted.add(key)
-                logger.warning(
-                    "IndexDispatcher: indexer '%s' missing AND no outbox "
-                    "wired (catalog=%s, collection=%s); op dropped per "
-                    "fallback.",
-                    entry.driver_ref, ctx.catalog, ctx.collection,
-                )
-            return
-        await self._enqueue_or_warn(entry, ctx, [op])
 
     async def _ensure_or_handle(
         self,

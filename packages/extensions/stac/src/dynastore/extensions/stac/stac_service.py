@@ -1909,67 +1909,6 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             language=language,
         )
 
-    async def search_stac_collections_post(
-        self,
-        request: Request,
-        search_req: CollectionSearchRequest,
-        engine=Depends(get_async_engine),
-        language: str = Depends(get_language),
-    ):
-        try:
-            async with managed_transaction(engine) as conn:
-                configs_svc = await self._get_configs_service()
-                # ``catalog_id`` may be unset (cross-catalog collection search):
-                # ``get_config`` falls back through the platform tier, exactly
-                # the desired policy for that case.
-                stac_config = await configs_svc.get_config(
-                    StacPluginConfig,
-                    catalog_id=search_req.catalog_id,
-                    ctx=DriverContext(db_resource=conn),
-                )
-                collections, total_count = await search_collections(
-                    conn, search_req,
-                    default_limit=stac_config.default_limit,
-                    max_limit=stac_config.max_limit,
-                )
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-        # Release connection before PySTAC processing
-        stac_collections = []
-        for coll in collections:
-            # Localize before creating PySTAC collection
-            localized_coll, _ = stac_localize(coll, language)
-            if coll.extent is None:
-                continue
-            stac_coll = pystac.Collection(
-                id=str(localized_coll.get("id") or ""),
-                description=str(localized_coll.get("description") or ""),
-                title=localized_coll.get("title"),
-                license=str(localized_coll.get("license") or ""),
-                extent=pystac.Extent(
-                    spatial=pystac.SpatialExtent(coll.extent.spatial.bbox),
-                    temporal=pystac.TemporalExtent(coll.extent.temporal.interval),
-                ),
-            )
-            # Inject language metadata
-            if "language" in localized_coll:
-                stac_coll.extra_fields["language"] = localized_coll["language"]
-            if "languages" in localized_coll:
-                stac_coll.extra_fields["languages"] = localized_coll["languages"]
-
-            stac_collections.append(stac_coll.to_dict())
-        return JSONResponse(
-            content={
-                "collections": stac_collections,
-                "context": {
-                    "limit": search_req.limit,
-                    "matched": total_count,
-                    "returned": len(stac_collections),
-                },
-            }
-        )
-
     @router.post(
         "/catalogs/{catalog_id}/collections/{collection_id}/aggregate",
         response_class=JSONResponse,
