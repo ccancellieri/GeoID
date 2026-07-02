@@ -424,6 +424,41 @@ class TestGetCollectionMapStyled:
 
 
 # ---------------------------------------------------------------------------
+# get_maps_landing_page — top-level landing page
+# ---------------------------------------------------------------------------
+
+
+def _make_cat(cid: str, ext: str | None = None) -> MagicMock:
+    c = MagicMock()
+    c.id = cid
+    c.external_id = ext
+    return c
+
+
+class TestGetMapsLandingPage:
+    @pytest.mark.asyncio
+    async def test_dataset_links_use_public_ids(self, monkeypatch):
+        """Landing hrefs must use the public external_id when set, else the
+        internal id — never the raw internal id when an external_id exists
+        (GeoID #2805: internal ids leaked here 404 on every advertised link,
+        since resolve_catalog_id() is external-only).
+        """
+        svc = MagicMock()
+        svc.list_catalogs = AsyncMock(
+            return_value=[_make_cat("c_internal_a", ext="public-a"), _make_cat("c_internal_b")]
+        )
+        monkeypatch.setattr(ms, "get_protocol", lambda _proto: svc)
+
+        result = await ms.MapsService.get_maps_landing_page(_mock_request())
+
+        dataset_links = [link for link in result.links if link.rel == "dataset"]
+        hrefs = [link.href for link in dataset_links]
+        assert any(h.endswith("/catalogs/public-a") for h in hrefs)
+        assert any(h.endswith("/catalogs/c_internal_b") for h in hrefs)
+        assert not any(h.endswith("/catalogs/c_internal_a") for h in hrefs)
+
+
+# ---------------------------------------------------------------------------
 # get_catalog_maps — catalog-level metadata listing
 # ---------------------------------------------------------------------------
 

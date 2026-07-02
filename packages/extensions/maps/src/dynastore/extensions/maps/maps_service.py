@@ -533,9 +533,14 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         base = str(request.url).rstrip("/")
         links = [Link(href=str(request.url), rel="self", type="application/json", title=LocalizedText(en="this document"))]
         for cat in catalogs:
+            # cat.id is the immutable internal id; resolve_catalog_id() (used by
+            # get_catalog_maps and siblings) is external-only, so advertising the
+            # internal id here 404s every link. Mirror the public_id pattern used
+            # for collection links below.
+            public_id = cat.external_id or cat.id
             links.append(Link(
-                href=f"{base}/catalogs/{cat.id}",
-                rel="dataset", type="application/json", title=LocalizedText(en=f"Maps for dataset '{cat.id}'")
+                href=f"{base}/catalogs/{public_id}",
+                rel="dataset", type="application/json", title=LocalizedText(en=f"Maps for dataset '{public_id}'")
             ))
         return MapsLandingPage(links=links)
 
