@@ -19,11 +19,16 @@
 import logging
 import os
 import tempfile
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Tuple, Any
 
-import morecantile
+import morecantile  # noqa: F401 — hard-import gate: see tests/dynastore/tasks/unit/test_heavy_task_hard_imports.py
 
-from dynastore.modules.db_config.query_executor import managed_transaction, DbResource
+from dynastore.modules.db_config.query_executor import (
+    managed_transaction,
+    DbResource,
+    DQLQuery,
+    ResultHandler,
+)
 from dynastore.modules.concurrency import run_in_thread
 
 from dynastore.modules.processes.protocols import ProcessTaskProtocol
@@ -36,9 +41,8 @@ from dynastore.modules.tiles.tiles_config import (
     TilesPreseedConfig,
 )
 from dynastore.modules.tiles import tiles_module
-from dynastore.modules.tiles import tiles_db
-from dynastore.modules.tiles.tiles_module import TileStorageProtocol, TileArchiveStorageProtocol
-from dynastore.modules.tiles.tms_definitions import BUILTIN_TILE_MATRIX_SETS
+from dynastore.modules.tiles import tiles_engine
+from dynastore.modules.tiles.tiles_module import TileArchiveStorageProtocol
 from dynastore.modules.tiles.writers.pmtiles_writer import TileEntry, write_pmtiles_from_entries, zxy_to_tileid
 from dynastore.tools.geospatial import SimplificationAlgorithm
 from .models import TilePreseedRequest
@@ -48,6 +52,14 @@ from dynastore.modules.processes.models import ExecuteRequest, Process, StatusIn
 from dynastore.models.driver_context import DriverContext
 
 logger = logging.getLogger(__name__)
+
+# Bounded default scope (#2813): the world bbox at an unbounded zoom range
+# can fan out to an enormous tile count. Applied only when no bbox is
+# configured anywhere (request/preseed/runtime) — an operator-supplied bbox
+# is assumed intentional at whatever zoom range they configured.
+PRESEED_DEFAULT_MAX_ZOOM = 8
+
+BoundingBox = Tuple[float, float, float, float]
 
 
 class TilePreseedTask(
@@ -126,11 +138,12 @@ class TilePreseedTask(
                 logger.warning(f"No target collections for {catalog_id}. Skipping.")
                 return None
 
-            effective_bboxes = (
-                request.update_bbox or preseed_config.bboxes or runtime_config.bbox or [(-180, -90, 180, 90)]
-            )
+            explicit_bboxes = request.update_bbox or preseed_config.bboxes or runtime_config.bbox
             target_tms_ids = request.tms_ids or preseed_config.target_tms_ids
             formats = request.formats or preseed_config.formats
+            statement_timeout_ms = preseed_config.preseed_tile_timeout_seconds * 1000
+
+            from dynastore.modules.tiles.tiles_module import TileStorageProtocol
 
             storage = get_protocol(TileStorageProtocol)
             if not storage:
@@ -145,93 +158,53 @@ class TilePreseedTask(
                     results["errors"] += 1
                     continue
 
+                if explicit_bboxes:
+                    effective_bboxes: List[BoundingBox] = explicit_bboxes
+                    effective_max_zoom = runtime_config.max_zoom
+                else:
+                    effective_bboxes, effective_max_zoom = await _bounded_default_scope(
+                        catalogs, catalog_id, col_id, preseed_config, runtime_config.max_zoom,
+                    )
+                logger.info(
+                    "tiles_preseed: bounded scope catalog=%s collection=%s bbox=%s "
+                    "zoom=[%d,%d]",
+                    catalog_id, col_id, effective_bboxes, runtime_config.min_zoom, effective_max_zoom,
+                )
+
                 for tms_id in target_tms_ids:
-                    tms_def = await tiles_module.get_custom_tms(catalog_id=catalog_id, tms_id=tms_id)
-                    if not tms_def:
-                        tms_def = BUILTIN_TILE_MATRIX_SETS.get(tms_id)
-                        if not tms_def:
-                            if morecantile is None:
-                                logger.error(f"TMS {tms_id} not found and morecantile not installed.")
-                                results["errors"] += 1
-                                continue
-                            try:
-                                tms_def = morecantile.tms.get(tms_id)
-                            except Exception:
-                                logger.error(f"TMS {tms_id} not found.")
-                                results["errors"] += 1
-                                continue
-
-                    if tms_def and not hasattr(tms_def, "tiles") and morecantile:
-                        try:
-                            tms_dict = tms_def.model_dump(exclude_none=True) if hasattr(tms_def, "model_dump") else tms_def
-                            tms_def = morecantile.TileMatrixSet.model_validate(tms_dict)
-                        except Exception as e:
-                            logger.error(f"Failed to convert TMS {tms_id} to morecantile: {e}")
-                            results["errors"] += 1
-                            continue
-
-                    target_srid = 3857
-                    if hasattr(tms_def, "crs"):
-                        try:
-                            target_srid = await tiles_module.resolve_srid(engine, str(tms_def.crs), catalog_id)
-                        except Exception as e:
-                            logger.warning(f"Failed SRID resolution for {tms_def.crs}: {e}. Using 3857.")
-
-                    mc_tms: Any = tms_def
+                    ctx = await tiles_engine.build_render_context(
+                        catalog_id, [col_id], tms_id, engine=engine, morecantile_compatible=True,
+                    )
+                    if ctx is None:
+                        logger.error(
+                            "tiles_preseed: render-context resolution failed for %s/%s/%s.",
+                            catalog_id, col_id, tms_id,
+                        )
+                        results["errors"] += 1
+                        continue
+                    mc_tms: Any = ctx.tms_def
+                    target_srid = ctx.target_srid
 
                     if request.output_format == "pmtiles":
                         await self._preseed_pmtiles(
                             engine=engine, request=request, payload=payload,
                             catalog_id=catalog_id, col_id=col_id, tms_id=tms_id,
-                            mc_tms=mc_tms, target_srid=target_srid,
-                            effective_bboxes=effective_bboxes, runtime_config=runtime_config,
+                            ctx=ctx, mc_tms=mc_tms, target_srid=target_srid,
+                            effective_bboxes=effective_bboxes, effective_max_zoom=effective_max_zoom,
+                            runtime_config=runtime_config,
                             preseed_config=preseed_config, schema=schema, results=results,
                         )
                         total_processed += results.get("generated", 0) + results.get("skipped", 0)
                     else:
-                        async with managed_transaction(engine) as conn:
-                            for z in range(runtime_config.min_zoom, runtime_config.max_zoom + 1):
-                                for bbox in effective_bboxes:
-                                    try:
-                                        tiles = mc_tms.tiles(*bbox, zooms=[z])
-                                    except Exception as e:
-                                        logger.error(f"Error generating tiles for bbox {bbox}: {e}")
-                                        continue
-                                    for tile in tiles:
-                                        total_processed += 1
-                                        for fmt in formats:
-                                            try:
-                                                simplification = (
-                                                    preseed_config.simplification_by_zoom_override.get(z)
-                                                    if preseed_config.simplification_by_zoom_override else None
-                                                )
-                                                data = await tiles_db.get_features_as_mvt_filtered(
-                                                    conn=conn, resolved_collections=[meta],
-                                                    tms_def=mc_tms, target_srid=target_srid,
-                                                    z=str(z), x=tile.x, y=tile.y,
-                                                    simplification=simplification,
-                                                    simplification_algorithm=runtime_config.simplification_algorithm
-                                                    or SimplificationAlgorithm.TOPOLOGY_PRESERVING,
-                                                )
-                                                if data:
-                                                    await storage.save_tile(
-                                                        catalog_id=catalog_id, collection_id=col_id,
-                                                        tms_id=tms_id, z=z, x=tile.x, y=tile.y,
-                                                        data=data, format=fmt,
-                                                    )
-                                                    results["generated"] += 1
-                                                else:
-                                                    results["skipped"] += 1
-                                            except Exception as e:
-                                                logger.error(f"Error generating tile {z}/{tile.x}/{tile.y}: {e}")
-                                                results["errors"] += 1
-
-                                        if total_processed % 100 == 0 and payload.task_id:
-                                            new_outputs = {**results, "processed_tiles": total_processed}
-                                            await tasks_module.update_task(
-                                                engine, payload.task_id,
-                                                TaskUpdate(outputs=new_outputs), schema=schema,
-                                            )
+                        total_processed += await self._preseed_mvt(
+                            engine=engine, payload=payload, ctx=ctx, storage=storage,
+                            catalog_id=catalog_id,
+                            col_id=col_id, tms_id=tms_id, mc_tms=mc_tms,
+                            effective_bboxes=effective_bboxes, effective_max_zoom=effective_max_zoom,
+                            runtime_config=runtime_config, preseed_config=preseed_config,
+                            formats=formats, statement_timeout_ms=statement_timeout_ms,
+                            schema=schema, results=results, total_processed_so_far=total_processed,
+                        )
 
             if payload.task_id:
                 results["processed_tiles"] = total_processed
@@ -254,10 +227,100 @@ class TilePreseedTask(
                 )
             raise e
 
+    async def _preseed_mvt(
+        self, *, engine: DbResource, payload: "TaskPayload[ExecuteRequest]",
+        ctx: Any, storage: Any, catalog_id: str, col_id: str, tms_id: str, mc_tms: Any,
+        effective_bboxes: List[BoundingBox], effective_max_zoom: int,
+        runtime_config: Any, preseed_config: Any, formats: List[str],
+        statement_timeout_ms: int, schema: str, results: Dict[str, Any],
+        total_processed_so_far: int,
+    ) -> int:
+        """Per-zoom-transaction MVT preseed loop (#2813).
+
+        Replaces the single giant transaction spanning the whole preseed run:
+        a per-zoom transaction frees the pool between zooms (the checkpoint-
+        visibility fix — the old outer transaction held a pooled connection
+        for the entire run, so `update_task`'s own connection checkout could
+        starve on a small pool and progress never landed) and bounds the
+        blast radius of a per-tile statement timeout to at most the
+        remainder of one zoom's tiles: a canceled statement leaves the PG
+        transaction aborted, so the rest of that zoom is skipped and picked
+        up by the next preseed run rather than attempting mid-transaction
+        recovery. Already-committed zooms are unaffected.
+        """
+        total_processed = total_processed_so_far
+        zoom_span = max(1, effective_max_zoom - runtime_config.min_zoom + 1)
+
+        for z in range(runtime_config.min_zoom, effective_max_zoom + 1):
+            progress = min(99, int(100 * (z - runtime_config.min_zoom) / zoom_span))
+            try:
+                async with managed_transaction(engine) as conn:
+                    await DQLQuery(
+                        f"SET LOCAL statement_timeout = {statement_timeout_ms}",
+                        result_handler=ResultHandler.NONE,
+                    ).execute(conn)
+
+                    for bbox in effective_bboxes:
+                        try:
+                            tiles = mc_tms.tiles(*bbox, zooms=[z])
+                        except Exception as e:
+                            logger.error(f"Error generating tiles for bbox {bbox}: {e}")
+                            continue
+                        for tile in tiles:
+                            total_processed += 1
+                            for fmt in formats:
+                                simplification = (
+                                    preseed_config.simplification_by_zoom_override.get(z)
+                                    if preseed_config.simplification_by_zoom_override else None
+                                )
+                                data = await tiles_engine.render_tile(
+                                    conn, ctx, str(z), tile.x, tile.y,
+                                    format=fmt, use_l1_cache=False,
+                                    simplification=simplification,
+                                    simplification_algorithm=runtime_config.simplification_algorithm
+                                    or SimplificationAlgorithm.TOPOLOGY_PRESERVING,
+                                )
+                                if data:
+                                    await storage.save_tile(
+                                        catalog_id=catalog_id, collection_id=col_id,
+                                        tms_id=tms_id, z=z, x=tile.x, y=tile.y,
+                                        data=data, format=fmt,
+                                    )
+                                    results["generated"] += 1
+                                else:
+                                    results["skipped"] += 1
+
+                            if total_processed % 100 == 0 and payload.task_id:
+                                new_outputs = {**results, "processed_tiles": total_processed}
+                                await tasks_module.update_task(
+                                    engine, payload.task_id,
+                                    TaskUpdate(outputs=new_outputs, progress=progress), schema=schema,
+                                )
+            except Exception as exc:
+                # A canceled statement (or any other SQL error) leaves this
+                # zoom's transaction aborted — nothing more can be committed
+                # on it. Count it and move on to the next zoom; already-
+                # committed zooms are unaffected, and a subsequent preseed
+                # run picks up whatever this zoom didn't finish.
+                logger.error(
+                    "tiles_preseed: zoom %d aborted for %s/%s/%s (%s); "
+                    "remaining tiles at this zoom will be retried on the next run.",
+                    z, catalog_id, col_id, tms_id, exc,
+                )
+                results["errors"] += 1
+
+        if payload.task_id:
+            new_outputs = {**results, "processed_tiles": total_processed}
+            await tasks_module.update_task(
+                engine, payload.task_id, TaskUpdate(outputs=new_outputs, progress=99), schema=schema,
+            )
+        return total_processed
+
     async def _preseed_pmtiles(
         self, *, engine: DbResource, request: "TilePreseedRequest",
         payload: "TaskPayload[ExecuteRequest]", catalog_id: str, col_id: str,
-        tms_id: str, mc_tms: Any, target_srid: int, effective_bboxes: List[Any],
+        tms_id: str, ctx: Any, mc_tms: Any, target_srid: int,
+        effective_bboxes: List[BoundingBox], effective_max_zoom: int,
         runtime_config: Any, preseed_config: Any, schema: str, results: Dict[str, Any],
     ) -> None:
         """Two-phase PMTiles archive generation (disk-backed, no in-memory tile accumulation)."""
@@ -286,7 +349,7 @@ class TilePreseedTask(
 
             with open(data_tmp_path, "wb") as data_out:
                 async with managed_transaction(engine) as conn:
-                    for z in range(runtime_config.min_zoom, runtime_config.max_zoom + 1):
+                    for z in range(runtime_config.min_zoom, effective_max_zoom + 1):
                         for bbox in effective_bboxes:
                             try:
                                 tiles_iter = mc_tms.tiles(*bbox, zooms=[z])
@@ -300,11 +363,9 @@ class TilePreseedTask(
                                         preseed_config.simplification_by_zoom_override.get(z)
                                         if preseed_config.simplification_by_zoom_override else None
                                     )
-                                    meta = await tiles_module.get_tile_resolution_params(catalog_id, col_id)
-                                    mvt = await tiles_db.get_features_as_mvt_filtered(
-                                        conn=conn, resolved_collections=[meta],
-                                        tms_def=mc_tms, target_srid=target_srid,
-                                        z=str(z), x=tile.x, y=tile.y,
+                                    mvt = await tiles_engine.render_tile(
+                                        conn, ctx, str(z), tile.x, tile.y,
+                                        format="mvt", use_l1_cache=False,
                                         simplification=simplification,
                                         simplification_algorithm=runtime_config.simplification_algorithm
                                         or SimplificationAlgorithm.TOPOLOGY_PRESERVING,
@@ -330,7 +391,7 @@ class TilePreseedTask(
 
             sorted_entries = sorted(tile_entries, key=lambda e: e.tile_id)
             min_zoom = runtime_config.min_zoom
-            max_zoom = runtime_config.max_zoom
+            max_zoom = effective_max_zoom
             metadata: Dict[str, Any] = {"name": tms_id, "type": "vector"}
             _data_path = data_tmp_path
             _arch_path = archive_tmp_path
@@ -359,3 +420,39 @@ class TilePreseedTask(
                         os.unlink(path)
                     except OSError:
                         pass
+
+
+async def _bounded_default_scope(
+    catalogs: CatalogsProtocol,
+    catalog_id: str,
+    col_id: str,
+    preseed_config: TilesPreseedConfig,
+    runtime_max_zoom: int,
+) -> Tuple[List[BoundingBox], int]:
+    """Bounded default scope (#2813).
+
+    When no bbox is configured anywhere (request/preseed/runtime), the world
+    bbox at an unbounded zoom range can fan out to an enormous tile count.
+    Derives the default bbox from the collection's STAC spatial extent
+    instead of the world, and caps the zoom range to
+    ``preseed_config.preseed_max_zoom`` (default ``PRESEED_DEFAULT_MAX_ZOOM``).
+    Falls back to the world bbox if the collection's extent can't be resolved
+    (never crashes the preseed on a metadata miss).
+    """
+    bbox: List[BoundingBox] = [(-180.0, -90.0, 180.0, 90.0)]
+    try:
+        collection = await catalogs.get_collection(catalog_id, col_id)
+        spatial = getattr(getattr(collection, "extent", None), "spatial", None)
+        raw_bbox = getattr(spatial, "bbox", None) if spatial else None
+        if raw_bbox:
+            first = raw_bbox[0]
+            if first and len(first) >= 4 and any(v != 0.0 for v in first):
+                bbox = [(float(first[0]), float(first[1]), float(first[2]), float(first[3]))]
+    except Exception as exc:
+        logger.warning(
+            "tiles_preseed: could not resolve STAC spatial extent for %s/%s (%s); "
+            "using world bbox as the default scope.",
+            catalog_id, col_id, exc,
+        )
+    effective_max_zoom = min(runtime_max_zoom, preseed_config.preseed_max_zoom or PRESEED_DEFAULT_MAX_ZOOM)
+    return bbox, effective_max_zoom

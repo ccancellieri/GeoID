@@ -158,17 +158,34 @@ class TilesModule(ModuleProtocol, DatabaseProtocol):
                 await DDLQuery(TILE_MATRIX_SETS_DDL).execute(conn)
                 await DDLQuery(TILE_MATRIX_SETS_COMMENT_DDL).execute(conn)
 
-            # Register PG tile storage as fallback if no higher-priority provider (e.g. GCS) registered yet
+            # Register the composite tile-cache dispatcher unconditionally.
+            # It is the ONLY TileStorageProtocol plugin — no other module
+            # registers one. Per call it resolves the live writer list
+            # (tiles_writers.resolve_effective_writers) and selects ONE
+            # available writer (tiles_writers.select_tile_writer); each
+            # implementation module (this one for PG, the gcp module for
+            # GCS, modules/local for local disk) only needs to register a
+            # (config class, factory) pair — see tiles_writers.py.
             if get_protocol(TileStorageProtocol) is None:
-                self._pg_tile_storage = TilePGPreseedStorage()
-                register_plugin(self._pg_tile_storage)
-                logger.info("TilesModule: Registered TilePGPreseedStorage as fallback.")
+                from .tile_blob_storage import CompositeTileStorage
+
+                self._composite_tile_storage = CompositeTileStorage()
+                register_plugin(self._composite_tile_storage)
+                logger.info("TilesModule: Registered CompositeTileStorage.")
 
             # Register PG archive storage as fallback if no higher-priority provider registered yet
             if get_protocol(TileArchiveStorageProtocol) is None:
                 self._pg_tile_archive = PGTileArchive()
                 register_plugin(self._pg_tile_archive)
                 logger.info("TilesModule: Registered PGTileArchive as fallback.")
+
+            # Register the PostGIS TileSourceProtocol impl. v1 ships one
+            # source; the engine (tiles_engine.build_render_context) picks
+            # the first registered source whose supports(driver) is True.
+            from .tiles_source import PostgisTileSource
+
+            self._postgis_tile_source = PostgisTileSource()
+            register_plugin(self._postgis_tile_source)
 
             logger.info("TilesModule: Initialization complete.")
         except Exception as e:
@@ -179,7 +196,7 @@ class TilesModule(ModuleProtocol, DatabaseProtocol):
         yield
 
         # --- SHUTDOWN ---
-        for attr in ("_pg_tile_storage", "_pg_tile_archive"):
+        for attr in ("_composite_tile_storage", "_pg_tile_archive", "_postgis_tile_source"):
             obj = getattr(self, attr, None)
             if obj is not None:
                 unregister_plugin(obj)
@@ -366,7 +383,7 @@ class TilePGPreseedStorage(TileStorageProtocol):
         data: bytes,
         format: str,
     ) -> Optional[str]:
-        from dynastore.modules.gcp.tiles_storage import _load_caching_config
+        from dynastore.modules.tiles.tiles_config import _load_caching_config
 
         cfg = await _load_caching_config()
         if not cfg.cache_enabled:
@@ -412,7 +429,7 @@ class TilePGPreseedStorage(TileStorageProtocol):
         y: int,
         format: str,
     ) -> Optional[bytes]:
-        from dynastore.modules.gcp.tiles_storage import _load_caching_config
+        from dynastore.modules.tiles.tiles_config import _load_caching_config
 
         cfg = await _load_caching_config()
         if not cfg.cache_enabled:
@@ -490,7 +507,7 @@ class TilePGPreseedStorage(TileStorageProtocol):
         format: str,
     ) -> bool:
         """Checks for tile existence using a lightweight SELECT EXISTS query."""
-        from dynastore.modules.gcp.tiles_storage import _load_caching_config
+        from dynastore.modules.tiles.tiles_config import _load_caching_config
 
         cfg = await _load_caching_config()
         if not cfg.cache_enabled:

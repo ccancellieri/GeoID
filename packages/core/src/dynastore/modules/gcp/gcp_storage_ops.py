@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-from typing import Optional, Dict, Any
+from typing import ClassVar, FrozenSet, List, Optional, Dict, Any
 
 from dynastore.tools.discovery import get_protocol
 from dynastore.models.protocols import (
@@ -37,6 +37,10 @@ class GcpStorageOpsMixin:
     # AssetUploadProtocol surface
     driver_id: str = "gcs"
     supports_versioning: bool = False
+
+    # Scheme-claim for the tile-writer registry (tiles_writers.py) and
+    # tile_blob_storage.StorageTileWriter — this backend serves ``gs://`` URIs.
+    supported_schemes: ClassVar[FrozenSet[str]] = frozenset({"gs"})
 
     # --- Host interface stubs (provided by GCPModule) ---
     _upload_tickets: Dict[str, Dict[str, Any]]
@@ -94,6 +98,14 @@ class GcpStorageOpsMixin:
     async def download_file(self, source_path: str, target_path: str) -> None:
         """StorageProtocol: Downloads a file from storage to local."""
         return await self.get_bucket_service().download_file(source_path, target_path)
+
+    async def download_file_content(self, path: str) -> Optional[bytes]:
+        """StorageProtocol: Downloads a full object as bytes, or None if absent."""
+        return await self.get_bucket_service().download_file_content(path)
+
+    async def list_prefix(self, base_uri: str, prefix: str) -> List[str]:
+        """StorageProtocol: List object paths under a bucket + key prefix."""
+        return await self.get_bucket_service().list_prefix(base_uri, prefix)
 
     async def file_exists(self, path: str) -> bool:
         """StorageProtocol: Checks if a file exists in storage."""

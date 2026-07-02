@@ -154,6 +154,14 @@ class Hint(StrEnum):
     METADATA = "metadata"
     ASSETS = "assets"
 
+    # Prefer a durable, transactionally-consistent store over an eventually-
+    # consistent object-storage backend. Used by tile-cache writer selection
+    # (modules/tiles/tiles_writers.select_tile_writer) to elevate the
+    # PG-table writer over a bucket-backed one when the caller has a reason
+    # to want strong consistency (e.g. immediate read-your-write after a
+    # preseed run) rather than the default first-available ordering.
+    DURABLE = "durable"
+
     # ── Cross-driver feature requests ─────────────────────────────────
     # Hints that signal participation in a specific feature surface.
     # ``JOIN`` opts the driver into OGC API - Joins dispatch (extensions/

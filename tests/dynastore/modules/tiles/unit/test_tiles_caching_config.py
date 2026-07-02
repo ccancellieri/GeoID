@@ -25,10 +25,19 @@ restart. Defaults must match the pre-#475 hardcoded values
 (``tiles/collections`` / ``31536000``) so a missing config layer is a
 no-op; live overrides must take effect; and a protocol failure must
 fall back to defaults rather than crash tile I/O.
+
+``_load_caching_config`` and ``_build_blob_path`` moved to
+``tiles_config.py`` / ``tile_blob_storage.py`` respectively as part of the
+tile-writer-selection unification (the GCS-only ``TileBucketPreseedStorage``
+this file used to exercise directly is gone; its ``cache_enabled``
+short-circuit is now on ``tile_blob_storage.CompositeTileStorage``, tested
+below against a stubbed writer-selection call so no real StorageProtocol/DB
+is needed).
 """
 from __future__ import annotations
 
 from typing import Optional, Type
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -113,7 +122,7 @@ def install_stub(monkeypatch):
 async def test_loader_falls_back_when_protocol_missing(monkeypatch):
     """Cold-boot / unit-test path: no PlatformConfigsProtocol registered."""
     from dynastore.tools import discovery
-    from dynastore.modules.gcp.tiles_storage import _load_caching_config
+    from dynastore.modules.tiles.tiles_config import _load_caching_config
 
     monkeypatch.setattr(discovery, "get_protocol", lambda *a, **kw: None)
     cfg = await _load_caching_config()
@@ -124,7 +133,7 @@ async def test_loader_falls_back_when_protocol_missing(monkeypatch):
 @pytest.mark.asyncio
 async def test_loader_returns_live_config(install_stub):
     install_stub(TilesCachingConfig(key_prefix="cache/v2", ttl_seconds=3600))
-    from dynastore.modules.gcp.tiles_storage import _load_caching_config
+    from dynastore.modules.tiles.tiles_config import _load_caching_config
 
     cfg = await _load_caching_config()
     assert cfg.key_prefix == "cache/v2"
@@ -143,7 +152,7 @@ async def test_loader_falls_back_on_protocol_error(monkeypatch):
 
     from dynastore.tools import discovery
     from dynastore.models.protocols import platform_configs as pc_mod
-    from dynastore.modules.gcp.tiles_storage import _load_caching_config
+    from dynastore.modules.tiles.tiles_config import _load_caching_config
 
     monkeypatch.setattr(
         discovery,
@@ -156,37 +165,36 @@ async def test_loader_falls_back_on_protocol_error(monkeypatch):
 
 
 def test_build_blob_path_shape():
-    from dynastore.modules.gcp.tiles_storage import _build_blob_path
+    from dynastore.modules.tiles.tile_blob_storage import _build_blob_path
 
     path = _build_blob_path("tiles/collections", "admin0", "WebMercatorQuad", 5, 17, 11, "mvt")
     assert path == "tiles/collections/admin0/WebMercatorQuad/5/17/11.mvt"
 
 
 def test_build_blob_path_honors_custom_prefix():
-    from dynastore.modules.gcp.tiles_storage import _build_blob_path
+    from dynastore.modules.tiles.tile_blob_storage import _build_blob_path
 
     path = _build_blob_path("cache/v2", "admin0", "WebMercatorQuad", 5, 17, 11, "mvt")
     assert path == "cache/v2/admin0/WebMercatorQuad/5/17/11.mvt"
 
 
 # -----------------------------------------------------------------
-# `enabled` short-circuit on TileBucketPreseedStorage I/O methods
+# `cache_enabled` short-circuit on CompositeTileStorage I/O methods
 # -----------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_read_paths_short_circuit_when_disabled(install_stub):
-    """`enabled=False` makes every read path return as a miss
-    WITHOUT touching the bucket — no StorageProtocol lookup, no GCS I/O."""
-    from unittest.mock import MagicMock
-    from dynastore.modules.gcp.tiles_storage import TileBucketPreseedStorage
+    """`cache_enabled=False` makes every read path return as a miss WITHOUT
+    resolving a writer — no StorageProtocol lookup, no PG/GCS I/O."""
+    from dynastore.modules.tiles.tile_blob_storage import CompositeTileStorage
 
     install_stub(TilesCachingConfig(cache_enabled=False))
 
-    storage = TileBucketPreseedStorage()
-    # Spy on the storage-provider hook to assert it is NEVER consulted.
-    storage._get_storage_provider = MagicMock(side_effect=AssertionError(
-        "L2 cache disabled — get_storage_provider must not be reached"
+    storage = CompositeTileStorage()
+    # Spy on writer selection to assert it is NEVER reached.
+    storage._select = AsyncMock(side_effect=AssertionError(
+        "cache disabled — writer selection must not be reached"
     ))
 
     assert await storage.get_tile("cat", "coll", "WebMercatorQuad", 5, 17, 11, "mvt") is None
@@ -200,19 +208,18 @@ async def test_read_paths_short_circuit_when_disabled(install_stub):
 
 @pytest.mark.asyncio
 async def test_save_tile_is_noop_when_disabled(install_stub, caplog):
-    """`enabled=False` makes save_tile a no-op that emits a `skip` debug log."""
+    """`cache_enabled=False` makes save_tile a no-op that emits a `skip` debug log."""
     import logging
-    from unittest.mock import MagicMock
-    from dynastore.modules.gcp.tiles_storage import TileBucketPreseedStorage
+    from dynastore.modules.tiles.tile_blob_storage import CompositeTileStorage
 
     install_stub(TilesCachingConfig(cache_enabled=False))
 
-    storage = TileBucketPreseedStorage()
-    storage._get_storage_provider = MagicMock(side_effect=AssertionError(
-        "L2 cache disabled — save_tile must not reach storage provider"
+    storage = CompositeTileStorage()
+    storage._select = AsyncMock(side_effect=AssertionError(
+        "cache disabled — save_tile must not reach writer selection"
     ))
 
-    with caplog.at_level(logging.DEBUG, logger="dynastore.modules.gcp.tiles_storage"):
+    with caplog.at_level(logging.DEBUG, logger="dynastore.modules.tiles.tile_blob_storage"):
         result = await storage.save_tile(
             "cat", "coll", "WebMercatorQuad", 5, 17, 11, b"data", "mvt",
         )
@@ -229,19 +236,17 @@ async def test_save_tile_is_noop_when_disabled(install_stub, caplog):
 
 @pytest.mark.asyncio
 async def test_enabled_default_preserves_pre_f3_behavior(install_stub):
-    """`cache_enabled=True` (default) keeps the bucket I/O path live."""
-    from unittest.mock import MagicMock, AsyncMock
-    from dynastore.modules.gcp.tiles_storage import TileBucketPreseedStorage
+    """`cache_enabled=True` (default) keeps the writer-selection path live."""
+    from dynastore.modules.tiles.tile_blob_storage import CompositeTileStorage
 
     install_stub(TilesCachingConfig())  # defaults: cache_enabled=True
 
-    storage = TileBucketPreseedStorage()
-    storage_provider = MagicMock()
-    storage_provider.get_storage_identifier = AsyncMock(return_value=None)  # no bucket
-    storage._get_storage_provider = MagicMock(return_value=storage_provider)
-    storage._get_client_provider = MagicMock()
+    storage = CompositeTileStorage()
+    storage._select = AsyncMock(return_value=("pg_tile_writer_config", AsyncMock(
+        get_tile=AsyncMock(return_value=None),
+    )))
 
-    # No bucket => returns None, but the storage_provider WAS consulted
-    # (proves the short-circuit did NOT fire).
+    # No writer data => returns None, but selection WAS consulted (proves
+    # the short-circuit did NOT fire).
     assert await storage.get_tile("cat", "coll", "WebMercatorQuad", 5, 17, 11, "mvt") is None
-    storage_provider.get_storage_identifier.assert_awaited_once()
+    storage._select.assert_awaited_once()

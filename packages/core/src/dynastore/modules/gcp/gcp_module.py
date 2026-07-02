@@ -743,15 +743,20 @@ class GCPModule(
             )
             register_plugin(self._asset_download_process)
 
-            # Register GCS-backed tile storage providers
-            from dynastore.modules.gcp.tiles_storage import (
-                TileBucketPreseedStorage,
-                StorageBackedTileArchive,
-            )
-            self._tile_bucket_storage = TileBucketPreseedStorage()
+            # Register the GCS PMTiles archive store and the signed-URL
+            # provider for the 307-redirect serve mode. The per-tile cache
+            # writer itself is NOT registered here: importing
+            # gcp.tiles_storage (below) registers 'gcs_tile_writer' into the
+            # tile-writer registry (tiles_writers.register_tile_writer_factory),
+            # which the unconditionally-registered CompositeTileStorage
+            # (TilesModule) selects among live, per catalog — no
+            # TileStorageProtocol plugin registration needed from this module.
+            from dynastore.modules.tiles.tile_blob_storage import StorageBackedTileArchive
+            from dynastore.modules.gcp.tiles_storage import GcsTileUrlSigner
             self._tile_archive_storage = StorageBackedTileArchive()
-            register_plugin(self._tile_bucket_storage)
+            self._tile_url_signer = GcsTileUrlSigner()
             register_plugin(self._tile_archive_storage)
+            register_plugin(self._tile_url_signer)
 
             from dynastore.modules.gcp.asset_sync import (
                 register_bucket_annotation_patcher,
@@ -920,8 +925,8 @@ class GCPModule(
                 "_bq_service",
                 "_bq_collection_enricher",
                 "_asset_download_process",
-                "_tile_bucket_storage",
                 "_tile_archive_storage",
+                "_tile_url_signer",
                 "_monitoring_signal_provider",
             ):
                 obj = getattr(self, attr, None)

@@ -699,8 +699,8 @@ async def test_reconcile_purges_when_cache_disabled(monkeypatch):
     monkeypatch.setattr(_mods, "get_protocol", lambda *_a, **_k: provider)
     import dynastore.modules.tiles.tiles_module as _tm
     monkeypatch.setattr(_tm, "invalidate_collection_tiles", _invalidate)
-    import dynastore.modules.gcp.tiles_storage as _gcs
-    monkeypatch.setattr(_gcs, "_load_caching_config", _load_cfg)
+    import dynastore.modules.tiles.tiles_config as _tcc
+    monkeypatch.setattr(_tcc, "_load_caching_config", _load_cfg)
 
     report = await tcs.reconcile_tile_cache("cat", "col")
     assert report["action"] == "purged_cache_disabled"
@@ -724,8 +724,8 @@ async def test_reconcile_reconciles_when_enabled(monkeypatch):
     monkeypatch.setattr(_mods, "get_protocol", lambda *_a, **_k: provider)
     import dynastore.modules.tiles.tiles_module as _tm
     monkeypatch.setattr(_tm, "invalidate_collection_tiles", _invalidate)
-    import dynastore.modules.gcp.tiles_storage as _gcs
-    monkeypatch.setattr(_gcs, "_load_caching_config", _load_cfg)
+    import dynastore.modules.tiles.tiles_config as _tcc
+    monkeypatch.setattr(_tcc, "_load_caching_config", _load_cfg)
 
     report = await tcs.reconcile_tile_cache("cat", "col")
     assert report["action"] == "reconciled"

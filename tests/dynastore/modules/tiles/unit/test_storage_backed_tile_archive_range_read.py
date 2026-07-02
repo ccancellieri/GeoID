@@ -41,7 +41,7 @@ from __future__ import annotations
 import io
 from typing import List, Optional, Tuple
 
-from dynastore.modules.gcp.tiles_storage import StorageBackedTileArchive
+from dynastore.modules.tiles.tile_blob_storage import StorageBackedTileArchive
 from dynastore.modules.tiles.tiles_module import read_pmtiles_tile
 from dynastore.modules.tiles.writers.pmtiles_writer import write_pmtiles
 

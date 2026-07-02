@@ -16,59 +16,23 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Unit tests for TileBucketPreseedStorage.get_tile_url signing behaviour.
+"""Unit tests for `GcsTileUrlSigner.sign` (the tile-cache 307-redirect
+signing provider — moved out of the deleted `TileBucketPreseedStorage`).
 
 Validates that:
-- get_tile_url generates a V4 signed URL via IAM signBlob (mock identity provider).
+- sign() generates a V4 signed URL via IAM signBlob (mock identity provider).
 - When blob.exists() raises (Forbidden), a WARNING is logged and None is returned.
 - When blob.exists() returns False, None is returned with no WARNING.
 - A None/invalid service-account email from the identity provider raises ValueError
-  (surfaced as WARNING in _try_cached_tile, keeping the proxy fallback).
+  (surfaced as WARNING by the caller, keeping the proxy fallback).
 - generate_gcs_signed_url guards service_account_email for None/non-email values.
 """
 from __future__ import annotations
 
 import logging
-from typing import Optional, Type
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-from dynastore.models.plugin_config import PluginConfig
-from dynastore.modules.tiles.tiles_config import TilesCachingConfig
-
-
-# ---------------------------------------------------------------------------
-# Shared stub: PlatformConfigsProtocol
-# ---------------------------------------------------------------------------
-
-
-class _StubPlatformConfigsProtocol:
-    is_platform_manager = True
-
-    def __init__(self, cfg: Optional[TilesCachingConfig]) -> None:
-        self._cfg = cfg
-
-    async def get_config(self, config_cls: Type[PluginConfig], ctx=None) -> PluginConfig:
-        if self._cfg is None or config_cls is not TilesCachingConfig:
-            return TilesCachingConfig()
-        return self._cfg
-
-    async def set_config(self, *a, **kw) -> None: ...
-    async def list_configs(self): return {}
-
-
-def _install_config(monkeypatch, cfg: TilesCachingConfig):
-    stub = _StubPlatformConfigsProtocol(cfg)
-    from dynastore.models.protocols import platform_configs as pc_mod
-    from dynastore.tools import discovery
-
-    def fake_get_protocol(proto, *a, **kw):
-        if proto is pc_mod.PlatformConfigsProtocol:
-            return stub
-        return None
-
-    monkeypatch.setattr(discovery, "get_protocol", fake_get_protocol)
 
 
 # ---------------------------------------------------------------------------
@@ -77,20 +41,13 @@ def _install_config(monkeypatch, cfg: TilesCachingConfig):
 
 
 @pytest.mark.asyncio
-async def test_get_tile_url_returns_signed_url_via_iam_signblob(monkeypatch):
-    """get_tile_url returns a signed URL when blob exists and identity provides
+async def test_sign_returns_signed_url_via_iam_signblob(monkeypatch):
+    """sign() returns a signed URL when blob exists and identity provides
     a valid SA email + fresh token (the IAM signBlob path on Cloud Run)."""
-    from dynastore.modules.gcp.tiles_storage import TileBucketPreseedStorage
-
-    _install_config(monkeypatch, TilesCachingConfig())
-    monkeypatch.setattr(
-        "dynastore.modules.gcp.tiles_storage._external_gcp_cache",
-        AsyncMock(return_value=("shared-bucket", "tiles/cat")),
-    )
+    from dynastore.modules.gcp.tiles_storage import GcsTileUrlSigner
 
     signed_url = "https://storage.googleapis.com/shared-bucket/tiles/cat/coll/WMQ/5/17/11.mvt?X-Goog-Signature=abc"
 
-    # Blob mock: exists() → True, generate_signed_url → the signed URL
     blob_mock = MagicMock()
     blob_mock.exists = MagicMock(return_value=True)
     blob_mock.generate_signed_url = MagicMock(return_value=signed_url)
@@ -110,21 +67,17 @@ async def test_get_tile_url_returns_signed_url_via_iam_signblob(monkeypatch):
     )
     identity_mock.get_fresh_token = AsyncMock(return_value="ya29.fresh-token")
 
-    storage_provider_mock = MagicMock()
-    storage_provider_mock.get_storage_identifier = AsyncMock(
-        side_effect=AssertionError("should not be called with override set")
-    )
+    signer = GcsTileUrlSigner()
+    signer._get_client_provider = MagicMock(return_value=client_provider_mock)
+    signer._get_identity_provider = MagicMock(return_value=identity_mock)
 
-    storage = TileBucketPreseedStorage()
-    storage._get_storage_provider = MagicMock(return_value=storage_provider_mock)
-    storage._get_client_provider = MagicMock(return_value=client_provider_mock)
-    storage._get_identity_provider = MagicMock(return_value=identity_mock)
-
-    with patch("dynastore.modules.gcp.tiles_storage.run_in_thread", new=AsyncMock(side_effect=lambda f, *a, **kw: f(*a, **kw))):
-        result = await storage.get_tile_url("cat", "coll", "WebMercatorQuad", 5, 17, 11, "mvt")
+    with patch(
+        "dynastore.modules.gcp.tiles_storage.run_in_thread",
+        new=AsyncMock(side_effect=lambda f, *a, **kw: f(*a, **kw)),
+    ):
+        result = await signer.sign("gs://shared-bucket/tiles/cat/coll/WMQ/5/17/11.mvt")
 
     assert result == signed_url
-    # Confirm signed_url was called with IAM fields
     call_kwargs = blob_mock.generate_signed_url.call_args[1]
     assert call_kwargs["service_account_email"] == "sa@project.iam.gserviceaccount.com"
     assert call_kwargs["access_token"] == "ya29.fresh-token"
@@ -133,22 +86,16 @@ async def test_get_tile_url_returns_signed_url_via_iam_signblob(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# blob.exists() raises → WARNING logged, None returned
+# blob.exists() raises -> WARNING logged, None returned
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_get_tile_url_warns_when_blob_exists_raises(monkeypatch, caplog):
+async def test_sign_warns_when_blob_exists_raises(caplog):
     """If blob.exists() raises (e.g. 403 Forbidden on metadata API), a WARNING is
-    logged and get_tile_url returns None so the proxy path can serve the tile."""
+    logged and sign() returns None so the proxy path can serve the tile."""
     from google.api_core.exceptions import Forbidden
-    from dynastore.modules.gcp.tiles_storage import TileBucketPreseedStorage
-
-    _install_config(monkeypatch, TilesCachingConfig())
-    monkeypatch.setattr(
-        "dynastore.modules.gcp.tiles_storage._external_gcp_cache",
-        AsyncMock(return_value=("shared-bucket", "tiles/cat")),
-    )
+    from dynastore.modules.gcp.tiles_storage import GcsTileUrlSigner
 
     blob_mock = MagicMock()
     blob_mock.exists = MagicMock(side_effect=Forbidden("403 SA lacks storage.objects.get"))
@@ -162,21 +109,16 @@ async def test_get_tile_url_warns_when_blob_exists_raises(monkeypatch, caplog):
     client_provider_mock = MagicMock()
     client_provider_mock.get_storage_client = MagicMock(return_value=storage_client_mock)
 
-    identity_mock = MagicMock()
-    storage_provider_mock = MagicMock()
-    storage_provider_mock.get_storage_identifier = AsyncMock(return_value=None)
-
-    storage = TileBucketPreseedStorage()
-    storage._get_storage_provider = MagicMock(return_value=storage_provider_mock)
-    storage._get_client_provider = MagicMock(return_value=client_provider_mock)
-    storage._get_identity_provider = MagicMock(return_value=identity_mock)
+    signer = GcsTileUrlSigner()
+    signer._get_client_provider = MagicMock(return_value=client_provider_mock)
+    signer._get_identity_provider = MagicMock(return_value=MagicMock())
 
     with patch(
         "dynastore.modules.gcp.tiles_storage.run_in_thread",
         new=AsyncMock(side_effect=lambda f, *a, **kw: f(*a, **kw)),
     ):
         with caplog.at_level(logging.WARNING, logger="dynastore.modules.gcp.tiles_storage"):
-            result = await storage.get_tile_url("cat", "coll", "WebMercatorQuad", 5, 17, 11, "mvt")
+            result = await signer.sign("gs://shared-bucket/tiles/cat/coll/WMQ/5/17/11.mvt")
 
     assert result is None, "Should return None so proxy can handle the tile"
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
@@ -187,20 +129,14 @@ async def test_get_tile_url_warns_when_blob_exists_raises(monkeypatch, caplog):
 
 
 # ---------------------------------------------------------------------------
-# blob.exists() returns False → None, no WARNING
+# blob.exists() returns False -> None, no WARNING
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_get_tile_url_returns_none_silently_on_blob_miss(monkeypatch, caplog):
-    """Normal cache-miss: blob.exists() returns False → None, no WARNING."""
-    from dynastore.modules.gcp.tiles_storage import TileBucketPreseedStorage
-
-    _install_config(monkeypatch, TilesCachingConfig())
-    monkeypatch.setattr(
-        "dynastore.modules.gcp.tiles_storage._external_gcp_cache",
-        AsyncMock(return_value=("shared-bucket", "tiles/cat")),
-    )
+async def test_sign_returns_none_silently_on_blob_miss(caplog):
+    """Normal cache-miss: blob.exists() returns False -> None, no WARNING."""
+    from dynastore.modules.gcp.tiles_storage import GcsTileUrlSigner
 
     blob_mock = MagicMock()
     blob_mock.exists = MagicMock(return_value=False)
@@ -214,38 +150,41 @@ async def test_get_tile_url_returns_none_silently_on_blob_miss(monkeypatch, capl
     client_provider_mock = MagicMock()
     client_provider_mock.get_storage_client = MagicMock(return_value=storage_client_mock)
 
-    identity_mock = MagicMock()
-    storage_provider_mock = MagicMock()
-    storage_provider_mock.get_storage_identifier = AsyncMock(return_value=None)
-
-    storage = TileBucketPreseedStorage()
-    storage._get_storage_provider = MagicMock(return_value=storage_provider_mock)
-    storage._get_client_provider = MagicMock(return_value=client_provider_mock)
-    storage._get_identity_provider = MagicMock(return_value=identity_mock)
+    signer = GcsTileUrlSigner()
+    signer._get_client_provider = MagicMock(return_value=client_provider_mock)
+    signer._get_identity_provider = MagicMock(return_value=MagicMock())
 
     with patch(
         "dynastore.modules.gcp.tiles_storage.run_in_thread",
         new=AsyncMock(side_effect=lambda f, *a, **kw: f(*a, **kw)),
     ):
         with caplog.at_level(logging.WARNING, logger="dynastore.modules.gcp.tiles_storage"):
-            result = await storage.get_tile_url("cat", "coll", "WebMercatorQuad", 5, 17, 11, "mvt")
+            result = await signer.sign("gs://shared-bucket/tiles/cat/coll/WMQ/5/17/11.mvt")
 
     assert result is None
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert not warnings, f"No WARNING expected on cache miss; got: {warnings}"
 
 
+@pytest.mark.asyncio
+async def test_sign_returns_none_for_non_gs_uri():
+    """sign() is scoped to gs:// — an unexpected scheme is a clean None, not a crash."""
+    from dynastore.modules.gcp.tiles_storage import GcsTileUrlSigner
+
+    signer = GcsTileUrlSigner()
+    assert await signer.sign("file:///tmp/tile.mvt") is None
+
+
 # ---------------------------------------------------------------------------
-# Invalid SA email → ValueError from generate_gcs_signed_url
+# Invalid SA email -> ValueError from generate_gcs_signed_url
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_generate_gcs_signed_url_raises_on_none_email():
     """If identity_provider.get_account_email() returns None, generate_gcs_signed_url
-    raises ValueError so _try_cached_tile can log it as WARNING and fall back to proxy."""
+    raises ValueError so callers can log it as WARNING and fall back to proxy."""
     from datetime import timedelta
-    from unittest.mock import AsyncMock, MagicMock
 
     from dynastore.modules.gcp.tools.signed_urls import generate_gcs_signed_url
 

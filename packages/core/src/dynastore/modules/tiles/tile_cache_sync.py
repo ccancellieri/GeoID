@@ -399,7 +399,7 @@ async def is_tile_cache_active(catalog_id: str, collection_id: str) -> bool:
     # (0) L2 cache off → nothing is being cached, so no invalidation
     # obligation is warranted. Resolve tolerantly (defaults to enabled).
     try:
-        from dynastore.modules.gcp.tiles_storage import _load_caching_config
+        from dynastore.modules.tiles.tiles_config import _load_caching_config
 
         cfg = await _load_caching_config()
         if not getattr(cfg, "cache_enabled", True):
@@ -678,7 +678,7 @@ async def reconcile_tile_cache(
             TileStorageProtocol,
             invalidate_collection_tiles,
         )
-        from dynastore.modules.gcp.tiles_storage import _load_caching_config
+        from dynastore.modules.tiles.tiles_config import _load_caching_config
 
         provider = get_protocol(TileStorageProtocol)
         if provider is None:

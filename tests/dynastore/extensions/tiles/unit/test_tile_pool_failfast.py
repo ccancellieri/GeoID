@@ -207,7 +207,6 @@ async def test_get_vector_tile_acquires_conn_on_happy_path():
     svc._resolve_request_config = AsyncMock(return_value=MagicMock())
     svc._is_cache_enabled = AsyncMock(return_value=False)
     svc._validate_tms_and_matrix = AsyncMock(return_value=MagicMock(crs="EPSG:3857"))
-    svc._generate_mvt = AsyncMock(return_value=b"fake-mvt")
     svc._finalize_response = MagicMock(return_value=MagicMock(status_code=200))
 
     async def _fast_timeout() -> float:
@@ -225,6 +224,13 @@ async def test_get_vector_tile_acquires_conn_on_happy_path():
     config_mock = MagicMock()
     config_mock.get_config = AsyncMock(return_value=MagicMock())
 
+    # get_vector_tile lazily does `from dynastore.modules.tiles import
+    # tiles_engine` inside the handler, then calls attributes on that (real,
+    # already-imported-elsewhere) module object — patching the module's own
+    # attributes (rather than sys.modules) is what actually intercepts the
+    # call regardless of import-caching order across the test session.
+    fake_ctx = MagicMock(target_srid=3857)
+
     with patch(
         "dynastore.extensions.tiles.tiles_service._read_live_fg_acquire_timeout",
         _fast_timeout,
@@ -235,26 +241,20 @@ async def test_get_vector_tile_acquires_conn_on_happy_path():
         "dynastore.extensions.tiles.tiles_service.get_protocol",
         return_value=config_mock,
     ), patch(
-        "dynastore.extensions.tiles.tiles_service.tms_manager.resolve_srid",
-        AsyncMock(return_value=3857),
-    ), patch(
-        "dynastore.extensions.tiles.tiles_service.tms_manager.get_tile_resolution_params",
-        AsyncMock(return_value=MagicMock()),
-    ):
-        # Patch local import in get_vector_tile
-        fake_tiles_module = MagicMock()
-        fake_tiles_module.get_tile_resolution_params = AsyncMock(
-            return_value=MagicMock()
+        "dynastore.modules.tiles.tiles_engine.build_render_context",
+        AsyncMock(return_value=fake_ctx),
+    ) as fake_build_ctx, patch(
+        "dynastore.modules.tiles.tiles_engine.render_tile",
+        AsyncMock(return_value=b"fake-mvt"),
+    ) as fake_render_tile:
+        result = await svc.get_vector_tile(
+            request=_make_request(),
+            background_tasks=_make_bg_tasks(),
+            **_minimal_tile_kwargs(),
         )
-        with patch.dict(
-            "sys.modules",
-            {"dynastore.modules.tiles.tiles_module": fake_tiles_module},
-        ):
-            result = await svc.get_vector_tile(
-                request=_make_request(),
-                background_tasks=_make_bg_tasks(),
-                **_minimal_tile_kwargs(),
-            )
 
+    assert result is not None
+    fake_build_ctx.assert_awaited_once()
+    fake_render_tile.assert_awaited_once()
     # Connection must have been closed in the finally block
     mock_conn.close.assert_awaited_once()

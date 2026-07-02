@@ -383,6 +383,23 @@ class BucketService:
 
         await run_in_thread(blob.download_to_filename, target_path)
 
+    async def download_file_content(self, path: str) -> Optional[bytes]:
+        """StorageProtocol: Downloads a full object as bytes, or None if absent."""
+        if not path.startswith("gs://"):
+            raise ValueError(f"Invalid GCS path: {path}")
+
+        bucket_name, blob_name = path[5:].split("/", 1)
+        blob = self.storage_client.bucket(bucket_name).blob(blob_name)
+
+        def _fetch():
+            from google.api_core.exceptions import NotFound
+            try:
+                return blob.download_as_bytes()
+            except NotFound:
+                return None
+
+        return await run_in_thread(_fetch)
+
     async def file_exists(self, path: str) -> bool:
         """StorageProtocol: Checks if a file exists in storage."""
         if not path.startswith("gs://"):
@@ -444,6 +461,18 @@ class BucketService:
         blob = bucket.blob(blob_name)
 
         await run_in_thread(blob.delete)
+
+    async def list_prefix(self, base_uri: str, prefix: str) -> list:
+        """StorageProtocol: List ``gs://`` object paths under a bucket + key prefix."""
+        if not base_uri.startswith("gs://"):
+            raise ValueError(f"Invalid GCS path: {base_uri}")
+        bucket_name = base_uri[5:].split("/", 1)[0]
+        bucket = self.storage_client.bucket(bucket_name)
+
+        def _list() -> list:
+            return [f"gs://{bucket_name}/{blob.name}" for blob in bucket.list_blobs(prefix=prefix)]
+
+        return await run_in_thread(_list)
 
 
     async def download_bytes_range(self, path: str, offset: int, length: int) -> bytes:

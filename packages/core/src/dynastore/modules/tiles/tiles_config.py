@@ -16,12 +16,16 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from typing import ClassVar, Dict, List, Literal, Optional, Tuple
-from pydantic import Field
+import logging
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
+from pydantic import Field, field_serializer, field_validator
 from dynastore.models.mutability import Mutable
 from dynastore.models.plugin_config import PluginConfig
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
 from dynastore.tools.geospatial import SimplificationAlgorithm
+from dynastore.modules.tiles.tiles_writers import TileWriterConfig, resolve_writer_config_entry
+
+logger = logging.getLogger(__name__)
 
 class TilesConfig(ExposableConfigMixin, PluginConfig):
     """
@@ -256,6 +260,83 @@ class TilesCachingConfig(PluginConfig):
         ),
     )
 
+    # --- Writers list (backend-agnostic, extensible, typed) ---
+    #
+    # WHERE tiles are cached, as an ORDERED list of typed writer configs
+    # rather than an enum + a scatter of backend-specific fields. Each
+    # implementation provides its own ``TileWriterConfig`` subclass
+    # co-located with the implementation (``PgTileWriterConfig`` here,
+    # ``GcsTileWriterConfig`` in the ``gcp`` module, a local-disk equivalent
+    # in ``modules/local``) and registers a ``(config class, factory)`` pair
+    # via ``tiles_writers.register_tile_writer_factory`` — a new writer needs
+    # no change to this config's schema. List order = selection priority: at
+    # most ONE writer is ever active — ``tiles_writers.select_tile_writer``
+    # picks the first AVAILABLE one (registered factory + enabled + target
+    # resolves), which is what replaces ``storage_priority``. Resolution
+    # (defaulting, back-compat mapping) lives in
+    # ``tiles_writers.resolve_effective_writers``.
+    writers: Mutable[Optional[List[TileWriterConfig]]] = Field(
+        default=None,
+        description=(
+            "Ordered tile-cache writer list. ``None``/empty (default) = auto: "
+            "``[GcsTileWriterConfig()]`` (the catalog's own managed bucket) "
+            "when the ``gcp`` module registered a ``StorageProtocol`` "
+            "provider, followed by ``PgTileWriterConfig()`` as a fail-safe "
+            "fallback; else just ``[PgTileWriterConfig()]`` — today's "
+            "behavior, zero migration. The first AVAILABLE writer in list "
+            "order is selected and serves both reads and writes; an "
+            "unavailable earlier candidate (e.g. no matching StorageProtocol "
+            "registered) is skipped and logged, never silently drops writes. "
+            "Each list entry must include its ``writer_key`` (its concrete "
+            "class's snake_case identity, e.g. ``'gcs_tile_writer_config'``, "
+            "``'pg_tile_writer_config'``) so it round-trips to the right typed class."
+        ),
+    )
+
+    @field_validator("writers", mode="before")
+    @classmethod
+    def _resolve_writers(cls, value: Any) -> Any:
+        if value is None:
+            return value
+        return [resolve_writer_config_entry(item) for item in value]
+
+    @field_serializer("writers")
+    def _serialize_writers(self, value: Optional[List[TileWriterConfig]]) -> Optional[List[Dict[str, Any]]]:
+        # The field is typed List[TileWriterConfig] (the base class), so
+        # pydantic's default nested-field serialization would use only the
+        # base class's schema and silently drop each entry's own subclass
+        # fields (e.g. GcsTileWriterConfig.bucket). Dumping each instance
+        # directly uses its actual runtime type instead, preserving them —
+        # and preserving the writer_key discriminator round_trip needs.
+        if value is None:
+            return None
+        return [item.model_dump() for item in value]
+
+
+async def _load_caching_config() -> TilesCachingConfig:
+    """Fetch live ``TilesCachingConfig``; fall back to defaults if unavailable.
+
+    Mirrors the ``ElasticsearchIndexConfig`` pattern (issue #489): a missing
+    platform-configs layer (cold boot, unit test, manager not registered)
+    yields safe defaults rather than crashing tile I/O.
+
+    Lives here (not in the GCP module) so PG- and local-disk-only tile
+    storage providers never need to import anything GCP-specific to resolve
+    their caching config.
+    """
+    from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+    from dynastore.tools.discovery import get_protocol as _get_protocol
+
+    mgr = _get_protocol(PlatformConfigsProtocol)
+    if mgr is None:
+        return TilesCachingConfig()
+    try:
+        cfg = await mgr.get_config(TilesCachingConfig)
+    except Exception as exc:
+        logger.debug("TilesCachingConfig: get_config failed (%s); using defaults", exc)
+        return TilesCachingConfig()
+    return cfg if isinstance(cfg, TilesCachingConfig) else TilesCachingConfig()
+
 
 class TilesPreseedConfig(PluginConfig):
     """
@@ -291,7 +372,16 @@ class TilesPreseedConfig(PluginConfig):
     # Storage Configuration
     storage_priority: Mutable[List[str]] = Field(
         default=["bucket", "pg"],
-        description="Priority list of storage providers to use for saving tiles."
+        description=(
+            "DEPRECATED, no-op: storage selection is now "
+            "``TilesCachingConfig.writers`` (first AVAILABLE writer in list "
+            "order wins). Kept only so existing configs keep validating. "
+            "When ``writers`` is unset and this list's first entry is "
+            "``'pg'``, it is soft-mapped to ``[PgTileWriterConfig()]`` for "
+            "back-compat, reproducing the original intent exactly; a leading "
+            "``'bucket'`` (or any other value) leaves ``writers`` at its "
+            "default auto-injection."
+        ),
     )
 
     # Generation Overrides
@@ -302,4 +392,28 @@ class TilesPreseedConfig(PluginConfig):
     # Catalog Level specific
     collections_to_preseed: Mutable[Optional[List[str]]] = Field(default=None,
         description="For Catalog-level config: list of collections to include. If None, applies to all (or logic defined by task)."
+    )
+
+    # --- Preseed hardening (#2813) ---
+    preseed_max_zoom: Mutable[Optional[int]] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Caps the max zoom preseeded when no explicit request/runtime-"
+            "config zoom applies, so an unbounded default bbox can't fan out "
+            "to a huge tile count. ``None`` (default) falls back to a fixed "
+            "internal cap (see ``tasks.tiles_preseed.task.PRESEED_DEFAULT_MAX_ZOOM``)."
+        ),
+    )
+
+    preseed_tile_timeout_seconds: Mutable[int] = Field(
+        default=30,
+        ge=1,
+        description=(
+            "Per-tile PostgreSQL statement timeout (``SET LOCAL "
+            "statement_timeout``) applied for the duration of each per-zoom "
+            "preseed transaction. A tile that exceeds this is counted in "
+            "``results['skipped']`` and the run continues, instead of one "
+            "pathological tile stalling the whole job."
+        ),
     )

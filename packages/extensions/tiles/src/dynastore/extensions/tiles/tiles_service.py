@@ -57,9 +57,7 @@ from dynastore.tools.geospatial import SimplificationAlgorithm
 from dynastore.extensions.web.decorators import expose_web_page
 import os
 
-from dynastore.modules.tiles import tiles_db
 from dynastore.modules.tiles.tiles_module import TileStorageProtocol, TileArchiveStorageProtocol
-from dynastore.tools.cache import cached
 from dynastore.modules.tiles.tiles_config import (
     TilesConfig,
     TilesCachingConfig,
@@ -949,36 +947,26 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 ) from None
             conn = _conn
 
-            # 4. TMS & Coordinate Validation
-            tms_def = await self._validate_tms_and_matrix(
-                dataset, tileMatrixSetId, z, x, y
-            )
+            # 4. TMS & Coordinate Validation (HTTP-specific z/x/y bounds check;
+            # stays here — tiles_engine.build_render_context re-resolves the
+            # same TMS internally for the SRID/source-selection it owns).
+            await self._validate_tms_and_matrix(dataset, tileMatrixSetId, z, x, y)
 
-            # 5. SRID Resolution
+            # 5. Resolve the render context: collection metadata, TMS, target
+            # SRID, and TileSource — consolidated with the preseed task's
+            # identical resolution in tiles_engine.build_render_context.
+            from dynastore.modules.tiles import tiles_engine
+            from dynastore.modules.tiles.tiles_source import TileSourceNotSupported
+
             try:
-                target_srid = await tms_manager.resolve_srid(
-                    conn=conn, crs_str=tms_def.crs, catalog_id=dataset
+                ctx = await tiles_engine.build_render_context(
+                    dataset, requested_cols_list, tileMatrixSetId, engine=conn,
                 )
-                if not target_srid:
-                    raise ValueError("Failed to resolve SRID.")
-            except Exception as e:
-                logger.error(f"SRID resolution failed: {e}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Could not process CRS for TMS '{tileMatrixSetId}'.",
-                ) from e
+            except TileSourceNotSupported as exc:
+                logger.error("get_vector_tile: %s", exc)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-            # Resolve metadata for each collection (Cached in TilesModule)
-            from dynastore.modules.tiles import tiles_module
-
-            resolved_collections = []
-            for coll_id in requested_cols_list:
-                # get_tile_resolution_params is cached and validates existence
-                meta = await tiles_module.get_tile_resolution_params(dataset, coll_id)
-                if meta:
-                    resolved_collections.append(meta)
-
-            if not resolved_collections:
+            if ctx is None:
                 logger.warning(
                     "No valid collections found for %s/%s "
                     "(requested=%d) — see tile metadata warnings above for "
@@ -1017,20 +1005,22 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                                 },
                             )
 
-            # Retrieve MVT content — PostGIS generation
-            mvt_content = await self._generate_mvt(
+            # Retrieve MVT content via the unified render engine — L1 cache
+            # enabled (the live request-serving path); the preseed task
+            # renders each tile exactly once and passes use_l1_cache=False.
+            mvt_content = await tiles_engine.render_tile(
                 conn,
-                resolved_collections,
-                tms_def,
-                target_srid,
+                ctx,
                 str(z),
                 x,
                 y,
-                datetime,
-                filter,
-                subset,
-                simplification,
-                simplification_algorithm,
+                format=format,
+                use_l1_cache=True,
+                datetime_str=datetime,
+                cql_filter=filter,
+                subset_params=subset,  # type: ignore[arg-type]
+                simplification=simplification,
+                simplification_algorithm=simplification_algorithm,
             )
 
             # 9. Background Caching
@@ -1094,54 +1084,10 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 await _conn.close()
 
     # --- Helper Private Methods ---
-
-    @cached(
-        maxsize=512,
-        ttl=60,
-        jitter=5,
-        namespace="mvt_l1",
-        ignore=["conn"],
-        condition=lambda r: r is not None,
-    )
-    async def _generate_mvt(
-        self,
-        conn: AsyncConnection,
-        resolved_collections: list,
-        tms_def,
-        target_srid: int,
-        z: str,
-        x: int,
-        y: int,
-        datetime_str: Optional[str],
-        cql_filter: Optional[str],
-        subset_params: Optional[str],
-        simplification: Optional[float],
-        simplification_algorithm,
-    ) -> Optional[bytes]:
-        """PostGIS MVT generation — L1 in-process cache above the storage provider L2."""
-        try:
-            return await tiles_db.get_features_as_mvt_filtered(
-                conn=conn,
-                resolved_collections=resolved_collections,
-                tms_def=tms_def,
-                target_srid=target_srid,
-                z=z,
-                x=x,
-                y=y,
-                datetime_str=datetime_str,
-                cql_filter=cql_filter,
-                subset_params=subset_params,  # type: ignore[arg-type]
-                simplification=simplification,
-                simplification_algorithm=simplification_algorithm,
-            )
-        except ValueError as exc:
-            # Belt-and-suspenders: tiles_db._build_collection_subquery already
-            # catches ValueError per-collection, but any storage-resolution
-            # ValueError that escapes here would otherwise become an opaque
-            # 500.  Returning None becomes a 204 upstream and — because the
-            # @cached condition rejects None — does not poison the L1 cache.
-            logger.warning("MVT generation skipped (storage unresolved): %s", exc)
-            return None
+    #
+    # MVT generation itself (with its L1 in-process cache) moved to
+    # dynastore.modules.tiles.tiles_engine.render_tile — shared with the
+    # preseed task rather than duplicated here.
 
     @staticmethod
     async def _resolve_request_config(

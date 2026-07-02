@@ -20,7 +20,7 @@
 Storage-related protocol definitions.
 """
 
-from typing import Protocol, Optional, Any, runtime_checkable
+from typing import List, Protocol, Optional, Any, runtime_checkable
 
 @runtime_checkable
 class StorageProtocol(Protocol):
@@ -111,3 +111,29 @@ class StorageProtocol(Protocol):
             with open(tmp.name, "rb") as f:
                 f.seek(offset)
                 return f.read(length)
+
+    async def download_file_content(self, path: str) -> Optional[bytes]:
+        """Download a full object as bytes, or None if it does not exist.
+
+        Default: existence-check then download to a temp file and read it
+        back — correct but allocates a temp file per call. Providers should
+        override this with a direct in-memory read (e.g. GCS
+        ``blob.download_as_bytes()``).
+        """
+        import tempfile
+        if not await self.file_exists(path):
+            return None
+        with tempfile.NamedTemporaryFile(delete=True) as tmp:
+            await self.download_file(path, tmp.name)
+            with open(tmp.name, "rb") as f:
+                return f.read()
+
+    async def list_prefix(self, base_uri: str, prefix: str) -> List[str]:
+        """List object paths (each usable as ``delete_file``'s ``path`` arg)
+        under ``{base_uri}/{prefix}``.
+
+        Default: not supported (empty list) — callers that need a prefix-
+        scoped bulk delete degrade to a no-op rather than fail. Providers
+        should override this (GCS: ``bucket.list_blobs(prefix=...)``).
+        """
+        return []
