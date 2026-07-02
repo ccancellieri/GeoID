@@ -54,24 +54,26 @@ def _dead_task(offset_seconds: int = 0) -> Task:
 # ---------------------------------------------------------------------------
 
 class TestToTaskPage:
-    def test_last_page_has_no_cursor(self):
+    @pytest.mark.asyncio
+    async def test_last_page_has_no_cursor(self):
         """When rows <= limit the page has no next_cursor."""
         import dynastore.extensions.tasks.tasks_service as svc
 
         rows = [_dead_task(i) for i in range(3)]
-        page = svc._to_task_page(rows, limit=5)
+        page = await svc._to_task_page(rows, limit=5)
 
         assert isinstance(page, TaskPage)
         assert len(page.items) == 3
         assert page.next_cursor is None
 
-    def test_full_page_yields_cursor(self):
+    @pytest.mark.asyncio
+    async def test_full_page_yields_cursor(self):
         """When limit+1 rows are present the (limit+1)-th row is encoded as cursor."""
         import dynastore.extensions.tasks.tasks_service as svc
         from dynastore.modules.tasks.tasks_module import decode_cursor
 
         rows = [_dead_task(i) for i in range(6)]
-        page = svc._to_task_page(rows, limit=5)
+        page = await svc._to_task_page(rows, limit=5)
 
         assert len(page.items) == 5
         assert page.next_cursor is not None
@@ -81,12 +83,13 @@ class TestToTaskPage:
         assert c_ts == sixth.timestamp
         assert c_id == sixth.jobID
 
-    def test_exact_limit_rows_has_no_cursor(self):
+    @pytest.mark.asyncio
+    async def test_exact_limit_rows_has_no_cursor(self):
         """Exactly limit rows means no overflow → no next page."""
         import dynastore.extensions.tasks.tasks_service as svc
 
         rows = [_dead_task(i) for i in range(5)]
-        page = svc._to_task_page(rows, limit=5)
+        page = await svc._to_task_page(rows, limit=5)
 
         assert len(page.items) == 5
         assert page.next_cursor is None
@@ -248,7 +251,7 @@ class TestDlqRouteHandlers:
 
         # Access the inner function via the closure on tasks_service module level
         # (the handlers are closures inside register_plugin; test via the helper).
-        page = svc._to_task_page(rows, limit=5)
+        page = await svc._to_task_page(rows, limit=5)
 
         assert isinstance(page, TaskPage)
         assert page.next_cursor is None
@@ -281,7 +284,7 @@ class TestDlqRouteHandlers:
         from dynastore.modules.tasks.tasks_module import decode_cursor
 
         rows = [_dead_task(i) for i in range(6)]  # 6 rows for limit=5
-        page = svc._to_task_page(rows, limit=5)
+        page = await svc._to_task_page(rows, limit=5)
 
         assert page.next_cursor is not None
         c_ts, c_id = decode_cursor(page.next_cursor)

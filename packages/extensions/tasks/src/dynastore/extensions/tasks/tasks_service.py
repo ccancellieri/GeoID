@@ -67,6 +67,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.tools.db import get_async_connection, get_async_engine
 from dynastore.models.auth_models import SYSTEM_USER_ID
+from dynastore.models.protocols import CatalogsProtocol
 from dynastore.models.protocols.visibility import (
     resolve_catalog_listing_ids,
     resolve_collection_listing_ids,
@@ -88,6 +89,7 @@ from dynastore.modules.tasks.maintenance import (
 )
 from dynastore.modules.tasks.reconciliation import reconcile_task_liveness
 from dynastore.modules.tasks.tasks_module import encode_cursor
+from dynastore.tools.discovery import get_protocol
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +214,46 @@ async def _get_task_scoped_uncached(
             "reconcile_task_liveness failed for task %s: %s — serving unreconciled status.",
             task_id, e,
         )
+    await _project_collection_external_ids([task])
     return task
+
+
+# ---------------------------------------------------------------------------
+# Physical -> external collection id projection (#2710)
+# ---------------------------------------------------------------------------
+
+
+async def _project_collection_external_ids(tasks: List[Task]) -> List[Task]:
+    """Project each task's stored ``collection_id`` to its public external_id.
+
+    Internal machinery (index_propagation, storage_drain, cascade_cleanup, ...)
+    stores the physical collection id in the ``collection_id`` column at spawn
+    time. Resolving here, at the REST read boundary, rather than at spawn
+    time keeps every task row correct across a collection rename. Reuses the
+    same ``CollectionsProtocol.resolve_collection_external_id`` mapping the
+    catalog/collection CRUD read path already relies on. Fails open (leaves
+    the stored value untouched) when the mapping is unavailable or the id is
+    already external, so a resolver hiccup never turns a 200 into a 500.
+    """
+    catalogs = get_protocol(CatalogsProtocol)
+    if catalogs is None:
+        return tasks
+
+    cache: Dict[Tuple[str, str], str] = {}
+    for task in tasks:
+        if not task.collection_id or not task.catalog_id:
+            continue
+        key = (task.catalog_id, task.collection_id)
+        if key not in cache:
+            try:
+                resolved = await catalogs.collections.resolve_collection_external_id(
+                    task.catalog_id, task.collection_id, allow_missing=True
+                )
+            except Exception:
+                resolved = None
+            cache[key] = resolved or task.collection_id
+        task.collection_id = cache[key]
+    return tasks
 
 
 # ---------------------------------------------------------------------------
@@ -220,12 +261,13 @@ async def _get_task_scoped_uncached(
 # ---------------------------------------------------------------------------
 
 
-def _to_task_page(rows: List[Task], limit: int) -> TaskPage:
+async def _to_task_page(rows: List[Task], limit: int) -> TaskPage:
     """Slice rows to limit; encode cursor from the (limit+1)-th row if present."""
     next_cursor: Optional[str] = None
     if len(rows) > limit:
         next_cursor = encode_cursor(rows[limit])
         rows = rows[:limit]
+    await _project_collection_external_ids(rows)
     return TaskPage(items=rows, next_cursor=next_cursor)
 
 
@@ -544,7 +586,7 @@ class TasksService(ExtensionProtocol):
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _to_task_page(rows, limit)
+        return await _to_task_page(rows, limit)
 
     # ------------------------------------------------------------------
     # 2. GET /task/tasks/{task_id} — get any task unscoped
@@ -578,6 +620,7 @@ class TasksService(ExtensionProtocol):
                 "reconcile_task_liveness failed for task %s: %s — serving unreconciled status.",
                 task_id, e,
             )
+        await _project_collection_external_ids([task])
         return task
 
     # ------------------------------------------------------------------
@@ -616,7 +659,7 @@ class TasksService(ExtensionProtocol):
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _to_task_page(rows, limit)
+        return await _to_task_page(rows, limit)
 
     # ------------------------------------------------------------------
     # 4. GET /task/catalogs/{catalog_id}/tasks/{task_id}
@@ -682,7 +725,7 @@ class TasksService(ExtensionProtocol):
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _to_task_page(rows, limit)
+        return await _to_task_page(rows, limit)
 
     # ------------------------------------------------------------------
     # 6. GET /task/catalogs/{catalog_id}/collections/{collection_id}/tasks/{task_id}
@@ -802,7 +845,7 @@ class TasksService(ExtensionProtocol):
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _to_task_page(rows, limit)
+        return await _to_task_page(rows, limit)
 
     # ------------------------------------------------------------------
     # 11. GET /task/catalogs/{catalog_id}/dead-letter
@@ -829,7 +872,7 @@ class TasksService(ExtensionProtocol):
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _to_task_page(rows, limit)
+        return await _to_task_page(rows, limit)
 
     # ------------------------------------------------------------------
     # 12. GET /task/catalogs/{catalog_id}/collections/{collection_id}/dead-letter
@@ -862,7 +905,7 @@ class TasksService(ExtensionProtocol):
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _to_task_page(rows, limit)
+        return await _to_task_page(rows, limit)
 
     # ------------------------------------------------------------------
     # 13. POST /task/dead-letter/{task_id}/requeue
