@@ -453,6 +453,11 @@ async def test_columnar_sidecar_property_sort_raises_value_error(monkeypatch):
     catalogs_mock.list_collections = AsyncMock(return_value=[])
     catalogs_mock.get_collection_column_names = AsyncMock(return_value=[])
     catalogs_mock.resolve_physical_schema = AsyncMock(return_value="test_schema")
+    # #2786: the explicit ``collections=`` scope is resolved external->internal
+    # before the PG fallback runs; round-trip the id unchanged so the COLUMNAR
+    # guard under test is still reached with the expected collection id.
+    catalogs_mock.resolve_catalog_id = AsyncMock(return_value="cat-x")
+    catalogs_mock.collections.resolve_collection_id = AsyncMock(return_value=col_id)
     monkeypatch.setattr(
         "dynastore.extensions.stac.search.get_protocol",
         lambda proto: catalogs_mock,
@@ -497,6 +502,11 @@ async def test_no_attr_sidecar_property_sort_raises_value_error(monkeypatch):
     catalogs_mock.list_collections = AsyncMock(return_value=[])
     catalogs_mock.get_collection_column_names = AsyncMock(return_value=[])
     catalogs_mock.resolve_physical_schema = AsyncMock(return_value="test_schema")
+    # #2786: the explicit ``collections=`` scope is resolved external->internal
+    # before the PG fallback runs; round-trip the id unchanged so the guard
+    # under test is still reached with the expected collection id.
+    catalogs_mock.resolve_catalog_id = AsyncMock(return_value="cat-x")
+    catalogs_mock.collections.resolve_collection_id = AsyncMock(return_value=col_id)
     monkeypatch.setattr(
         "dynastore.extensions.stac.search.get_protocol",
         lambda proto: catalogs_mock,
@@ -539,6 +549,11 @@ async def test_jsonb_sidecar_property_sort_does_not_raise_on_guard(monkeypatch):
     catalogs_mock.list_collections = AsyncMock(return_value=[])
     catalogs_mock.get_collection_column_names = AsyncMock(return_value=[])
     catalogs_mock.resolve_physical_schema = AsyncMock(return_value="test_schema")
+    # #2786: the explicit ``collections=`` scope is resolved external->internal
+    # before the PG fallback runs; round-trip the id unchanged so the guard
+    # under test is still reached with the expected collection id.
+    catalogs_mock.resolve_catalog_id = AsyncMock(return_value="cat-x")
+    catalogs_mock.collections.resolve_collection_id = AsyncMock(return_value=col_id)
     monkeypatch.setattr(
         "dynastore.extensions.stac.search.get_protocol",
         lambda proto: catalogs_mock,

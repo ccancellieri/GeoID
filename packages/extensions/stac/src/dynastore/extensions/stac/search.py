@@ -656,6 +656,54 @@ async def _maybe_dispatch_to_es_search(
     return features, total, None
 
 
+async def _resolve_scoped_collection_ids(
+    catalogs: Any, cat_id: str, external_ids: List[str],
+) -> Tuple[List[str], Dict[str, str]]:
+    """Resolve an explicit ``collections=`` filter list to internal ids.
+
+    Both the ES canonical docs and the PG-backed hydration path key
+    ``collection_id`` on the immutable INTERNAL id (see #2653), so a
+    caller-supplied EXTERNAL id must be resolved before it reaches the
+    search dispatch or it silently matches zero documents (#2786).
+
+    Mirrors ``_ItemsElasticsearchBase._resolve_internal_ids``'s convention
+    (elasticsearch.py): resolve the catalog id first, then each collection id
+    scoped to it, via ``allow_missing=True``.
+
+    An id shaped like an internal id (``is_internal_physical_name``) is
+    rejected outright rather than resolved — passing it through would let it
+    match its own internal-keyed documents directly, leaking the internal-id
+    namespace onto the REST filter surface (same class of leak as #2325). An
+    id that simply fails to resolve as an external label is dropped the same
+    way the PG fallback below already treats an unknown collection (excluded
+    from ``target_collections``, contributing zero matches rather than
+    raising) — so a mixed list of known/unknown ids still serves the known
+    ones.
+
+    Returns ``(internal_ids, coll_ext_id_map)`` where ``coll_ext_id_map`` maps
+    each resolved internal id back to the external id the caller supplied, for
+    response-side restoration.
+    """
+    from dynastore.modules.catalog.catalog_service import is_internal_physical_name
+
+    internal_cat = await catalogs.resolve_catalog_id(cat_id, allow_missing=True)
+    resolved_cat_id = internal_cat if internal_cat is not None else cat_id
+
+    internal_ids: List[str] = []
+    coll_ext_id_map: Dict[str, str] = {}
+    for external_id in external_ids:
+        if is_internal_physical_name(external_id, "col"):
+            continue
+        internal_id = await catalogs.collections.resolve_collection_id(
+            resolved_cat_id, external_id, allow_missing=True
+        )
+        if internal_id is None:
+            continue
+        internal_ids.append(internal_id)
+        coll_ext_id_map[internal_id] = external_id
+    return internal_ids, coll_ext_id_map
+
+
 async def _expand_collections_for_search(
     catalogs: Any,
     cat_id: str,
@@ -673,21 +721,26 @@ async def _expand_collections_for_search(
     scoped with ``collections=`` matched.
 
     Returns a tuple of (request, coll_ext_id_map) where ``coll_ext_id_map``
-    maps each internal collection id to its public external label. The map is
-    built from the ``list_collections`` round-trip so the STAC item serializer
-    can emit the correct public id on every search result without extra DB hits.
+    maps each internal collection id to its public external label, needed by
+    both the ES dispatch's response-side hint injection and the PG hydration
+    path's ``feature.properties["_collection_id"]`` restoration.
 
-    Returns the request unchanged when it is already scoped or the catalog
-    has no collections; otherwise returns a copy scoped to every collection
-    id (one ``list_collections`` round-trip — the PG fallback reuses the
-    explicit scope instead of enumerating again).
+    Returns the request unchanged when the catalog has no collections;
+    otherwise returns a copy scoped to every collection id. An unscoped
+    request is expanded to every collection of the catalog (one
+    ``list_collections`` round-trip). An explicitly-scoped request has its
+    external collection ids resolved to internal ids (see
+    :func:`_resolve_scoped_collection_ids`) — unresolvable/internal-shaped
+    ids are dropped rather than passed through.
     """
     if search_request.collections:
-        # Already scoped to explicit collection ids — the hydration paths emit
-        # the public id directly (the PG path reuses the user-supplied external
-        # ids; the ES path reads the external id off the document), so no map is
-        # needed and we skip the list_collections round-trip on this hot path.
-        return search_request, {}
+        internal_ids, coll_ext_id_map = await _resolve_scoped_collection_ids(
+            catalogs, cat_id, search_request.collections
+        )
+        return (
+            search_request.model_copy(update={"collections": internal_ids}),
+            coll_ext_id_map,
+        )
     all_collections = await catalogs.list_collections(
         cat_id, limit=1000, ctx=DriverContext(db_resource=db_resource)
     )
@@ -730,13 +783,23 @@ async def search_items(
     )
 
     # An unscoped request is rewritten to explicitly scope all collections of
-    # the catalog so the routing-aware dispatch below can serve it; see
-    # :func:`_expand_collections_for_search`.
+    # the catalog so the routing-aware dispatch below can serve it; an
+    # explicitly-scoped request has its external collection ids resolved to
+    # internal ids (#2786). See :func:`_expand_collections_for_search`.
     # The function also returns an internal→external collection id map used
     # throughout the search response to emit public ids, not internal tokens.
+    had_explicit_scope = bool(search_request.collections)
     search_request, _coll_ext_id_map = await _expand_collections_for_search(
         catalogs, cat_id, search_request, db_resource
     )
+    if had_explicit_scope and not search_request.collections:
+        # Every explicitly-requested collection failed to resolve as a live
+        # external id (unknown, or internal-id-shaped and rejected outright).
+        # Zero matches — same convention the PG fallback's "no
+        # target_collections" branch below applies — never fall through to
+        # the unscoped-expansion path, which would silently search every
+        # collection in the catalog instead.
+        return [], 0, None
 
     # ── Routing-aware search-driver dispatch (issues #222, #989) ──────
     # For structural-filter-only requests (no CQL2 ``filter``), dispatch to
