@@ -100,112 +100,164 @@ async def test_offload_required_false_on_resolver_error(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# offload_required — backlog-adaptive drain tasks (#2622)
+# offload_required — async-write workclass placement (#2732)
+#
+# storage_drain / event_drain no longer consult the live outbox-backlog
+# signal for PLACEMENT (that signal's one legitimate job is ingestion
+# backpressure, see tasks/ingestion/main_ingestion.py). Placement is now
+# unconditional for any task subclassing
+# dynastore.tasks.workclass_drain.AsyncWriteDrainTaskProtocol, resolved
+# directly off the task registry — no routing config, no per-task-key
+# enumeration in execution.py.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_offload_required_true_for_storage_drain_when_backlog_high(monkeypatch):
-    """storage_drain has no static OFFLOAD/HEAVY routing hint by default — the
-    live backlog signal alone must be able to trigger offload."""
+async def test_offload_required_true_for_storage_drain(monkeypatch):
+    """storage_drain has no static OFFLOAD/HEAVY routing hint by default —
+    the async-write workclass marker alone must trigger offload."""
     import dynastore.modules.tasks.routing.resolver as rr
-    import dynastore.modules.tasks.async_writer_backlog as backlog
+    # Import triggers TaskProtocol.__init_subclass__ registration; the
+    # dispatcher/app normally does this via task discovery at startup.
+    import dynastore.tasks.workclass_drain.storage_drain_task  # noqa: F401
 
     async def _targets(_k):
         return []
 
-    async def _high(*args, **kwargs):
-        return True
-
     monkeypatch.setattr(rr, "resolved_targets", _targets)
-    monkeypatch.setattr(backlog, "backlog_is_high", _high)
     assert await execution.offload_required("storage_drain") is True
 
 
 @pytest.mark.asyncio
-async def test_offload_required_false_for_storage_drain_when_backlog_low(monkeypatch):
+async def test_offload_required_true_for_event_drain(monkeypatch):
     import dynastore.modules.tasks.routing.resolver as rr
-    import dynastore.modules.tasks.async_writer_backlog as backlog
+    import dynastore.tasks.workclass_drain.event_drain_task  # noqa: F401
 
     async def _targets(_k):
         return []
 
-    async def _low(*args, **kwargs):
-        return False
-
     monkeypatch.setattr(rr, "resolved_targets", _targets)
-    monkeypatch.setattr(backlog, "backlog_is_high", _low)
-    assert await execution.offload_required("storage_drain") is False
-
-
-@pytest.mark.asyncio
-async def test_offload_required_true_for_event_drain_when_backlog_high(monkeypatch):
-    import dynastore.modules.tasks.routing.resolver as rr
-    import dynastore.modules.tasks.async_writer_backlog as backlog
-
-    async def _targets(_k):
-        return []
-
-    async def _high(*args, **kwargs):
-        return True
-
-    monkeypatch.setattr(rr, "resolved_targets", _targets)
-    monkeypatch.setattr(backlog, "backlog_is_high", _high)
     assert await execution.offload_required("event_drain") is True
 
 
 @pytest.mark.asyncio
-async def test_offload_required_ignores_backlog_signal_for_unrelated_task(monkeypatch):
-    """Only the backlog-adaptive task keys consult the live signal — a high
-    backlog must not spuriously offload an unrelated task."""
+async def test_offload_required_false_for_non_workclass_task(monkeypatch):
+    """A task outside the async-write workclass (e.g. gdal) is unaffected —
+    only its own OFFLOAD/HEAVY routing hint (absent here) can trigger it."""
     import dynastore.modules.tasks.routing.resolver as rr
-    import dynastore.modules.tasks.async_writer_backlog as backlog
 
     async def _targets(_k):
         return []
 
-    async def _high(*args, **kwargs):
-        return True
-
     monkeypatch.setattr(rr, "resolved_targets", _targets)
-    monkeypatch.setattr(backlog, "backlog_is_high", _high)
     assert await execution.offload_required("gdal") is False
 
 
 @pytest.mark.asyncio
-async def test_offload_required_false_for_storage_drain_on_backlog_probe_error(monkeypatch):
-    """A backlog-probe failure must never force offload — fail-open False."""
+async def test_offload_required_false_for_workclass_task_on_registry_lookup_error(monkeypatch):
+    """A task-registry failure must never force offload — fail-open False."""
     import dynastore.modules.tasks.routing.resolver as rr
-    import dynastore.modules.tasks.async_writer_backlog as backlog
+    import dynastore.tasks as tasks_module
 
     async def _targets(_k):
         return []
 
-    async def _boom(*args, **kwargs):
-        raise RuntimeError("pool exhausted")
+    def _boom(_task_key):
+        raise RuntimeError("registry unavailable")
 
     monkeypatch.setattr(rr, "resolved_targets", _targets)
-    monkeypatch.setattr(backlog, "backlog_is_high", _boom)
+    monkeypatch.setattr(tasks_module, "get_task_config", _boom)
     assert await execution.offload_required("storage_drain") is False
 
 
 @pytest.mark.asyncio
-async def test_offload_required_static_hint_short_circuits_backlog_probe(monkeypatch):
-    """A static OFFLOAD/HEAVY routing hint is sufficient on its own — the
-    backlog probe must not even be consulted in that case."""
+async def test_offload_required_static_hint_and_workclass_marker_both_sufficient(monkeypatch):
+    """A static OFFLOAD/HEAVY routing hint alone is sufficient — the
+    workclass registry lookup is never reached in that case."""
     from dynastore.modules.tasks.routing.exec_hints import ExecHint
     import dynastore.modules.tasks.routing.resolver as rr
-    import dynastore.modules.tasks.async_writer_backlog as backlog
+    import dynastore.tasks as tasks_module
+
+    calls = []
 
     async def _targets(_k):
         return [_target("gcp_cloud_run", {ExecHint.OFFLOAD})]
 
-    async def _boom(*args, **kwargs):
-        raise AssertionError("backlog probe must not be called")
+    def _record(_task_key):
+        calls.append(_task_key)
+        return None
 
     monkeypatch.setattr(rr, "resolved_targets", _targets)
-    monkeypatch.setattr(backlog, "backlog_is_high", _boom)
+    monkeypatch.setattr(tasks_module, "get_task_config", _record)
     assert await execution.offload_required("storage_drain") is True
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_offload_required_true_for_new_drainer_subclass_with_no_execution_py_edit():
+    """A brand-new drainer that only subclasses AsyncWriteDrainTaskProtocol
+    is picked up by offload_required with zero changes to execution.py —
+    the whole point of the workclass marker (#2732)."""
+    from typing import ClassVar
+
+    from dynastore.tasks.workclass_drain import AsyncWriteDrainTaskProtocol
+
+    class _FutureDrainer(AsyncWriteDrainTaskProtocol):
+        task_type: ClassVar[str] = "test_future_drainer_2732"
+
+        async def run(self, payload):  # pragma: no cover - not exercised
+            return None
+
+    assert await execution.offload_required("test_future_drainer_2732") is True
+
+
+@pytest.mark.asyncio
+async def test_offload_required_false_for_plain_taskprotocol_subclass():
+    """A task that subclasses TaskProtocol directly (not the workclass base)
+    does not inherit placement, even with no routing opinion."""
+    from typing import ClassVar
+
+    from dynastore.tasks.protocols import TaskProtocol
+
+    class _PlainTask(TaskProtocol):
+        task_type: ClassVar[str] = "test_plain_task_2732"
+
+        async def run(self, payload):  # pragma: no cover - not exercised
+            return None
+
+    assert await execution.offload_required("test_plain_task_2732") is False
+
+
+# ---------------------------------------------------------------------------
+# offload_required composed with _restrict_to_offload_runners — the actual
+# fail-open enforcement point (#2732)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workclass_task_stays_in_process_when_no_offload_runner_advertises():
+    """offload_required("storage_drain") is True (workclass marker), but with
+    no gcp_cloud_run / worker_queue runner in the candidate list,
+    _restrict_to_offload_runners leaves the in-process runner untouched —
+    the fail-open compose/onprem/tests rely on."""
+    import dynastore.tasks.workclass_drain.storage_drain_task  # noqa: F401
+
+    assert await execution.offload_required("storage_drain") is True
+    runners = [_Runner("background")]
+    kept = execution._restrict_to_offload_runners(runners)
+    assert [r.runner_type for r in kept] == ["background"]
+
+
+@pytest.mark.asyncio
+async def test_workclass_task_drops_in_process_when_offload_runner_advertises():
+    """Same task, but a gcp_cloud_run runner now advertises it — the
+    in-process candidate is dropped."""
+    import dynastore.tasks.workclass_drain.storage_drain_task  # noqa: F401
+
+    assert await execution.offload_required("storage_drain") is True
+    runners = [_Runner("background"), _Runner("gcp_cloud_run")]
+    kept = execution._restrict_to_offload_runners(runners)
+    assert [r.runner_type for r in kept] == ["gcp_cloud_run"]
 
 
 # ---------------------------------------------------------------------------

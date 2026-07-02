@@ -177,19 +177,37 @@ async def select_runner_for(task_key: str):
 # transient empty Cloud Run job map), the existing candidates are left intact
 # rather than failing the request — so the guard never introduces a new
 # failure mode, it only removes the in-process option when offload is real.
+#
+# A second, structural trigger (#2732): any task in the async-write workclass
+# (``dynastore.tasks.workclass_drain.AsyncWriteDrainTaskProtocol`` — the
+# generic secondary-write drainers) always wants to offload, independent of
+# routing hints. See ``_is_async_write_workclass`` below.
 # ----------------------------------------------------------------------
 
 _OFFLOAD_RUNNER_TYPES = frozenset({"gcp_cloud_run", "worker_queue"})
 
-# System tasks whose offload decision also consults the LIVE aggregate outbox
-# backlog (dynastore.modules.tasks.async_writer_backlog), not just the static
-# routing-config hints every other task relies on (#2622). These are the
-# generic secondary-write drainers: under light load they stay in-process
-# (the routing-config hint path below is empty for them by default); once the
-# aggregate backlog crosses TasksPluginConfig.async_writer_backlog_threshold,
-# offload_required() starts returning True so _restrict_to_offload_runners can
-# hand them to the async_writer Cloud Run Job when one is deployed.
-_BACKLOG_ADAPTIVE_TASK_KEYS = frozenset({"storage_drain", "event_drain"})
+
+def _is_async_write_workclass(task_key: str) -> bool:
+    """True when ``task_key`` is registered to a task in the async-write
+    workclass (``dynastore.tasks.workclass_drain.AsyncWriteDrainTaskProtocol``,
+    #2732) — the generic secondary-write drainers (``storage_drain``,
+    ``event_drain``, and any future outbox drainer).
+
+    Resolved directly off the task registry rather than through routing
+    config: a task opts in by subclassing the workclass base, not by
+    editing this module or a routing preset, so a NEW drainer inherits the
+    placement rule with zero edits here. Fail-open (``False``) when the
+    task is unregistered or the registry lookup errors.
+    """
+    try:
+        from dynastore.tasks import get_task_config
+
+        cfg = get_task_config(task_key)
+        if cfg is None:
+            return False
+        return bool(getattr(cfg.cls, "is_async_write_workclass", False))
+    except Exception:  # noqa: BLE001 — registry lookup is best-effort
+        return False
 
 
 async def offload_required(task_key: str) -> bool:
@@ -199,16 +217,23 @@ async def offload_required(task_key: str) -> bool:
 
     1. Routing tags ``task_key`` OFFLOAD/HEAVY (static, config-driven) — the
        existing contract for heavy processes like ``ingestion``.
-    2. ``task_key`` is a backlog-adaptive drain task (``storage_drain`` /
-       ``event_drain``, #2622) AND the live aggregate outbox backlog exceeds
-       the configured threshold — see
-       :func:`dynastore.modules.tasks.async_writer_backlog.backlog_is_high`.
+    2. ``task_key`` belongs to the async-write workclass (#2732) — the
+       generic secondary-write drainers. Placement is unconditional for this
+       workclass: the row-count outbox backlog says nothing about hydration
+       bytes (#2723), so a "small backlog" is not a safe signal that
+       in-process drain is cheap. See :func:`_is_async_write_workclass`.
 
-    Fail-open: any resolver/probe error or absent opinion returns ``False`` so
-    in-process execution remains available where it is the intent — the
-    ``onprem`` profile (every process routed to ``background``), system
-    tasks, and test fixtures with no live routing config or no deployed
-    async_writer job.
+    Neither signal checks whether an offload-capable runner is actually
+    registered here — that is :func:`_restrict_to_offload_runners`'s job,
+    and it is where the real fail-open lives: compose / onprem / tests with
+    no ``gcp_cloud_run`` / ``worker_queue`` runner advertising the task type
+    keep the in-process candidates untouched.
+
+    Fail-open: any resolver/registry error or absent opinion returns
+    ``False`` so in-process execution remains available where it is the
+    intent — the ``onprem`` profile (every process routed to
+    ``background``), unregistered task keys, and test fixtures with no live
+    routing config.
     """
     from dynastore.modules.tasks.routing import resolver as routing_resolver
     from dynastore.modules.tasks.routing.exec_hints import ExecHint
@@ -221,13 +246,7 @@ async def offload_required(task_key: str) -> bool:
     if any(heavy & set(t.hints) for t in targets):
         return True
 
-    if task_key in _BACKLOG_ADAPTIVE_TASK_KEYS:
-        try:
-            from dynastore.modules.tasks.async_writer_backlog import backlog_is_high
-            return await backlog_is_high()
-        except Exception:  # noqa: BLE001 — backlog probe is best-effort
-            return False
-    return False
+    return _is_async_write_workclass(task_key)
 
 
 def _restrict_to_offload_runners(runners: list) -> list:

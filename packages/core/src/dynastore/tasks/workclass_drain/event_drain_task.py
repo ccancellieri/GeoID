@@ -74,8 +74,8 @@ from typing import Any, ClassVar, Dict, List, Optional, Set
 from uuid import uuid4
 
 from dynastore.models.tasks import TaskPayload
-from dynastore.tasks.protocols import TaskProtocol
 from dynastore.tasks.report import TaskReport
+from dynastore.tasks.workclass_drain import AsyncWriteDrainTaskProtocol
 from dynastore.tools.db import validate_sql_identifier
 
 logger = logging.getLogger(__name__)
@@ -153,7 +153,7 @@ def _subscription_matches_event(
     return False
 
 
-class EventDrainTask(TaskProtocol):
+class EventDrainTask(AsyncWriteDrainTaskProtocol):
     """One-shot drain for the global ``tasks.events`` event outbox.
 
     Claims ready rows (and stale PROCESSING rows whose lease expired),
@@ -166,7 +166,10 @@ class EventDrainTask(TaskProtocol):
     tier-less system task to the ``catalog`` tier — the service that
     co-locates the dispatcher and the in-process event listeners this drain
     delivers to (and where the legacy event consumer already runs). An
-    operator can repoint it via routing config without a code change.
+    operator can repoint it via routing config without a code change. Member
+    of the async-write workclass (``AsyncWriteDrainTaskProtocol``) — on GCP
+    this always offloads to the async-writer Cloud Run Job once one is
+    deployed (#2732); with none deployed it keeps running here.
     """
 
     task_type: ClassVar[str] = "event_drain"

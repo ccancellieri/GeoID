@@ -58,8 +58,8 @@ from dynastore.models.protocols.indexing import (
     IndexableOp,
 )
 from dynastore.models.tasks import TaskPayload
-from dynastore.tasks.protocols import TaskProtocol
 from dynastore.tasks.report import TaskReport
+from dynastore.tasks.workclass_drain import AsyncWriteDrainTaskProtocol
 from dynastore.tools.db import validate_sql_identifier
 
 logger = logging.getLogger(__name__)
@@ -130,7 +130,7 @@ def _chunked(items: List[Dict[str, Any]], size: int) -> Iterator[List[Dict[str, 
         yield items[start : start + size]
 
 
-class StorageDrainTask(TaskProtocol):
+class StorageDrainTask(AsyncWriteDrainTaskProtocol):
     """One-shot drain for the global ``tasks.storage`` index outbox.
 
     Claims ready rows (and stale in_flight rows whose lease expired), fans
@@ -143,7 +143,10 @@ class StorageDrainTask(TaskProtocol):
     tier-less system task to the ``catalog`` tier — the service that
     co-locates the dispatcher and the secondary-write driver this drain pushes
     to (and where the legacy outbox drain already runs). An operator can
-    repoint it via routing config without a code change.
+    repoint it via routing config without a code change. Member of the
+    async-write workclass (``AsyncWriteDrainTaskProtocol``) — on GCP this
+    always offloads to the async-writer Cloud Run Job once one is deployed
+    (#2732); with none deployed it keeps running here.
     """
 
     task_type: ClassVar[str] = "storage_drain"
