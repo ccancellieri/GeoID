@@ -34,6 +34,7 @@ from dynastore.modules.crs.models import CRS, CRSCreate, CRSDefinition, CRSLink,
 from dynastore.models.protocols import CatalogsProtocol
 from dynastore.models.protocols.crs import CRSProtocol
 from dynastore.tools.discovery import get_protocol
+from dynastore.extensions.tools.resolvers import resolve_internal_catalog_id_or_404
 
 logger = logging.getLogger(__name__)
 
@@ -225,10 +226,7 @@ class CRSExtension(ExtensionProtocol):
         catalog rename (external id change) never orphans existing rows.
         Raises 404 when the catalog does not exist or has been deleted.
         """
-        internal_id = await self.catalogs.resolve_catalog_id(catalog_id)
-        if not internal_id:
-            raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
-        return internal_id
+        return await resolve_internal_catalog_id_or_404(self.catalogs, catalog_id)
 
     async def create_crs_endpoint(
         self,

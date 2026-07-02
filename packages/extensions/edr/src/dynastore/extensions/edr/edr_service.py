@@ -348,16 +348,15 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
         request: Request,
         language: str = Depends(get_language),
     ) -> JSONResponse:
-        catalogs = await self._get_catalogs_service()
+        detail = f"Collection {collection_id!r} not found in catalog {catalog_id!r}."
         try:
-            collection = await catalogs.get_collection(catalog_id, collection_id)
+            collection = await self._resolve_collection_or_404(
+                catalog_id, collection_id, detail=detail,
+            )
         except Exception:
             collection = None
         if collection is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Collection {collection_id!r} not found in catalog {catalog_id!r}.",
-            )
+            raise HTTPException(status_code=404, detail=detail)
 
         await self._require_catalog_ready(catalog_id)
         base_url = get_root_url(request).rstrip("/")
@@ -703,13 +702,10 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
         ``?hints=`` is accepted uniformly for API consistency; this route
         performs no data reads so the value has no effect today.
         """
-        catalogs_svc = await self._get_catalogs_service()
-        coll = await catalogs_svc.get_collection(catalog_id, collection_id)
-        if coll is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Collection {collection_id!r} not found.",
-            )
+        coll = await self._resolve_collection_or_404(
+            catalog_id, collection_id,
+            detail=f"Collection {collection_id!r} not found.",
+        )
 
         locations = _get_edr_locations(coll)
         return em.EDRLocations(features=locations)
@@ -722,13 +718,10 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
         request: Request,
     ):
         """Return a specific named location."""
-        catalogs_svc = await self._get_catalogs_service()
-        coll = await catalogs_svc.get_collection(catalog_id, collection_id)
-        if coll is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Collection {collection_id!r} not found.",
-            )
+        coll = await self._resolve_collection_or_404(
+            catalog_id, collection_id,
+            detail=f"Collection {collection_id!r} not found.",
+        )
 
         locations = _get_edr_locations(coll)
         for loc in locations:

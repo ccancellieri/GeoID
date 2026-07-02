@@ -213,6 +213,48 @@ class OGCServiceMixin:
         return self._ogc_storage_protocol
 
     # ------------------------------------------------------------------
+    # Catalog/collection lookup-or-404 (thin wrappers over extensions.tools.resolvers)
+    # ------------------------------------------------------------------
+
+    async def _resolve_catalog_or_404(
+        self,
+        catalog_id: str,
+        *,
+        detail: Optional[str] = None,
+        use_model: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        """Fetch a catalog model via this service's catalogs protocol or raise 404.
+
+        See :func:`dynastore.extensions.tools.resolvers.resolve_catalog_or_404`.
+        """
+        from dynastore.extensions.tools.resolvers import resolve_catalog_or_404
+
+        catalogs_svc = await self._get_catalogs_service()
+        return await resolve_catalog_or_404(
+            catalogs_svc, catalog_id, detail=detail, use_model=use_model, **kwargs
+        )
+
+    async def _resolve_collection_or_404(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        detail: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Fetch a collection model via this service's catalogs protocol or raise 404.
+
+        See :func:`dynastore.extensions.tools.resolvers.resolve_collection_or_404`.
+        """
+        from dynastore.extensions.tools.resolvers import resolve_collection_or_404
+
+        catalogs_svc = await self._get_catalogs_service()
+        return await resolve_collection_or_404(
+            catalogs_svc, catalog_id, collection_id, detail=detail, **kwargs
+        )
+
+    # ------------------------------------------------------------------
     # Shared config / item access helpers
     # ------------------------------------------------------------------
 

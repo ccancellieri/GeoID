@@ -616,11 +616,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
     ):
         catalog_id = validate_sql_identifier(catalog_id)
         _reject_internal_id(catalog_id, "c", "Catalog")
-        catalogs_svc = await self._get_catalogs_service()
-        if not await catalogs_svc.get_catalog(catalog_id, lang=language, hints=request_hints):
-            raise HTTPException(
-                status_code=404, detail=f"Catalog '{catalog_id}' not found."
-            )
+        await self._resolve_catalog_or_404(catalog_id, lang=language, hints=request_hints)
         catalog_dict = await stac_generator.create_catalog(
             request, catalog_id=catalog_id, lang=language, hints=request_hints,
         )
@@ -795,12 +791,11 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         collection_id = validate_sql_identifier(collection_id)
         _reject_internal_id(catalog_id, "c", "Catalog")
         _reject_internal_id(collection_id, "col", "Collection")
-        catalogs_svc = await self._get_catalogs_service()
-        if not await catalogs_svc.get_collection(catalog_id, collection_id, hints=request_hints):
-            raise HTTPException(
-                status_code=404,
-                detail=f"Collection '{catalog_id}:{collection_id}' not found.",
-            )
+        await self._resolve_collection_or_404(
+            catalog_id, collection_id,
+            detail=f"Collection '{catalog_id}:{collection_id}' not found.",
+            hints=request_hints,
+        )
         collection = await stac_generator.create_collection(
             request, catalog_id=catalog_id, collection_id=collection_id, lang=language, hints=request_hints,
         )
@@ -1006,7 +1001,6 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         collection_id = validate_sql_identifier(collection_id)
         _reject_internal_id(catalog_id, "c", "Catalog")
         _reject_internal_id(collection_id, "col", "Collection")
-        catalogs_svc = await self._get_catalogs_service()
 
         # Single-field equality shorthand: any non-reserved query parameter is
         # treated as a ``?{property}={value}`` attribute filter and combined with
@@ -1042,13 +1036,9 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         cql_filter = combine_cql_filters(filter, extra_filters)
 
         async with managed_transaction(engine) as conn:
-            collection_metadata = await catalogs_svc.get_collection(
+            await self._resolve_collection_or_404(
                 catalog_id, collection_id, ctx=DriverContext(db_resource=conn)
             )
-            if not collection_metadata:
-                raise HTTPException(
-                    status_code=404, detail=f"Collection '{collection_id}' not found."
-                )
 
             stac_config = await self._get_stac_config(
                 catalog_id, collection_id, db_resource=conn

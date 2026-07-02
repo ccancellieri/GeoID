@@ -461,12 +461,7 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
     async def get_catalog(
         self, catalog_id: str, request: Request, language: str = Depends(get_language)
     ):
-        catalogs_svc = await self._get_catalogs_service()
-        catalog = await catalogs_svc.get_catalog(catalog_id, lang=language)
-        if not catalog:
-            raise HTTPException(
-                status_code=404, detail=f"Catalog '{catalog_id}' not found."
-            )
+        catalog = await self._resolve_catalog_or_404(catalog_id, lang=language)
 
         catalog_dict, languages = catalog.localize(language)
         self_url = get_url(request)
@@ -654,12 +649,11 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         language: str = Depends(get_language),
         request_hints: FrozenSet = Depends(parse_hints_param),
     ):
-        catalogs_svc = await self._get_catalogs_service()
-        collection = await catalogs_svc.get_collection(
-            catalog_id, collection_id, lang=language, hints=request_hints,
+        collection = await self._resolve_collection_or_404(
+            catalog_id, collection_id,
+            detail="Collection not found",
+            lang=language, hints=request_hints,
         )
-        if not collection:
-            raise HTTPException(status_code=404, detail="Collection not found")
 
         # We need to construct the OGC response wrapper
         collection_dict, languages = collection.localize(language)
@@ -871,14 +865,12 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         configs_svc = await self._get_configs_service()
         storage_svc = await self._get_storage_service()
 
-        collection_metadata = await catalogs_svc.get_collection(
-            catalog_id, collection_id, lang="en"
-        )  # Default language for internal check
-        if not collection_metadata:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Collection '{collection_id}' not found or logically deleted.",
-            )
+        # Default language for internal check
+        await self._resolve_collection_or_404(
+            catalog_id, collection_id,
+            detail=f"Collection '{collection_id}' not found or logically deleted.",
+            lang="en",
+        )
 
         # --- Caching Support ---
 

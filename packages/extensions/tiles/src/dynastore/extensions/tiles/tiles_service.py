@@ -57,6 +57,10 @@ from dynastore.modules.db_config.query_executor import (
 )
 from dynastore.modules.db_config.exceptions import QueryExecutionError
 from dynastore.extensions.tools.query import parse_hints_param
+from dynastore.extensions.tools.resolvers import (
+    resolve_internal_catalog_id_or_404,
+    resolve_internal_collection_id_or_404,
+)
 import dynastore.modules.tiles.tiles_module as tms_manager
 from dynastore.tools.geospatial import SimplificationAlgorithm
 from dynastore.extensions.web.decorators import expose_web_page
@@ -495,9 +499,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         immutable internal id before writing so the row survives a catalog rename.
         """
         catalogs_svc = await self._get_catalogs_service()
-        internal_catalog_id = await catalogs_svc.resolve_catalog_id(dataset)
-        if not internal_catalog_id:
-            raise HTTPException(status_code=404, detail=f"Catalog '{dataset}' not found.")
+        internal_catalog_id = await resolve_internal_catalog_id_or_404(catalogs_svc, dataset)
         stored_tms = await tms_manager.create_custom_tms(
             catalog_id=internal_catalog_id, tms_data=tms_data
         )
@@ -538,9 +540,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         # partition key that survives catalog renames.
         if dataset:
             catalogs_svc = await self._get_catalogs_service()
-            internal_dataset_id = await catalogs_svc.resolve_catalog_id(dataset)
-            if not internal_dataset_id:
-                raise HTTPException(status_code=404, detail=f"Catalog '{dataset}' not found.")
+            internal_dataset_id = await resolve_internal_catalog_id_or_404(catalogs_svc, dataset)
             custom_tms_list = await tms_manager.list_custom_tms(catalog_id=internal_dataset_id)
             for tms in custom_tms_list:
                 # Avoid duplicating if a custom TMS overrides a built-in one
@@ -585,9 +585,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         tms = None
         if dataset:
             catalogs_svc = await self._get_catalogs_service()
-            internal_dataset_id = await catalogs_svc.resolve_catalog_id(dataset)
-            if not internal_dataset_id:
-                raise HTTPException(status_code=404, detail=f"Catalog '{dataset}' not found.")
+            internal_dataset_id = await resolve_internal_catalog_id_or_404(catalogs_svc, dataset)
             tms = await tms_manager.get_custom_tms(
                 catalog_id=internal_dataset_id, tms_id=tileMatrixSetId
             )
@@ -633,9 +631,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
     ):
         """Catalog-centric endpoint defaulting to WebMercatorQuad."""
         catalogs_svc = await self._get_catalogs_service()
-        internal_dataset = await catalogs_svc.resolve_catalog_id(dataset)
-        if not internal_dataset:
-            raise HTTPException(status_code=404, detail=f"Catalog '{dataset}' not found.")
+        internal_dataset = await resolve_internal_catalog_id_or_404(catalogs_svc, dataset)
         return await self.get_vector_tile(
             request=request,
             dataset=internal_dataset,
@@ -691,9 +687,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
     ):
         """Catalog-centric endpoint with full TMS support."""
         catalogs_svc = await self._get_catalogs_service()
-        internal_dataset = await catalogs_svc.resolve_catalog_id(dataset)
-        if not internal_dataset:
-            raise HTTPException(status_code=404, detail=f"Catalog '{dataset}' not found.")
+        internal_dataset = await resolve_internal_catalog_id_or_404(catalogs_svc, dataset)
         return await self.get_vector_tile(
             request=request,
             dataset=internal_dataset,
@@ -745,9 +739,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
     ):
         """Defaults to WebMercatorQuad."""
         catalogs_svc = await self._get_catalogs_service()
-        internal_dataset = await catalogs_svc.resolve_catalog_id(dataset)
-        if not internal_dataset:
-            raise HTTPException(status_code=404, detail=f"Catalog '{dataset}' not found.")
+        internal_dataset = await resolve_internal_catalog_id_or_404(catalogs_svc, dataset)
         return await self.get_vector_tile(
             request=request,
             dataset=internal_dataset,
@@ -1466,37 +1458,17 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
     ) -> Tuple[str, str]:
         """Resolve external → internal catalog and collection IDs.
 
-        Raises HTTPException(404) when either ID is not found.
-        Splits ValueError (not found) from AttributeError (test stub) per
-        the reviewer fix — ValueError must not be swallowed.
+        Raises HTTPException(404) when either ID is not found. Delegates to
+        the shared resolvers, which already split ValueError (not found)
+        from AttributeError (test stub) — ValueError must not be swallowed.
         """
         catalogs_svc = await self._get_catalogs_service()
-        try:
-            internal_catalog_id = await catalogs_svc.resolve_catalog_id(
-                catalog_id, allow_missing=False
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        if not internal_catalog_id:
-            raise HTTPException(
-                status_code=404, detail=f"Catalog '{catalog_id}' not found."
-            )
-
-        try:
-            internal_collection_id = await catalogs_svc.collections.resolve_collection_id(
-                internal_catalog_id, collection_id, allow_missing=False
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except AttributeError:
-            # Test-stub path: stub may not implement resolve_collection_id.
-            internal_collection_id = collection_id
-
-        if not internal_collection_id:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Collection '{collection_id}' not found.",
-            )
+        internal_catalog_id = await resolve_internal_catalog_id_or_404(
+            catalogs_svc, catalog_id
+        )
+        internal_collection_id = await resolve_internal_collection_id_or_404(
+            catalogs_svc, internal_catalog_id, collection_id
+        )
         return internal_catalog_id, internal_collection_id
 
     # ------------------------------------------------------------------

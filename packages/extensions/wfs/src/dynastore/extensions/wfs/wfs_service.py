@@ -23,7 +23,7 @@ import logging
 import re
 from typing import Any, AsyncGenerator, AsyncIterator, Optional, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, FastAPI
+from fastapi import APIRouter, Depends, Request, Response, FastAPI
 from sqlalchemy.ext.asyncio import AsyncConnection
 from contextlib import asynccontextmanager
 
@@ -421,11 +421,9 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
     ):
         """Handles requests scoped to a specific catalog, e.g., `/wfs/my_catalog`."""
         safe_catalog_id = catalog_id.replace(":", "_").replace("-", "_")
-        catalogs_svc = await self._get_catalogs_service()
-        if not await catalogs_svc.get_catalog(safe_catalog_id, ctx=DriverContext(db_resource=conn)):
-            raise HTTPException(
-                status_code=404, detail=f"Catalog '{safe_catalog_id}' not found."
-            )
+        await self._resolve_catalog_or_404(
+            safe_catalog_id, ctx=DriverContext(db_resource=conn),
+        )
         return await self._dispatch_request(
             request,
             conn,

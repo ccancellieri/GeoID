@@ -319,10 +319,9 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
 
         Returns 404 if the collection does not exist or is not 3D.
         """
-        catalogs_svc = await self._get_catalogs_service()
-        coll = await catalogs_svc.get_collection(catalog_id, collection_id)
-        if coll is None:
-            raise HTTPException(status_code=404, detail="Collection not found.")
+        coll = await self._resolve_collection_or_404(
+            catalog_id, collection_id, detail="Collection not found.",
+        )
         if not _is_3d_collection(coll):
             raise HTTPException(
                 status_code=404,
@@ -351,10 +350,9 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
         Subsequent lines are individual CityJSONFeature objects (NDJSON).
         Media type: ``application/city+json``.
         """
-        catalogs_svc = await self._get_catalogs_service()
-        coll = await catalogs_svc.get_collection(catalog_id, collection_id)
-        if coll is None:
-            raise HTTPException(status_code=404, detail="Collection not found.")
+        coll = await self._resolve_collection_or_404(
+            catalog_id, collection_id, detail="Collection not found.",
+        )
         if not _is_3d_collection(coll):
             raise HTTPException(
                 status_code=404,
@@ -378,6 +376,7 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
         # Stream instead of materializing: each item carries the full
         # CityJSONFeature payload, so buffering the whole collection can
         # cost hundreds of MB at the default limit.
+        catalogs_svc = await self._get_catalogs_service()
         query_response = await catalogs_svc.stream_items(
             catalog_id, collection_id, QueryRequest(limit=limit), ctx=None
         )

@@ -33,6 +33,10 @@ from typing import Optional
 from fastapi import APIRouter, FastAPI, HTTPException
 
 from dynastore.extensions.protocols import ExtensionProtocol
+from dynastore.extensions.tools.resolvers import (
+    resolve_catalog_or_404,
+    resolve_collection_or_404,
+)
 from dynastore.models.protocols.catalogs import CatalogsProtocol
 from dynastore.modules import get_protocol
 
@@ -139,11 +143,7 @@ class CatalogStatusService(ExtensionProtocol):
             raise HTTPException(
                 status_code=503, detail="Catalogs service not available."
             )
-        catalog = await catalogs.get_catalog_model(catalog_id)
-        if catalog is None:
-            raise HTTPException(
-                status_code=404, detail=f"Catalog '{catalog_id}' not found."
-            )
+        catalog = await resolve_catalog_or_404(catalogs, catalog_id, use_model=True)
 
         provisioning_status = getattr(catalog, "provisioning_status", "ready") or "ready"
 
@@ -259,21 +259,13 @@ class CatalogStatusService(ExtensionProtocol):
                 status_code=503, detail="Catalogs service not available."
             )
 
-        catalog = await catalogs.get_catalog_model(catalog_id)
-        if catalog is None:
-            raise HTTPException(
-                status_code=404, detail=f"Catalog '{catalog_id}' not found."
-            )
+        catalog = await resolve_catalog_or_404(catalogs, catalog_id, use_model=True)
 
         # get_collection already enforces visibility (returns None for hidden).
-        collection = await catalogs.get_collection(catalog_id, collection_id)
-        if collection is None:
-            raise HTTPException(
-                status_code=404,
-                detail=(
-                    f"Collection '{collection_id}' not found in catalog '{catalog_id}'."
-                ),
-            )
+        await resolve_collection_or_404(
+            catalogs, catalog_id, collection_id,
+            detail=f"Collection '{collection_id}' not found in catalog '{catalog_id}'.",
+        )
 
         provisioning_status = getattr(catalog, "provisioning_status", "ready") or "ready"
 

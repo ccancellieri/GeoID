@@ -39,6 +39,10 @@ from dynastore.extensions.maps.format_convert import (
 from dynastore.extensions.maps.renderer import render_map_image
 from dynastore.models.protocols import CatalogsProtocol
 from dynastore.tools.discovery import get_protocol
+from dynastore.extensions.tools.resolvers import (
+    resolve_internal_catalog_id_or_404,
+    resolve_internal_collection_id_or_404,
+)
 from dynastore.modules.db_config import shared_queries
 from dynastore.tools.geospatial import BboxDimensionality, parse_bbox_string
 from dynastore.tools.ogc_common import parse_subset_parameter
@@ -733,14 +737,9 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         if not catalogs_svc:
             raise HTTPException(status_code=500, detail="Catalogs service not available.")
 
-        try:
-            internal_catalog_id = await catalogs_svc.resolve_catalog_id(
-                catalog_id, allow_missing=False
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        if not internal_catalog_id:
-            raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
+        internal_catalog_id = await resolve_internal_catalog_id_or_404(
+            catalogs_svc, catalog_id
+        )
 
         from dynastore.models.protocols.visibility import resolve_collection_listing_ids
         visible_ids = await resolve_collection_listing_ids(internal_catalog_id)
@@ -808,14 +807,9 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         if not catalogs_svc:
             raise HTTPException(status_code=500, detail="Catalogs service not available.")
 
-        try:
-            internal_catalog_id = await catalogs_svc.resolve_catalog_id(
-                catalog_id, allow_missing=False
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        if not internal_catalog_id:
-            raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
+        internal_catalog_id = await resolve_internal_catalog_id_or_404(
+            catalogs_svc, catalog_id
+        )
 
         from dynastore.models.protocols.visibility import resolve_collection_listing_ids
         visible_ids = await resolve_collection_listing_ids(internal_catalog_id)
@@ -825,16 +819,9 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
             raise HTTPException(status_code=400, detail="At least one collection is required.")
         internal_collections: List[str] = []
         for ext_id in requested:
-            try:
-                internal_id = await catalogs_svc.collections.resolve_collection_id(
-                    internal_catalog_id, ext_id, allow_missing=False
-                )
-            except ValueError as exc:
-                raise HTTPException(status_code=404, detail=str(exc)) from exc
-            except AttributeError:
-                internal_id = ext_id
-            if not internal_id:
-                raise HTTPException(status_code=404, detail=f"Collection '{ext_id}' not found.")
+            internal_id = await resolve_internal_collection_id_or_404(
+                catalogs_svc, internal_catalog_id, ext_id
+            )
             if visible_ids is not None and internal_id not in visible_ids:
                 raise HTTPException(status_code=404, detail="Collection not found.")
             internal_collections.append(internal_id)
@@ -872,25 +859,13 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         if not catalogs_svc:
             raise HTTPException(status_code=500, detail="Catalogs service not available.")
 
-        try:
-            internal_catalog_id = await catalogs_svc.resolve_catalog_id(
-                catalog_id, allow_missing=False
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        if not internal_catalog_id:
-            raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
+        internal_catalog_id = await resolve_internal_catalog_id_or_404(
+            catalogs_svc, catalog_id
+        )
 
-        try:
-            internal_collection_id = await catalogs_svc.collections.resolve_collection_id(
-                internal_catalog_id, collection_id, allow_missing=False
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except AttributeError:
-            internal_collection_id = collection_id
-        if not internal_collection_id:
-            raise HTTPException(status_code=404, detail=f"Collection '{collection_id}' not found.")
+        internal_collection_id = await resolve_internal_collection_id_or_404(
+            catalogs_svc, internal_catalog_id, collection_id
+        )
 
         from dynastore.models.protocols.visibility import resolve_collection_listing_ids
         visible_ids = await resolve_collection_listing_ids(internal_catalog_id)
@@ -947,25 +922,13 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         if not catalogs_svc:
             raise HTTPException(status_code=500, detail="Catalogs service not available.")
 
-        try:
-            internal_catalog_id = await catalogs_svc.resolve_catalog_id(
-                catalog_id, allow_missing=False
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        if not internal_catalog_id:
-            raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
+        internal_catalog_id = await resolve_internal_catalog_id_or_404(
+            catalogs_svc, catalog_id
+        )
 
-        try:
-            internal_collection_id = await catalogs_svc.collections.resolve_collection_id(
-                internal_catalog_id, collection_id, allow_missing=False
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except AttributeError:
-            internal_collection_id = collection_id
-        if not internal_collection_id:
-            raise HTTPException(status_code=404, detail=f"Collection '{collection_id}' not found.")
+        internal_collection_id = await resolve_internal_collection_id_or_404(
+            catalogs_svc, internal_catalog_id, collection_id
+        )
 
         from dynastore.models.protocols.visibility import resolve_collection_listing_ids
         visible_ids = await resolve_collection_listing_ids(internal_catalog_id)
@@ -1019,25 +982,13 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         if not catalogs_svc:
             raise HTTPException(status_code=500, detail="Catalogs service not available.")
 
-        try:
-            internal_catalog_id = await catalogs_svc.resolve_catalog_id(
-                catalog_id, allow_missing=False
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        if not internal_catalog_id:
-            raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
+        internal_catalog_id = await resolve_internal_catalog_id_or_404(
+            catalogs_svc, catalog_id
+        )
 
-        try:
-            internal_collection_id = await catalogs_svc.collections.resolve_collection_id(
-                internal_catalog_id, collection_id, allow_missing=False
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except AttributeError:
-            internal_collection_id = collection_id
-        if not internal_collection_id:
-            raise HTTPException(status_code=404, detail=f"Collection '{collection_id}' not found.")
+        internal_collection_id = await resolve_internal_collection_id_or_404(
+            catalogs_svc, internal_catalog_id, collection_id
+        )
 
         from dynastore.models.protocols.visibility import resolve_collection_listing_ids
         visible_ids = await resolve_collection_listing_ids(internal_catalog_id)

@@ -24,6 +24,11 @@ from fastapi import FastAPI, APIRouter, HTTPException, Query, Request
 from contextlib import asynccontextmanager
 
 from dynastore.extensions.protocols import ExtensionProtocol
+from dynastore.extensions.tools.resolvers import (
+    resolve_catalog_or_404,
+    resolve_collection_or_404,
+    resolve_internal_catalog_id_or_404,
+)
 from dynastore.modules import get_protocol
 from dynastore.modules.iam.compiled_rule_cache import iam_rule_version
 from dynastore.modules.iam.iam_service import IamService
@@ -225,12 +230,8 @@ async def _assert_catalog_exists(catalog_id: str) -> Optional[str]:
     # Phase 2: resolve external catalog_id → internal before calling the
     # internal get_catalog_model (which queries by internal id).  A missing
     # external_id is surfaced as 404, matching the pre-Phase-2 behaviour.
-    internal_id = await catalogs.resolve_catalog_id(catalog_id, allow_missing=True)
-    if internal_id is None:
-        raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
-    model = await catalogs.get_catalog_model(internal_id)
-    if model is None:
-        raise HTTPException(status_code=404, detail=f"Catalog '{catalog_id}' not found.")
+    internal_id = await resolve_internal_catalog_id_or_404(catalogs, catalog_id)
+    await resolve_catalog_or_404(catalogs, internal_id, use_model=True)
     return internal_id
 
 
@@ -244,12 +245,10 @@ async def _assert_collection_exists(catalog_id: str, collection_id: str) -> None
     catalogs = get_protocol(CatalogsProtocol)
     if catalogs is None:
         return
-    collection = await catalogs.collections.get_collection(catalog_id, collection_id)
-    if collection is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Collection '{collection_id}' not found in catalog '{catalog_id}'.",
-        )
+    await resolve_collection_or_404(
+        catalogs.collections, catalog_id, collection_id,
+        detail=f"Collection '{collection_id}' not found in catalog '{catalog_id}'.",
+    )
 
 
 async def _resolve_collection_internal_id(
