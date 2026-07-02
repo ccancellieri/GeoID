@@ -38,7 +38,7 @@ import pytest
 
 from starlette.requests import Request as StarletteRequest
 
-from dynastore.models.shared_models import Feature
+from dynastore.models.ogc import Feature
 from dynastore.modules.stac.stac_config import StacPluginConfig
 from dynastore.tools.discovery import get_protocols, register_plugin, unregister_plugin
 from dynastore.extensions.stac.wmts_web_map_links import (

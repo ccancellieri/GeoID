@@ -51,7 +51,7 @@ from dynastore.tools.db import validate_sql_identifier
 from dynastore.tools.geospatial import BboxDimensionality, parse_bbox_string
 from .stac_models import STACCatalogRequest, stac_localize
 from .stac_validator import validate_stac_item, validate_stac_collection
-from dynastore.models.shared_models import Feature
+from dynastore.models.ogc import Feature
 from . import stac_generator
 from .stac_models import (
     STACCollectionUpdate,
@@ -1188,7 +1188,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
                 )
 
             # Add handling for deleted items
-            if item.properties.get("deleted_at") is not None:
+            if (item.properties or {}).get("deleted_at") is not None:
                 raise HTTPException(
                     status_code=404, detail=f"Item {item_id} not found."
                 )

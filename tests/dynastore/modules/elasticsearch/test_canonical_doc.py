@@ -657,7 +657,7 @@ def test_validity_string_bounds_pass_through_without_isoformat():
 def test_stac_reserved_members_assets_stored_and_round_trips():
     """assets from stac_reserved_members survive the canonical doc and unproject."""
     from dynastore.modules.elasticsearch.items_projection import unproject_item_from_es
-    from dynastore.models.shared_models import Feature
+    from dynastore.models.ogc import Feature
 
     assets = {
         "data": {
@@ -688,7 +688,7 @@ def test_stac_reserved_members_assets_stored_and_round_trips():
 def test_stac_reserved_members_stac_extensions_stored_and_round_trips():
     """stac_extensions from stac_reserved_members survive canonical doc and unproject."""
     from dynastore.modules.elasticsearch.items_projection import unproject_item_from_es
-    from dynastore.models.shared_models import Feature
+    from dynastore.models.ogc import Feature
 
     exts = [
         "https://stac-extensions.github.io/eo/v1.0.0/schema.json",
@@ -712,7 +712,7 @@ def test_stac_reserved_members_stac_extensions_stored_and_round_trips():
 def test_stac_reserved_members_assets_and_extensions_together():
     """Full ES-only STAC round-trip: assets + stac_extensions survive write→read."""
     from dynastore.modules.elasticsearch.items_projection import unproject_item_from_es
-    from dynastore.models.shared_models import Feature
+    from dynastore.models.ogc import Feature
 
     assets = {"thumbnail": {"href": "https://example.com/thumb.png", "roles": ["thumbnail"]}}
     exts = ["https://stac-extensions.github.io/eo/v1.0.0/schema.json"]

@@ -38,7 +38,7 @@ def _make_sidecar():
 
 
 def _make_feature():
-    from dynastore.models.shared_models import Feature
+    from dynastore.models.ogc import Feature
 
     return Feature(type="Feature", id="test-feature-1", geometry=None, properties={})
 
@@ -129,12 +129,14 @@ def test_bbox_derived_from_geometry_when_no_scalar_columns() -> None:
     sidecar = _make_sidecar()
     context = _make_context()
 
-    from dynastore.models.shared_models import Feature, GeoJSONGeometry
+    from geojson_pydantic import Point
+
+    from dynastore.models.ogc import Feature
 
     feature = Feature(
         type="Feature",
         id="test-geom-1",
-        geometry=GeoJSONGeometry(type="Point", coordinates=[10.0, 20.0]),
+        geometry=Point(type="Point", coordinates=[10.0, 20.0]),
         properties={},
     )
     row: Dict[str, Any] = {}  # no scalar or bbox_geom columns
@@ -147,14 +149,16 @@ def test_bbox_polygon_from_geometry() -> None:
     """Polygon geometry produces the tight bounding box."""
     pytest.importorskip("shapely.geometry")
 
-    from dynastore.models.shared_models import Feature, GeoJSONGeometry
+    from geojson_pydantic import Polygon
+
+    from dynastore.models.ogc import Feature
 
     sidecar = _make_sidecar()
     context = _make_context()
     feature = Feature(
         type="Feature",
         id="test-poly-1",
-        geometry=GeoJSONGeometry(
+        geometry=Polygon(
             type="Polygon",
             coordinates=[[[0, 0], [0, 5], [10, 5], [10, 0], [0, 0]]],
         ),

@@ -41,8 +41,26 @@ class Feature(_Feature):
     # Allow extra fields for extension data (like geom_gml, etc.)
     # and custom links mapping
     links: Optional[List[Link]] = None
-    
-    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+    model_config = ConfigDict(
+        extra="allow",
+        arbitrary_types_allowed=True,
+        json_schema_extra={
+            "examples": [
+                {
+                    "type": "Feature",
+                    "id": "feature_001",
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [12.49, 41.89],
+                    },
+                    "bbox": [12.49, 41.89, 12.49, 41.89],
+                    "properties": {"name": "Rome", "country": "Italy"},
+                    "links": [],
+                }
+            ]
+        },
+    )
 
 class FeatureCollection(_FeatureCollection):
     features: List[Feature] = []
@@ -50,5 +68,25 @@ class FeatureCollection(_FeatureCollection):
     timeStamp: Optional[str] = None
     numberMatched: Optional[int] = None
     numberReturned: Optional[int] = None
-    
-    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+    model_config = ConfigDict(
+        extra="allow",
+        arbitrary_types_allowed=True,
+        json_schema_extra={
+            "examples": [
+                {
+                    "type": "FeatureCollection",
+                    "features": [
+                        {
+                            "type": "Feature",
+                            "id": "feature_001",
+                            "geometry": {"type": "Point", "coordinates": [12.49, 41.89]},
+                            "properties": {"name": "Rome"},
+                        }
+                    ],
+                    "numberMatched": 1,
+                    "numberReturned": 1,
+                }
+            ]
+        },
+    )

@@ -66,7 +66,7 @@ from dynastore.modules.catalog.models import (
     LocalizedText,
     Collection,
 )
-from dynastore.models.shared_models import Feature
+from dynastore.models.ogc import Feature
 from dynastore.modules.catalog.catalog_config import CollectionPluginConfig
 from dynastore.models.protocols import (
     CatalogsProtocol,
@@ -2779,7 +2779,7 @@ class CatalogService(CatalogsProtocol):
         lang: str = "en",
         read_policy: Optional[Any] = None,
     ) -> Feature:
-        return self._item_svc.map_row_to_feature(  # type: ignore[return-value]
+        return self._item_svc.map_row_to_feature(
             row, col_config, lang=lang, read_policy=read_policy
         )
 

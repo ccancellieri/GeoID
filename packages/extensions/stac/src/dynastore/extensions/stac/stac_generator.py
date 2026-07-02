@@ -20,9 +20,8 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, FrozenSet, List, Optional, Union, cast
-from dynastore.models.shared_models import Feature
-from dynastore.models.ogc import Feature as OGCFeature
+from typing import Any, Dict, FrozenSet, List, Optional, cast
+from dynastore.models.ogc import Feature
 
 import pystac
 from fastapi import HTTPException, Request, status
@@ -1148,7 +1147,7 @@ async def create_item_from_feature(
     request: Request,
     catalog_id: str,
     collection_id: str,
-    feature: Union[Feature, OGCFeature],
+    feature: Feature,
     stac_config: Optional[StacPluginConfig] = None,
     view_mode: str = "standard",
     lang: str = "en",
@@ -1622,8 +1621,9 @@ async def create_search_results_collection(
     stac_items_tasks = []
     for feature in features:
         # Cross-collection tracking injected by search.py
-        cid = feature.properties.get("_catalog_id") or ""
-        tid = feature.properties.get("_collection_id") or ""
+        properties = feature.properties or {}
+        cid = properties.get("_catalog_id") or ""
+        tid = properties.get("_collection_id") or ""
 
         stac_items_tasks.append(
             create_item_from_feature(request, cid, tid, feature=feature, stac_config=stac_config, lang=lang)

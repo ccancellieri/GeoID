@@ -23,7 +23,6 @@ from typing import (
     Any,
     Dict,
     List,
-    Literal,
     Optional,
     Set,
     TypeVar,
@@ -520,85 +519,6 @@ class CollectionUpdate(LocalizedFieldsBase):
     summaries: Optional[Dict[str, Any]] = Field(None)
     assets: Optional[Dict[str, Any]] = Field(None)
     item_assets: Optional[Dict[str, Any]] = Field(None)
-
-
-# --- Generic GeoJSON Models ---
-
-
-class GeoJSONGeometry(BaseModel):
-    type: str
-    coordinates: Any
-
-
-class Feature(BaseModel):
-    model_config = ConfigDict(
-        extra="allow",
-        from_attributes=True,
-        populate_by_name=True,
-        json_schema_extra={
-            "examples": [
-                {
-                    "type": "Feature",
-                    "id": "feature_001",
-                    "geometry": {
-                        "type": "Point",
-                        "coordinates": [12.49, 41.89],
-                    },
-                    "bbox": [12.49, 41.89, 12.49, 41.89],
-                    "properties": {"name": "Rome", "country": "Italy"},
-                    "links": [],
-                }
-            ]
-        },
-    )
-
-    type: Literal["Feature"] = "Feature"
-    id: str
-    geometry: Optional[GeoJSONGeometry] = None
-    bbox: Optional[List[float]] = None
-    properties: Dict[str, Any]
-    links: Optional[List[Link]] = None
-
-
-class FeatureCollection(BaseModel):
-    """
-    A GeoJSON FeatureCollection, compliant with OGC API - Features Part 1.
-    """
-    model_config = ConfigDict(
-        extra="allow",
-        from_attributes=True,
-        populate_by_name=True,
-        json_schema_extra={
-            "examples": [
-                {
-                    "type": "FeatureCollection",
-                    "features": [
-                        {
-                            "type": "Feature",
-                            "id": "feature_001",
-                            "geometry": {"type": "Point", "coordinates": [12.49, 41.89]},
-                            "properties": {"name": "Rome"},
-                        }
-                    ],
-                    "numberMatched": 1,
-                    "numberReturned": 1,
-                }
-            ]
-        },
-    )
-
-    type: Literal["FeatureCollection"] = "FeatureCollection"
-    features: List[Feature]
-    links: Optional[List[Link]] = None
-    numberMatched: Optional[int] = Field(
-        None, description="The total number of features matching the query."
-    )
-    numberReturned: Optional[int] = Field(
-        None, description="The number of features returned in this response."
-    )
-    timeStamp: Optional[str] = Field(
-        None, description="A timestamp of when the response was generated."
-    )  # Recommended by Part 1
 
 
 # --- OGC API Common Models (e.g., for Filtering/CQL) ---

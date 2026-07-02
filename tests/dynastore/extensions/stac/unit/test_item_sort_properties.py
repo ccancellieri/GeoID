@@ -42,7 +42,7 @@ from dynastore.extensions.stac.search import (
 )
 from dynastore.models.protocols.storage_driver import Capability
 from dynastore.models.query_builder import QueryRequest
-from dynastore.models.shared_models import Feature
+from dynastore.models.ogc import Feature
 
 
 # ---------------------------------------------------------------------------

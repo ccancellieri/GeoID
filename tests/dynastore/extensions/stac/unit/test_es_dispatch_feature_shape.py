@@ -45,7 +45,7 @@ import pytest
 
 from dynastore.extensions.stac.search import _maybe_dispatch_to_es_search
 from dynastore.models.protocols.storage_driver import Capability
-from dynastore.models.shared_models import Feature
+from dynastore.models.ogc import Feature
 
 
 @dataclass
