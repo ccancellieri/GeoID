@@ -33,7 +33,7 @@ Related issues:
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Dict, Tuple
 
 
 def resolve_timeout_settings(
@@ -51,3 +51,43 @@ def resolve_timeout_settings(
         db_config.statement_timeout,
         db_config.idle_in_transaction_session_timeout,
     )
+
+
+def lock_safety_server_settings(
+    lock_timeout: str, idle_in_transaction_session_timeout: str
+) -> Dict[str, str]:
+    """Return the ``lock_timeout`` + ``idle_in_transaction_session_timeout``
+    ``server_settings`` pair every PostgreSQL connection should carry.
+
+    Single, reusable definition for the pair the shared engine
+    (``modules/db/db_service.py``) has always applied — factored out so
+    ad-hoc, short-lived engines (task/job code building their own
+    NullPool-backed async engine) can carry the same lock-safety net
+    instead of copy-pasting the dict. Without it, a task connection that
+    freezes mid-transaction can hold row/relation locks indefinitely,
+    invisible to any timeout (#2749, #2832).
+    """
+    return {
+        "lock_timeout": lock_timeout,
+        "idle_in_transaction_session_timeout": idle_in_transaction_session_timeout,
+    }
+
+
+def task_engine_connect_args(db_config) -> Dict[str, Dict[str, str]]:
+    """``connect_args`` carrying the lock-safety ``server_settings`` for a
+    task-side, NullPool-backed ad-hoc async engine.
+
+    Resolves ``lock_timeout`` / ``idle_in_transaction_session_timeout`` from
+    ``db_config`` via :func:`resolve_timeout_settings` and wraps them via
+    :func:`lock_safety_server_settings`. Intended for the short-lived,
+    single-use engines built outside the shared engine (see #2832) — pass
+    the result straight as the engine's ``connect_args`` keyword.
+    """
+    lock_timeout, _statement_timeout, idle_in_transaction_session_timeout = (
+        resolve_timeout_settings(db_config)
+    )
+    return {
+        "server_settings": lock_safety_server_settings(
+            lock_timeout, idle_in_transaction_session_timeout
+        ),
+    }

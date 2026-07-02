@@ -202,6 +202,9 @@ class EventDrainTask(AsyncWriteDrainTaskProtocol):
         from sqlalchemy.pool import NullPool
 
         from dynastore.modules.db_config.db_config import DBConfig
+        from dynastore.modules.db_config.db_timeout_config import (
+            task_engine_connect_args,
+        )
         from dynastore.modules.db_config.tools import normalize_db_url
 
         # ``normalize_db_url`` both swaps the prefix to ``postgresql+asyncpg://``
@@ -215,7 +218,12 @@ class EventDrainTask(AsyncWriteDrainTaskProtocol):
 
         # One engine for the lifetime of this run — shared across all claim and
         # terminal-write statements so connection overhead is paid once.
-        engine = create_async_engine(db_url, poolclass=NullPool)
+        # server_settings carries the same lock_timeout /
+        # idle_in_transaction_session_timeout the shared engine applies, so a
+        # frozen connection here can't hold a lock indefinitely (#2749, #2832).
+        engine = create_async_engine(
+            db_url, poolclass=NullPool, connect_args=task_engine_connect_args(DBConfig)
+        )
         # Stable owner_id for the lifetime of this run — the claim stamp and the
         # CAS guard on terminal writes.
         owner_id = f"event_drain:{uuid4()}"

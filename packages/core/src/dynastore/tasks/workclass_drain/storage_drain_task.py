@@ -267,6 +267,9 @@ class StorageDrainTask(TaskProtocol):
         callers and existing tests are unaffected.
         """
         from dynastore.modules.db_config.db_config import DBConfig
+        from dynastore.modules.db_config.db_timeout_config import (
+            task_engine_connect_args,
+        )
         from dynastore.modules.db_config.tools import normalize_db_url
         from sqlalchemy.ext.asyncio import create_async_engine
         from sqlalchemy.pool import NullPool
@@ -282,8 +285,12 @@ class StorageDrainTask(TaskProtocol):
 
         # One engine for the lifetime of this run — shared across all
         # claim and terminal-write statements so connection overhead is paid
-        # once, not per-row.
-        engine = create_async_engine(db_url, poolclass=NullPool)
+        # once, not per-row. server_settings carries the same lock_timeout /
+        # idle_in_transaction_session_timeout the shared engine applies, so a
+        # frozen connection here can't hold a lock indefinitely (#2749, #2832).
+        engine = create_async_engine(
+            db_url, poolclass=NullPool, connect_args=task_engine_connect_args(DBConfig)
+        )
         # Stable owner_id for the lifetime of this run — used as the
         # ``claimed_by`` stamp and the CAS guard on terminal writes.
         owner_id = f"storage_drain:{uuid4()}"

@@ -45,7 +45,10 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 from sqlalchemy.engine import Engine
 from dynastore.modules import ModuleProtocol
 from dynastore.modules.db_config.db_config import DBConfig
-from dynastore.modules.db_config.db_timeout_config import resolve_timeout_settings
+from dynastore.modules.db_config.db_timeout_config import (
+    lock_safety_server_settings,
+    resolve_timeout_settings,
+)
 from dynastore.modules.db_config.tools import (
     get_config,
     normalize_db_url,
@@ -332,10 +335,12 @@ class DBService(ModuleProtocol, DatabaseProtocol):
                                 # PostgreSQL release a held lock server-side when a
                                 # transaction is left open idle — even if the client
                                 # was interrupted and never rolled back. See
-                                # DBConfig.lock_timeout.
-                                "lock_timeout": lock_timeout,
-                                "idle_in_transaction_session_timeout": (
-                                    idle_in_transaction_session_timeout
+                                # DBConfig.lock_timeout. Factored into
+                                # lock_safety_server_settings() so task-side ad-hoc
+                                # engines carry the same pair (#2832).
+                                **lock_safety_server_settings(
+                                    lock_timeout,
+                                    idle_in_transaction_session_timeout,
                                 ),
                                 # statement_timeout bounds total statement EXECUTION
                                 # (not just the lock wait). "0" = disabled (default,

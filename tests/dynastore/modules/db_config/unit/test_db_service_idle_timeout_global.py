@@ -16,35 +16,31 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""#2749 item 3 — bounded idle transactions on task/ingestion connections.
+"""#2749 item 3 / #2832 — bounded idle transactions on task/ingestion connections.
 
 Source-pin regression: ``idle_in_transaction_session_timeout`` (and
-``lock_timeout``) are applied as ``server_settings`` on every connection the
-MAIN async engine hands out (``DBConfig.idle_in_transaction_session_timeout``
-/ ``DBConfig.lock_timeout``, resolved once via ``resolve_timeout_settings``
-at engine construction in ``modules/db/db_service.py``). That engine serves
-both the API service and every background loop that resolves its connection
-via ``get_engine()`` / ``DatabaseProtocol`` — which is the mechanism that
-lets a wedged transaction self-clear (PostgreSQL terminates a backend
-idle-in-transaction past the configured window, releasing its locks
-server-side) instead of pinning a lock for hours.
+``lock_timeout``) are applied as ``server_settings`` on every connection
+built anywhere in the tree, via ONE shared definition —
+``lock_safety_server_settings`` / ``task_engine_connect_args`` in
+``modules/db_config/db_timeout_config.py`` — rather than copy-pasted dicts.
+The MAIN async engine (``modules/db/db_service.py``) resolves the pair via
+``resolve_timeout_settings`` and merges ``lock_safety_server_settings(...)``
+into its ``server_settings``. Every ad-hoc, short-lived task-side engine
+(``create_async_engine(..., poolclass=NullPool)``) passes
+``connect_args=task_engine_connect_args(DBConfig)`` for the same guarantee.
 
-KNOWN GAP (follow-up, not fixed here): a handful of task-side call sites
-build their OWN short-lived ``create_async_engine(..., poolclass=NullPool)``
-instead of resolving the shared engine, and pass no ``server_settings`` at
-all — so those specific connections do NOT carry either timeout:
+Without this, a task connection that freezes mid-transaction (asyncio stall,
+OOM pause, network partition) can hold row/relation locks indefinitely — the
+forensics on #2749 point at exactly this: the 15h wedge's blocking
+transactions came from an ingestion-job connection with
+``stmt_age ≈ xact_age``, invisible to any timeout because none was set on
+that engine.
 
-- tasks/ingestion/ingestion_task.py (`_maybe_enqueue_tile_preseed`)
-- tasks/workclass_drain/event_drain_task.py
-- tasks/workclass_drain/storage_drain_task.py
-- modules/db_config/typed_store/cli.py (a CLI tool, not a server process)
-
-The three task-side engines are lower-risk than the #2749 wedge itself —
-each is built, used once, and ``.dispose()``-d in a ``finally`` within the
-same function, so it never sits in a pool waiting to be reused — but they
-are not covered by this test's guarantee. ``test_known_bare_engine_sites``
-pins the current inventory so a newly added bare ``create_async_engine()``
-call is caught for review instead of silently joining the gap.
+``test_bare_engine_sites_carry_lock_safety_settings`` asserts every
+``create_async_engine()`` call site in the tree either goes through the
+shared helper or is on the explicit allowlist below (a justified exception,
+reviewed case by case) — so a newly added bare engine with no
+``server_settings`` is caught instead of silently joining the gap.
 """
 
 from __future__ import annotations
@@ -62,6 +58,13 @@ def _db_service_source() -> str:
     ).read_text(encoding="utf-8")
 
 
+def _db_timeout_config_source() -> str:
+    return (
+        _repo_root()
+        / "packages/core/src/dynastore/modules/db_config/db_timeout_config.py"
+    ).read_text(encoding="utf-8")
+
+
 def _calls_create_async_engine(path: pathlib.Path) -> bool:
     for line in path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
@@ -73,59 +76,98 @@ def _calls_create_async_engine(path: pathlib.Path) -> bool:
 
 
 def test_engine_server_settings_include_idle_in_transaction_timeout():
-    source = _db_service_source()
-    assert '"idle_in_transaction_session_timeout": (' in source, (
-        "db_service.py must pass idle_in_transaction_session_timeout in "
-        "server_settings for every connection the engine creates — this is "
-        "the safety net that lets a wedged transaction (task/job or "
-        "interactive) self-clear instead of pinning a lock indefinitely (#2749)."
+    source = _db_timeout_config_source()
+    assert (
+        '"idle_in_transaction_session_timeout": idle_in_transaction_session_timeout,'
+        in source
+    ), (
+        "db_timeout_config.py must define lock_safety_server_settings() carrying "
+        "idle_in_transaction_session_timeout — the safety net that lets a wedged "
+        "transaction (task/job or interactive) self-clear instead of pinning a "
+        "lock indefinitely (#2749, #2832)."
     )
     assert "resolve_timeout_settings(db_config)" in source, (
         "the timeout values must come from DBConfig via resolve_timeout_settings, "
         "not be hardcoded or duplicated inline."
     )
+    assert "lock_safety_server_settings(" in _db_service_source(), (
+        "db_service.py must consume the shared lock_safety_server_settings() "
+        "helper rather than inlining its own copy of the dict."
+    )
 
 
 def test_engine_server_settings_include_lock_timeout():
-    source = _db_service_source()
+    source = _db_timeout_config_source()
     assert '"lock_timeout": lock_timeout,' in source, (
-        "db_service.py must pass lock_timeout in server_settings for every "
-        "connection — this bounds how long ANY statement (appender INSERT "
+        "db_timeout_config.py's lock_safety_server_settings() must pass "
+        "lock_timeout — this bounds how long ANY statement (appender INSERT "
         "or DDL) waits to acquire a lock, appender queuing briefly instead "
         "of blocking unbounded behind a pending ACCESS EXCLUSIVE."
     )
 
 
-def test_known_bare_engine_sites():
-    """Inventory of ``create_async_engine()`` call sites that do NOT go
-    through ``db_service.py`` and so do NOT carry ``lock_timeout`` /
-    ``idle_in_transaction_session_timeout``.
+# create_async_engine() sites that do NOT route through
+# task_engine_connect_args() / lock_safety_server_settings() — a justified,
+# reviewed exception, not a silent gap:
+#
+# - modules/db/db_service.py — the shared engine itself; it defines
+#   lock_safety_server_settings() and merges it directly (see
+#   test_engine_server_settings_include_idle_in_transaction_timeout above).
+# - modules/db_config/typed_store/cli.py — a standalone CLI tool (not a
+#   long-lived server/task process); its ``_engine()`` helper builds a
+#   plain, default-pooled engine for one-off operator commands.
+_ALLOWLIST_NO_TASK_HELPER = frozenset(
+    {
+        pathlib.Path("modules/db/db_service.py"),
+        pathlib.Path("modules/db_config/typed_store/cli.py"),
+    }
+)
 
-    This is a known, tracked gap (see module docstring) — not asserting
-    they're acceptable, just pinning the current set so a new bare engine
-    doesn't join it unnoticed. If this test fails because the list shrank,
-    update it (progress). If it grew, the new site needs the same review
-    this docstring gives the existing four.
+
+def test_bare_engine_sites_carry_lock_safety_settings():
+    """Every ``create_async_engine()`` call site either uses the shared
+    lock-safety helper or is on the explicit, reviewed allowlist above.
+
+    Replaces the prior "known gap" inventory: the three task-side engines
+    (ingestion / event_drain / storage_drain) now pass
+    ``connect_args=task_engine_connect_args(DBConfig)`` and are asserted
+    here, not merely documented. If this fails because a NEW bare
+    ``create_async_engine()`` call site appeared, either wire it to
+    ``task_engine_connect_args()`` or add it to
+    ``_ALLOWLIST_NO_TASK_HELPER`` with a one-line justification.
     """
     core_src = _repo_root() / "packages/core/src/dynastore"
-    hits = sorted(
+    sites = sorted(
         path.relative_to(core_src)
         for path in core_src.rglob("*.py")
         if _calls_create_async_engine(path)
     )
-    expected = sorted(
-        pathlib.Path(p)
-        for p in (
-            "modules/db/db_service.py",
-            "modules/db_config/typed_store/cli.py",
-            "tasks/ingestion/ingestion_task.py",
-            "tasks/workclass_drain/event_drain_task.py",
-            "tasks/workclass_drain/storage_drain_task.py",
+
+    covered = {
+        pathlib.Path("tasks/ingestion/ingestion_task.py"),
+        pathlib.Path("tasks/workclass_drain/event_drain_task.py"),
+        pathlib.Path("tasks/workclass_drain/storage_drain_task.py"),
+    }
+
+    missing_from_tree = covered - set(sites)
+    assert not missing_from_tree, (
+        f"Expected task-side engine sites not found: {sorted(missing_from_tree)}. "
+        "Update this test's `covered` set if these files moved."
+    )
+
+    uncovered = set(sites) - covered - _ALLOWLIST_NO_TASK_HELPER
+    assert not uncovered, (
+        f"New bare create_async_engine() site(s) with no lock-safety coverage: "
+        f"{sorted(uncovered)}. Either pass "
+        "connect_args=task_engine_connect_args(DBConfig) (see #2832) or add "
+        "to _ALLOWLIST_NO_TASK_HELPER with a justification."
+    )
+
+    for site in covered:
+        source = (core_src / site).read_text(encoding="utf-8")
+        assert "task_engine_connect_args(" in source, (
+            f"{site} calls create_async_engine() but does not pass "
+            "connect_args=task_engine_connect_args(DBConfig) — it would build "
+            "an engine with no lock_timeout / idle_in_transaction_session_timeout "
+            "(#2749, #2832)."
         )
-    )
-    assert hits == expected, (
-        f"create_async_engine() call sites changed — expected {expected}, "
-        f"found {hits}. Update this inventory (see module docstring) and, "
-        "for any new task-side site, evaluate whether it needs the same "
-        "server_settings as db_service.py."
-    )
