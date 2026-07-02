@@ -25,20 +25,21 @@ TerriaJS's ``regionMapping.json`` shape:
 * ``GET /region-mappings/definitions``            — ``{"regionWmsMap": {...}}``
 * ``GET /region-mappings/{mapping_id}/regionIds``  — sorted distinct values
 
-Anonymous read for these routes is granted by the ``region_mappings_registry``
-platform preset via a direct ``/region-mappings/.*`` policy bound to the
-``unauthenticated`` role — these routes are not catalog-path-shaped, so the
-usual ``CatalogLookupAudience`` condition handler cannot gate them (see
-``presets/region_mappings_registry.py`` for the full two-part rationale).
+These routes carry no IAM policy of their own. On a deployment without the
+IAM module (e.g. dev's ``scope_catalog``, which ships without it) every
+route is open by default, so these are reachable anonymously with no extra
+setup. On an IAM-enabled deployment nothing here is public until an operator
+explicitly grants read access to ``/region-mappings/.*`` (and, for the
+underlying Records reads, ``/records/catalogs/_region_mappings_/.*``) —
+the same way they would grant any other protected route; this extension
+does not assume or automate that decision.
 
-That grant only opens the *registry* routes, not the *source* catalog's own
-data — a claim registered against a private source collection must not
-leak that collection's bbox/title/regionIds anonymously. Both handlers gate
-per request on ``registry_data.is_catalog_public(src_catalog)`` (the same
-``CatalogLookupAudience`` opt-in, checked against the source catalog this
-time, not the registry): ``/definitions`` skips such a mapping entirely;
-``/regionIds`` returns 404 — never 403, so a private mapping is
-indistinguishable from a non-existent one.
+There is no per-source-catalog visibility check: applying the
+``region_mapping`` preset on a collection is itself the publication
+decision — see ``presets/region_mapping.py`` for what publishing means in
+detail. Once a claim is registered, its mapping's distinct region-id
+values, the source collection's bbox/title, and its tile URL are served
+here to anyone who can reach these routes.
 """
 from __future__ import annotations
 
@@ -60,7 +61,6 @@ from .registry_data import (
     fetch_distinct_region_ids,
     fetch_mapping_primary,
     fetch_primary_records,
-    is_catalog_public,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,24 +81,15 @@ async def _build_region_wms_map(
     alias_ci = alias.strip().casefold() if alias else None
     records = await fetch_primary_records(catalog, collection, alias_ci)
 
-    # De-dup by mapping_id, preserving the query's sort order.
+    # De-dup by mapping_id, preserving the query's sort order, then paginate
+    # over MAPPINGS (not claim rows).
     by_mapping: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
     for record in records:
         mapping_id = record.get("mapping_id")
         if mapping_id and mapping_id not in by_mapping:
             by_mapping[mapping_id] = record
 
-    # Serve-time visibility gate — registering a claim does not make the
-    # SOURCE catalog's data public; only that catalog's own
-    # CatalogLookupAudience opt-in does (see the module docstring). Applied
-    # before pagination so limit/offset count over the set the caller can
-    # actually see.
-    visible: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
-    for mapping_id, record in by_mapping.items():
-        if await is_catalog_public(record.get("src_catalog", "")):
-            visible[mapping_id] = record
-
-    page = list(visible.items())[offset: offset + limit]
+    page = list(by_mapping.items())[offset: offset + limit]
     base_url = get_root_url(request)
 
     region_wms_map: Dict[str, Any] = {}
@@ -192,13 +183,6 @@ class RegionMappingService(ExtensionProtocol):
             raise HTTPException(status_code=503, detail="Catalogs service not available.")
         record = await fetch_mapping_primary(mapping_id)
         if record is None:
-            raise HTTPException(
-                status_code=404, detail=f"Region mapping {mapping_id!r} not found.",
-            )
-        # Same visibility gate as /definitions — a private source catalog's
-        # mapping is 404, not 403, so it is indistinguishable from a
-        # non-existent one (no existence disclosure).
-        if not await is_catalog_public(record.get("src_catalog", "")):
             raise HTTPException(
                 status_code=404, detail=f"Region mapping {mapping_id!r} not found.",
             )

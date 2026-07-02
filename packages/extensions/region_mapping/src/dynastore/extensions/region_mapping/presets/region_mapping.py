@@ -19,6 +19,22 @@
 """``region_mapping`` preset — claims a collection's region-id column for
 TerriaJS WMS region mapping (dynastore#443 Phase 1).
 
+REGISTRATION IS PUBLICATION. Applying this preset on a collection is an
+explicit decision to publish, via ``/region-mappings/definitions`` and
+``/region-mappings/{mapping_id}/regionIds``, to anyone who can reach those
+routes:
+
+* the claimed column's distinct values (every ``region_prop`` value in the
+  source collection, fetched in full by the regionIds endpoint);
+* the source collection's bbox and title;
+* a working WMS/MVT tile URL for the source collection.
+
+There is no separate visibility check against the source collection's own
+access posture — applying ``region_mapping`` against a collection an
+operator wants to keep private is a mistake, not something this preset
+guards against. Do not register a collection you do not want partially
+public this way.
+
 Collection-scoped (``catalog_scopable=False``). Apply endpoint::
 
     POST /configs/catalogs/{cat}/collections/{col}/presets/region_mapping
@@ -162,6 +178,20 @@ class _RegionMappingPreset:
             PresetPlanEntry(
                 kind="ensure_registry", target=REGISTRY_CATALOG_ID,
                 detail={"if_absent": True},
+            ),
+            PresetPlanEntry(
+                kind="publish_notice",
+                target=f"{catalog_id}/{collection_id}",
+                detail={
+                    "note": (
+                        "Applying this preset publishes, to anyone who can "
+                        "reach /region-mappings, the distinct values of "
+                        f"{p.column!r}, this collection's bbox/title, and "
+                        "its tile URL. There is no separate visibility "
+                        "check — registering a private collection is an "
+                        "explicit decision to publish that much."
+                    ),
+                },
             ),
         ]
         for claim_ci, (claim, role) in claims.items():

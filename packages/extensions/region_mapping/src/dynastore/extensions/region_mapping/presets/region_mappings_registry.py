@@ -21,39 +21,49 @@ claims registry (dynastore#443 Phase 1).
 
 Hand-rolled (not ``MultiContributorPreset``): a ``ConfigContributor`` only
 applies configs at the preset's own scope, but this platform-tier preset
-must set ``CatalogLookupAudience`` at the ``_region_mappings_`` catalog's
-own scope — so it talks to ``PresetContext`` directly instead.
+must set configs at the ``_region_mappings_`` catalog's own scope — so it
+talks to ``PresetContext`` directly instead.
 
 Idempotently provisions:
 
 1. The bucket-free ``_region_mappings_`` catalog (``Hint.DEFER``) and its
    ``mappings`` RECORDS collection (``ItemsSchema`` with a UNIQUE
-   ``claim_ci`` field — see ``registry_data.py``).
-2. Anonymous read, in two parts:
-   a. ``CatalogLookupAudience(is_public=True)`` at the catalog's own scope
-      — opens the catalog-path-shaped Records reads (item listing/search
-      under ``/records/catalogs/_region_mappings_/...``).
-   b. A direct platform-tier ``Policy`` (``actions=["GET"]``,
-      ``resources=["/region-mappings/.*"]``) bound to the
-      ``unauthenticated`` role — the ``/region-mappings/*`` serving routes
-      are NOT catalog-path-shaped (the ``catalog_lookup_public_allowed``
-      condition handler regex-parses ``/catalogs/{id}/`` out of the request
-      path), so part (a) alone can never reach them.
+   ``claim_ci`` field — see ``registry_data.py``). Both creates pass
+   ``lang="*"`` — the title/description payloads are multilanguage dicts, and
+   ``create_catalog``/``create_collection`` reject a multilanguage dict input
+   when a concrete ``lang`` (the "en" default) is requested (mirrors the
+   live-proven pattern in
+   ``dynastore.extensions.volumes.presets.tiles3d_samples``).
+2. PG-only routing on the catalog, collection, and items tiers — no
+   Elasticsearch / secondary index anywhere for this registry (mirrors
+   ``dynastore.modules.storage.presets.pg_only_catalog``'s routing shape).
+   The registry is exclusively a small claims table; every read the
+   extension performs (claim lookups, the CQL-style ``claim_ci=`` conflict
+   check, ``mapping_id=`` grouping) goes through the PG driver only.
+3. ``CatalogLookupAudience(is_public=True)`` at the catalog's own scope —
+   opens the catalog-path-shaped Records reads (item listing/search under
+   ``/records/catalogs/_region_mappings_/...``) to anonymous callers.
 
-Revoke removes only the direct policy and the audience config — the
-catalog/collection and any claim data already registered are preserved
-(mirrors the ``common_dimensions`` preset's revoke posture: shared
-platform infrastructure is never deleted by an individual apply/revoke).
+No IAM policy is registered here. On a deployment without the IAM module
+(e.g. dev's ``scope_catalog``, which ships without it) all routes are open
+by default, so nothing needs granting. On an IAM-enabled deployment the
+operator is expected to grant read access to ``/region-mappings/.*`` and
+``/records/catalogs/_region_mappings_/.*`` explicitly, the same way they
+grant any other protected route — this preset does not assume or automate
+that decision.
+
+Revoke removes only the audience config — the catalog/collection and any
+claim data already registered are preserved (mirrors the
+``common_dimensions`` preset's revoke posture: shared platform
+infrastructure is never deleted by an individual apply/revoke).
 """
 from __future__ import annotations
 
 import logging
-from typing import Any, ClassVar, List, Optional, Tuple, Type
+from typing import ClassVar, Tuple, Type
 
 from pydantic import BaseModel
 
-from dynastore.models.auth import Policy
-from dynastore.models.auth_models import Role
 from dynastore.modules.db_config.exceptions import UniqueViolationError
 from dynastore.modules.iam.audience_configs import CatalogLookupAudience
 from dynastore.modules.storage.hints import Hint
@@ -66,11 +76,17 @@ from dynastore.modules.storage.presets.preset import (
 )
 from dynastore.modules.storage.presets.protocol import PresetTier
 from dynastore.modules.storage.presets.registry import register_preset
+from dynastore.modules.storage.routing_config import (
+    CatalogRoutingConfig,
+    CollectionRoutingConfig,
+    ItemsRoutingConfig,
+)
 
 from ..registry_data import (
     MAPPINGS_COLLECTION_ID,
     REGISTRY_CATALOG_ID,
     build_registry_items_schema,
+    build_registry_routing_configs,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,50 +109,11 @@ _COLLECTION_DATA = {
     "title": {"en": "Region Mapping Claims"},
 }
 
-_POLICY_ID = "region_mappings_public_read"
-_ROLE_NAME = "unauthenticated"
-
-_PUBLIC_READ_POLICY = Policy(
-    id=_POLICY_ID,
-    description=(
-        "Anonymous GET access to the TerriaJS region-mapping serving "
-        "endpoints (/region-mappings/*). These routes are not "
-        "catalog-path-shaped, so CatalogLookupAudience cannot gate them — "
-        "a direct platform-tier policy is required instead."
-    ),
-    actions=["GET"],
-    resources=[r"/region-mappings/.*"],
-    effect="ALLOW",
-    priority=0,
-)
-
-
-async def _get_role_by_name(iam: Any, role_name: str) -> Optional[Role]:
-    roles: List[Role] = await iam.list_roles()
-    return next((r for r in roles if r.name == role_name), None)
-
-
-async def _union_policy_into_role(iam: Any, role_name: str, policy_id: str) -> None:
-    existing = await _get_role_by_name(iam, role_name)
-    if existing is None:
-        await iam.create_role(Role(name=role_name, policies=[policy_id]))
-        return
-    if policy_id not in existing.policies:
-        merged = existing.model_copy(update={"policies": list(existing.policies) + [policy_id]})
-        await iam.update_role(merged)
-
-
-async def _strip_policy_from_role(iam: Any, role_name: str, policy_id: str) -> None:
-    existing = await _get_role_by_name(iam, role_name)
-    if existing is None:
-        return
-    remaining = [p for p in existing.policies if p != policy_id]
-    await iam.update_role(existing.model_copy(update={"policies": remaining}))
-
 
 async def ensure_registry_provisioned(ctx: PresetContext) -> None:
-    """Idempotently create the registry catalog/collection and grant public
-    read access.
+    """Idempotently create the registry catalog/collection, pin PG-only
+    routing, and grant the catalog-path-shaped Records reads to anonymous
+    callers.
 
     Shared by this preset's ``apply()`` and by the collection-scoped
     ``region_mapping`` preset, which must guarantee the registry exists
@@ -157,7 +134,9 @@ async def ensure_registry_provisioned(ctx: PresetContext) -> None:
     existing_catalog = await ctx.catalogs.get_catalog_model(REGISTRY_CATALOG_ID)
     if existing_catalog is None:
         try:
-            await ctx.catalogs.create_catalog(dict(_CATALOG_DATA), hints=frozenset({Hint.DEFER}))
+            await ctx.catalogs.create_catalog(
+                dict(_CATALOG_DATA), lang="*", hints=frozenset({Hint.DEFER}),
+            )
         except UniqueViolationError:
             logger.info(
                 "region_mappings_registry: %r was created concurrently by "
@@ -176,7 +155,9 @@ async def ensure_registry_provisioned(ctx: PresetContext) -> None:
         collection_payload["layer_config"] = {"collection_type": "RECORDS"}
         collection_payload["schema"] = build_registry_items_schema()
         try:
-            await ctx.catalogs.create_collection(REGISTRY_CATALOG_ID, collection_payload)
+            await ctx.catalogs.create_collection(
+                REGISTRY_CATALOG_ID, collection_payload, lang="*",
+            )
         except UniqueViolationError:
             logger.info(
                 "region_mappings_registry: %r/%r was created concurrently "
@@ -190,6 +171,26 @@ async def ensure_registry_provisioned(ctx: PresetContext) -> None:
                 raise
 
     if ctx.config is not None:
+        # PG-only routing — no ES/secondary index anywhere for this
+        # registry (re-asserted on every apply; cheap and self-healing
+        # against a platform-level default that might otherwise inject an
+        # ES driver).
+        catalog_routing, collection_routing, items_routing = build_registry_routing_configs()
+        await ctx.config.set_config(
+            CatalogRoutingConfig, catalog_routing,
+            catalog_id=REGISTRY_CATALOG_ID, check_immutability=False,
+        )
+        await ctx.config.set_config(
+            CollectionRoutingConfig, collection_routing,
+            catalog_id=REGISTRY_CATALOG_ID, collection_id=MAPPINGS_COLLECTION_ID,
+            check_immutability=False,
+        )
+        await ctx.config.set_config(
+            ItemsRoutingConfig, items_routing,
+            catalog_id=REGISTRY_CATALOG_ID, collection_id=MAPPINGS_COLLECTION_ID,
+            check_immutability=False,
+        )
+
         await ctx.config.set_config(
             CatalogLookupAudience,
             CatalogLookupAudience(is_public=True),
@@ -197,21 +198,15 @@ async def ensure_registry_provisioned(ctx: PresetContext) -> None:
             check_immutability=False,
         )
 
-    if ctx.policy is not None and ctx.iam is not None:
-        updated = await ctx.policy.update_policy(_PUBLIC_READ_POLICY)
-        if updated is None:
-            await ctx.policy.create_policy(_PUBLIC_READ_POLICY)
-        await _union_policy_into_role(ctx.iam, _ROLE_NAME, _POLICY_ID)
-
 
 class _RegionMappingsRegistryPreset:
     """Platform-tier preset — provisions the shared claims registry."""
 
     name: ClassVar[str] = "region_mappings_registry"
     description: ClassVar[str] = (
-        "Provision the shared _region_mappings_ claims registry (bucket-free "
-        "RECORDS catalog) and grant anonymous read to the TerriaJS "
-        "region-mapping serving endpoints. Idempotent; safe to re-apply."
+        "Provision the shared _region_mappings_ claims registry (bucket-free, "
+        "PG-only RECORDS catalog) and open its catalog-path-shaped Records "
+        "reads to anonymous callers. Idempotent; safe to re-apply."
     )
     keywords: ClassVar[Tuple[str, ...]] = ("region-mapping", "terria", "platform", "records")
     tier: ClassVar[PresetTier] = PresetTier.PLATFORM
@@ -225,31 +220,38 @@ class _RegionMappingsRegistryPreset:
             PresetPlanEntry(
                 kind="create_catalog",
                 target=REGISTRY_CATALOG_ID,
-                detail={"if_absent": True, "hints": ["defer"]},
+                detail={"if_absent": True, "hints": ["defer"], "lang": "*"},
             ),
             PresetPlanEntry(
                 kind="create_collection",
                 target=MAPPINGS_COLLECTION_ID,
-                detail={"if_absent": True, "collection_type": "RECORDS"},
+                detail={"if_absent": True, "collection_type": "RECORDS", "lang": "*"},
+            ),
+            PresetPlanEntry(
+                kind="set_config",
+                target="CatalogRoutingConfig",
+                detail={"scope": f"catalog:{REGISTRY_CATALOG_ID}", "pg_only": True},
+            ),
+            PresetPlanEntry(
+                kind="set_config",
+                target="CollectionRoutingConfig",
+                detail={
+                    "scope": f"catalog:{REGISTRY_CATALOG_ID}/collection:{MAPPINGS_COLLECTION_ID}",
+                    "pg_only": True,
+                },
+            ),
+            PresetPlanEntry(
+                kind="set_config",
+                target="ItemsRoutingConfig",
+                detail={
+                    "scope": f"catalog:{REGISTRY_CATALOG_ID}/collection:{MAPPINGS_COLLECTION_ID}",
+                    "pg_only": True,
+                },
             ),
             PresetPlanEntry(
                 kind="set_config",
                 target="CatalogLookupAudience",
                 detail={"scope": f"catalog:{REGISTRY_CATALOG_ID}", "is_public": True},
-            ),
-            PresetPlanEntry(
-                kind="upsert_policy",
-                target=_POLICY_ID,
-                detail={
-                    "actions": _PUBLIC_READ_POLICY.actions,
-                    "resources": _PUBLIC_READ_POLICY.resources,
-                    "effect": _PUBLIC_READ_POLICY.effect,
-                },
-            ),
-            PresetPlanEntry(
-                kind="upsert_role_binding",
-                target=_ROLE_NAME,
-                detail={"add_policies": [_POLICY_ID]},
             ),
         ]
         return PresetPlan(preset_name=self.name, scope_key=scope, entries=tuple(entries))
@@ -262,29 +264,18 @@ class _RegionMappingsRegistryPreset:
             "preset_name": self.name,
             "catalog_id": REGISTRY_CATALOG_ID,
             "collection_id": MAPPINGS_COLLECTION_ID,
-            "policy_id": _POLICY_ID,
-            "role_name": _ROLE_NAME,
         })
 
     async def revoke(
         self, applied_descriptor: AppliedDescriptor, ctx: PresetContext,
     ) -> None:
-        payload = applied_descriptor.payload
-        role_name = payload.get("role_name", _ROLE_NAME)
-        policy_id = payload.get("policy_id", _POLICY_ID)
-
-        if ctx.iam is not None:
-            await _strip_policy_from_role(ctx.iam, role_name, policy_id)
-        if ctx.policy is not None:
-            await ctx.policy.delete_policy(policy_id)
         if ctx.config is not None:
             await ctx.config.delete_config(CatalogLookupAudience, catalog_id=REGISTRY_CATALOG_ID)
 
         logger.info(
-            "region_mappings_registry: revoked public-read policy %r and "
-            "audience config; registry catalog/collection and claim data "
-            "are preserved.",
-            policy_id,
+            "region_mappings_registry: revoked the anonymous-read audience "
+            "config; PG-only routing, registry catalog/collection, and "
+            "claim data are preserved.",
         )
 
 

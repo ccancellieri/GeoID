@@ -22,7 +22,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi import FastAPI
@@ -86,21 +86,6 @@ class _StubCatalogs:
         return collection
 
 
-class _StubConfigs:
-    """Minimal ConfigsProtocol stand-in — backs ``is_catalog_public``'s
-    ``CatalogLookupAudience`` read with a fixed per-catalog opt-in set."""
-
-    def __init__(self, public_catalogs: "set[str]") -> None:
-        self._public_catalogs = public_catalogs
-
-    async def get_config(self, config_cls: Any, catalog_id: Optional[str] = None, **_kw: Any) -> Any:
-        from dynastore.modules.iam.audience_configs import CatalogLookupAudience
-
-        if config_cls is CatalogLookupAudience:
-            return CatalogLookupAudience(is_public=catalog_id in self._public_catalogs)
-        return config_cls()
-
-
 def _claim(mapping_id: str, claim: str, role: str, **extra: Any) -> Dict[str, Any]:
     base = {
         "claim": claim,
@@ -120,46 +105,20 @@ def _claim(mapping_id: str, claim: str, role: str, **extra: Any) -> Dict[str, An
 @pytest.fixture(autouse=True)
 def _reset_caches():
     """Every @cached read helper must start each test with an empty cache."""
-    from dynastore.extensions.region_mapping.registry_data import (
-        invalidate_serving_caches,
-        is_catalog_public,
-    )
-    from dynastore.tools.cache import cache_clear
+    from dynastore.extensions.region_mapping.registry_data import invalidate_serving_caches
 
     invalidate_serving_caches()
-    cache_clear(is_catalog_public)
     yield
     invalidate_serving_caches()
-    cache_clear(is_catalog_public)
 
 
-# Default visibility posture for tests that don't care about FINDING-1
-# gating: every source catalog these existing fixtures reference ("fao",
-# "who") is public, so pre-existing definitions/regionIds assertions keep
-# their original meaning. Tests targeting the gate itself pass an explicit
-# ``public_catalogs`` set (e.g. ``set()`` for an all-private scenario).
-_DEFAULT_PUBLIC_CATALOGS = {"fao", "who"}
-
-
-def _app_with_catalogs(
-    monkeypatch: pytest.MonkeyPatch,
-    catalogs: _StubCatalogs,
-    *,
-    public_catalogs: Optional["set[str]"] = None,
-) -> FastAPI:
+def _app_with_catalogs(monkeypatch: pytest.MonkeyPatch, catalogs: _StubCatalogs) -> FastAPI:
     from dynastore.extensions.region_mapping.region_mapping_service import RegionMappingService
     from dynastore.models.protocols.catalogs import CatalogsProtocol
-    from dynastore.models.protocols.configs import ConfigsProtocol
-
-    configs = _StubConfigs(
-        public_catalogs if public_catalogs is not None else set(_DEFAULT_PUBLIC_CATALOGS)
-    )
 
     def _fake_get_protocol(protocol_type: Any) -> Any:
         if protocol_type is CatalogsProtocol:
             return catalogs
-        if protocol_type is ConfigsProtocol:
-            return configs
         return None
 
     monkeypatch.setattr(
@@ -314,107 +273,3 @@ async def test_region_ids_unknown_mapping_returns_404(monkeypatch: pytest.Monkey
         resp = await client.get("/region-mappings/does-not-exist/regionIds")
 
     assert resp.status_code == 404
-
-
-# ---------------------------------------------------------------------------
-# Serve-time visibility gate (dynastore#443 review finding 1) — a mapping
-# whose SOURCE catalog has not opted into CatalogLookupAudience.is_public
-# must not leak data anonymously, even though /region-mappings/* itself is
-# publicly reachable.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_definitions_excludes_mapping_from_private_source_catalog(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    records = [
-        _claim("fao_countries", "country", "primary", src_catalog="fao"),
-        _claim("secret_regions", "region", "primary", src_catalog="secret", src_collection="regions"),
-    ]
-    catalogs = _StubCatalogs(records, collection_extent_bbox=[1.0, 1.0, 2.0, 2.0])
-    # Only "fao" opts in; "secret" is not in the public set.
-    app = _app_with_catalogs(monkeypatch, catalogs, public_catalogs={"fao"})
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get("/region-mappings/definitions")
-
-    body = resp.json()["regionWmsMap"]
-    assert list(body.keys()) == ["FAO_COUNTRIES"], (
-        "a mapping sourced from a non-public catalog must not appear in "
-        "/definitions"
-    )
-
-
-@pytest.mark.asyncio
-async def test_definitions_all_private_yields_empty_map(monkeypatch: pytest.MonkeyPatch) -> None:
-    records = [_claim("fao_countries", "country", "primary")]
-    catalogs = _StubCatalogs(records, collection_extent_bbox=[1.0, 1.0, 2.0, 2.0])
-    app = _app_with_catalogs(monkeypatch, catalogs, public_catalogs=set())
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get("/region-mappings/definitions")
-
-    assert resp.json() == {"regionWmsMap": {}}
-
-
-@pytest.mark.asyncio
-async def test_definitions_pagination_counts_only_visible_mappings(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """limit/offset must apply to the VISIBLE set, not the raw claim rows —
-    a private mapping sitting inside the requested page must not consume a
-    page slot nor shift a later public mapping out of range."""
-    records = [
-        _claim("fao_a", "a", "primary", src_catalog="fao", src_collection="a"),
-        _claim("secret_b", "b", "primary", src_catalog="secret", src_collection="b"),
-        _claim("fao_c", "c", "primary", src_catalog="fao", src_collection="c"),
-    ]
-    catalogs = _StubCatalogs(records, collection_extent_bbox=[1.0, 1.0, 2.0, 2.0])
-    app = _app_with_catalogs(monkeypatch, catalogs, public_catalogs={"fao"})
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get("/region-mappings/definitions", params={"limit": 2, "offset": 0})
-
-    body = resp.json()["regionWmsMap"]
-    assert set(body.keys()) == {"FAO_A", "FAO_C"}
-
-
-@pytest.mark.asyncio
-async def test_region_ids_returns_404_for_private_source_catalog(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    records = [_claim("secret_regions", "region", "primary", src_catalog="secret", src_collection="regions")]
-    catalogs = _StubCatalogs(
-        records,
-        region_id_pages=[["ITA", "FRA"]],
-    )
-    app = _app_with_catalogs(monkeypatch, catalogs, public_catalogs=set())
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get("/region-mappings/secret_regions/regionIds")
-
-    assert resp.status_code == 404
-    # Same message shape as a genuinely unknown mapping — no existence
-    # disclosure via a distinct 403/error body.
-    assert "not found" in resp.json()["detail"]
-
-
-@pytest.mark.asyncio
-async def test_region_ids_public_source_catalog_still_served(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    records = [_claim("fao_countries", "country", "primary")]
-    catalogs = _StubCatalogs(records, region_id_pages=[["ITA", "FRA"]])
-    app = _app_with_catalogs(monkeypatch, catalogs, public_catalogs={"fao"})
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get("/region-mappings/fao_countries/regionIds")
-
-    assert resp.status_code == 200
-    assert resp.json()["values"] == ["FRA", "ITA"]

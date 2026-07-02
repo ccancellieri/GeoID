@@ -46,7 +46,6 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from dynastore.models.protocols.catalogs import CatalogsProtocol
-from dynastore.models.protocols.configs import ConfigsProtocol
 from dynastore.models.protocols.field_definition import FieldDefinition
 from dynastore.models.query_builder import (
     FieldSelection,
@@ -54,8 +53,15 @@ from dynastore.models.query_builder import (
     QueryRequest,
     SortOrder,
 )
-from dynastore.modules.iam.audience_configs import CatalogLookupAudience
 from dynastore.modules.storage.driver_config import ItemsSchema
+from dynastore.modules.storage.routing_config import (
+    CatalogRoutingConfig,
+    CollectionRoutingConfig,
+    FailurePolicy,
+    ItemsRoutingConfig,
+    Operation,
+    OperationDriverEntry,
+)
 from dynastore.tools.cache import cache_clear, cached
 from dynastore.tools.discovery import get_protocol
 
@@ -107,6 +113,70 @@ def build_registry_items_schema() -> ItemsSchema:
             "title": FieldDefinition(name="title", data_type="string"),
         },
     )
+
+
+def build_registry_routing_configs() -> Tuple[
+    CatalogRoutingConfig, CollectionRoutingConfig, ItemsRoutingConfig,
+]:
+    """PG-only routing for the registry catalog/collection/items tiers.
+
+    No Elasticsearch or other secondary index anywhere for this registry —
+    it is exclusively a small claims table, and every read the extension
+    performs (claim lookups, the ``claim_ci=`` conflict check,
+    ``mapping_id=`` grouping) must go through the PG driver only. Mirrors
+    the shape of ``dynastore.modules.storage.presets.pg_only_catalog``
+    (catalog + collection + items tiers; asset routing is omitted — the
+    registry never stores assets). ``Operation.SEARCH`` is pinned on the
+    catalog and collection tiers so the self-register helper cannot
+    auto-append a discoverable ES store to those tiers.
+    """
+    catalog_routing = CatalogRoutingConfig(
+        operations={
+            Operation.WRITE: [
+                OperationDriverEntry(
+                    driver_ref="catalog_postgresql_driver", on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+            Operation.READ: [
+                OperationDriverEntry(
+                    driver_ref="catalog_postgresql_driver", on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+            Operation.SEARCH: [
+                OperationDriverEntry(driver_ref="catalog_postgresql_driver"),
+            ],
+        },
+    )
+    collection_routing = CollectionRoutingConfig(
+        operations={
+            Operation.WRITE: [
+                OperationDriverEntry(
+                    driver_ref="collection_postgresql_driver", on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+            Operation.READ: [
+                OperationDriverEntry(
+                    driver_ref="collection_postgresql_driver", on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+            Operation.SEARCH: [
+                OperationDriverEntry(driver_ref="collection_postgresql_driver"),
+            ],
+        },
+    )
+    items_routing = ItemsRoutingConfig(
+        operations={
+            Operation.WRITE: [
+                OperationDriverEntry(
+                    driver_ref="items_postgresql_driver", on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+            Operation.READ: [
+                OperationDriverEntry(driver_ref="items_postgresql_driver"),
+            ],
+        },
+    )
+    return catalog_routing, collection_routing, items_routing
 
 
 def slugify(value: str) -> str:
@@ -346,31 +416,6 @@ async def fetch_distinct_region_ids(
             break
         offset += REGION_IDS_PAGE_SIZE
     return sorted(values)
-
-
-@cached(maxsize=512, ttl=60, namespace="region_mapping_catalog_public")
-async def is_catalog_public(catalog_id: str) -> bool:
-    """True when ``catalog_id`` has opted into anonymous lookup via
-    ``CatalogLookupAudience.is_public``.
-
-    Serve-time visibility gate: registering a ``region_mapping`` claim does
-    not itself make the *source* catalog's data public — the direct
-    ``/region-mappings/.*`` policy only opens the registry-serving routes,
-    it does not bypass the source catalog's own access posture. The router
-    calls this before returning anything derived from the source collection
-    (bbox, title, regionIds) so a claim registered against a private
-    catalog is not readable anonymously. Checked per request — the short
-    TTL bounds how quickly a revoked opt-in closes the leak, not just how
-    quickly a new opt-in becomes visible.
-    """
-    configs = get_protocol(ConfigsProtocol)
-    if configs is None:
-        return False
-    try:
-        audience = await configs.get_config(CatalogLookupAudience, catalog_id=catalog_id)
-    except Exception:
-        return False
-    return isinstance(audience, CatalogLookupAudience) and bool(audience.is_public)
 
 
 def invalidate_serving_caches() -> None:
