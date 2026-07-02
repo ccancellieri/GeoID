@@ -29,22 +29,14 @@ from dynastore.extensions.web.decorators import expose_web_page
 from dynastore.models.auth import Condition, Policy
 from dynastore.models.auth_models import Role
 from dynastore.models.protocols.authorization import IamRolesConfig
-from dynastore.modules.db_config.query_executor import (
-    DQLQuery,
-    ResultHandler,
-    managed_transaction,
-    DbResource,
-)
 from dynastore.modules.catalog.catalog_module import register_event_listener
 from dynastore.modules.elasticsearch.dashboards_provisioner import kibana_api_key
-from dynastore.models.shared_models import SYSTEM_CATALOG_ID, SYSTEM_LOGS_TABLE
+from dynastore.models.shared_models import SYSTEM_CATALOG_ID
 from dynastore.modules.catalog.log_manager import log_event
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from .models import LogEntryCreate, LogEntry, LogsListResponse
 from dynastore.modules.catalog.event_service import CatalogEventType
-from dynastore.models.protocols.catalogs import CatalogsProtocol
-from dynastore.models.protocols.database import DatabaseProtocol
 from dynastore.tools.discovery import get_protocol
 
 logger = logging.getLogger(__name__)
@@ -277,7 +269,6 @@ def _logs_per_catalog_role_bindings(
 from dynastore.models.protocols.logs import LogsProtocol
 class LogExtension(ExtensionProtocol, LogsProtocol):
     priority: int = 100
-    engine: Optional[DbResource] = None
 
     def __init__(self, app: Any = None):
         self.app = app
@@ -448,29 +439,13 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
             "public_path": _public_path(),
         }
 
-    @property
-    def catalogs(self) -> CatalogsProtocol:
-        return self.get_protocol(CatalogsProtocol)  # type: ignore[return-value]
-
-    @property
-    def database(self) -> DatabaseProtocol:
-        return self.get_protocol(DatabaseProtocol)  # type: ignore[return-value]
-
     @asynccontextmanager
     async def lifespan(self, app: Any):
-        db = self.database
-        if db:
-            self.engine = db.engine
-
-        if not self.engine:
-            logger.warning(
-                "LogExtension: No DB engine found via DatabaseProtocol. Extension disabled."
-            )
-            yield
-            return
-
-        # We rely on CatalogModule for schema management.
-
+        # No database engine dependency (#2749) — logs are Elasticsearch-only;
+        # the extension always registers its listeners and routes regardless
+        # of whether a log backend is currently available (optional-module
+        # posture, same as everything else — writes/reads degrade gracefully
+        # inside LogService / search_logs rather than disabling the extension).
         self._register_listeners()
         logger.info("LogExtension initialized.")
         yield
@@ -500,7 +475,7 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
         )
 
     async def _on_catalog_created(self, catalog_id: str, **kwargs):
-        db_resource = kwargs.pop("db_resource", None)
+        kwargs.pop("db_resource", None)  # no PG leg to route through (#2749)
         await self.append_log(
             LogEntryCreate(
                 catalog_id=catalog_id,
@@ -509,7 +484,6 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
                 details=kwargs,
                 is_system=True,
             ),
-            db_resource=db_resource,
             # Lifecycle events are sparse: write in-band rather than via the
             # batch aggregator, whose timer-based flush is unreliable on a
             # Cloud Run instance that goes idle (CPU-throttled) and scales to
@@ -518,7 +492,7 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
         )
 
     async def _on_catalog_deleted(self, catalog_id: str, **kwargs):
-        db_resource = kwargs.pop("db_resource", None)
+        kwargs.pop("db_resource", None)
         await self.append_log(
             LogEntryCreate(
                 catalog_id=catalog_id,
@@ -527,13 +501,11 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
                 details=kwargs,
                 is_system=True,
             ),
-            db_resource=db_resource,
             immediate=True,
         )
 
     async def _on_catalog_hard_deleted(self, catalog_id: str, **kwargs):
-        # This goes to System Logs as the schema might be dropping/dropped
-        db_resource = kwargs.pop("db_resource", None)
+        kwargs.pop("db_resource", None)
         await self.append_log(
             LogEntryCreate(
                 catalog_id=catalog_id,
@@ -542,14 +514,13 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
                 details=kwargs,
                 is_system=True,
             ),
-            db_resource=db_resource,
             immediate=True,
         )
 
     async def _on_catalog_failure(self, catalog_id: str, error: Optional[str] = None, **kwargs):
         # We route this via system catalog for global logging,
         # but preserve the actual failing catalog ID for LogService to extract.
-        db_resource = kwargs.pop("db_resource", None)
+        kwargs.pop("db_resource", None)
         await self.append_log(
             LogEntryCreate(
                 catalog_id=catalog_id,
@@ -559,22 +530,16 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
                 details=kwargs,
                 is_system=True,
             ),
-            db_resource=db_resource,
             immediate=True,
         )
 
     async def _on_collection_created(self, catalog_id: str, collection_id: str, **kwargs):
-        # is_system=True routes to the flat catalog.system_logs (with
-        # collection_id set), NOT the tenant {schema}.logs table. The tenant
-        # table is partitioned by collection_id, and this listener runs in-band
-        # during the create_collection transaction that is itself creating the
-        # new collection's log partition — an immediate write on a separate
-        # connection cannot see that uncommitted partition (and would contend
-        # on its ACCESS EXCLUSIVE lock). system_logs is flat, so the write is
-        # safe; search_logs filters it back out by catalog_id + collection_id,
-        # surfacing it under both /catalogs/{cat}/logs and the collection-scoped
-        # endpoint — mirroring how catalog_creation reaches /logs.
-        db_resource = kwargs.pop("db_resource", None)
+        # is_system=True routes this into the platform-wide log stream
+        # (rather than being scoped only to the collection) — search_logs
+        # filters it back out by catalog_id + collection_id, surfacing it
+        # under both /catalogs/{cat}/logs and the collection-scoped
+        # endpoint, mirroring how catalog_creation reaches /logs.
+        kwargs.pop("db_resource", None)
         await self.append_log(
             LogEntryCreate(
                 catalog_id=catalog_id,
@@ -584,14 +549,13 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
                 details=kwargs,
                 is_system=True,
             ),
-            db_resource=db_resource,
             # immediate=True: see _on_catalog_created — the batch aggregator's
             # timer flush is lost when an idle Cloud Run instance scales to zero.
             immediate=True,
         )
 
     async def _on_collection_deleted(self, catalog_id: str, collection_id: str, **kwargs):
-        db_resource = kwargs.pop("db_resource", None)
+        kwargs.pop("db_resource", None)
         await self.append_log(
             LogEntryCreate(
                 catalog_id=catalog_id,
@@ -601,16 +565,11 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
                 details=kwargs,
                 is_system=True,
             ),
-            db_resource=db_resource,
             immediate=True,
         )
 
     async def _on_collection_hard_deleted(self, catalog_id: str, collection_id: str, **kwargs):
-        # is_system=True (catalog.system_logs): a hard-delete drops the
-        # collection's tenant log partition, so a tenant-scoped write would have
-        # nowhere durable to land. system_logs survives and search_logs filters
-        # it back by catalog_id + collection_id.
-        db_resource = kwargs.pop("db_resource", None)
+        kwargs.pop("db_resource", None)
         await self.append_log(
             LogEntryCreate(
                 catalog_id=catalog_id,
@@ -620,14 +579,12 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
                 details=kwargs,
                 is_system=True,
             ),
-            db_resource=db_resource,
             immediate=True,
         )
 
     async def append_log(
         self,
         entry: LogEntryCreate,
-        db_resource: Optional[DbResource] = None,
         immediate: bool = False,
     ):
         """Appends a log entry via the catalog module's log manager."""
@@ -638,7 +595,6 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
             message=entry.message,
             collection_id=entry.collection_id,
             details=entry.details,
-            db_resource=db_resource,
             immediate=immediate,
             is_system=entry.is_system,
         )
@@ -655,98 +611,49 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
         offset: int = 0,
     ) -> List[LogEntry]:
         """
-        Retrieves logs for a specific catalog (Tenant Logs).
+        Retrieves logs for a specific catalog (#2749: Elasticsearch-backed).
         To view System Logs, pass catalog_id="_system_".
 
-        Harmonization: If searching for a specific tenant, it includes records from
-        both tenant logs and system logs associated with that tenant.
+        ``catalog_id == SYSTEM_CATALOG_ID`` returns the platform-wide
+        ``is_system`` stream with no catalog filter; any other value
+        filters by that ``catalog_id`` regardless of ``is_system`` —
+        matching the pre-#2749 behavior of UNIONing system-tagged and
+        tenant-tagged rows for a given catalog. Returns ``[]`` when no
+        log backend is registered (rather than a 404/500) — a catalog
+        that never existed and one with no logs yet are indistinguishable
+        from this read path, same as every other optional-module surface.
         """
-        async with managed_transaction(self.engine) as conn:
-            # 1. Prepare shared filters
-            base_clauses = ["catalog_id = :catalog_id"]
-            params = {"catalog_id": catalog_id, "limit": limit, "offset": offset}
+        from dynastore.models.protocols.logs import LogBackendProtocol
 
-            if collection_id:
-                base_clauses.append("collection_id = :collection_id")
-                params["collection_id"] = collection_id
-            if event_type:
-                base_clauses.append("event_type = :event_type")
-                params["event_type"] = event_type
-            if level:
-                base_clauses.append("level = :level")
-                params["level"] = level
-            if start_date:
-                base_clauses.append("timestamp >= :start_date")
-                params["start_date"] = start_date
-            if end_date:
-                base_clauses.append("timestamp <= :end_date")
-                params["end_date"] = end_date
+        backend = get_protocol(LogBackendProtocol)
+        if not backend:
+            return []
+        backend = backend[0] if isinstance(backend, list) else backend
+        search_fn = getattr(backend, "search_logs", None)
+        if search_fn is None:
+            return []
 
-            where_clause = " AND ".join(base_clauses)
+        is_system = True if catalog_id == SYSTEM_CATALOG_ID else None
+        filter_catalog_id = None if catalog_id == SYSTEM_CATALOG_ID else catalog_id
 
-            # System logs (catalog.system_logs) and tenant logs ({schema}.logs)
-            # declare their columns in a DIFFERENT physical order — notably
-            # `timestamp` is column 2 in the tenant table but the last column in
-            # system_logs. A `SELECT *` UNION ALL aligns columns positionally,
-            # so the branches collide (catalog_id VARCHAR vs timestamp TIMESTAMPTZ)
-            # and the whole query raises a type-mismatch error. Project an
-            # explicit, identically-ordered column list from each branch so the
-            # union is well-defined regardless of declaration order.
-            cols = (
-                "id, timestamp, catalog_id, collection_id, event_type, "
-                "level, message, details, stacktrace, request_context"
+        try:
+            rows = await search_fn(
+                catalog_id=filter_catalog_id,
+                collection_id=collection_id,
+                event_type=event_type,
+                level=level,
+                is_system=is_system,
+                start_date=start_date,
+                end_date=end_date,
+                limit=limit,
+                offset=offset,
             )
-
-            # 2. Determine tables to query
-            queries = []
-
-            # System Logs
-            # If asking for _system_, we return ALL system logs.
-            # If asking for a tenant, we return system logs matching that tenant.
-            sys_where = where_clause
-            if catalog_id == SYSTEM_CATALOG_ID:
-                sys_where = where_clause.replace("catalog_id = :catalog_id", "TRUE")
-
-            queries.append(
-                f"SELECT {cols} FROM catalog.{SYSTEM_LOGS_TABLE} WHERE {sys_where}"
-            )
-
-            # Tenant Logs
-            if catalog_id != SYSTEM_CATALOG_ID:
-                    # 1. Resolve Physical Names
-                catalogs_provider = self.catalogs
-                if not catalogs_provider:
-                    raise HTTPException(
-                        status_code=500, detail="CatalogsProtocol not available."
-                    )
-
-                physical_schema = await catalogs_provider.resolve_physical_schema(
-                    catalog_id
-                )
-                if not physical_schema:
-                    raise HTTPException(
-                        status_code=404, detail=f"Catalog '{catalog_id}' not found."
-                    )
-
-                if physical_schema:
-                    queries.append(
-                        f'SELECT {cols} FROM "{physical_schema}".logs WHERE {where_clause}'
-                    )
-
-            # 3. Combine queries with UNION ALL and sort
-            final_sql = " UNION ALL ".join(queries)
-            final_sql = f"SELECT * FROM ({final_sql}) AS combined_logs ORDER BY timestamp DESC LIMIT :limit OFFSET :offset"
-
-            try:
-                rows = await DQLQuery(
-                    final_sql, result_handler=ResultHandler.ALL_DICTS
-                ).execute(conn, **params)
-                return [LogEntry.model_validate(r) for r in rows]
-            except Exception as e:
-                # Don't bury read failures at debug — a swallowed error here
-                # silently returns "no logs", which masks real breakage.
-                logger.warning("Log search failed for catalog '%s': %s", catalog_id, e)
-                return []
+            return [LogEntry.model_validate(r) for r in rows]
+        except Exception as e:
+            # Don't bury read failures at debug — a swallowed error here
+            # silently returns "no logs", which masks real breakage.
+            logger.warning("Log search failed for catalog '%s': %s", catalog_id, e)
+            return []
 
 
     async def get_system_logs(

@@ -1304,19 +1304,17 @@ async def generic_exception_handler(request: Request, exc: Exception) -> Respons
         "operation": f"{request.method} {request.url.path}",
     }
 
-    # Log the exception to the database and get a log_id for the response
+    # Log the exception (Elasticsearch-backed, #2749) and get a log_id for
+    # the response. immediate=True dispatches straight to the backend
+    # instead of buffering, so log_id is available before we build the
+    # response below.
     log_id = None
     try:
-        from dynastore.tools.discovery import get_protocol
-        from dynastore.models.protocols.database import DatabaseProtocol
-
-        db_svc = get_protocol(DatabaseProtocol)
-        engine = db_svc.engine if db_svc else None
-
         from dynastore.models.protocols.logs import LogsProtocol
+        from dynastore.tools.discovery import get_protocol
 
         log_event = get_protocol(LogsProtocol)
-        if log_event and engine:
+        if log_event:
             log_id = await log_event.log_event(
                 catalog_id=context.get("catalog_id", "_system_"),
                 event_type="exception",
@@ -1328,7 +1326,6 @@ async def generic_exception_handler(request: Request, exc: Exception) -> Respons
                     "traceback": traceback.format_exc(),
                     "request_context": context.get("request_context"),
                 },
-                db_resource=engine,
                 immediate=True,
             )
             if log_id:
@@ -1336,7 +1333,7 @@ async def generic_exception_handler(request: Request, exc: Exception) -> Respons
                 context["log_catalog"] = context.get("catalog_id", "_system_")
     except Exception as log_exc:
         logger.critical(
-            f"CRITICAL: Failed to log original exception to database: {log_exc}",
+            f"CRITICAL: Failed to log original exception: {log_exc}",
             exc_info=True,
         )
         logger.error(f"Original unlogged exception: {exc}", exc_info=True)

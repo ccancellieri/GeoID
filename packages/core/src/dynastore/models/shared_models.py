@@ -115,7 +115,6 @@ class Link(BaseModel, LocalizableModelMixin):
 SYSTEM_CATALOG_ID = "_system_"
 SYSTEM_CATALOG_TITLE = "System Catalog"
 SYSTEM_SCHEMA = "catalog"  # Physical schema for system-level tables
-SYSTEM_LOGS_TABLE = "system_logs"
 
 # --- Reusable Internationalization Types ---
 

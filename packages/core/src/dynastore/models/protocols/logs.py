@@ -18,8 +18,17 @@
 
 """
 Logging protocol definitions.
+
+#2749: PostgreSQL log persistence has been removed. Logs flow buffer ->
+chunk -> ``LogBackendProtocol.write_batch`` only (Elasticsearch in
+practice); there is no caller-supplied database connection anywhere in
+this protocol anymore. ``log_event``/``list_logs``/``get_log_by_id`` no
+longer accept a ``db_resource`` — that concept (force a synchronous write
+on the caller's own PG transaction) does not apply to a backend-dispatch
+model.
 """
 
+from datetime import datetime
 from typing import Protocol, Optional, Any, List, Dict, runtime_checkable, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -44,10 +53,9 @@ class LogsProtocol(Protocol):
         message: Optional[str] = None,
         collection_id: Optional[str] = None,
         details: Optional[Dict[str, Any]] = None,
-        db_resource: Optional[Any] = None,
         immediate: bool = False,
         is_system: bool = False
-    ) -> Optional[int]:
+    ) -> Optional[str]:
         """
         Main entry point for logging events.
 
@@ -58,12 +66,17 @@ class LogsProtocol(Protocol):
             message: Human-readable message
             collection_id: Optional collection ID
             details: Optional structured details
-            db_resource: Optional database connection for immediate write
-            immediate: If True, flush immediately if buffer is not full
+            immediate: If True, dispatch to the backend now instead of
+                waiting for the buffer's threshold/timer flush. Use for
+                sparse, high-value events (lifecycle transitions) where the
+                buffered timer could lose the row to a scale-to-zero
+                instance; do not use on a hot path.
             is_system: Whether this is a system-level log
 
         Returns:
-            Log ID if written immediately, None otherwise
+            The entry's backend id when ``immediate=True`` and a backend is
+            available, ``None`` otherwise (a buffered write's id is not
+            known until a later flush).
         """
         ...
 
@@ -87,27 +100,26 @@ class LogsProtocol(Protocol):
         event_type: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
-        db_resource: Optional[Any] = None
     ) -> List[Dict[str, Any]]:
         """
-        Lists log entries with filtering and pagination.
+        Lists log entries with filtering and pagination. Reads the backend
+        (Elasticsearch); returns ``[]`` when no backend is available.
         """
         ...
 
     async def get_log_by_id(
         self,
-        log_id: int,
+        log_id: str,
         catalog_id: str,
-        db_resource: Optional[Any] = None
     ) -> Optional[Dict[str, Any]]:
         """
-        Retrieve a specific log entry by ID.
+        Retrieve a specific log entry by its backend-assigned id.
         """
         ...
 
     async def flush(self) -> None:
         """
-        Flushes all buffered log entries to the database immediately.
+        Flushes all buffered log entries to the backend immediately.
         """
         ...
 
@@ -118,7 +130,7 @@ class LogBackendProtocol(Protocol):
     Protocol for pluggable log backend implementations.
 
     Modules implement this to receive batched log entries from LogService.
-    Multiple backends can coexist (e.g., PostgreSQL + Elasticsearch + GCP Cloud Logging).
+    Multiple backends can coexist (e.g., Elasticsearch + GCP Cloud Logging).
     Discovered via get_protocol(LogBackendProtocol).
 
     Implementations should:
@@ -141,6 +153,33 @@ class LogBackendProtocol(Protocol):
             - "count": number of entries written
             - "backend": name of this backend
             - Optional: "error" (error message if status="error")
+        """
+        ...
+
+    async def search_logs(
+        self,
+        catalog_id: Optional[str] = None,
+        collection_id: Optional[str] = None,
+        event_type: Optional[str] = None,
+        level: Optional[str] = None,
+        is_system: Optional[bool] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Query persisted log entries. Returns ``[]`` when the backend is
+        unavailable or the query fails — reads degrade silently, mirroring
+        ``write_batch``'s "skipped" status.
+        """
+        ...
+
+    async def get_log(self, log_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch a single log entry by its backend-assigned id (the ``id`` key
+        returned by ``search_logs``). Returns ``None`` when unavailable or
+        not found.
         """
         ...
 

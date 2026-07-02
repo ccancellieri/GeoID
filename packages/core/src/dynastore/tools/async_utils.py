@@ -161,11 +161,12 @@ class AsyncBufferAggregator:
     - Key-based aggregation (e.g. summing increments for the same API key)
     """
     def __init__(
-        self, 
+        self,
         flush_callback: Callable[[List[Any]], Awaitable[None]],
         threshold: int = 100,
         interval: float = 5.0,
-        name: str = "aggregator"
+        name: str = "aggregator",
+        max_size: Optional[int] = None,
     ):
         self._callback = flush_callback
         self._threshold = threshold
@@ -177,38 +178,78 @@ class AsyncBufferAggregator:
         self._flush_event = asyncio.Event()
         self._last_flush = 0.0  # Lazy initialization on first flush
         self._flush_exec_lock: Optional[asyncio.Lock] = None
+        # Hard cap on the buffer (None = unbounded, the historical default —
+        # existing callers of this generic utility are unaffected). When set,
+        # add() drops the OLDEST buffered item once at capacity rather than
+        # growing memory without bound while the backend is slow; drops are
+        # rate-limited to one summary warning per _DROP_WARNING_COOLDOWN.
+        self._max_size = max_size
+        self._dropped_since_warning = 0
+        self._last_drop_warning = 0.0
+
+    _DROP_WARNING_COOLDOWN = 30.0  # seconds
 
     async def add(self, item: Any):
-        """Adds an item to the buffer and triggers flush if threshold reached."""
+        """Adds an item to the buffer and triggers flush if threshold reached.
+
+        When ``max_size`` is set and the buffer is already at capacity, the
+        oldest buffered item is dropped to make room — bounded memory over
+        completeness, since a backlog this deep already implies old items
+        are stale by the time they would flush.
+        """
         async with self._lock:
+            if self._max_size is not None and len(self._buffer) >= self._max_size:
+                self._buffer.pop(0)
+                self._dropped_since_warning += 1
+                now = asyncio.get_event_loop().time()
+                if now - self._last_drop_warning >= self._DROP_WARNING_COOLDOWN:
+                    logger.warning(
+                        "%s: buffer at cap (%d) — dropped %d oldest entr%s "
+                        "in the last %.0fs (backend too slow to keep up).",
+                        self._name,
+                        self._max_size,
+                        self._dropped_since_warning,
+                        "y" if self._dropped_since_warning == 1 else "ies",
+                        self._DROP_WARNING_COOLDOWN,
+                    )
+                    self._last_drop_warning = now
+                    self._dropped_since_warning = 0
             self._buffer.append(item)
             if len(self._buffer) >= self._threshold:
                 self._flush_event.set()
 
     async def _trigger_flush(self, wait: bool = False) -> Optional[asyncio.Task]:
-        """Internal: Drains buffer and executes callback."""
-        if not self._buffer:
-            return None
+        """Internal: swaps the buffer out under the lock, then dispatches the
+        callback OUTSIDE the lock.
 
-        to_flush = self._buffer[:]
-        self._buffer.clear()
-        self._last_flush = asyncio.get_running_loop().time()
-        
-        # We wrap the callback in another lock check if we want to serialize flushes.
-        # But wait, run_in_background is decoupled.
-        # Let's ensure ONE flush runs at a time for THIS aggregator.
-        
+        The swap (copy + clear) is the only step that needs ``self._lock`` —
+        it must be atomic with respect to concurrent ``add()`` calls. The
+        callback itself (a network call to the log backend) must NOT run
+        while the lock is held: every producer's ``add()`` blocks on that
+        same lock, so a slow (not dead) backend would otherwise stall every
+        in-flight ``log_event()`` call for the callback's full retry budget —
+        reintroducing, at the aggregator layer, the exact "logging blocks the
+        request path" failure class #2749 exists to eliminate.
+        """
+        async with self._lock:
+            if not self._buffer:
+                return None
+            to_flush = self._buffer[:]
+            self._buffer.clear()
+            self._last_flush = asyncio.get_running_loop().time()
+
         from dynastore.modules.concurrency import run_in_background
-        
+
         async def _flush_locked():
             # This second internal lock ensures that callback executions for this
-            # specific aggregator are serialized.
+            # specific aggregator are serialized. It is independent of
+            # self._lock (which only ever guards the buffer itself).
             if self._flush_exec_lock is None:
                 self._flush_exec_lock = asyncio.Lock()
 
             async with self._flush_exec_lock:
                 await self._callback(to_flush)
-                
+
         task = run_in_background(_flush_locked(), name=f"flush_{self._name}")
         if wait:
              await task
@@ -241,10 +282,12 @@ class AsyncBufferAggregator:
                 except asyncio.TimeoutError:
                     pass # Interval reached
 
-                async with self._lock:
-                    self._flush_event.clear()
-                    await self._trigger_flush(wait=True)
-                    
+                # _trigger_flush takes self._lock itself, only around the
+                # buffer swap — do NOT wrap it in self._lock here, or the
+                # callback dispatch below runs while every add() is blocked.
+                self._flush_event.clear()
+                await self._trigger_flush(wait=True)
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -266,12 +309,14 @@ class KeyValueAggregator(AsyncBufferAggregator):
                  self._flush_event.set()
 
     async def _trigger_flush(self, wait: bool = False) -> Optional[asyncio.Task]:
-        if not self._kv_buffer:
-            return None
-
-        to_flush = list(self._kv_buffer.items())
-        self._kv_buffer.clear()
-        self._last_flush = asyncio.get_event_loop().time()
+        """Swaps ``_kv_buffer`` out under the lock, dispatches outside it —
+        see ``AsyncBufferAggregator._trigger_flush`` for why."""
+        async with self._lock:
+            if not self._kv_buffer:
+                return None
+            to_flush = list(self._kv_buffer.items())
+            self._kv_buffer.clear()
+            self._last_flush = asyncio.get_event_loop().time()
 
         from dynastore.modules.concurrency import run_in_background
 
@@ -280,7 +325,7 @@ class KeyValueAggregator(AsyncBufferAggregator):
                 self._flush_exec_lock = asyncio.Lock()
             async with self._flush_exec_lock:
                 await self._callback(to_flush)
-                
+
         task = run_in_background(_flush_locked(), name=f"flush_{self._name}")
         if wait:
              await task

@@ -17,180 +17,38 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-import os
 from contextlib import asynccontextmanager
-import json
-from dynastore.tools.json import CustomJSONEncoder
-from typing import Optional, Dict, Any, List, AsyncGenerator
 from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List, AsyncGenerator
 from pydantic import BaseModel, ConfigDict
 
 from dynastore.tools.plugin import ProtocolPlugin
-from dynastore.modules.db_config.query_executor import (
-    DQLQuery,
-    ResultHandler,
-    managed_transaction,
-    best_effort_savepoint,
-    DbResource,
-)
-from dynastore.models.shared_models import (
-    SYSTEM_CATALOG_ID,
-    SYSTEM_LOGS_TABLE,
-    SYSTEM_SCHEMA,
-)
-from dynastore.tools.protocol_helpers import get_engine
-from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry
-from dynastore.modules.db_config.maintenance_tools import ensure_schema_exists
-from dynastore.modules.db_config.locking_tools import (
-    check_table_exists,
-    safe_drop_relation,
-)
-from dynastore.models.protocols import LogsProtocol, CatalogsProtocol
+from dynastore.models.shared_models import SYSTEM_CATALOG_ID
+from dynastore.models.protocols import LogsProtocol
 from dynastore.tools.discovery import get_protocol
 
 logger = logging.getLogger(__name__)
 
-#
-#  Tables:
-#   - logs:              partitioned by collection_id (LIST) for efficient pruning.
-#   - logs_default:      DEFAULT partition for catalog-scoped logs (no collection).
-#
-#  Maintenance (MaintenanceSupervisor JOB_TENANT_LOGS_PRUNE / JOB_SYSTEM_LOGS_PRUNE):
-#   - Monthly: Prune logs older than 1 year.
 # ==============================================================================
-
-# ----- Tenant logs (flat parent, partitioned by collection_id LIST) -----
-TENANT_LOGS_DDL = """
-CREATE TABLE IF NOT EXISTS {schema}.logs (
-    id              BIGSERIAL       NOT NULL,
-    timestamp       TIMESTAMPTZ     DEFAULT NOW(),
-    catalog_id      VARCHAR         NOT NULL,
-    collection_id   VARCHAR         NOT NULL DEFAULT '',
-    event_type      VARCHAR,
-    level           VARCHAR(20),
-    message         TEXT,
-    details         JSONB,
-    stacktrace      TEXT,
-    request_context JSONB,
-    PRIMARY KEY (collection_id, id)
-) PARTITION BY LIST (collection_id);
-"""
-
-TENANT_LOGS_DEFAULT_PARTITION_DDL = """
-CREATE TABLE IF NOT EXISTS {schema}.logs_default
-    PARTITION OF {schema}.logs FOR VALUES IN ('');
-"""
-
-# Logs do not use dead-letter tables; old rows are pruned directly by the
-# MaintenanceSupervisor (JOB_TENANT_LOGS_PRUNE / JOB_SYSTEM_LOGS_PRUNE jobs).
-
-# ----- System logs (flat, no partition) -----
-SYSTEM_LOGS_DDL = f"""
-CREATE TABLE IF NOT EXISTS {SYSTEM_SCHEMA}.{SYSTEM_LOGS_TABLE} (
-    id              BIGSERIAL       PRIMARY KEY,
-    catalog_id      VARCHAR,
-    collection_id   VARCHAR,
-    event_type      VARCHAR         NOT NULL,
-    level           VARCHAR         NOT NULL,
-    message         TEXT,
-    details         JSONB,
-    stacktrace      TEXT,
-    request_context JSONB,
-    timestamp       TIMESTAMPTZ     DEFAULT NOW()
-);
-"""
-
-# System logs: flat table (no dead letter) — old rows are pruned directly.
-SYSTEM_LOGS_DL_DDL = None
-
-
-
-@lifecycle_registry.sync_catalog_initializer(priority=50)
-async def _initialize_logs_tenant_slice(conn: DbResource, schema: str, catalog_id: str):
-    """Initializes per-tenant log tables and cron jobs (no time partitions)."""
-
-    async def _check_all_logs_tables_exist(active_conn=None, params=None):
-        target = active_conn or conn
-        exists_logs = await check_table_exists(target, "logs", schema)
-        exists_default = await check_table_exists(target, "logs_default", schema)
-        return exists_logs and exists_default
-
-    combined_ddl = TENANT_LOGS_DDL + TENANT_LOGS_DEFAULT_PARTITION_DDL
-
-    await DDLQuery(
-        combined_ddl,
-        check_query=_check_all_logs_tables_exist,
-    ).execute(conn, schema=schema)
-
-    # Retention is handled by the maintenance supervisor (job: tenant_logs_prune).
-
-
-async def initialize_system_logs(conn: DbResource):
-    """Initializes the system-level logs table (flat, no partitions)."""
-    # Ensure system schema exists (idempotent)
-    await ensure_schema_exists(conn, SYSTEM_SCHEMA)
-
-    await DDLQuery(SYSTEM_LOGS_DDL).execute(conn)
-    # System logs retention is handled by the maintenance supervisor (job: system_logs_prune).
-
-
-# ==============================================================================
-#  COLLECTION-LEVEL LOG PARTITION LIFECYCLE
+#  #2749: PostgreSQL log persistence has been removed entirely.
 #
-#  When a collection is created  → attach a dedicated LIST partition for it in logs.
-#  When a collection is hard-deleted → archive and drop its log partition.
-#  Empty-string DEFAULT partition handles catalog-scoped logs (collection_id='').
+#  Logs flow buffer -> chunk -> LogBackendProtocol.write_batch only
+#  (Elasticsearch in practice, see modules/elasticsearch/log_backend.py).
+#  There is no {schema}.logs table, no catalog.system_logs table, no
+#  per-collection LIST partition, and no lifecycle hook performing DDL —
+#  the entire class of "partition-CREATE takes ACCESS EXCLUSIVE inside the
+#  collection-creation transaction" wedge this issue started from is
+#  retired by removing the DDL, not by isolating it.
+#
+#  Without a registered LogBackendProtocol, writes degrade to the stdlib
+#  logger and reads return an empty result — the same optional-module
+#  posture as every other pluggable backend in this codebase (e.g. IAM).
+#
+#  Existing ``{schema}.logs`` / ``catalog.system_logs`` tables on already
+#  deployed databases are left in place as dead weight; nothing in this
+#  codebase creates, writes, or reads them anymore. Dropping them is
+#  optional offline cleanup (see the PR description), never runtime DDL.
 # ==============================================================================
-
-from dynastore.modules.catalog.lifecycle_manager import (
-    sync_collection_initializer,
-    sync_collection_hard_destroyer,
-)
-from dynastore.modules.db_config.query_executor import DDLQuery
-from dynastore.models.driver_context import DriverContext
-
-
-@sync_collection_initializer()
-async def _create_logs_partition(
-    conn: DbResource, schema: str, catalog_id: str, collection_id: str, **kwargs
-) -> None:
-    """Creates a per-collection LIST partition in logs."""
-    safe_suffix = collection_id.replace("-", "_").replace(".", "_")
-    partition_table = f"logs_{safe_suffix}"
-
-    async def partition_exists(active_conn=None, params=None):
-        return await check_table_exists(active_conn or conn, partition_table, schema)
-
-    create_ddl = (
-        f'CREATE TABLE IF NOT EXISTS "{schema}"."{partition_table}" '
-        f'PARTITION OF "{schema}".logs '
-        f"FOR VALUES IN ('{collection_id}');"
-    )
-
-    await DDLQuery(
-        create_ddl,
-        check_query=partition_exists,
-    ).execute(conn)
-    logger.info("Created logs partition '%s.%s'.", schema, partition_table)
-
-
-@sync_collection_hard_destroyer()
-async def _drop_logs_partition(
-    conn: DbResource, schema: str, catalog_id: str, collection_id: str
-) -> None:
-    """Drops the per-collection log partition on hard delete (no archival needed — logs are ephemeral)."""
-    safe_suffix = collection_id.replace("-", "_").replace(".", "_")
-    partition_table = f"logs_{safe_suffix}"
-
-    exists = await check_table_exists(conn, partition_table, schema)
-    if not exists:
-        logger.debug("No logs partition to drop for collection '%s'.", collection_id)
-        return
-
-    # Bound AccessExclusiveLock wait — concurrent log appenders on other pods
-    # may still be writing to this partition when hard-delete races them.
-    await safe_drop_relation(conn, schema, partition_table, kind="table")
-    logger.info("Dropped logs partition '%s.%s'.", schema, partition_table)
 
 
 # --- Log Entry Model (Local Definition) ---
@@ -206,87 +64,77 @@ class LogEntryCreate(BaseModel):
     message: Optional[str] = None
     details: Optional[Dict[str, Any]] = None
     is_system: bool = False
+    # Stamped at log_event() call time — the event's real occurrence time.
+    # Without this, a buffered entry only learns its timestamp at flush
+    # time, which can lag the actual event by up to flush_interval_seconds
+    # and reorders entries relative to when they actually happened.
+    timestamp: Optional[datetime] = None
+    # Set only for immediate (unbuffered) writes — see LogService.log_event.
+    # The backend uses it as the persisted document id when present so a
+    # synchronous caller can round-trip to the exact entry it just wrote.
+    id: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
-
-
-# --- Log Buffer ---
-# Gone. Replaced by AsyncBufferAggregator from async_utils.
-
 
 
 # --- Log Service (similar to StatsService) ---
 
 
 class LogService(ProtocolPlugin[Any], LogsProtocol):
-    """Singleton service for buffered, high-throughput log ingestion."""
+    """Singleton service for buffered, high-throughput log ingestion.
+
+    Persistence is backend-dispatch only (#2749): entries are buffered in
+    an ``AsyncBufferAggregator`` and flushed in chunks to every registered
+    ``LogBackendProtocol`` provider. There is no database engine here at
+    all — no PG connection, no transaction, no DDL.
+    """
 
     # Protocol attributes — lower means higher precedence in get_protocols()
     priority: int = 10
 
     def __init__(self):
-        self._engine: Optional[DbResource] = None
         self._aggregator: Optional[Any] = None
         self._aggregator_started: bool = False
+
+    async def _build_aggregator(self) -> Any:
+        """Build the buffer aggregator from ``LogServiceConfig`` (#2749).
+
+        Resolved once here — the aggregator is built once and cannot be
+        rewired live, so a config edit only takes effect on the next
+        process start/lifespan (same caveat as ``ElasticsearchClientConfig``).
+        """
+        from dynastore.tools.async_utils import AsyncBufferAggregator
+        from dynastore.modules.catalog.log_service_config import load as load_log_config
+
+        cfg = await load_log_config()
+        logger.info(
+            "LogService initialized with flush_threshold=%s, flush_interval=%ss, "
+            "buffer_max_size=%s",
+            cfg.flush_threshold,
+            cfg.flush_interval_seconds,
+            cfg.buffer_max_size,
+        )
+        return AsyncBufferAggregator(
+            flush_callback=self._flush_batch,
+            threshold=cfg.flush_threshold,
+            interval=cfg.flush_interval_seconds,
+            name="LogAggregator",
+            max_size=cfg.buffer_max_size,
+        )
 
     @asynccontextmanager
     async def lifespan(self, app_state: Any) -> AsyncGenerator[None, None]:
         """Lifecycle hook for LogService."""
-        from dynastore.tools.protocol_helpers import get_engine
-        
-        self._engine = get_engine()
-        if not self._engine:
-            logger.warning(
-                "LogService: No database engine available. Logging will fall back to stdlib."
-            )
-            yield
-            return
+        self._aggregator = await self._build_aggregator()
 
-        from dynastore.tools.async_utils import AsyncBufferAggregator
-        flush_threshold = int(os.environ.get("LOG_FLUSH_THRESHOLD", 50))
-        flush_interval = float(os.environ.get("LOG_FLUSH_INTERVAL", 5.0))
-
-        self._aggregator = AsyncBufferAggregator(
-            flush_callback=self._flush_batch,
-            threshold=flush_threshold,
-            interval=flush_interval,
-            name="LogAggregator",
-        )
-        logger.info(
-            "LogService initialized with flush_threshold=%s, flush_interval=%ss",
-            flush_threshold,
-            flush_interval,
-        )
-        
         try:
             yield
         finally:
             await self.stop()
 
-    async def start(self, db_resource: Optional[DbResource] = None) -> None:
+    async def start(self) -> None:
         """Deprecated: use lifespan instead. Legacy support for manual startup."""
-        self._engine = db_resource or get_engine()
-        if not self._engine:
-            logger.warning(
-                "LogService: No database engine available. Logging will fall back to stdlib."
-            )
-            return
-
-        from dynastore.tools.async_utils import AsyncBufferAggregator
-        flush_threshold = int(os.environ.get("LOG_FLUSH_THRESHOLD", 50))
-        flush_interval = float(os.environ.get("LOG_FLUSH_INTERVAL", 5.0))
-
-        self._aggregator = AsyncBufferAggregator(
-            flush_callback=self._flush_batch,
-            threshold=flush_threshold,
-            interval=flush_interval,
-            name="LogAggregator",
-        )
-        logger.info(
-            "LogService initialized with flush_threshold=%s, flush_interval=%ss",
-            flush_threshold,
-            flush_interval,
-        )
+        self._aggregator = await self._build_aggregator()
 
     async def stop(self) -> None:
         """Flushes remaining entries and tears down the aggregator."""
@@ -294,165 +142,54 @@ class LogService(ProtocolPlugin[Any], LogsProtocol):
             logger.info("LogService shutting down...")
             await self._aggregator.stop()
             self._aggregator = None
-            self._engine = None
             logger.info("LogService shutdown complete.")
 
-    async def _flush_batch(self, entries: List[LogEntryCreate]):
-        """Callback for AsyncBufferAggregator. Writes to PG then dispatches to backends."""
-        if not self._engine:
+    def _get_backend_protocol(self):
+        from dynastore.models.protocols.logs import LogBackendProtocol
+        return LogBackendProtocol
+
+    def _backend_available(self) -> bool:
+        return bool(get_protocol(self._get_backend_protocol()))
+
+    async def _dispatch_to_backends(self, entries: List[LogEntryCreate]) -> None:
+        """Write a chunk of entries to every registered ``LogBackendProtocol``.
+
+        Single seam for backend dispatch — both the buffered flush
+        (``_flush_batch``) and an ``immediate=True`` call go through here.
+        This is also the intended integration point for a future
+        Valkey-buffered producer (push the chunk to a bounded list instead
+        of calling backends directly, with a separate drainer popping
+        batches into ``write_batch``) without touching the aggregator or
+        ``log_event`` — deferred out of this change, see #2749 follow-up.
+        """
+        if not entries:
             return
 
-        try:
-            async with managed_transaction(self._engine) as conn:
-                for entry in entries:
-                    # Savepoint-isolated so one entry failing (e.g. the logs
-                    # table doesn't exist yet) doesn't poison the batch's
-                    # transaction for the remaining entries.
-                    async with best_effort_savepoint(conn) as outcome:
-                        await self._write_log_entry(conn, entry)
-                    if outcome.error is not None:
-                        logger.warning(
-                            f"LogService: Failed to write individual log entry: {outcome.error}"
-                        )
-            logger.debug(f"Flushed {len(entries)} log entries to database.")
-        except Exception as e:
-            logger.error(f"Failed to flush log entries: {e}", exc_info=True)
+        backends = get_protocol(self._get_backend_protocol())
+        if not backends:
+            logger.debug(
+                "LogService: no LogBackendProtocol registered; %d entries dropped.",
+                len(entries),
+            )
+            return
 
-        # Dispatch to registered log backends (ES, GCP Cloud Logging, etc.)
-        try:
-            from dynastore.models.protocols.logs import LogBackendProtocol
+        # get_protocol may return a single instance or a list; normalize to list
+        backend_list = [backends] if not isinstance(backends, list) else backends
+        for backend in backend_list:
+            try:
+                result = await backend.write_batch(entries)
+                logger.debug("Log backend '%s' result: %s", backend.name, result)
+            except Exception as exc:
+                logger.warning("Log backend '%s' failed: %s", backend.name, exc)
 
-            backends = get_protocol(LogBackendProtocol)
-            if backends:
-                # get_protocol may return a single instance or a list; normalize to list
-                backend_list = [backends] if not isinstance(backends, list) else backends
-                for backend in backend_list:
-                    try:
-                        result = await backend.write_batch(entries)
-                        logger.debug(
-                            "Log backend '%s' result: %s", backend.name, result
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Log backend '%s' failed: %s", backend.name, exc
-                        )
-        except Exception as exc:
-            logger.warning("Failed to dispatch logs to backends: %s", exc)
+    async def _flush_batch(self, entries: List[LogEntryCreate]):
+        """Callback for AsyncBufferAggregator. Dispatches to backends."""
+        await self._dispatch_to_backends(entries)
 
     async def flush(self):
         """Manually trigger a flush (legacy support)."""
         if self._aggregator:
             await self._aggregator._trigger_flush(wait=True)
-
-    async def _write_log_entry(
-        self, conn: DbResource, entry: LogEntryCreate
-    ) -> Optional[int]:
-        """Writes a single log entry, ensuring partition exists. Returns log ID."""
-        # Determine target schema and table
-        catalogs = get_protocol(CatalogsProtocol)
-        if entry.is_system or entry.catalog_id == SYSTEM_CATALOG_ID or not catalogs:
-            phys_schema = "catalog"
-            table_name = SYSTEM_LOGS_TABLE
-        else:
-            try:
-                phys_schema = await catalogs.resolve_physical_schema(
-                    entry.catalog_id, ctx=DriverContext(db_resource=conn)
-                )
-                table_name = "logs"
-            except ValueError:
-                # Catalog might have been deleted or doesn't exist
-                phys_schema = None
-
-        if not phys_schema:
-            logger.warning(
-                f"LogService: Physical schema not found for catalog '{entry.catalog_id}'. Falling back to system_logs."
-            )
-            phys_schema = "catalog"
-            table_name = SYSTEM_LOGS_TABLE
-
-        # Prepare details with stacktrace and request_context if provided
-        details_dict = entry.details or {}
-        stacktrace = (
-            details_dict.pop("stacktrace", None)
-            if isinstance(details_dict, dict)
-            else None
-        )
-        request_context = (
-            details_dict.pop("request_context", None)
-            if isinstance(details_dict, dict)
-            else None
-        )
-
-        catalog_id_val = entry.catalog_id
-
-        from dynastore.modules.db_config.query_executor import managed_transaction
-        async with managed_transaction(conn) as tx_conn:
-            try:
-                # Insert log entry and return ID
-                log_id = await DQLQuery(
-                    """
-                    INSERT INTO {schema}.{table} (timestamp, catalog_id, collection_id, event_type, level, message, details, stacktrace, request_context)
-                    VALUES (:timestamp, :catalog_id, :collection_id, :event_type, :level, :message, :details, :stacktrace, :request_context)
-                    RETURNING id;
-                    """,
-                    result_handler=ResultHandler.SCALAR_ONE,
-                ).execute(
-                    tx_conn,
-                    schema=phys_schema,
-                    table=table_name,
-                    timestamp=datetime.now(timezone.utc),
-                    catalog_id=catalog_id_val,
-                    collection_id=entry.collection_id or "",
-                    event_type=entry.event_type,
-                    level=entry.level,
-                    message=entry.message,
-                    details=json.dumps(details_dict, cls=CustomJSONEncoder)
-                    if details_dict
-                    else None,
-                    stacktrace=stacktrace,
-                    request_context=json.dumps(request_context, cls=CustomJSONEncoder)
-                    if request_context
-                    else None,
-                )
-                return log_id
-            except Exception as e:
-                if entry.collection_id and "no partition" in str(e).lower():
-                    # Fallback to default partition (catalog-scoped) if partition is missing
-                    logger.warning(
-                        f"Log partition missing for collection '{entry.collection_id}'. Falling back to catalog-scoped log."
-                    )
-                    # Ensure the original collection_id is recorded in details
-                    if not details_dict:
-                        details_dict = {}
-                    details_dict["original_collection_id"] = entry.collection_id
-
-                    log_id = await DQLQuery(
-                        """
-                        INSERT INTO {schema}.{table} (timestamp, catalog_id, collection_id, event_type, level, message, details, stacktrace, request_context)
-                        VALUES (:timestamp, :catalog_id, :collection_id, :event_type, :level, :message, :details, :stacktrace, :request_context)
-                        RETURNING id;
-                        """,
-                        result_handler=ResultHandler.SCALAR_ONE,
-                    ).execute(
-                        tx_conn,
-                        schema=phys_schema,
-                        table=table_name,
-                        timestamp=datetime.now(timezone.utc),
-                        catalog_id=catalog_id_val,
-                        collection_id="",
-                        event_type=entry.event_type,
-                        level=entry.level,
-                        message=entry.message,
-                        details=json.dumps(details_dict, cls=CustomJSONEncoder)
-                        if details_dict
-                        else None,
-                        stacktrace=stacktrace,
-                        request_context=json.dumps(request_context, cls=CustomJSONEncoder)
-                        if request_context
-                        else None,
-                    )
-                    return log_id
-                raise
 
     async def log_event(
         self,
@@ -462,10 +199,9 @@ class LogService(ProtocolPlugin[Any], LogsProtocol):
         message: Optional[str] = None,
         collection_id: Optional[str] = None,
         details: Optional[Dict[str, Any]] = None,
-        db_resource: Optional[DbResource] = None,
         immediate: bool = False,
         is_system: bool = False,
-    ) -> Optional[int]:
+    ) -> Optional[str]:
         """
         Main entry point for logging events.
 
@@ -475,15 +211,24 @@ class LogService(ProtocolPlugin[Any], LogsProtocol):
             level: Log level (INFO, WARNING, ERROR).
             message: Human-readable message.
             collection_id: Optional collection ID if event is collection-scoped.
-            details: Optional structured details dictionary. Can include 'stacktrace' and 'request_context'.
-            db_resource: Optional database connection. If provided, writes immediately (bypasses buffer).
-            immediate: If True and not under load, flush immediately. Otherwise, buffer for batch write.
+            details: Optional structured details dictionary.
+            immediate: If True, dispatch to the backend now instead of
+                waiting for the buffer's threshold/timer flush. Use for
+                sparse, high-value events (lifecycle transitions) whose row
+                would otherwise be lost when a Cloud Run instance scales to
+                zero before the timer fires; do not use on a hot path.
+            is_system: Whether this is a system-level log.
 
         Returns:
-            Log ID if db_resource is provided and write succeeds, None otherwise.
+            The entry's backend id when ``immediate=True`` and a backend is
+            available (so a caller can build a deep link to the exact row),
+            ``None`` otherwise — a buffered write's id is not known until a
+            later flush, so it is never returned (matches pre-#2749 behavior,
+            which only ever returned an id for a synchronous write).
         """
-        if not self._engine and not db_resource:
-            # Fallback to standard logging if no DB available
+        if not self._backend_available():
+            # No backend registered (optional-module posture, #2749) —
+            # fall back to the stdlib logger so the event is not silently lost.
             safe_msg = f"[LogService] {level} | {catalog_id} | {event_type}: {message}"
             if level.upper() == "ERROR":
                 logger.error(safe_msg)
@@ -501,6 +246,8 @@ class LogService(ProtocolPlugin[Any], LogsProtocol):
             if isinstance(details["request_context"], dict):
                 details["request_context"].setdefault("correlation_id", cid)
 
+        now = datetime.now(timezone.utc)
+        entry_id = f"{catalog_id}:{event_type}:{now.isoformat()}" if immediate else None
         entry = LogEntryCreate(
             catalog_id=catalog_id,
             collection_id=collection_id,
@@ -509,14 +256,13 @@ class LogService(ProtocolPlugin[Any], LogsProtocol):
             message=message,
             details=details,
             is_system=is_system,
+            timestamp=now,
+            id=entry_id,
         )
 
-        # If db_resource is provided, write immediately (transactional guarantee) and return ID
-        if db_resource or immediate:
-            conn = db_resource or self._engine
-            if conn is None:
-                return None
-            return await self._write_log_entry(conn, entry)
+        if immediate:
+            await self._dispatch_to_backends([entry])
+            return entry_id
 
         aggregator = self._aggregator
         if aggregator is None:
@@ -577,56 +323,29 @@ class LogService(ProtocolPlugin[Any], LogsProtocol):
         await self.stop()
 
     async def get_log_by_id(
-        self, log_id: int, catalog_id: str, db_resource: Optional[DbResource] = None
+        self, log_id: str, catalog_id: str
     ) -> Optional[Dict[str, Any]]:
         """
-        Retrieve a specific log entry by ID.
-
-        Args:
-            log_id: The log entry ID
-            catalog_id: The catalog code (or "_system_")
-            db_resource: Optional database connection
-
-        Returns:
-            Log entry as dict, or None if not found
+        Retrieve a specific log entry by its backend-assigned id (#2749:
+        Elasticsearch-backed). Returns ``None`` when no backend is
+        registered, the entry does not exist, or it belongs to a different
+        catalog than requested (unless the caller asked for the
+        platform-wide ``_system_`` stream).
         """
-        # Determine schema and table
-        catalogs = get_protocol(CatalogsProtocol)
-        if catalog_id == SYSTEM_CATALOG_ID or catalog_id == "_system_" or not catalogs:
-            phys_schema = "catalog"
-            table_name = SYSTEM_LOGS_TABLE
-        else:
-            if db_resource:
-                phys_schema = await catalogs.resolve_physical_schema(
-                    catalog_id, ctx=DriverContext(db_resource=db_resource)
-                )
-            else:
-                async with managed_transaction(self._engine) as conn:
-                    phys_schema = await catalogs.resolve_physical_schema(
-                        catalog_id, ctx=DriverContext(db_resource=conn)
-                    )
-            table_name = "logs"
-
-        if not phys_schema:
+        backend = get_protocol(self._get_backend_protocol())
+        if not backend:
+            return None
+        backend = backend[0] if isinstance(backend, list) else backend
+        get_log = getattr(backend, "get_log", None)
+        if get_log is None:
             return None
 
-        # Query log entry
-        async def _query(conn):
-            return await DQLQuery(
-                """
-                SELECT id, timestamp, catalog_id, collection_id, event_type, level, message, details, stacktrace, request_context
-                FROM {schema}.{table}
-                WHERE id = :log_id
-                LIMIT 1;
-                """,
-                result_handler=ResultHandler.ONE_DICT,
-            ).execute(conn, schema=phys_schema, table=table_name, log_id=log_id)
-
-        if db_resource:
-            return await _query(db_resource)
-        else:
-            async with managed_transaction(self._engine) as conn:
-                return await _query(conn)
+        entry = await get_log(log_id)
+        if entry is None:
+            return None
+        if catalog_id != SYSTEM_CATALOG_ID and entry.get("catalog_id") != catalog_id:
+            return None
+        return entry
 
     async def list_logs(
         self,
@@ -636,79 +355,40 @@ class LogService(ProtocolPlugin[Any], LogsProtocol):
         event_type: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
-        db_resource: Optional[DbResource] = None,
     ) -> List[Dict[str, Any]]:
         """
-        List log entries with filtering and pagination.
+        List log entries with filtering and pagination (#2749:
+        Elasticsearch-backed). Returns ``[]`` when no backend is registered.
 
-        Args:
-            catalog_id: The catalog code (or "_system_")
-            collection_id: Optional collection filter
-            level: Optional level filter (ERROR, WARNING, INFO)
-            event_type: Optional event type filter
-            limit: Maximum number of results (default 50, max 1000)
-            offset: Pagination offset
-            db_resource: Optional database connection
+        ``catalog_id == SYSTEM_CATALOG_ID`` ("_system_") returns the
+        platform-wide ``is_system`` stream with no catalog filter; any other
+        value filters by that ``catalog_id`` regardless of ``is_system`` —
+        matching the pre-#2749 behavior of UNIONing system-tagged and
+        tenant-tagged rows for a given catalog.
 
-        Returns:
-            List of log entries as dicts
+        Reads consult a single backend (the first one discovered); unlike
+        writes, results are not fanned out across multiple backends.
         """
-        # Determine schema and table
-        catalogs = get_protocol(CatalogsProtocol)
-        if catalog_id == "_system_" or not catalogs:
-            phys_schema = "catalog"
-            table_name = SYSTEM_LOGS_TABLE
-        else:
-            if db_resource:
-                phys_schema = await catalogs.resolve_physical_schema(
-                    catalog_id, ctx=DriverContext(db_resource=db_resource)
-                )
-            else:
-                async with managed_transaction(self._engine) as conn:
-                    phys_schema = await catalogs.resolve_physical_schema(
-                        catalog_id, ctx=DriverContext(db_resource=conn)
-                    )
-            table_name = "logs"
-
-        if not phys_schema:
+        backend = get_protocol(self._get_backend_protocol())
+        if not backend:
+            return []
+        backend = backend[0] if isinstance(backend, list) else backend
+        search_logs = getattr(backend, "search_logs", None)
+        if search_logs is None:
             return []
 
-        # Build WHERE clause
-        where_clauses = ["catalog_id = :catalog_id"]
-        params = {"catalog_id": catalog_id, "limit": limit, "offset": offset}
+        is_system = True if catalog_id == SYSTEM_CATALOG_ID else None
+        filter_catalog_id = None if catalog_id == SYSTEM_CATALOG_ID else catalog_id
 
-        if collection_id:
-            where_clauses.append("collection_id = :collection_id")
-            params["collection_id"] = collection_id
-
-        if level:
-            where_clauses.append("level = :level")
-            params["level"] = level.upper()
-
-        if event_type:
-            where_clauses.append("event_type = :event_type")
-            params["event_type"] = event_type
-
-        where_clause = " AND ".join(where_clauses)
-
-        # Query logs
-        async def _query(conn):
-            return await DQLQuery(
-                f"""
-                SELECT id, timestamp, catalog_id, collection_id, event_type, level, message, details, stacktrace, request_context
-                FROM {{schema}}.{{table}}
-                WHERE {where_clause}
-                ORDER BY timestamp DESC
-                LIMIT :limit OFFSET :offset;
-                """,
-                result_handler=ResultHandler.ALL_DICTS,
-            ).execute(conn, schema=phys_schema, table=table_name, **params)
-
-        if db_resource:
-            return await _query(db_resource)
-        else:
-            async with managed_transaction(self._engine) as conn:
-                return await _query(conn)
+        return await search_logs(
+            catalog_id=filter_catalog_id,
+            collection_id=collection_id,
+            event_type=event_type,
+            level=level,
+            is_system=is_system,
+            limit=limit,
+            offset=offset,
+        )
 
 
 # Global instance
@@ -724,16 +404,12 @@ async def log_event(
     message: Optional[str] = None,
     collection_id: Optional[str] = None,
     details: Optional[Dict[str, Any]] = None,
-    db_resource: Optional[DbResource] = None,
     immediate: bool = False,
     is_system: bool = False,
-) -> Optional[int]:
+) -> Optional[str]:
     """
     Main entry point for logging events to the Catalog Log Service.
     Fails safely (logs to stdout) if service is not initialized.
-
-    Returns:
-        Log ID if db_resource is provided and write succeeds, None otherwise.
     """
     service = get_protocol(LogsProtocol)
     if not service:
@@ -748,7 +424,6 @@ async def log_event(
         message=message,
         collection_id=collection_id,
         details=details,
-        db_resource=db_resource,
         immediate=immediate,
         is_system=is_system,
     )

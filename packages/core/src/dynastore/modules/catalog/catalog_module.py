@@ -82,7 +82,7 @@ from dynastore.modules.catalog.event_service import (
     register_event_listener,
     emit_event,
 )
-from dynastore.modules.catalog.log_manager import LogService, initialize_system_logs
+from dynastore.modules.catalog.log_manager import LogService
 
 logger = logging.getLogger(__name__)
 
@@ -554,8 +554,8 @@ class CatalogModule(ModuleProtocol):
             async with managed_transaction(engine) as conn:
                 await ensure_schema_exists(conn, "catalog")
 
-                # Centralized system-level maintenance initialization
-                await initialize_system_logs(conn)
+                # System-level logs table removed (#2749) — logs are
+                # Elasticsearch-only now; no PG DDL for them anywhere.
 
                 await DDLQuery(
                     CATALOGS_TABLE_DDL + SHARED_PROPERTIES_SCHEMA

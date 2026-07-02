@@ -20,8 +20,9 @@
 
 Drives deadline-insensitive periodic jobs off ``tasks.maintenance_schedule``
 (jobs 4–12 from the #1911 spec), replacing ALL pg_cron registrations:
-events DLQ/reaper/alert, tenant-logs prune, system-logs prune, IAM prune,
-and the three task-queue jobs (stuck-task reaper, partition-create, retention).
+events DLQ/reaper/alert, IAM prune, and the three task-queue jobs (stuck-task
+reaper, partition-create, retention). Tenant-logs / system-logs prune were
+retired with PG log persistence (#2749) — logs are Elasticsearch-only now.
 
 Architecture contract
 ---------------------
@@ -138,8 +139,6 @@ _SUPERVISOR_ADVISORY_LOCK_KEY = 0x4D41494E_54454E41  # "MAINTENA" in ASCII hex
 # Job names — must match the strings passed to repo.upsert_job at startup.
 # ---------------------------------------------------------------------------
 
-JOB_TENANT_LOGS_PRUNE = "tenant_logs_prune"
-JOB_SYSTEM_LOGS_PRUNE = "system_logs_prune"
 JOB_IAM_PRUNE = "iam_prune"
 JOB_TASK_REAPER = "task_reaper"
 JOB_TASK_PARTITION_CREATE = "task_partition_create"
@@ -167,6 +166,12 @@ _OBSOLETE_SCHEDULE_JOBS = (
     "events_dlq_prune",
     "events_stuck_reaper",
     "events_pending_alert",
+    # PG log persistence removed entirely (#2749) — logs are
+    # Elasticsearch-only now, so these prune jobs no longer exist to
+    # dispatch. Pruned here so an already-deployed schedule row does not
+    # make get_due_jobs surface an unknown job_name forever.
+    "tenant_logs_prune",
+    "system_logs_prune",
 )
 
 # pg_cron job names this supervisor supersedes. On a non-fresh deploy these may
@@ -188,8 +193,6 @@ _SUPERSEDED_TENANT_LOG_PREFIX = "monthly_cleanup_logs_"
 _SUPERSEDED_TASK_REAPER_PREFIX = "dynastore-task-reaper-"
 
 # Cadences (seconds)
-_CADENCE_TENANT_LOGS = 2592000    # monthly (30 days)
-_CADENCE_SYSTEM_LOGS = 2592000    # monthly (30 days)
 _CADENCE_IAM_PRUNE = 86400        # daily
 _CADENCE_TASK_REAPER = 60         # every minute (matches old "* * * * *")
 _CADENCE_TASK_PARTITION_CREATE = 86400   # daily (idempotent CREATE IF NOT EXISTS)
@@ -215,8 +218,8 @@ _STALE_AFTER_SECONDS = 600  # 10 minutes (5× the 60 s task_reaper cadence)
 _JOB_STATEMENT_TIMEOUT_MS = 60_000  # 60 seconds
 
 # Total wall-clock cap for a single dispatched job.  Covers jobs that loop
-# internally (e.g. _run_tenant_logs_prune across thousands of schemas) or
-# stall waiting for IO.  Chosen as 15× the longest per-statement timeout so
+# internally across many schemas or stall waiting for IO.  Chosen as 15× the
+# longest per-statement timeout so
 # a legitimate slow run across many schemas still completes; an actual hung
 # job is cancelled well before it wedges the supervisor for a full cycle.
 JOB_DISPATCH_TIMEOUT_SECONDS = 900  # 15 minutes
@@ -268,58 +271,6 @@ async def _bounded_batch_delete(
 # ---------------------------------------------------------------------------
 # Individual job implementations
 # ---------------------------------------------------------------------------
-
-
-async def _list_active_catalog_schemas(conn: Any) -> list[str]:
-    """Return schema names (= catalog id) for all non-deleted catalogs."""
-    rows = await DQLQuery(
-        "SELECT id FROM catalog.catalogs WHERE deleted_at IS NULL ORDER BY id",
-        result_handler=ResultHandler.ALL,
-    ).execute(conn)
-    return [r[0] for r in rows] if rows else []
-
-
-async def _run_tenant_logs_prune(conn: Any) -> int:
-    """Delete tenant log rows older than 1 year across all active catalogs.
-
-    Each schema is pruned in an independent try/except so a concurrently
-    dropped catalog schema does not abort the remaining schemas.  A WARNING
-    is emitted per failed schema so operators can investigate; the loop
-    always continues to the next schema.
-    """
-    schemas = await _list_active_catalog_schemas(conn)
-    total = 0
-    for schema in schemas:
-        # Schema name is an identifier, not a value; interpolate directly.
-        sql = (
-            f'DELETE FROM "{schema}".logs '
-            f'WHERE ctid IN ('
-            f'  SELECT ctid FROM "{schema}".logs '
-            f'  WHERE "timestamp" < NOW() - INTERVAL \'1 year\' '
-            f'  LIMIT :batch_size'
-            f')'
-        )
-        try:
-            total += await _bounded_batch_delete(conn, sql)
-        except Exception as exc:
-            logger.warning(
-                "maintenance_supervisor: tenant_logs_prune skipping schema %r: %s",
-                schema, exc,
-            )
-    return total
-
-
-async def _run_system_logs_prune(conn: Any) -> int:
-    """Delete system_logs rows older than 1 year."""
-    sql = (
-        'DELETE FROM "catalog"."system_logs" '
-        'WHERE ctid IN ('
-        '  SELECT ctid FROM "catalog"."system_logs" '
-        '  WHERE "timestamp" < NOW() - INTERVAL \'1 year\' '
-        '  LIMIT :batch_size'
-        ')'
-    )
-    return await _bounded_batch_delete(conn, sql)
 
 
 async def _run_iam_prune(conn: Any) -> int:
@@ -797,10 +748,6 @@ async def _dispatch_job(job_name: str, conn: Any, config: dict[str, Any]) -> int
     Returns the number of rows affected (0 if not applicable).
     Raises on unexpected errors so the caller can record status='error'.
     """
-    if job_name == JOB_TENANT_LOGS_PRUNE:
-        return await _run_tenant_logs_prune(conn)
-    if job_name == JOB_SYSTEM_LOGS_PRUNE:
-        return await _run_system_logs_prune(conn)
     if job_name == JOB_IAM_PRUNE:
         return await _run_iam_prune(conn)
     if job_name == JOB_TASK_REAPER:
@@ -1043,8 +990,6 @@ async def register_supervisor_jobs(engine: Any) -> None:
     """
     repo = MaintenanceScheduleRepository()
     jobs = [
-        (JOB_TENANT_LOGS_PRUNE, _CADENCE_TENANT_LOGS),
-        (JOB_SYSTEM_LOGS_PRUNE, _CADENCE_SYSTEM_LOGS),
         (JOB_IAM_PRUNE, _CADENCE_IAM_PRUNE),
         (JOB_TASK_REAPER, _CADENCE_TASK_REAPER),
         (JOB_TASK_PARTITION_CREATE, _CADENCE_TASK_PARTITION_CREATE),

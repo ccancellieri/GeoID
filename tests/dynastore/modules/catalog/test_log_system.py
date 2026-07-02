@@ -16,11 +16,17 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
+"""#2749: log persistence is Elasticsearch-only now — no PG table, no PG
+partition. This module does not enable the ``elasticsearch`` module, so
+these tests exercise the degradation posture (same optional-module
+contract as IAM): writes fall back to the stdlib logger, reads return an
+empty result, and nothing raises. A live Elasticsearch write/read round
+trip belongs in ``tests/dynastore/modules/elasticsearch/integration/``.
+"""
+
 import pytest
 from dynastore.modules.catalog.log_manager import LogsProtocol
 from dynastore.tools.discovery import get_protocol
-from dynastore.modules.db_config.query_executor import managed_transaction, DQLQuery, ResultHandler
-from dynastore.tools.protocol_helpers import get_engine
 
 pytestmark = [
     pytest.mark.asyncio,
@@ -28,38 +34,43 @@ pytestmark = [
 ]
 
 
-async def test_system_logs_creation(app_lifespan_module):
-    """Verifies that the system_logs table is created and can be queried."""
-    engine = get_engine(app_lifespan_module)
-    assert engine is not None
-
-    async with managed_transaction(engine) as conn:
-        res = await DQLQuery(
-            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = 'catalog' AND table_name = 'system_logs')",
-            result_handler=ResultHandler.SCALAR
-        ).execute(conn)
-        assert res is True
-
-async def test_log_event_system(app_lifespan_module):
-    """Verifies that logging to _system_ works correctly."""
+async def test_log_event_without_backend_degrades_to_stdlib(caplog, app_lifespan_module):
+    """No LogBackendProtocol is registered in this module set — log_event
+    must fall back to the stdlib logger instead of raising, and must not
+    return a fabricated id."""
     logs_service = get_protocol(LogsProtocol)
     assert logs_service is not None
 
-    await logs_service.log_event(
-        catalog_id="_system_",
-        event_type="test_event",
-        level="INFO",
-        message="Verification test message",
-        immediate=True
-    )
+    import logging
 
-    await logs_service.flush()
+    with caplog.at_level(logging.INFO, logger="dynastore.modules.catalog.log_manager"):
+        result = await logs_service.log_event(
+            catalog_id="_system_",
+            event_type="test_event",
+            level="INFO",
+            message="Verification test message",
+            immediate=True,
+        )
 
-    engine = get_engine(app_lifespan_module)
-    async with managed_transaction(engine) as conn:
-        logs = await DQLQuery(
-            "SELECT message FROM catalog.system_logs WHERE event_type = 'test_event' ORDER BY timestamp DESC LIMIT 1",
-            result_handler=ResultHandler.ALL_SCALARS
-        ).execute(conn)
-        assert len(logs) > 0
-        assert logs[0] == "Verification test message"
+    assert result is None
+    assert any(
+        "Verification test message" in r.message for r in caplog.records
+    ), "log_event must fall back to the stdlib logger when no backend is registered"
+
+
+async def test_list_logs_without_backend_returns_empty(app_lifespan_module):
+    """No backend registered -> list_logs degrades to [] rather than raising."""
+    logs_service = get_protocol(LogsProtocol)
+    assert logs_service is not None
+
+    results = await logs_service.list_logs(catalog_id="_system_")
+    assert results == []
+
+
+async def test_get_log_by_id_without_backend_returns_none(app_lifespan_module):
+    """No backend registered -> get_log_by_id degrades to None rather than raising."""
+    logs_service = get_protocol(LogsProtocol)
+    assert logs_service is not None
+
+    result = await logs_service.get_log_by_id("does-not-exist", catalog_id="_system_")
+    assert result is None

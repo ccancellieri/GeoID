@@ -854,7 +854,6 @@ def get_log_index_name(prefix: str) -> str:
 LOG_MAPPING: Dict[str, Any] = {
     "dynamic": False,
     "properties": {
-        "id": {"type": "keyword"},
         "catalog_id": {"type": "keyword"},
         "collection_id": {"type": "keyword"},
         "event_type": {"type": "keyword"},
@@ -863,4 +862,15 @@ LOG_MAPPING: Dict[str, Any] = {
         "message": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
         "timestamp": {"type": "date"},
     },
+}
+
+# Logs are a low-value, high-volume stream — they must not cost item-
+# indexing capacity. No replicas (losing a log on node loss is acceptable),
+# a relaxed refresh interval (search freshness isn't latency-critical here),
+# and async translog durability (bounded data loss on a hard crash, in
+# exchange for not fsync-ing every bulk request).
+LOG_INDEX_SETTINGS: Dict[str, Any] = {
+    "number_of_replicas": 0,
+    "refresh_interval": "30s",
+    "translog.durability": "async",
 }
