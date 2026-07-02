@@ -372,11 +372,23 @@ class DuckdbEngineConfig(EngineConfig):
     ``pool_size`` is the SSOT for ``ItemsDuckdbDriver``'s bounded
     connection pool (a ``queue.Queue`` of pre-warmed ``duckdb.connect()``
     in-process wires, see ``drivers/duckdb.py``).  The driver reads it from
-    the central cached config getter once, at its ``lifespan()`` startup —
-    it used to be the env var ``DUCKDB_POOL_SIZE`` (also fixed at process
-    boot); moved here so operators change it via the configs API instead of
-    a redeploy, though a change still only takes effect on the next pod
-    restart (the queue is sized once and never resized in place).
+    the central cached config getter at its ``lifespan()`` startup, and
+    from then on re-checks it live on a throttled cadence (at most once
+    every 30s, see ``_maybe_resize_pool`` in ``drivers/duckdb.py``) at the
+    driver's async choke point every read/write/delete/ensure_storage path
+    already passes through. A raise grows the pool immediately; a lower
+    value shrinks it lazily — surplus connections are only retired as they
+    are returned, never yanked out from under a caller — so a config change
+    takes effect within roughly one throttle window, not on the next pod
+    restart. It used to be the env var ``DUCKDB_POOL_SIZE`` (fixed at
+    process boot); moved here so operators change it via the configs API.
+
+    An optional scaling actuator (``ScalingPolicyConfig.duckdb_pool_autosize``,
+    default off — see ``modules/scaling/config.py``) may also bump this
+    value itself: when the reconciler sees the pool saturated but the fleet
+    compute-idle (the same condition that otherwise just holds
+    ``min_instances``), it writes a bounded, cooled-down step up to this
+    field at platform scope instead.
 
     Each pooled connection is a genuine in-memory DuckDB process with its
     own thread/memory budget (``threads``, ``max_memory_gb``) — but it
@@ -401,10 +413,16 @@ class DuckdbEngineConfig(EngineConfig):
         le=64,
         description=(
             "Number of DuckDB connections in the pool.  Tune to available "
-            "cores × workload concurrency.  Read once at driver startup — "
-            "takes effect on next pod restart, not live.  CPU/memory-bound "
-            "only — does not consume PostgreSQL connections, so it is NOT "
-            "part of ``ScalingPolicyConfig``'s connection budget."
+            "cores × workload concurrency.  Read at driver startup and "
+            "re-checked live thereafter on a throttled cadence (at most "
+            "every 30s) — grows immediately, shrinks lazily as borrowed "
+            "connections are returned, so a change takes effect within "
+            "roughly one throttle window, not on the next pod restart.  "
+            "May also be bumped by the optional scaling actuator "
+            "(``ScalingPolicyConfig.duckdb_pool_autosize``, default off).  "
+            "CPU/memory-bound only — does not consume PostgreSQL "
+            "connections, so it is NOT part of ``ScalingPolicyConfig``'s "
+            "connection budget."
         ),
     )
 

@@ -32,13 +32,15 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Optional, Union
+from typing import Optional, Sequence, Union
 
 from dynastore.models.protocols.configs import ConfigsProtocol
+from dynastore.models.scaling import ScalingSignal
 from dynastore.models.protocols.platform_scaling import PlatformScalingProtocol
 from dynastore.modules.scaling.aggregator import (
     collect_live_signals,
     compute_desired_min,
+    compute_duckdb_pool_bump,
     extract_global_metric,
     read_signals_document,
 )
@@ -67,6 +69,7 @@ class GcpScalingReconciler(PeriodicService):
         self._platform = platform
         self._configs = configs
         self._last_change_ts: float = 0.0
+        self._last_pool_change_ts: float = 0.0
 
     async def _load_policy(self) -> ScalingPolicyConfig:
         configs = self._configs or get_protocol(ConfigsProtocol)
@@ -147,3 +150,102 @@ class GcpScalingReconciler(PeriodicService):
                 "GcpScalingReconciler: min_instances %d -> %d (signals=%d).",
                 current, desired, len(signals),
             )
+
+        await self._maybe_bump_duckdb_pool(policy, signals, now)
+
+    async def _maybe_bump_duckdb_pool(
+        self,
+        policy: ScalingPolicyConfig,
+        signals: Sequence[ScalingSignal],
+        now: float,
+    ) -> None:
+        """Actuate the DuckDB pool-autosize decision, if one is due this tick.
+
+        Off by default (``policy.duckdb_pool_autosize``). The actuation
+        itself is a single config write: the leader reads the current
+        platform-scope ``DuckdbEngineConfig``, bumps ``pool_size`` per
+        ``compute_duckdb_pool_bump``, and writes it back. Every instance
+        picks the change up via the existing hot-reload path — that write
+        IS the fan-out, no extra plumbing needed. Fail-soft: a read/write
+        error costs one tick, mirroring the rest of this reconciler.
+
+        Read-modify-write note: ``ConfigsProtocol`` exposes no
+        compare-and-set primitive today, so a concurrent operator edit
+        (e.g. to ``threads``, a field this actuator never touches) landing
+        between our read and our write would otherwise be silently
+        reverted by ``model_copy(update=...)``. Mitigated by re-reading and
+        recomputing the bump immediately before the write (see below) — a
+        residual race window remains between that re-read and the
+        ``set_config`` call, which only a real CAS primitive would close
+        (tracked as a follow-up, not built here).
+        """
+        if not policy.duckdb_pool_autosize:
+            return
+
+        configs = self._configs or get_protocol(ConfigsProtocol)
+        if configs is None:
+            return
+
+        from dynastore.modules.db_config.engine_config import DuckdbEngineConfig
+
+        try:
+            current_cfg = await configs.get_config(DuckdbEngineConfig)
+        except Exception:
+            logger.debug(
+                "GcpScalingReconciler: DuckdbEngineConfig read failed — "
+                "skipping pool-autosize this tick.",
+                exc_info=True,
+            )
+            return
+
+        # First pass: is a bump due at all? Cheap early-exit so a quiet tick
+        # (flag off already returned above; here: not saturated, CPU not
+        # idle, at the cap, or cooling down) never pays for the re-read below.
+        if compute_duckdb_pool_bump(
+            signals, policy,
+            current_pool_size=current_cfg.pool_size,
+            last_pool_change_ts=self._last_pool_change_ts,
+            now=now,
+        ) is None:
+            return
+
+        # Re-read immediately before the write and recompute the bump from
+        # THIS fresh copy — narrows the read-modify-write window to just the
+        # gap between this read and the write call below, and ensures the
+        # update is layered on whatever pool_size (and every other field)
+        # actually holds right now, not the possibly-stale first read.
+        try:
+            fresh_cfg = await configs.get_config(DuckdbEngineConfig)
+        except Exception:
+            logger.debug(
+                "GcpScalingReconciler: DuckdbEngineConfig re-read before "
+                "pool-autosize write failed — skipping this tick.",
+                exc_info=True,
+            )
+            return
+
+        new_size = compute_duckdb_pool_bump(
+            signals, policy,
+            current_pool_size=fresh_cfg.pool_size,
+            last_pool_change_ts=self._last_pool_change_ts,
+            now=now,
+        )
+        if new_size is None:
+            return
+
+        updated_cfg = fresh_cfg.model_copy(update={"pool_size": new_size})
+        try:
+            await configs.set_config(DuckdbEngineConfig, updated_cfg)
+        except Exception:
+            logger.error(
+                "GcpScalingReconciler: failed to write DuckdbEngineConfig.pool_size bump",
+                exc_info=True,
+            )
+            return
+
+        self._last_pool_change_ts = now
+        logger.info(
+            "GcpScalingReconciler: duckdb pool_size %d -> %d "
+            "(pool saturated, CPU idle — deepening pool instead of instance count).",
+            fresh_cfg.pool_size, new_size,
+        )

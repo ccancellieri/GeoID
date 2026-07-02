@@ -16,6 +16,10 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
+import asyncio
+import contextlib
+import time
+
 import pytest
 from unittest.mock import AsyncMock, patch
 
@@ -486,15 +490,21 @@ class TestDuckDBPoolSizeConfig:
             duckdb_mod._pool_initialized,
             duckdb_mod._pool_size,
             duckdb_mod._pool,
+            duckdb_mod._pool_target_size,
+            duckdb_mod._last_resize_check,
         )
         duckdb_mod._pool_initialized = False
         duckdb_mod._pool_size = 0
         duckdb_mod._pool = duckdb_mod.queue.Queue()
+        duckdb_mod._pool_target_size = 0
+        duckdb_mod._last_resize_check = 0.0
         yield
         (
             duckdb_mod._pool_initialized,
             duckdb_mod._pool_size,
             duckdb_mod._pool,
+            duckdb_mod._pool_target_size,
+            duckdb_mod._last_resize_check,
         ) = saved
 
     async def test_read_live_pool_size_falls_back_when_no_config_service(self):
@@ -571,3 +581,231 @@ class TestDuckDBPoolSizeConfig:
         from dynastore.modules.storage.driver_config import DuckDBConfig
 
         assert not hasattr(DuckDBConfig, "pool_size")
+
+
+class TestDuckDBPoolRuntimeResize:
+    """Runtime-adjustable pool depth (#2333 follow-up): the pool re-checks
+    ``DuckdbEngineConfig.pool_size`` live, growing immediately and shrinking
+    lazily (never yanking a borrowed connection)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_pool_globals(self):
+        import dynastore.modules.storage.drivers.duckdb as duckdb_mod
+
+        saved = (
+            duckdb_mod._pool_initialized,
+            duckdb_mod._pool_size,
+            duckdb_mod._pool,
+            duckdb_mod._pool_target_size,
+            duckdb_mod._last_resize_check,
+        )
+        duckdb_mod._pool_initialized = False
+        duckdb_mod._pool_size = 0
+        duckdb_mod._pool = duckdb_mod.queue.Queue()
+        duckdb_mod._pool_target_size = 0
+        duckdb_mod._last_resize_check = 0.0
+        yield
+        (
+            duckdb_mod._pool_initialized,
+            duckdb_mod._pool_size,
+            duckdb_mod._pool,
+            duckdb_mod._pool_target_size,
+            duckdb_mod._last_resize_check,
+        ) = saved
+
+    @staticmethod
+    def _fake_conn():
+        """A cheap stand-in with a ``close()`` the tests can assert on."""
+        conn = AsyncMock(name="duckdb_conn")
+        conn.close = lambda: None
+        return conn
+
+    def test_apply_pool_resize_grows_immediately(self):
+        from dynastore.modules.storage.drivers.duckdb import (
+            _apply_pool_resize, _init_pool, get_pool_saturation,
+        )
+        import dynastore.modules.storage.drivers.duckdb as duckdb_mod
+
+        with patch.object(duckdb_mod, "_create_connection", side_effect=self._fake_conn):
+            _init_pool(size=4)
+            _apply_pool_resize(8)
+
+        assert duckdb_mod._pool_size == 8
+        assert duckdb_mod._pool_target_size == 8
+        assert duckdb_mod._pool.qsize() == 8
+        # New denominator: saturation is computed against the grown size.
+        duckdb_mod._pool.get_nowait()
+        assert get_pool_saturation() == pytest.approx(1 / 8)
+
+    def test_apply_pool_resize_shrink_is_a_no_op_until_conns_are_returned(self):
+        """Shrinking only lowers the target — no connection is closed until
+        ``_borrow_conn`` retires one on return."""
+        from dynastore.modules.storage.drivers.duckdb import _apply_pool_resize, _init_pool
+        import dynastore.modules.storage.drivers.duckdb as duckdb_mod
+
+        with patch.object(duckdb_mod, "_create_connection", side_effect=self._fake_conn):
+            _init_pool(size=8)
+            _apply_pool_resize(4)
+
+        assert duckdb_mod._pool_target_size == 4
+        assert duckdb_mod._pool_size == 8  # unchanged — nothing retired yet
+        assert duckdb_mod._pool.qsize() == 8  # all 8 still queued, none closed
+
+    def test_borrow_conn_retires_surplus_on_return_without_breaking_borrower(self):
+        """A shrink in progress must never touch a connection currently
+        borrowed — only the returned one is retired, and the caller's
+        ``with`` block completes normally either way."""
+        from dynastore.modules.storage.drivers.duckdb import (
+            _apply_pool_resize, _borrow_conn, _init_pool,
+        )
+        import dynastore.modules.storage.drivers.duckdb as duckdb_mod
+
+        closed: list = []
+
+        def _make_conn():
+            conn = AsyncMock(name="duckdb_conn")
+            conn.close = lambda c=conn: closed.append(c)
+            return conn
+
+        with patch.object(duckdb_mod, "_create_connection", side_effect=_make_conn):
+            _init_pool(size=4)
+            _apply_pool_resize(2)  # target now 2, still 4 live connections
+
+            # Borrow one connection while the shrink is pending — this must
+            # succeed and hand back a live connection, not raise.
+            with _borrow_conn() as conn:
+                assert conn is not None
+                # Nothing retired yet — the borrowed conn is still in flight.
+                assert duckdb_mod._pool_size == 4
+            # On return, the surplus is retired (pool_size drops toward target).
+            assert duckdb_mod._pool_size == 3
+            assert len(closed) == 1
+
+            # Borrow/return again — retires the next surplus connection.
+            with _borrow_conn():
+                pass
+            assert duckdb_mod._pool_size == 2
+            assert len(closed) == 2
+
+            # At target: further borrow/return no longer retires anything.
+            with _borrow_conn():
+                pass
+            assert duckdb_mod._pool_size == 2
+            assert len(closed) == 2
+
+    async def test_maybe_resize_pool_grows_from_live_config(self):
+        from dynastore.modules.db_config.engine_config import DuckdbEngineConfig
+        from dynastore.modules.storage.drivers.duckdb import _init_pool, _maybe_resize_pool
+        import dynastore.modules.storage.drivers.duckdb as duckdb_mod
+
+        fake_svc = AsyncMock()
+        fake_svc.get_config.return_value = DuckdbEngineConfig(pool_size=6)
+
+        with patch.object(duckdb_mod, "_create_connection", side_effect=self._fake_conn):
+            _init_pool(size=3)
+            with patch(
+                "dynastore.tools.discovery.get_protocol", return_value=fake_svc,
+            ):
+                await _maybe_resize_pool()
+
+        assert duckdb_mod._pool_size == 6
+        assert duckdb_mod._pool_target_size == 6
+
+    async def test_maybe_resize_pool_is_throttled_and_does_not_hammer_config(self):
+        """A burst of calls inside ``_RESIZE_CHECK_INTERVAL_SECONDS`` must
+        only trigger a single live config read."""
+        from dynastore.modules.db_config.engine_config import DuckdbEngineConfig
+        from dynastore.modules.storage.drivers.duckdb import _init_pool, _maybe_resize_pool
+        import dynastore.modules.storage.drivers.duckdb as duckdb_mod
+
+        fake_svc = AsyncMock()
+        fake_svc.get_config.return_value = DuckdbEngineConfig(pool_size=6)
+
+        with patch.object(duckdb_mod, "_create_connection", side_effect=self._fake_conn):
+            _init_pool(size=3)
+            with patch(
+                "dynastore.tools.discovery.get_protocol", return_value=fake_svc,
+            ):
+                await _maybe_resize_pool()
+                await _maybe_resize_pool()
+                await _maybe_resize_pool()
+
+        assert fake_svc.get_config.await_count == 1
+        assert duckdb_mod._pool_size == 6  # the one check that did fire still resized
+
+    async def test_maybe_resize_pool_noop_before_pool_initialized(self):
+        from dynastore.modules.storage.drivers.duckdb import _maybe_resize_pool
+        import dynastore.modules.storage.drivers.duckdb as duckdb_mod
+
+        fake_svc = AsyncMock()
+        with patch(
+            "dynastore.tools.discovery.get_protocol", return_value=fake_svc,
+        ):
+            await _maybe_resize_pool()
+
+        fake_svc.get_config.assert_not_awaited()
+        assert duckdb_mod._pool_size == 0
+
+    async def test_get_location_async_triggers_the_throttled_resize_check(self):
+        """``_get_location_async`` is the single choke point every read/
+        write/delete path passes through before touching the pool — it must
+        drive the resize check."""
+        from dynastore.modules.storage.drivers.duckdb import ItemsDuckdbDriver
+        import dynastore.modules.storage.drivers.duckdb as duckdb_mod
+
+        driver = ItemsDuckdbDriver()
+        with patch.object(
+            duckdb_mod, "_maybe_resize_pool", new_callable=AsyncMock,
+        ) as fake_resize, patch(
+            "dynastore.tools.discovery.get_protocol", return_value=None,
+        ):
+            await driver._get_location_async("cat1", "col1")
+
+        fake_resize.assert_awaited_once()
+
+    async def test_maybe_resize_pool_grow_does_not_block_the_event_loop(self):
+        """Finding-1 regression guard: growing the pool builds connections
+        via real (here: slow) blocking calls. If that ran inline on the
+        event loop, a concurrent coroutine ticking on the same loop would be
+        starved for the whole grow. Offloading it (``run_in_thread``) lets
+        the ticker keep advancing while the grow is in flight."""
+        from dynastore.modules.db_config.engine_config import DuckdbEngineConfig
+        from dynastore.modules.storage.drivers.duckdb import _init_pool, _maybe_resize_pool
+        import dynastore.modules.storage.drivers.duckdb as duckdb_mod
+
+        def _slow_conn():
+            time.sleep(0.05)  # stand-in for duckdb.connect + extension install/load
+            return AsyncMock(name="slow_duckdb_conn")
+
+        # Set up the starting pool (small, fast) before the ticker starts —
+        # this setup cost isn't part of what the test measures.
+        with patch.object(duckdb_mod, "_create_connection", side_effect=_slow_conn):
+            _init_pool(size=2)
+
+        fake_svc = AsyncMock()
+        fake_svc.get_config.return_value = DuckdbEngineConfig(pool_size=10)  # grow by 8
+
+        ticks = {"count": 0}
+
+        async def _tick_loop():
+            while True:
+                ticks["count"] += 1
+                await asyncio.sleep(0.005)
+
+        with patch.object(
+            duckdb_mod, "_create_connection", side_effect=_slow_conn,
+        ), patch(
+            "dynastore.tools.discovery.get_protocol", return_value=fake_svc,
+        ):
+            ticker = asyncio.create_task(_tick_loop())
+            await asyncio.sleep(0)  # let the ticker actually start
+            await _maybe_resize_pool()  # grows 2 -> 10: 8 * 0.05s ~= 0.4s of "blocking" work
+            ticker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await ticker
+
+        assert duckdb_mod._pool_size == 10
+        # Generous margin, no flaky timing assert on an exact count: if the
+        # grow had run inline on the event loop, the ticker would have
+        # accumulated close to zero ticks for the ~0.4s the grow took.
+        assert ticks["count"] >= 15

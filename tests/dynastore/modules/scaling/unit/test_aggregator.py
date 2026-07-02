@@ -26,7 +26,7 @@ docstring directly.
 from __future__ import annotations
 
 from dynastore.models.scaling import ScalingSignal
-from dynastore.modules.scaling.aggregator import compute_desired_min
+from dynastore.modules.scaling.aggregator import compute_desired_min, compute_duckdb_pool_bump
 from dynastore.modules.scaling.config import ScalingPolicyConfig
 
 
@@ -337,3 +337,140 @@ def test_scale_out_clamps_to_effective_max_replicas():
     )
 
     assert result == 5  # effective_max caps at max_replicas since budget (1000) >> 5
+
+
+# ---------------------------------------------------------------------------
+# compute_duckdb_pool_bump — the second actuator for the same hold branch
+# ---------------------------------------------------------------------------
+
+
+def test_duckdb_pool_bump_off_by_default():
+    """``duckdb_pool_autosize`` defaults False — inert even when every other
+    condition for a bump is met."""
+    policy = _policy(scale_out_saturation=0.80, cpu_idle_ceiling=0.30)
+    signals = [_instance_signal(0.95, source="duckdb_pool"), _global_signal(0.1, metric="cpu_utilization")]
+
+    result = compute_duckdb_pool_bump(
+        signals, policy, current_pool_size=8, last_pool_change_ts=0.0, now=1000.0
+    )
+
+    assert result is None
+
+
+def test_duckdb_pool_bump_fires_when_saturated_and_cpu_idle():
+    """Mirrors the same condition ``compute_desired_min`` uses to hold
+    min_instances — but here it actuates the pool depth instead."""
+    policy = _policy(
+        scale_out_saturation=0.80, cpu_idle_ceiling=0.30,
+        duckdb_pool_autosize=True, duckdb_pool_step=2, duckdb_pool_size_max=32,
+    )
+    signals = [_instance_signal(0.95, source="duckdb_pool"), _global_signal(0.1, metric="cpu_utilization")]
+
+    result = compute_duckdb_pool_bump(
+        signals, policy, current_pool_size=8, last_pool_change_ts=0.0, now=1000.0
+    )
+
+    assert result == 10
+
+
+def test_duckdb_pool_bump_ignores_non_duckdb_pool_sources():
+    """A hot PG pool must never deepen the DuckDB pool — only
+    ``source='duckdb_pool'`` instance signals count."""
+    policy = _policy(
+        scale_out_saturation=0.80, cpu_idle_ceiling=0.30, duckdb_pool_autosize=True,
+    )
+    signals = [_instance_signal(0.95, source="pg_pool"), _global_signal(0.1, metric="cpu_utilization")]
+
+    result = compute_duckdb_pool_bump(
+        signals, policy, current_pool_size=8, last_pool_change_ts=0.0, now=1000.0
+    )
+
+    assert result is None
+
+
+def test_duckdb_pool_bump_requires_confirmed_cpu_idle():
+    """Absent (or hot) CPU is NOT the hold branch — the pool-only algorithm
+    already scales instances out in that case, so the pool actuator must
+    stay out of the way."""
+    policy = _policy(
+        scale_out_saturation=0.80, cpu_idle_ceiling=0.30, duckdb_pool_autosize=True,
+    )
+    saturated = _instance_signal(0.95, source="duckdb_pool")
+
+    # No CPU signal at all.
+    assert compute_duckdb_pool_bump(
+        [saturated], policy, current_pool_size=8, last_pool_change_ts=0.0, now=1000.0
+    ) is None
+
+    # CPU confirmed hot, not idle.
+    hot = _global_signal(0.90, metric="cpu_utilization")
+    assert compute_duckdb_pool_bump(
+        [saturated, hot], policy, current_pool_size=8, last_pool_change_ts=0.0, now=1000.0
+    ) is None
+
+
+def test_duckdb_pool_bump_not_saturated_holds():
+    policy = _policy(scale_out_saturation=0.80, cpu_idle_ceiling=0.30, duckdb_pool_autosize=True)
+    signals = [_instance_signal(0.5, source="duckdb_pool"), _global_signal(0.1, metric="cpu_utilization")]
+
+    result = compute_duckdb_pool_bump(
+        signals, policy, current_pool_size=8, last_pool_change_ts=0.0, now=1000.0
+    )
+
+    assert result is None
+
+
+def test_duckdb_pool_bump_respects_max_cap():
+    policy = _policy(
+        scale_out_saturation=0.80, cpu_idle_ceiling=0.30,
+        duckdb_pool_autosize=True, duckdb_pool_size_max=8,
+    )
+    signals = [_instance_signal(0.95, source="duckdb_pool"), _global_signal(0.1, metric="cpu_utilization")]
+
+    result = compute_duckdb_pool_bump(
+        signals, policy, current_pool_size=8, last_pool_change_ts=0.0, now=1000.0
+    )
+
+    assert result is None
+
+
+def test_duckdb_pool_bump_clamps_step_to_max_cap():
+    policy = _policy(
+        scale_out_saturation=0.80, cpu_idle_ceiling=0.30,
+        duckdb_pool_autosize=True, duckdb_pool_step=10, duckdb_pool_size_max=12,
+    )
+    signals = [_instance_signal(0.95, source="duckdb_pool"), _global_signal(0.1, metric="cpu_utilization")]
+
+    result = compute_duckdb_pool_bump(
+        signals, policy, current_pool_size=8, last_pool_change_ts=0.0, now=1000.0
+    )
+
+    assert result == 12
+
+
+def test_duckdb_pool_bump_respects_cooldown():
+    policy = _policy(
+        scale_out_saturation=0.80, cpu_idle_ceiling=0.30,
+        duckdb_pool_autosize=True, duckdb_pool_cooldown_seconds=120,
+    )
+    signals = [_instance_signal(0.95, source="duckdb_pool"), _global_signal(0.1, metric="cpu_utilization")]
+
+    result = compute_duckdb_pool_bump(
+        signals, policy, current_pool_size=8, last_pool_change_ts=950.0, now=1000.0
+    )
+
+    assert result is None
+
+
+def test_duckdb_pool_bump_allowed_once_cooldown_elapses():
+    policy = _policy(
+        scale_out_saturation=0.80, cpu_idle_ceiling=0.30,
+        duckdb_pool_autosize=True, duckdb_pool_step=2, duckdb_pool_cooldown_seconds=120,
+    )
+    signals = [_instance_signal(0.95, source="duckdb_pool"), _global_signal(0.1, metric="cpu_utilization")]
+
+    result = compute_duckdb_pool_bump(
+        signals, policy, current_pool_size=8, last_pool_change_ts=800.0, now=1000.0
+    )
+
+    assert result == 10

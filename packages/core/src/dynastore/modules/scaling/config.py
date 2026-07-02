@@ -314,6 +314,49 @@ class ScalingPolicyConfig(PluginConfig):
         ),
     )
 
+    duckdb_pool_autosize: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "Second actuator for the same 'pool saturated but CPU idle' "
+            "hold branch above (#2333): instead of only holding min_instances, "
+            "deepen the DuckDB driver's connection pool by writing a bounded "
+            "bump to ``DuckdbEngineConfig.pool_size``. The config write "
+            "propagates to every instance via the existing hot-reload path — "
+            "no separate fan-out plumbing. Off by default: only fires when "
+            "the saturated instance-scope pool signal is specifically "
+            "``source='duckdb_pool'`` (see ``DuckDbPoolSignalProvider``), so "
+            "a deployment with no DuckDB-routed reads never actuates even "
+            "when enabled."
+        ),
+    )
+    duckdb_pool_size_max: Mutable[int] = Field(
+        default=32,
+        ge=1,
+        le=64,
+        description=(
+            "Ceiling the autosize actuator will not deepen "
+            "``DuckdbEngineConfig.pool_size`` past. Bounded by the same "
+            "``le=64`` the field itself enforces; keep at or below the "
+            "instance's CPU/memory headroom (``threads`` / ``max_memory_gb`` "
+            "x pool_size, see ``DuckdbEngineConfig``)."
+        ),
+    )
+    duckdb_pool_step: Mutable[int] = Field(
+        default=2,
+        ge=1,
+        description="Connections added per DuckDB pool-autosize actuation.",
+    )
+    duckdb_pool_cooldown_seconds: Mutable[int] = Field(
+        default=120,
+        ge=0,
+        description=(
+            "Minimum time between two consecutive DuckDB pool-autosize "
+            "actuations — same cooldown idiom as ``scale_in_cooldown_"
+            "seconds``, damping repeated bumps while the pool is draining "
+            "into its new capacity."
+        ),
+    )
+
 
 class MonitoringSignalConfig(PluginConfig):
     """Tunables for ``MonitoringSignalProvider`` — the slow, corroborating

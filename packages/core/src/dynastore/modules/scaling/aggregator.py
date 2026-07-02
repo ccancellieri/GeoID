@@ -327,3 +327,56 @@ def compute_desired_min(
         target = current_min
 
     return target
+
+
+def compute_duckdb_pool_bump(
+    signals: Sequence[ScalingSignal],
+    policy: ScalingPolicyConfig,
+    *,
+    current_pool_size: int,
+    last_pool_change_ts: float,
+    now: float,
+) -> Optional[int]:
+    """Second actuator for the same hold branch in :func:`compute_desired_min`
+    (pool saturated but the fleet is compute-idle): instead of only holding
+    ``min_instances``, deepen the DuckDB driver's own connection pool — the
+    lever that actually relieves this specific bottleneck.
+
+    Pure function — no I/O — mirrors ``compute_desired_min``'s cooldown/step
+    idiom but is deliberately independent of it: it reads only the
+    ``source="duckdb_pool"`` instance-scope signals (see
+    ``DuckDbPoolSignalProvider``), not the fleet-wide mix ``compute_desired_min``
+    uses, so a hot PG pool with an idle DuckDB pool never triggers this.
+
+    Returns the new (bumped) ``pool_size``, or ``None`` when no actuation is
+    due this tick — the flag is off, no DuckDB pool signal is reporting,
+    the pool isn't saturated, CPU isn't confirmed idle, the pool is already
+    at ``duckdb_pool_size_max``, or the actuation is still inside
+    ``duckdb_pool_cooldown_seconds``.
+    """
+    if not policy.duckdb_pool_autosize:
+        return None
+
+    duckdb_values = [
+        s.value
+        for s in signals
+        if s.scope == "instance" and s.source == "duckdb_pool" and s.metric == "pool_saturation"
+    ]
+    if not duckdb_values:
+        return None
+
+    cpu_utilization = extract_global_metric(signals, "cpu_utilization")
+    cpu_idle = cpu_utilization is not None and cpu_utilization < policy.cpu_idle_ceiling
+    if not cpu_idle:
+        return None  # not the hold branch — either CPU is hot, or unknown.
+
+    if max(duckdb_values) < policy.scale_out_saturation:
+        return None
+
+    if current_pool_size >= policy.duckdb_pool_size_max:
+        return None
+
+    if (now - last_pool_change_ts) < policy.duckdb_pool_cooldown_seconds:
+        return None
+
+    return min(policy.duckdb_pool_size_max, current_pool_size + policy.duckdb_pool_step)

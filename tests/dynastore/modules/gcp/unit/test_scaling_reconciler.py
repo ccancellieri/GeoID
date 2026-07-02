@@ -40,11 +40,21 @@ def disable_managed_eventing():
     return None
 
 
-def _fake_configs(policy: ScalingPolicyConfig):
-    async def get_config(_cls):
-        return policy
+def _fake_configs(policy: ScalingPolicyConfig, duckdb_cfg=None):
+    """Fake ``ConfigsProtocol`` that discriminates by class — unlike a
+    single-class stub, the pool-autosize actuator needs both
+    ``ScalingPolicyConfig`` (the policy) and ``DuckdbEngineConfig`` (the
+    actuated resource) resolvable from the same fake.
+    """
+    from dynastore.modules.db_config.engine_config import DuckdbEngineConfig
 
-    return SimpleNamespace(get_config=get_config)
+    store = {ScalingPolicyConfig: policy, DuckdbEngineConfig: duckdb_cfg or DuckdbEngineConfig()}
+    set_config = AsyncMock(side_effect=lambda cls, cfg, **_kw: store.__setitem__(cls, cfg) or cfg)
+
+    async def get_config(cls):
+        return store[cls]
+
+    return SimpleNamespace(get_config=get_config, set_config=set_config, _store=store)
 
 
 def _fake_backend(doc):
@@ -180,6 +190,107 @@ async def test_memory_recommendation_logged_not_actuated(caplog):
 
     platform.set_min_instances.assert_not_awaited()
     assert any("memory_utilization" in r.getMessage() for r in caplog.records)
+
+
+def _doc_with_duckdb_pool_and_cpu(pool_value: float, cpu_value: float) -> dict:
+    now = time.time()
+    return {
+        "instances": {
+            "host-a:1": {
+                "ts": now,
+                "signals": [
+                    {
+                        "source": "duckdb_pool", "metric": "pool_saturation",
+                        "value": pool_value, "scope": "instance", "ts": now,
+                    }
+                ],
+            }
+        },
+        "global": {
+            "monitoring_signal_provider:cpu_utilization": {
+                "ts": now,
+                "signal": {
+                    "source": "monitoring_signal_provider", "metric": "cpu_utilization",
+                    "value": cpu_value, "scope": "global", "ts": now,
+                },
+            }
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_duckdb_pool_autosize_off_by_default_never_writes_config():
+    """``duckdb_pool_autosize`` defaults False — a saturated+idle fleet must
+    not trigger a ``DuckdbEngineConfig`` write even though the aggregator
+    hold-branch condition is met."""
+    from dynastore.modules.gcp import scaling_reconciler as mod
+
+    platform = SimpleNamespace(
+        get_min_instances=AsyncMock(return_value=2),
+        set_min_instances=AsyncMock(),
+    )
+    policy = ScalingPolicyConfig(enabled=True, scale_out_saturation=0.80, cpu_idle_ceiling=0.30)
+    configs = _fake_configs(policy)
+    reconciler = GcpScalingReconciler(platform=platform, configs=configs)
+
+    with _patch_cache(mod, _fake_backend(_doc_with_duckdb_pool_and_cpu(0.95, 0.1))):
+        await reconciler._reconcile_once()
+
+    configs.set_config.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_duckdb_pool_autosize_bumps_pool_size_when_saturated_and_cpu_idle():
+    from dynastore.modules.db_config.engine_config import DuckdbEngineConfig
+    from dynastore.modules.gcp import scaling_reconciler as mod
+
+    platform = SimpleNamespace(
+        get_min_instances=AsyncMock(return_value=2),
+        set_min_instances=AsyncMock(),
+    )
+    policy = ScalingPolicyConfig(
+        enabled=True, scale_out_saturation=0.80, cpu_idle_ceiling=0.30,
+        duckdb_pool_autosize=True, duckdb_pool_step=2, duckdb_pool_size_max=32,
+        duckdb_pool_cooldown_seconds=0,
+    )
+    configs = _fake_configs(policy, duckdb_cfg=DuckdbEngineConfig(pool_size=8))
+    reconciler = GcpScalingReconciler(platform=platform, configs=configs)
+
+    with _patch_cache(mod, _fake_backend(_doc_with_duckdb_pool_and_cpu(0.95, 0.1))):
+        await reconciler._reconcile_once()
+
+    configs.set_config.assert_awaited_once()
+    written_cls, written_cfg = configs.set_config.await_args.args
+    assert written_cls is DuckdbEngineConfig
+    assert written_cfg.pool_size == 10
+
+
+@pytest.mark.asyncio
+async def test_duckdb_pool_autosize_respects_cooldown():
+    """A second saturated tick inside ``duckdb_pool_cooldown_seconds`` of the
+    reconciler's own last pool actuation must not write again."""
+    from dynastore.modules.db_config.engine_config import DuckdbEngineConfig
+    from dynastore.modules.gcp import scaling_reconciler as mod
+
+    platform = SimpleNamespace(
+        get_min_instances=AsyncMock(return_value=2),
+        set_min_instances=AsyncMock(),
+    )
+    policy = ScalingPolicyConfig(
+        enabled=True, scale_out_saturation=0.80, cpu_idle_ceiling=0.30,
+        duckdb_pool_autosize=True, duckdb_pool_step=2, duckdb_pool_size_max=32,
+        duckdb_pool_cooldown_seconds=120,
+    )
+    configs = _fake_configs(policy, duckdb_cfg=DuckdbEngineConfig(pool_size=8))
+    reconciler = GcpScalingReconciler(platform=platform, configs=configs)
+
+    with _patch_cache(mod, _fake_backend(_doc_with_duckdb_pool_and_cpu(0.95, 0.1))):
+        await reconciler._reconcile_once()
+    assert configs.set_config.await_count == 1
+
+    with _patch_cache(mod, _fake_backend(_doc_with_duckdb_pool_and_cpu(0.95, 0.1))):
+        await reconciler._reconcile_once()
+    assert configs.set_config.await_count == 1  # still one — inside cooldown
 
 
 @pytest.mark.asyncio
