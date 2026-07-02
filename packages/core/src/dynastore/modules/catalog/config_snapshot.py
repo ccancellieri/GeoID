@@ -40,7 +40,7 @@ platform driver-evolution unblocked — only stable value-configs are frozen.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Type
 
 from dynastore.models.plugin_config import PluginConfig
 from dynastore.tools.typed_store.registry import TypedModelRegistry
@@ -123,5 +123,39 @@ def select_snapshot_base(
         logger.warning(
             "config snapshot for %s failed to validate — using live default",
             cls.class_key(),
+        )
+        return None
+
+
+async def resolve_catalog_snapshot_base(
+    cls: Type[PluginConfig],
+    catalog_id: Optional[str],
+    get_snapshot_blob: "Callable[[str], Awaitable[Optional[Dict[str, Any]]]]",
+) -> Optional[PluginConfig]:
+    """Shared #1079 (c) base-resolution step (#2830).
+
+    Fetches the catalog's defaults-snapshot blob via ``get_snapshot_blob``
+    (``ConfigsProtocol.get_catalog_defaults_snapshot``) and gates it through
+    :func:`select_snapshot_base`. This is the single snapshot-base-resolution
+    path both ``ConfigService.get_config`` (runtime reads) and the
+    composed-config view (``extensions/configs``) consult, so an operator
+    reading the composed view never sees a value a driver would resolve
+    differently at runtime.
+
+    Returns ``None`` when ``catalog_id`` is falsy, no snapshot entry exists
+    for ``cls``, or the entry is stale/invalid — the caller falls back to
+    the live platform/code default in every case. Best-effort: any failure
+    fetching or validating the snapshot is swallowed (never blocks a read).
+    """
+    if not catalog_id:
+        return None
+    try:
+        snapshot_blob = await get_snapshot_blob(catalog_id)
+        return select_snapshot_base(snapshot_blob, cls)
+    except Exception:  # noqa: BLE001 — snapshot is best-effort; never block a read
+        logger.debug(
+            "defaults-snapshot base resolution failed for %s — using live default",
+            cls.class_key(),
+            exc_info=True,
         )
         return None

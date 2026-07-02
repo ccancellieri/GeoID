@@ -202,6 +202,137 @@ async def test_get_effective_configs_consumes_real_list_configs_row_shape(resolv
 
 
 # ---------------------------------------------------------------------------
+# _get_effective_configs — #2830 catalog defaults snapshot parity (#1079 c)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_effective_configs_snapshot_base_shadows_live_platform_delta():
+    """The composed view must use the catalog's frozen defaults snapshot as
+    the base — mirroring ``ConfigService.get_config``'s #1079(c) waterfall —
+    and must NOT re-apply a live platform-tier delta stored *after* the
+    snapshot was taken. Before the #2830 fix the composer always rebuilt
+    from the live platform delta, so an operator would see the live value
+    here while every driver actually resolved the frozen snapshot value.
+    """
+    from dynastore.modules.catalog.config_snapshot import serialize_for_snapshot
+    from dynastore.modules.storage.driver_config import ItemsWritePolicy, WriteConflictPolicy
+
+    default_oc = ItemsWritePolicy().on_conflict
+    other_oc = next(m for m in WriteConflictPolicy if m != default_oc)
+
+    # Snapshot froze the ORIGINAL default at catalog-creation time.
+    snapshot_blob = {
+        ItemsWritePolicy.class_key(): serialize_for_snapshot(ItemsWritePolicy()),
+    }
+
+    async def list_side_effect(catalog_id=None, collection_id=None, **_):
+        if catalog_id:
+            return {"results": [], "total": 0}
+        # A platform-tier override landed AFTER the catalog's snapshot —
+        # ``ConfigService.get_config`` never re-applies it once a valid
+        # snapshot exists for this class.
+        return {
+            "results": [
+                {"plugin_id": "items_write_policy",
+                 "config": {"on_conflict": other_oc}},
+            ],
+            "total": 1,
+        }
+
+    svc_mock = MagicMock()
+    svc_mock.list_configs = AsyncMock(side_effect=list_side_effect)
+    svc_mock.get_catalog_defaults_snapshot = AsyncMock(return_value=snapshot_blob)
+
+    svc = ConfigApiService(config_service=svc_mock)
+    by_class, sources, _tier_data = await svc._get_effective_configs(
+        catalog_id="cat-x", collection_id=None, resolved=True,
+    )
+    assert by_class["items_write_policy"]["on_conflict"] == default_oc, (
+        "composed view leaked the live platform delta instead of honouring "
+        "the catalog's frozen defaults snapshot"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_effective_configs_snapshot_base_still_overlays_catalog_delta():
+    """A catalog-tier override on top of a frozen snapshot must still win —
+    only the platform delta is shadowed by the snapshot, catalog/collection
+    deltas continue to overlay normally (mirrors ``ConfigService.get_config``,
+    which merges catalog/collection deltas onto the snapshot base)."""
+    from dynastore.modules.catalog.config_snapshot import serialize_for_snapshot
+    from dynastore.modules.storage.driver_config import ItemsWritePolicy, WriteConflictPolicy
+
+    default_oc = ItemsWritePolicy().on_conflict
+    catalog_oc = next(m for m in WriteConflictPolicy if m != default_oc)
+
+    snapshot_blob = {
+        ItemsWritePolicy.class_key(): serialize_for_snapshot(ItemsWritePolicy()),
+    }
+
+    async def list_side_effect(catalog_id=None, collection_id=None, **_):
+        if catalog_id and not collection_id:
+            return {
+                "results": [
+                    {"plugin_id": "items_write_policy",
+                     "config": {"on_conflict": catalog_oc}},
+                ],
+                "total": 1,
+            }
+        return {"results": [], "total": 0}
+
+    svc_mock = MagicMock()
+    svc_mock.list_configs = AsyncMock(side_effect=list_side_effect)
+    svc_mock.get_catalog_defaults_snapshot = AsyncMock(return_value=snapshot_blob)
+
+    svc = ConfigApiService(config_service=svc_mock)
+    by_class, sources, _tier_data = await svc._get_effective_configs(
+        catalog_id="cat-x", collection_id=None, resolved=True,
+    )
+    assert by_class["items_write_policy"]["on_conflict"] == catalog_oc
+    assert sources["items_write_policy"] == "catalog"
+
+
+@pytest.mark.asyncio
+async def test_get_effective_configs_stale_schema_snapshot_falls_back_to_live():
+    """A snapshot entry whose ``schema_id`` no longer matches the live class
+    (the class evolved since the catalog was created) must be ignored — the
+    composed view falls back to the live platform/code default, exactly
+    like ``select_snapshot_base`` / ``ConfigService.get_config``."""
+    from dynastore.modules.catalog.config_snapshot import serialize_for_snapshot
+    from dynastore.modules.storage.driver_config import ItemsWritePolicy, WriteConflictPolicy
+
+    default_oc = ItemsWritePolicy().on_conflict
+    other_oc = next(m for m in WriteConflictPolicy if m != default_oc)
+
+    stale_entry = serialize_for_snapshot(ItemsWritePolicy())
+    stale_entry["schema_id"] = "stale-deadbeef"
+    snapshot_blob = {ItemsWritePolicy.class_key(): stale_entry}
+
+    async def list_side_effect(catalog_id=None, collection_id=None, **_):
+        if catalog_id:
+            return {"results": [], "total": 0}
+        # Live platform-tier delta must apply since the snapshot is stale.
+        return {
+            "results": [
+                {"plugin_id": "items_write_policy",
+                 "config": {"on_conflict": other_oc}},
+            ],
+            "total": 1,
+        }
+
+    svc_mock = MagicMock()
+    svc_mock.list_configs = AsyncMock(side_effect=list_side_effect)
+    svc_mock.get_catalog_defaults_snapshot = AsyncMock(return_value=snapshot_blob)
+
+    svc = ConfigApiService(config_service=svc_mock)
+    by_class, sources, _tier_data = await svc._get_effective_configs(
+        catalog_id="cat-x", collection_id=None, resolved=True,
+    )
+    assert by_class["items_write_policy"]["on_conflict"] == other_oc
+    assert sources["items_write_policy"] == "platform"
+
+
+# ---------------------------------------------------------------------------
 # _compose_tree — scope/topic tree + optional meta in a single pass
 # ---------------------------------------------------------------------------
 

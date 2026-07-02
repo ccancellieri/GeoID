@@ -135,6 +135,22 @@ class ConfigsProtocol(Protocol):
         """
         ...
 
+    async def get_catalog_defaults_snapshot(
+        self,
+        catalog_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the catalog's frozen defaults-snapshot blob (#1079 c), or ``None``.
+
+        Raw ``{class_key: {"schema_id": ..., "data": ...}}`` blob captured by
+        :meth:`snapshot_catalog_defaults` at catalog creation. Callers gate
+        the per-class entry through
+        ``dynastore.modules.catalog.config_snapshot.select_snapshot_base``
+        (or its ``resolve_catalog_snapshot_base`` wrapper) — this is the
+        shared accessor both ``get_config``'s runtime resolution and the
+        composed-config view use so the two never disagree (#2830).
+        """
+        ...
+
     async def delete_config(
         self,
         config_cls: Type["PluginConfig"],

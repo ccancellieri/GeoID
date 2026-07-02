@@ -333,24 +333,17 @@ class ConfigService(ConfigsProtocol):
         # live platform/code default — so a later default change does not
         # silently re-resolve into collections that already inherited it. The
         # snapshot is schema-id-gated: on a class-schema change the entry is
-        # ignored and we keep the live ``base`` above (see config_snapshot).
+        # ignored and we keep the live ``base`` above. Shared with the
+        # composed-config view via ``resolve_catalog_snapshot_base`` so the
+        # two paths agree by construction (#2830).
         from dynastore.modules.catalog.config_snapshot import (
-            SNAPSHOT_REF_KEY,
-            select_snapshot_base,
+            resolve_catalog_snapshot_base,
         )
-        try:
-            snapshot_blob = await self.get_catalog_config_internal_cached(
-                catalog_id, SNAPSHOT_REF_KEY
-            )
-            snap_base = select_snapshot_base(snapshot_blob, cls)
-            if snap_base is not None:
-                base = snap_base
-        except Exception:  # noqa: BLE001 — snapshot is best-effort; never block a read
-            logger.debug(
-                "defaults-snapshot base resolution failed for %s — using live default",
-                class_key,
-                exc_info=True,
-            )
+        snap_base = await resolve_catalog_snapshot_base(
+            cls, catalog_id, self.get_catalog_defaults_snapshot,
+        )
+        if snap_base is not None:
+            base = snap_base
 
         # Collect per-tier deltas top-down.
         deltas: list[dict] = []
@@ -428,6 +421,20 @@ class ConfigService(ConfigsProtocol):
         return await _catalog_config_cache(
             self.engine, self._get_catalog_manager(), catalog_id, class_key
         )
+
+    async def get_catalog_defaults_snapshot(
+        self, catalog_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the catalog's frozen defaults-snapshot blob (#1079 c), or ``None``.
+
+        Raw ``{class_key: {"schema_id": ..., "data": ...}}`` blob written by
+        :meth:`snapshot_catalog_defaults` at catalog creation. Shared accessor
+        both this method's own ``get_config`` and the composed-config view
+        (``extensions/configs``) call so they resolve the snapshot base
+        identically (#2830).
+        """
+        from dynastore.modules.catalog.config_snapshot import SNAPSHOT_REF_KEY
+        return await self.get_catalog_config_internal_cached(catalog_id, SNAPSHOT_REF_KEY)
 
     async def get_persisted_config(
         self,

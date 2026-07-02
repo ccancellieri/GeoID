@@ -52,6 +52,7 @@ from dynastore.extensions.configs.config_api_dto import (
 )
 from dynastore.models.protocols import ConfigsProtocol
 from dynastore.models.plugin_config import PluginConfig, list_registered_configs
+from dynastore.modules.catalog.config_snapshot import resolve_catalog_snapshot_base
 
 logger = logging.getLogger(__name__)
 
@@ -317,15 +318,32 @@ class ConfigApiService:
             else:
                 sources[class_key] = "default"
 
-            # Build the effective payload by merging deltas onto the code
-            # default model.  Tier rows are stored as deltas (only fields
-            # the caller explicitly set), so dict-update with last-wins
-            # mirrors ``ConfigService.get_config``.
-            try:
-                merged: Dict[str, Any] = cls().model_dump(mode="python")
-            except Exception:
-                merged = {}
-            for tier_dict in (platform_data, catalog_data, collection_data):
+            # Build the effective payload by merging deltas onto the base.
+            # #2830: the base mirrors ``ConfigService.get_config``'s #1079(c)
+            # snapshot substitution — a catalog that froze a still-valid
+            # defaults snapshot for this class uses it as the inheritance
+            # base instead of the live platform/code default, exactly as
+            # the runtime waterfall does. When a snapshot base applies, the
+            # live platform-tier delta is NOT re-merged on top (the runtime
+            # path only overlays catalog/collection deltas on a snapshot
+            # base — see ``ConfigService.get_config``); otherwise tier rows
+            # are deltas (only fields the caller explicitly set), so
+            # dict-update with last-wins mirrors the same waterfall.
+            snap_base = await resolve_catalog_snapshot_base(
+                cls, catalog_id, svc.get_catalog_defaults_snapshot,
+            )
+            if snap_base is not None:
+                merged: Dict[str, Any] = snap_base.model_dump(mode="python")
+                tier_dicts: Tuple[Dict[str, Dict[str, Any]], ...] = (
+                    catalog_data, collection_data,
+                )
+            else:
+                try:
+                    merged = cls().model_dump(mode="python")
+                except Exception:
+                    merged = {}
+                tier_dicts = (platform_data, catalog_data, collection_data)
+            for tier_dict in tier_dicts:
                 delta = tier_dict.get(class_key)
                 if delta:
                     merged.update(delta)
