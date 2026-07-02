@@ -33,7 +33,7 @@ import asyncio
 import inspect
 from typing import Callable, Awaitable, List, Dict, Any, Union, Tuple, Optional
 from pydantic import BaseModel, ConfigDict
-from dynastore.modules.db_config.query_executor import DbResource
+from dynastore.modules.db_config.query_executor import DbResource, best_effort_savepoint
 from dynastore.tools.async_utils import signal_bus
 from dynastore.tools.discovery import get_protocol
 from dynastore.models.protocols import DatabaseProtocol
@@ -526,57 +526,44 @@ class LifecycleRegistry:
 
         Returns True if successful, False if the initializer failed
         (non-fatal). Raises if the outer transaction itself is already
-        aborted (fatal).
+        aborted, or the connection is dead, or the hook is registered
+        ``critical`` (all fatal — caller must roll back the outer
+        transaction / abort catalog creation).
         """
-        from sqlalchemy.ext.asyncio import AsyncConnection
+        from dynastore.modules.db_config.exceptions import DatabaseConnectionError
 
-        # Only use begin_nested on async connections that support it
-        if not isinstance(conn, AsyncConnection):
-            # Sync connection or engine — call directly with try/except
-            try:
-                result = func(*args, **kwargs)
-                if inspect.isawaitable(result):
-                    await result
-                return True
-            except Exception as e:
-                logger.error(f"{label} failed: {e}", exc_info=True)
+        def _tolerate(exc: BaseException) -> bool:
+            error_str = str(exc)
+            # Fatal connection errors — cannot continue on a dead connection.
+            if isinstance(exc, DatabaseConnectionError) or "ConnectionDoesNotExistError" in error_str:
+                logger.error(f"{label}: fatal connection error. Aborting lifecycle hooks. Error: {exc}")
                 return False
-
-        try:
-            async with conn.begin_nested():
-                result = func(*args, **kwargs)
-                if inspect.isawaitable(result):
-                    await result
-            return True
-        except Exception as e:
-            # If begin_nested itself fails, the outer transaction is already aborted
-            # (InFailedSQLTransactionError on SAVEPOINT creation). This is fatal.
-            error_str = str(e)
-            
-            # Check for fatal connection errors - we cannot continue on a dead connection
-            from dynastore.modules.db_config.exceptions import DatabaseConnectionError
-            if isinstance(e, DatabaseConnectionError) or "ConnectionDoesNotExistError" in error_str:
-                logger.error(f"{label}: fatal connection error. Aborting lifecycle hooks. Error: {e}")
-                raise
-
+            # If begin_nested itself fails, the outer transaction is already
+            # aborted (InFailedSQLTransactionError on SAVEPOINT creation).
             if "InFailedSQLTransaction" in error_str or "current transaction is aborted" in error_str:
                 logger.error(
                     f"{label}: outer transaction already aborted before SAVEPOINT. "
-                    f"Cannot continue lifecycle initialization. Error: {e}"
+                    f"Cannot continue lifecycle initialization. Error: {exc}"
                 )
-                raise  # fatal — caller must roll back the outer transaction
+                return False
             # Otherwise the SAVEPOINT was rolled back cleanly; the outer tx is
             # still healthy so a critical hook can re-raise to abort the create,
             # while a normal hook is logged and skipped.
             if getattr(func, "_lifecycle_critical", False):
                 logger.error(
                     f"{label} is CRITICAL and failed (SAVEPOINT rolled back); "
-                    f"aborting catalog creation. Error: {e}",
+                    f"aborting catalog creation. Error: {exc}",
                     exc_info=True,
                 )
-                raise
-            logger.error(f"{label} failed (SAVEPOINT rolled back, outer tx healthy): {e}", exc_info=True)
-            return False
+                return False
+            logger.error(f"{label} failed (SAVEPOINT rolled back, outer tx healthy): {exc}", exc_info=True)
+            return True
+
+        async with best_effort_savepoint(conn, tolerate=_tolerate) as outcome:
+            result = func(*args, **kwargs)
+            if inspect.isawaitable(result):
+                await result
+        return outcome.error is None
 
     async def init_catalog(
         self, conn: DbResource, schema: str, catalog_id: str

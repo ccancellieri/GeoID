@@ -23,7 +23,14 @@ import json
 import logging
 
 from dynastore.modules.db_config import maintenance_tools
-from dynastore.modules.db_config.query_executor import DDLQuery, DQLQuery, ResultHandler, DbResource, managed_transaction
+from dynastore.modules.db_config.query_executor import (
+    DDLQuery,
+    DQLQuery,
+    ResultHandler,
+    DbResource,
+    best_effort_savepoint,
+    managed_transaction,
+)
 from dynastore.modules import get_protocol
 from dynastore.models.protocols import DatabaseProtocol
 
@@ -200,30 +207,19 @@ class PostgresPolicyStorage(AbstractPolicyStorage):
         so a duplicate-table error from a concurrent same-tenant provision rolls
         back only this statement and leaves the surrounding transaction healthy.
         """
-        from sqlalchemy.ext.asyncio import AsyncConnection
-
-        def _is_duplicate(exc: Exception) -> bool:
+        def _is_duplicate(exc: BaseException) -> bool:
             orig = getattr(exc, "orig", None)
             return "already exists" in str(exc) or (
                 orig is not None and getattr(orig, "pgcode", None) == "42P07"
             )
 
-        try:
-            if isinstance(conn, AsyncConnection):
-                async with conn.begin_nested():
-                    await ddl.execute(conn, schema=schema)
-            else:
-                # No nested-savepoint support (e.g. engine-level resource):
-                # rely on IF NOT EXISTS and tolerate the rare race directly.
-                await ddl.execute(conn, schema=schema)
-        except Exception as exc:
-            if _is_duplicate(exc):
-                logger.debug(
-                    "Policy partition %s.%s existed (concurrently created).",
-                    schema, partition_name,
-                )
-                return
-            raise
+        async with best_effort_savepoint(conn, tolerate=_is_duplicate) as outcome:
+            await ddl.execute(conn, schema=schema)
+        if outcome.error is not None:
+            logger.debug(
+                "Policy partition %s.%s existed (concurrently created).",
+                schema, partition_name,
+            )
 
     async def ensure_policy_partition(self, conn: DbResource, partition_key: str, schema: str = "iam"):
         from dynastore.tools.db import validate_sql_identifier

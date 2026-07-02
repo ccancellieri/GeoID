@@ -144,7 +144,9 @@ async def _enqueue_drain_trigger(
       yet expired) still blocks, exactly as before — this only unblocks a
       demonstrably wedged row, never a healthy in-flight drain.
     """
-    from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
+    from dynastore.modules.db_config.query_executor import (
+        DQLQuery, ResultHandler, best_effort_savepoint,
+    )
     from dynastore.modules.tasks.tasks_module import get_task_schema
 
     task_schema = get_task_schema()
@@ -193,46 +195,26 @@ async def _enqueue_drain_trigger(
     params: Dict[str, Any] = {"task_id": generate_uuidv7()}
     if wedge_grace_seconds is not None:
         params["wedge_grace_seconds"] = wedge_grace_seconds
-    try:
-        # Use a nested transaction (SAVEPOINT) so a missing-tasks-table error
-        # does not abort the outer PG transaction carrying the storage rows.
-        # A bare try/except does not help here: once asyncpg sees a statement
-        # error the outer PG TX enters the aborted state and must be rolled
-        # back in its entirety. The SAVEPOINT isolates the trigger INSERT so
-        # only it is rolled back on failure, leaving the work rows intact.
-        #
-        # ``conn.begin_nested()`` is only available on a SQLAlchemy
-        # AsyncConnection (not on an asyncpg connection or a raw SA
-        # AsyncEngine). We probe for the attribute and fall back to a fire-
-        # and-forget attempt if the caller's conn type does not support it.
-        begin_nested = getattr(conn, "begin_nested", None)
-        if begin_nested is not None:
-            try:
-                async with begin_nested():
-                    await DQLQuery(insert_sql, result_handler=ResultHandler.NONE).execute(
-                        conn, **params
-                    )
-            except Exception:  # noqa: BLE001
-                logger.debug(
-                    "storage_drain: drain trigger skipped — tasks table "
-                    "not available in schema %r (normal during staged rollout).",
-                    task_schema,
-                    exc_info=True,
-                )
-        else:
-            # Conn type doesn't support nested transactions — attempt
-            # the INSERT directly. If it fails the outer TX aborts;
-            # production always uses SA AsyncConnection so this branch
-            # is a defensive fallback only.
-            await DQLQuery(insert_sql, result_handler=ResultHandler.NONE).execute(
-                conn, **params
-            )
-    except Exception:  # noqa: BLE001
-        # Last-resort catch: savepoint setup itself failed.
+
+    # Use a nested transaction (SAVEPOINT) so a missing-tasks-table error
+    # does not abort the outer PG transaction carrying the storage rows. A
+    # bare try/except does not help here: once asyncpg sees a statement error
+    # the outer PG TX enters the aborted state and must be rolled back in its
+    # entirety. best_effort_savepoint isolates the trigger INSERT so only it
+    # is rolled back on failure, leaving the work rows intact — and falls
+    # back to a direct (unguarded) attempt when ``conn`` doesn't support
+    # nested transactions (production always uses SA AsyncConnection, so
+    # that fallback is defensive only).
+    async with best_effort_savepoint(conn) as outcome:
+        await DQLQuery(insert_sql, result_handler=ResultHandler.NONE).execute(
+            conn, **params
+        )
+    if outcome.error is not None:
         logger.debug(
-            "storage_drain: drain trigger failed for schema %r.",
+            "storage_drain: drain trigger skipped — tasks table "
+            "not available in schema %r (normal during staged rollout).",
             task_schema,
-            exc_info=True,
+            exc_info=outcome.error,
         )
 
 

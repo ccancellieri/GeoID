@@ -66,6 +66,7 @@ from geoalchemy2.shape import to_shape
 from geoalchemy2.elements import WKBElement, WKTElement
 from sqlalchemy import Table, MetaData
 from typing import (
+    AsyncIterator,
     Iterator,
     Union,
     List,
@@ -2431,6 +2432,64 @@ async def managed_nested_transaction(conn: DbResource):
     """
     async with managed_transaction(conn) as active_conn:
         yield active_conn
+
+
+class SavepointOutcome:
+    """Readable after a :func:`best_effort_savepoint` block exits.
+
+    ``error`` is the exception the block raised and ``tolerate`` accepted
+    (``None`` on success). Callers that need a pass/fail signal — rather than
+    just letting an intolerable exception propagate — check this instead of
+    threading their own flag through the ``async with`` body.
+    """
+
+    __slots__ = ("error",)
+
+    def __init__(self) -> None:
+        self.error: Optional[BaseException] = None
+
+
+@asynccontextmanager
+async def best_effort_savepoint(
+    conn: DbResource,
+    *,
+    tolerate: Callable[[BaseException], bool] = lambda exc: True,
+) -> AsyncIterator[SavepointOutcome]:
+    """Run a body that may fail without poisoning the caller's transaction.
+
+    Wraps the body in a SAVEPOINT via ``conn.begin_nested()`` when the
+    connection supports one, so a tolerated failure rolls back only the
+    body's own statements and the outer transaction stays healthy. When
+    ``conn`` has no ``begin_nested`` (e.g. a raw driver connection), the body
+    still runs — and failures are still classified by ``tolerate`` — but
+    without SAVEPOINT isolation, matching every call site's existing
+    defensive fallback for connection types that don't support nesting.
+
+    ``tolerate`` classifies the exception: return ``True`` to swallow it (the
+    yielded :class:`SavepointOutcome` records it in ``.error``), or ``False``
+    to re-raise after the SAVEPOINT has rolled back. Defaults to tolerating
+    everything.
+
+    This is deliberately independent of :func:`managed_nested_transaction`:
+    that helper always propagates the body's exception (it has no
+    swallow-and-continue mode), and its poisoned-connection/autocommit
+    detection targets a different set of callers than the five best-effort
+    sites this consolidates. Using a plain ``begin_nested()`` context here
+    keeps the behavior identical to what those sites already relied on.
+    """
+    outcome = SavepointOutcome()
+    begin_nested = getattr(conn, "begin_nested", None)
+    try:
+        if begin_nested is not None:
+            async with begin_nested():
+                yield outcome
+        else:
+            yield outcome
+    except BaseException as exc:  # noqa: BLE001 - classification delegated to `tolerate`
+        if tolerate(exc):
+            outcome.error = exc
+            return
+        raise
 
 
 _T = TypeVar("_T")

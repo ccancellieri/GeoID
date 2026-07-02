@@ -113,7 +113,7 @@ async def _enqueue_event_drain_trigger(
 
     Degrades gracefully when the tasks table is absent (e.g. test environments
     that only provision ``tasks.events``): the INSERT is SAVEPOINT-isolated via
-    ``conn.begin_nested()`` so a missing table cannot abort the outer PG
+    :func:`best_effort_savepoint` so a missing table cannot abort the outer PG
     transaction carrying the event row, and any failure is logged at DEBUG and
     swallowed.  The event row still commits; the drain runs on its next
     scheduled tick even without this NOTIFY.
@@ -134,6 +134,7 @@ async def _enqueue_event_drain_trigger(
     from dynastore.modules.db_config.query_executor import (  # noqa: PLC0415
         DQLQuery,
         ResultHandler,
+        best_effort_savepoint,
     )
     from dynastore.modules.tasks.tasks_module import get_task_schema  # noqa: PLC0415
     from dynastore.tools.caller import current_caller_id  # noqa: PLC0415
@@ -184,30 +185,17 @@ async def _enqueue_event_drain_trigger(
     params: Dict[str, Any] = {"task_id": generate_uuidv7(), "caller_id": caller_id}
     if wedge_grace_seconds is not None:
         params["wedge_grace_seconds"] = wedge_grace_seconds
-    try:
-        begin_nested = getattr(conn, "begin_nested", None)
-        if begin_nested is not None:
-            try:
-                async with begin_nested():
-                    await DQLQuery(insert_sql, result_handler=ResultHandler.NONE).execute(
-                        conn, **params
-                    )
-            except Exception:  # noqa: BLE001
-                logger.debug(
-                    "event_drain: drain trigger skipped — tasks table not "
-                    "available in schema %r (normal during staged rollout).",
-                    task_schema,
-                    exc_info=True,
-                )
-        else:
-            await DQLQuery(insert_sql, result_handler=ResultHandler.NONE).execute(
-                conn, **params
-            )
-    except Exception:  # noqa: BLE001
+
+    async with best_effort_savepoint(conn) as outcome:
+        await DQLQuery(insert_sql, result_handler=ResultHandler.NONE).execute(
+            conn, **params
+        )
+    if outcome.error is not None:
         logger.debug(
-            "event_drain: drain trigger failed for schema %r.",
+            "event_drain: drain trigger skipped — tasks table not "
+            "available in schema %r (normal during staged rollout).",
             task_schema,
-            exc_info=True,
+            exc_info=outcome.error,
         )
 
 

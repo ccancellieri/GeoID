@@ -30,6 +30,7 @@ from dynastore.modules.db_config.query_executor import (
     DQLQuery,
     ResultHandler,
     managed_transaction,
+    best_effort_savepoint,
     DbResource,
 )
 from dynastore.models.shared_models import (
@@ -303,24 +304,16 @@ class LogService(ProtocolPlugin[Any], LogsProtocol):
 
         try:
             async with managed_transaction(self._engine) as conn:
-                from dynastore.modules.db_config.query_executor import DbAsyncConnection
-
                 for entry in entries:
-                    try:
-                        # Fallback: Use a savepoint if in a transaction to avoid poisoning
-                        # the main transaction if the logs table doesn't exist yet.
-                        if isinstance(conn, DbAsyncConnection) and hasattr(
-                            conn, "begin_nested"
-                        ):
-                            async with conn.begin_nested():
-                                await self._write_log_entry(conn, entry)
-                        else:
-                            await self._write_log_entry(conn, entry)
-                    except Exception as e:
+                    # Savepoint-isolated so one entry failing (e.g. the logs
+                    # table doesn't exist yet) doesn't poison the batch's
+                    # transaction for the remaining entries.
+                    async with best_effort_savepoint(conn) as outcome:
+                        await self._write_log_entry(conn, entry)
+                    if outcome.error is not None:
                         logger.warning(
-                            f"LogService: Failed to write individual log entry: {e}"
+                            f"LogService: Failed to write individual log entry: {outcome.error}"
                         )
-                        pass
             logger.debug(f"Flushed {len(entries)} log entries to database.")
         except Exception as e:
             logger.error(f"Failed to flush log entries: {e}", exc_info=True)
