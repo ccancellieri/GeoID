@@ -17,16 +17,11 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-import secrets
-from contextlib import asynccontextmanager
-from typing import AsyncGenerator
 
 from typing import Optional, Any, Union, Dict
 from dynastore.modules.db_config.db_config import DBConfig
 from dynastore.modules.db_config.query_executor import (
     DbResource,
-    DbConnection,
-    DDLQuery,
     DQLQuery,
     ResultHandler,
 )
@@ -185,43 +180,6 @@ async def ensure_init_db(resource: DbResource):
 def get_config(app_state) -> DBConfig:
     """Returns the current database configuration."""
     return app_state.db_config
-
-
-@asynccontextmanager
-async def isolated_transaction(
-    conn: DbConnection,
-) -> AsyncGenerator[None, None]:
-    """
-    Creates an isolated sub-transaction using a SAVEPOINT.
-
-    This is critical for running DDL statements that might fail harmlessly
-    (e.g., CREATE TYPE ... IF NOT EXISTS). If such a statement fails,
-    PostgreSQL would normally abort the entire parent transaction.
-
-    This context manager wraps the operation in a SAVEPOINT. If any exception
-    occurs within the `with` block, it rolls back to the savepoint, which
-    clears the error state from the connection, allowing the parent transaction
-    to proceed without being poisoned.
-
-    Usage:
-        try:
-            async with isolated_transaction(conn):
-                await DDLQuery("CREATE TYPE ...").execute(conn)
-        except DuplicateObjectError:
-            logger.debug("Type already exists, continuing.")
-
-    """
-    savepoint_name = f"sp_{secrets.token_hex(6)}"
-    await DDLQuery(f"SAVEPOINT {savepoint_name}").execute(conn)
-    rolled_back = False
-    try:
-        yield
-    except Exception:
-        rolled_back = True
-        await DDLQuery(f"ROLLBACK TO SAVEPOINT {savepoint_name}").execute(conn)
-        raise  # Re-raise the exception for the caller to handle
-    if not rolled_back:
-        await DDLQuery(f"RELEASE SAVEPOINT {savepoint_name}").execute(conn)
 
 
 # --- Reflection Tools ---

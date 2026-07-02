@@ -127,25 +127,11 @@ def test_build_index_ddl_index_name_is_table_scoped():
 
 def test_pg_trgm_extension_in_bootstrap():
     """The extension bootstrap enables pg_trgm alongside the other extensions."""
-    tools_path = (
-        Path(__file__).resolve().parents[1]
-        / "packages/core/src/dynastore/modules/db_config/tools.py"
-    )
-    text = tools_path.read_text()
-    assert 'ensure_db_extension(resource, "pg_trgm")' in text
+    from dynastore.modules.db_config.tools import BASE_DB_EXTENSIONS
+
+    assert "pg_trgm" in BASE_DB_EXTENSIONS
 
 
-@pytest.mark.parametrize(
-    "init_sql",
-    [
-        "packages/core/src/dynastore/modules/db/db_init/init.sql",
-        "packages/core/src/dynastore/modules/datastore/db_init/init.sql",
-    ],
-)
-def test_pg_trgm_extension_in_init_sql(init_sql):
-    path = Path(__file__).resolve().parents[1] / init_sql
-    text = path.read_text()
-    assert "CREATE EXTENSION IF NOT EXISTS pg_trgm;" in text
 
 
 # ---------------------------------------------------------------------------

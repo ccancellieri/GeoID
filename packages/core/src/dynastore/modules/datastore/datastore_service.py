@@ -145,19 +145,9 @@ class DatastoreModule(ModuleProtocol, DatabaseProtocol):
                 )
                 logger.info("SQLAlchemy SyncEngine established successfully.")
 
-                # Run initialization scripts using the shared maintenance tool.
-                # Even though the engine is synchronous, we are in an async lifespan context,
-                # so we can await the tool. The tool will handle the sync engine correctly.
-                # _current_file_dir = os.path.dirname(os.path.abspath(__file__))
-                # init_sql_path: str = os.path.join(_current_file_dir, "db_init/init.sql")
-
-                # managed_transaction works for sync engines too (yields a standard connection)
-                # But here we are passing the engine directly to the tool via a transaction wrapper
-                # to ensure we have a connection context for the lock.
-
-                # Note: managed_transaction for a sync engine behaves synchronously,
-                # but we need to wrap it to call the async tool?
-                # Actually, managed_transaction is an @asynccontextmanager that yields a sync conn if engine is sync.
+                # Run initialization (extension bootstrap) using the shared
+                # maintenance tool; it handles sync engines from an async
+                # lifespan context.
                 await ensure_init_db(app_state.sync_engine)
 
 
