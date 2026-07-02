@@ -137,7 +137,9 @@ async def get_features_for_rendering(
     
     # 2. Transform that envelope to the Source CRS to use with the Spatial Index
     source_envelope_sql = f"ST_Transform({bbox_envelope_sql}, {source_srid})"
-    spatial_filter = f"ST_Intersects(geom, {source_envelope_sql})"
+    # ``geom`` lives on the geometries sidecar (aliased ``g`` below), never on
+    # the hub table itself — see the JOINs built per collection below.
+    spatial_filter = f"ST_Intersects(g.geom, {source_envelope_sql})"
     
     # 3. Calculate Simplification Tolerance (Generalization)
     # Tolerance = (Width of BBOX in Source Units) / (Image Width in Pixels)
@@ -151,15 +153,26 @@ async def get_features_for_rendering(
         # This significantly boosts performance for large datasets.
         # ``layer`` stays the (external-facing) collection id; the FROM
         # clause uses the resolved physical table, which may diverge from it.
+        #
+        # The hub table only carries ``geoid``/``transaction_time``/
+        # ``deleted_at`` (GeoID #2719) — ``geom`` and ``attributes`` live on
+        # the ``_geometries``/``_attributes`` sidecars and must be JOINed in,
+        # mirroring the PG driver's own query builder
+        # (``drivers/postgresql.py``, hub alias ``h`` / geometry alias ``g`` /
+        # attributes alias ``a``). This assumes the standard JSONB attributes
+        # sidecar (production default); COLUMNAR-mode attribute storage is
+        # not handled here.
         union_queries.append(f"""
             SELECT
                 '{collection}' as layer,
                 ST_AsBinary(
-                    ST_SimplifyPreserveTopology(geom, {resolution_sql})
+                    ST_SimplifyPreserveTopology(g.geom, {resolution_sql})
                 ) as geom,
-                geoid,
-                attributes
-            FROM "{schema}"."{physical_table}"
+                h.geoid,
+                a.attributes
+            FROM "{schema}"."{physical_table}" h
+            JOIN "{schema}"."{physical_table}_geometries" g ON h.geoid = g.geoid
+            JOIN "{schema}"."{physical_table}_attributes" a ON h.geoid = a.geoid
             WHERE {spatial_filter} AND ({where_clause})
         """)
 
