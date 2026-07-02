@@ -461,7 +461,14 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
                 index=index_name,
                 id=_doc_id(catalog_id, collection_id),
                 body=doc,
-                params={"routing": catalog_id, "refresh": "wait_for"},
+                # No "refresh": "wait_for" — under job load (bulk collection
+                # creation) it holds the shared AsyncOpenSearch client's
+                # connection pool for up to request_timeout * max_retries per
+                # write, exhausting the pool and stalling every write behind
+                # it. PG is the system of record for collections; ES is a
+                # best-effort secondary index that refreshes on its own
+                # interval (default 1s).
+                params={"routing": catalog_id},
             )
         except Exception as exc:
             from dynastore.modules.elasticsearch._mapping_errors import (
@@ -607,13 +614,13 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
                     index=index_name,
                     id=doc_id,
                     body={"doc": {"_deleted": True}},
-                    params={"routing": catalog_id, "refresh": "wait_for"},
+                    params={"routing": catalog_id},
                 )
             else:
                 await client.delete(
                     index=index_name,
                     id=doc_id,
-                    params={"routing": catalog_id, "refresh": "wait_for"},
+                    params={"routing": catalog_id},
                 )
         except Exception as e:
             logger.debug("delete_metadata ES error for %s/%s: %s", catalog_id, collection_id, e)
@@ -643,7 +650,7 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
             index=index_name,
             id=doc_id,
             body={"doc": {"system": {"lifecycle_status": None}}},
-            params={"routing": catalog_id, "refresh": "wait_for"},
+            params={"routing": catalog_id},
         )
 
     async def search_metadata(

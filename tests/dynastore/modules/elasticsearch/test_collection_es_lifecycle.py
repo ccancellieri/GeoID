@@ -247,6 +247,77 @@ async def test_clear_lifecycle_status_calls_es_update():
         f"Expected lifecycle_status=None body; got {kwargs.get('body')}"
     )
     assert kwargs.get("params", {}).get("routing") == "cat-1"
+    assert "refresh" not in kwargs.get("params", {}), (
+        "clear_lifecycle_status must not request 'refresh': 'wait_for' — it "
+        "holds the shared ES client's connection pool under job load (see "
+        "upsert_metadata/delete_metadata tests below for the same guard)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 5. Collection ES writes must not request synchronous refresh (job-load
+#    connection-pool exhaustion — see collection_es_driver.upsert_metadata).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upsert_metadata_does_not_use_wait_for_refresh():
+    """``upsert_metadata`` must not pass ``"refresh": "wait_for"``: under job
+    load (bulk collection creation) that param holds the shared
+    AsyncOpenSearch client's connection pool open per write, exhausting it
+    and stalling every subsequent write behind a timeout storm."""
+    fake_client = AsyncMock()
+
+    driver = _make_driver()
+    with patch(_GET_CLIENT, return_value=fake_client), \
+         patch(_INDEX_NAME, return_value="test-collections"):
+        await driver.upsert_metadata("cat-1", "col-1", {"title": "T"})
+
+    fake_client.index.assert_called_once()
+    _, kwargs = fake_client.index.call_args
+    params = kwargs.get("params", {})
+    assert params.get("routing") == "cat-1"
+    assert "refresh" not in params, (
+        f"upsert_metadata must not request synchronous refresh; got params={params}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_metadata_hard_does_not_use_wait_for_refresh():
+    """Hard ``delete_metadata`` must not pass ``"refresh": "wait_for"``."""
+    fake_client = AsyncMock()
+
+    driver = _make_driver()
+    with patch(_GET_CLIENT, return_value=fake_client), \
+         patch(_INDEX_NAME, return_value="test-collections"):
+        await driver.delete_metadata("cat-1", "col-1", soft=False)
+
+    fake_client.delete.assert_called_once()
+    _, kwargs = fake_client.delete.call_args
+    params = kwargs.get("params", {})
+    assert params.get("routing") == "cat-1"
+    assert "refresh" not in params, (
+        f"delete_metadata (hard) must not request synchronous refresh; got params={params}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_metadata_soft_does_not_use_wait_for_refresh():
+    """Soft ``delete_metadata`` must not pass ``"refresh": "wait_for"``."""
+    fake_client = AsyncMock()
+
+    driver = _make_driver()
+    with patch(_GET_CLIENT, return_value=fake_client), \
+         patch(_INDEX_NAME, return_value="test-collections"):
+        await driver.delete_metadata("cat-1", "col-1", soft=True)
+
+    fake_client.update.assert_called_once()
+    _, kwargs = fake_client.update.call_args
+    params = kwargs.get("params", {})
+    assert params.get("routing") == "cat-1"
+    assert "refresh" not in params, (
+        f"delete_metadata (soft) must not request synchronous refresh; got params={params}"
+    )
 
 
 @pytest.mark.asyncio

@@ -243,6 +243,39 @@ def _pack_stac_extras(input_data: Dict[str, Any], language: str) -> Dict[str, An
     return input_data
 
 
+def _pg_collections_to_stac_dicts(
+    collections_list: List[Any], language: str,
+) -> List[Dict[str, Any]]:
+    """Convert PG-backed ``Collection`` models into minimal STAC Collection
+    dicts, as used by the Collection Search response path.
+
+    Shared by the search branch of ``list_stac_collections`` and its
+    ES-empty/PG-populated fallback so both surfaces render collections the
+    same (minimal) way.
+    """
+    stac_collections: List[Dict[str, Any]] = []
+    for coll in collections_list:
+        localized_coll, _ = stac_localize(coll, language)
+        if coll.extent is None:
+            continue
+        stac_coll = pystac.Collection(
+            id=str(localized_coll.get("id") or ""),
+            description=str(localized_coll.get("description") or ""),
+            title=localized_coll.get("title"),
+            license=str(localized_coll.get("license") or ""),
+            extent=pystac.Extent(
+                spatial=pystac.SpatialExtent(coll.extent.spatial.bbox),
+                temporal=pystac.TemporalExtent(coll.extent.temporal.interval),
+            ),
+        )
+        if "language" in localized_coll:
+            stac_coll.extra_fields["language"] = localized_coll["language"]
+        if "languages" in localized_coll:
+            stac_coll.extra_fields["languages"] = localized_coll["languages"]
+        stac_collections.append(stac_coll.to_dict())
+    return stac_collections
+
+
 STAC_API_URIS = [
     "https://api.stacspec.org/v1.0.0/core",
     "https://api.stacspec.org/v1.0.0/item-search",
@@ -664,12 +697,40 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
                 collections = await stac_generator.create_collections_catalog(
                     request, catalog_id=catalog_id, lang=language, hints=request_hints,
                 )
-                return JSONResponse(content=collections)
             except AttributeError as e:
                 raise HTTPException(
                     status_code=501,
                     detail="STAC Collection listing not yet implemented in generator.",
                 ) from e
+
+            if not collections.get("collections"):
+                # The plain-listing path hydrates each collection through the
+                # routed READ driver, which can be ES. Under job load (bulk
+                # collection creation) the ES secondary-index write may not
+                # have landed yet, so hydration returns nothing even though
+                # PG — the system of record — already has rows. Fall back to
+                # the PG-backed query the Collection Search branch below
+                # uses, with no filters, so listing never silently empties
+                # out while PG has data.
+                async with managed_transaction(engine) as conn:
+                    stac_config = await self._get_stac_config(catalog_id, db_resource=conn)
+                    fallback_req = CollectionSearchRequest(catalog_id=catalog_id)
+                    pg_collections, pg_total = await search_collections(
+                        conn, fallback_req,
+                        default_limit=stac_config.default_limit,
+                        max_limit=stac_config.max_limit,
+                    )
+                if pg_total:
+                    stac_collections = _pg_collections_to_stac_dicts(pg_collections, language)
+                    collections["collections"] = stac_collections
+                    collections["context"] = {
+                        "limit": fallback_req.limit,
+                        "offset": fallback_req.offset,
+                        "matched": pg_total,
+                        "returned": len(stac_collections),
+                    }
+
+            return JSONResponse(content=collections)
 
         # Collection Search path — parse params into CollectionSearchRequest
         parsed_bbox = None
@@ -708,26 +769,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-        stac_collections = []
-        for coll in collections_list:
-            localized_coll, _ = stac_localize(coll, language)
-            if coll.extent is None:
-                continue
-            stac_coll = pystac.Collection(
-                id=str(localized_coll.get("id") or ""),
-                description=str(localized_coll.get("description") or ""),
-                title=localized_coll.get("title"),
-                license=str(localized_coll.get("license") or ""),
-                extent=pystac.Extent(
-                    spatial=pystac.SpatialExtent(coll.extent.spatial.bbox),
-                    temporal=pystac.TemporalExtent(coll.extent.temporal.interval),
-                ),
-            )
-            if "language" in localized_coll:
-                stac_coll.extra_fields["language"] = localized_coll["language"]
-            if "languages" in localized_coll:
-                stac_coll.extra_fields["languages"] = localized_coll["languages"]
-            stac_collections.append(stac_coll.to_dict())
+        stac_collections = _pg_collections_to_stac_dicts(collections_list, language)
 
         return JSONResponse(
             content={
