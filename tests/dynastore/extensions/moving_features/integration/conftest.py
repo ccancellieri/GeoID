@@ -16,34 +16,9 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-import pytest
+from tests.dynastore.extensions.conftest import build_setup_fixtures
 
+# No delete-before-create, 201-or-409 accepted, no teardown delete (cleanup
+# is handled by the session-level DB reset).
 
-@pytest.fixture
-async def setup_catalog(sysadmin_in_process_client, catalog_data, catalog_id):
-    """Fixture to ensure a catalog exists using the STAC API."""
-    r = await sysadmin_in_process_client.post("/stac/catalogs", json=catalog_data)
-    if r.status_code == 409:
-        pass
-    else:
-        assert r.status_code == 201, f"Failed to create setup catalog: {r.text}"
-    
-    yield catalog_id
-
-
-@pytest.fixture
-async def setup_collection(
-    sysadmin_in_process_client, setup_catalog, collection_data, collection_id
-):
-    """Fixture to ensure a collection exists using the STAC API."""
-    catalog_id = setup_catalog
-    
-    r = await sysadmin_in_process_client.post(
-        f"/stac/catalogs/{catalog_id}/collections", json=collection_data
-    )
-    if r.status_code == 409:
-        pass
-    else:
-        assert r.status_code == 201, f"Failed to create setup collection: {r.text}"
-    
-    yield collection_id
+setup_catalog, setup_collection = build_setup_fixtures("/stac", assert_mode="loose")

@@ -21,6 +21,8 @@ import asyncio
 import pytest
 from dynastore.tools.identifiers import generate_id_hex
 
+from tests.dynastore.extensions.conftest import build_setup_fixtures
+
 
 @pytest.fixture
 def catalog_id(data_id):
@@ -75,23 +77,22 @@ def config_data():
     }
 
 
-@pytest.fixture
-async def setup_catalog(in_process_client_module, catalog_data, catalog_id):
-    r = await in_process_client_module.post("/features/catalogs", json=catalog_data)
-    assert r.status_code == 201
-    yield catalog_id
-    await in_process_client_module.delete(f"/features/catalogs/{catalog_id}?force=true")
+# Module-scoped client, strict 201-only create assertion, catalog delete on
+# teardown (collection cleanup cascades from the catalog delete).
+setup_catalog, _setup_collection_base = build_setup_fixtures(
+    "/features",
+    client_fixture="in_process_client_module",
+    assert_mode="strict",
+    catalog_teardown=True,
+)
 
 
 @pytest.fixture
 async def setup_collection(
-    in_process_client_module, setup_catalog, collection_data, collection_id, config_data
+    in_process_client_module, setup_catalog, _setup_collection_base, config_data
 ):
     catalog_id = setup_catalog
-    r = await in_process_client_module.post(
-        f"/features/catalogs/{catalog_id}/collections", json=collection_data
-    )
-    assert r.status_code == 201
+    collection_id = _setup_collection_base
 
     # The config storage for a freshly-created collection can briefly return
     # 409 while provisioning settles (the "config PUT right after create"

@@ -19,6 +19,8 @@
 import pytest
 from dynastore.tools.identifiers import generate_geoid, generate_id_hex
 
+from tests.dynastore.extensions.conftest import build_setup_fixtures
+
 # --- Test Data Fixtures ---
 
 
@@ -82,46 +84,8 @@ def config_catalog_data():
 
 
 # --- Setup/Cleanup Fixtures (Features Extension Level) ---
+#
+# Delete-before-create (hard delete) with no response assertion and no
+# teardown delete (cleanup is handled by the session-level DB reset).
 
-
-@pytest.fixture
-async def setup_catalog(sysadmin_in_process_client, catalog_data, catalog_id):
-    """Fixture to ensure a catalog exists and is cleaned up using the API."""
-    # Cleanup any existing catalog with hard delete to avoid duplicate key constraints
-    await sysadmin_in_process_client.delete(f"/features/catalogs/{catalog_id}?force=true")
-
-    # Create catalog
-    r = await sysadmin_in_process_client.post("/features/catalogs", json=catalog_data)
-    if r.status_code != 201:
-        # Check if it already exists (409 maybe? or just proceed)
-        pass
-
-    yield catalog_id
-
-    # Cleanup with hard delete handled by session fixture
-    # await in_process_client.delete(f"/features/catalogs/{catalog_id}?force=true")
-
-
-@pytest.fixture
-async def setup_collection(
-    sysadmin_in_process_client, setup_catalog, collection_data, collection_id
-):
-    """Fixture to ensure a collection exists and is cleaned up using the API."""
-    catalog_id = setup_catalog
-
-    # Cleanup with hard delete to avoid duplicate key constraints
-    await sysadmin_in_process_client.delete(
-        f"/features/catalogs/{catalog_id}/collections/{collection_id}?force=true"
-    )
-
-    # Create collection
-    r = await sysadmin_in_process_client.post(
-        f"/features/catalogs/{catalog_id}/collections", json=collection_data
-    )
-
-    yield collection_id
-
-    # Cleanup with hard delete handled by session fixture
-    # await in_process_client.delete(
-    #     f"/features/catalogs/{catalog_id}/collections/{collection_id}?force=true"
-    # )
+setup_catalog, setup_collection = build_setup_fixtures("/features", delete_before=True)

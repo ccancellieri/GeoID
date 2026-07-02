@@ -20,6 +20,8 @@ import pytest
 import os
 from dynastore.tools.identifiers import generate_id_hex
 
+from tests.dynastore.extensions.conftest import build_setup_fixtures
+
 @pytest.fixture
 def dynastore_extensions():
     # Both features and web extensions are needed for test_search_api.py
@@ -52,30 +54,15 @@ def collection_data(collection_id):
         },
     }
 
-@pytest.fixture
-async def setup_catalog(sysadmin_in_process_client, catalog_data, catalog_id):
-    # Ensure cleanup first
-    await sysadmin_in_process_client.delete(f"/features/catalogs/{catalog_id}?force=true")
-
-    response = await sysadmin_in_process_client.post("/features/catalogs", json=catalog_data)
-    assert response.status_code in (201, 409)
-
-    yield catalog_id
-
-    await sysadmin_in_process_client.delete(f"/features/catalogs/{catalog_id}?force=true")
-
-@pytest.fixture
-async def setup_collection(sysadmin_in_process_client, setup_catalog, collection_data, collection_id):
-    catalog_id = setup_catalog
-    # Ensure cleanup first
-    await sysadmin_in_process_client.delete(f"/features/catalogs/{catalog_id}/collections/{collection_id}?force=true")
-
-    response = await sysadmin_in_process_client.post(f"/features/catalogs/{catalog_id}/collections", json=collection_data)
-    assert response.status_code in (201, 409)
-
-    yield collection_id
-
-    await sysadmin_in_process_client.delete(f"/features/catalogs/{catalog_id}/collections/{collection_id}?force=true")
+# Delete-before-create, 201-or-409 accepted, delete on teardown for both
+# catalog and collection.
+setup_catalog, setup_collection = build_setup_fixtures(
+    "/features",
+    delete_before=True,
+    assert_mode="loose",
+    catalog_teardown=True,
+    collection_teardown=True,
+)
 
 @pytest.fixture
 async def setup_catalog_with_collection(setup_catalog, setup_collection):

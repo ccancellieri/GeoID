@@ -26,59 +26,15 @@ from dynastore.modules.stac.stac_config import (
 )
 from dynastore.extensions.stac.stac_models import STACItem
 
+from tests.dynastore.extensions.conftest import build_setup_fixtures
+
 
 # --- Setup/Cleanup Fixtures (STAC Extension Level) ---
+#
+# No delete-before-create (random ids make it redundant), 201-or-409 accepted,
+# no teardown delete (cleanup is handled by the session-level DB reset).
 
-
-@pytest.fixture
-async def setup_catalog(sysadmin_in_process_client, catalog_data, catalog_id):
-    """Fixture to ensure a catalog exists and is cleaned up using the STAC API."""
-    # Cleanup any existing catalog (redundant with random IDs)
-    # await sysadmin_in_process_client.delete(f"/stac/catalogs/{catalog_id}")
-
-    # Create catalog via STAC
-    r = await sysadmin_in_process_client.post("/stac/catalogs", json=catalog_data)
-    # If it already exists (409), that's "fine" for setup, but we prefer a clean slate.
-    # If we got 409, it means the delete failed or didn't happen.
-    if r.status_code == 409:
-        # Try to get it to ensure it's the right one? Or just proceed.
-        pass
-    else:
-        assert r.status_code == 201, f"Failed to create setup catalog: {r.text}"
-
-    yield catalog_id
-
-    # Cleanup handled by session fixture
-    # await in_process_client.delete(f"/stac/catalogs/{catalog_id}")
-
-
-@pytest.fixture
-async def setup_collection(
-    sysadmin_in_process_client, setup_catalog, collection_data, collection_id
-):
-    """Fixture to ensure a collection exists and is cleaned up using the STAC API."""
-    catalog_id = setup_catalog
-
-    # Cleanup any existing collection (redundant with random IDs)
-    # await sysadmin_in_process_client.delete(
-    #     f"/stac/catalogs/{catalog_id}/collections/{collection_id}"
-    # )
-
-    # Create collection via STAC
-    r = await sysadmin_in_process_client.post(
-        f"/stac/catalogs/{catalog_id}/collections", json=collection_data
-    )
-    if r.status_code == 409:
-        pass
-    else:
-        assert r.status_code == 201, f"Failed to create setup collection: {r.text}"
-
-    yield collection_id
-
-    # Cleanup handled by session fixture
-    # await in_process_client.delete(
-    #     f"/stac/catalogs/{catalog_id}/collections/{collection_id}"
-    # )
+setup_catalog, setup_collection = build_setup_fixtures("/stac", assert_mode="loose")
 
 
 @pytest.fixture
