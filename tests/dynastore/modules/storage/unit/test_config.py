@@ -317,8 +317,7 @@ class TestCollectionMetadataRouting:
         phase commits the PG write, in the same TX it enqueues an
         outbox row for the ES sink, and a background drain task pumps
         the row through with retry.  Replaces the legacy per-item
-        listener pattern (``feedback_es_indexing_per_item_async_not_bulk.md``)
-        which lacked durability under restart.
+        listener pattern, which lacked durability under restart.
         """
         cfg = ItemsRoutingConfig()
         write = cfg.operations[Operation.WRITE]
@@ -337,9 +336,11 @@ class TestCollectionMetadataRouting:
         assert read[0].hints == {"geometry_simplified"}
         # PG's READ entry also pins Hint.TILES (added by #456 so tile
         # rendering routes through PG, which alone exposes schema/table
-        # identifiers).
+        # identifiers) and Hint.JOIN (declared on the PG entries so join
+        # surfaces route to PG — see the READ/SEARCH hints in
+        # routing_config's default ItemsRoutingConfig).
         from dynastore.modules.storage.hints import Hint
-        assert read[1].hints == {Hint.GEOMETRY_EXACT, Hint.TILES}
+        assert read[1].hints == {Hint.GEOMETRY_EXACT, Hint.TILES, Hint.JOIN}
 
     def test_code_default_instance_has_empty_fields_set(self):
         """ItemsRoutingConfig() built from default_factory has no
