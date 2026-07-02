@@ -55,6 +55,7 @@ dynastore-ext-edr = { workspace = true }
 dynastore-ext-moving-features = { workspace = true }
 dynastore-ext-connected-systems = { workspace = true }
 dynastore-ext-dimensions = { workspace = true }
+dynastore-ext-region-mapping = { workspace = true }
 dynastore-ext-notebooks = { workspace = true }
 dynastore-ext-proxy = { workspace = true }
 dynastore-ext-processes = { workspace = true }
@@ -168,6 +169,7 @@ module_coverages_netcdf = ["netCDF4>=1.6.0", "xarray>=2024.0.0"]
 module_coverages_zarr = ["zarr>=2.18.0", "xarray>=2024.0.0"]
 extension_dwh = ["dynastore[extension_base,dwh,geospatial_io]", "pyproj>=3.0.0", "dynastore-ext-dwh"]
 extension_dimensions = ["dynastore[extension_base]", "ogc-dimensions @ git+https://github.com/ccancellieri/ogc-dimensions.git@main#subdirectory=reference-implementation", "dynastore-ext-dimensions"]
+extension_region_mapping = ["dynastore[extension_base]", "dynastore-ext-region-mapping"]
 
 # ==========================================================================
 # GRANULAR TASKS
@@ -237,6 +239,7 @@ storage = ["dynastore[module_storage]"]
 auth = ["dynastore[extension_auth]"]
 template = ["dynastore[extension_template]"]
 dimensions = ["dynastore[extension_dimensions]"]
+region_mapping = ["dynastore[extension_region_mapping]"]
 notebooks = ["dynastore[module_notebooks, extension_notebooks]"]
 edr = ["dynastore[extension_edr]"]
 
@@ -294,7 +297,7 @@ google_grp = ["dynastore[gcp_routes_grp,dwh_grp]"]
 auth_grp = ["dynastore[iam,auth,extension_admin]"]
 # tools_grp split: core proxy/template vs route-heavy dimensions/notebooks.
 tools_core_grp = ["dynastore[extension_httpx,template]"]
-tools_grp = ["dynastore[tools_core_grp,dimensions,notebooks]"]
+tools_grp = ["dynastore[tools_core_grp,dimensions,region_mapping,notebooks]"]
 monitor_grp = ["dynastore[stats,logs]"]
 index_grp = ["dynastore[elasticsearch,task_elasticsearch_indexer_deps]"]
 # drivers_grp — all storage/asset/metadata drivers (both collection and asset domains)
@@ -599,7 +602,7 @@ worker_local = ["dynastore[worker_service,monitor_grp]"]
 # Prefixed with scope_ to avoid collision with module-level extras above.
 # ==========================================================================
 # scope_catalog: catalog API without auth — open for local testing
-scope_catalog = ["dynastore[core,catalog_grp,google_grp,monitor_grp,index_grp,processes,tasks,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup,module_cache,notebooks,dimensions,drivers_grp,extension_volumes,extension_dggs,extension_edr,extension_moving_features,extension_connected_systems]"]
+scope_catalog = ["dynastore[core,catalog_grp,google_grp,monitor_grp,index_grp,processes,tasks,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup,module_cache,notebooks,dimensions,region_mapping,drivers_grp,extension_volumes,extension_dggs,extension_edr,extension_moving_features,extension_connected_systems]"]
 # scope_catalog_review: scope_catalog + gdal running in-process as a background
 # async runner on the catalog pod.  For review / local images ONLY — not
 # referenced by scope_catalog, scope_geoid, or any production scope.
@@ -609,7 +612,7 @@ scope_geoid = ["dynastore[scope_catalog,extension_geoid,auth_grp]"]
 # scope_worker: background task processor — headless Cloud Run job runner
 scope_worker = ["dynastore[core,module_catalog,gcp,extension_dwh,index_grp,tasks,ingestion,worker_task_export_features,worker_task_dwh_join,worker_task_joins_export,worker_task_tiles_preseed,worker_task_gdal,worker_task_dimensions_materialize,worker_task_stac_harvest,worker_task_catalog_provision,catalog_task_gcp_provision,catalog_task_gcp_catalog_cleanup]"]
 # scope_tools: proxy + template tools service — no auth
-scope_tools = ["dynastore[core,template,notebooks,cache,dimensions,proxy]"]
+scope_tools = ["dynastore[core,template,notebooks,cache,dimensions,region_mapping,proxy]"]
 # scope_maps: vector producer + raster renderer (local docker), no auth.
 # Mirrors api_maps_open + module_cache + drivers_grp so local data reads work.
 # worker_task_gdal pulls task_base (module_tasks dispatcher + capability
