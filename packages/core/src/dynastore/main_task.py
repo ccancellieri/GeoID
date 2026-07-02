@@ -333,7 +333,7 @@ async def main(task_name: str, payload: dict, schema: str):
                 try:
                     logger.info(f"--- [main_task.py] Executing task: '{task_name}' ---")
                     from dynastore.tools.execution_context import task_run_scope
-                    with task_run_scope():
+                    with task_run_scope(catalog=schema):
                         res = await target_task.run(payload=validate_payload)
                     logger.info(f"--- [main_task.py] Task '{task_name}' returned: {res} ---")
 

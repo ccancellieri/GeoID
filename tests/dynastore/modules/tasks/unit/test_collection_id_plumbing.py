@@ -142,3 +142,63 @@ def test_runner_taskcreate_sites_pass_collection_id_grep_guard() -> None:
             f"`collection_id=context.collection_id` — attribution would be "
             f"lost for collection-scoped work. Window:\n{window}"
         )
+
+
+def test_runner_task_run_scope_sites_declare_own_catalog_grep_guard() -> None:
+    """Source-level guard (#2716): every ``task_run_scope(...)`` call site
+    in ``runners.py`` declares ``catalog=context.db_schema``.
+
+    Without the catalog, ``IndexDispatcher``'s in-run write-absorption gate
+    (#2716) falls back to "no restriction known" and a task run's ASYNC
+    secondary writes are absorbed inline regardless of which catalog they
+    target — the exact foreign-backlog-absorption bug this issue fixes. A
+    mock-based check is brittle here for the same reason as the
+    ``collection_id`` guard above (lazy imports inside each runner method),
+    so this reads the source directly.
+    """
+    import inspect
+
+    from dynastore.modules.tasks import runners as runners_module
+
+    source = inspect.getsource(runners_module)
+    lines = source.splitlines()
+    scope_lines = [i for i, ln in enumerate(lines) if "task_run_scope(" in ln]
+    assert scope_lines, "No task_run_scope(...) sites found in runners.py"
+
+    for idx in scope_lines:
+        assert "catalog=context.db_schema" in lines[idx], (
+            f"runners.py:{idx + 1}: task_run_scope(...) missing "
+            f"`catalog=context.db_schema` — in-run index-dispatch absorption "
+            f"would be unscoped for this runner. Line: {lines[idx]!r}"
+        )
+
+
+def test_main_task_task_run_scope_site_declares_own_catalog_grep_guard() -> None:
+    """Source-level guard (#2716): the ``task_run_scope(...)`` call site in
+    ``main_task.py`` — the Cloud Run Job entrypoint — declares
+    ``catalog=schema``.
+
+    ``schema`` is the task's own catalog id (GcpJobRunner passes it via
+    ``--schema``, sourced from the task row's ``catalog_id``). Without it,
+    ``current_task_catalog()`` stays ``None`` for every Cloud Run Job
+    execution and ``IndexDispatcher``'s in-run write-absorption gate falls
+    back to "no restriction known", leaving the job process — the one that
+    actually OOM'd — able to absorb a foreign catalog's outbox backlog
+    inline. Mirrors the runners.py guard above; kept separate because
+    main_task.py binds a plain local (``schema``), not ``context.db_schema``.
+    """
+    import inspect
+
+    from dynastore import main_task as main_task_module
+
+    source = inspect.getsource(main_task_module)
+    lines = source.splitlines()
+    scope_lines = [i for i, ln in enumerate(lines) if "task_run_scope(" in ln]
+    assert scope_lines, "No task_run_scope(...) sites found in main_task.py"
+
+    for idx in scope_lines:
+        assert "catalog=schema" in lines[idx], (
+            f"main_task.py:{idx + 1}: task_run_scope(...) missing "
+            f"`catalog=schema` — in-run index-dispatch absorption would be "
+            f"unscoped for the Cloud Run Job entrypoint. Line: {lines[idx]!r}"
+        )

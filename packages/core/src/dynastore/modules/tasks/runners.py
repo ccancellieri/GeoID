@@ -201,7 +201,11 @@ class SyncRunner(RunnerProtocol, ProtocolPlugin[Any]):
 
             # Hydrate and execute, bounded by the effective deadline when set.
             hydrated_payload = hydrate_task_payload(task_instance, raw_payload)
-            with task_run_scope():
+            # ``context.db_schema`` is the task's own catalog_id (or the
+            # "platform"/"system" sentinel for cross-tenant work) — passed
+            # through so in-run index-dispatch absorption stays scoped to
+            # this task's own catalog (#2716).
+            with task_run_scope(catalog=context.db_schema):
                 if _effective_timeout:
                     result = await asyncio.wait_for(
                         task_instance.run(hydrated_payload),
@@ -829,7 +833,11 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                         f"({context.task_type}) in background."
                     )
                     hydrated_payload = hydrate_task_payload(task_instance, raw_payload)
-                    with task_run_scope():
+                    # ``context.db_schema`` is the claimed task's own
+                    # catalog_id (or the "platform"/"system" sentinel) —
+                    # passed through so in-run index-dispatch absorption
+                    # stays scoped to this task's own catalog (#2716).
+                    with task_run_scope(catalog=context.db_schema):
                         if _bg_effective_timeout:
                             result = await asyncio.wait_for(
                                 task_instance.run(hydrated_payload),

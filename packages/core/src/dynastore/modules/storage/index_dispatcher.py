@@ -79,7 +79,7 @@ from dynastore.modules.storage.routing_config import (
     OperationDriverEntry,
     WriteMode,
 )
-from dynastore.tools.execution_context import in_task_run
+from dynastore.tools.execution_context import current_task_catalog, in_task_run
 
 
 # Public surface of the dispatcher accepts either the legacy
@@ -554,6 +554,56 @@ async def _storage_plane_routing_enabled() -> bool:
     return bool(TasksPluginConfig.model_fields["items_secondary_via_storage_plane"].default)
 
 
+async def _resolve_in_task_run_chunk_size() -> int:
+    """Read ``TasksPluginConfig.in_task_run_inline_chunk_size``, hot-reloaded.
+
+    Bounds the per-chunk size of the in-run absorption path (#2716) — a job
+    container's memory budget was sized for ITS OWN write path, not for
+    ``INLINE_DISPATCH_CHUNK_SIZE`` (500) full envelopes on top of it.
+    Mirrors the fail-open resolution pattern of
+    ``_storage_plane_routing_enabled``: falls back to the field default when
+    the platform configs protocol is unavailable (early startup, tests).
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+        from dynastore.tools.discovery import get_protocol
+
+        config_mgr = get_protocol(PlatformConfigsProtocol)
+        if config_mgr is None:
+            return int(
+                TasksPluginConfig.model_fields["in_task_run_inline_chunk_size"].default
+            )
+        cfg = await config_mgr.get_config(TasksPluginConfig)
+        if isinstance(cfg, TasksPluginConfig):
+            return cfg.in_task_run_inline_chunk_size
+    except Exception:  # noqa: BLE001 — config read is best-effort
+        logger.debug(
+            "IndexDispatcher: in_task_run_inline_chunk_size unavailable — "
+            "falling back to the field default.",
+            exc_info=True,
+        )
+    from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+    return int(TasksPluginConfig.model_fields["in_task_run_inline_chunk_size"].default)
+
+
+def _task_run_absorption_allowed(catalog: str) -> bool:
+    """True when the currently running task run may absorb an ASYNC write
+    for *catalog* inline instead of enqueuing it to the durable outbox.
+
+    A task run that declared no catalog (``current_task_catalog() is
+    None`` — a cross-tenant/global task, or a call site that predates
+    catalog-scoped ``task_run_scope``, e.g. the Cloud Run Job entrypoint)
+    is treated as unrestricted, preserving the original #2621 behaviour.
+    A task run that DID declare a catalog may only absorb writes for that
+    SAME catalog — a write for any other catalog is foreign backlog that
+    belongs to the async-writer job, not to this job's memory budget
+    (#2716).
+    """
+    scoped = current_task_catalog()
+    return scoped is None or scoped == catalog
+
+
 def _make_default_routing_resolver():
     """Build an entity-aware resolver that loads the live PluginConfig
     matching the dispatched tier via ``ConfigsProtocol.get_config``.
@@ -866,12 +916,17 @@ class IndexDispatcher:
             # ``_collection_uses_access_aware_driver`` (item_service.py).
             # Recovering the envelope at drain time is tracked as a
             # follow-up; until then these entries take the legacy path
-            # below unchanged.
+            # below unchanged — but #2716 still keeps them off the in-run
+            # absorption path (see ``storage_plane_active`` below: the flag
+            # applies to every item-tier ASYNC entry, access-aware or not).
+            storage_plane_active = (
+                ctx.entity_type == "item"
+                and await _storage_plane_routing_enabled()
+            )
             if (
                 entry.write_mode == WriteMode.ASYNC
-                and ctx.entity_type == "item"
+                and storage_plane_active
                 and not getattr(type(indexer), "applies_access_filter", False)
-                and await _storage_plane_routing_enabled()
             ):
                 actually_enqueued = await self._enqueue_storage_plane_ids(
                     entry, ctx, entry_ops, tx_factory=tx_factory,
@@ -900,8 +955,25 @@ class IndexDispatcher:
             # background task/job execution (``in_task_run()``), spawning an
             # outbox row per chunk would fan out onto the serving pods that
             # drain it — the write is instead absorbed inline below, in the
-            # running job.
-            if entry.write_mode == WriteMode.ASYNC and not in_task_run():
+            # running job. #2716 narrows the exception two ways so a busy
+            # job's memory budget is never spent on work that isn't its own:
+            # (a) ``storage_plane_active`` — the flag owner (storage_drain)
+            # already claimed item-tier obligations above; an access-aware
+            # entry that fell through here still must not be absorbed once
+            # the operator has opted into the storage plane; (b)
+            # ``_task_run_absorption_allowed`` — a task run that declared
+            # its own catalog via ``task_run_scope(catalog=...)`` may only
+            # absorb writes for THAT catalog; a write for any other catalog
+            # is foreign backlog that belongs to the async-writer job, not
+            # to this job's container. A task run with no declared catalog
+            # (``current_task_catalog() is None`` — e.g. the Cloud Run Job
+            # entrypoint, which predates catalog-scoped ``task_run_scope``)
+            # stays unrestricted, matching the original #2621 behaviour.
+            if entry.write_mode == WriteMode.ASYNC and not (
+                in_task_run()
+                and not storage_plane_active
+                and _task_run_absorption_allowed(ctx.catalog)
+            ):
                 actually_enqueued = await self._enqueue_or_warn(entry, ctx, entry_ops)
                 enqueue_ok = actually_enqueued == len(entry_ops)
                 _log_dispatch_path(
@@ -1335,10 +1407,22 @@ class IndexDispatcher:
         # Distinguish the two callers that land here: an ASYNC entry absorbed
         # inline during a task/job run vs. an ordinary SYNC entry chunked on the
         # post-commit tail. Same code path, different provenance in the logs.
-        chunk_mode = "inline_in_task_run" if in_task_run() else "sync_chunked"
+        running_in_task = in_task_run()
+        chunk_mode = "inline_in_task_run" if running_in_task else "sync_chunked"
+        # #2716: a job container's memory budget is sized for its own write
+        # path, not for INLINE_DISPATCH_CHUNK_SIZE (500) full envelopes on
+        # top of it. Inside a task run, chunk at the smaller, hot-reloadable
+        # ``TasksPluginConfig.in_task_run_inline_chunk_size`` instead — the
+        # serving-path SYNC chunk size (this same code path outside a task
+        # run) is unaffected.
+        chunk_size = (
+            await _resolve_in_task_run_chunk_size()
+            if running_in_task
+            else INLINE_DISPATCH_CHUNK_SIZE
+        )
         aggregated = BulkResult()
-        for start in range(0, len(ops), INLINE_DISPATCH_CHUNK_SIZE):
-            chunk = ops[start:start + INLINE_DISPATCH_CHUNK_SIZE]
+        for start in range(0, len(ops), chunk_size):
+            chunk = ops[start:start + chunk_size]
             if tx_factory is not None:
                 async with tx_factory() as chunk_conn:
                     chunk_ctx = ctx.model_copy(update={"pg_conn": chunk_conn})

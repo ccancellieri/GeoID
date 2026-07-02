@@ -1280,12 +1280,25 @@ async def test_async_in_task_run_dispatches_inline_and_enqueues_zero_outbox():
     assert results["a"].failed == 0
 
 
+def _patch_in_task_run_chunk_size(monkeypatch, size: int) -> None:
+    """Pin the #2716 in-run chunk-size resolution to *size*, mirroring the
+    ``_patch_storage_plane_flag`` convention above — deterministic in unit
+    tests regardless of whether a ``PlatformConfigsProtocol`` happens to be
+    registered process-wide."""
+    import dynastore.modules.storage.index_dispatcher as idx_mod
+
+    async def _resolved() -> int:
+        return size
+
+    monkeypatch.setattr(idx_mod, "_resolve_in_task_run_chunk_size", _resolved)
+
+
 @pytest.mark.asyncio
-async def test_inline_in_task_run_chunks_large_batch():
-    """A batch larger than INLINE_DISPATCH_CHUNK_SIZE is split into
-    sequential chunked driver calls; the aggregated result reflects the
-    full batch.
+async def test_inline_in_task_run_chunks_large_batch(monkeypatch):
+    """A batch larger than the in-run chunk size is split into sequential
+    chunked driver calls; the aggregated result reflects the full batch.
     """
+    _patch_in_task_run_chunk_size(monkeypatch, INLINE_DISPATCH_CHUNK_SIZE)
     a = _StubIndexer("a")
     writer = _RecordingWriter()
     ctx_with_conn = IndexContext(
@@ -1312,13 +1325,14 @@ async def test_inline_in_task_run_chunks_large_batch():
 
 
 @pytest.mark.asyncio
-async def test_inline_in_task_run_opens_one_short_tx_per_chunk():
+async def test_inline_in_task_run_opens_one_short_tx_per_chunk(monkeypatch):
     """With a tx_factory (the in-task-run inline path), the dispatcher opens
     a FRESH transaction per chunk — never one long-lived transaction across
     the whole sequential fan-out — and enters/exits each one, so a busy job
     never parks a pooled connection with an open transaction across the full
     ES dispatch.
     """
+    _patch_in_task_run_chunk_size(monkeypatch, INLINE_DISPATCH_CHUNK_SIZE)
     opened: list = []
 
     class _FakeTx:
@@ -1365,6 +1379,61 @@ async def test_inline_in_task_run_opens_one_short_tx_per_chunk():
     assert len(a.bulk_calls) == expected_chunks
     assert results["a"].succeeded == n
     assert writer.rows == []
+
+
+@pytest.mark.asyncio
+async def test_inline_in_task_run_honors_configured_chunk_size_cap(monkeypatch):
+    """#2716: inside a task run, the inline chunk size is bounded by
+    ``TasksPluginConfig.in_task_run_inline_chunk_size`` — NOT the fixed
+    ``INLINE_DISPATCH_CHUNK_SIZE`` (500) the serving path uses. A job
+    container's memory budget is sized for its own write path, not for
+    hundreds of full envelopes absorbed on top of it.
+    """
+    _patch_in_task_run_chunk_size(monkeypatch, 7)
+    a = _StubIndexer("a")
+    writer = _RecordingWriter()
+    ctx_with_conn = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_async_entry("a")],
+        indexers={"a": a},
+        outbox=writer,
+    )
+    n = 20
+    ops = [_op(entity_id=f"i{i}") for i in range(n)]
+    with task_run_scope():
+        results = await dispatcher.fan_out_bulk(ctx_with_conn, ops)
+
+    import math
+    assert len(a.bulk_calls) == math.ceil(n / 7)
+    assert all(len(chunk) <= 7 for chunk in a.bulk_calls)
+    assert sum(len(c) for c in a.bulk_calls) == n
+    assert writer.rows == []
+    assert results["a"].succeeded == n
+
+
+@pytest.mark.asyncio
+async def test_sync_chunked_serving_path_ignores_in_task_run_chunk_size(monkeypatch):
+    """Outside a task run, chunking still uses the fixed
+    ``INLINE_DISPATCH_CHUNK_SIZE`` — the #2716 config field only bounds the
+    in-run absorption path, not ordinary serving-path SYNC dispatch.
+    """
+    _patch_in_task_run_chunk_size(monkeypatch, 3)
+    a = _StubIndexer("a")
+    dispatcher = _make_dispatcher(
+        entries=[_entry("a", on_failure=FailurePolicy.WARN)],  # write_mode=SYNC
+        indexers={"a": a},
+    )
+    n = INLINE_DISPATCH_CHUNK_SIZE + 5
+    ops = [_op(entity_id=f"i{i}") for i in range(n)]
+    results = await dispatcher.fan_out_bulk(_ctx(), ops)
+
+    import math
+    assert len(a.bulk_calls) == math.ceil(n / INLINE_DISPATCH_CHUNK_SIZE)
+    assert sum(len(c) for c in a.bulk_calls) == n
+    assert results["a"].succeeded == n
 
 
 @pytest.mark.asyncio
@@ -1820,3 +1889,173 @@ async def test_async_enqueue_drop_path_c_transient_pg_error_returns_failed():
         "Transient PG error: succeeded must be 0, not len(ops)"
     )
     assert results["a"].failed == 2
+
+
+# ---------------------------------------------------------------------------
+# In-run absorption scoped to the running task's own catalog (#2716)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_in_task_run_absorbs_own_catalog_write():
+    """A task run that declares its own catalog still absorbs an ASYNC
+    write for THAT catalog inline — the original #2621 benefit is
+    unaffected when the write matches the task's own scope.
+    """
+    a = _StubIndexer("a")
+    writer = _RecordingWriter()
+    ctx_with_conn = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_async_entry("a")],
+        indexers={"a": a},
+        outbox=writer,
+    )
+    ops = [_op(entity_id="i1"), _op(entity_id="i2")]
+    with task_run_scope(catalog="cat-x"):
+        results = await dispatcher.fan_out_bulk(ctx_with_conn, ops)
+
+    assert len(a.bulk_calls) == 1
+    assert writer.rows == [], "own-catalog write must still be absorbed inline"
+    assert results["a"].succeeded == 2
+
+
+@pytest.mark.asyncio
+async def test_in_task_run_does_not_absorb_foreign_catalog_write():
+    """#2716: a task run that declared catalog A must NOT absorb an ASYNC
+    write for catalog B inline — that backlog belongs to the async-writer
+    job, not to this task's memory budget. It falls back to the durable
+    outbox exactly as the not-in-task-run path does.
+    """
+    a = _StubIndexer("a")
+    writer = _RecordingWriter()
+    foreign_ctx = IndexContext(
+        catalog="cat-foreign", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_async_entry("a")],
+        indexers={"a": a},
+        outbox=writer,
+    )
+    ops = [_op(entity_id="i1"), _op(entity_id="i2")]
+    with task_run_scope(catalog="cat-own"):
+        results = await dispatcher.fan_out_bulk(foreign_ctx, ops)
+
+    assert a.bulk_calls == [], (
+        "a task run scoped to a DIFFERENT catalog must not absorb this write"
+    )
+    assert len(writer.rows) >= 1, "foreign-catalog write must be enqueued to the outbox"
+    assert results["a"].succeeded == 2
+
+
+@pytest.mark.asyncio
+async def test_in_task_run_unscoped_catalog_still_absorbs_any_write():
+    """Backward compat: a task run entered WITHOUT a declared catalog
+    (``task_run_scope()`` with no argument, e.g. the Cloud Run Job
+    entrypoint which predates this parameter) stays unrestricted — the
+    pre-#2716 #2621 behaviour is unchanged for that call site.
+    """
+    a = _StubIndexer("a")
+    writer = _RecordingWriter()
+    ctx_with_conn = IndexContext(
+        catalog="cat-anything", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_async_entry("a")],
+        indexers={"a": a},
+        outbox=writer,
+    )
+    ops = [_op(entity_id="i1")]
+    with task_run_scope():
+        results = await dispatcher.fan_out_bulk(ctx_with_conn, ops)
+
+    assert len(a.bulk_calls) == 1
+    assert writer.rows == []
+    assert results["a"].succeeded == 1
+
+
+@pytest.mark.asyncio
+async def test_in_task_run_foreign_catalog_logs_outbox_handoff_not_inline(caplog):
+    import logging as _logging
+
+    a = _StubIndexer("a")
+    writer = _RecordingWriter()
+    foreign_ctx = IndexContext(
+        catalog="cat-foreign", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_async_entry("a")],
+        indexers={"a": a},
+        outbox=writer,
+    )
+    with caplog.at_level(_logging.INFO):
+        with task_run_scope(catalog="cat-own"):
+            await dispatcher.fan_out_bulk(foreign_ctx, [_op(entity_id="i1")])
+
+    rows = _extract_dispatch_path_records(caplog)
+    assert any(r.get("mode") == "async_outbox_enqueued" for r in rows), rows
+    assert not any(r.get("mode") == "post_commit_inline" for r in rows), rows
+    assert not any(r.get("mode") == "inline_in_task_run" for r in rows), rows
+
+
+# ---------------------------------------------------------------------------
+# Storage-plane flag suppresses in-run absorption of payload rows (#2716)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_storage_plane_flag_on_access_aware_entry_not_absorbed_in_task_run(
+    monkeypatch,
+):
+    """#2716: when ``items_secondary_via_storage_plane`` is enabled, an
+    access-aware ASYNC entry (excluded from the id-only plane) must still
+    NOT be absorbed inline while inside a task run — the operator opted
+    into letting storage_drain own every item-tier ASYNC write, payload or
+    not, in-run or not. It falls back to the legacy payload-carrying
+    outbox instead.
+    """
+    _patch_storage_plane_flag(monkeypatch, enabled=True)
+    _patch_storage_emit_recorder(monkeypatch)
+
+    a = _AccessAwareStubIndexer("a")
+    writer = _RecordingWriter()
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_async_entry("a")], indexers={"a": a}, outbox=writer,
+    )
+    with task_run_scope(catalog="cat-x"):
+        results = await dispatcher.fan_out_bulk(_item_ctx(), [_op(entity_id="i1")])
+
+    assert a.bulk_calls == [], (
+        "storage-plane flag on must prevent in-run absorption even for "
+        "entries excluded from the id-only plane"
+    )
+    assert len(writer.rows) >= 1, "must fall back to the legacy payload-carrying outbox"
+    assert results["a"].succeeded == 1
+
+
+@pytest.mark.asyncio
+async def test_storage_plane_flag_off_access_aware_entry_still_absorbed_in_task_run(
+    monkeypatch,
+):
+    """Companion negative case: with the flag OFF, an access-aware entry
+    keeps the pre-#2716 in-run absorption behaviour unchanged.
+    """
+    _patch_storage_plane_flag(monkeypatch, enabled=False)
+    _patch_storage_emit_recorder(monkeypatch)
+
+    a = _AccessAwareStubIndexer("a")
+    writer = _RecordingWriter()
+    dispatcher = _make_dispatcher_with_outbox(
+        entries=[_async_entry("a")], indexers={"a": a}, outbox=writer,
+    )
+    with task_run_scope(catalog="cat-x"):
+        results = await dispatcher.fan_out_bulk(_item_ctx(), [_op(entity_id="i1")])
+
+    assert len(a.bulk_calls) == 1, "flag off must preserve pre-#2716 absorption"
+    assert writer.rows == []
+    assert results["a"].succeeded == 1

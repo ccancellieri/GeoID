@@ -356,10 +356,32 @@ class TasksPluginConfig(ExposableConfigMixin, PluginConfig):
             "opts in. Read on every dispatch via the platform configs "
             "hot-reload path; no restart required. Scope: entries pinned "
             "to an access-aware driver (``applies_access_filter=True``, "
-            "e.g. private ES) are ALWAYS excluded regardless of this flag "
-            "— the drain's canonical re-read cannot recover the "
-            "write-time access envelope (_visibility/_owner/_attrs), so "
-            "those entries keep using the legacy dispatch path."
+            "e.g. private ES) are ALWAYS excluded from the id-only plane "
+            "regardless of this flag — the drain's canonical re-read "
+            "cannot recover the write-time access envelope "
+            "(_visibility/_owner/_attrs). They still fall back to the "
+            "legacy payload-carrying outbox, but (#2716) never to in-run "
+            "absorption while this flag is on: once an operator opts in, "
+            "storage_drain owns every item-tier ASYNC write, payload or "
+            "id-only, in-run or not."
+        ),
+    )
+
+    in_task_run_inline_chunk_size: Mutable[int] = Field(
+        default=150,
+        ge=1,
+        description=(
+            "#2716: chunk size for the in-run absorption path (#2621) — "
+            "an ASYNC secondary-index entry dispatched inline because the "
+            "write is already executing inside a task/job run. Distinct "
+            "from the fixed ``INLINE_DISPATCH_CHUNK_SIZE`` (500) the "
+            "serving-path SYNC chunking still uses: a Cloud Run Job "
+            "container's memory budget is sized for its own ingest "
+            "working set, not for 500-2000 full ES envelopes absorbed on "
+            "top of it (the OOM traced in #2716). Conservative default "
+            "(150) keeps one absorbed chunk small relative to a typical "
+            "2Gi job. Read once per chunked dispatch via the platform "
+            "configs hot-reload path; no restart required."
         ),
     )
 

@@ -18,7 +18,11 @@
 
 """Unit tests for the ``in_task_run`` contextvar / ``task_run_scope``."""
 
-from dynastore.tools.execution_context import in_task_run, task_run_scope
+from dynastore.tools.execution_context import (
+    current_task_catalog,
+    in_task_run,
+    task_run_scope,
+)
 
 
 def test_default_is_not_in_task_run():
@@ -41,3 +45,32 @@ def test_nested_scopes_restore_prior_value():
         # still inside the outer scope
         assert in_task_run() is True
     assert in_task_run() is False
+
+
+# ---------------------------------------------------------------------------
+# catalog scoping (#2716)
+# ---------------------------------------------------------------------------
+
+
+def test_default_task_catalog_is_none():
+    assert current_task_catalog() is None
+
+
+def test_task_run_scope_without_catalog_stays_none():
+    with task_run_scope():
+        assert current_task_catalog() is None
+
+
+def test_task_run_scope_records_declared_catalog():
+    assert current_task_catalog() is None
+    with task_run_scope(catalog="cat-x"):
+        assert current_task_catalog() == "cat-x"
+    assert current_task_catalog() is None
+
+
+def test_nested_scope_restores_prior_catalog():
+    with task_run_scope(catalog="outer-cat"):
+        assert current_task_catalog() == "outer-cat"
+        with task_run_scope(catalog="inner-cat"):
+            assert current_task_catalog() == "inner-cat"
+        assert current_task_catalog() == "outer-cat"
