@@ -257,6 +257,26 @@ class TasksPluginConfig(ExposableConfigMixin, PluginConfig):
         ),
     )
 
+    storage_drain_batch_size: Mutable[int] = Field(
+        default=100,
+        ge=1,
+        le=10_000,
+        description=(
+            "Rows storage_drain claims (and hydrates) per drain cycle. "
+            "Id-only obligations (#2494 P1) are re-read from canonical PG "
+            "state and built into full documents for the WHOLE claimed "
+            "batch before the bulk dispatch, so peak memory scales with "
+            "batch_size x document size — 1500 multi-MB geometries "
+            "OOM-killed both the serving workers and the 2Gi async_writer "
+            "job (#2723). The default of 100 bounds the hydration spike for "
+            "MB-scale features while keeping small-feature throughput "
+            "reasonable (the drain loops until the outbox is empty either "
+            "way). Read once per drain run via the platform configs "
+            "hot-reload path; no restart required. Byte-aware capping "
+            "remains open under #2723."
+        ),
+    )
+
     items_secondary_via_storage_plane: Mutable[bool] = Field(
         default=False,
         description=(

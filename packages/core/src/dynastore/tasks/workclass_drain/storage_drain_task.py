@@ -72,8 +72,11 @@ _BACKOFF_SECONDS: List[int] = [1, 5, 30, 5 * 60, 30 * 60]
 # reclaim by any drain worker.
 _DEFAULT_LEASE_SECONDS: int = 300
 
-# Default claim batch size.
-_DEFAULT_BATCH_SIZE: int = 1500
+# Default claim batch size. Matches TasksPluginConfig.storage_drain_batch_size:
+# id-only rows (#2494 P1) hydrate to full canonical documents for the whole
+# claimed batch before the bulk dispatch, so the claim size bounds peak memory.
+# The previous 1500 OOM-killed 2Gi containers on MB-scale geometries (#2723).
+_DEFAULT_BATCH_SIZE: int = 100
 
 # The well-known driver_id for the Elasticsearch items secondary-index driver.
 # Resolution is config-scoped via the storage driver registry (populated from
@@ -180,10 +183,17 @@ class StorageDrainTask(TaskProtocol):
         # Stable owner_id for the lifetime of this run — used as the
         # ``claimed_by`` stamp and the CAS guard on terminal writes.
         owner_id = f"storage_drain:{uuid4()}"
+        # Hot-reloaded claim size, resolved once per run: id-only rows
+        # hydrate to full canonical documents for the whole claimed batch
+        # before the bulk dispatch, so this bounds the run's peak memory
+        # (#2723 — 1500 MB-scale features OOM-killed the host container).
+        batch_size = await self._resolve_batch_size()
         total = 0
         try:
             while True:
-                n = await self.drain_once(engine=engine, owner_id=owner_id)
+                n = await self.drain_once(
+                    engine=engine, owner_id=owner_id, batch_size=batch_size,
+                )
                 total += n
                 if n == 0:
                     break
@@ -207,8 +217,45 @@ class StorageDrainTask(TaskProtocol):
 
         return report
 
-    async def drain_once(self, *, engine: Any, owner_id: str) -> int:
+    async def _resolve_batch_size(self) -> int:
+        """Resolve ``TasksPluginConfig.storage_drain_batch_size``, hot-reloaded.
+
+        Mirrors the resolution pattern of
+        ``index_dispatcher._storage_plane_routing_enabled``: falls back to
+        the instance default (constructor value, itself matching the field
+        default) when the platform configs protocol is unavailable — early
+        startup, lightweight worker contexts, tests.
+        """
+        try:
+            from dynastore.models.protocols.platform_configs import (
+                PlatformConfigsProtocol,
+            )
+            from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+            from dynastore.tools.discovery import get_protocol
+
+            config_mgr = get_protocol(PlatformConfigsProtocol)
+            if config_mgr is not None:
+                cfg = await config_mgr.get_config(TasksPluginConfig)
+                if isinstance(cfg, TasksPluginConfig):
+                    return int(cfg.storage_drain_batch_size)
+        except Exception:  # noqa: BLE001 — config read is best-effort
+            logger.debug(
+                "StorageDrainTask: storage_drain_batch_size unavailable — "
+                "falling back to the instance default (%d).",
+                self.batch_size,
+                exc_info=True,
+            )
+        return self.batch_size
+
+    async def drain_once(
+        self, *, engine: Any, owner_id: str, batch_size: Optional[int] = None,
+    ) -> int:
         """Claim one batch, process, apply fenced outcomes; return rows handled.
+
+        ``batch_size`` overrides the instance default for this cycle (the
+        hot-reloaded ``TasksPluginConfig.storage_drain_batch_size`` value,
+        resolved once per run); ``None`` keeps ``self.batch_size`` so
+        internal callers and existing tests are unaffected.
 
         Whole-batch indexer exception: every row is funnelled to the
         retry path so a flaky indexer can never lose data.  Per-row
@@ -228,6 +275,7 @@ class StorageDrainTask(TaskProtocol):
             engine=engine,
             task_schema=task_schema,
             owner_id=owner_id,
+            batch_size=batch_size if batch_size is not None else self.batch_size,
         )
         if not rows:
             return 0
@@ -312,6 +360,7 @@ class StorageDrainTask(TaskProtocol):
         engine: Any,
         task_schema: str,
         owner_id: str,
+        batch_size: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Claim a batch of ready/stale rows; return them as raw dicts.
 
@@ -353,7 +402,7 @@ class StorageDrainTask(TaskProtocol):
             ).execute(
                 conn,
                 lease_seconds=self.lease_seconds,
-                batch_size=self.batch_size,
+                batch_size=batch_size if batch_size is not None else self.batch_size,
                 owner_id=owner_id,
             )
 
