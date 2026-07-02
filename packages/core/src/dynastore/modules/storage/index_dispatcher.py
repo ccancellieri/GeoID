@@ -175,6 +175,13 @@ class TaskTableOutboxWriter:
     The dedup_key is a stable hash of
     ``(indexer_id, entity_type, entity_id, op_type)`` so concurrent
     failures on the same item don't fan-out into multiple retry rows.
+
+    Deprecated: ``get_index_dispatcher()`` no longer wires this writer as
+    the default ``OUTBOX`` handler — see :class:`StoragePlaneOutboxWriter`,
+    which enqueues into the unified ``tasks.storage`` outbox instead. This
+    class stays importable/testable for the migration window (already
+    running deployments may still hold a reference to it) but new code
+    should not construct it as the dispatcher's ``outbox``.
     """
 
     TASK_TYPE = "index_propagation"
@@ -383,6 +390,106 @@ class TaskTableOutboxWriter:
         )
 
 
+class StoragePlaneOutboxWriter:
+    """Outbox backed by the storage-plane ``tasks.storage`` table.
+
+    Replaces :class:`TaskTableOutboxWriter` as the ``OUTBOX`` failure-
+    policy handler (un-fao/GeoID#2732 step 1) — the same durable-retry
+    concept, on the plane ``storage_drain`` already drains, instead of a
+    second ``tasks.tasks`` outbox living behind ``index_propagation``.
+
+    Writes id-only rows via :func:`~dynastore.modules.storage.storage_emit.enqueue_storage_op_id_only`
+    on the caller's PG connection so the enqueue commits / rolls back
+    atomically with the upstream data write (same co-transactionality
+    contract as the legacy writer). Upsert rows carry no payload — the
+    drain re-reads canonical PG state at replay time, which is fresher
+    than a payload frozen at enqueue time. Delete rows are written with
+    ``op='delete'``: the drain's id-only canonical-reread branch only
+    fires for ``op == 'upsert'``, so a delete replays as an actual
+    delete, never as a doc rebuild.
+
+    ``chunk_size`` is accepted for :class:`OutboxWriterProtocol`
+    compatibility but unused — the storage plane already writes one row
+    per op, so there is no oversized-JSONB-blob concern to chunk against.
+    ``last_error`` has no dedicated column on ``tasks.storage``; it is
+    logged instead of persisted (the row itself is enough for the drain
+    to retry — operator triage reads the log line for the reason).
+    """
+
+    async def enqueue(
+        self,
+        *,
+        indexer_id: str,
+        ctx: IndexContext,
+        ops: Sequence[IndexOp],
+        last_error: Optional[str] = None,
+        chunk_size: Optional[int] = None,
+    ) -> None:
+        if not ops:
+            return
+        if ctx.pg_conn is None:
+            # Without a caller TX we can't honour the atomicity guarantee —
+            # same degrade as TaskTableOutboxWriter.enqueue.
+            sample = ops[0]
+            logger.warning(
+                "StoragePlaneOutboxWriter: ctx.pg_conn is None — skipping "
+                "outbox enqueue for indexer '%s' on %s/%s/%s (+%d more). "
+                "Caller must pass an open PG connection on IndexContext "
+                "for the OUTBOX policy to be durable.",
+                indexer_id, sample.op_type, sample.entity_type,
+                sample.entity_id, max(len(ops) - 1, 0),
+            )
+            return
+
+        from dynastore.models.protocols.indexing import OutboxRecord
+        from dynastore.modules.storage.driver_instance_id import (
+            compute_driver_instance_id,
+        )
+        from dynastore.modules.storage.storage_emit import (
+            enqueue_storage_op_id_only,
+        )
+        from dynastore.tools.identifiers import generate_uuidv7
+
+        collection_id = ctx.collection or ""
+        records = [
+            OutboxRecord(
+                op_id=generate_uuidv7(),
+                driver_id=indexer_id,
+                driver_instance_id=compute_driver_instance_id(
+                    indexer_id, ctx.catalog, collection_id,
+                ),
+                collection_id=collection_id,
+                op=cast(Any, op.op_type),
+                item_id=op.entity_id,
+                payload={},
+                idempotency_key=op.entity_id,
+            )
+            for op in ops
+        ]
+        logger.info(
+            "index_chunk_emitted indexer=%s source=storage_plane_outbox "
+            "catalog=%s collection=%s chunk_size=%d",
+            indexer_id, ctx.catalog, ctx.collection, len(records),
+        )
+        if last_error:
+            logger.warning(
+                "StoragePlaneOutboxWriter: enqueueing %d op(s) for indexer "
+                "'%s' (catalog=%s collection=%s) after inline failure: %s",
+                len(records), indexer_id, ctx.catalog, ctx.collection,
+                last_error,
+            )
+        _log_dispatch_path(
+            mode="outbox_handoff",
+            indexer_id=indexer_id,
+            catalog=ctx.catalog,
+            collection=ctx.collection,
+            chunk_size=len(records),
+        )
+        await enqueue_storage_op_id_only(
+            ctx.pg_conn, catalog_id=ctx.catalog, rows=records,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Default factory — wires the dispatcher against the live routing config
 # and the protocol-discovery indexer registry
@@ -568,7 +675,7 @@ def _make_default_indexer_registry():
 
 def get_index_dispatcher() -> IndexDispatcher:
     """Process-wide singleton dispatcher — reuses live resolvers +
-    :class:`TaskTableOutboxWriter` for the ``OUTBOX`` failure path +
+    :class:`StoragePlaneOutboxWriter` for the ``OUTBOX`` failure path +
     a per-indexer :class:`CircuitBreaker`.
     """
     global _DEFAULT_DISPATCHER
@@ -578,7 +685,7 @@ def get_index_dispatcher() -> IndexDispatcher:
         _DEFAULT_DISPATCHER = IndexDispatcher(
             routing_resolver=_make_default_routing_resolver(),
             indexer_registry=_make_default_indexer_registry(),
-            outbox=TaskTableOutboxWriter(),
+            outbox=StoragePlaneOutboxWriter(),
             breaker=CircuitBreaker(),
         )
     return _DEFAULT_DISPATCHER

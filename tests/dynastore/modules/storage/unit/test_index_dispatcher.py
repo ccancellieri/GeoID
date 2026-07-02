@@ -34,7 +34,8 @@ from dynastore.models.protocols.indexer import (
 )
 from dynastore.modules.storage.index_dispatcher import (
     INLINE_DISPATCH_CHUNK_SIZE, IndexDispatcher, IndexerFatal,
-    TaskTableOutboxWriter, get_index_dispatcher, reset_index_dispatcher,
+    StoragePlaneOutboxWriter, TaskTableOutboxWriter, get_index_dispatcher,
+    reset_index_dispatcher,
 )
 from dynastore.modules.storage.routing_config import (
     FailurePolicy, Operation, OperationDriverEntry, WriteMode,
@@ -728,6 +729,180 @@ async def test_outbox_policy_with_writer_enqueues_on_failure():
     # Outbox row was written on the caller's connection.
     assert len(writer.rows) == 1
     assert "INSERT INTO tasks.tasks" in writer.rows[0]["sql"]
+
+
+# ---------------------------------------------------------------------------
+# StoragePlaneOutboxWriter — replaces TaskTableOutboxWriter as the default
+# OUTBOX failure-policy handler (un-fao/GeoID#2732 step 1: index_propagation
+# consolidation).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_storage_plane_outbox_writer_skips_when_no_pg_conn(caplog):
+    """Same atomicity guard as TaskTableOutboxWriter: no open TX means the
+    enqueue can't be made durable, so it degrades to a warning instead of
+    silently writing a non-atomic row."""
+    import logging as _logging
+
+    writer = StoragePlaneOutboxWriter()
+    with caplog.at_level(_logging.WARNING):
+        await writer.enqueue(
+            indexer_id="x", ctx=_ctx(), ops=[_op()], last_error="boom",
+        )
+    assert any("ctx.pg_conn is None" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_storage_plane_outbox_writer_enqueues_id_only_row_on_upsert_failure(
+    monkeypatch,
+):
+    """An inline upsert failure enqueues an id-only tasks.storage row — the
+    drain re-reads canonical PG state at replay time instead of replaying a
+    payload frozen at enqueue time."""
+    calls = _patch_storage_emit_recorder(monkeypatch)
+    writer = StoragePlaneOutboxWriter()
+    ctx = IndexContext(
+        catalog="cat-x", collection="col-y", correlation_id="cid-1",
+        pg_conn=object(),
+    )
+    await writer.enqueue(
+        indexer_id="items_elasticsearch_driver",
+        ctx=ctx,
+        ops=[_op(op_type="upsert", entity_id="item-1")],
+        last_error="ES timeout",
+    )
+    assert len(calls) == 1
+    assert calls[0]["catalog_id"] == "cat-x"
+    rows = calls[0]["rows"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.driver_id == "items_elasticsearch_driver"
+    assert row.op == "upsert"
+    assert row.item_id == "item-1"
+    assert row.collection_id == "col-y"
+
+
+@pytest.mark.asyncio
+async def test_storage_plane_outbox_writer_maps_delete_op_to_delete_row(
+    monkeypatch,
+):
+    """A delete-op inline failure must enqueue an actual delete row — never
+    an id-only upsert, which would make the drain rebuild a doc for an item
+    that's supposed to be removed from the index."""
+    calls = _patch_storage_emit_recorder(monkeypatch)
+    writer = StoragePlaneOutboxWriter()
+    ctx = IndexContext(
+        catalog="cat-x", collection="col-y", correlation_id="cid-1",
+        pg_conn=object(),
+    )
+    await writer.enqueue(
+        indexer_id="items_elasticsearch_driver",
+        ctx=ctx,
+        ops=[_op(op_type="delete", entity_id="item-1")],
+    )
+    assert len(calls) == 1
+    row = calls[0]["rows"][0]
+    assert row.op == "delete"
+    assert row.item_id == "item-1"
+
+
+@pytest.mark.asyncio
+async def test_storage_plane_outbox_writer_empty_ops_is_noop(monkeypatch):
+    calls = _patch_storage_emit_recorder(monkeypatch)
+    writer = StoragePlaneOutboxWriter()
+    await writer.enqueue(
+        indexer_id="x",
+        ctx=IndexContext(catalog="cat", collection="col", pg_conn=object()),
+        ops=[],
+    )
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_outbox_policy_with_storage_plane_writer_enqueues_on_failure(
+    monkeypatch,
+):
+    """OUTBOX policy + the storage-plane writer wired as ``outbox`` writes a
+    tasks.storage row on inline failure and never produces an
+    index_propagation (tasks.tasks) row."""
+    calls = _patch_storage_emit_recorder(monkeypatch)
+    a = _StubIndexer("a", raise_on="upsert")
+    ctx_with_conn = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    routing = _StubRouting([_entry("a", on_failure=FailurePolicy.OUTBOX)])
+
+    async def routing_resolver(catalog, collection):
+        return routing
+
+    async def indexer_registry(indexer_id):
+        return {"a": a}.get(indexer_id)
+
+    dispatcher = IndexDispatcher(
+        routing_resolver=routing_resolver,
+        indexer_registry=indexer_registry,
+        outbox=StoragePlaneOutboxWriter(),
+    )
+    await dispatcher.fan_out_bulk(ctx_with_conn, [_op()])
+
+    # Indexer was attempted once (and raised).
+    assert len(a.bulk_calls) == 1
+    # Storage-plane row was written on the caller's connection — one call,
+    # one row, correct driver_id/op/entity_id.
+    assert len(calls) == 1
+    row = calls[0]["rows"][0]
+    assert row.driver_id == "a"
+    assert row.item_id == "item-1"
+    assert row.op == "upsert"
+
+
+@pytest.mark.asyncio
+async def test_outbox_policy_delete_failure_enqueues_storage_plane_delete_row(
+    monkeypatch,
+):
+    calls = _patch_storage_emit_recorder(monkeypatch)
+    a = _StubIndexer("a", raise_on="delete")
+    ctx_with_conn = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    routing = _StubRouting([_entry("a", on_failure=FailurePolicy.OUTBOX)])
+
+    async def routing_resolver(catalog, collection):
+        return routing
+
+    async def indexer_registry(indexer_id):
+        return {"a": a}.get(indexer_id)
+
+    dispatcher = IndexDispatcher(
+        routing_resolver=routing_resolver,
+        indexer_registry=indexer_registry,
+        outbox=StoragePlaneOutboxWriter(),
+    )
+    await dispatcher.fan_out_bulk(
+        ctx_with_conn, [_op(op_type="delete", entity_id="item-1")],
+    )
+
+    assert len(calls) == 1
+    row = calls[0]["rows"][0]
+    assert row.op == "delete"
+    assert row.item_id == "item-1"
+
+
+@pytest.mark.asyncio
+async def test_default_dispatcher_wires_storage_plane_outbox_writer():
+    """un-fao/GeoID#2732 step 1: the process-wide default dispatcher's
+    OUTBOX handler is the storage-plane writer, not TaskTableOutboxWriter —
+    fresh writes must never produce index_propagation rows."""
+    await reset_index_dispatcher()
+    dispatcher = get_index_dispatcher()
+    try:
+        assert isinstance(dispatcher._outbox, StoragePlaneOutboxWriter)
+        assert not isinstance(dispatcher._outbox, TaskTableOutboxWriter)
+    finally:
+        await reset_index_dispatcher()
 
 
 @pytest.mark.asyncio

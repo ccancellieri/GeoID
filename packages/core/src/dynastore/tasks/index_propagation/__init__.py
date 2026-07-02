@@ -19,15 +19,24 @@
 """Index-propagation task — surgical per-item retry path for the OUTBOX
 failure policy.
 
+DEPRECATED (un-fao/GeoID#2732 step 1): the ``IndexDispatcher`` no longer
+enqueues rows of this task type — ``on_failure=OUTBOX`` now enqueues into
+the storage-plane outbox (``tasks.storage``, drained by ``storage_drain``)
+instead. This package remains only so rows enqueued before the cutover
+still drain during the migration window; see
+:class:`~dynastore.modules.storage.index_dispatcher.StoragePlaneOutboxWriter`
+for the current producer.
+
 Decoupled from the heavy ``elasticsearch_indexer`` Cloud Run Job:
 
 * ``elasticsearch_indexer`` (existing) — operator-triggered full
   collection / catalog rebuild.  Runs as a Cloud Run Job.
 
-* ``index_propagation`` (this task) — single-item retry, enqueued by the
+* ``index_propagation`` (this task, deprecated) — single-item retry,
+  formerly enqueued by the
   :class:`~dynastore.modules.storage.index_dispatcher.IndexDispatcher`
   in the same PG transaction as the upstream data write when an
-  in-process indexer call fails with ``on_failure=OUTBOX``.  Drained by
+  in-process indexer call failed with ``on_failure=OUTBOX``.  Drained by
   the regular tasks worker pool — no dedicated infrastructure.
 
 Both task types operate on the same generic

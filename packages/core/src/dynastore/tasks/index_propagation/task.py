@@ -18,14 +18,23 @@
 
 """``index_propagation`` task — runs one ``Indexer.index_bulk(ctx, ops)`` call.
 
-Enqueued by :class:`~dynastore.modules.storage.index_dispatcher.OutboxWriter`
-when an in-process indexer attempt fails under ``FailurePolicy.OUTBOX``.
-The task row lives in the same ``tasks.tasks`` table as every other
-durable task; the dispatcher's drain semantics (``claim_batch`` →
-``complete_task`` / ``fail_task``) provide retry-with-DLQ for free.
+DEPRECATED (un-fao/GeoID#2732 step 1): ``IndexDispatcher`` no longer
+enqueues rows of this task type. ``FailurePolicy.OUTBOX`` now enqueues
+into the storage-plane outbox (``tasks.storage``, drained by
+``storage_drain``) via
+:class:`~dynastore.modules.storage.index_dispatcher.StoragePlaneOutboxWriter`
+instead of :class:`~dynastore.modules.storage.index_dispatcher.TaskTableOutboxWriter`.
 
-The inputs always carry a list of ops — a single-row replay is just a
-list of length 1.
+This task class and its handler stay registered for a migration window
+so any ``index_propagation`` row enqueued before the cutover still
+drains to completion. Once no such rows remain in production, this
+module and ``TaskTableOutboxWriter`` can be removed.
+
+Historical behaviour (for rows already queued): the task row lives in
+the same ``tasks.tasks`` table as every other durable task; the
+dispatcher's drain semantics (``claim_batch`` -> ``complete_task`` /
+``fail_task``) provide retry-with-DLQ for free. The inputs always carry
+a list of ops — a single-row replay is just a list of length 1.
 """
 
 from __future__ import annotations
@@ -108,6 +117,10 @@ def registered_indexer_ids() -> List[str]:
 
 class IndexPropagationTask(TaskProtocol):
     """Drain one outbox row by re-invoking the target ``Indexer.index_bulk``.
+
+    DEPRECATED: no new rows of this task type are produced (see the
+    module docstring). Kept registered only so rows enqueued before the
+    storage-plane cutover still drain during the migration window.
 
     The runner re-resolves the :class:`Indexer` instance from the
     protocol registry by ``indexer_id`` — so a backend swap (e.g. ES →
