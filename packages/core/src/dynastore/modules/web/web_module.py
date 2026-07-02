@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Dict, Any, Callable, List, Optional
 from contextlib import asynccontextmanager
 
+from dynastore.tools.http_cache import cache_control_headers, generate_strong_etag
 from dynastore.tools.language_utils import resolve_localized_field
 from dynastore.modules import ModuleProtocol, get_protocols
 from dynastore.models.protocols.web import WebModuleProtocol, WebPageProtocol, StaticFilesProtocol, WebOverrideProtocol
@@ -403,21 +404,13 @@ class WebModule(WebModuleProtocol, ModuleProtocol):
             
         return "\n".join(content_parts)
 
-    def generate_etag(self, content: Any) -> str:
-        """Generates an ETag for the given content."""
-        import hashlib
-        if isinstance(content, str):
-            content = content.encode("utf-8")
-        elif not isinstance(content, bytes):
-            content = str(content).encode("utf-8")
-        return hashlib.md5(content).hexdigest()
+    def generate_etag(self, content_parts: List[bytes]) -> str:
+        """Generates a quoted RFC 7232 strong ETag for the given content parts."""
+        return generate_strong_etag(content_parts)
 
     def get_cache_headers(self, max_age: int = 3600) -> Dict[str, str]:
         """Returns standard cache-control headers. Callers set ETag separately."""
-        return {
-            "Cache-Control": f"public, max-age={max_age}, stale-while-revalidate=60",
-            "Vary": "Accept-Encoding",
-        }
+        return cache_control_headers(max_age)
 
 
     def list_static_prefix_info(self) -> List[Dict[str, str]]:

@@ -18,7 +18,6 @@
 
 import asyncio
 import os
-import hashlib
 import itertools
 import logging
 import re
@@ -40,6 +39,7 @@ from dynastore.models.auth import Condition
 from dynastore.models.protocols.authorization import IamRolesConfig
 from dynastore.models.protocols.policies import Policy, Role, Principal
 from dynastore.tools.discovery import get_protocol, get_protocols, register_plugin
+from dynastore.tools.http_cache import cache_control_headers, generate_strong_etag
 from dynastore.extensions.tools.language_utils import get_language
 
 # Register public access policy for web extension
@@ -562,18 +562,12 @@ class Web(ExtensionProtocol, OGCServiceMixin):
 
     def generate_etag(self, content_parts: List[bytes]) -> str:
         """Generates a strong ETag for a list of content parts."""
-        hasher = hashlib.md5()
-        for part in content_parts:
-            hasher.update(part)
-        return f'"{hasher.hexdigest()}"'
+        return generate_strong_etag(content_parts)
 
     def get_cache_headers(self, max_age: Optional[int] = None) -> Dict[str, str]:
         """Provides default cache control headers."""
         eff_max_age = max_age if max_age is not None else self.DEFAULT_CACHE_MAX_AGE
-        return {
-            "Cache-Control": f"public, max-age={eff_max_age}, stale-while-revalidate=60",
-            "Vary": "Accept-Encoding",
-        }
+        return cache_control_headers(eff_max_age)
 
     def configure_app(self, app: FastAPI):
         """Configures global settings like middleware and CORS."""
