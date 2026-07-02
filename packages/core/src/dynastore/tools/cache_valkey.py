@@ -880,6 +880,67 @@ class ValkeyCacheBackend:
             )
             return False
 
+    # ------------------------------------------------------------------
+    # ListCacheBackend extension protocol (#2833)
+    # ------------------------------------------------------------------
+    #
+    # Bounded FIFO primitives backing the Valkey-buffered log producer/
+    # drainer. Mirrors the ``CountingCacheBackend`` primitives above: no
+    # parallel client, raises on failure (rather than swallowing) so the
+    # caller — the producer's push-then-fallback seam, or the drainer's
+    # tick — can react to Valkey trouble itself.
+
+    async def rpush_trimmed(
+        self,
+        key: str,
+        values: List[bytes],
+        *,
+        max_len: int,
+    ) -> int:
+        full = self._key(key)
+        if not values:
+            return 0
+        try:
+            new_len = await self._client.rpush(full, *values)
+            self._record_success()
+        except Exception:
+            self._record_failure()
+            logger.warning(
+                "ValkeyCacheBackend.rpush_trimmed failed (key=%s)", full, exc_info=True
+            )
+            raise
+        # Not atomic with the RPUSH above — under concurrent producers the
+        # list may transiently exceed max_len by a few entries; the next
+        # push's trim self-heals it. Acceptable for an ephemeral log queue
+        # (losing a few extra entries is fine; blocking producers is not).
+        dropped = max(0, int(new_len) - max_len)
+        if dropped:
+            try:
+                await self._client.ltrim(full, -max_len, -1)
+                self._record_success()
+            except Exception:
+                self._record_failure()
+                logger.warning(
+                    "ValkeyCacheBackend.rpush_trimmed: ltrim failed (key=%s)",
+                    full, exc_info=True,
+                )
+        return dropped
+
+    async def lpop_many(self, key: str, count: int) -> List[bytes]:
+        full = self._key(key)
+        try:
+            result = await self._client.lpop(full, count)
+            self._record_success()
+        except Exception:
+            self._record_failure()
+            logger.warning(
+                "ValkeyCacheBackend.lpop_many failed (key=%s)", full, exc_info=True
+            )
+            raise
+        if not result:
+            return []
+        return list(result)
+
     async def ping(self) -> bool:
         """Health check — verify Valkey connectivity."""
         try:

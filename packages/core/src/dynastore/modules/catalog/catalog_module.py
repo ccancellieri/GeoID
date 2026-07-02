@@ -681,6 +681,26 @@ class CatalogModule(ModuleProtocol):
                 )
 
             try:
+                from dynastore.modules.catalog.log_drainer import LogDrainer
+                from dynastore.modules.catalog.log_service_config import (
+                    load as load_log_service_config,
+                )
+
+                log_service_cfg = await load_log_service_config()
+                bg_supervisor.register(LogDrainer(log_service_cfg))
+                logger.info(
+                    "CatalogModule: log drainer registered (interval=%ss).",
+                    log_service_cfg.valkey_drain_interval_seconds,
+                )
+            except Exception as exc:  # noqa: BLE001 — never block startup
+                logger.warning(
+                    "CatalogModule: log drainer failed to configure: %s — "
+                    "Valkey-buffered logs will not be drained (the direct-"
+                    "to-backend dispatch fallback still writes logs).",
+                    exc,
+                )
+
+            try:
                 lifecycle_reaper_cfg = await load_lifecycle_reaper_config()
                 bg_supervisor.register(LifecycleReaper(lifecycle_reaper_cfg))
                 logger.info(

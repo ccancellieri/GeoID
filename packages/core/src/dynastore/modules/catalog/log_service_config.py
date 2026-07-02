@@ -92,6 +92,54 @@ class LogServiceConfig(PluginConfig):
         ),
     )
 
+    # -------------------------------------------------------------------
+    # Valkey-buffered producer/drainer (#2833) — appended at the end of
+    # the class; keep new fields below this point.
+    # -------------------------------------------------------------------
+
+    valkey_queue_key: Mutable[str] = Field(
+        default="logs:queue",
+        description=(
+            "Valkey list key the log producer RPUSHes serialized batches "
+            "onto and the log drainer LPOPs from. Namespaced further by "
+            "ValkeyCacheBackend's own key prefix. Read hot on every "
+            "buffered flush and every drainer tick."
+        ),
+    )
+
+    valkey_queue_max_len: Mutable[int] = Field(
+        default=20_000,
+        ge=100,
+        le=1_000_000,
+        description=(
+            "Hard cap on the shared Valkey log queue. Once exceeded, the "
+            "oldest entries are LTRIM-dropped (logs are ephemeral — losing "
+            "some under sustained drainer slowness is acceptable; unbounded "
+            "Valkey memory growth is not)."
+        ),
+    )
+
+    valkey_drain_interval_seconds: Mutable[float] = Field(
+        default=2.0,
+        ge=0.5,
+        le=60.0,
+        description=(
+            "Cadence (seconds) of the leader-elected log drainer's tick. "
+            "Lower values reduce end-to-end log latency and queue depth; "
+            "higher values reduce ES bulk request frequency."
+        ),
+    )
+
+    valkey_drain_chunk_size: Mutable[int] = Field(
+        default=500,
+        ge=1,
+        le=10_000,
+        description=(
+            "Maximum entries the drainer LPOPs per chunk. Bounds the size "
+            "of a single ES bulk request the drainer issues per pop."
+        ),
+    )
+
 
 # Auto-registers via PluginConfig.__init_subclass__.
 

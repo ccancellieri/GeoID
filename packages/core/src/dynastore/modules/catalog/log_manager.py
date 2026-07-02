@@ -17,6 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, AsyncGenerator
@@ -75,6 +76,114 @@ class LogEntryCreate(BaseModel):
     id: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+
+# ---------------------------------------------------------------------------
+# Valkey-buffered producer/drainer (#2833)
+#
+# ``LogService._dispatch_to_backends`` is the single seam both the buffered
+# aggregator flush and an ``immediate=True`` write go through. Buffered
+# flushes try RPUSHing the batch onto a shared, bounded Valkey list first —
+# one leader-elected drainer (``log_drainer.py``) then LPOPs chunks and
+# calls ``write_batch_to_backends`` below, giving ES one writer instead of
+# one per pod under a write burst. Any Valkey trouble (unavailable, no
+# ListCacheBackend registered, RPUSH error) falls through to dispatching
+# straight to the backends — the original #2749 behavior — so producers
+# never block on Valkey. ``immediate=True`` writes always go straight to
+# the backend: they exist for Cloud Run scale-to-zero reliability
+# (log_event's docstring), and parking one in a queue that may not drain
+# before the instance dies would defeat that purpose.
+# ---------------------------------------------------------------------------
+
+_QUEUE_DROP_WARNING_COOLDOWN = 30.0  # seconds — mirrors AsyncBufferAggregator
+_queue_dropped_since_warning = 0
+_last_queue_drop_warning = 0.0
+
+
+def _warn_queue_drop(dropped: int) -> None:
+    """Rate-limited warning for Valkey queue LTRIM drops (mirrors
+    ``AsyncBufferAggregator``'s bounded-buffer drop warning: one summary
+    line per cooldown window instead of one per push under sustained
+    drainer slowness)."""
+    global _queue_dropped_since_warning, _last_queue_drop_warning
+    _queue_dropped_since_warning += dropped
+    now = time.monotonic()
+    if now - _last_queue_drop_warning >= _QUEUE_DROP_WARNING_COOLDOWN:
+        logger.warning(
+            "LogService: Valkey log queue at cap — dropped %d oldest entr%s "
+            "in the last %.0fs (drainer too slow to keep up).",
+            _queue_dropped_since_warning,
+            "y" if _queue_dropped_since_warning == 1 else "ies",
+            _QUEUE_DROP_WARNING_COOLDOWN,
+        )
+        _last_queue_drop_warning = now
+        _queue_dropped_since_warning = 0
+
+
+async def write_batch_to_backends(entries: List[LogEntryCreate]) -> None:
+    """Fan out ``entries`` directly to every registered ``LogBackendProtocol``.
+
+    The actual backend-dispatch primitive: called by
+    ``LogService._dispatch_to_backends`` when Valkey is unavailable/errors
+    (or for an ``immediate`` write) and by the Valkey drainer
+    (``log_drainer.py``) after popping a chunk off the shared queue — one
+    code path, so ES sees the same ``write_batch`` behavior regardless of
+    which route a batch arrived by.
+    """
+    if not entries:
+        return
+
+    from dynastore.models.protocols.logs import LogBackendProtocol
+
+    backends = get_protocol(LogBackendProtocol)
+    if not backends:
+        logger.debug(
+            "LogService: no LogBackendProtocol registered; %d entries dropped.",
+            len(entries),
+        )
+        return
+
+    # get_protocol may return a single instance or a list; normalize to list
+    backend_list = [backends] if not isinstance(backends, list) else backends
+    for backend in backend_list:
+        try:
+            result = await backend.write_batch(entries)
+            logger.debug("Log backend '%s' result: %s", backend.name, result)
+        except Exception as exc:
+            logger.warning("Log backend '%s' failed: %s", backend.name, exc)
+
+
+async def _push_to_valkey_queue(entries: List[LogEntryCreate]) -> bool:
+    """Best-effort producer: RPUSH ``entries`` onto the shared Valkey queue.
+
+    Returns ``True`` if the push succeeded (caller must not also dispatch
+    directly), ``False`` if Valkey is unavailable, the active cache backend
+    has no list ops, or the push itself failed — the caller falls back to
+    direct dispatch in every ``False`` case. Never raises.
+    """
+    try:
+        from dynastore.tools.cache import get_cache_manager
+        from dynastore.models.protocols.cache import ListCacheBackend
+        from dynastore.modules.catalog.log_service_config import load as load_log_config
+
+        backend = get_cache_manager().get_async_backend()
+        if not isinstance(backend, ListCacheBackend):
+            return False
+
+        cfg = await load_log_config()
+        values = [entry.model_dump_json().encode("utf-8") for entry in entries]
+        dropped = await backend.rpush_trimmed(
+            cfg.valkey_queue_key, values, max_len=cfg.valkey_queue_max_len
+        )
+        if dropped:
+            _warn_queue_drop(dropped)
+        return True
+    except Exception as exc:
+        logger.debug(
+            "LogService: Valkey queue push failed (%s); falling back to "
+            "direct-to-backend dispatch.", exc,
+        )
+        return False
 
 
 # --- Log Service (similar to StatsService) ---
@@ -151,36 +260,30 @@ class LogService(ProtocolPlugin[Any], LogsProtocol):
     def _backend_available(self) -> bool:
         return bool(get_protocol(self._get_backend_protocol()))
 
-    async def _dispatch_to_backends(self, entries: List[LogEntryCreate]) -> None:
+    async def _dispatch_to_backends(
+        self, entries: List[LogEntryCreate], *, immediate: bool = False
+    ) -> None:
         """Write a chunk of entries to every registered ``LogBackendProtocol``.
 
         Single seam for backend dispatch — both the buffered flush
         (``_flush_batch``) and an ``immediate=True`` call go through here.
-        This is also the intended integration point for a future
-        Valkey-buffered producer (push the chunk to a bounded list instead
-        of calling backends directly, with a separate drainer popping
-        batches into ``write_batch``) without touching the aggregator or
-        ``log_event`` — deferred out of this change, see #2749 follow-up.
+
+        Producer/drainer split (#2833): a buffered flush (``immediate=
+        False``) first tries pushing the batch onto the shared Valkey queue
+        (:func:`_push_to_valkey_queue`) so a single leader-elected drainer
+        (``log_drainer.py``) does the ES write instead of every pod. Any
+        Valkey trouble falls through to :func:`write_batch_to_backends`
+        below — the original #2749 direct-dispatch behavior, and always
+        the path for ``immediate`` writes (see :meth:`log_event`'s
+        docstring for why those must never be queued).
         """
         if not entries:
             return
 
-        backends = get_protocol(self._get_backend_protocol())
-        if not backends:
-            logger.debug(
-                "LogService: no LogBackendProtocol registered; %d entries dropped.",
-                len(entries),
-            )
+        if not immediate and await _push_to_valkey_queue(entries):
             return
 
-        # get_protocol may return a single instance or a list; normalize to list
-        backend_list = [backends] if not isinstance(backends, list) else backends
-        for backend in backend_list:
-            try:
-                result = await backend.write_batch(entries)
-                logger.debug("Log backend '%s' result: %s", backend.name, result)
-            except Exception as exc:
-                logger.warning("Log backend '%s' failed: %s", backend.name, exc)
+        await write_batch_to_backends(entries)
 
     async def _flush_batch(self, entries: List[LogEntryCreate]):
         """Callback for AsyncBufferAggregator. Dispatches to backends."""
@@ -261,7 +364,7 @@ class LogService(ProtocolPlugin[Any], LogsProtocol):
         )
 
         if immediate:
-            await self._dispatch_to_backends([entry])
+            await self._dispatch_to_backends([entry], immediate=True)
             return entry_id
 
         aggregator = self._aggregator
