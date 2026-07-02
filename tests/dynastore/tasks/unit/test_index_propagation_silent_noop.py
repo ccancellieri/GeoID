@@ -135,3 +135,42 @@ async def test_run_empty_ops_is_not_a_false_positive() -> None:
         result = await IndexPropagationTask().run(_payload([]))
     assert result["status"] == "ok"
     assert result["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_delete_only_noop_is_not_a_false_positive() -> None:
+    """A delete-only batch that legitimately reaches zero/zero (nothing
+    left to delete) mirrors ``IndexDispatcher``'s delete pass-through —
+    it must not be treated as a silent-no-op failure."""
+    fake = _StubIndexer(
+        "StubIndexer",
+        BulkResult(total=1, succeeded=0, failed=0, failures=[]),
+    )
+    delete_ops = [{"entity_id": "e1", "op_type": "delete", "payload": None}]
+    with patch(
+        "dynastore.tasks.index_propagation.task.get_protocols",
+        return_value=[fake],
+    ):
+        result = await IndexPropagationTask().run(_payload(delete_ops))
+    assert result["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_run_raises_on_silent_noop_with_mixed_ops() -> None:
+    """A zero/zero batch that mixes upserts with deletes must still raise
+    — the upsert side is always a failure signal, regardless of the
+    deletes riding along in the same replay row."""
+    fake = _StubIndexer(
+        "StubIndexer",
+        BulkResult(total=2, succeeded=0, failed=0, failures=[]),
+    )
+    mixed_ops = [
+        {"entity_id": "e1", "op_type": "upsert", "payload": {"x": 1}},
+        {"entity_id": "e2", "op_type": "delete", "payload": None},
+    ]
+    with patch(
+        "dynastore.tasks.index_propagation.task.get_protocols",
+        return_value=[fake],
+    ):
+        with pytest.raises(RuntimeError, match="silent no-op"):
+            await IndexPropagationTask().run(_payload(mixed_ops))

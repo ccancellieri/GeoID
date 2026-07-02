@@ -225,14 +225,27 @@ class IndexPropagationTask(TaskProtocol):
 
         result = await target.index_bulk(ctx, ops)
 
-        # #914 / #2666 — same silent no-op trap ``IndexDispatcher._dispatch_bulk``
-        # guards against (indexer accepted the call but wrote nothing, and
-        # raised nothing) also applies on replay. Without this check a replayed
-        # no-op is reported ``status="ok"`` / the task row COMPLETEs, and the
-        # write is silently dropped a second time with no further retry. An
-        # empty ``ops`` list (``total == 0``) is a legitimate, non-noop result
-        # and must not trip this guard.
-        if result.total > 0 and result.succeeded == 0 and result.failed == 0:
+        # #914 / #2666 / #2804 — same silent no-op trap ``IndexDispatcher.
+        # _dispatch_bulk`` guards against (indexer accepted the call but
+        # wrote nothing, and raised nothing) also applies on replay. Without
+        # this check a replayed no-op is reported ``status="ok"`` / the task
+        # row COMPLETEs, and the write is silently dropped a second time
+        # with no further retry. An empty ``ops`` list (``total == 0``) is a
+        # legitimate, non-noop result and must not trip this guard.
+        #
+        # Mirrors the dispatcher's op-type distinction too: a delete-only
+        # batch that legitimately reaches zero/zero (nothing left to
+        # delete) has "its own pass-through" there — it is never
+        # re-enqueued by ``_dispatch_bulk`` in the first place — so a
+        # replayed delete-only no-op is not treated as a failure here
+        # either. An upsert with ``total > 0`` touching zero docs is always
+        # a signal something is wrong, so any batch containing at least one
+        # upsert still trips the guard.
+        has_upsert = any(rec.op_type == "upsert" for rec in inputs.ops)
+        if (
+            result.total > 0 and result.succeeded == 0 and result.failed == 0
+            and has_upsert
+        ):
             raise RuntimeError(
                 f"index_propagation: indexer '{inputs.indexer_id}' returned a "
                 f"silent no-op on replay (total={result.total}, succeeded=0, "
