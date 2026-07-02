@@ -42,6 +42,10 @@ from dynastore.tools.discovery import get_protocol
 from dynastore.modules.db_config import shared_queries
 from dynastore.tools.geospatial import BboxDimensionality, parse_bbox_string
 from dynastore.tools.ogc_common import parse_subset_parameter
+from dynastore.modules.storage.drivers.pg_sidecars import (
+    GeometriesSidecarConfig,
+    driver_sidecars,
+)
 from . import maps_db
 from dynastore.models.localization import LocalizedText
 from .maps_models import MapsLandingPage, DatasetMaps, MapContent, Link
@@ -115,6 +119,32 @@ OGC_API_MAPS_URIS = [
 # renderer (useful for unit testing in dev venvs without osgeo).
 
 # --- Helpers ---
+
+def _resolve_target_srid(layer_config: Any) -> int:
+    """Resolve the render SRID for a collection's config.
+
+    ``target_srid`` used to live on a ``geometry_storage`` field that was
+    removed when the PG driver's sidecar tables became a derived
+    (Computed) ``sidecars`` list (GeoID #2744). We look the geometries
+    sidecar up in that list via ``driver_sidecars()``, which degrades to
+    ``[]`` for non-PG driver configs.
+
+    The sidecars list is legitimately empty in two cases that are NOT
+    errors: a FEATURES/VECTOR collection that hasn't been materialised
+    yet (``ensure_storage()`` populates it lazily), and a RECORDS
+    collection, which never gets a geometries sidecar (#2655). Both fall
+    back to the geometries sidecar's own default SRID so rendering can
+    proceed with the standard CRS.
+    """
+    return next(
+        (
+            sc.target_srid
+            for sc in driver_sidecars(layer_config)
+            if isinstance(sc, GeometriesSidecarConfig)
+        ),
+        GeometriesSidecarConfig.model_fields["target_srid"].default,
+    )
+
 
 async def _get_style_to_render(conn: AsyncConnection, dataset: str, collection_id: Optional[str], style_name: Optional[str]) -> Optional[Any]:
     """
@@ -622,10 +652,10 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
             except ValueError as e:
                 logger.error(f"Data Error: {e}")
                 raise HTTPException(status_code=400, detail=str(e)) from e
-            if layer_config is None or layer_config.geometry_storage is None:
+            if layer_config is None:
                 raise HTTPException(
                     status_code=404,
-                    detail=f"Collection '{valid_collections[0]}' has no geometry storage config.",
+                    detail=f"Collection '{valid_collections[0]}' has no storage config.",
                 )
 
             style_to_render = await _get_style_to_render(
@@ -639,7 +669,7 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
                 MapsService.process_pool,
                 render_map_image,
                 width, height, bbox_list, crs,
-                layer_config.geometry_storage.target_srid,
+                _resolve_target_srid(layer_config),
                 layers_data, style_to_render,
                 transparent, bgcolor,
             )
