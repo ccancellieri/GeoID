@@ -150,3 +150,78 @@ def raise_on_bulk_errors(
         f"document(s) — see ERROR logs above for per-doc details.",
         failures=all_failures,
     )
+
+
+async def raise_on_bulk_errors_with_ladder(
+    es: Any,
+    bulk_resp: Any,
+    index_name: str,
+    ids: "List[str]",
+    doc_by_id: "Dict[str, Dict[str, Any]]",
+    *,
+    routing: Optional[str] = None,
+) -> None:
+    """Same contract as :func:`raise_on_bulk_errors`, plus a degradation-
+    ladder retry (#2769) for poison-classified rejections before raising.
+
+    Every ``poison`` failure whose submitted ``_source`` is available in
+    *doc_by_id* is retried through
+    :func:`~dynastore.modules.elasticsearch.geo_shape_ladder.retry_doc_with_ladder`
+    — progressively coarser geometry resubmitted as single-document
+    ``index`` calls. A doc that lands on a rung is WARNING-logged (with the
+    rung name) and dropped from the failure set entirely; a doc with no
+    geometry to degrade, or that exhausts every rung, keeps its original
+    rejection and is ERROR-logged / raised exactly as
+    :func:`raise_on_bulk_errors` would have done.
+
+    ``doc_by_id`` supplies the just-submitted document for each id so the
+    ladder starts from the exact geometry that was rejected rather than a
+    fresh re-read — every caller building a bulk request already has this
+    in scope.
+
+    Must be called AFTER :func:`maybe_raise_bulk_mapping_mismatch` — same
+    ordering requirement as :func:`raise_on_bulk_errors`.
+    """
+    if not isinstance(bulk_resp, dict) or not bulk_resp.get("errors"):
+        return
+
+    from dynastore.modules.elasticsearch.bulk_classify import classify_bulk_response
+    from dynastore.modules.elasticsearch.geo_shape_ladder import retry_doc_with_ladder
+    from dynastore.modules.storage.errors import EsBulkWriteError
+
+    _passed, transient, poison = classify_bulk_response(bulk_resp, ids)
+
+    remaining_poison: List[Tuple[str, str]] = []
+    for doc_id, reason in poison:
+        doc = doc_by_id.get(doc_id)
+        recovered = False
+        rung: Optional[str] = None
+        if doc is not None:
+            recovered, rung = await retry_doc_with_ladder(
+                es, index_name=index_name, doc_id=doc_id, doc=doc,
+                reason=reason, routing=routing,
+            )
+        if recovered:
+            logger.warning(
+                "ES bulk write: doc id=%s in index=%s recovered on degraded "
+                "geometry rung=%s after rejection (%s)",
+                doc_id, index_name, rung, reason,
+            )
+        else:
+            remaining_poison.append((doc_id, reason))
+
+    all_failures: List[Tuple[str, str]] = list(transient) + remaining_poison
+    if not all_failures:
+        return
+
+    for doc_id, reason in all_failures:
+        logger.error(
+            "ES bulk write rejected: index=%s id=%s reason=%s",
+            index_name, doc_id, reason,
+        )
+
+    raise EsBulkWriteError(
+        f"ES bulk write to '{index_name}' rejected {len(all_failures)} "
+        f"document(s) — see ERROR logs above for per-doc details.",
+        failures=all_failures,
+    )

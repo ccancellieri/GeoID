@@ -35,6 +35,18 @@ from dynastore.modules.storage.computed_fields import (
     _SYSTEM_ONLY_FIELD_NAMES,
 )
 
+# Geometry sphere-normalization (#2769) — shapely is an optional dependency;
+# guard so this module still imports in environments without it (tests, lean
+# deployments). Mirrors the guard pattern used for maybe_simplify_for_es in
+# the ES storage driver.
+try:
+    from dynastore.tools.geometry_normalize import normalize_geometry_for_es
+except ImportError:  # shapely not installed
+
+    def normalize_geometry_for_es(geometry: Optional[dict]) -> Optional[dict]:
+        """No-op fallback when shapely is not available."""
+        return geometry
+
 _SYSTEM_KEYS: frozenset = frozenset(SYSTEM_FIELD_KEYS)
 
 
@@ -293,6 +305,17 @@ def build_canonical_index_doc(
             found, value = sidecar.resolve_metadata_value(row, name)
             if found and value is not None:
                 metadata[name] = value
+
+    # Sphere-normalization (#2769): fix ring winding + repair topology, then
+    # split any geometry crossing the antimeridian. Runs unconditionally,
+    # here in the single canonical doc builder, so no writer (inline write,
+    # bulk reindex, or the storage drain — every write path funnels through
+    # this function) can skip it. See geometry_normalize.py for why this is
+    # necessary: Lucene's geo_shape parser reads ring vertices on the
+    # sphere, not the plane, so a Shapely-valid CW ring or an unsplit
+    # antimeridian crossing (e.g. the GAUL Antarctica boundary) reads as
+    # self-intersecting/ambiguous and is rejected outright.
+    geometry = normalize_geometry_for_es(geometry)
 
     reserved_members: Dict[str, Any] = {"geometry": geometry, "bbox": bbox}
     if stac_reserved_members:

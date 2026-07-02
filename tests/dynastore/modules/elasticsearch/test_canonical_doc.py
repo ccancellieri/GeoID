@@ -196,6 +196,12 @@ def test_access_section_passthrough_and_omitted_when_empty():
 # ---------------------------------------------------------------------------
 
 def test_geometry_and_bbox_pass_through():
+    """Geometry round-trips through the #2769 sphere-normalization step
+    (orient/validate + antimeridian split), which parses via shapely and
+    re-emits ``mapping()`` — coordinate tuples/floats instead of the input's
+    lists/ints, but the same ring, already CCW-wound so normalization is
+    otherwise a no-op. bbox is untouched (normalization only touches
+    ``geometry``)."""
     geom = {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 0]]]}
     bbox = [0.0, 0.0, 1.0, 1.0]
     doc = build_canonical_index_doc(
@@ -203,7 +209,9 @@ def test_geometry_and_bbox_pass_through():
         catalog_id="c", collection_id="k",
         geometry=geom, bbox=bbox,
     )
-    assert doc["geometry"] == geom
+    assert doc["geometry"]["type"] == "Polygon"
+    ring = doc["geometry"]["coordinates"][0]
+    assert [list(pt) for pt in ring] == [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]
     assert doc["bbox"] == bbox
 
 

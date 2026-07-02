@@ -1544,13 +1544,16 @@ class ItemsElasticsearchDriver(
         if prepped_bulk:
             body: list = []
             submitted_ids: list = []
+            doc_by_id: Dict[str, Dict[str, Any]] = {}
             for entry in prepped_bulk:
                 body.append(entry["action"])
                 body.append(entry["doc"])
-                submitted_ids.append(entry["action"]["index"]["_id"])
+                doc_id_str = entry["action"]["index"]["_id"]
+                submitted_ids.append(doc_id_str)
+                doc_by_id[doc_id_str] = entry["doc"]
             from dynastore.modules.elasticsearch._mapping_errors import (
                 maybe_raise_bulk_mapping_mismatch,
-                raise_on_bulk_errors,
+                raise_on_bulk_errors_with_ladder,
             )
             # ``write_entities`` is the synchronous ES-*primary* write path
             # (ES-only / ES-primary collections): there is no PG row and no
@@ -1564,7 +1567,15 @@ class ItemsElasticsearchDriver(
             # eventual by design and drained from the outbox.
             resp = await es.bulk(body=body, params={"refresh": "wait_for"})
             maybe_raise_bulk_mapping_mismatch(resp, index_name)
-            raise_on_bulk_errors(resp, index_name, submitted_ids)
+            # Ladder-aware rejection handling (#2769): a poison-classified
+            # per-doc rejection is retried through progressively coarser
+            # geometry before it is reported as a failure — this is also the
+            # bulk reindex path's rejection point (reindex_collection_into_index
+            # calls write_entities), so the retry benefits both callers.
+            await raise_on_bulk_errors_with_ladder(
+                es, resp, index_name, submitted_ids, doc_by_id,
+                routing=collection_id,
+            )
 
         return written
 

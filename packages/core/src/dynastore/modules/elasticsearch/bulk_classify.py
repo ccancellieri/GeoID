@@ -43,7 +43,19 @@ it lands here as a straightforward poison bucket.
 """
 from __future__ import annotations
 
-from typing import Any, List, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
+
+
+# Cap on the formatted reason string (#2769): ES nested ``caused_by`` chains
+# are normally short human-readable sentences, but the cap guarantees a log
+# line can never balloon regardless of what a future ES version puts there
+# (e.g. never a geometry coordinate dump).
+_MAX_REASON_LEN = 2000
+
+# Bound on how many ``caused_by`` hops are walked, defensively — an ES error
+# body is not expected to nest deeper than a couple of levels; this just
+# rules out an unbounded/cyclic structure looping forever.
+_MAX_CAUSED_BY_DEPTH = 5
 
 
 _TRANSIENT_ERROR_TYPES: frozenset[str] = frozenset({
@@ -63,6 +75,37 @@ _POISON_ERROR_TYPES: frozenset[str] = frozenset({
     "type_missing_exception",
     "invalid_shape_exception",            # duplicate consecutive coordinates etc.
 })
+
+
+def _format_error_reason(error: Optional[dict]) -> str:
+    """Render an ES bulk-item error object, including the nested
+    ``caused_by`` chain (#2769).
+
+    A ``document_parsing_exception`` for a rejected geo_shape typically
+    carries a generic top-level reason ("failed to parse field [geometry]
+    of type [geo_shape]") with the actual diagnosable cause ("Self-
+    intersection at or near point ...") one or more ``caused_by`` hops
+    down. The previous behaviour surfaced only the top-level reason, so a
+    geo_shape rejection was undiagnosable without a live repro. Capped at
+    :data:`_MAX_REASON_LEN`.
+    """
+    if not isinstance(error, dict):
+        return str(error) if error is not None else "no reason"
+
+    parts: List[str] = []
+    node: Optional[dict] = error
+    depth = 0
+    while isinstance(node, dict) and depth < _MAX_CAUSED_BY_DEPTH:
+        err_type = node.get("type", "unknown")
+        reason = node.get("reason", "no reason")
+        parts.append(f"{err_type}: {reason}")
+        node = node.get("caused_by")
+        depth += 1
+
+    text = " | caused by: ".join(parts) if parts else "no reason"
+    if len(text) > _MAX_REASON_LEN:
+        text = text[:_MAX_REASON_LEN] + "...(truncated)"
+    return text
 
 
 def classify_bulk_response(
@@ -109,20 +152,20 @@ def classify_bulk_response(
         err_type = (
             (error or {}).get("type", "unknown") if isinstance(error, dict) else "unknown"
         )
-        err_reason = (
-            (error or {}).get("reason", "no reason") if isinstance(error, dict) else str(error)
-        )
+        # Includes the nested caused_by chain (#2769) — err_type is already
+        # the first segment of this string, so it is not re-prepended below.
+        err_reason = _format_error_reason(error)
 
         if int(status) == 429:
             transient.append((item_id, f"429 rate-limited: {err_reason}"))
             continue
         if err_type in _TRANSIENT_ERROR_TYPES or int(status) >= 500:
-            transient.append((item_id, f"{status} {err_type}: {err_reason}"))
+            transient.append((item_id, f"{status} {err_reason}"))
             continue
         if err_type in _POISON_ERROR_TYPES or 400 <= int(status) < 500:
-            poison.append((item_id, f"{status} {err_type}: {err_reason}"))
+            poison.append((item_id, f"{status} {err_reason}"))
             continue
         # Unknown shape — be conservative, send to retry.
-        transient.append((item_id, f"{status} {err_type}: {err_reason}"))
+        transient.append((item_id, f"{status} {err_reason}"))
 
     return passed, transient, poison

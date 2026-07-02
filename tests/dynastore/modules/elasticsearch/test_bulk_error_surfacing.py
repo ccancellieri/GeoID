@@ -164,6 +164,58 @@ class TestClassifyBulkResponse:
         passed, transient, poison = classify_bulk_response({}, [])
         assert passed == transient == poison == []
 
+    def test_caused_by_chain_is_included_in_reason(self):
+        """#2769: a geo_shape rejection's actual diagnosable cause typically
+        lives one or more ``caused_by`` hops below the generic top-level
+        reason — both must appear in the classified reason string."""
+        from dynastore.modules.elasticsearch.bulk_classify import classify_bulk_response
+
+        resp = {
+            "errors": True,
+            "items": [{
+                "index": {
+                    "_id": "geo-1",
+                    "status": 400,
+                    "error": {
+                        "type": "document_parsing_exception",
+                        "reason": "failed to parse field [geometry] of type [geo_shape]",
+                        "caused_by": {
+                            "type": "invalid_shape_exception",
+                            "reason": "Self-intersection at or near point [179.99, -85.0]",
+                        },
+                    },
+                },
+            }],
+        }
+        _passed, _transient, poison = classify_bulk_response(resp, ["geo-1"])
+        assert len(poison) == 1
+        reason = poison[0][1]
+        assert "document_parsing_exception" in reason
+        assert "failed to parse field [geometry]" in reason
+        assert "invalid_shape_exception" in reason
+        assert "Self-intersection" in reason
+
+    def test_reason_is_capped_at_max_length(self):
+        from dynastore.modules.elasticsearch.bulk_classify import (
+            _MAX_REASON_LEN,
+            classify_bulk_response,
+        )
+
+        huge_reason = "x" * (_MAX_REASON_LEN * 3)
+        resp = {
+            "errors": True,
+            "items": [{
+                "index": {
+                    "_id": "geo-2",
+                    "status": 400,
+                    "error": {"type": "mapper_parsing_exception", "reason": huge_reason},
+                },
+            }],
+        }
+        _passed, _transient, poison = classify_bulk_response(resp, ["geo-2"])
+        assert len(poison) == 1
+        assert len(poison[0][1]) <= _MAX_REASON_LEN + len("...(truncated)") + 30
+
 
 # ---------------------------------------------------------------------------
 # Task 2 helper — raise_on_bulk_errors
@@ -210,6 +262,114 @@ class TestRaiseOnBulkErrors:
         resp = _bulk_error_response("illegal_argument_exception", "unknown field", 400, "id-x")
         with pytest.raises(IndexMappingMismatchError):
             maybe_raise_bulk_mapping_mismatch(resp, "my-index")
+
+
+# ---------------------------------------------------------------------------
+# raise_on_bulk_errors_with_ladder (#2769)
+# ---------------------------------------------------------------------------
+
+
+class _LadderRecoveringEs:
+    """Fake ES client whose ``index`` call always succeeds — every
+    poison-classified doc with a geometry recovers on the first rung."""
+
+    def __init__(self) -> None:
+        self.index_calls: list = []
+
+    async def index(self, *, index, id, body, params=None):
+        self.index_calls.append((index, id, body, params))
+        return {"result": "created"}
+
+
+class _LadderFailingEs:
+    """Fake ES client whose ``index`` call always raises — every rung is
+    exhausted and the original rejection stands."""
+
+    def __init__(self) -> None:
+        self.index_calls: list = []
+
+    async def index(self, *, index, id, body, params=None):
+        self.index_calls.append((index, id, body, params))
+        raise RuntimeError("still document_parsing_exception")
+
+
+class TestRaiseOnBulkErrorsWithLadder:
+    @pytest.mark.asyncio
+    async def test_geo_shape_rejection_recovers_and_does_not_raise(self, caplog):
+        from dynastore.modules.elasticsearch._mapping_errors import (
+            raise_on_bulk_errors_with_ladder,
+        )
+
+        resp = _bulk_error_response(
+            "document_parsing_exception",
+            "failed to parse field [geometry] of type [geo_shape]",
+            400, "geo-1",
+        )
+        doc = {
+            "id": "geo-1",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[0, 0], [0, 1], [1, 1], [1, 0], [0, 0]]],
+            },
+        }
+        es = _LadderRecoveringEs()
+        with caplog.at_level(logging.WARNING):
+            await raise_on_bulk_errors_with_ladder(
+                es, resp, "my-index", ["geo-1"], {"geo-1": doc},
+            )
+        assert es.index_calls, "ladder must have attempted at least one rung"
+        assert any(
+            "recovered on degraded" in r.message for r in caplog.records
+            if r.levelno == logging.WARNING
+        )
+
+    @pytest.mark.asyncio
+    async def test_geo_shape_rejection_exhausted_still_raises(self, caplog):
+        from dynastore.modules.elasticsearch._mapping_errors import (
+            raise_on_bulk_errors_with_ladder,
+        )
+        from dynastore.modules.storage.errors import EsBulkWriteError
+
+        resp = _bulk_error_response(
+            "document_parsing_exception",
+            "failed to parse field [geometry] of type [geo_shape]",
+            400, "geo-2",
+        )
+        doc = {
+            "id": "geo-2",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[0, 0], [0, 1], [1, 1], [1, 0], [0, 0]]],
+            },
+        }
+        es = _LadderFailingEs()
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(EsBulkWriteError) as exc_info:
+                await raise_on_bulk_errors_with_ladder(
+                    es, resp, "my-index", ["geo-2"], {"geo-2": doc},
+                )
+        assert exc_info.value.failures[0][0] == "geo-2"
+        assert any(r.levelno == logging.ERROR for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_non_geometry_rejection_raises_without_ladder_attempt(self):
+        """A doc with no geometry key is not a candidate for the ladder —
+        it must be reported exactly as raise_on_bulk_errors would."""
+        from dynastore.modules.elasticsearch._mapping_errors import (
+            raise_on_bulk_errors_with_ladder,
+        )
+        from dynastore.modules.storage.errors import EsBulkWriteError
+
+        resp = _bulk_error_response(
+            "mapper_parsing_exception", "unrelated field type mismatch", 400, "id-1",
+        )
+        doc = {"id": "id-1"}  # no geometry
+        es = _LadderRecoveringEs()
+        with pytest.raises(EsBulkWriteError):
+            await raise_on_bulk_errors_with_ladder(
+                es, resp, "my-index", ["id-1"], {"id-1": doc},
+            )
+        assert es.index_calls == []
 
 
 # ---------------------------------------------------------------------------
