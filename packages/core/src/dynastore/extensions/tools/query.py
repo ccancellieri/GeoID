@@ -32,6 +32,7 @@ from dynastore.extensions.tools.formatters import (
     format_response,
     OGCResponseMetadata,
 )
+from dynastore.tools.geospatial import BboxDimensionality, parse_bbox_string
 
 logger = logging.getLogger(__name__)
 
@@ -660,9 +661,13 @@ def parse_ogc_query_request(
 
     if bbox:
         try:
-            parsed_bbox = tuple(map(float, bbox.split(",")))
-            if len(parsed_bbox) != 4:
-                raise ValueError("BBOX must have 4 coordinates.")
+            parsed_bbox = parse_bbox_string(
+                bbox,
+                dimensionality=BboxDimensionality.STRICT_2D,
+                allow_none=False,
+                validate_geometry=False,
+            )
+            assert parsed_bbox is not None  # allow_none=False guarantees this
             srid = bbox_crs_srid or 4326
             request_obj.filters.append(
                 FilterCondition(

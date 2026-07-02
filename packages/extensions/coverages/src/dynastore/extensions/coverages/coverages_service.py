@@ -48,6 +48,7 @@ from dynastore.modules.coverages.domainset import build_domainset
 from dynastore.modules.coverages.rangetype import build_rangetype
 from dynastore.modules.coverages.subset import AxisRange, SubsetRequest, parse_subset
 from dynastore.modules.coverages.writers import MEDIA_TYPE_FOR
+from dynastore.tools.geospatial import BboxDimensionality, parse_bbox_string
 
 from . import coverages_models as cm
 
@@ -62,19 +63,17 @@ def _bbox_to_subset(bbox: str) -> SubsetRequest:
     which maps directly to Lon(minlon:maxlon),Lat(minlat:maxlat) subset axes.
     """
     from fastapi import HTTPException
-    parts = bbox.split(",")
-    if len(parts) != 4:
-        raise HTTPException(
-            status_code=400,
-            detail="bbox must be 'minlon,minlat,maxlon,maxlat' (four comma-separated numbers).",
-        )
     try:
-        minlon, minlat, maxlon, maxlat = (float(p.strip()) for p in parts)
+        parsed_bbox = parse_bbox_string(
+            bbox,
+            dimensionality=BboxDimensionality.STRICT_2D,
+            allow_none=False,
+            validate_geometry=False,
+        )
     except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"bbox values must be numeric: {exc}",
-        ) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    assert parsed_bbox is not None  # allow_none=False guarantees this
+    minlon, minlat, maxlon, maxlat = parsed_bbox
     if minlon > maxlon or minlat > maxlat:
         raise HTTPException(
             status_code=400,

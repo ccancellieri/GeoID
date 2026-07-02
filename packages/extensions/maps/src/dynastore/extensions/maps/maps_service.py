@@ -40,6 +40,7 @@ from dynastore.extensions.maps.renderer import render_map_image
 from dynastore.models.protocols import CatalogsProtocol
 from dynastore.tools.discovery import get_protocol
 from dynastore.modules.db_config import shared_queries
+from dynastore.tools.geospatial import BboxDimensionality, parse_bbox_string
 from dynastore.tools.ogc_common import parse_subset_parameter
 from . import maps_db
 from dynastore.models.localization import LocalizedText
@@ -562,9 +563,16 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
                 pass
 
         try:
-            bbox_list = [float(coord) for coord in bbox.split(',')]
+            parsed_bbox = parse_bbox_string(
+                bbox,
+                dimensionality=BboxDimensionality.STRICT_2D,
+                allow_none=False,
+                validate_geometry=False,
+            )
         except ValueError as e:
             raise HTTPException(status_code=400, detail="Invalid BBOX format.") from e
+        assert parsed_bbox is not None  # allow_none=False guarantees this
+        bbox_list = list(parsed_bbox)
 
         # Raster branch: when the first requested collection is RASTER-kind,
         # skip the vector DB/render pipeline entirely and use the COG engine.

@@ -48,6 +48,7 @@ from dynastore.extensions.stac.search import (
 from dynastore.modules.stac.stac_config import StacPluginConfig
 
 from dynastore.tools.db import validate_sql_identifier
+from dynastore.tools.geospatial import BboxDimensionality, parse_bbox_string
 from .stac_models import STACCatalogRequest, stac_localize
 from .stac_validator import validate_stac_item, validate_stac_collection
 from dynastore.models.shared_models import Feature
@@ -648,18 +649,14 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         # Collection Search path — parse params into CollectionSearchRequest
         parsed_bbox = None
         if bbox:
-            parts = bbox.split(",")
-            if len(parts) != 4:
-                raise HTTPException(
-                    status_code=400,
-                    detail="bbox must be four comma-separated numbers: minx,miny,maxx,maxy",
-                )
             try:
-                parsed_bbox = tuple(float(p) for p in parts)  # type: ignore[assignment]
+                parsed_bbox = parse_bbox_string(
+                    bbox,
+                    dimensionality=BboxDimensionality.STRICT_2D,
+                    validate_geometry=False,
+                )
             except ValueError as exc:
-                raise HTTPException(
-                    status_code=400, detail="bbox values must be numbers"
-                ) from exc
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         parsed_q: Optional[List[str]] = (
             [t.strip() for t in q.split(",") if t.strip()] if q else None
@@ -1459,18 +1456,14 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         # Parse bbox: comma-separated floats → 4-tuple
         parsed_bbox = None
         if bbox:
-            parts = bbox.split(",")
-            if len(parts) != 4:
-                raise HTTPException(
-                    status_code=400,
-                    detail="bbox must be four comma-separated numbers: minx,miny,maxx,maxy",
-                )
             try:
-                parsed_bbox = tuple(float(p) for p in parts)  # type: ignore[assignment]
+                parsed_bbox = parse_bbox_string(
+                    bbox,
+                    dimensionality=BboxDimensionality.STRICT_2D,
+                    validate_geometry=False,
+                )
             except ValueError as exc:
-                raise HTTPException(
-                    status_code=400, detail="bbox values must be numbers"
-                ) from exc
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         # Parse ids: comma-separated → list
         parsed_ids: Optional[List[str]] = (
@@ -1762,18 +1755,16 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         """
         parsed_bbox = None
         if bbox:
-            parts = bbox.split(",")
-            if len(parts) != 4:
-                raise HTTPException(
-                    status_code=400,
-                    detail="bbox must be four comma-separated numbers: minx,miny,maxx,maxy",
-                )
             try:
-                parsed_bbox = [float(p) for p in parts]
+                parsed_tuple = parse_bbox_string(
+                    bbox,
+                    dimensionality=BboxDimensionality.STRICT_2D,
+                    validate_geometry=False,
+                )
             except ValueError as exc:
-                raise HTTPException(
-                    status_code=400, detail="bbox values must be numbers"
-                ) from exc
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            assert parsed_tuple is not None  # bbox truthy above => allow_none path not hit
+            parsed_bbox = list(parsed_tuple)
 
         parsed_ids = [i.strip() for i in ids.split(",") if i.strip()] if ids else None
         parsed_collections = (
