@@ -68,6 +68,17 @@ _current_backend: Optional[Any] = None
 _app_state: Optional[Any] = None
 _apply_lock: LoopLocalLock = LoopLocalLock()
 
+# Circuit-breaker recovery loop (#2741). ``register_backend`` is otherwise
+# only ever called at startup or from an explicit config-PATCH apply
+# handler, so a mid-life circuit trip (``ValkeyCacheBackend._record_failure``
+# unregistering itself after 3 consecutive failures) would otherwise never
+# recover — the pod stays on L1-only cache (and IAM denylist checks fail
+# open) until it restarts. Tracks the single in-flight recovery task so a
+# burst of trips schedules at most one loop.
+_recovery_task: "Optional[asyncio.Task[None]]" = None
+_CB_RECOVERY_INITIAL_DELAY: float = 5.0
+_CB_RECOVERY_MAX_DELAY: float = 60.0
+
 # Sentinel default for ``_on_valkey_engine_config_change``'s ``config`` arg.
 # The boot-order upgrade path (``_boot_upgrade_to_valkey``) calls the handler
 # with no config to say "keep whatever the engine snapshot already resolved,
@@ -149,11 +160,12 @@ async def _load_cache_config() -> "CachePluginConfig":
 async def _load_valkey_engine_config() -> "ValkeyEngineConfig":
     """Load the live ``ValkeyEngineConfig`` snapshot from the PluginConfig protocol.
 
-    Mirrors ``_load_cache_config`` above.  Used by the cluster auto-detect
-    rebuild path (``CacheModule.lifespan``) to obtain the connection params
-    that produced the already-built engine client, so the cluster-mode
-    rebuild can reuse ``ValkeyEngineConfig.engine_init()`` instead of
-    re-deriving URL/TLS/IAM/discovery resolution here.
+    Mirrors ``_load_cache_config`` above.  Used by the shared cluster
+    auto-detect/correct helper (:func:`_detect_and_correct_cluster_mismatch`)
+    to obtain the connection params that produced the already-built engine
+    client, so the cluster-mode rebuild can reuse
+    ``ValkeyEngineConfig.engine_init()`` instead of re-deriving
+    URL/TLS/IAM/discovery resolution here.
     """
     from dynastore.modules.db_config.engine_config import ValkeyEngineConfig
 
@@ -193,11 +205,103 @@ async def _load_valkey_engine_config() -> "ValkeyEngineConfig":
     return ValkeyEngineConfig()
 
 
+async def _detect_and_correct_cluster_mismatch(
+    *,
+    server_redis_mode: Optional[str],
+    client_is_cluster: bool,
+    cache_cfg: "CachePluginConfig",
+    engine_cache: "Optional[EngineInstanceCache]",
+) -> Optional[Any]:
+    """Shared cluster-mode mismatch detector/corrector.
+
+    If the connected server reports cluster mode but the currently probed
+    client is standalone, the stored ``ValkeyEngineConfig.cluster_mode`` is
+    misconfigured. Config stays the SSOT — an operator WARNING points at
+    the fix — this only builds a same-process, in-memory corrected client
+    so the cache routes correctly in the meantime, mirroring
+    ``ValkeyEngineConfig.engine_init()`` with a local
+    ``cluster_mode=True`` override rather than persisting the correction.
+
+    Called from both the cold-boot probe (``CacheModule.lifespan``) and
+    the live reconnect path (``_on_valkey_engine_config_change`` — which
+    backs both a config-PATCH apply and the circuit-breaker recovery
+    loop). Without this, a pod that boot-corrected a misconfiguration
+    would silently regress to a standalone client on its next reconnect
+    (e.g. after a transient circuit-breaker trip): the recovery path used
+    to rebuild straight from the still-misconfigured stored config,
+    undoing the correction and routing a rebuilt cluster's traffic through
+    a standalone client — misrouting plus an endless trip/recover cycle,
+    logged as a plain "recovered".
+
+    Returns the corrected backend, or ``None`` when there is no mismatch
+    or the correction attempt failed (caller keeps using what it already
+    has). On success, evicts the superseded standalone entry from
+    ``engine_cache`` (best-effort) so its connection pool does not idle
+    until process shutdown (#2743).
+    """
+    if not (server_redis_mode == "cluster" and not client_is_cluster):
+        return None
+
+    logger.warning(
+        "CacheModule: server reports cluster mode but "
+        "ValkeyEngineConfig.cluster_mode=False built a "
+        "standalone client — the stored engine config is "
+        "misconfigured. Correct it via PATCH "
+        "/configs/plugins/valkey_engine_config "
+        "(cluster_mode=true). Rebuilding a cluster-mode client "
+        "for this process in the meantime."
+    )
+    try:
+        from dynastore.tools.cache_valkey import ValkeyCacheBackend
+
+        valkey_cfg = await _load_valkey_engine_config()
+        cluster_cfg = valkey_cfg.model_copy(update={"cluster_mode": True})
+        new_client = await cluster_cfg.engine_init()
+        new_backend = ValkeyCacheBackend(
+            client=new_client,
+            owns_client=True,
+            circuit_breaker_threshold=cache_cfg.circuit_breaker_threshold,
+            on_trip=_on_backend_trip,
+        )
+    except Exception as exc:
+        logger.warning(
+            "CacheModule: failed to rebuild a cluster-mode "
+            "client (%s); continuing with the standalone "
+            "client — commands may misroute until the engine "
+            "config is corrected.",
+            exc,
+        )
+        return None
+
+    if engine_cache is not None:
+        try:
+            await engine_cache.evict("valkey_engine")
+        except Exception:
+            logger.warning(
+                "CacheModule: failed to evict the superseded "
+                "standalone Valkey client after cluster-mode "
+                "rebuild; it will stay idle until process "
+                "shutdown.",
+                exc_info=True,
+            )
+    return new_backend
+
+
+# Sentinel default for ``_on_valkey_engine_config_change``'s ``guard_current``
+# kwarg — "no guard, proceed unconditionally" (the normal config-PATCH apply
+# and boot-upgrade paths). The circuit-breaker recovery loop passes the
+# backend instance it observed at wake-up so the re-check happens atomically
+# with the teardown decision, once ``_apply_lock`` is held (#2741 finding 2).
+_NO_GUARD: Any = object()
+
+
 async def _on_valkey_engine_config_change(
     config: Any = _KEEP_SNAPSHOT_CONFIG,
     _catalog_id: Any = None,
     _collection_id: Any = None,
     _conn: Any = None,
+    *,
+    guard_current: Any = _NO_GUARD,
 ) -> None:
     """Apply handler for ValkeyEngineConfig — live reconnect on config change.
 
@@ -207,13 +311,27 @@ async def _on_valkey_engine_config_change(
       2. Push the fresh ``config`` into the engine_cache snapshot + evict
          the cached instance (#827).
       3. Re-get the engine (lazy re-init with new config).
-      4. Build + probe + register the new backend.
+      4. Build + probe + register the new backend, correcting a
+         cluster-mode mismatch if the server disagrees with the client
+         (:func:`_detect_and_correct_cluster_mismatch`).
 
     Called with no ``config`` (``_KEEP_SNAPSHOT_CONFIG``) on the boot-order
-    upgrade path (driven by ``_boot_upgrade_to_valkey``): step 2 is skipped
-    so the engine snapshot already populated post-pool by
+    upgrade path (driven by ``_boot_upgrade_to_valkey``) and the
+    circuit-breaker recovery loop (``_recover_after_circuit_trip``): step 2
+    is skipped so the engine snapshot already populated post-pool by
     ``refresh_snapshot_until_ready`` is kept as-is, and only the backend is
     (re)built, probed, and registered.
+
+    ``guard_current`` (#2741 finding 2): when set, the reconnect is
+    aborted — before touching anything — unless ``_current_backend`` is
+    still identically the instance the caller observed before deciding to
+    reconnect. The recovery loop passes the tripped backend it woke up to
+    replace; without this, a concurrent config-PATCH apply that wins the
+    race to ``_apply_lock`` first would install a healthy backend, and the
+    recovery loop's own (now-redundant) call would tear that healthy
+    backend down and rebuild it again — an unregister gap that is an
+    avoidable extra IAM fail-open blip. Checked *inside* the lock so the
+    check is atomic with the teardown decision, not a racy check-then-act.
     """
     global _current_backend, _app_state
 
@@ -229,6 +347,14 @@ async def _on_valkey_engine_config_change(
 
     _t0 = asyncio.get_event_loop().time()
     async with _apply_lock:
+        if guard_current is not _NO_GUARD and _current_backend is not guard_current:
+            logger.debug(
+                "ValkeyEngineConfig apply handler: _current_backend already "
+                "changed since this reconnect attempt was scheduled (a "
+                "concurrent apply won the race); skipping."
+            )
+            return
+
         # 1. Close + unregister old backend.
         old_backend = _current_backend
         if old_backend is not None:
@@ -287,6 +413,7 @@ async def _on_valkey_engine_config_change(
             client=client,
             owns_client=False,
             circuit_breaker_threshold=cache_cfg.circuit_breaker_threshold,
+            on_trip=_on_backend_trip,
         )
 
         try:
@@ -369,6 +496,20 @@ async def _on_valkey_engine_config_change(
             )
             return
 
+        # Cluster-mode mismatch correction (#2741 finding 1) — shared with
+        # the cold-boot probe (``CacheModule.lifespan``) so a boot-time
+        # correction survives every later reconnect (config-PATCH apply or
+        # circuit-breaker recovery) instead of silently reverting to the
+        # still-misconfigured stored config.
+        corrected = await _detect_and_correct_cluster_mismatch(
+            server_redis_mode=info.get("server", {}).get("redis_mode"),
+            client_is_cluster=topo.get("is_cluster", False),
+            cache_cfg=cache_cfg,
+            engine_cache=engine_cache,
+        )
+        if corrected is not None:
+            new_backend = corrected
+
         get_cache_manager().register_backend(new_backend)
         _notify_backend_upgrade()
         _current_backend = new_backend
@@ -384,6 +525,103 @@ async def _on_valkey_engine_config_change(
             "CACHE RECONNECT: success=true version=%s mode=%s duration_ms=%d",
             version, mode, _dur_ms,
         )
+
+
+def _on_backend_trip(backend: Any) -> None:
+    """Circuit-breaker trip callback (#2741), passed to every
+    ``ValkeyCacheBackend`` this module constructs.
+
+    Called synchronously by ``ValkeyCacheBackend._record_failure`` right
+    after it unregisters itself from the ``CacheManager`` on 3 consecutive
+    failures. Schedules a guarded background re-probe loop so a pod that
+    lives for hours after a transient blip does not stay on L1-only cache
+    (and IAM denylist checks fail open) for its whole lifetime. Idempotent:
+    a trip while a recovery loop is already in flight is a no-op — the
+    running loop re-probes on its own schedule regardless of which backend
+    instance triggered it.
+    """
+    global _recovery_task
+    if _recovery_task is not None and not _recovery_task.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.warning(
+            "CacheModule: circuit breaker tripped but no running event loop; "
+            "cannot schedule a recovery probe."
+        )
+        return
+    _recovery_task = loop.create_task(
+        _recover_after_circuit_trip(backend), name="cache-valkey-cb-recovery"
+    )
+
+
+async def _recover_after_circuit_trip(tripped_backend: Any) -> None:
+    """Re-probe Valkey with exponential backoff until the backend recovers.
+
+    Reuses ``_on_valkey_engine_config_change`` (no ``config`` arg — keeps
+    the current engine snapshot, only rebuilds + probes + registers the
+    backend, correcting a cluster-mode mismatch if present) so the
+    recovery path exercises the exact same reconnect logic a config-PATCH
+    apply would. Stops as soon as either this loop lands a fresh backend,
+    or a concurrent reconnect (e.g. an operator's config PATCH) already
+    replaced ``tripped_backend`` while this loop was sleeping. Runs until
+    cancelled — a tripped pod may live for hours or days on Cloud Run, so
+    the retry budget is unbounded, unlike the one-shot boot-order upgrade.
+
+    The pre-sleep check below is a cheap fast path only (skip an
+    already-known-superseded attempt without even touching the lock); the
+    authoritative check is ``guard_current`` inside
+    ``_on_valkey_engine_config_change``, re-evaluated atomically once
+    ``_apply_lock`` is held (#2741 finding 2) — without it, a config-PATCH
+    apply that wins the race to the lock right after this fast path passes
+    would have its freshly-installed healthy backend torn down and rebuilt
+    by this loop's own (now-redundant) reconnect, an avoidable extra IAM
+    fail-open blip. The guard passed on each attempt is the ``_current_backend``
+    *this loop itself just observed* (``tripped_backend`` on the first
+    attempt; ``None`` on a later attempt once a prior failed reconnect left
+    the cache degraded) — not always the original ``tripped_backend`` —
+    so a concurrent actor is what trips the guard, never this loop's own
+    prior attempts.
+    """
+    delay = _CB_RECOVERY_INITIAL_DELAY
+    try:
+        while True:
+            await asyncio.sleep(delay)
+            observed = _current_backend
+            if observed is not None and observed is not tripped_backend:
+                # Superseded by a concurrent reconnect while we waited.
+                return
+            try:
+                await _on_valkey_engine_config_change(guard_current=observed)
+            except Exception:
+                logger.debug(
+                    "CacheModule: circuit-breaker recovery probe failed",
+                    exc_info=True,
+                )
+            if _current_backend is not None:
+                logger.info(
+                    "CacheModule: Valkey circuit breaker recovered — "
+                    "backend re-registered."
+                )
+                return
+            delay = min(delay * 2.0, _CB_RECOVERY_MAX_DELAY)
+    finally:
+        global _recovery_task
+        _recovery_task = None
+
+
+async def _cancel_recovery_task() -> None:
+    """Cancel and await the in-flight circuit-breaker recovery loop, if any."""
+    global _recovery_task
+    task = _recovery_task
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+    _recovery_task = None
 
 
 async def _on_cache_plugin_config_change(
@@ -590,6 +828,7 @@ async def _degraded_local_lifespan(
                 await upgrade_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        await _cancel_recovery_task()
         if handlers_registered:
             _unregister_engine_apply_handlers()
         if _current_backend is not None:
@@ -714,6 +953,7 @@ class CacheModule(ModuleProtocol):
                 client=client,
                 owns_client=False,
                 circuit_breaker_threshold=cache_cfg.circuit_breaker_threshold,
+                on_trip=_on_backend_trip,
             )
 
         if backend is None:
@@ -764,49 +1004,20 @@ class CacheModule(ModuleProtocol):
 
             # Auto-detect cluster mode: if the server reports cluster but the
             # engine built a standalone client, the stored
-            # ``ValkeyEngineConfig.cluster_mode`` is misconfigured — config
-            # is the SSOT, so this is surfaced as a loud WARNING rather than
-            # silently patched.  We still rebuild a dedicated cluster-mode
-            # client for this process so the cache is correct in the
-            # meantime: a fresh ``cluster_mode=True`` copy of the live
-            # engine config re-runs ``ValkeyEngineConfig.engine_init()`` so
-            # connection-param resolution (URL/TLS/IAM/discovery) stays in
-            # one place rather than being re-derived here.  The new backend
-            # owns the rebuilt client (``owns_client=True``); the engine's
-            # original standalone client is left untouched — it remains
-            # owned by ``engine_cache`` and is released via
-            # ``ValkeyEngineConfig.engine_release`` at engine shutdown, not
-            # here.
-            if server_redis_mode == "cluster" and not topo.get("is_cluster"):
-                logger.warning(
-                    "CacheModule: server reports cluster mode but "
-                    "ValkeyEngineConfig.cluster_mode=False built a "
-                    "standalone client — the stored engine config is "
-                    "misconfigured. Correct it via PATCH "
-                    "/configs/plugins/valkey_engine_config "
-                    "(cluster_mode=true). Rebuilding a cluster-mode client "
-                    "for this process in the meantime."
-                )
-                try:
-                    valkey_cfg = await _load_valkey_engine_config()
-                    cluster_cfg = valkey_cfg.model_copy(
-                        update={"cluster_mode": True}
-                    )
-                    new_client = await cluster_cfg.engine_init()
-                    new_backend = ValkeyCacheBackend(
-                        client=new_client,
-                        owns_client=True,
-                        circuit_breaker_threshold=cache_cfg.circuit_breaker_threshold,
-                    )
-                    backend = new_backend
-                except Exception as exc:
-                    logger.warning(
-                        "CacheModule: failed to rebuild a cluster-mode "
-                        "client (%s); continuing with the standalone "
-                        "client — commands may misroute until the engine "
-                        "config is corrected.",
-                        exc,
-                    )
+            # ``ValkeyEngineConfig.cluster_mode`` is misconfigured.
+            # ``_detect_and_correct_cluster_mismatch`` is shared with the
+            # live reconnect path (config-PATCH apply / circuit-breaker
+            # recovery, ``_on_valkey_engine_config_change``) so a
+            # boot-time correction is not silently undone on a later
+            # reconnect (#2741 finding 1).
+            corrected = await _detect_and_correct_cluster_mismatch(
+                server_redis_mode=server_redis_mode,
+                client_is_cluster=topo.get("is_cluster", False),
+                cache_cfg=cache_cfg,
+                engine_cache=engine_cache,
+            )
+            if corrected is not None:
+                backend = corrected
         except Exception as exc:
             _reason = (
                 "probe timed out" if isinstance(exc, asyncio.TimeoutError) else str(exc)
@@ -878,6 +1089,7 @@ class CacheModule(ModuleProtocol):
         try:
             yield
         finally:
+            await _cancel_recovery_task()
             try:
                 from dynastore.modules.db_config.engine_config import (
                     ValkeyEngineConfig,

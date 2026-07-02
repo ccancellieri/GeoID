@@ -550,6 +550,7 @@ class ValkeyCacheBackend:
         pool: Optional[Any] = None,
         owns_client: bool = True,
         circuit_breaker_threshold: Optional[int] = None,
+        on_trip: Optional[Callable[["ValkeyCacheBackend"], None]] = None,
     ) -> None:
         """Wrap an engine-built Valkey ``client`` as the cache backend.
 
@@ -563,6 +564,15 @@ class ValkeyCacheBackend:
         wrapper; reconfiguration flows through the configs API and
         re-inits the engine, never by re-constructing this backend with raw
         connection kwargs.
+
+        ``on_trip`` (#2741): called synchronously, with ``self``, right
+        after the circuit breaker unregisters this instance from the
+        ``CacheManager``. ``CacheModule`` passes a callback here that
+        schedules a guarded background re-probe loop, since
+        ``register_backend`` is otherwise only ever called at startup or
+        on an explicit config PATCH — without a recovery path a mid-life
+        trip degrades the process to L1-only cache (and IAM denylist
+        checks fail open) until the pod restarts.
         """
         # ModuleNotFoundError (a subclass of ImportError) so existing
         # `except ImportError` handlers still catch it AND the module
@@ -584,6 +594,7 @@ class ValkeyCacheBackend:
         self._client = client
         self._pool = pool
         self._owns_client = owns_client
+        self._on_trip = on_trip
 
         self._prefix = key_prefix
         self._stats = CacheStats(maxsize=0)
@@ -621,6 +632,13 @@ class ValkeyCacheBackend:
                 logger.exception(
                     "ValkeyCacheBackend: failed to unregister backend on circuit trip"
                 )
+            if self._on_trip is not None:
+                try:
+                    self._on_trip(self)
+                except Exception:
+                    logger.exception(
+                        "ValkeyCacheBackend: on_trip recovery callback failed"
+                    )
 
     def _record_success(self) -> None:
         """Reset failure counter on successful operation."""

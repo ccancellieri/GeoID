@@ -27,6 +27,7 @@ directly. No real Valkey, no cache-manager registration internals.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
@@ -467,6 +468,44 @@ async def test_deny_no_backend_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 12a. is_denied fail-open observability (#2741) — no backend must log a
+# rate-limited WARNING instead of degrading with zero signal.
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_is_denied_no_backend_logs_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    _install(monkeypatch, None)
+    with caplog.at_level("WARNING", logger="dynastore.modules.iam.phantom_token"):
+        assert await phantom_token.is_denied("tok1") is False
+    assert any("failing OPEN" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_is_denied_no_backend_warning_is_rate_limited(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    _install(monkeypatch, None)
+    with caplog.at_level("WARNING", logger="dynastore.modules.iam.phantom_token"):
+        for _ in range(5):
+            assert await phantom_token.is_denied("tok1") is False
+    warnings = [r for r in caplog.records if "failing OPEN" in r.getMessage()]
+    assert len(warnings) == 1, (
+        "a sustained outage must log once per throttle window, not once per call"
+    )
+
+
+@pytest.mark.asyncio
+async def test_is_denied_with_backend_does_not_warn(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    _install(monkeypatch, FakeCountingBackend())
+    with caplog.at_level("WARNING", logger="dynastore.modules.iam.phantom_token"):
+        assert await phantom_token.is_denied("tok1") is False
+    assert not any("failing OPEN" in r.getMessage() for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
 # 12b. denylist admin primitives (#1343 follow-up: REST surface)
 # --------------------------------------------------------------------------- #
 class _FakeAdminBackend(FakeCountingBackend):
@@ -588,6 +627,33 @@ async def test_list_denied_scan_error_raises_unavailable(monkeypatch: pytest.Mon
     _install(monkeypatch, backend)
     with pytest.raises(phantom_token.DenylistBackendUnavailable):
         await phantom_token.list_denied()
+
+
+@pytest.mark.asyncio
+async def test_list_denied_bounds_a_runaway_scan(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#2742 — a scan that never finishes (e.g. a narrow prefix against a
+    huge shared keyspace) must be time-boxed, returning partial results
+    instead of hanging the admin request."""
+    monkeypatch.setattr(phantom_token, "_LIST_DENIED_SCAN_TIMEOUT_SECONDS", 0.05)
+
+    backend = _FakeAdminBackend()
+    _install(monkeypatch, backend)
+    await phantom_token.deny("tok-A", ttl_seconds=300)
+
+    async def _hanging_scan_iter(*, match: str, count: int = 100):
+        yield "iam:denylist:tok-A".encode("utf-8")
+        await asyncio.sleep(10)  # never reached within the timeout
+        yield "iam:denylist:tok-B".encode("utf-8")
+
+    monkeypatch.setattr(backend, "scan_iter", _hanging_scan_iter)
+
+    with caplog.at_level("WARNING", logger="dynastore.modules.iam.phantom_token"):
+        rows = await phantom_token.list_denied()
+
+    assert [r["token_id"] for r in rows] == ["tok-A"]
+    assert any("timed out" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio

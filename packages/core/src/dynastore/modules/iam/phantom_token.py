@@ -53,10 +53,13 @@ fails OPEN (logged) so a transient Valkey blip cannot lock every caller out.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from time import monotonic, time as _now
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
+
+from dynastore.tools.ttl_gate import TTLGate
 
 if TYPE_CHECKING:
     from dynastore.models.protocols.authorization import IamScaleConfig
@@ -67,6 +70,23 @@ logger = logging.getLogger(__name__)
 _VERSION_PREFIX = "iam:bv:"
 _RESOLUTION_PREFIX = "iam:phantom:"
 _DENYLIST_PREFIX = "iam:denylist:"
+
+# Rate-limits the "denylist backend unavailable" WARNING (#2741) so a
+# sustained Valkey outage logs the fail-open signal once per window instead
+# of once per request — ``is_denied`` runs on every token validation.
+_DENYLIST_UNAVAILABLE_WARN_TTL_SECONDS = 60.0
+_denylist_unavailable_gate: TTLGate = TTLGate(
+    maxsize=1, ttl_seconds=_DENYLIST_UNAVAILABLE_WARN_TTL_SECONDS
+)
+
+# Defensive bound on the admin denylist-listing scan (#2742). SCAN's MATCH
+# filters server-side, but the cursor still walks the *entire* keyspace to
+# find matches — a narrow (or non-matching) prefix against a large shared
+# keyspace (millions of uc:*/iam:phantom:* keys) can otherwise pin the
+# request, and the shared Valkey instance, for an unbounded time. Time-box
+# the whole walk; on timeout return whatever was collected so far instead
+# of hanging.
+_LIST_DENIED_SCAN_TIMEOUT_SECONDS = 5.0
 
 # In-process L1 cap for the tiered resolution backend (seconds). The runtime
 # ``binding_resolution_ttl_seconds`` config drives the L2 TTL; this caps how
@@ -150,6 +170,7 @@ def _reset_caches() -> None:
     _tiered = None
     _tiered_l2_id = None
     _version_memo.clear()
+    _denylist_unavailable_gate.clear()
 
 
 def phantom_token_active(cfg: "IamScaleConfig") -> bool:
@@ -298,6 +319,26 @@ async def deny(
         logger.warning("phantom_token: deny failed for %s", token_id, exc_info=True)
 
 
+async def _warn_denylist_unavailable() -> None:
+    """Rate-limited WARNING for the "no denylist backend" fail-open path (#2741).
+
+    Without this, ``is_denied()`` returning ``False`` because ``backend is
+    None`` is structurally indistinguishable from "this deployment never had
+    Valkey" — a circuit-breaker trip mid-life left zero log signal that
+    revocation enforcement went dark. Throttled via ``TTLGate`` so a
+    sustained outage (every token validation hits this path) logs once per
+    window instead of once per request.
+    """
+    async with _denylist_unavailable_gate.acquire("denylist_unavailable") as h:
+        if h.should_run:
+            logger.warning(
+                "phantom_token: denylist backend unavailable — is_denied() "
+                "is failing OPEN (revocation checks are not enforced) until "
+                "Valkey recovers."
+            )
+            h.mark()
+
+
 async def is_denied(token_id: str) -> bool:
     """Return True iff the token id is on the revocation denylist.
 
@@ -307,6 +348,7 @@ async def is_denied(token_id: str) -> bool:
     """
     backend = _distributed_backend()
     if backend is None:
+        await _warn_denylist_unavailable()
         return False
     try:
         return await backend.exists(_DENYLIST_PREFIX + token_id)
@@ -385,6 +427,13 @@ async def list_denied(
     ``pttl`` so we can return TTLs cheaply; falls back to an empty list when
     the underlying backend does not expose either (a degraded but harmless
     behaviour — the entries still exist and still kill the token).
+
+    SCAN's ``MATCH`` pattern is applied server-side (#2742), but the cursor
+    still walks the whole keyspace to find matches — a narrow or
+    non-matching ``prefix`` against a large shared keyspace can otherwise
+    run unbounded. The walk is time-boxed
+    (``_LIST_DENIED_SCAN_TIMEOUT_SECONDS``); on timeout this returns
+    whatever was collected so far instead of hanging the request.
     """
     backend = _distributed_backend()
     if backend is None:
@@ -400,7 +449,8 @@ async def list_denied(
 
     match = f"{key_prefix}{_DENYLIST_PREFIX}{prefix or ''}*"
     out: List[Dict[str, Any]] = []
-    try:
+
+    async def _scan() -> None:
         async for raw_key in client.scan_iter(match=match, count=200):
             if len(out) >= limit:
                 break
@@ -451,6 +501,17 @@ async def list_denied(
             out.append(
                 {"token_id": token_id, "reason": reason, "expires_at": expires_at}
             )
+
+    try:
+        await asyncio.wait_for(_scan(), timeout=_LIST_DENIED_SCAN_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "phantom_token: list_denied scan timed out after %.0fs "
+            "(prefix=%s) — returning %d partial result(s); a narrow or "
+            "non-matching prefix against a large shared keyspace can "
+            "outrun the bound.",
+            _LIST_DENIED_SCAN_TIMEOUT_SECONDS, prefix, len(out),
+        )
     except Exception as exc:
         logger.warning(
             "phantom_token: list_denied scan failed (prefix=%s)", prefix, exc_info=True

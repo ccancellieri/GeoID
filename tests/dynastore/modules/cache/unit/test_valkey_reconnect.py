@@ -317,6 +317,78 @@ async def test_apply_handler_probe_failure_degrades_to_l1(
 
 
 @pytest.mark.asyncio
+async def test_apply_handler_guard_current_mismatch_skips_reconnect_entirely() -> None:
+    """#2741 finding 2 — a stale ``guard_current`` must bail before touching
+    anything.
+
+    Simulates the recovery loop losing a race to a concurrent config-PATCH
+    apply that already installed a fresh healthy backend: the recovery
+    loop's own (now-redundant) reconnect must not tear that backend down.
+    """
+    winner_backend = MagicMock()
+    stale_tripped_backend = MagicMock()
+
+    engine_cache = MagicMock()
+    engine_cache.get = AsyncMock(side_effect=AssertionError("must not be called"))
+
+    cm._app_state = _make_app_state(engine_cache)
+    cm._current_backend = winner_backend  # a concurrent apply already won
+
+    manager = MagicMock()
+    with patch("dynastore.tools.cache.get_cache_manager", return_value=manager):
+        await cm._on_valkey_engine_config_change(guard_current=stale_tripped_backend)
+
+    # Nothing was touched: no unregister, no close, no engine re-init.
+    manager.unregister_backend.assert_not_called()
+    winner_backend.close.assert_not_called()
+    engine_cache.get.assert_not_called()
+    engine_cache.update_config.assert_not_called()
+    assert cm._current_backend is winner_backend
+
+
+@pytest.mark.asyncio
+async def test_apply_handler_guard_current_match_proceeds_normally(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ``guard_current`` that still matches ``_current_backend`` must not
+    change reconnect behavior at all."""
+    old_backend = MagicMock()
+    old_backend.close = AsyncMock(return_value=None)
+
+    new_client = MagicMock()
+    engine_cache = _stub_engine_cache(new_client)
+
+    cm._app_state = _make_app_state(engine_cache)
+    cm._current_backend = old_backend
+
+    new_backend = MagicMock()
+    new_backend.info = AsyncMock(
+        return_value={
+            "server": {"redis_version": "7.4.0", "redis_mode": "standalone"},
+            "memory": {"used_memory_human": "1M"},
+        }
+    )
+    new_backend.topology = AsyncMock(return_value={"is_cluster": False})
+    new_backend.close = AsyncMock(return_value=None)
+
+    manager = MagicMock()
+    with (
+        patch(
+            "dynastore.tools.cache_valkey.ValkeyCacheBackend", return_value=new_backend
+        ),
+        patch("dynastore.tools.cache.get_cache_manager", return_value=manager),
+        patch("dynastore.tools.cache._notify_backend_upgrade"),
+        caplog.at_level("INFO"),
+    ):
+        await cm._on_valkey_engine_config_change(guard_current=old_backend)
+
+    manager.unregister_backend.assert_called_once_with(old_backend)
+    old_backend.close.assert_awaited_once()
+    manager.register_backend.assert_called_once_with(new_backend)
+    assert cm._current_backend is new_backend
+
+
+@pytest.mark.asyncio
 async def test_apply_handler_no_engine_cache_is_a_warning_no_op() -> None:
     """If app_state has no engine_cache, the handler logs and returns
     without touching the backend — config change just takes effect on

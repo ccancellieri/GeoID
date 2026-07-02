@@ -33,6 +33,7 @@ silently drop it.
 
 from __future__ import annotations
 
+import asyncio
 import types
 from typing import Any
 
@@ -149,6 +150,141 @@ async def test_engine_path_rebuilds_cluster_client_on_mode_mismatch(
         )
 
 
+async def test_engine_path_evicts_superseded_standalone_client_on_rebuild_success(
+    monkeypatch,
+):
+    """#2743 — once the corrected cluster-mode client is built and live, the
+    superseded standalone client must be evicted from ``engine_cache``
+    instead of idling in it (``lifecycle.policy`` defaults to "global",
+    i.e. never TTL-evicted) for the rest of the process."""
+    from dynastore.modules.cache.cache_module import CacheModule
+
+    _FakeBackend.instances = []
+
+    standalone_client = object()
+    cluster_client = object()
+
+    import dynastore.tools.cache_valkey as cv
+    monkeypatch.setattr(cv, "_CACHE_DEPS_OK", True)
+    monkeypatch.setattr(cv, "ValkeyCacheBackend", _FakeBackend)
+
+    evict_calls: list[str] = []
+
+    class _EngineCacheStub:
+        async def get(self, ref: str) -> object:
+            assert ref == "valkey_engine"
+            return standalone_client
+
+        async def evict(self, ref: str) -> bool:
+            evict_calls.append(ref)
+            return True
+
+    class _FakeCfg:
+        def model_copy(self, update: dict[str, Any]) -> "_FakeCfg":
+            return self
+
+        async def engine_init(self) -> object:
+            return cluster_client
+
+    async def _fake_load_cfg() -> Any:
+        return _FakeCfg()
+
+    monkeypatch.setattr(
+        "dynastore.modules.cache.cache_module._load_valkey_engine_config",
+        _fake_load_cfg,
+    )
+
+    async def _no_cfg(*_a: Any, **_kw: Any) -> Any:
+        from dynastore.modules.cache.cache_config import CachePluginConfig
+        return CachePluginConfig()
+
+    monkeypatch.setattr(
+        "dynastore.modules.cache.cache_module._load_cache_config", _no_cfg,
+    )
+
+    class _FakeManager:
+        def register_backend(self, backend: Any) -> None:
+            pass
+
+    import dynastore.tools.cache as cache_mod
+    monkeypatch.setattr(cache_mod, "get_cache_manager", lambda: _FakeManager())
+    monkeypatch.setattr(cache_mod, "_notify_backend_upgrade", lambda: None)
+
+    app_state = _make_app_state(engine_cache=_EngineCacheStub())
+
+    module = CacheModule(app_state=app_state)
+    async with module.lifespan(app_state):
+        assert evict_calls == ["valkey_engine"], (
+            "the superseded standalone client must be evicted exactly once, "
+            "right after the cluster-mode rebuild succeeds"
+        )
+
+
+async def test_engine_path_rebuild_eviction_failure_does_not_break_rebuild(
+    monkeypatch,
+):
+    """An eviction failure is best-effort — the successfully-rebuilt
+    cluster-mode backend must still be the one registered as live."""
+    from dynastore.modules.cache.cache_module import CacheModule
+
+    _FakeBackend.instances = []
+
+    standalone_client = object()
+    cluster_client = object()
+
+    import dynastore.tools.cache_valkey as cv
+    monkeypatch.setattr(cv, "_CACHE_DEPS_OK", True)
+    monkeypatch.setattr(cv, "ValkeyCacheBackend", _FakeBackend)
+
+    class _EngineCacheStub:
+        async def get(self, ref: str) -> object:
+            return standalone_client
+
+        async def evict(self, ref: str) -> bool:
+            raise RuntimeError("engine cache unavailable")
+
+    class _FakeCfg:
+        def model_copy(self, update: dict[str, Any]) -> "_FakeCfg":
+            return self
+
+        async def engine_init(self) -> object:
+            return cluster_client
+
+    async def _fake_load_cfg() -> Any:
+        return _FakeCfg()
+
+    monkeypatch.setattr(
+        "dynastore.modules.cache.cache_module._load_valkey_engine_config",
+        _fake_load_cfg,
+    )
+
+    async def _no_cfg(*_a: Any, **_kw: Any) -> Any:
+        from dynastore.modules.cache.cache_config import CachePluginConfig
+        return CachePluginConfig()
+
+    monkeypatch.setattr(
+        "dynastore.modules.cache.cache_module._load_cache_config", _no_cfg,
+    )
+
+    registered: dict[str, Any] = {}
+
+    class _FakeManager:
+        def register_backend(self, backend: Any) -> None:
+            registered["backend"] = backend
+
+    import dynastore.tools.cache as cache_mod
+    monkeypatch.setattr(cache_mod, "get_cache_manager", lambda: _FakeManager())
+    monkeypatch.setattr(cache_mod, "_notify_backend_upgrade", lambda: None)
+
+    app_state = _make_app_state(engine_cache=_EngineCacheStub())
+
+    module = CacheModule(app_state=app_state)
+    async with module.lifespan(app_state):
+        rebuilt = _FakeBackend.instances[-1]
+        assert rebuilt.client is cluster_client
+        assert registered["backend"] is rebuilt
+
+
 async def test_engine_path_rebuild_failure_keeps_standalone(monkeypatch):
     """If the rebuild raises, the still-functional standalone wrap stays live."""
     from dynastore.modules.cache.cache_module import CacheModule
@@ -199,3 +335,105 @@ async def test_engine_path_rebuild_failure_keeps_standalone(monkeypatch):
         assert len(_FakeBackend.instances) == 1
         assert registered["backend"] is _FakeBackend.instances[0]
         assert registered["backend"].client is standalone_client
+
+
+async def test_recovery_after_trip_reapplies_cluster_correction_from_stale_snapshot(
+    monkeypatch,
+):
+    """#2741 finding 1 — a boot-time cluster-mode correction must survive a
+    later circuit-breaker recovery.
+
+    The correction is deliberately never persisted into the stored
+    ``ValkeyEngineConfig`` (config stays the SSOT — the operator still has
+    to PATCH it), so ``engine_cache.get("valkey_engine")`` keeps handing
+    back a *standalone* client even after a pod already corrected once.
+    When the corrected cluster backend later trips (a transient blip) and
+    the circuit-breaker recovery loop reconnects, it must re-detect the
+    same mismatch against that stale snapshot and land a cluster client
+    again — not silently regress to routing a real cluster's traffic
+    through a standalone client.
+    """
+    import dynastore.modules.cache.cache_module as cm
+    import dynastore.tools.cache_valkey as cv
+
+    cm._current_backend = None
+    cm._recovery_task = None
+    _FakeBackend.instances = []
+
+    standalone_client = object()  # what the STALE snapshot still returns
+    cluster_client = object()  # what the cluster_mode=True correction builds
+
+    monkeypatch.setattr(cv, "_CACHE_DEPS_OK", True)
+    monkeypatch.setattr(cv, "ValkeyCacheBackend", _FakeBackend)
+
+    class _EngineCacheStub:
+        def __init__(self) -> None:
+            self.evict_calls: list[str] = []
+
+        async def get(self, ref: str) -> object:
+            assert ref == "valkey_engine"
+            return standalone_client
+
+        async def evict(self, ref: str) -> bool:
+            self.evict_calls.append(ref)
+            return True
+
+    engine_cache = _EngineCacheStub()
+    cm._app_state = _make_app_state(engine_cache=engine_cache)
+
+    class _FakeCfg:
+        def model_copy(self, update: dict[str, Any]) -> "_FakeCfg":
+            assert update == {"cluster_mode": True}
+            return self
+
+        async def engine_init(self) -> object:
+            return cluster_client
+
+    async def _fake_load_valkey_cfg() -> Any:
+        return _FakeCfg()
+
+    monkeypatch.setattr(cm, "_load_valkey_engine_config", _fake_load_valkey_cfg)
+
+    async def _no_cfg(*_a: Any, **_kw: Any) -> Any:
+        from dynastore.modules.cache.cache_config import CachePluginConfig
+        return CachePluginConfig()
+
+    monkeypatch.setattr(cm, "_load_cache_config", _no_cfg)
+
+    import dynastore.tools.cache as cache_mod
+
+    manager = types.SimpleNamespace(
+        unregister_backend=lambda backend: None,
+        register_backend=lambda backend: None,
+    )
+    monkeypatch.setattr(cache_mod, "get_cache_manager", lambda: manager)
+    monkeypatch.setattr(cache_mod, "_notify_backend_upgrade", lambda: None)
+
+    monkeypatch.setattr(cm, "_CB_RECOVERY_INITIAL_DELAY", 0.01)
+    monkeypatch.setattr(cm, "_CB_RECOVERY_MAX_DELAY", 0.02)
+
+    # A pod that already boot-corrected to a cluster backend; that backend
+    # is what trips now.
+    tripped_backend = _FakeBackend(client=cluster_client, owns_client=True)
+    cm._current_backend = tripped_backend
+
+    cm._on_backend_trip(tripped_backend)
+    task = cm._recovery_task
+    assert task is not None
+    for _ in range(500):
+        if task.done():
+            break
+        await asyncio.sleep(0.01)
+
+    assert cm._current_backend is not None, "recovery must land a backend"
+    assert cm._current_backend is not tripped_backend
+    assert cm._current_backend.client is cluster_client, (
+        "recovery rebuilt from the stale standalone-mode snapshot, detected "
+        "the mismatch again, and must re-correct to a cluster client — not "
+        "leave the standalone client from the stale snapshot in place"
+    )
+    assert cm._current_backend.owns_client is True
+    assert "valkey_engine" in engine_cache.evict_calls
+
+    cm._current_backend = None
+    cm._recovery_task = None
