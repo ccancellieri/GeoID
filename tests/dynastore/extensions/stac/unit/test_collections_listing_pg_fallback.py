@@ -37,7 +37,11 @@ import pytest
 from fastapi import Request
 
 import dynastore.extensions.stac.stac_service as stac_service
-from dynastore.extensions.stac.stac_service import STACService
+from dynastore.extensions.stac.stac_service import (
+    STACService,
+    _pg_collections_to_stac_dicts,
+)
+from dynastore.models.shared_models import Collection
 
 
 class _FakeCatalogsService:
@@ -167,3 +171,39 @@ async def test_plain_listing_no_fallback_when_page_non_empty(monkeypatch):
     assert fallback_called is False
     assert body["collections"] == [{"id": "col-a", "type": "Collection"}]
     assert "context" not in body
+
+
+def test_pg_collections_to_stac_dicts_keeps_null_extent_rows():
+    """Harvested collections persist ``extent = NULL`` in PG (harvest does
+    not aggregate/persist collection extents). The converter must render a
+    STAC-valid default extent for those rows instead of dropping them —
+    otherwise a page the caller already counted in ``matched`` comes back
+    with ``returned=0``, breaking the pagination contract."""
+    no_extent_coll = Collection(
+        id="harvested-1",
+        description="harvested, no aggregated extent",
+        license="proprietary",
+        extent=None,
+    )
+    real_extent_coll = Collection(
+        id="authored-1",
+        description="has a real extent",
+        license="proprietary",
+        extent={
+            "spatial": {"bbox": [[10.0, 20.0, 30.0, 40.0]]},
+            "temporal": {"interval": [["2020-01-01T00:00:00Z", None]]},
+        },
+    )
+
+    stac_dicts = _pg_collections_to_stac_dicts(
+        [no_extent_coll, real_extent_coll], language="en",
+    )
+
+    assert [d["id"] for d in stac_dicts] == ["harvested-1", "authored-1"]
+
+    no_extent_dict = stac_dicts[0]
+    assert no_extent_dict["extent"]["spatial"]["bbox"] == [[-180.0, -90.0, 180.0, 90.0]]
+    assert no_extent_dict["extent"]["temporal"]["interval"] == [[None, None]]
+
+    real_extent_dict = stac_dicts[1]
+    assert real_extent_dict["extent"]["spatial"]["bbox"] == [[10.0, 20.0, 30.0, 40.0]]

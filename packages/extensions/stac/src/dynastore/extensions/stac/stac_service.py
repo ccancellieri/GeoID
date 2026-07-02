@@ -256,17 +256,26 @@ def _pg_collections_to_stac_dicts(
     stac_collections: List[Dict[str, Any]] = []
     for coll in collections_list:
         localized_coll, _ = stac_localize(coll, language)
-        if coll.extent is None:
-            continue
+        if coll.extent is not None:
+            extent = pystac.Extent(
+                spatial=pystac.SpatialExtent(coll.extent.spatial.bbox),
+                temporal=pystac.TemporalExtent(coll.extent.temporal.interval),
+            )
+        else:
+            # Harvested collections may not have an aggregated extent
+            # persisted in PG. Render the standard STAC "unknown extent"
+            # fallback instead of dropping the collection from the page —
+            # the caller already promised it in `matched`.
+            extent = pystac.Extent(
+                spatial=pystac.SpatialExtent([[-180.0, -90.0, 180.0, 90.0]]),
+                temporal=pystac.TemporalExtent([[None, None]]),
+            )
         stac_coll = pystac.Collection(
             id=str(localized_coll.get("id") or ""),
             description=str(localized_coll.get("description") or ""),
             title=localized_coll.get("title"),
             license=str(localized_coll.get("license") or ""),
-            extent=pystac.Extent(
-                spatial=pystac.SpatialExtent(coll.extent.spatial.bbox),
-                temporal=pystac.TemporalExtent(coll.extent.temporal.interval),
-            ),
+            extent=extent,
         )
         if "language" in localized_coll:
             stac_coll.extra_fields["language"] = localized_coll["language"]
