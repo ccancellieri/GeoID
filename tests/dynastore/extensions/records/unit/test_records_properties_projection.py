@@ -143,6 +143,13 @@ def _wire(monkeypatch, svc, catalogs):
     )
 
 
+async def _read_body(resp) -> bytes:
+    chunks = []
+    async for chunk in resp.body_iterator:
+        chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
+    return b"".join(chunks)
+
+
 def _call_get_records(svc, **overrides):
     kwargs = dict(
         request=_make_request(),
@@ -178,7 +185,7 @@ async def test_records_properties_subset(monkeypatch):
     _wire(monkeypatch, svc, catalogs)
 
     resp = await _call_get_records(svc, properties="title,country")
-    body = json.loads(bytes(resp.body))
+    body = json.loads(await _read_body(resp))
     feat = body["features"][0]
     # Property set narrowed by the post-fetch projection.
     assert set(feat["properties"].keys()) == {"title", "country"}

@@ -109,6 +109,13 @@ class _FakeCatalogs:
         )
 
 
+async def _read_body(resp) -> bytes:
+    chunks = []
+    async for chunk in resp.body_iterator:
+        chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
+    return b"".join(chunks)
+
+
 def _build_query_response(features: List[_GeoJSONFeature], total: int, cat, col):
     async def _gen():
         for f in features:
@@ -144,7 +151,7 @@ async def test_get_records_uses_search_dispatch_when_available(monkeypatch):
     resp = await svc.get_records(**_get_records_defaults())
 
     import json
-    body = json.loads(bytes(resp.body))
+    body = json.loads(await _read_body(resp))
     assert body["type"] == "FeatureCollection"
     assert body["numberMatched"] == 2
     assert body["numberReturned"] == 2
@@ -173,7 +180,7 @@ async def test_get_records_falls_back_to_pg_when_dispatch_declines(monkeypatch):
     resp = await svc.get_records(**_get_records_defaults())
 
     import json
-    body = json.loads(bytes(resp.body))
+    body = json.loads(await _read_body(resp))
     assert body["numberMatched"] == 1
     assert [f["id"] for f in body["features"]] == ["pg-1"]
     assert catalogs.stream_called is True

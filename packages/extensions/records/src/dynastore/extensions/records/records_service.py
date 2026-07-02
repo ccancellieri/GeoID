@@ -49,6 +49,7 @@ from dynastore.extensions.tools.db import get_async_connection, get_async_engine
 from dynastore.extensions.tools.language_utils import get_language
 from dynastore.tools.language_utils import resolve_localized_field
 from dynastore.extensions.tools.url import get_root_url
+from dynastore.extensions.tools.formatters import OutputFormatEnum
 from dynastore.extensions.tools.query import (  # noqa: E402
     parse_hints_param,
     resolve_items_read_policy,
@@ -514,6 +515,7 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             validate_filter_lang,
             resolve_geometry_flag_from_query,
             dispatch_or_stream_items,
+            stream_ogc_features,
         )
         from dynastore.tools.discovery import get_protocol
 
@@ -657,92 +659,63 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         if select_fields is not None:
             projection_set = set(select_fields)
 
-        # Response byte budget (#2681): ``get_records`` materialises the full
-        # page before responding (no streaming path here, unlike Features'
-        # ``stream_ogc_features``), so a page of large geometries can exceed
-        # process memory well under ``max_limit``. Stop accumulating once the
-        # serialized records cross the configured budget; always keep at
-        # least one record so the page is never empty and pagination can
-        # still advance.
+        # Response byte budget (#2681): once the serialized ``features``
+        # bytes cross ``max_response_bytes`` the streamed page is cut short
+        # by ``_stream_ogc_json`` — a page of large records can otherwise
+        # exceed process memory well under ``max_limit``. At least one
+        # record is always served (the check runs after each item is
+        # yielded), so the page is never empty and pagination still advances.
         max_response_bytes = records_config.max_response_bytes
-        response_bytes = 0
-        if max_response_bytes is not None:
-            import orjson
 
-            from dynastore.tools.json import orjson_default
-
-        records: List[rm.Record] = []
-        async for feature in query_response:
-            if projection_set is not None:
-                props = getattr(feature, "properties", None)
-                if isinstance(props, dict):
-                    for key in list(props.keys()):
-                        if key not in projection_set:
-                            props.pop(key, None)
-            # For a geometry-less collection ``Record`` always emits
-            # ``geometry: null`` regardless of what the driver returned
-            # (``db_row_to_record`` with ``geometry_enabled=False``); for a
-            # geometry-enabled one, ``skipGeometry``/``returnGeometry`` is
-            # still honoured as a per-request override.
-            if skip_geom_bool and hasattr(feature, "geometry"):
-                try:
-                    feature.geometry = None
-                except Exception:
-                    pass
-            record = gen.db_row_to_record(
-                feature, catalog_id, collection_id, root_url, layer_config,
-                read_policy=read_policy, geometry_enabled=geometry_enabled,
-            )
-            records.append(record)
-
-            if max_response_bytes is not None:
-                response_bytes += len(orjson.dumps(
-                    record.model_dump(exclude_none=True, by_alias=True),
-                    default=orjson_default,
-                ))
-                if response_bytes >= max_response_bytes:
-                    aclose = getattr(query_response.items, "aclose", None)
-                    if aclose is not None:
+        # ── OGC post-processing wrapper (mirrors Features' streaming path) ──
+        # ``finally`` propagates an early close (the byte-budget cutoff in
+        # ``_stream_ogc_json``) down to ``items`` — the raw driver stream —
+        # so its underlying DB connection/transaction is released promptly
+        # instead of waiting on garbage collection.
+        async def _ogc_post_process(items):
+            try:
+                async for feature in items:
+                    if projection_set is not None:
+                        props = getattr(feature, "properties", None)
+                        if isinstance(props, dict):
+                            for key in list(props.keys()):
+                                if key not in projection_set:
+                                    props.pop(key, None)
+                    # For a geometry-less collection ``Record`` always emits
+                    # ``geometry: null`` regardless of what the driver
+                    # returned (``db_row_to_record`` with
+                    # ``geometry_enabled=False``); for a geometry-enabled
+                    # one, ``skipGeometry``/``returnGeometry`` is still
+                    # honoured as a per-request override.
+                    if skip_geom_bool and hasattr(feature, "geometry"):
                         try:
-                            await aclose()
+                            feature.geometry = None
                         except Exception:
-                            logger.debug(
-                                "byte-budget cutoff: source aclose() failed",
-                                exc_info=True,
-                            )
-                    break
+                            pass
+                    yield gen.db_row_to_record(
+                        feature, catalog_id, collection_id, root_url, layer_config,
+                        read_policy=read_policy, geometry_enabled=geometry_enabled,
+                    )
+            finally:
+                aclose = getattr(items, "aclose", None)
+                if aclose is not None:
+                    await aclose()
 
-        # Pagination links. ``next`` is built from the ACTUAL number of
-        # records served (not the requested ``limit``): a byte-budget
-        # cutoff can serve fewer, and ``offset + len(records)`` is correct
-        # whether the page ended naturally (last page) or was cut short by
-        # bytes — both cases resume exactly where this page left off.
-        from dynastore.extensions.tools.pagination import (
-            build_next_link,
-            build_pagination_links,
-        )
-        links = [
-            l for l in build_pagination_links(request, offset, limit, count)
-            if l.rel != "next"
-        ]
-        next_link = build_next_link(request, offset, len(records), count)
-        if next_link is not None:
-            links.append(next_link)
+        query_response.items = _ogc_post_process(query_response.items)
 
-        result = rm.RecordCollection(
-            type="FeatureCollection",
-            features=records,
+        from dynastore.extensions.tools.pagination import build_pagination_links
+        links = build_pagination_links(request, offset, limit, count)
+
+        return stream_ogc_features(
+            request=request,
+            query_response=query_response,
+            output_format=OutputFormatEnum.GEOJSON,
+            catalog_id=catalog_id,
+            collection_id=collection_id,
             links=links,
-            numberMatched=count,
-            numberReturned=len(records),
-        )
-        content = result.model_dump(exclude_none=True)
-        _resolve_links_titles(content.get("links"), language)
-        for feat in content.get("features", []):
-            _resolve_links_titles(feat.get("links"), language)
-        return JSONResponse(
-            content=content,
-            media_type="application/geo+json",
+            language=language,
+            offset=offset,
+            max_response_bytes=max_response_bytes,
         )
 
     async def get_record(

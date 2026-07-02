@@ -18,15 +18,15 @@
 
 """Unit tests for the OGC Records ``/items`` response byte budget (#2681).
 
-Unlike Features, ``get_records`` materialises the full page before
-responding (a plain ``JSONResponse``, not a streaming one) — so a page of
-large records exceeds process memory well under ``max_limit``. The
-configured ``max_response_bytes`` budget stops accumulating records once
-their serialized size crosses it: fewer records are served than the SQL
-result set, ``numberReturned`` reflects what was actually served,
-``numberMatched`` is unaffected, and the ``next`` link resumes exactly where
-the page stopped (``offset + numberReturned``) rather than skipping the
-unserved records.
+``get_records`` streams its page through the same
+``stream_ogc_features``/``_stream_ogc_json`` machinery as OGC Features (#2781)
+— on a collection with large records a page-size ``limit`` alone does not
+bound response memory, so the configured ``max_response_bytes`` budget stops
+the streamed page once the serialized ``features`` bytes cross it: fewer
+records are served than the SQL result set, ``numberReturned`` reflects what
+was actually served, ``numberMatched`` is unaffected, and the ``next`` link
+resumes exactly where the page stopped (``offset + numberReturned``) rather
+than skipping the unserved records.
 """
 
 from __future__ import annotations
@@ -130,6 +130,13 @@ def _get_records_defaults(**overrides) -> dict:
     return kwargs
 
 
+async def _read_body(resp) -> bytes:
+    chunks = []
+    async for chunk in resp.body_iterator:
+        chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
+    return b"".join(chunks)
+
+
 def _next_offset(links: list) -> int | None:
     for link in links:
         if link.get("rel") == "next":
@@ -166,7 +173,7 @@ async def test_byte_budget_cuts_page_short_with_correct_next_link(monkeypatch):
     _wire(monkeypatch, svc, catalogs, plugin_config)
 
     resp = await svc.get_records(**_get_records_defaults(limit=5))
-    body = json.loads(bytes(resp.body))
+    body = json.loads(await _read_body(resp))
 
     assert body["type"] == "FeatureCollection"
     assert body["numberMatched"] == 5
@@ -195,7 +202,7 @@ async def test_byte_budget_disabled_serves_full_page(monkeypatch):
     _wire(monkeypatch, svc, catalogs, plugin_config)
 
     resp = await svc.get_records(**_get_records_defaults(limit=5))
-    body = json.loads(bytes(resp.body))
+    body = json.loads(await _read_body(resp))
 
     assert body["numberReturned"] == 5
     assert body["numberMatched"] == 5
@@ -215,7 +222,7 @@ async def test_byte_budget_always_returns_at_least_one_record(monkeypatch):
     _wire(monkeypatch, svc, catalogs, plugin_config)
 
     resp = await svc.get_records(**_get_records_defaults(limit=3))
-    body = json.loads(bytes(resp.body))
+    body = json.loads(await _read_body(resp))
 
     assert body["numberReturned"] == 1
     assert body["numberMatched"] == 3
