@@ -400,10 +400,22 @@ async def main(task_name: str, payload: dict, schema: str):
                 except PermanentTaskFailure as exc:
                     if task_id_uuid is not None and engine is not None:
                         from dynastore.modules.tasks.tasks_module import fail_task
-                        await fail_task(
+                        _fail_updated = await fail_task(
                             engine, task_id_uuid, datetime.now(timezone.utc),
                             str(exc), retry=False,
                         )
+                        if not _fail_updated:
+                            # fail_task's guarded UPDATE matched no row (already
+                            # terminal / reclaimed). Log loudly so this isn't a
+                            # silent zombie ACTIVE row — this exception still
+                            # propagates to the outer handler below, which
+                            # decides whether the report_failure() fallback runs.
+                            logger.warning(
+                                "--- [main_task.py] fail_task() was a no-op for "
+                                "task %s (guarded write matched no row); status "
+                                "may still be stale. ---",
+                                task_id_uuid,
+                            )
                         logger.error(
                             f"--- [main_task.py] Task {task_id_uuid} permanently failed: {exc} ---"
                         )
@@ -441,19 +453,33 @@ async def main(task_name: str, payload: dict, schema: str):
                         # silently masking the row as FAILED with no retry accounting.
                         from dynastore.modules.tasks.tasks_module import fail_task
                         from datetime import datetime, timezone
-                        await fail_task(
+                        _fail_updated = await fail_task(
                             engine, uuid.UUID(task_id_str),
                             datetime.now(timezone.utc), f"Runtime Error: {str(e)}",
                             retry=True,
                         )
-                        logger.info("Successfully reported failure to DB via fail_task.")
-                        # Signal to the outer __main__ handler that this failure
-                        # was already recorded.  The outer handler checks this
-                        # attribute before calling report_failure(), which would
-                        # otherwise open a second full modules.lifespan() in the
-                        # same process — paying the ~40s bootstrap cost again and
-                        # triggering "already instantiated … reusing" warnings.
-                        e._failure_already_reported = True  # type: ignore[attr-defined]
+                        if _fail_updated:
+                            logger.info("Successfully reported failure to DB via fail_task.")
+                            # Signal to the outer __main__ handler that this failure
+                            # was already recorded.  The outer handler checks this
+                            # attribute before calling report_failure(), which would
+                            # otherwise open a second full modules.lifespan() in the
+                            # same process — paying the ~40s bootstrap cost again and
+                            # triggering "already instantiated … reusing" warnings.
+                            e._failure_already_reported = True  # type: ignore[attr-defined]
+                        else:
+                            # Guarded UPDATE matched no row — do NOT claim success
+                            # and do NOT stamp the sentinel, so the outer __main__
+                            # handler falls through to report_failure() (its
+                            # unconditional update_task write) instead of leaving
+                            # the row ACTIVE with a truthfully-uncaptured failure.
+                            logger.warning(
+                                "--- [main_task.py] fail_task() was a no-op for "
+                                "task %s (guarded write matched no row); leaving "
+                                "the failure unreported so __main__ falls through "
+                                "to report_failure(). ---",
+                                task_id_str,
+                            )
                 except Exception as report_error:
                     logger.error(f"Failed to report failure within lifecycle: {report_error}. Falling back to external reporter.")
             raise

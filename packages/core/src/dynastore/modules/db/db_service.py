@@ -243,169 +243,180 @@ class DBService(ModuleProtocol, DatabaseProtocol):
             app_state.engine = None
 
         try:
-            if not existing_engine:
-                logger.info(
-                    f"DBService: Using DB configuration: {db_config.database_url}"
-                )
+            try:
+                if not existing_engine:
+                    logger.info(
+                        f"DBService: Using DB configuration: {db_config.database_url}"
+                    )
 
-                # Tag every wire-level connection with the logical service
-                # name so DB-side ``pg_stat_activity.application_name`` is
-                # populated. Without this every connection shows as the empty
-                # string and per-service contention cannot be diagnosed from
-                # the DB side. See #699 / #655.
-                from dynastore.modules.db_config.instance import (
-                    get_service_name,
-                )
-                app_name = get_service_name() or os.getenv(
-                    "SERVICE_NAME"
-                ) or "dynastore"
+                    # Tag every wire-level connection with the logical service
+                    # name so DB-side ``pg_stat_activity.application_name`` is
+                    # populated. Without this every connection shows as the empty
+                    # string and per-service contention cannot be diagnosed from
+                    # the DB side. See #699 / #655.
+                    from dynastore.modules.db_config.instance import (
+                        get_service_name,
+                    )
+                    app_name = get_service_name() or os.getenv(
+                        "SERVICE_NAME"
+                    ) or "dynastore"
 
-                # Resolve timeout settings from PluginConfig, env, or DBConfig
-                (
-                    lock_timeout,
-                    statement_timeout,
-                    idle_in_transaction_session_timeout,
-                ) = resolve_timeout_settings(db_config)
+                    # Resolve timeout settings from PluginConfig, env, or DBConfig
+                    (
+                        lock_timeout,
+                        statement_timeout,
+                        idle_in_transaction_session_timeout,
+                    ) = resolve_timeout_settings(db_config)
 
-                # 1. Create Engine
-                app_state.engine = create_async_engine(
-                    normalize_db_url(db_config.database_url, is_async=True),
-                    pool_size=db_config.pool_min_size,
-                    max_overflow=db_config.pool_max_overflow,
-                    # pool_timeout = max seconds to wait for a free slot from
-                    # QueuePool before raising sqlalchemy.exc.TimeoutError
-                    # (fail-fast; not the statement/command execution budget).
-                    # Previously this was fed pool_command_timeout (60s) which
-                    # is the wrong semantic — see DBConfig.pool_acquire_timeout
-                    # and #1894.
-                    pool_timeout=db_config.pool_acquire_timeout,
-                    pool_pre_ping=True,
-                    pool_recycle=db_config.pool_recycle,
-                    connect_args={
-                        "timeout": db_config.connect_timeout,
-                        # Transaction-mode connection poolers (AlloyDB Managed
-                        # Connection Pooling / PgBouncer) multiplex one server
-                        # backend across many client sessions, so a prepared
-                        # statement cached against one backend may be absent —
-                        # or its numeric name already taken — on the next one
-                        # the pooler hands out. Disabling the driver's prepared
-                        # statement cache and giving every prepared statement a
-                        # unique name makes the asyncpg engine safe behind such
-                        # a pooler. It also avoids InvalidCachedStatementError
-                        # when ANOTHER instance emits DDL against shared objects
-                        # (per-catalog schema provisioning, CREATE EXTENSION) and
-                        # invalidates a cached statement's OIDs fleet-wide. See
-                        # SQLAlchemy asyncpg dialect "Prepared Statement Name
-                        # with PGBouncer" + asyncpg #837 / sqlalchemy #6467.
-                        # Deployment invariant: because each query now PREPAREs a
-                        # uniquely-named statement and never DEALLOCATEs it, the
-                        # pooler in front of us must reset the backend on release
-                        # (AlloyDB Managed Connection Pooling and PgBouncer both
-                        # run DISCARD ALL by default). Do NOT set server_reset_query
-                        # empty, or orphaned prepared statements accumulate per
-                        # backend for the life of the SQLAlchemy pool.
-                        "prepared_statement_cache_size": 0,
-                        "prepared_statement_name_func": (
-                            lambda: f"__asyncpg_{uuid4()}__"
-                        ),
-                        # asyncpg has no libpq client-side keepalive params;
-                        # the equivalent server-side GUCs must be passed as
-                        # strings via server_settings so Cloud NAT never
-                        # silently drops the idle mapping. See #655.
-                        "server_settings": {
-                            "application_name": app_name,
-                            "tcp_keepalives_idle": str(
-                                db_config.tcp_keepalives_idle
+                    # 1. Create Engine
+                    app_state.engine = create_async_engine(
+                        normalize_db_url(db_config.database_url, is_async=True),
+                        pool_size=db_config.pool_min_size,
+                        max_overflow=db_config.pool_max_overflow,
+                        # pool_timeout = max seconds to wait for a free slot from
+                        # QueuePool before raising sqlalchemy.exc.TimeoutError
+                        # (fail-fast; not the statement/command execution budget).
+                        # Previously this was fed pool_command_timeout (60s) which
+                        # is the wrong semantic — see DBConfig.pool_acquire_timeout
+                        # and #1894.
+                        pool_timeout=db_config.pool_acquire_timeout,
+                        pool_pre_ping=True,
+                        pool_recycle=db_config.pool_recycle,
+                        connect_args={
+                            "timeout": db_config.connect_timeout,
+                            # Transaction-mode connection poolers (AlloyDB Managed
+                            # Connection Pooling / PgBouncer) multiplex one server
+                            # backend across many client sessions, so a prepared
+                            # statement cached against one backend may be absent —
+                            # or its numeric name already taken — on the next one
+                            # the pooler hands out. Disabling the driver's prepared
+                            # statement cache and giving every prepared statement a
+                            # unique name makes the asyncpg engine safe behind such
+                            # a pooler. It also avoids InvalidCachedStatementError
+                            # when ANOTHER instance emits DDL against shared objects
+                            # (per-catalog schema provisioning, CREATE EXTENSION) and
+                            # invalidates a cached statement's OIDs fleet-wide. See
+                            # SQLAlchemy asyncpg dialect "Prepared Statement Name
+                            # with PGBouncer" + asyncpg #837 / sqlalchemy #6467.
+                            # Deployment invariant: because each query now PREPAREs a
+                            # uniquely-named statement and never DEALLOCATEs it, the
+                            # pooler in front of us must reset the backend on release
+                            # (AlloyDB Managed Connection Pooling and PgBouncer both
+                            # run DISCARD ALL by default). Do NOT set server_reset_query
+                            # empty, or orphaned prepared statements accumulate per
+                            # backend for the life of the SQLAlchemy pool.
+                            "prepared_statement_cache_size": 0,
+                            "prepared_statement_name_func": (
+                                lambda: f"__asyncpg_{uuid4()}__"
                             ),
-                            "tcp_keepalives_interval": str(
-                                db_config.tcp_keepalives_interval
-                            ),
-                            "tcp_keepalives_count": str(
-                                db_config.tcp_keepalives_count
-                            ),
-                            # Bounded lock windows on every connection so a
-                            # stuck DDL or a leaked / interrupted transaction
-                            # can never block the whole application. lock_timeout
-                            # caps how long any statement waits to acquire a
-                            # lock; idle_in_transaction_session_timeout makes
-                            # PostgreSQL release a held lock server-side when a
-                            # transaction is left open idle — even if the client
-                            # was interrupted and never rolled back. See
-                            # DBConfig.lock_timeout.
-                            "lock_timeout": lock_timeout,
-                            "idle_in_transaction_session_timeout": (
-                                idle_in_transaction_session_timeout
-                            ),
-                            # statement_timeout bounds total statement EXECUTION
-                            # (not just the lock wait). "0" = disabled (default,
-                            # historical behaviour). Set DB_STATEMENT_TIMEOUT just
-                            # under pool_command_timeout to turn a silent 60s
-                            # client-side cancel into a logged 57014 naming the
-                            # slow query. SET LOCAL in long jobs overrides it.
-                            "statement_timeout": statement_timeout,
+                            # asyncpg has no libpq client-side keepalive params;
+                            # the equivalent server-side GUCs must be passed as
+                            # strings via server_settings so Cloud NAT never
+                            # silently drops the idle mapping. See #655.
+                            "server_settings": {
+                                "application_name": app_name,
+                                "tcp_keepalives_idle": str(
+                                    db_config.tcp_keepalives_idle
+                                ),
+                                "tcp_keepalives_interval": str(
+                                    db_config.tcp_keepalives_interval
+                                ),
+                                "tcp_keepalives_count": str(
+                                    db_config.tcp_keepalives_count
+                                ),
+                                # Bounded lock windows on every connection so a
+                                # stuck DDL or a leaked / interrupted transaction
+                                # can never block the whole application. lock_timeout
+                                # caps how long any statement waits to acquire a
+                                # lock; idle_in_transaction_session_timeout makes
+                                # PostgreSQL release a held lock server-side when a
+                                # transaction is left open idle — even if the client
+                                # was interrupted and never rolled back. See
+                                # DBConfig.lock_timeout.
+                                "lock_timeout": lock_timeout,
+                                "idle_in_transaction_session_timeout": (
+                                    idle_in_transaction_session_timeout
+                                ),
+                                # statement_timeout bounds total statement EXECUTION
+                                # (not just the lock wait). "0" = disabled (default,
+                                # historical behaviour). Set DB_STATEMENT_TIMEOUT just
+                                # under pool_command_timeout to turn a silent 60s
+                                # client-side cancel into a logged 57014 naming the
+                                # slow query. SET LOCAL in long jobs overrides it.
+                                "statement_timeout": statement_timeout,
+                            },
                         },
-                    },
+                    )
+                    # Arm client-side TCP keepalive on every asyncpg socket so a
+                    # silently-dropped idle connection is detected fast instead of
+                    # hanging the next pool_pre_ping for connect_timeout (#710).
+                    _arm_client_socket_keepalive(app_state.engine, db_config)
+                    engine_created_by_service = True
+                    logger.info(
+                        "DBService: ASYNC Database connection pool established successfully."
+                    )
+
+                # Self-heal the base Postgres extensions (postgis et al.) on the
+                # async engine before serving traffic. #1748 gated the sync-engine
+                # DatastoreModule — the historical owner of this bootstrap — off the
+                # API/catalog SCOPE, so on a freshly-provisioned database the catalog
+                # service would otherwise have NO path to ``CREATE EXTENSION postgis``
+                # and every geometry-typed write fails with "type geometry does not
+                # exist". Runs on the asyncpg engine, so it does NOT re-introduce the
+                # sync psycopg2 engine #1748 removed from API services. The call is
+                # guarded (DB-backed presence check, Valkey-cached positive keyed by
+                # database identity), so across the multi-Cloud-Run fleet the steady
+                # state is a single cache read, not repeated DDL on every pod boot.
+                # Best-effort: a failure here must never abort foundational startup.
+                _async_engine = getattr(app_state, "engine", None)
+                if _async_engine is not None:
+                    try:
+                        from dynastore.modules.db_config.tools import (
+                            ensure_base_extensions,
+                        )
+
+                        await ensure_base_extensions(_async_engine)
+                    except Exception:
+                        logger.warning(
+                            "DBService: base-extension ensure failed (best-effort) — "
+                            "continuing startup; geometry-typed writes may fail until "
+                            "the extensions exist.",
+                            exc_info=True,
+                        )
+
+                if _async_engine is not None:
+                    try:
+                        from dynastore.tools.discovery import register_plugin
+
+                        pg_pool_signal_provider = PgPoolSignalProvider(_async_engine, db_config)
+                        register_plugin(pg_pool_signal_provider)
+                    except Exception:
+                        logger.warning(
+                            "DBService: PG pool signal provider failed to register — "
+                            "PostgreSQL pool saturation will not feed the autoscaling "
+                            "control loop.",
+                            exc_info=True,
+                        )
+                        pg_pool_signal_provider = None
+            except Exception as e:
+                logger.critical(
+                    f"DBService: FATAL: Failed to create database connection pool: {e}",
+                    exc_info=True,
                 )
-                # Arm client-side TCP keepalive on every asyncpg socket so a
-                # silently-dropped idle connection is detected fast instead of
-                # hanging the next pool_pre_ping for connect_timeout (#710).
-                _arm_client_socket_keepalive(app_state.engine, db_config)
-                engine_created_by_service = True
-                logger.info(
-                    "DBService: ASYNC Database connection pool established successfully."
+                raise
+
+            try:
+                yield
+            except Exception as e:
+                # The pool was already established above — an exception surfacing
+                # here comes from the application body or teardown, not from pool
+                # creation, so it must not be relabelled as a connection-pool
+                # creation failure (that misleads operators during shutdown).
+                logger.critical(
+                    f"DBService: Error during database service runtime or shutdown: {e}",
+                    exc_info=True,
                 )
-
-            # Self-heal the base Postgres extensions (postgis et al.) on the
-            # async engine before serving traffic. #1748 gated the sync-engine
-            # DatastoreModule — the historical owner of this bootstrap — off the
-            # API/catalog SCOPE, so on a freshly-provisioned database the catalog
-            # service would otherwise have NO path to ``CREATE EXTENSION postgis``
-            # and every geometry-typed write fails with "type geometry does not
-            # exist". Runs on the asyncpg engine, so it does NOT re-introduce the
-            # sync psycopg2 engine #1748 removed from API services. The call is
-            # guarded (DB-backed presence check, Valkey-cached positive keyed by
-            # database identity), so across the multi-Cloud-Run fleet the steady
-            # state is a single cache read, not repeated DDL on every pod boot.
-            # Best-effort: a failure here must never abort foundational startup.
-            _async_engine = getattr(app_state, "engine", None)
-            if _async_engine is not None:
-                try:
-                    from dynastore.modules.db_config.tools import (
-                        ensure_base_extensions,
-                    )
-
-                    await ensure_base_extensions(_async_engine)
-                except Exception:
-                    logger.warning(
-                        "DBService: base-extension ensure failed (best-effort) — "
-                        "continuing startup; geometry-typed writes may fail until "
-                        "the extensions exist.",
-                        exc_info=True,
-                    )
-
-            if _async_engine is not None:
-                try:
-                    from dynastore.tools.discovery import register_plugin
-
-                    pg_pool_signal_provider = PgPoolSignalProvider(_async_engine, db_config)
-                    register_plugin(pg_pool_signal_provider)
-                except Exception:
-                    logger.warning(
-                        "DBService: PG pool signal provider failed to register — "
-                        "PostgreSQL pool saturation will not feed the autoscaling "
-                        "control loop.",
-                        exc_info=True,
-                    )
-                    pg_pool_signal_provider = None
-
-            yield
-
-        except Exception as e:
-            logger.critical(
-                f"DBService: FATAL: Failed to create database connection pool: {e}",
-                exc_info=True,
-            )
-            raise
+                raise
         finally:
             if pg_pool_signal_provider is not None:
                 from dynastore.tools.discovery import unregister_plugin
