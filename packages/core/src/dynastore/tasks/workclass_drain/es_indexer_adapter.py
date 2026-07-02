@@ -48,6 +48,7 @@ Classification rules
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, List, Sequence, Tuple, cast
 from uuid import UUID
 
@@ -56,6 +57,8 @@ from dynastore.models.protocols.indexing import (
     IndexableOp,
 )
 from dynastore.modules.elasticsearch.bulk_classify import classify_bulk_response
+
+logger = logging.getLogger(__name__)
 
 
 class ESBulkIndexer:
@@ -122,9 +125,17 @@ class ESBulkIndexer:
         es = self._get_client()
 
         try:
-            response = await es.bulk(operations=bulk_body)
+            # opensearch-py signature: ``bulk(*, body, ...)`` — NOT the
+            # elasticsearch-py 8.x ``operations=`` keyword.
+            response = await es.bulk(body=bulk_body)
         except Exception as exc:  # noqa: BLE001 — connection-level fail = retry all
             reason = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "ESBulkIndexer: whole-batch bulk call failed before/at the "
+                "wire — %d op(s) funnelled to transient retry: %s",
+                len(op_index_map),
+                reason,
+            )
             return BulkIndexResult(
                 passed=[],
                 transient=[(op.op_id, reason) for op in op_index_map],
