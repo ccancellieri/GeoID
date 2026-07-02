@@ -420,7 +420,14 @@ worker_task_dimensions_materialize = ["dynastore[task_base,module_db,module_cata
 # still referencing it directly. Add new secondary write-driver modules here
 # as they are built so this job stays the ONE place that drains every driver
 # family, not just Elasticsearch.
-worker_task_async_writer = ["dynastore[task_base,module_catalog,elasticsearch,task_elasticsearch_indexer_deps,outbox_drain,module_storage_postgresql]"]
+# module_db (asyncpg) is required: storage_drain builds a SQLAlchemy async
+# engine (workclass_drain/storage_drain_task.py — create_async_engine +
+# NullPool) for its claim/terminal-write loop; task_base alone ships only the
+# sync psycopg2 engine, so every run dies at startup with
+# ModuleNotFoundError: No module named 'asyncpg' and the storage-plane outbox
+# never drains (#2718). Same dual-engine pairing as
+# worker_task_dimensions_materialize (#2472).
+worker_task_async_writer = ["dynastore[task_base,module_db,module_catalog,elasticsearch,task_elasticsearch_indexer_deps,outbox_drain,module_storage_postgresql]"]
 # Back-compat alias: `worker_task_elasticsearch_indexer` was this SCOPE's name
 # before #2622 generalized it beyond Elasticsearch. Kept as a pure alias so
 # `pip install dynastore[worker_task_elasticsearch_indexer]` (still used by
