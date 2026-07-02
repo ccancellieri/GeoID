@@ -212,6 +212,21 @@ class IndexPropagationTask(TaskProtocol):
 
         result = await target.index_bulk(ctx, ops)
 
+        # #914 / #2666 — same silent no-op trap ``IndexDispatcher._dispatch_bulk``
+        # guards against (indexer accepted the call but wrote nothing, and
+        # raised nothing) also applies on replay. Without this check a replayed
+        # no-op is reported ``status="ok"`` / the task row COMPLETEs, and the
+        # write is silently dropped a second time with no further retry. An
+        # empty ``ops`` list (``total == 0``) is a legitimate, non-noop result
+        # and must not trip this guard.
+        if result.total > 0 and result.succeeded == 0 and result.failed == 0:
+            raise RuntimeError(
+                f"index_propagation: indexer '{inputs.indexer_id}' returned a "
+                f"silent no-op on replay (total={result.total}, succeeded=0, "
+                f"failed=0) — treating as a retryable failure instead of "
+                f"reporting false success."
+            )
+
         return {
             "status": "ok" if result.failed == 0 else "partial",
             "indexer_id": inputs.indexer_id,
