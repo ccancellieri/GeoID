@@ -1110,6 +1110,7 @@ class LifecycleRegistry:
                         ResultHandler,
                     )
                     from dynastore.tasks import get_loaded_task_types
+                    from dynastore.tools.db import qualify_table
 
                     schema = get_task_schema()
                     loaded_types = list(get_loaded_task_types())
@@ -1120,7 +1121,7 @@ class LifecycleRegistry:
                         placeholders = ", ".join(f":t_{i}" for i in range(len(loaded_types)))
                         type_params = {f"t_{i}": t for i, t in enumerate(loaded_types)}
                         count_sql = (
-                            f"SELECT COUNT(*) FROM {schema}.tasks "
+                            f"SELECT COUNT(*) FROM {qualify_table(schema, 'tasks')} "
                             f"WHERE status IN ('PENDING', 'ACTIVE', 'RUNNING') "
                             f"AND task_type IN ({placeholders})"
                         )

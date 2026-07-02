@@ -131,3 +131,45 @@ def validate_column_identifier(identifier: str) -> str:
         )
 
     return identifier
+
+
+def quote_ident(identifier: str) -> str:
+    """
+    Double-quote a single PostgreSQL identifier for safe interpolation into
+    SQL text, escaping embedded ``"`` per the SQL standard (``"`` -> ``""``).
+
+    This only handles quoting/escaping — it does not validate character
+    content. Callers that build identifiers from user input should run them
+    through ``validate_sql_identifier``/``validate_column_identifier`` first
+    (``qualify_table``/``qualify_column`` below do this for the common
+    two-part and single-part cases).
+    """
+    if not isinstance(identifier, str):
+        raise TypeError("Identifier must be a string.")
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def qualify_table(schema: str, table: str) -> str:
+    """
+    Validate and quote a ``schema.table`` reference for safe interpolation
+    into SQL text, e.g. ``qualify_table("my_schema", "notebooks")`` ->
+    ``'"my_schema"."notebooks"'``.
+
+    Raises:
+        InvalidIdentifierError: If either part fails identifier validation.
+    """
+    validate_sql_identifier(schema)
+    validate_column_identifier(table)
+    return f"{quote_ident(schema)}.{quote_ident(table)}"
+
+
+def qualify_column(name: str) -> str:
+    """
+    Validate and quote a single column identifier for safe interpolation
+    into SQL text, e.g. ``qualify_column("geoid")`` -> ``'"geoid"'``.
+
+    Raises:
+        InvalidIdentifierError: If the name fails column-identifier validation.
+    """
+    validate_column_identifier(name)
+    return quote_ident(name)

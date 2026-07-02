@@ -31,6 +31,7 @@ from sqlalchemy import text
 from dynastore.modules.db_config.exceptions import ResourceNotFoundError
 from dynastore.modules.db_config.query_executor import DDLQuery, DQLQuery, ResultHandler
 from dynastore.modules.db_config.core_metadata_ddl import core_metadata_columns
+from dynastore.tools.db import qualify_table
 
 from .models import NotebookCreate
 
@@ -64,7 +65,7 @@ async def get_notebook(conn, schema: str, notebook_id: str) -> Dict[str, Any]:
     query = text(f"""
         SELECT notebook_id, catalog_id, title, description, tags, content, metadata,
                created_at, updated_at, deleted_at, owner_id, copied_from
-        FROM {schema}.notebooks
+        FROM {qualify_table(schema, "notebooks")}
         WHERE notebook_id = :notebook_id AND deleted_at IS NULL
     """)
     row = await DQLQuery(query, result_handler=ResultHandler.ONE_DICT).execute(
@@ -113,7 +114,7 @@ async def list_notebooks(
 
     where_sql = " AND ".join(where_clauses)
 
-    count_query = text(f"SELECT COUNT(*) FROM {schema}.notebooks WHERE {where_sql}")
+    count_query = text(f"SELECT COUNT(*) FROM {qualify_table(schema, 'notebooks')} WHERE {where_sql}")
     total_count = await DQLQuery(
         count_query, result_handler=ResultHandler.SCALAR_ONE_OR_NONE
     ).execute(conn, **{k: v for k, v in params.items() if k not in ("limit", "offset")})
@@ -122,7 +123,7 @@ async def list_notebooks(
     list_query = text(f"""
         SELECT notebook_id, catalog_id, title, description, tags, metadata,
                created_at, updated_at, owner_id, copied_from
-        FROM {schema}.notebooks
+        FROM {qualify_table(schema, "notebooks")}
         WHERE {where_sql}
         ORDER BY updated_at DESC
         LIMIT :limit OFFSET :offset
@@ -136,7 +137,7 @@ async def list_notebooks(
 async def soft_delete_notebook(conn, schema: str, notebook_id: str) -> None:
     """Soft-delete a notebook."""
     rowcount = await DQLQuery(
-        f"UPDATE {schema}.notebooks SET deleted_at = NOW() WHERE notebook_id = :notebook_id AND deleted_at IS NULL",
+        f"UPDATE {qualify_table(schema, 'notebooks')} SET deleted_at = NOW() WHERE notebook_id = :notebook_id AND deleted_at IS NULL",
         result_handler=ResultHandler.ROWCOUNT,
     ).execute(conn, notebook_id=notebook_id)
     if not rowcount:
@@ -164,7 +165,7 @@ async def save_notebook(
 ) -> Dict[str, Any]:
     """Save or update a notebook."""
     query = text(f"""
-        INSERT INTO {schema}.notebooks
+        INSERT INTO {qualify_table(schema, "notebooks")}
             (notebook_id, catalog_id, title, description, tags, content, metadata,
              owner_id, copied_from, updated_at)
         VALUES
@@ -203,7 +204,7 @@ async def copy_from_platform(
 ) -> Dict[str, Any]:
     """Copy a platform notebook into a tenant catalog (no-op if already exists)."""
     query = text(f"""
-        INSERT INTO {schema}.notebooks
+        INSERT INTO {qualify_table(schema, "notebooks")}
             (notebook_id, catalog_id, title, description, tags, content, metadata,
              owner_id, copied_from)
         VALUES
