@@ -78,16 +78,6 @@ _DEFAULT_LEASE_SECONDS: int = 300
 # The previous 1500 OOM-killed 2Gi containers on MB-scale geometries (#2723).
 _DEFAULT_BATCH_SIZE: int = 100
 
-# The well-known driver_id for the Elasticsearch items secondary-index driver.
-# Resolution is config-scoped via the storage driver registry (populated from
-# per-collection routing configs at startup). The ES adapter is just one
-# adapter — any driver registered under its config-scoped snake_case id resolves
-# automatically through the registry.  This constant is used only as a fallback
-# construction key when the registry has not yet been populated (e.g. early
-# in startup or in test environments without a running app context).
-_ES_ITEMS_DRIVER_ID: str = "items_elasticsearch_driver"
-
-
 def _backoff(attempts: int) -> int:
     """Return the backoff in seconds for the given zero-based attempt count."""
     idx = min(attempts, len(_BACKOFF_SECONDS) - 1)
@@ -317,8 +307,11 @@ class StorageDrainTask(TaskProtocol):
             indexer = await self._resolve_indexer(driver_id)
             if indexer is None:
                 logger.warning(
-                    "StorageDrainTask: no BulkIndexer registered for "
-                    "driver_id=%r — %d row(s) queued for retry.",
+                    "StorageDrainTask: driver_id=%r is not registered — "
+                    "%d row(s) queued for retry. Registration is required: "
+                    "the owning driver's module must be installed and "
+                    "instantiated for this runtime's SCOPE so it registers "
+                    "into the storage driver registry.",
                     driver_id,
                     len(driver_rows),
                 )
@@ -479,11 +472,14 @@ class StorageDrainTask(TaskProtocol):
            any registered ``CollectionItemsStore`` driver, not just ES.
         3. ``DriverRegistry.asset_index().get(driver_id)`` — fallback for
            drivers that live in the asset tier rather than the items tier.
-        4. For the known ES items driver_id: if the registry yields nothing
-           (e.g. early startup or a test environment without a running app
-           context), construct ``ItemsElasticsearchDriver()`` directly and wrap
-           it.  This preserves the original availability semantics and keeps
-           existing tests green.
+
+        There is no construction fallback: a driver that is not registered
+        (module not installed for this runtime's SCOPE, or discovery/lifespan
+        hasn't populated it yet) resolves to ``None``. Registration is the
+        single, symmetric contract every storage driver must satisfy to
+        participate in drain — see module entry points under
+        ``[project.entry-points."dynastore.modules"]`` (e.g.
+        ``storage_elasticsearch = "...:ItemsElasticsearchDriver"``).
 
         ``driver_id``\\s that cannot be resolved through any of the above paths
         return ``None``; the caller funnels those rows to retry — they are
@@ -507,7 +503,7 @@ class StorageDrainTask(TaskProtocol):
         from dynastore.modules.storage.driver_registry import DriverRegistry
         from dynastore.tasks.workclass_drain.es_indexer_adapter import ESBulkIndexer
 
-        # --- Step 1: registry-driven resolution ---
+        # --- Registry-driven resolution ---
         driver = (
             DriverRegistry.collection_index().get(driver_id)
             or DriverRegistry.asset_index().get(driver_id)
@@ -538,26 +534,9 @@ class StorageDrainTask(TaskProtocol):
             )
             return None
 
-        # --- Step 2: construction fallback for the known ES driver_id ---
-        # Handles the case where the registry is not yet populated (e.g. the
-        # elasticsearch extension is installed but discovery hasn't run, or the
-        # worker is in a lightweight context that skips protocol registration).
-        if driver_id == _ES_ITEMS_DRIVER_ID:
-            # cast(Any, ...): pyright sees the Protocol-mixin as abstract, but
-            # runtime instantiation is valid.
-            es_driver = cast(Any, ItemsElasticsearchDriver)()
-            if not es_driver.is_available():
-                logger.warning(
-                    "StorageDrainTask: ES driver unavailable (opensearch-py "
-                    "missing from worker extras) — rows for driver_id=%r will "
-                    "retry until a capable pod drains them.",
-                    driver_id,
-                )
-                return None
-            indexer = cast(BulkIndexer, ESBulkIndexer(es_driver))
-            self._indexer_cache[driver_id] = indexer
-            return indexer
-
+        # Unregistered: no construction fallback. The driver's module must
+        # register itself (its entry point instantiated for this runtime's
+        # SCOPE) for drain to find it — see the resolution-order note above.
         return None
 
     # ------------------------------------------------------------------
@@ -751,7 +730,7 @@ class StorageDrainTask(TaskProtocol):
         Couples this generically-named drain task to the ES-shaped
         canonical envelope (``build_canonical_index_doc``); today the only
         ``BulkIndexer`` the drain resolves is the ES adapter
-        (:data:`_ES_ITEMS_DRIVER_ID`), so this is not a behaviour change —
+        (``items_elasticsearch_driver``), so this is not a behaviour change —
         a future non-ES ``BulkIndexer`` would need its own re-read
         strategy here.
         """

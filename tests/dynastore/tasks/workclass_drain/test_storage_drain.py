@@ -758,6 +758,91 @@ async def test_resolve_indexer_es_driver_is_bulk_indexer(drain_env):
     )
 
 
+@pytest.mark.asyncio
+async def test_resolve_indexer_registered_driver_resolves_via_registry():
+    """A driver registered under its snake_case ``driver_id`` in
+    ``DriverRegistry.collection_index()`` resolves to a ``BulkIndexer`` —
+    the registry lookup is the only resolution path (#2732 step 3: the
+    hardcoded ``ItemsElasticsearchDriver()`` construction fallback was
+    removed). Pure-unit — no PG required."""
+    from unittest.mock import MagicMock, patch
+
+    from dynastore.modules.storage.driver_registry import DriverRegistry
+    from dynastore.modules.storage.drivers.elasticsearch import (
+        ItemsElasticsearchDriver,
+    )
+    from dynastore.tasks.workclass_drain.es_indexer_adapter import ESBulkIndexer
+    from dynastore.tasks.workclass_drain.storage_drain_task import StorageDrainTask
+
+    fake_driver = MagicMock(spec=ItemsElasticsearchDriver)
+    fake_driver.is_available.return_value = True
+
+    task = StorageDrainTask()
+    with (
+        patch.object(
+            DriverRegistry, "collection_index",
+            return_value={"items_elasticsearch_driver": fake_driver},
+        ),
+        patch.object(DriverRegistry, "asset_index", return_value={}),
+    ):
+        indexer = await task._resolve_indexer("items_elasticsearch_driver")
+
+    assert isinstance(indexer, ESBulkIndexer)
+
+
+@pytest.mark.asyncio
+async def test_drain_once_unregistered_driver_retries_without_affecting_others(
+    drain_env, monkeypatch, caplog,
+):
+    """A ``driver_id`` with no registered ``BulkIndexer`` funnels its rows to
+    retry with a WARNING naming the driver_id and stating registration is
+    required — while another ``driver_id``'s rows claimed in the same batch
+    are indexed normally (#2732 step 3: no construction fallback, so an
+    unregistered driver can never silently mask a real registration gap)."""
+    import logging as _logging
+
+    from dynastore.models.protocols.indexing import BulkIndexResult
+
+    task_schema, engine = drain_env
+    await _seed_rows(engine, task_schema, n=2, driver_id="registered_driver")
+    await _seed_rows(engine, task_schema, n=1, driver_id="unregistered_driver_xyz")
+
+    task = _make_task(engine, task_schema)
+    fake = _FakeBulkIndexer(
+        lambda ops: BulkIndexResult(
+            passed=[op.op_id for op in ops], transient=[], poison=[],
+        )
+    )
+
+    async def _resolve(driver_id: str) -> Any:
+        return fake if driver_id == "registered_driver" else None
+
+    monkeypatch.setattr(task, "_resolve_indexer", _resolve)
+
+    owner_id = f"owner:{uuid4()}"
+    with caplog.at_level(_logging.WARNING):
+        count = await task.drain_once(engine=engine, owner_id=owner_id)
+    assert count == 3
+
+    # The registered driver's rows were dispatched to its bulk indexer;
+    # nothing from the unregistered driver reached it.
+    assert len(fake.calls) == 1
+    assert len(fake.calls[0]) == 2
+
+    rows = await _fetch_rows(engine, task_schema)
+    done = [r for r in rows if r["status"] == "done"]
+    retried = [r for r in rows if r["status"] == "ready"]
+    assert len(done) == 2, "the registered driver's rows must be indexed and done"
+    assert len(retried) == 1, "the unregistered driver's row must be retried, not dropped"
+    assert retried[0]["attempts"] == 1
+
+    assert any(
+        "unregistered_driver_xyz" in r.getMessage()
+        and "registration is required" in r.getMessage().lower()
+        for r in caplog.records
+    ), "the WARN must name the driver_id and state registration is required"
+
+
 # ---------------------------------------------------------------------------
 # 8. Canonical re-read for id-only rows (#2494 P1)
 # ---------------------------------------------------------------------------
