@@ -250,6 +250,25 @@ class GcpModuleConfig(ExposableConfigMixin, PluginConfig):
                     "ordinary cadence jitter between reconciler passes never fires "
                     "the backstop."
     )
+    liveness_staleness_grace_seconds: Mutable[int] = Field(
+        default=60,
+        description="geoid#2819: grace window (seconds) added on top of a bare "
+                    "lapsed lease before the non-locking staleness scan reports a "
+                    "row. Filters out rows that merely lapsed within the last tick "
+                    "or two, so only rows old enough that the FOR UPDATE SKIP "
+                    "LOCKED scan would certainly have already reached them are "
+                    "considered candidates for the visible-but-unclaimable check."
+    )
+    liveness_staleness_max_passes: Mutable[int] = Field(
+        default=2,
+        ge=1,
+        description="geoid#2819: number of consecutive reconciler passes a row may "
+                    "appear in the non-locking staleness scan without also being "
+                    "claimed by the FOR UPDATE SKIP LOCKED scan before it is logged "
+                    "as visible-but-unclaimable (loud warning) and a lock-free heal "
+                    "attempt is made via the same probe+owner-guarded-write path "
+                    "the on-demand GET healer (reconcile_task_liveness) uses."
+    )
 
     # --- GCS retry and per-bucket circuit breaker ---
     gcs_retry_max_attempts: Mutable[int] = Field(

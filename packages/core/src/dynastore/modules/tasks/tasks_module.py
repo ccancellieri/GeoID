@@ -2952,6 +2952,24 @@ async def persist_outputs(
         )
 
 
+def _decode_gcp_task_rows_inputs(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Decode the raw JSONB-as-text ``inputs`` column on each row, in place.
+
+    asyncpg hands JSONB back as a JSON *string* under a raw ``text()``/
+    ``DQLQuery`` read; ``apply_terminal_action`` only spreads ``inputs`` when
+    ``isinstance(inputs, dict)``, so an un-decoded string silently drops the
+    original payload (geoid#1743).
+    """
+    for row in rows:
+        inputs_raw = row.get("inputs")
+        if isinstance(inputs_raw, str):
+            try:
+                row["inputs"] = json.loads(inputs_raw)
+            except (ValueError, TypeError):
+                row["inputs"] = None
+    return rows
+
+
 async def select_lapsed_gcp_tasks(engine: DbResource) -> List[Dict[str, Any]]:
     """Return lapsed-lease Cloud Run task rows for the liveness reconciler.
 
@@ -2987,14 +3005,51 @@ async def select_lapsed_gcp_tasks(engine: DbResource) -> List[Dict[str, Any]]:
     """
     async with managed_transaction(engine) as conn:
         rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(conn)
-    for row in rows or []:
-        inputs_raw = row.get("inputs")
-        if isinstance(inputs_raw, str):
-            try:
-                row["inputs"] = json.loads(inputs_raw)
-            except (ValueError, TypeError):
-                row["inputs"] = None
-    return rows or []
+    return _decode_gcp_task_rows_inputs(rows or [])
+
+
+async def select_stale_gcp_tasks(
+    engine: DbResource, grace_seconds: float
+) -> List[Dict[str, Any]]:
+    """Return lapsed ``ACTIVE`` Cloud Run rows via a plain, non-locking SELECT.
+
+    geoid#2819: :func:`select_lapsed_gcp_tasks` takes ``FOR UPDATE SKIP
+    LOCKED`` — correct for avoiding a fight with the pg_cron reaper, but it
+    means a row held by a zombie PG session (a SIGKILLed remote backend that
+    left an idle-in-transaction lock behind) is silently skipped on *every*
+    pass, not just delayed. This query has no ``FOR UPDATE`` clause, so it
+    sees such a row regardless of any lock another session holds on it — the
+    liveness reconciler diffs this result against
+    :func:`select_lapsed_gcp_tasks`'s to tell "naturally lapsed, about to be
+    claimed" apart from "stuck behind a lock, invisible to every locking
+    scan".
+
+    ``grace_seconds`` is deliberately larger than the locking scan's implicit
+    zero-grace ``locked_until < NOW()`` — it filters out rows that merely
+    lapsed within the last reconciler tick or two, so this scan only reports
+    rows old enough that a healthy locking scan would certainly have reached
+    them by now.
+
+    Returns the identical row shape as :func:`select_lapsed_gcp_tasks` so a
+    row surfaced here can be handed straight to
+    ``GcpLivenessReconciler._reconcile_row`` for a lock-free heal attempt.
+    """
+    task_schema = get_task_schema()
+    sql = f"""
+        SELECT task_id, catalog_id, task_type, owner_id, runner_ref,
+               started_at, locked_until, retry_count, max_retries, outputs,
+               scope, caller_id, inputs, collection_id
+        FROM {task_schema}.tasks
+        WHERE status = 'ACTIVE'
+          AND locked_until < NOW() - make_interval(secs => :grace_seconds)
+          AND owner_id LIKE 'gcp_cloud_run_%'
+        LIMIT 500;
+    """
+    async with managed_transaction(engine) as conn:
+        rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
+            conn, grace_seconds=grace_seconds
+        )
+    return _decode_gcp_task_rows_inputs(rows or [])
 
 
 async def select_dismissed_unconfirmed_gcp_tasks(

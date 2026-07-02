@@ -54,6 +54,9 @@ _LIVENESS_FIELDS = (
     "liveness_reconciler_interval_seconds",
     "liveness_extend_visibility_seconds",
     "liveness_unknown_grace_seconds",
+    # geoid#2819: non-locking staleness detection tunables.
+    "liveness_staleness_grace_seconds",
+    "liveness_staleness_max_passes",
 )
 
 
@@ -120,6 +123,9 @@ def test_gcp_module_lifespan_reads_reconciler_settings_from_plugin_config():
         "liveness_reconciler_interval_seconds",
         "liveness_extend_visibility_seconds",
         "liveness_unknown_grace_seconds",
+        # geoid#2819: non-locking staleness detection tunables.
+        "liveness_staleness_grace_seconds",
+        "liveness_staleness_max_passes",
     ):
         assert field in src, (
             f"GCPModule.lifespan no longer reads {field!r} from PluginConfig — "

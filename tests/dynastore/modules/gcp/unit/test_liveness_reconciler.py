@@ -106,6 +106,9 @@ def _patch_actions(monkeypatch):
       — the confirmed-dismiss helpers; patched here so tests that call
       ``_reconcile_once`` (which drives both the lapsed-lease and
       dismissed-unconfirmed scans) do not hit the real DB.
+    * ``select_stale_gcp_tasks`` — the geoid#2819 non-locking staleness scan
+      ``_reconcile_once`` also drives every pass; defaults to an empty result
+      so tests that don't care about staleness detection see no extra rows.
     """
     from dynastore.modules.tasks import tasks_module
 
@@ -115,12 +118,14 @@ def _patch_actions(monkeypatch):
     complete = AsyncMock(return_value=True)
     select_dismissed = AsyncMock(return_value=[])
     stamp = AsyncMock(return_value=True)
+    select_stale = AsyncMock(return_value=[])
     monkeypatch.setattr(tasks_module, "heartbeat_tasks", hb)
     monkeypatch.setattr(tasks_module, "heartbeat_task_if_active", hb_if_active)
     monkeypatch.setattr(tasks_module, "fail_task", fail)
     monkeypatch.setattr(tasks_module, "complete_task", complete)
     monkeypatch.setattr(tasks_module, "select_dismissed_unconfirmed_gcp_tasks", select_dismissed)
     monkeypatch.setattr(tasks_module, "stamp_dismiss_confirmed", stamp)
+    monkeypatch.setattr(tasks_module, "select_stale_gcp_tasks", select_stale)
     return SimpleNamespace(
         heartbeat=hb,
         heartbeat_if_active=hb_if_active,
@@ -128,6 +133,7 @@ def _patch_actions(monkeypatch):
         complete=complete,
         select_dismissed=select_dismissed,
         stamp=stamp,
+        select_stale=select_stale,
     )
 
 
@@ -671,3 +677,172 @@ async def test_terminal_race_losses_counted_in_pass_summary(monkeypatch, caplog)
 
     msg = _summary_lines(caplog)[-1].getMessage()
     assert "RACE_LOST=2" in msg, "both terminal-path race losses must be tallied"
+
+
+# --- geoid#2819: non-locking staleness detection ----------------------------
+#
+# A row held by a zombie PG session (dead remote backend still holding its
+# row lock) is silently skipped by the FOR UPDATE SKIP LOCKED scan on every
+# pass. ``_check_staleness`` diffs a plain, non-locking SELECT against the
+# task_ids the locking scan actually reached this pass, and after
+# ``staleness_max_passes`` consecutive occurrences logs loudly and attempts a
+# lock-free heal via the same probe + owner-guarded-write path as the primary
+# scan / backstop.
+
+
+def _staleness_warnings(caplog):
+    return [
+        r for r in caplog.records
+        if "liveness_staleness_visible_unclaimable" in r.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_staleness_streak_increments_but_no_warning_below_threshold(monkeypatch, caplog):
+    from dynastore.modules.tasks import tasks_module
+
+    actions = _patch_actions(monkeypatch)
+    row = _row()
+    monkeypatch.setattr(tasks_module, "select_stale_gcp_tasks", AsyncMock(return_value=[row]))
+    rec = _make_reconciler(staleness_max_passes=3)
+
+    with caplog.at_level("WARNING", logger="dynastore.modules.gcp.liveness_reconciler"):
+        await rec._check_staleness(claimed_ids=set())
+
+    assert rec._stale_streak[row["task_id"]] == 1
+    assert not _staleness_warnings(caplog), "must not warn before crossing staleness_max_passes"
+    actions.heartbeat_if_active.assert_not_awaited()
+    actions.fail.assert_not_awaited()
+    actions.complete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_staleness_warns_and_attempts_lock_free_heal_after_max_passes(monkeypatch, caplog):
+    from dynastore.modules.tasks import tasks_module
+    from dynastore.modules.tasks.liveness import LivenessVerdict
+
+    actions = _patch_actions(monkeypatch)
+    _patch_probe(monkeypatch, LivenessVerdict.ALIVE)
+    row = _row()
+    monkeypatch.setattr(tasks_module, "select_stale_gcp_tasks", AsyncMock(return_value=[row]))
+    rec = _make_reconciler(staleness_max_passes=2)
+
+    with caplog.at_level("WARNING", logger="dynastore.modules.gcp.liveness_reconciler"):
+        await rec._check_staleness(claimed_ids=set())
+        await rec._check_staleness(claimed_ids=set())
+
+    warnings = _staleness_warnings(caplog)
+    assert len(warnings) == 1, "loud warning fires exactly once on the pass that crosses the threshold"
+    msg = warnings[0].getMessage()
+    assert str(row["task_id"]) in msg
+    assert "passes=2" in msg
+    # Lock-free heal attempted via the shared _reconcile_row path (same
+    # probe + owner-guarded-write path the primary scan / backstop use).
+    actions.heartbeat_if_active.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_staleness_streak_resets_when_row_claimed_by_locking_scan(monkeypatch):
+    """A row the FOR UPDATE SKIP LOCKED scan reaches this pass is merely
+    lapsed, not stuck behind a lock — its streak must reset, not accumulate
+    toward a false-positive loud warning."""
+    from dynastore.modules.tasks import tasks_module
+
+    _patch_actions(monkeypatch)
+    row = _row()
+    monkeypatch.setattr(tasks_module, "select_stale_gcp_tasks", AsyncMock(return_value=[row]))
+    rec = _make_reconciler(staleness_max_passes=3)
+
+    await rec._check_staleness(claimed_ids=set())
+    await rec._check_staleness(claimed_ids=set())
+    assert rec._stale_streak[row["task_id"]] == 2
+
+    await rec._check_staleness(claimed_ids={row["task_id"]})
+    assert row["task_id"] not in rec._stale_streak
+
+
+@pytest.mark.asyncio
+async def test_staleness_streak_resets_when_row_disappears_from_scan(monkeypatch):
+    """A row that stops appearing in the non-locking scan (healed, reclaimed,
+    or no longer lapsed) must not keep an accumulated streak around — a
+    fresh occurrence later starts counting from zero."""
+    from dynastore.modules.tasks import tasks_module
+
+    _patch_actions(monkeypatch)
+    row = _row()
+    select_stale = AsyncMock(return_value=[row])
+    monkeypatch.setattr(tasks_module, "select_stale_gcp_tasks", select_stale)
+    rec = _make_reconciler(staleness_max_passes=3)
+
+    await rec._check_staleness(claimed_ids=set())
+    assert rec._stale_streak[row["task_id"]] == 1
+
+    select_stale.return_value = []
+    await rec._check_staleness(claimed_ids=set())
+    assert row["task_id"] not in rec._stale_streak
+
+
+@pytest.mark.asyncio
+async def test_staleness_heal_failure_does_not_raise_and_streak_survives(monkeypatch, caplog):
+    """A probe/write exception during the lock-free heal attempt must not
+    break the tick — the streak is left in place so the next pass retries."""
+    from dynastore.modules.tasks import tasks_module
+
+    _patch_actions(monkeypatch)
+    row = _row()
+    monkeypatch.setattr(tasks_module, "select_stale_gcp_tasks", AsyncMock(return_value=[row]))
+
+    def _boom(owner_id):
+        raise RuntimeError("probe resolution blew up")
+
+    monkeypatch.setattr(_reconciler_mod(), "resolve_probe", _boom)
+    rec = _make_reconciler(staleness_max_passes=1)
+
+    with caplog.at_level("WARNING", logger="dynastore.modules.gcp.liveness_reconciler"):
+        await rec._check_staleness(claimed_ids=set())  # must not raise
+
+    fail_logs = [
+        r for r in caplog.records if "lock-free heal attempt failed" in r.getMessage()
+    ]
+    assert fail_logs
+    assert rec._stale_streak[row["task_id"]] == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_once_threads_claimed_ids_into_staleness_check(monkeypatch):
+    """``_reconcile_once`` must pass the primary scan's claimed task_ids into
+    ``_check_staleness`` so a row genuinely reached this pass resets its
+    streak instead of accumulating toward a false-positive loud warning."""
+    from dynastore.modules.tasks import tasks_module
+    from dynastore.modules.tasks.liveness import LivenessVerdict
+
+    _patch_actions(monkeypatch)
+    _patch_probe(monkeypatch, LivenessVerdict.ALIVE)
+    row = _row()
+    monkeypatch.setattr(tasks_module, "select_lapsed_gcp_tasks", AsyncMock(return_value=[row]))
+    monkeypatch.setattr(tasks_module, "select_stale_gcp_tasks", AsyncMock(return_value=[row]))
+    rec = _make_reconciler(staleness_max_passes=1)
+    rec._stale_streak[row["task_id"]] = 5  # pretend a prior streak existed
+
+    await rec._reconcile_once()
+
+    assert row["task_id"] not in rec._stale_streak
+
+
+@pytest.mark.asyncio
+async def test_staleness_scan_failure_is_swallowed(monkeypatch, caplog):
+    """A staleness-scan SELECT failure (e.g. transient DB error) must not
+    break the reconciler tick — detection is best-effort."""
+    from dynastore.modules.tasks import tasks_module
+
+    _patch_actions(monkeypatch)
+    monkeypatch.setattr(
+        tasks_module, "select_stale_gcp_tasks",
+        AsyncMock(side_effect=RuntimeError("db unavailable")),
+    )
+    rec = _make_reconciler()
+
+    with caplog.at_level("WARNING", logger="dynastore.modules.gcp.liveness_reconciler"):
+        await rec._check_staleness(claimed_ids=set())  # must not raise
+
+    assert any("staleness scan failed" in r.getMessage() for r in caplog.records)

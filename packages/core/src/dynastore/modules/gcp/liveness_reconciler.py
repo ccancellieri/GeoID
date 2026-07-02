@@ -136,6 +136,8 @@ class GcpLivenessReconciler(PeriodicService):
         interval_seconds: float | None = None,
         extend_visibility_seconds: int | None = None,
         unknown_grace_seconds: int | None = None,
+        staleness_grace_seconds: int | None = None,
+        staleness_max_passes: int | None = None,
     ) -> None:
         from dynastore.modules.db_config.instance import get_service_name as _get_service_name
         service = _get_service_name() or "unknown"
@@ -148,6 +150,24 @@ class GcpLivenessReconciler(PeriodicService):
         self._engine: Any = engine
         self._extend_visibility_seconds: int = int(extend_visibility_seconds if extend_visibility_seconds is not None else cfg_visibility)
         self._unknown_grace_seconds: int = int(unknown_grace_seconds if unknown_grace_seconds is not None else cfg_unknown_grace)
+        # geoid#2819: non-locking staleness detection tunables. Defaults here
+        # (mirroring the backstop's hardcoded-default pattern above) are
+        # overridden by GcpModuleConfig.liveness_staleness_grace_seconds /
+        # liveness_staleness_max_passes when wired from gcp_module.py.
+        self._staleness_grace_seconds: int = int(
+            staleness_grace_seconds if staleness_grace_seconds is not None else 60
+        )
+        self._staleness_max_passes: int = int(
+            staleness_max_passes if staleness_max_passes is not None else 2
+        )
+        # In-process streak tracker: task_id -> consecutive passes seen by the
+        # non-locking staleness scan but NOT reached by this pass's FOR UPDATE
+        # SKIP LOCKED scan. Leader-gated (this instance only ticks on the
+        # elected leader pod), so no cross-pod synchronization is needed —
+        # a leadership handoff simply restarts the streak, which is safe:
+        # a genuinely stuck row re-accumulates the streak within
+        # ``staleness_max_passes`` more ticks.
+        self._stale_streak: Dict[Any, int] = {}
 
     # --- PeriodicService tick ----------------------------------------------
 
@@ -188,6 +208,7 @@ class GcpLivenessReconciler(PeriodicService):
         non-zero to keep the line compact.
         """
         rows = await tasks_module.select_lapsed_gcp_tasks(self._engine)
+        claimed_ids = {row.get("task_id") for row in rows if row.get("task_id") is not None}
         verdicts: Counter[str] = Counter()
         unmapped = 0
         errors = 0
@@ -237,6 +258,11 @@ class GcpLivenessReconciler(PeriodicService):
             _SERVICE_NAME_FOR_METRICS, len(rows), race_lost, verdict_suffix,
         )
 
+        # geoid#2819: non-locking staleness pass — catches a row the FOR
+        # UPDATE SKIP LOCKED scan above keeps silently skipping because a
+        # zombie PG session still holds its row lock.
+        await self._check_staleness(claimed_ids)
+
         # Dismissed-unconfirmed scan: drive DISMISSED rows whose backing
         # Cloud Run execution is still alive toward a confirmed stop.
         dismissed_rows = await tasks_module.select_dismissed_unconfirmed_gcp_tasks(
@@ -262,6 +288,99 @@ class GcpLivenessReconciler(PeriodicService):
                 len(dismissed_rows),
                 dismiss_unconfirmed_total,
             )
+
+    async def _check_staleness(self, claimed_ids: set[Any]) -> None:
+        """geoid#2819: surface a row the locking scan keeps silently skipping.
+
+        Diffs a plain, non-locking SELECT of lapsed rows
+        (:func:`tasks_module.select_stale_gcp_tasks`) against ``claimed_ids``
+        — the ``task_id``s this pass's ``FOR UPDATE SKIP LOCKED`` scan
+        actually reached. A row present in the former but absent from the
+        latter, past ``_staleness_grace_seconds``, was silently skipped by
+        the locking scan — consistent with a zombie PG session still holding
+        its row lock (the row lock itself is invisible from application code
+        without a ``pg_locks`` join; this is a symptom-based proxy).
+
+        Only after ``_staleness_max_passes`` consecutive occurrences is the
+        row logged loudly and a lock-free heal attempted, via the same
+        probe + owner-guarded-write path ``_reconcile_row`` already uses for
+        the primary scan and the RUN_EVERYWHERE backstop. Those writes are
+        plain ``UPDATE ... WHERE task_id = ...`` statements bounded by
+        ``DBConfig.lock_timeout`` (#2837 delivered this) — a still-live
+        zombie lock makes the attempt fail fast instead of hanging, so
+        retrying it every pass is safe. If the zombie session has since been
+        reaped (by ``idle_in_transaction_session_timeout``, also #2837) the
+        write lands immediately.
+
+        The streak tracker is in-process state on this leader-gated instance
+        — acceptable per geoid#2819: a leadership handoff simply restarts a
+        stuck row's streak, and a genuinely stuck row re-accumulates it
+        within a few more ticks.
+        """
+        try:
+            stale_rows = await tasks_module.select_stale_gcp_tasks(
+                self._engine, self._staleness_grace_seconds
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — detection must not break the tick
+            logger.warning(
+                "GcpLivenessReconciler: staleness scan failed: %s", e,
+            )
+            return
+
+        now = datetime.now(timezone.utc)
+        seen_ids: set = set()
+        for row in stale_rows:
+            task_id = row.get("task_id")
+            if task_id is None:
+                continue
+            seen_ids.add(task_id)
+
+            if task_id in claimed_ids:
+                # The locking scan reached this row on this very pass — it
+                # is merely lapsed, not stuck behind a lock. Reset any prior
+                # streak; a future occurrence starts counting from zero.
+                self._stale_streak.pop(task_id, None)
+                continue
+
+            streak = self._stale_streak.get(task_id, 0) + 1
+            self._stale_streak[task_id] = streak
+            if streak < self._staleness_max_passes:
+                continue
+
+            locked_until = row.get("locked_until")
+            age_s = (now - locked_until).total_seconds() if locked_until is not None else -1.0
+            logger.warning(
+                "liveness_staleness_visible_unclaimable service=%s task_id=%s "
+                "owner_id=%s runner_ref=%s age_s=%.0f passes=%d — row is "
+                "visible to a plain SELECT but has been skipped by FOR "
+                "UPDATE SKIP LOCKED for %d consecutive reconciler pass(es); "
+                "likely a zombie PG session still holding the row lock. "
+                "Attempting a lock-free heal.",
+                _SERVICE_NAME_FOR_METRICS, task_id, row.get("owner_id"),
+                row.get("runner_ref"), age_s, streak, streak,
+            )
+            try:
+                await self._reconcile_row(row)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — one bad row must not stop the rest
+                logger.warning(
+                    "GcpLivenessReconciler: lock-free heal attempt failed "
+                    "for task %s: %s", task_id, e,
+                )
+                # Leave the streak in place — the row is still stuck and the
+                # next pass will retry the heal without re-logging until the
+                # streak next crosses the threshold on a fresh occurrence.
+
+        # Rows that dropped out of the stale scan this pass (healed,
+        # reclaimed by the locking scan, or no longer lapsed) reset — a
+        # fresh occurrence starts the streak over rather than accumulating
+        # across unrelated incidents.
+        for task_id in list(self._stale_streak):
+            if task_id not in seen_ids:
+                self._stale_streak.pop(task_id, None)
 
     async def _reconcile_dismissed_row(self, row: Dict[str, Any]) -> bool:
         """Drive a single DISMISSED-but-unconfirmed GCP row toward confirmed stop.

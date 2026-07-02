@@ -95,6 +95,45 @@ def test_select_lapsed_gcp_tasks_sql_shape():
         assert col in normalised, f"select must return {col}"
 
 
+def test_select_stale_gcp_tasks_exists_and_is_async():
+    fn = _tasks_module().select_stale_gcp_tasks
+    assert inspect.iscoroutinefunction(fn)
+    sig = inspect.signature(fn)
+    for param in ("engine", "grace_seconds"):
+        assert param in sig.parameters, f"missing parameter: {param}"
+
+
+def test_select_stale_gcp_tasks_sql_shape():
+    """geoid#2819: the non-locking staleness scan must mirror
+    ``select_lapsed_gcp_tasks``'s WHERE/column shape exactly EXCEPT it must
+    NOT take ``FOR UPDATE`` — that is the entire point: a row a zombie PG
+    session holds locked stays invisible to every ``FOR UPDATE SKIP LOCKED``
+    scan, but a plain SELECT still sees it. Also asserts the additional
+    ``grace_seconds`` bound on top of the bare lapsed-lease check."""
+    src = inspect.getsource(_tasks_module().select_stale_gcp_tasks)
+    # Isolate the actual SQL statement (not the docstring, which discusses
+    # ``FOR UPDATE`` in prose) by slicing from the ``sql = f"""`` assignment
+    # onward — every reference in the executable query body, not comments.
+    query_src = src[src.index('sql = f"""'):]
+    normalised = " ".join(query_src.split()).upper()
+    assert "STATUS = 'ACTIVE'" in normalised
+    assert "OWNER_ID LIKE 'GCP_CLOUD_RUN_%'" in normalised
+    assert "MAKE_INTERVAL(SECS => :GRACE_SECONDS)" in normalised
+    assert "FOR UPDATE" not in normalised, (
+        "select_stale_gcp_tasks must NOT lock rows — a locking clause here "
+        "would defeat its entire purpose of seeing rows the FOR UPDATE SKIP "
+        "LOCKED scan cannot."
+    )
+    # Same row shape as select_lapsed_gcp_tasks so a row surfaced here can be
+    # handed straight to GcpLivenessReconciler._reconcile_row for a
+    # lock-free heal attempt without a second round-trip.
+    for col in (
+        "RUNNER_REF", "STARTED_AT", "OUTPUTS",
+        "SCOPE", "CALLER_ID", "INPUTS", "COLLECTION_ID",
+    ):
+        assert col in normalised, f"select must return {col}"
+
+
 def test_persist_outputs_exists_and_is_async():
     """The #726-followup hardening: a distinct, retryable write that lands
     ``outputs`` on the row *before* the terminal status flip — so a

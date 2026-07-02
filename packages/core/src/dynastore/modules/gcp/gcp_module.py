@@ -803,6 +803,12 @@ class GCPModule(
                             unknown_grace_seconds=getattr(
                                 cfg, "liveness_unknown_grace_seconds", 180
                             ),
+                            staleness_grace_seconds=getattr(
+                                cfg, "liveness_staleness_grace_seconds", 60
+                            ),
+                            staleness_max_passes=getattr(
+                                cfg, "liveness_staleness_max_passes", 2
+                            ),
                         )
                     )
                     logger.info("GCP Module: liveness reconciler registered.")
