@@ -250,7 +250,9 @@ class _CapturingDispatcher:
     def __init__(self) -> None:
         self.ops: Any = None
 
-    async def fan_out_bulk(self, _ctx: Any, ops: Any) -> Dict[str, Any]:
+    async def fan_out_bulk(
+        self, _ctx: Any, ops: Any, *, tx_factory: Any = None,
+    ) -> Dict[str, Any]:
         self.ops = ops
         return {}
 

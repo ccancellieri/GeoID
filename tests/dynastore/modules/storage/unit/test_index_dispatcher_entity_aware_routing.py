@@ -345,7 +345,7 @@ async def test_dispatch_index_upsert_sets_entity_type_item_on_ctx():
     captured_ctxs: List[IndexContext] = []
 
     class _CapturingDispatcher:
-        async def fan_out_bulk(self, ctx, ops):
+        async def fan_out_bulk(self, ctx, ops, *, tx_factory=None):
             captured_ctxs.append(ctx)
             return {}
 
