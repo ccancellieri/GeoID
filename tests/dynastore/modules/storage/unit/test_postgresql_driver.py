@@ -16,8 +16,11 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
+from typing import Any, Dict
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+from sqlalchemy.ext.asyncio import AsyncConnection
 
 from dynastore.modules.storage.drivers.postgresql import ItemsPostgresqlDriver
 from dynastore.models.ogc import Feature
@@ -295,6 +298,134 @@ class TestLifecycleMethods:
         driver = ItemsPostgresqlDriver()
         with pytest.raises(NotImplementedError):
             await driver.export_entities("cat1", "col1")
+
+
+class TestEnsureStorageCollectionTypeThreading:
+    """#2655: ``ensure_storage`` must thread the real ``CollectionInfo.kind``
+    (+ ``allow_geometry``) into ``_effective_sidecars``, the same resolution
+    ``collection_has_geometry()`` / ``_get_effective_driver_config`` already
+    use — so a RECORDS collection no longer provisions an unused geometry
+    sidecar table at DDL time, while VECTOR provisioning stays unchanged.
+
+    Each test stops execution right after ``_effective_sidecars`` resolves
+    (by raising from a spy that wraps the real resolver) so the DDL /
+    managed_transaction machinery never has to be mocked — only the
+    collection_type-threading contract under test.
+    """
+
+    @staticmethod
+    def _install_config_stub(kind, monkeypatch_target="dynastore.tools.discovery.get_protocol"):
+        from dynastore.modules.catalog.catalog_config import CollectionInfo
+
+        mock_configs = AsyncMock()
+
+        async def _get_config_side_effect(cls, **kwargs):
+            if cls is CollectionInfo:
+                return CollectionInfo(kind=kind)
+            return None
+
+        mock_configs.get_config = AsyncMock(side_effect=_get_config_side_effect)
+        return patch(monkeypatch_target, return_value=mock_configs)
+
+    @staticmethod
+    def _install_effective_sidecars_spy():
+        """Wrap the real ``_effective_sidecars`` and raise with its result
+        so the test can assert on both the resolved sidecar list and the
+        kwargs ``ensure_storage`` passed in, without mocking DDL/DB internals.
+        """
+        from dynastore.modules.storage.drivers.pg_sidecars import (
+            _effective_sidecars as _real_effective_sidecars,
+        )
+
+        captured: Dict[str, Any] = {}
+
+        class _StopAfterSidecars(Exception):
+            pass
+
+        def _spy(*args, **kwargs):
+            captured["collection_type"] = kwargs.get("collection_type")
+            captured["context"] = kwargs.get("context")
+            captured["sidecars"] = _real_effective_sidecars(*args, **kwargs)
+            raise _StopAfterSidecars
+
+        return (
+            patch(
+                "dynastore.modules.storage.drivers.pg_sidecars._effective_sidecars",
+                side_effect=_spy,
+            ),
+            captured,
+            _StopAfterSidecars,
+        )
+
+    @pytest.mark.asyncio
+    async def test_records_collection_skips_geometry_sidecar(self):
+        """A RECORDS collection resolves collection_type="RECORDS" into
+        _effective_sidecars and the geometries sidecar is omitted.
+        """
+        from dynastore.modules.catalog.catalog_config import CollectionKind
+
+        driver = ItemsPostgresqlDriver()
+        spy_patch, captured, stop_exc = self._install_effective_sidecars_spy()
+
+        with (
+            patch.object(driver, "_resolve_schema", new_callable=AsyncMock, return_value="schema1"),
+            self._install_config_stub(CollectionKind.RECORDS),
+            spy_patch,
+        ):
+            with pytest.raises(stop_exc):
+                await driver.ensure_storage(
+                    "cat1", "col1", db_resource=MagicMock(spec=AsyncConnection),
+                )
+
+        assert captured["collection_type"] == "RECORDS"
+        sidecar_types = [s.sidecar_type for s in captured["sidecars"]]
+        assert "geometries" not in sidecar_types
+        assert "attributes" in sidecar_types
+
+    @pytest.mark.asyncio
+    async def test_vector_collection_ddl_unchanged(self):
+        """A VECTOR collection (default kind) still resolves geometries +
+        attributes — provisioning DDL for VECTOR stays byte-identical.
+        """
+        from dynastore.modules.catalog.catalog_config import CollectionKind
+
+        driver = ItemsPostgresqlDriver()
+        spy_patch, captured, stop_exc = self._install_effective_sidecars_spy()
+
+        with (
+            patch.object(driver, "_resolve_schema", new_callable=AsyncMock, return_value="schema1"),
+            self._install_config_stub(CollectionKind.VECTOR),
+            spy_patch,
+        ):
+            with pytest.raises(stop_exc):
+                await driver.ensure_storage(
+                    "cat1", "col1", db_resource=MagicMock(spec=AsyncConnection),
+                )
+
+        assert captured["collection_type"] == "VECTOR"
+        sidecar_types = [s.sidecar_type for s in captured["sidecars"]]
+        assert "geometries" in sidecar_types
+        assert "attributes" in sidecar_types
+
+    @pytest.mark.asyncio
+    async def test_no_configs_protocol_defaults_to_vector(self):
+        """No ConfigsProtocol registered → CollectionInfo() default (VECTOR),
+        matching the pre-#2655 fallback behaviour for that edge case.
+        """
+        driver = ItemsPostgresqlDriver()
+        spy_patch, captured, stop_exc = self._install_effective_sidecars_spy()
+
+        with (
+            patch.object(driver, "_resolve_schema", new_callable=AsyncMock, return_value="schema1"),
+            patch("dynastore.tools.discovery.get_protocol", return_value=None),
+            spy_patch,
+        ):
+            with pytest.raises(stop_exc):
+                await driver.ensure_storage(
+                    "cat1", "col1", db_resource=MagicMock(spec=AsyncConnection),
+                )
+
+        assert captured["collection_type"] == "VECTOR"
 
 
 class TestLocation:

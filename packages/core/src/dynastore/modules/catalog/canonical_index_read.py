@@ -146,22 +146,38 @@ async def _get_col_config(
         return None
 
 
-def _resolve_sidecars_for(col_config: Any, catalog_id: str, collection_id: str) -> List[Any]:
+async def _resolve_sidecars_for(col_config: Any, catalog_id: str, collection_id: str) -> List[Any]:
     """Return the ordered list of resolved sidecar instances for a collection.
 
     Uses the same ``_effective_sidecars`` + ``SidecarRegistry.get_sidecar``
     path as :meth:`ItemService.map_row_to_feature` — without running the
     pipeline so we can share the resolved list independently of a Feature.
+
+    #2655: resolves the real ``CollectionInfo.kind`` / ``allow_geometry``
+    (same lookup ``ItemsPostgresqlDriver._get_effective_driver_config`` and
+    ``collection_has_geometry()`` use) so a RECORDS collection's resolved
+    sidecar list correctly omits the geometry sidecar here too, instead of
+    relying on ``_effective_sidecars``'s "VECTOR" fallback default.
     """
     try:
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.modules.catalog.catalog_config import CollectionInfo
         from dynastore.modules.storage.drivers.pg_sidecars import (
             SidecarRegistry,
             _effective_sidecars,
         )
+        from dynastore.tools.discovery import get_protocol
+
+        configs = get_protocol(ConfigsProtocol)
+        ct = await configs.get_config(
+            CollectionInfo, catalog_id=catalog_id, collection_id=collection_id,
+        ) if configs else CollectionInfo()
         sidecar_configs = _effective_sidecars(
             col_config,
             catalog_id=catalog_id,
             collection_id=collection_id,
+            collection_type=ct.kind.value,
+            context={"allow_geometry": ct.allow_geometry},
         )
         resolved: List[Any] = []
         for sc_config in sidecar_configs:
@@ -317,7 +333,7 @@ async def read_canonical_index_inputs(
         return {}
 
     col_config = await _get_col_config(catalog_id, collection_id, db_resource=db_resource)
-    resolved_sidecars = _resolve_sidecars_for(col_config, catalog_id, collection_id)
+    resolved_sidecars = await _resolve_sidecars_for(col_config, catalog_id, collection_id)
     raw_rows = await _fetch_raw_rows(
         catalog_id, collection_id, geoids, col_config, db_resource=db_resource,
     )

@@ -533,16 +533,23 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         stac_items_pg = await _resolve_stac_items_pg(
             catalog_id, collection_id or "", configs=_configs_for_stac,
         )
-        # RFC #2550: thread the geometry capability override (independent of
-        # `collection_type`, which this DDL entry point doesn't resolve) so
-        # an explicit `allow_geometry=False` can suppress the geometries
-        # sidecar even at provisioning time. `allow_geometry=None` (default)
-        # leaves this call's behaviour byte-identical to before.
+        # #2655: thread the real `collection_type` (+ the RFC #2550
+        # `allow_geometry` capability override) into `_effective_sidecars`,
+        # same resolution `collection_has_geometry()` / `_get_effective_driver_config`
+        # already use at read/write time — so a NEW RECORDS collection no
+        # longer provisions the unused geometry sidecar table at DDL time.
+        # `_effective_sidecars` defaults `collection_type` to "VECTOR" when
+        # omitted, so VECTOR-collection DDL stays byte-identical. The DDL
+        # loop below only ever emits `CREATE TABLE IF NOT EXISTS` per
+        # resolved sidecar, so an already-provisioned RECORDS collection's
+        # geometry table (if one exists from before this fix) is never
+        # dropped or altered here — this is purely additive/omissive.
         _ct_for_geom = await _configs_for_stac.get_config(
             _CollectionInfo, catalog_id=catalog_id, collection_id=collection_id,
         ) if _configs_for_stac else _CollectionInfo()
         effective_sidecars = _effective_sidecars(
             col_config, catalog_id=catalog_id, collection_id=collection_id,
+            collection_type=_ct_for_geom.kind.value,
             context={
                 "stac_items_pg": stac_items_pg,
                 "allow_geometry": _ct_for_geom.allow_geometry,
