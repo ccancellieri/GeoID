@@ -481,12 +481,19 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         # Policies declared via PolicyContributor; IAM forwards centrally.
         import multiprocessing
 
-        MapsService.process_pool = ProcessPoolExecutor()
+        # Use an explicit "spawn" context: the Python 3.14 Linux default
+        # ("forkserver") binds an AF_UNIX socket under TMPDIR, which fails
+        # with OSError(95) when TMPDIR points at a filesystem without
+        # Unix-socket support (e.g. the GCS FUSE volume the deploy mounts
+        # for large temp files). "spawn" uses pipes only, and pool workers
+        # persist, so the higher per-worker start cost is paid once.
+        mp_context = multiprocessing.get_context("spawn")
+        MapsService.process_pool = ProcessPoolExecutor(mp_context=mp_context)
         logger.info(
             "Maps Service startup: process pool started (executor=%s, "
             "mp_start_method=%s, max_workers=%s)",
             type(MapsService.process_pool).__name__,
-            multiprocessing.get_start_method(allow_none=True),
+            mp_context.get_start_method(),
             getattr(MapsService.process_pool, "_max_workers", "unknown"),
         )
         app.state.maps_config = MapsConfig()
