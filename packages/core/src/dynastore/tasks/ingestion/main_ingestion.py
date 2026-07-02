@@ -16,6 +16,8 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
+import hashlib
+import json
 import logging
 import re
 import os
@@ -556,6 +558,59 @@ def _resolve_source_content_type(asset: Asset) -> Optional[str]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Deterministic per-feature identity (#2709)
+# ---------------------------------------------------------------------------
+#
+# Re-running the same vector ingest must CONVERGE (upsert) rather than
+# duplicate every feature. ``prepare_record_for_upsert`` resolves the
+# GeoJSON-style ``feature["id"]`` through a three-tier precedence — each
+# tier only runs when the previous one produced nothing:
+#
+#   1. A configurable source field (``column_mapping.external_id``, e.g.
+#      GAUL's ``GAUL1_CODE``) or the source's own natural ``id``.
+#   2. The reader-surfaced OGR feature id (FID) — stable across re-reads of
+#      the SAME unmodified source (``GdalOsgeoReader`` now emits it as the
+#      record's top-level ``"id"``, so tier 1's "id" lookup already covers
+#      it when no explicit field is configured).
+#   3. A content hash of the feature (geometry + attributes) — the final
+#      safety net for sources where neither of the above resolved anything.
+#
+# ``feature["id"]`` then feeds ``ItemsWritePolicy.resolve_external_id`` (see
+# ``modules/storage/driver_config.py``), which falls back to the feature's
+# top-level ``id`` when no ``derive.external_id`` path is configured on the
+# collection — so no downstream write-path change is required here.
+
+
+def _resolve_raw_identity(raw: dict, ext_id_field: str) -> Any:
+    """Look up *ext_id_field* on a raw reader record.
+
+    Top-level key first, then ``properties[ext_id_field]`` — mirrors
+    ``prepare_record_for_upsert``'s private ``_get_raw_val`` for the
+    identity field specifically, factored out so tiers 1/2 of the #2709
+    identity precedence are unit-testable without a live reader or DB.
+    """
+    if not ext_id_field:
+        return None
+    return raw[ext_id_field] if ext_id_field in raw else raw.get("properties", {}).get(ext_id_field)
+
+
+def _content_hash_feature_id(geometry: Optional[dict], properties: dict) -> str:
+    """Tier-3 identity fallback (#2709): a stable hash of the feature.
+
+    Used only when neither a configured id field nor a natural id/OGR FID
+    resolved (tiers 1-2). Deterministic for byte-identical geometry +
+    properties, so a retried/re-run ingest of the SAME source converges on
+    the same external_id instead of appending a duplicate row.
+    """
+    canonical = json.dumps(
+        {"geometry": geometry, "properties": properties},
+        sort_keys=True,
+        default=str,
+    )
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 async def run_ingestion_task(
     engine: DbEngine,
     task_id: str,
@@ -865,10 +920,16 @@ async def run_ingestion_task(
                     raw.get(key) if key in raw else raw.get("properties", {}).get(key)
                 )
 
-            # 1. Identity
+            # 1. Identity — tiers 1 & 2 of the #2709 deterministic-identity
+            # precedence (see the module-level comment above
+            # ``_resolve_raw_identity``): a configured field wins, else the
+            # source's natural "id" (which GdalOsgeoReader now populates
+            # from the OGR FID when the source has no native id — tier 2).
+            # ``is not None`` — not truthy — so a legitimate FID/id of 0
+            # is not dropped.
             ext_id_field = mapping.external_id or "id"
-            ext_id = _get_raw_val(ext_id_field)
-            if ext_id:
+            ext_id = _resolve_raw_identity(raw, ext_id_field)
+            if ext_id is not None and ext_id != "":
                 feature["id"] = ext_id
 
             # 2. Geometry
@@ -989,6 +1050,16 @@ async def run_ingestion_task(
             valid_to = _get_raw_val(request.time_validity_end_column)
             if valid_to:
                 feature["valid_to"] = valid_to
+
+            # 5. Tier 3 of the #2709 deterministic-identity precedence:
+            # neither a configured field nor a natural id/OGR FID resolved
+            # in step 1 — hash the assembled feature so a retried/re-run
+            # ingest of the SAME source still converges instead of
+            # appending a duplicate row.
+            if "id" not in feature:
+                feature["id"] = _content_hash_feature_id(
+                    feature.get("geometry"), feature["properties"]
+                )
 
             return feature
 

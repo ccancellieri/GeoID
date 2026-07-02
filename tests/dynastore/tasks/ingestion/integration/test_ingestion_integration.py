@@ -192,6 +192,128 @@ async def test_geojson_ingestion(task_app_state, test_data_loader, data_id):
 
 
 @pytest.mark.asyncio
+async def test_geojson_ingestion_rerun_converges_without_configured_external_id(
+    task_app_state, test_data_loader, data_id,
+):
+    """Regression coverage for GeoID #2709.
+
+    Re-running the SAME ingestion job — with no ``column_mapping.external_id``
+    configured at all — must CONVERGE (2 features stay 2) rather than
+    duplicate every feature on the second run. Deliberately omits
+    ``external_id`` so identity falls through to the reader-surfaced natural
+    id / OGR-FID tier rather than the explicit-field tier already covered by
+    ``test_geojson_ingestion``.
+    """
+    catalog_id = f"cat_geo_rerun_{data_id}"
+    collection_id = "test_points_geojson_rerun"
+
+    geojson_path = os.path.join(os.path.dirname(__file__), "data", "points.geojson")
+
+    from dynastore.modules.catalog.models import (
+        Catalog,
+        Collection,
+        Extent,
+        SpatialExtent,
+        TemporalExtent,
+    )
+
+    catalogs: CatalogsProtocol = get_protocol(CatalogsProtocol)
+    configs: ConfigsProtocol = get_protocol(ConfigsProtocol)
+    async with managed_transaction(task_app_state.engine) as conn:
+        phys_schema_before = await catalogs.resolve_physical_schema(
+            catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
+        )
+        if phys_schema_before:
+            await conn.execute(
+                text(f'DROP SCHEMA IF EXISTS "{phys_schema_before}" CASCADE')
+            )
+
+    await catalogs.create_catalog(Catalog(id=catalog_id, title=catalog_id))
+
+    col_def = Collection(
+        id=collection_id,
+        title=collection_id,
+        description="Test collection",
+        extent=Extent(
+            spatial=SpatialExtent(bbox=[[-180.0, -90.0, 180.0, 90.0]]),
+            temporal=TemporalExtent(interval=[[None, None]]),
+        ),
+        attribute_schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "value": {"type": "integer"},
+            },
+        },
+    )
+    await catalogs.create_collection(catalog_id, col_def)
+
+    from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
+    pg_plugin_id = ItemsPostgresqlDriverConfig
+    config = await configs.get_config(pg_plugin_id, catalog_id=catalog_id, collection_id=collection_id)
+    if config.partitioning:
+        config.partitioning.enabled = False
+    await configs.set_config(
+        pg_plugin_id, config, catalog_id=catalog_id, collection_id=collection_id,
+    )
+
+    async with managed_transaction(task_app_state.engine) as conn:
+        phys_schema = await catalogs.resolve_physical_schema(
+            catalog_id, ctx=DriverContext(db_resource=conn)
+        )
+        phys_table = await catalogs.resolve_physical_table(
+            catalog_id, collection_id, db_resource=conn
+        )
+        if phys_schema and phys_table:
+            await conn.execute(
+                text(f'DROP TABLE IF EXISTS "{phys_schema}"."{phys_table}" CASCADE')
+            )
+
+    task = IngestionTask(task_app_state)
+
+    def _payload() -> TaskPayload:
+        return TaskPayload(
+            task_id=generate_task_id(),
+            caller_id="test_user",
+            inputs=ExecuteRequest(
+                inputs={
+                    "catalog_id": catalog_id,
+                    "collection_id": collection_id,
+                    "ingestion_request": {
+                        "asset": {"uri": geojson_path},
+                        "source_srid": 4326,
+                        # No column_mapping.external_id — exercises the
+                        # deterministic-identity fallback tiers (#2709)
+                        # instead of an explicitly configured field.
+                        "column_mapping": {"attributes_source_type": "all"},
+                    },
+                }
+            ),
+        )
+
+    async def _count() -> int:
+        async with task_app_state.engine.connect() as conn:
+            phys_schema = await catalogs.resolve_physical_schema(
+                catalog_id, ctx=DriverContext(db_resource=conn)
+            )
+            phys_table = await catalogs.resolve_physical_table(
+                catalog_id, collection_id, db_resource=conn
+            )
+            result = await conn.execute(
+                text(f'SELECT count(*) FROM "{phys_schema}"."{phys_table}"')
+            )
+            return result.scalar()
+
+    # First run: inserts both features.
+    await task.run(_payload())
+    assert await _count() == 2
+
+    # Second run of the SAME source: must converge (upsert), not duplicate.
+    await task.run(_payload())
+    assert await _count() == 2
+
+
+@pytest.mark.asyncio
 async def test_csv_ingestion(task_app_state, test_data_loader, data_id):
     """
     Integration test for CSV ingestion with explicit column mapping.

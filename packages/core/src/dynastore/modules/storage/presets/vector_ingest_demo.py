@@ -25,7 +25,12 @@ Applies at platform scope (``POST /configs/presets/vector_ingest_demo``):
      routing so items ingested by the background task appear in STAC search.
 
   2. Submits an async ``ingestion`` job that reads the source vector file
-     and upserts every feature into the collection.
+     and upserts every feature into the collection. Re-running the preset
+     against the SAME source converges instead of duplicating: pass
+     ``id_field`` to key identity on a stable source column/property (e.g.
+     GAUL's ``GAUL1_CODE``); without it, identity falls back to the
+     source's own OGR feature id (stable across re-reads of an unmodified
+     file) and finally to a content hash of the feature (see #2709).
 
 **Default behavior (no body / empty body)**:
 
@@ -176,6 +181,22 @@ class VectorIngestParams(BaseModel):
         ),
         examples=["application/geopackage+sqlite3", "application/geo+json"],
     )
+    id_field: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional source column/property that uniquely identifies each "
+            "feature (e.g. 'GAUL1_CODE' for GAUL administrative boundaries). "
+            "Forwarded as ingestion_request.column_mapping.external_id. "
+            "Re-running the preset against the SAME source converges on this "
+            "field instead of appending duplicate rows (#2709). When absent, "
+            "identity falls back to the source's own OGR feature id (FID) "
+            "and finally to a content hash of the feature — both are still "
+            "deterministic across re-runs of an unmodified source file, so "
+            "an id_field is recommended but not required for idempotent "
+            "re-ingestion."
+        ),
+        examples=["GAUL1_CODE", "ADM2_PCODE"],
+    )
     preseed_tiles: bool = Field(
         default=True,
         description=(
@@ -272,6 +293,7 @@ class _VectorIngestDemoContributor:
     collection_id: str
     source_uri: str
     source_format: Optional[str]
+    id_field: Optional[str] = None
     preseed_tiles: bool = True
     tile_format: str = "mvt"
     cache_bucket: Optional[str] = None
@@ -366,14 +388,19 @@ class _VectorIngestDemoContributor:
             f"{self.catalog_id}:{self.collection_id}:{self.source_uri}"
         )
 
+        column_mapping: Dict[str, Any] = {"attributes_source_type": "all"}
+        if self.id_field:
+            # Deterministic per-source identity (#2709): keys the upsert on
+            # this stable field so re-applying the preset against the same
+            # source converges instead of appending duplicate features.
+            column_mapping["external_id"] = self.id_field
+
         inputs: Dict[str, Any] = {
             "catalog_id": self.catalog_id,
             "collection_id": self.collection_id,
             "ingestion_request": {
                 "asset": asset,
-                "column_mapping": {
-                    "attributes_source_type": "all",
-                },
+                "column_mapping": column_mapping,
             },
         }
         if self.preseed_tiles:
@@ -417,11 +444,15 @@ class _VectorIngestDemoPreset:
     )
     description: ClassVar[str] = (
         "Create the target catalog/collection and submit an async ingestion job "
-        "that reads a vector source file and upserts every feature. Without params "
-        "ingests the Natural Earth 110m country polygons GeoJSON into "
-        "demo_vector_catalog/demo_vector_collection. Pass source_uri, catalog_id, "
-        "and/or collection_id to ingest any gs:// or https:// vector file into a "
-        "custom target. Items are indexed in Elasticsearch via PG-primary + async-"
+        "that reads a vector source file and upserts every feature — re-applying "
+        "the preset against the same source converges instead of duplicating "
+        "features (#2709). Without params ingests the Natural Earth 110m country "
+        "polygons GeoJSON into demo_vector_catalog/demo_vector_collection. Pass "
+        "source_uri, catalog_id, and/or collection_id to ingest any gs:// or "
+        "https:// vector file into a custom target. Pass id_field to key identity "
+        "on a stable source column (e.g. 'GAUL1_CODE'); without it identity falls "
+        "back to the source's own OGR feature id, then a content hash of the "
+        "feature. Items are indexed in Elasticsearch via PG-primary + async-"
         "secondary routing so STAC search returns them after the job completes."
     )
 
@@ -437,6 +468,7 @@ class _VectorIngestDemoPreset:
             collection_id=p.collection_id or _COLLECTION_ID,
             source_uri=p.source_uri or _NE_COUNTRIES_URL,
             source_format=p.source_format,
+            id_field=p.id_field,
             preseed_tiles=p.preseed_tiles,
             tile_format=p.tile_format,
             cache_bucket=p.cache_bucket,

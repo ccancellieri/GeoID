@@ -383,17 +383,30 @@ class GdalOsgeoReader(SourceReaderProtocol):
                         geom_wkb = bytes(geom.ExportToWkb())
                     except Exception:  # noqa: BLE001 — feature still yields; caller decides
                         pass
+                # Stable per-row identity fallback (#2709): the OGR feature id
+                # is deterministic across re-reads of the SAME unmodified
+                # source (row order on disk), so surfacing it as the GeoJSON
+                # top-level "id" lets a re-run converge instead of appending a
+                # duplicate copy when no column_mapping.external_id is
+                # configured. -1 means "no FID" (some drivers never assign
+                # one) — left out entirely so downstream identity resolution
+                # falls through to its next fallback rather than colliding
+                # every FID-less feature onto the same id.
+                fid = feat.GetFID()
                 # Emit the GeoJSON Feature record shape (`{"properties": …,
                 # "geometry": …}`) so call sites that deconstruct reader
                 # records don't need to branch per reader.  Add ``geometry_wkb``
                 # as a convenience so column_mapping=geometry_wkb just
                 # works for STAC items.
-                yield {
+                record: dict = {
                     "type": "Feature",
                     "properties": props,
                     "geometry": geom_geojson,
                     "geometry_wkb": geom_wkb,
                 }
+                if fid is not None and fid >= 0:
+                    record["id"] = fid
+                yield record
 
 
 register_reader(GdalOsgeoReader)

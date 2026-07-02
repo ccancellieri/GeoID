@@ -57,6 +57,7 @@ def test_params_all_none_by_default() -> None:
     assert p.catalog_id is None
     assert p.collection_id is None
     assert p.source_format is None
+    assert p.id_field is None
 
 
 def test_params_extra_fields_ignored() -> None:
@@ -290,6 +291,41 @@ def test_source_format_none_means_no_metadata() -> None:
     tseed = list(c.get_tasks())[0]
     asset = tseed.inputs["ingestion_request"]["asset"]
     assert "metadata" not in asset
+
+
+# ---------------------------------------------------------------------------
+# id_field — deterministic per-source identity (#2709)
+# ---------------------------------------------------------------------------
+
+
+def test_id_field_forwarded_as_column_mapping_external_id() -> None:
+    c = _VectorIngestDemoContributor(
+        catalog_id="cc", collection_id="lyr",
+        source_uri=_GPKG_URI, source_format=None,
+        id_field="GAUL1_CODE",
+    )
+    tseed = list(c.get_tasks())[0]
+    mapping = tseed.inputs["ingestion_request"]["column_mapping"]
+    assert mapping["external_id"] == "GAUL1_CODE"
+
+
+def test_id_field_none_omits_external_id_from_mapping() -> None:
+    """Without id_field the mapping still carries attributes_source_type but
+    no external_id key — identity falls back to OGR FID / content hash."""
+    c = _VectorIngestDemoContributor(
+        catalog_id="cc", collection_id="lyr",
+        source_uri=_GPKG_URI, source_format=None,
+    )
+    tseed = list(c.get_tasks())[0]
+    mapping = tseed.inputs["ingestion_request"]["column_mapping"]
+    assert "external_id" not in mapping
+    assert mapping["attributes_source_type"] == "all"
+
+
+def test_resolve_forwards_id_field_to_contributor() -> None:
+    p = VectorIngestParams(id_field="GAUL1_CODE")
+    c = VECTOR_INGEST_DEMO_PRESET._resolve(p)
+    assert c.id_field == "GAUL1_CODE"
 
 
 def test_different_targets_have_different_dedup_keys() -> None:
