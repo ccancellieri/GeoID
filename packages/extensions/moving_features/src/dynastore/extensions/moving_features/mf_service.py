@@ -41,7 +41,7 @@ from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.tools.fast_api import AppJSONResponse as _AppJSONResponse
 from dynastore.extensions.tools.language_utils import get_language
 from dynastore.extensions.web.decorators import expose_web_page, expose_static
-from dynastore.extensions.tools.db import get_async_connection
+from dynastore.extensions.tools.db import get_async_connection, get_async_engine
 from dynastore.extensions.tools.query import parse_hints_param
 from dynastore.models.protocols import MovingFeaturesProtocol
 from dynastore.modules.catalog import catalog_module
@@ -420,6 +420,7 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
         collection_id: str,
         mf: MovingFeatureCreate = Body(...),
         conn: AsyncConnection = Depends(get_async_connection),
+        engine=Depends(get_async_engine),
     ) -> MovingFeature:
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
@@ -428,22 +429,23 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
             raise HTTPException(status_code=404, detail="Collection not found.")
         internal_id = await self._resolve_internal_catalog_id(catalog_id)
 
-        from dynastore.modules.db_config.partition_tools import ensure_partition_exists
+        from dynastore.modules.db_config.partition_tools import (
+            ensure_partitions_off_request_connection,
+        )
 
         try:
-            await ensure_partition_exists(
-                conn,
-                table_name="moving_features",
-                schema="moving_features",
-                strategy="LIST",
-                partition_value=internal_id,
-            )
-            await ensure_partition_exists(
-                conn,
-                table_name="temporal_geometries",
-                schema="moving_features",
-                strategy="LIST",
-                partition_value=internal_id,
+            # Provisioned on a dedicated connection (not `conn`, the
+            # request-scoped one) so the ACCESS EXCLUSIVE lock these
+            # CREATE TABLE ... PARTITION OF statements take on the shared
+            # moving_features.* parent tables is released as soon as this
+            # call returns, instead of being held for the rest of the
+            # request's transaction (see #2749, #2831).
+            await ensure_partitions_off_request_connection(
+                engine,
+                partitions=[
+                    dict(table_name="moving_features", schema="moving_features", strategy="LIST", partition_value=internal_id),
+                    dict(table_name="temporal_geometries", schema="moving_features", strategy="LIST", partition_value=internal_id),
+                ],
             )
         except Exception as exc:
             logger.error(
@@ -549,6 +551,7 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
         mf_id: uuid.UUID,
         tg: TemporalGeometryCreate = Body(...),
         conn: AsyncConnection = Depends(get_async_connection),
+        engine=Depends(get_async_engine),
     ) -> TemporalGeometry:
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
@@ -563,15 +566,22 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
         if not feature or feature.collection_id != collection_id:
             raise HTTPException(status_code=404, detail="Moving feature not found.")
 
-        from dynastore.modules.db_config.partition_tools import ensure_partition_exists
+        from dynastore.modules.db_config.partition_tools import (
+            ensure_partitions_off_request_connection,
+        )
 
         try:
-            await ensure_partition_exists(
-                conn,
-                table_name="temporal_geometries",
-                schema="moving_features",
-                strategy="LIST",
-                partition_value=internal_id,
+            # Provisioned on a dedicated connection (not `conn`, the
+            # request-scoped one) so the ACCESS EXCLUSIVE lock this
+            # CREATE TABLE ... PARTITION OF statement takes on the shared
+            # moving_features.temporal_geometries parent table is released
+            # as soon as this call returns, instead of being held for the
+            # rest of the request's transaction (see #2749, #2831).
+            await ensure_partitions_off_request_connection(
+                engine,
+                partitions=[
+                    dict(table_name="temporal_geometries", schema="moving_features", strategy="LIST", partition_value=internal_id),
+                ],
             )
         except Exception as exc:
             logger.error(

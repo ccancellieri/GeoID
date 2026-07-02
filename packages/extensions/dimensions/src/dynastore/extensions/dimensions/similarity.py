@@ -238,8 +238,16 @@ async def search_similar(
 
     sql, _ = build_similarity_query(schema, table)
 
+    # The GIN trigram index is provisioned at materialization time
+    # (``dimensions_extension.materialize_dimension``), not here: this
+    # function backs the public GET similarity search endpoint, and running
+    # `CREATE INDEX` DDL inline on that read path took a lock on the shared
+    # attributes sidecar table on every search request (#2831). ``%`` and
+    # ``similarity()`` do not require the index to produce correct results —
+    # a dimension materialized before this provisioning existed just runs an
+    # unindexed (slower) sequential scan until its next materialization run
+    # backfills the index.
     async with managed_transaction(engine) as conn:
-        await ensure_similarity_index(conn, schema, table)
         rows = await GeoDQLQuery(
             sql, result_handler=ResultHandler.ALL_DICTS,
         ).execute(conn, q=q, threshold=threshold, limit=limit)

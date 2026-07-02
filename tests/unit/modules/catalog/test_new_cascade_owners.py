@@ -179,6 +179,114 @@ class TestIamCatalogScopedOwner:
         catalog_owners = [o.owner_id for o in reg.owners_for_scope(ResourceScope.CATALOG)]
         assert IamCatalogScopedOwner.owner_id in catalog_owners
 
+    @pytest.mark.asyncio
+    async def test_cleanup_one_hard_drops_partition_via_safe_drop_relation(self) -> None:
+        """#2831: dropping the per-catalog ``iam.policies_{catalog_id}``
+        partition must go through ``safe_drop_relation`` (bounded
+        lock_timeout + retry on 55P03/40P01) instead of a raw
+        ``DROP TABLE`` — mirrors ``catalog_service``'s catalog-schema drop.
+        """
+        owner = self._make_owner()
+        ref = CleanupRef(
+            kind="iam_policies", locator=_CATALOG_ID,
+            owner_id="iam.catalog_scoped",
+            metadata={"partition_key": _CATALOG_ID},
+        )
+
+        fake_conn = MagicMock()
+
+        class _FakeTxn:
+            async def __aenter__(self):
+                return fake_conn
+
+            async def __aexit__(self, *exc: Any) -> bool:
+                return False
+
+        def _fake_dql_factory(sql_template, **kwargs):
+            instance = MagicMock()
+            if "pg_tables" in sql_template:
+                # Existence check for the per-catalog partition table.
+                instance.execute = AsyncMock(return_value=(1,))
+            else:
+                instance.execute = AsyncMock(return_value=None)
+            return instance
+
+        drop_mock = AsyncMock()
+
+        with (
+            patch("dynastore.tools.protocol_helpers.get_engine", return_value=MagicMock()),
+            patch(
+                "dynastore.modules.db_config.query_executor.managed_transaction",
+                return_value=_FakeTxn(),
+            ),
+            patch(
+                "dynastore.modules.db_config.query_executor.DQLQuery",
+                side_effect=_fake_dql_factory,
+            ),
+            patch(
+                "dynastore.modules.db_config.locking_tools.safe_drop_relation",
+                drop_mock,
+            ),
+            patch("dynastore.modules.iam.phantom_token.bump_binding_version", AsyncMock()),
+        ):
+            outcome = await owner.cleanup_one(ref, CleanupMode.HARD)
+
+        assert outcome == CleanupOutcome.DONE
+        drop_mock.assert_awaited_once_with(
+            fake_conn,
+            schema="iam",
+            relation=f"policies_{_CATALOG_ID}",
+            kind="table",
+        )
+
+    @pytest.mark.asyncio
+    async def test_cleanup_one_hard_skips_drop_when_partition_absent(self) -> None:
+        """No per-catalog partition (rows landed in the DEFAULT partition)
+        — cleanup_one must not call safe_drop_relation at all."""
+        owner = self._make_owner()
+        ref = CleanupRef(
+            kind="iam_policies", locator=_CATALOG_ID,
+            owner_id="iam.catalog_scoped",
+            metadata={"partition_key": _CATALOG_ID},
+        )
+
+        fake_conn = MagicMock()
+
+        class _FakeTxn:
+            async def __aenter__(self):
+                return fake_conn
+
+            async def __aexit__(self, *exc: Any) -> bool:
+                return False
+
+        def _fake_dql_factory(sql_template, **kwargs):
+            instance = MagicMock()
+            instance.execute = AsyncMock(return_value=None)  # never exists
+            return instance
+
+        drop_mock = AsyncMock()
+
+        with (
+            patch("dynastore.tools.protocol_helpers.get_engine", return_value=MagicMock()),
+            patch(
+                "dynastore.modules.db_config.query_executor.managed_transaction",
+                return_value=_FakeTxn(),
+            ),
+            patch(
+                "dynastore.modules.db_config.query_executor.DQLQuery",
+                side_effect=_fake_dql_factory,
+            ),
+            patch(
+                "dynastore.modules.db_config.locking_tools.safe_drop_relation",
+                drop_mock,
+            ),
+            patch("dynastore.modules.iam.phantom_token.bump_binding_version", AsyncMock()),
+        ):
+            outcome = await owner.cleanup_one(ref, CleanupMode.HARD)
+
+        assert outcome == CleanupOutcome.DONE
+        drop_mock.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # TilePreseedOwner

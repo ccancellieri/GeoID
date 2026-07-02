@@ -123,10 +123,18 @@ class IamCatalogScopedOwner(BaseResourceOwner):
                         result_handler=ResultHandler.ONE_OR_NONE,
                     ).execute(conn, tname=partition_table)
                     if exists:
-                        from dynastore.modules.db_config.query_executor import DDLQuery
-                        await DDLQuery(
-                            f'DROP TABLE IF EXISTS iam."{partition_table}";'
-                        ).execute(conn)
+                        # Bounded lock_timeout + retry on 55P03/40P01 instead
+                        # of a raw DROP TABLE — mirrors catalog_service's
+                        # catalog-schema drop (#2831).
+                        from dynastore.modules.db_config.locking_tools import (
+                            safe_drop_relation,
+                        )
+                        await safe_drop_relation(
+                            conn,
+                            schema=_IAM_SCHEMA,
+                            relation=partition_table,
+                            kind="table",
+                        )
                         logger.info(
                             "IamCatalogScopedOwner: dropped partition table iam.%r.",
                             partition_table,

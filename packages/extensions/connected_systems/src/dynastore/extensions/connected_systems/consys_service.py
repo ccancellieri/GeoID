@@ -34,7 +34,7 @@ from starlette import status
 
 from dynastore.extensions import protocols
 from dynastore.extensions.ogc_base import OGCServiceMixin
-from dynastore.extensions.tools.db import get_async_connection
+from dynastore.extensions.tools.db import get_async_connection, get_async_engine
 from dynastore.extensions.tools.fast_api import AppJSONResponse as JSONResponse
 from dynastore.extensions.tools.language_utils import get_language
 from dynastore.extensions.tools.query import parse_hints_param
@@ -277,41 +277,31 @@ class ConnectedSystemsService(
         catalog_id: str = Query(..., description="Catalog identifier"),
         system: SystemCreate = Body(...),
         conn: AsyncConnection = Depends(get_async_connection),
+        engine=Depends(get_async_engine),
     ) -> System:
         validate_sql_identifier(catalog_id)
         await self._require_catalog_ready(catalog_id)
         internal_id = await self._resolve_internal_catalog_id(catalog_id)
 
-        from dynastore.modules.db_config.partition_tools import ensure_partition_exists
+        from dynastore.modules.db_config.partition_tools import (
+            ensure_partitions_off_request_connection,
+        )
 
         try:
-            await ensure_partition_exists(
-                conn,
-                table_name="systems",
-                schema="consys",
-                strategy="LIST",
-                partition_value=internal_id,
-            )
-            await ensure_partition_exists(
-                conn,
-                table_name="deployments",
-                schema="consys",
-                strategy="LIST",
-                partition_value=internal_id,
-            )
-            await ensure_partition_exists(
-                conn,
-                table_name="datastreams",
-                schema="consys",
-                strategy="LIST",
-                partition_value=internal_id,
-            )
-            await ensure_partition_exists(
-                conn,
-                table_name="observations",
-                schema="consys",
-                strategy="LIST",
-                partition_value=internal_id,
+            # Provisioned on a dedicated connection (not `conn`, the
+            # request-scoped one) so the ACCESS EXCLUSIVE lock these
+            # CREATE TABLE ... PARTITION OF statements take on the shared
+            # consys.* parent tables is released as soon as this call
+            # returns, instead of being held for the rest of the request's
+            # transaction (see #2749, #2831).
+            await ensure_partitions_off_request_connection(
+                engine,
+                partitions=[
+                    dict(table_name="systems", schema="consys", strategy="LIST", partition_value=internal_id),
+                    dict(table_name="deployments", schema="consys", strategy="LIST", partition_value=internal_id),
+                    dict(table_name="datastreams", schema="consys", strategy="LIST", partition_value=internal_id),
+                    dict(table_name="observations", schema="consys", strategy="LIST", partition_value=internal_id),
+                ],
             )
         except Exception as exc:
             logger.error(

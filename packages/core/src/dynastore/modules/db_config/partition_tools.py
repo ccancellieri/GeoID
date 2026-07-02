@@ -23,7 +23,7 @@ from typing import Any, Optional, Tuple, List
 from pydantic import BaseModel
 
 from .query_executor import (
-    DDLQuery, DbConnection, DbResource
+    DDLQuery, DbConnection, DbResource, managed_transaction
 )
 
 logger = logging.getLogger(__name__)
@@ -115,6 +115,35 @@ async def ensure_partition_exists(
             raise
             
     return partition_name, create_sql
+
+
+async def ensure_partitions_off_request_connection(
+    engine: DbResource,
+    partitions: List[dict],
+) -> None:
+    """Provision one or more partitions on a dedicated, short-lived connection.
+
+    ``CREATE TABLE ... PARTITION OF`` takes an ACCESS EXCLUSIVE lock on the
+    shared parent table for the duration of the enclosing transaction, not
+    just the DDL statement. Calling ``ensure_partition_exists`` on a
+    request-scoped connection that stays open for the rest of the request
+    holds that lock (and blocks every other tenant's writes to the parent
+    table) until the request's transaction commits or rolls back. Opening a
+    fresh ``managed_transaction`` against ``engine`` instead acquires its own
+    pooled connection, commits as soon as the partitions are provisioned, and
+    releases the lock before the caller's own request transaction is even
+    opened.
+
+    Args:
+        engine: The database engine (NOT the request-scoped connection) to
+            provision the dedicated transaction on.
+        partitions: One dict of kwargs per partition, forwarded to
+            ``ensure_partition_exists`` (``table_name``, ``schema``,
+            ``strategy``, ``partition_value``, ...).
+    """
+    async with managed_transaction(engine) as ddl_conn:
+        for spec in partitions:
+            await ensure_partition_exists(ddl_conn, **spec)
 
 
 def _get_partition_ddl(

@@ -626,13 +626,17 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         catalog_id: str,
         collection_def: ogc_models.CollectionDefinition,
         language: str = Depends(get_language),
-        conn: AsyncConnection = Depends(get_async_connection),
     ):
         """Creates a new collection in a catalog."""
         try:
             collection_dict = collection_def.model_dump(exclude_unset=True)
+            # Pass None, not a request-scoped connection: `_ogc_create_collection`
+            # / `create_collection` provision the collection's own partitions
+            # internally and must do so on their own short-lived connection,
+            # the same way STAC's create_stac_collection already does — not
+            # under the caller's request transaction (#2831).
             return await self._ogc_create_collection(
-                catalog_id, collection_dict, language, conn
+                catalog_id, collection_dict, language, None
             )
         except Exception as e:
             return handle_or_raise(

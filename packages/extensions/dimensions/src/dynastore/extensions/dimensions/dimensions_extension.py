@@ -373,6 +373,11 @@ async def materialize_dimension(
                 "Dimension '%s' unchanged (cube:dimensions match) — skipping.",
                 dim_name,
             )
+            # Still (re-)ensure the similarity index even on the skip path:
+            # a dimension materialized before this provisioning point
+            # existed would otherwise never get one, since the GET search
+            # endpoint no longer builds it on demand (#2831).
+            await _ensure_dimension_similarity_index(catalogs, dim_name, db_resource)
             return {"materialized": 0, "skipped": True, "reason": "unchanged"}
 
     desired_extra: Dict[str, Any] = {
@@ -433,7 +438,47 @@ async def materialize_dimension(
             catalogs, dim_name, desired_extra, extent, db_resource,
         )
 
+    # Provision the pg_trgm GIN index here, at materialization time, so the
+    # public GET similarity search endpoint never runs DDL (#2831).
+    await _ensure_dimension_similarity_index(catalogs, dim_name, db_resource)
+
     return {"materialized": total, "skipped": False, "reason": "materialized"}
+
+
+async def _ensure_dimension_similarity_index(
+    catalogs: Any,
+    dim_name: str,
+    db_resource: Any,
+) -> None:
+    """Provision the Similarity search GIN trigram index for ``dim_name``.
+
+    Best-effort: a failure here is non-fatal to materialization. Without
+    the index, ``similarity.search_similar`` still returns correct results
+    via an unindexed sequential scan.
+    """
+    from dynastore.extensions.dimensions.similarity import (
+        _resolve_member_table,
+        ensure_similarity_index,
+    )
+    from dynastore.modules.db_config.query_executor import managed_transaction
+    from dynastore.tools.db import validate_sql_identifier
+
+    try:
+        ctx = DriverContext(db_resource=db_resource)
+        schema = await catalogs.resolve_physical_schema(DIMENSIONS_CATALOG_ID, ctx=ctx)
+        table = await _resolve_member_table(dim_name, db_resource=db_resource)
+        if not schema or not table:
+            return
+        schema = validate_sql_identifier(schema)
+        table = validate_sql_identifier(table)
+        async with managed_transaction(db_resource) as conn:
+            await ensure_similarity_index(conn, schema, table)
+    except Exception as exc:
+        logger.warning(
+            "Could not ensure similarity index for dimension '%s' "
+            "(non-fatal — similarity search falls back to an unindexed "
+            "scan): %s", dim_name, exc,
+        )
 
 
 async def _update_collection_cube_dims(

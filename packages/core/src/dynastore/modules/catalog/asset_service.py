@@ -1461,37 +1461,6 @@ class AssetService(AssetsProtocol):
             await DDLQuery(trigger_ddl).execute(conn)
 
     # -------------------------------------------------------------------------
-    # Asset reference table bootstrap
-    # -------------------------------------------------------------------------
-
-    async def ensure_asset_references_table(
-        self,
-        schema: str,
-        db_resource: Optional[DbResource] = None,
-    ) -> None:
-        """
-        Idempotently creates the ``asset_references`` table in *schema* if it
-        does not yet exist.  Called during tenant schema initialisation alongside
-        the ``assets`` table creation.
-        """
-        ddl = f"""
-        CREATE TABLE IF NOT EXISTS "{schema}".asset_references (
-            asset_id       VARCHAR     NOT NULL,
-            catalog_id     VARCHAR     NOT NULL,
-            ref_type       VARCHAR     NOT NULL,
-            ref_id         VARCHAR     NOT NULL,
-            cascade_delete BOOLEAN     NOT NULL DEFAULT TRUE,
-            created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-            PRIMARY KEY (catalog_id, asset_id, ref_type, ref_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_asset_refs_blocking_{schema}
-            ON "{schema}".asset_references (catalog_id, asset_id)
-            WHERE cascade_delete = FALSE;
-        """.strip()
-        async with managed_transaction(db_resource or self.engine) as conn:
-            await DDLQuery(ddl).execute(conn, schema=schema)
-
-    # -------------------------------------------------------------------------
     # Asset reference CRUD
     # -------------------------------------------------------------------------
 

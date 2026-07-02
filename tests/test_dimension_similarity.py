@@ -208,3 +208,57 @@ def test_similarity_feature_shape():
     assert feat["properties"]["title"] == "Brazil"
     assert feat["properties"]["dimension:similarity"] == 0.75
     assert feat["properties"]["recordType"] == "dimension-member"
+
+
+# ---------------------------------------------------------------------------
+# #2831 — GIN index provisioning moved off the public GET search path
+# ---------------------------------------------------------------------------
+
+
+def test_search_similar_no_longer_builds_the_index_inline():
+    """Source-level pin: ``search_similar`` (the public GET similarity
+    search endpoint) must NOT call ``ensure_similarity_index`` itself.
+    Running ``CREATE INDEX`` DDL inline on every search request took a lock
+    on the shared attributes sidecar table for the whole request (#2831).
+    Index provisioning moved to materialization time
+    (``dimensions_extension._ensure_dimension_similarity_index``)."""
+    import inspect
+
+    src = inspect.getsource(similarity.search_similar)
+    assert "ensure_similarity_index(" not in src, (
+        "search_similar must not build the GIN trigram index inline on the "
+        "public GET path — see dimensions_extension.materialize_dimension "
+        "for where it now runs (#2831)."
+    )
+
+
+def test_materialize_dimension_provisions_similarity_index():
+    """Source-level pin: ``materialize_dimension`` must provision the
+    similarity index (both on first materialization and on the
+    unchanged/skip fast-path, so a dimension materialized before this
+    provisioning point existed still gets one) — this is where index
+    creation now lives instead of the public GET search path (#2831)."""
+    ext = _load_extension_module()
+    import inspect
+
+    src = inspect.getsource(ext.materialize_dimension)
+    assert src.count("_ensure_dimension_similarity_index(") >= 2, (
+        "materialize_dimension must call _ensure_dimension_similarity_index "
+        "on both the unchanged-skip path and the materialized path, so "
+        "every dimension eventually gets its similarity index without the "
+        "GET search path ever running DDL (#2831)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_dimension_similarity_index_is_non_fatal():
+    """A failure resolving the schema/table or building the index must not
+    raise out of materialization — it's best-effort (search still works via
+    an unindexed scan without it)."""
+    ext = _load_extension_module()
+
+    catalogs = AsyncMock()
+    catalogs.resolve_physical_schema = AsyncMock(side_effect=RuntimeError("boom"))
+
+    # Must not raise.
+    await ext._ensure_dimension_similarity_index(catalogs, "world-admin", db_resource=object())
