@@ -98,8 +98,12 @@ class LeadershipConfig:
     # Lease-table election (election_backend="lease"): leader_lease row TTL.
     # Must exceed the longest expected tick so the lease outlives one work cycle.
     lease_ttl_seconds: float = 30.0
-    # Reserved for future periodic renewal tasks; not used by the current
+    # Renewal cadence for the continuous-tenure heartbeat regime (opt-in via
+    # BackgroundService.lease_renewal_mode = HEARTBEAT; see
+    # locking_tools.lease_leadership_with_heartbeat). Not used by the default
     # per-tick acquire-renew model (CM is entered/exited every cadence).
+    # Default is TTL/3, the classic heartbeat margin tolerating two
+    # consecutive missed renewals before the lease can expire.
     lease_renew_interval_seconds: float = 10.0
     # Safety margin: a tick whose timeout is within this many seconds of
     # lease_ttl_seconds risks outliving its lease under clock skew or load.

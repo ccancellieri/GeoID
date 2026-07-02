@@ -187,6 +187,45 @@ def _lease_breaker_record_failure(lock_name: str) -> None:
         )
 
 
+async def _lease_cas_round_trip(
+    engine: DbResource, lock_id: int, *, name: str, ttl: float
+) -> Any:
+    """Run the acquire-or-renew lease CAS once; return the winning row or ``None``.
+
+    ``None`` covers every case where this process is not (or no longer) the
+    leader: the circuit breaker is open, the transient-retry budget was
+    exhausted, or the CAS's ``WHERE`` clause simply did not match (a live
+    foreign owner holds the lease). A non-``None`` row always means this
+    process's ``_LEASE_OWNER`` now owns the row (see ``_LEASE_CAS_SQL``).
+
+    Shared by :func:`lease_leadership` (per-tick acquire-or-renew) and
+    :func:`renew_lease` (heartbeat renewal) so both regimes get identical
+    breaker/retry treatment of the CAS round-trip — the two regimes must
+    never diverge on what counts as "still the leader".
+    """
+    if _get_lease_breaker().is_open(_LEASE_BREAKER_KEY):
+        return None
+
+    @retry_on_transient_connect(max_retries=3)
+    async def _run_cas() -> Any:
+        async with managed_transaction(engine) as _conn:
+            aconn = cast(AsyncConnection, _conn)
+            result = await aconn.execute(
+                text(_LEASE_CAS_SQL),
+                {"lock_key": lock_id, "name": name, "owner": _LEASE_OWNER, "ttl": ttl},
+            )
+            return result.fetchone()
+
+    try:
+        row = await _run_cas()
+    except Exception as exc:
+        logger.warning("%s: lease CAS failed (%s).", name, exc)
+        _lease_breaker_record_failure(name)
+        return None
+    _lease_breaker_record_success(name)
+    return row
+
+
 async def probe_lock_connection_liveness(
     conn: Any,
     *,
@@ -522,7 +561,10 @@ async def lease_leadership(
       naturally.
     * Per-tick model: this CM is entered/exited per tick by
       :class:`~dynastore.tools.background_service.BackgroundSupervisor`.
-      No separate renewal task is needed.
+      No separate renewal task is needed. A service that must hold
+      leadership continuously for longer than ``lease_ttl_seconds`` should
+      use :func:`lease_leadership_with_heartbeat` instead (opt-in via
+      ``BackgroundService.lease_renewal_mode = LeaseRenewalMode.HEARTBEAT``).
     * Resilience: a circuit breaker short-circuits the CAS while the DB is
       down (decline immediately rather than hammer it); a modest transient
       retry covers a single backend drop mid-statement. Both reuse existing
@@ -539,48 +581,18 @@ async def lease_leadership(
     lock_id = key if isinstance(key, int) else _get_stable_lock_id(key)
     ttl = _leadership_config.lease_ttl_seconds
 
-    # Circuit breaker: when OPEN the CAS has failed repeatedly, so decline this
-    # tick without touching the DB rather than hammering a database that is
-    # down. is_open() advances OPEN -> HALF_OPEN once the cooldown elapses, so
-    # the next tick is let through as a recovery probe.
-    if _get_lease_breaker().is_open(_LEASE_BREAKER_KEY):
-        yield (False, None)
-        return
-
     # The CAS runs at CM entry, NOT under the caller's tick_timeout, so retry a
     # transient backend drop (08003 under a transaction-mode pooler) here on a
     # fresh connection instead of silently skipping a maintenance tick. Budget
     # is deliberately MODEST (max_retries=3 -> ~0.5/1/2s, ≈3.5s worst case): it
     # MUST stay well under lease_ttl_seconds, otherwise a struggling DB would
     # delay every pod's election by the full default ~15s budget each tick.
-    @retry_on_transient_connect(max_retries=3)
-    async def _run_cas() -> Any:
-        async with managed_transaction(engine) as _conn:
-            aconn = cast(AsyncConnection, _conn)
-            result = await aconn.execute(
-                text(_LEASE_CAS_SQL),
-                {"lock_key": lock_id, "name": name, "owner": _LEASE_OWNER, "ttl": ttl},
-            )
-            return result.fetchone()
-
-    try:
-        row = await _run_cas()
-    except Exception as exc:
-        # Retry budget exhausted: trip the breaker (logged once on transition)
-        # and decline. Fail-safe — a failed election never crashes the loop.
-        logger.warning(
-            "%s: lease acquire failed (%s); not a leader.", name, exc
-        )
-        _lease_breaker_record_failure(name)
-        yield (False, None)
-        return
-    # The CAS round-tripped (1 row = win, 0 rows = a live foreign owner); either
-    # way the DB is healthy, so reset the breaker.
-    _lease_breaker_record_success(name)
     # RETURNING yields a row iff our CAS WHERE matched (insert, takeover of an
     # expired lease, or renew of our own), and the upsert sets owner to ours —
     # so a non-None row always means we own the lease. Zero rows = a live
-    # foreign owner blocked the update.
+    # foreign owner blocked the update (or the breaker was open / retries were
+    # exhausted — see _lease_cas_round_trip).
+    row = await _lease_cas_round_trip(engine, lock_id, name=name, ttl=ttl)
     won = row is not None
     if not won:
         yield (False, None)
@@ -605,19 +617,289 @@ async def lease_leadership(
             time.monotonic() - acquired_at,
             len(_held_advisory_locks),
         )
-        try:
-            async with managed_transaction(engine) as _rconn:
-                arconn = cast(AsyncConnection, _rconn)
-                await arconn.execute(
-                    text(
-                        "UPDATE configs.leader_lease"
-                        " SET expires_at = now()"
-                        " WHERE lock_key = :lock_key AND owner = :owner"
-                    ),
-                    {"lock_key": lock_id, "owner": _LEASE_OWNER},
+        await _lease_best_effort_release(engine, lock_id)
+
+
+async def _lease_best_effort_release(engine: DbResource, lock_id: int) -> None:
+    """Best-effort UPDATE to expire this process's own lease row immediately.
+
+    Scoped to ``owner = _LEASE_OWNER`` so it is a no-op if this process is no
+    longer the recorded owner (already superseded by another pod's CAS) —
+    never clobbers a successor. Errors are swallowed: the lease expires
+    naturally via ``expires_at`` if this UPDATE fails, so a release failure
+    never blocks CM exit. Shared by :func:`lease_leadership` and
+    :func:`lease_leadership_with_heartbeat`.
+    """
+    try:
+        async with managed_transaction(engine) as _rconn:
+            arconn = cast(AsyncConnection, _rconn)
+            await arconn.execute(
+                text(
+                    "UPDATE configs.leader_lease"
+                    " SET expires_at = now()"
+                    " WHERE lock_key = :lock_key AND owner = :owner"
+                ),
+                {"lock_key": lock_id, "owner": _LEASE_OWNER},
+            )
+    except Exception:
+        pass  # best-effort; lease expires naturally via expires_at
+
+
+async def renew_lease(
+    engine: Optional[DbResource], key: Union[int, str], *, name: str = "leader"
+) -> bool:
+    """Renew this process's own lease tenure via the acquire-or-renew CAS.
+
+    Returns ``True`` if this process is still the recorded owner and the row
+    was refreshed; ``False`` if ownership was lost (another pod's CAS already
+    won the row after this process missed its renewal window) or the CAS
+    round-trip failed outright (breaker open, DB error after retries). A
+    failed round-trip is treated the same as an explicit loss — fail-safe, so
+    a struggling database demotes a heartbeat-mode leader rather than leaving
+    it uncertain whether it still holds the lease.
+
+    CAS-on-own-owner: ``_LEASE_CAS_SQL``'s ``WHERE`` clause is
+    ``expires_at < now() OR owner = EXCLUDED.owner``. Calling it with this
+    process's own ``_LEASE_OWNER`` can therefore only ever (a) refresh a row
+    this process already owns — regardless of whether ``expires_at`` had
+    already passed, since the ``owner = EXCLUDED.owner`` branch does not
+    additionally check expiry — or (b) return zero rows when a different
+    owner already holds the row. It can never resurrect a lease a different
+    pod has already taken over, which is the property the renewal heartbeat
+    depends on for correctness.
+    """
+    if not isinstance(engine, AsyncEngine):
+        return False
+    lock_id = key if isinstance(key, int) else _get_stable_lock_id(key)
+    ttl = _leadership_config.lease_ttl_seconds
+    row = await _lease_cas_round_trip(engine, lock_id, name=name, ttl=ttl)
+    return row is not None
+
+
+def start_lease_heartbeat(
+    engine: Optional[DbResource],
+    lock_id: int,
+    *,
+    name: str = "leader",
+    interval_seconds: Optional[float] = None,
+) -> Tuple[asyncio.Event, "asyncio.Task[None]"]:
+    """Start a background task that renews *lock_id*'s lease on a heartbeat cadence.
+
+    Returns ``(lost_event, task)``. ``lost_event`` is set the moment a
+    renewal attempt fails (see :func:`renew_lease`) so a caller ticking on a
+    slower cadence can still notice the loss between ticks instead of only at
+    the next tick boundary. The task stops looping as soon as ``lost_event``
+    is set (by itself on loss, or by the caller to end tenure normally) —
+    callers MUST still ``.cancel()`` and await the returned task on their own
+    shutdown path, since setting the event does not interrupt an in-progress
+    ``asyncio.sleep``.
+
+    ``interval_seconds`` defaults to
+    ``LeadershipConfig.lease_renew_interval_seconds`` (10s against the 30s
+    default ``lease_ttl_seconds`` — TTL/3, the classic heartbeat margin that
+    tolerates two consecutive missed renewals before the lease can expire).
+    """
+    interval = (
+        interval_seconds
+        if interval_seconds is not None
+        else _leadership_config.lease_renew_interval_seconds
+    )
+    lost = asyncio.Event()
+
+    async def _loop() -> None:
+        while not lost.is_set():
+            await asyncio.sleep(interval)
+            if lost.is_set():
+                return
+            if not await renew_lease(engine, lock_id, name=name):
+                logger.warning(
+                    "%s: lease renewal failed (key=%s); leadership lost.",
+                    name,
+                    lock_id,
                 )
+                lost.set()
+                return
+
+    task = asyncio.create_task(_loop(), name=f"lease-heartbeat:{name}")
+    return lost, task
+
+
+@asynccontextmanager
+async def lease_leadership_with_heartbeat(
+    engine: Optional[DbResource],
+    key: Union[int, str],
+    *,
+    name: str = "leader",
+) -> AsyncGenerator[Tuple[bool, Optional[asyncio.Event]], None]:
+    """Continuous-tenure leadership: acquire once, keep it alive via heartbeat.
+
+    Companion to :func:`lease_leadership` for a service that must hold
+    leadership continuously for LONGER than ``lease_ttl_seconds``. The
+    per-tick model in :func:`lease_leadership` deliberately caps each tick
+    under the TTL instead (see the lease-TTL tick clamp in
+    :class:`~dynastore.tools.background_service.BackgroundSupervisor`) —
+    that per-tick regime remains the default for every existing LEADER_ONLY
+    service. Reach for this only when tenure genuinely needs to outlive one
+    TTL window.
+
+    Yields ``(is_leader, lost_event)``. When ``is_leader`` is ``True``,
+    ``lost_event`` is an ``asyncio.Event`` the caller MUST check between
+    units of work: once set, this process is no longer the leader and MUST
+    stop leader work immediately — do not start another unit of work after
+    observing it set. A failed renewal (lease taken over by another pod after
+    a missed heartbeat, or a DB error) sets ``lost_event`` as soon as it
+    happens, independent of the caller's own cadence.
+
+    Exiting the ``async with`` block — normally or via exception — always
+    stops the heartbeat task and attempts the same best-effort early release
+    as :func:`lease_leadership` before returning.
+
+    Design invariants (mirrors :func:`lease_leadership`):
+
+    * Exactly ONE ``yield`` per code path.
+    * On WIN the lock_id is registered in ``_held_advisory_locks`` for the
+      duration of the tenure, same as the per-tick regime.
+    * The heartbeat renewal reuses :func:`renew_lease`, which is
+      CAS-on-own-owner and can never resurrect a lease another pod has
+      already taken over.
+    """
+    if not isinstance(engine, AsyncEngine):
+        logger.warning(
+            "%s: leadership requires AsyncEngine (got %s); not a leader.",
+            name,
+            type(engine).__name__ if engine is not None else "None",
+        )
+        yield (False, None)
+        return
+    lock_id = key if isinstance(key, int) else _get_stable_lock_id(key)
+    ttl = _leadership_config.lease_ttl_seconds
+
+    row = await _lease_cas_round_trip(engine, lock_id, name=name, ttl=ttl)
+    if row is None:
+        yield (False, None)
+        return
+
+    acquired_at = time.monotonic()
+    _held_advisory_locks[lock_id] = (name, acquired_at)
+    logger.info(
+        "%s: heartbeat lease leadership acquired (key=%s, advisory_locks_held_now=%d).",
+        name,
+        key,
+        len(_held_advisory_locks),
+    )
+    lost_event, heartbeat_task = start_lease_heartbeat(engine, lock_id, name=name)
+    try:
+        yield (True, lost_event)
+    finally:
+        lost_event.set()
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
         except Exception:
-            pass  # best-effort; lease expires naturally via expires_at
+            logger.debug(
+                "%s: heartbeat task raised during shutdown", name, exc_info=True
+            )
+        _held_advisory_locks.pop(lock_id, None)
+        logger.info(
+            "%s: heartbeat lease leadership released (key=%s, held=%.1fs, "
+            "advisory_locks_held_now=%d).",
+            name,
+            key,
+            time.monotonic() - acquired_at,
+            len(_held_advisory_locks),
+        )
+        await _lease_best_effort_release(engine, lock_id)
+
+
+async def run_lease_leadership_heartbeat_loop(
+    engine: Optional[DbResource],
+    key: Union[int, str],
+    *,
+    on_tick: Callable[[], Awaitable[None]],
+    name: str = "leader",
+    cadence_seconds: float,
+    is_shutdown: Optional[Callable[[], bool]] = None,
+    shutdown_event: Optional[asyncio.Event] = None,
+    reelect_cadence_seconds: float = 5.0,
+) -> None:
+    """Leader loop for the continuous-tenure lease-heartbeat regime.
+
+    Sibling of :func:`dynastore.tools.async_utils.run_leader_loop`, scoped to
+    the lease-table heartbeat model: the lease is acquired ONCE per tenure
+    (not per tick) via :func:`lease_leadership_with_heartbeat`, kept alive by
+    its background renewal task, and ``on_tick`` runs repeatedly on
+    ``cadence_seconds`` without releasing leadership between ticks.
+
+    Leadership loss is checked immediately before and after every
+    ``on_tick`` call, and interrupts the inter-tick sleep as soon as it
+    happens (so a loss occurring mid-sleep does not wait out the full
+    cadence). Once observed, this loop stops calling ``on_tick`` and exits
+    the leadership context (stopping the heartbeat and releasing the lease)
+    before re-electing on ``reelect_cadence_seconds`` — bounding a lost
+    tenure's overlap with a successor to at most one in-flight tick, the same
+    bound the per-tick TTL clamp gives the default regime. ``on_tick`` bodies
+    are expected to be short, matching the existing LEADER_ONLY no-inner-retry
+    invariant (see ``run_leader_loop``'s docstring) — a tick that can hang
+    indefinitely is a pre-existing risk for both regimes, not something this
+    loop guards against by cancelling an in-flight tick.
+
+    On any exception from ``on_tick`` (unrelated to lease loss) this loop
+    logs, exits the leadership context, and resigns-and-retries after
+    ``reelect_cadence_seconds`` — matching ``run_leader_loop``'s behaviour.
+    """
+    is_shutdown = is_shutdown or (lambda: False)
+
+    async def _interruptible_sleep(seconds: float, extra: Optional[asyncio.Event]) -> None:
+        events = [shutdown_event] if shutdown_event is not None else []
+        if extra is not None:
+            events.append(extra)
+        if not events:
+            await asyncio.sleep(seconds)
+            return
+        waiters = [asyncio.ensure_future(e.wait()) for e in events]
+        try:
+            await asyncio.wait(waiters, timeout=seconds, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for w in waiters:
+                if not w.done():
+                    w.cancel()
+
+    while not is_shutdown():
+        async with lease_leadership_with_heartbeat(engine, key, name=name) as (
+            is_leader,
+            lost_event,
+        ):
+            if not is_leader:
+                await _interruptible_sleep(reelect_cadence_seconds, None)
+                continue
+            logger.info("%s: heartbeat leader loop started", name)
+            try:
+                while not is_shutdown():
+                    if lost_event is not None and lost_event.is_set():
+                        logger.warning(
+                            "%s: lease lost; resigning immediately", name
+                        )
+                        break
+                    await on_tick()
+                    if lost_event is not None and lost_event.is_set():
+                        logger.warning(
+                            "%s: lease lost after tick; resigning immediately",
+                            name,
+                        )
+                        break
+                    await _interruptible_sleep(cadence_seconds, lost_event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "%s: heartbeat tick failed; resigning and retrying in %ss",
+                    name,
+                    reelect_cadence_seconds,
+                )
+        if not is_shutdown():
+            await _interruptible_sleep(reelect_cadence_seconds, None)
 
 
 @contextmanager

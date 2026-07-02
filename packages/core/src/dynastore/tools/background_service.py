@@ -44,6 +44,7 @@ from dynastore.modules.db_config.locking_tools import (
     pg_advisory_leadership,
     lease_leadership,
     probe_lock_connection_liveness,
+    run_lease_leadership_heartbeat_loop,
 )
 from dynastore.tools.async_utils import run_leader_loop
 
@@ -85,6 +86,31 @@ class PodPolicy(Enum):
     SKIP_EPHEMERAL = "skip_ephemeral"
     """Do NOT start when ServiceContext.is_ephemeral is True (e.g. Cloud Run Jobs,
     one-shot migration containers)."""
+
+
+class LeaseRenewalMode(Enum):
+    """How a LEADER_ONLY :class:`PeriodicService` holds its lease-table tenure.
+
+    Only meaningful under ``election_backend="lease"``
+    (:class:`~dynastore.modules.db_config.connection_health_config.LeadershipConfig`);
+    ``HEARTBEAT`` is silently treated as ``PER_TICK`` under the advisory
+    backend, whose session-affinity model does not fit a periodic renewal
+    task (see #2438).
+    """
+
+    PER_TICK = "per_tick"
+    """Acquire and release the lease every tick (default). Correct for the
+    short, idempotent ticks every LEADER_ONLY service uses today; each tick
+    is clamped under ``lease_ttl_seconds`` so it can never outlive its
+    lease (see the tick clamp in ``BackgroundSupervisor._leader_elected_coro``)."""
+
+    HEARTBEAT = "heartbeat"
+    """Acquire the lease ONCE and keep it alive via a background renewal
+    heartbeat (``lease_renew_interval_seconds``, default TTL/3), so the
+    service can hold leadership continuously for longer than
+    ``lease_ttl_seconds`` instead of re-electing every tick. Opt-in only —
+    reach for this only when tenure genuinely needs to outlive one TTL
+    window; every existing LEADER_ONLY service stays on PER_TICK."""
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +197,9 @@ class BackgroundService(Protocol):
     pod_policy: PodPolicy
     lock_key: Optional[Union[int, str]]
     """Advisory-lock key for LEADER_ONLY. None → derived from name + ctx.name."""
+    lease_renewal_mode: "LeaseRenewalMode"
+    """PER_TICK (default) or HEARTBEAT; see :class:`LeaseRenewalMode`. Read
+    only for a LEADER_ONLY :class:`PeriodicService` under the lease backend."""
 
     async def run(self, ctx: ServiceContext) -> None:
         """Main service loop. Must return (not raise) when ctx.shutdown is set."""
@@ -198,6 +227,11 @@ class PeriodicService(ABC):
     leadership: Leadership = Leadership.RUN_EVERYWHERE
     pod_policy: PodPolicy = PodPolicy.ALL
     lock_key: Optional[Union[int, str]] = None
+    lease_renewal_mode: LeaseRenewalMode = LeaseRenewalMode.PER_TICK
+    """Opt-in continuous-tenure heartbeat mode; see :class:`LeaseRenewalMode`.
+    Every existing service keeps the default PER_TICK — set this to
+    HEARTBEAT only when a service's tenure must genuinely outlive
+    ``lease_ttl_seconds`` without releasing leadership between ticks."""
     cadence_seconds: float = 30.0
     tick_timeout: Optional[float] = None
     """Maximum time a tick may run before the advisory lock is released.
@@ -413,6 +447,23 @@ class BackgroundSupervisor:
 
         if isinstance(service, PeriodicService):
             periodic = service
+
+            # Opt-in continuous-tenure regime: acquire the lease ONCE and keep
+            # it alive via a background renewal heartbeat instead of the
+            # per-tick acquire/release model below. Only meaningful under the
+            # lease backend (the advisory backend has no renewal primitive —
+            # see LeaseRenewalMode's docstring); silently falls back to the
+            # per-tick path otherwise so flipping election_backend never
+            # strands a HEARTBEAT-mode service leaderless.
+            from dynastore.modules.db_config.connection_health_config import (
+                _leadership_config as _cfg_for_mode,
+            )
+            if (
+                periodic.lease_renewal_mode is LeaseRenewalMode.HEARTBEAT
+                and _cfg_for_mode.election_backend == "lease"
+            ):
+                return self._heartbeat_leader_coro(periodic, ctx, key)
+
             # One-time visibility flag for the lease-TTL tick clamp below.
             _clamp_logged = {"done": False}
 
@@ -497,6 +548,39 @@ class BackgroundSupervisor:
             is_shutdown=ctx.shutdown.is_set,
             shutdown_event=ctx.shutdown,
             pre_tick_probe=_liveness_probe,
+        )
+
+    def _heartbeat_leader_coro(
+        self, periodic: PeriodicService, ctx: ServiceContext, key: Union[int, str]
+    ) -> Coroutine[Any, Any, None]:
+        """Wrap a HEARTBEAT-mode PeriodicService in continuous-tenure leadership.
+
+        Companion to :meth:`_leader_elected_coro`'s per-tick path: the lease is
+        acquired ONCE per tenure (not per tick) and kept alive by
+        :func:`~dynastore.modules.db_config.locking_tools.lease_leadership_with_heartbeat`'s
+        background renewal task, so ``tick`` runs on ``cadence_seconds``
+        without releasing leadership in between. Callers reach this only when
+        ``election_backend="lease"`` (checked by the caller) — the advisory
+        backend has no renewal primitive.
+        """
+        async def on_tick() -> None:
+            leader_ctx = ServiceContext(
+                engine=ctx.engine,
+                shutdown=ctx.shutdown,
+                is_ephemeral=ctx.is_ephemeral,
+                name=ctx.name,
+                lock_connection=None,
+            )
+            await periodic.tick(leader_ctx)
+
+        return run_lease_leadership_heartbeat_loop(
+            ctx.engine,
+            key,
+            on_tick=on_tick,
+            name=periodic.name,
+            cadence_seconds=periodic.cadence_seconds,
+            is_shutdown=ctx.shutdown.is_set,
+            shutdown_event=ctx.shutdown,
         )
 
     async def stop(self, *, timeout: float = 10.0) -> None:

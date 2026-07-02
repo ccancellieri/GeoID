@@ -30,6 +30,7 @@ from dynastore.tools.background_service import (
     BackgroundService,
     BackgroundSupervisor,
     Leadership,
+    LeaseRenewalMode,
     PeriodicService,
     PodPolicy,
     ServiceContext,
@@ -600,3 +601,151 @@ async def test_leader_elected_coro_passes_pre_tick_probe_for_periodic() -> None:
 
     assert "pre_tick_probe" in captured, "pre_tick_probe must be passed to run_leader_loop"
     assert captured["pre_tick_probe"] is not None, "pre_tick_probe must be non-None"
+
+
+# ---------------------------------------------------------------------------
+# LeaseRenewalMode — opt-in continuous-tenure heartbeat regime (#2597)
+# ---------------------------------------------------------------------------
+
+
+def test_periodic_service_default_lease_renewal_mode_is_per_tick() -> None:
+    """Every existing PeriodicService keeps the default PER_TICK regime
+    without any change to its class body."""
+
+    class _PlainPeriodic(PeriodicService):
+        name = "plain-periodic"
+
+        async def tick(self, ctx: ServiceContext) -> None:
+            pass
+
+    assert _PlainPeriodic.lease_renewal_mode is LeaseRenewalMode.PER_TICK
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_mode_dispatches_to_heartbeat_loop_under_lease_backend() -> None:
+    """A HEARTBEAT-mode PeriodicService under election_backend='lease' is
+    wrapped by run_lease_leadership_heartbeat_loop, not run_leader_loop."""
+    import dynastore.modules.db_config.connection_health_config as chc
+
+    class _HeartbeatPeriodic(PeriodicService):
+        name = "heartbeat-periodic"
+        leadership = Leadership.LEADER_ONLY
+        lease_renewal_mode = LeaseRenewalMode.HEARTBEAT
+        cadence_seconds = 30.0
+
+        async def tick(self, ctx: ServiceContext) -> None:
+            pass
+
+    ctx = _make_ctx(engine=MagicMock())
+    supervisor = BackgroundSupervisor()
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_heartbeat_loop(*args: Any, **kwargs: Any) -> None:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+    original_backend = chc._leadership_config.election_backend
+    chc._leadership_config.election_backend = "lease"
+    try:
+        with patch(
+            "dynastore.tools.background_service.run_lease_leadership_heartbeat_loop",
+            side_effect=_fake_heartbeat_loop,
+        ) as mock_heartbeat_loop, patch(
+            "dynastore.tools.background_service.run_leader_loop",
+        ) as mock_per_tick_loop:
+            coro = supervisor._leader_elected_coro(_HeartbeatPeriodic(), ctx)
+            await coro
+    finally:
+        chc._leadership_config.election_backend = original_backend
+
+    mock_heartbeat_loop.assert_called_once()
+    mock_per_tick_loop.assert_not_called()
+    assert captured["kwargs"]["name"] == "heartbeat-periodic"
+    assert captured["kwargs"]["cadence_seconds"] == 30.0
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_mode_falls_back_to_per_tick_under_advisory_backend() -> None:
+    """HEARTBEAT mode is a lease-table-only capability: under
+    election_backend='advisory' it silently falls back to the per-tick path
+    (run_leader_loop) instead of stranding the service leaderless."""
+    import dynastore.modules.db_config.connection_health_config as chc
+
+    class _HeartbeatPeriodic(PeriodicService):
+        name = "heartbeat-periodic-advisory"
+        leadership = Leadership.LEADER_ONLY
+        lease_renewal_mode = LeaseRenewalMode.HEARTBEAT
+        cadence_seconds = 5.0
+
+        async def tick(self, ctx: ServiceContext) -> None:
+            pass
+
+    ctx = _make_ctx(engine=MagicMock())
+    supervisor = BackgroundSupervisor()
+
+    async def _capture_and_exit(**kwargs: Any) -> None:
+        pass
+
+    original_backend = chc._leadership_config.election_backend
+    chc._leadership_config.election_backend = "advisory"
+    try:
+        with patch(
+            "dynastore.tools.background_service.run_lease_leadership_heartbeat_loop",
+        ) as mock_heartbeat_loop, patch(
+            "dynastore.tools.background_service.run_leader_loop",
+            MagicMock(side_effect=_capture_and_exit),
+        ) as mock_per_tick_loop:
+            coro = supervisor._leader_elected_coro(_HeartbeatPeriodic(), ctx)
+            await coro
+    finally:
+        chc._leadership_config.election_backend = original_backend
+
+    mock_heartbeat_loop.assert_not_called()
+    mock_per_tick_loop.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_mode_ticks_repeatedly_without_reacquiring() -> None:
+    """End-to-end (fake lease primitives): a HEARTBEAT-mode service ticks
+    several times on cadence while the lease acquire CM is entered exactly
+    once, proving the continuous-tenure model doesn't re-elect per tick."""
+    acquire_count = {"n": 0}
+    tick_count = {"n": 0}
+    lost = asyncio.Event()
+
+    @asynccontextmanager
+    async def _fake_heartbeat_acquire(engine: Any, key: Any, *, name: str = "leader"):
+        acquire_count["n"] += 1
+        yield (True, lost)
+
+    class _HeartbeatPeriodic(PeriodicService):
+        name = "heartbeat-e2e"
+        leadership = Leadership.LEADER_ONLY
+        lease_renewal_mode = LeaseRenewalMode.HEARTBEAT
+        cadence_seconds = 0.01
+
+        async def tick(self, ctx: ServiceContext) -> None:
+            tick_count["n"] += 1
+            if tick_count["n"] >= 3:
+                ctx.shutdown.set()
+
+    ctx = _make_ctx(engine=MagicMock())
+    supervisor = BackgroundSupervisor()
+
+    import dynastore.modules.db_config.connection_health_config as chc
+
+    original_backend = chc._leadership_config.election_backend
+    chc._leadership_config.election_backend = "lease"
+    try:
+        with patch(
+            "dynastore.modules.db_config.locking_tools.lease_leadership_with_heartbeat",
+            _fake_heartbeat_acquire,
+        ):
+            coro = supervisor._leader_elected_coro(_HeartbeatPeriodic(), ctx)
+            await asyncio.wait_for(coro, timeout=2.0)
+    finally:
+        chc._leadership_config.election_backend = original_backend
+
+    assert acquire_count["n"] == 1, "lease must be acquired ONCE, not per tick"
+    assert tick_count["n"] == 3

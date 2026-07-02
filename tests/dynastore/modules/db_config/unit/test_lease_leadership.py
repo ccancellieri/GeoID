@@ -28,6 +28,8 @@ DB layer is mocked via monkeypatching ``managed_transaction`` in the
 """
 from __future__ import annotations
 
+import asyncio
+import time
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 
@@ -43,6 +45,10 @@ from dynastore.modules.db_config.locking_tools import (
     _LEASE_BREAKER_KEY,
     _LEASE_OWNER,
     lease_leadership,
+    lease_leadership_with_heartbeat,
+    renew_lease,
+    run_lease_leadership_heartbeat_loop,
+    start_lease_heartbeat,
 )
 
 
@@ -595,3 +601,578 @@ async def test_breaker_recovers_half_open_to_closed_after_cooldown(monkeypatch):
     async with lease_leadership(_make_engine(), 42, name="test") as (is_leader, _):
         assert is_leader is True
     assert breaker.state_of(_LEASE_BREAKER_KEY) == "CLOSED"
+
+
+# ---------------------------------------------------------------------------
+# renew_lease — CAS-on-own-owner renewal (heartbeat regime, #2597)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_renew_lease_true_when_still_owner(monkeypatch):
+    """CAS returns our owner row (still owner) → renewed."""
+    cursor = _make_cursor(_LEASE_OWNER)
+    _patch_managed_transaction(monkeypatch, [cursor])
+
+    assert await renew_lease(_make_engine(), 42, name="test") is True
+
+
+@pytest.mark.asyncio
+async def test_renew_lease_false_when_ownership_lost(monkeypatch):
+    """CAS returns zero rows (a different owner already holds the row) → lost."""
+    cursor = _make_cursor(None)
+    _patch_managed_transaction(monkeypatch, [cursor])
+
+    assert await renew_lease(_make_engine(), 42, name="test") is False
+
+
+@pytest.mark.asyncio
+async def test_renew_lease_false_on_db_error(monkeypatch):
+    """A DB error is treated the same as an explicit loss — fail-safe."""
+    _patch_managed_transaction(monkeypatch, [RuntimeError("db down")])
+
+    assert await renew_lease(_make_engine(), 42, name="test") is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", [None, object()])
+async def test_renew_lease_false_on_non_async_engine(engine):
+    """None / non-AsyncEngine → False without DB contact."""
+    assert await renew_lease(engine, 42, name="test") is False
+
+
+def test_fake_lease_renewal_cannot_resurrect_after_takeover():
+    """SQL-semantics proof for CAS-on-own-owner: after a takeover by a
+    different owner, the original owner's renewal attempt (same CAS, same
+    owner string as before) gets zero rows. renew_lease reuses this exact
+    CAS, so it structurally cannot resurrect a lease another pod has already
+    taken over."""
+    fake = _FakeLease()
+    ttl = 30.0
+    assert fake.cas(42, "pod-A", ttl) == ("pod-A", 1)
+
+    # pod-A's lease expires; pod-B takes over.
+    fake.now += ttl + 1.0
+    assert fake.cas(42, "pod-B", ttl) == ("pod-B", 2)
+
+    # pod-A's heartbeat fires late and "renews" with its own owner string —
+    # zero rows, because pod-B already owns the row.
+    assert fake.cas(42, "pod-A", ttl) is None
+
+
+# ---------------------------------------------------------------------------
+# start_lease_heartbeat — background renewal task
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_start_lease_heartbeat_renews_repeatedly_when_healthy(monkeypatch):
+    """A healthy lease is renewed on every interval; lost_event stays unset."""
+    calls = {"n": 0}
+
+    async def _ok(engine, key, *, name="leader"):
+        calls["n"] += 1
+        return True
+
+    monkeypatch.setattr(locking_tools, "renew_lease", _ok)
+    lost, task = start_lease_heartbeat(_make_engine(), 42, name="test", interval_seconds=0.02)
+    try:
+        await asyncio.sleep(0.09)
+        assert calls["n"] >= 2, f"expected multiple renewals, got {calls['n']}"
+        assert lost.is_set() is False
+    finally:
+        lost.set()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_start_lease_heartbeat_sets_lost_on_renewal_failure(monkeypatch):
+    """A failed renewal sets lost_event immediately and the task stops on its
+    own (no further renewal attempts)."""
+    calls = {"n": 0}
+
+    async def _fail(engine, key, *, name="leader"):
+        calls["n"] += 1
+        return False
+
+    monkeypatch.setattr(locking_tools, "renew_lease", _fail)
+    lost, task = start_lease_heartbeat(_make_engine(), 42, name="test", interval_seconds=0.02)
+
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert lost.is_set() is True
+    assert calls["n"] == 1, "the loop must not retry after a failed renewal"
+
+
+@pytest.mark.asyncio
+async def test_start_lease_heartbeat_uses_configured_default_interval(monkeypatch):
+    """With no explicit interval_seconds, the default TTL/3-style config value
+    is read live (not frozen at import time)."""
+    monkeypatch.setattr(locking_tools._leadership_config, "lease_renew_interval_seconds", 0.02)
+    calls = {"n": 0}
+
+    async def _ok(engine, key, *, name="leader"):
+        calls["n"] += 1
+        return True
+
+    monkeypatch.setattr(locking_tools, "renew_lease", _ok)
+    lost, task = start_lease_heartbeat(_make_engine(), 42, name="test")
+    try:
+        await asyncio.sleep(0.07)
+        assert calls["n"] >= 2
+    finally:
+        lost.set()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# lease_leadership_with_heartbeat — continuous-tenure acquire CM
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_win_yields_true_and_lost_event(monkeypatch):
+    """On win, yields (True, lost_event) where lost_event starts unset."""
+    cursor = _make_cursor(_LEASE_OWNER)
+    _patch_managed_transaction(monkeypatch, [cursor])
+
+    fake_event = asyncio.Event()
+    fake_task = asyncio.get_event_loop().create_future()
+    fake_task.set_result(None)
+
+    monkeypatch.setattr(
+        locking_tools,
+        "start_lease_heartbeat",
+        lambda engine, lock_id, *, name="leader", interval_seconds=None: (fake_event, fake_task),
+    )
+
+    async with lease_leadership_with_heartbeat(_make_engine(), 42, name="test") as (
+        is_leader,
+        lost_event,
+    ):
+        assert is_leader is True
+        assert lost_event is fake_event
+        assert lost_event.is_set() is False
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_win_registers_held_lock(monkeypatch):
+    """On win, lock_id is added to _held_advisory_locks during tenure."""
+    cursor = _make_cursor(_LEASE_OWNER)
+    lock_id = _get_stable_lock_id("heartbeat_key")
+    _patch_managed_transaction(monkeypatch, [cursor])
+
+    fake_event = asyncio.Event()
+    fake_task = asyncio.get_event_loop().create_future()
+    fake_task.set_result(None)
+    monkeypatch.setattr(
+        locking_tools,
+        "start_lease_heartbeat",
+        lambda engine, lid, *, name="leader", interval_seconds=None: (fake_event, fake_task),
+    )
+
+    assert lock_id not in _held_advisory_locks
+    async with lease_leadership_with_heartbeat(_make_engine(), "heartbeat_key", name="test") as (
+        is_leader,
+        _,
+    ):
+        assert is_leader is True
+        assert lock_id in _held_advisory_locks
+    assert lock_id not in _held_advisory_locks
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_lose_yields_false_none_and_starts_no_heartbeat(monkeypatch):
+    """CAS loses → (False, None); no heartbeat task is ever started."""
+    cursor = _make_cursor(None)
+    _patch_managed_transaction(monkeypatch, [cursor])
+
+    start_spy = MagicMock(side_effect=AssertionError("heartbeat must not start on lose"))
+    monkeypatch.setattr(locking_tools, "start_lease_heartbeat", start_spy)
+
+    async with lease_leadership_with_heartbeat(_make_engine(), 42, name="test") as (
+        is_leader,
+        lost_event,
+    ):
+        assert is_leader is False
+        assert lost_event is None
+    start_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_non_async_engine_yields_false_no_db_contact():
+    """None / non-AsyncEngine → (False, None) without touching the DB or
+    starting a heartbeat."""
+    async with lease_leadership_with_heartbeat(object(), 42, name="test") as (
+        is_leader,
+        lost_event,
+    ):
+        assert is_leader is False
+        assert lost_event is None
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_release_cancels_heartbeat_task_and_issues_expire_update(monkeypatch):
+    """Exiting the CM stops the real heartbeat task and runs the same
+    best-effort expire UPDATE as lease_leadership."""
+    cursor = _make_cursor(_LEASE_OWNER)
+    execute_calls, _ = _patch_managed_transaction(monkeypatch, [cursor])
+    fake_event = asyncio.Event()
+
+    async def _never_ending() -> None:
+        await asyncio.Event().wait()
+
+    real_task = asyncio.create_task(_never_ending())
+    monkeypatch.setattr(
+        locking_tools,
+        "start_lease_heartbeat",
+        lambda engine, lock_id, *, name="leader", interval_seconds=None: (fake_event, real_task),
+    )
+
+    async with lease_leadership_with_heartbeat(_make_engine(), 42, name="test") as (
+        is_leader,
+        _,
+    ):
+        assert is_leader is True
+
+    assert real_task.cancelled() or real_task.done()
+    assert fake_event.is_set() is True
+
+    standalone_update_calls = [
+        sql for sql, _ in execute_calls if sql.lstrip().upper().startswith("UPDATE")
+    ]
+    assert len(standalone_update_calls) == 1
+    assert "leader_lease" in standalone_update_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_body_exception_propagates_and_still_releases(monkeypatch):
+    """A failure during the tenure propagates; the heartbeat is still stopped
+    and the release UPDATE still runs."""
+    cursor = _make_cursor(_LEASE_OWNER)
+    execute_calls, _ = _patch_managed_transaction(monkeypatch, [cursor])
+    fake_event = asyncio.Event()
+
+    async def _never_ending() -> None:
+        await asyncio.Event().wait()
+
+    real_task = asyncio.create_task(_never_ending())
+    monkeypatch.setattr(
+        locking_tools,
+        "start_lease_heartbeat",
+        lambda engine, lock_id, *, name="leader", interval_seconds=None: (fake_event, real_task),
+    )
+
+    with pytest.raises(RuntimeError, match="tick failed"):
+        async with lease_leadership_with_heartbeat(_make_engine(), 42, name="test") as (
+            is_leader,
+            _,
+        ):
+            assert is_leader is True
+            raise RuntimeError("tick failed")
+
+    assert real_task.cancelled() or real_task.done()
+    standalone_update_calls = [
+        sql for sql, _ in execute_calls if sql.lstrip().upper().startswith("UPDATE")
+    ]
+    assert len(standalone_update_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Real-time failover proof: heartbeat keeps tenure; a crash fails over
+# within lease_ttl_seconds (not before, not unboundedly after).
+# ---------------------------------------------------------------------------
+
+
+class _FakeLeaseTable:
+    """In-memory ``configs.leader_lease`` model driven by wall-clock time.
+
+    Mirrors ``_FakeLease`` (used for the synchronous CAS-ordering proofs
+    above) but keys expiry off ``time.monotonic()`` so it can back a fake
+    ``managed_transaction`` and prove real-time renewal/failover behaviour
+    end-to-end through :func:`lease_leadership_with_heartbeat` and
+    :func:`lease_leadership` without a live database.
+    """
+
+    def __init__(self) -> None:
+        self.row: dict | None = None
+
+    def cas(self, owner: str, ttl: float):
+        n = time.monotonic()
+        if self.row is None or self.row["expires_at"] < n or self.row["owner"] == owner:
+            same = self.row is not None and self.row["owner"] == owner
+            epoch = (self.row["epoch"] if same else (self.row["epoch"] + 1 if self.row else 1))
+            self.row = {"owner": owner, "epoch": epoch, "expires_at": n + ttl}
+            return (owner, epoch)
+        return None
+
+    def release(self, owner: str) -> None:
+        if self.row is not None and self.row["owner"] == owner:
+            self.row["expires_at"] = time.monotonic() - 1
+
+
+@pytest.mark.asyncio
+async def test_failover_within_ttl_after_simulated_crash(monkeypatch):
+    """Heartbeat-mode leader A crashes (its renewals stop). A competitor
+    polling via the default per-tick lease_leadership only wins once
+    lease_ttl_seconds has actually elapsed since A's last successful
+    renewal -- proving the heartbeat regime fails over within the TTL,
+    neither before (no premature takeover of a healthy leader) nor
+    unboundedly after (no permanently stuck lease)."""
+    table = _FakeLeaseTable()
+    ttl = 0.3
+    monkeypatch.setattr(locking_tools._leadership_config, "lease_ttl_seconds", ttl)
+    # Small renewal interval so pod-A's heartbeat actually fires (and is
+    # deliberately failed below) well inside the test window, rather than
+    # relying on the 10s production default never firing in time.
+    monkeypatch.setattr(locking_tools._leadership_config, "lease_renew_interval_seconds", 0.03)
+
+    @asynccontextmanager
+    async def _mt(engine):
+        conn = MagicMock()
+
+        async def _ex(sql, params=None, **kw):
+            sql_str = str(sql)
+            if sql_str.lstrip().upper().startswith("INSERT"):
+                result = table.cas(params["owner"], params["ttl"])
+                cur = MagicMock()
+                cur.fetchone.return_value = result
+                return cur
+            table.release(params["owner"])
+            return MagicMock()
+
+        conn.execute = _ex
+        yield conn
+
+    monkeypatch.setattr(locking_tools, "managed_transaction", _mt)
+
+    # _LEASE_OWNER is a process-wide singleton (minted once at import time),
+    # not derived from the `name` kwarg -- so two contenders in the SAME
+    # process/test must explicitly swap it to model different pods. pod-A's
+    # identity is fixed here; the poll loop below swaps in pod-B's identity
+    # only for the duration of each of its own attempts.
+    monkeypatch.setattr(locking_tools, "_LEASE_OWNER", "owner-pod-A")
+
+    async def _try_b_once(engine, lock_id) -> bool:
+        locking_tools._LEASE_OWNER = "owner-pod-B"
+        try:
+            async with lease_leadership(engine, lock_id, name="pod-B") as (b_leader, _):
+                return b_leader
+        finally:
+            locking_tools._LEASE_OWNER = "owner-pod-A"
+
+    engine = _make_engine()
+    lock_id = 4242
+
+    async with lease_leadership_with_heartbeat(engine, lock_id, name="pod-A") as (
+        is_leader,
+        lost_a,
+    ):
+        assert is_leader is True
+        crash_at = time.monotonic()
+
+        # Simulate pod-A crashing: every subsequent renewal attempt fails,
+        # standing in for a process that vanished (its heartbeat task never
+        # runs `finally`, mirroring a killed pod).
+        monkeypatch.setattr(locking_tools, "renew_lease", AsyncMock(return_value=False))
+
+        won_at = None
+        deadline = crash_at + ttl * 10
+        while time.monotonic() < deadline:
+            if await _try_b_once(engine, lock_id):
+                won_at = time.monotonic()
+                break
+            await asyncio.sleep(ttl / 20)
+
+    assert won_at is not None, "competitor never won the lease"
+    elapsed = won_at - crash_at
+    assert elapsed >= ttl * 0.5, (
+        f"competitor won too early ({elapsed:.3f}s), before A's lease could "
+        f"have expired (ttl={ttl}s)"
+    )
+    assert elapsed <= ttl * 4, (
+        f"competitor took too long to win ({elapsed:.3f}s) -- failover must "
+        f"be bounded by lease_ttl_seconds"
+    )
+
+
+# ---------------------------------------------------------------------------
+# run_lease_leadership_heartbeat_loop — control loop
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_acquires_once_and_ticks_repeatedly(monkeypatch):
+    """The lease CM is entered exactly ONCE per tenure; on_tick runs on
+    cadence_seconds without releasing leadership between ticks."""
+    acquire_count = {"n": 0}
+    tick_count = {"n": 0}
+    lost = asyncio.Event()
+
+    @asynccontextmanager
+    async def _fake_acquire(engine, key, *, name="leader"):
+        acquire_count["n"] += 1
+        yield (True, lost)
+
+    monkeypatch.setattr(locking_tools, "lease_leadership_with_heartbeat", _fake_acquire)
+
+    shutdown = asyncio.Event()
+
+    async def _on_tick() -> None:
+        tick_count["n"] += 1
+        if tick_count["n"] >= 3:
+            shutdown.set()
+
+    await asyncio.wait_for(
+        run_lease_leadership_heartbeat_loop(
+            _make_engine(),
+            42,
+            on_tick=_on_tick,
+            name="test",
+            cadence_seconds=0.01,
+            is_shutdown=shutdown.is_set,
+            shutdown_event=shutdown,
+        ),
+        timeout=2.0,
+    )
+
+    assert acquire_count["n"] == 1, "lease must be acquired ONCE, not per tick"
+    assert tick_count["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_no_tick_when_not_leader(monkeypatch):
+    """When the CM yields (False, None), on_tick is never called and the
+    loop keeps polling on reelect_cadence_seconds."""
+    acquire_count = {"n": 0}
+    tick_count = {"n": 0}
+
+    @asynccontextmanager
+    async def _fake_acquire(engine, key, *, name="leader"):
+        acquire_count["n"] += 1
+        yield (False, None)
+
+    monkeypatch.setattr(locking_tools, "lease_leadership_with_heartbeat", _fake_acquire)
+    shutdown = asyncio.Event()
+
+    async def _on_tick() -> None:
+        tick_count["n"] += 1
+
+    task = asyncio.create_task(
+        run_lease_leadership_heartbeat_loop(
+            _make_engine(),
+            42,
+            on_tick=_on_tick,
+            name="test",
+            cadence_seconds=0.02,
+            is_shutdown=shutdown.is_set,
+            shutdown_event=shutdown,
+            reelect_cadence_seconds=0.02,
+        )
+    )
+    await asyncio.sleep(0.1)
+    shutdown.set()
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert tick_count["n"] == 0
+    assert acquire_count["n"] >= 2
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_stops_immediately_on_lease_loss(monkeypatch):
+    """Once lost_event fires, the loop must not start another tick and must
+    exit the leadership context before re-electing -- no work continues
+    after the lease is known lost (bounds the two-leader overlap to at most
+    one in-flight tick, same bound the per-tick TTL clamp gives)."""
+    acquire_count = {"n": 0}
+    tick_count = {"n": 0}
+    lost = asyncio.Event()
+
+    @asynccontextmanager
+    async def _fake_acquire(engine, key, *, name="leader"):
+        acquire_count["n"] += 1
+        yield (True, lost)
+
+    monkeypatch.setattr(locking_tools, "lease_leadership_with_heartbeat", _fake_acquire)
+    shutdown = asyncio.Event()
+
+    async def _on_tick() -> None:
+        tick_count["n"] += 1
+        if tick_count["n"] == 1:
+            lost.set()  # simulate a renewal failure detected right after tick 1
+        if tick_count["n"] >= 5:
+            shutdown.set()  # safety net so a bug here can't hang the test
+
+    task = asyncio.create_task(
+        run_lease_leadership_heartbeat_loop(
+            _make_engine(),
+            42,
+            on_tick=_on_tick,
+            name="test",
+            cadence_seconds=10.0,  # long -- must NOT be waited out
+            is_shutdown=shutdown.is_set,
+            shutdown_event=shutdown,
+            reelect_cadence_seconds=0.02,
+        )
+    )
+    await asyncio.sleep(0.15)
+    shutdown.set()
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert tick_count["n"] == 1, "no tick should run after lease loss"
+    assert acquire_count["n"] >= 2, "loop must resign and re-attempt acquisition"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_stops_immediately_on_lease_loss_mid_sleep(monkeypatch):
+    """A loss occurring during the inter-tick sleep interrupts that sleep
+    immediately instead of waiting out the full cadence."""
+    tick_count = {"n": 0}
+    lost = asyncio.Event()
+
+    @asynccontextmanager
+    async def _fake_acquire(engine, key, *, name="leader"):
+        yield (True, lost)
+
+    monkeypatch.setattr(locking_tools, "lease_leadership_with_heartbeat", _fake_acquire)
+    shutdown = asyncio.Event()
+
+    async def _on_tick() -> None:
+        tick_count["n"] += 1
+
+    async def _lose_shortly_after() -> None:
+        await asyncio.sleep(0.03)
+        lost.set()
+
+    started = time.monotonic()
+    loser = asyncio.create_task(_lose_shortly_after())
+    task = asyncio.create_task(
+        run_lease_leadership_heartbeat_loop(
+            _make_engine(),
+            42,
+            on_tick=_on_tick,
+            name="test",
+            cadence_seconds=10.0,  # long -- the loss must cut this sleep short
+            is_shutdown=shutdown.is_set,
+            shutdown_event=shutdown,
+        )
+    )
+    await asyncio.sleep(0.2)
+    shutdown.set()
+    await asyncio.wait_for(task, timeout=2.0)
+    await loser
+    elapsed = time.monotonic() - started
+
+    assert tick_count["n"] == 1, "exactly one tick before the mid-sleep loss"
+    assert elapsed < 1.0, (
+        f"loop took {elapsed:.2f}s to resign after a mid-sleep loss; "
+        f"the 10s cadence sleep should have been interrupted, not waited out"
+    )
