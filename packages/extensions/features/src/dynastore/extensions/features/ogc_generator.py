@@ -38,6 +38,10 @@ from dynastore.models.localization import Language
 from dynastore.extensions.tools.url import get_root_url
 from dynastore.models.shared_models import Link
 from dynastore.extensions.tools.url import get_url
+from dynastore.extensions.tools.ogc_row_mapping import (
+    parse_temporal_range,
+    resolve_mapped_feature,
+)
 
 
 def create_landing_page(
@@ -84,32 +88,17 @@ def _map_validity_to_ogc(properties: Dict[str, Any]) -> None:
     Mutates *properties* in-place: removes the ``validity`` key and adds
     the OGC temporal extent properties if parseable.
     """
-    import re as _re
-
     v = properties.pop("validity", None)
     if v is None:
         return
-    try:
-        if hasattr(v, "lower"):
-            start, end = v.lower, v.upper
-            if start and not getattr(start, "is_infinite", lambda: False)():
-                properties["start_datetime"] = (
-                    start.isoformat() if hasattr(start, "isoformat") else str(start)
-                )
-            if end and not getattr(end, "is_infinite", lambda: False)():
-                properties["end_datetime"] = (
-                    end.isoformat() if hasattr(end, "isoformat") else str(end)
-                )
-        else:
-            match = _re.search(r"[\[\(]([^,]*),\s*([^\]\)]*)", str(v))
-            if match:
-                start, end = match.groups()
-                if start and start.strip() and start.strip() != "-infinity":
-                    properties["start_datetime"] = start.strip().strip('"')
-                if end and end.strip() and end.strip() != "infinity":
-                    properties["end_datetime"] = end.strip().strip('"')
-    except Exception as e:
-        logger.warning(f"Failed to parse validity range {v}: {e}")
+    parsed = parse_temporal_range(v)
+    if parsed is None:
+        return
+    start, end = parsed
+    if start:
+        properties["start_datetime"] = start
+    if end:
+        properties["end_datetime"] = end
 
 
 def _db_row_to_ogc_feature(
@@ -136,23 +125,14 @@ def _db_row_to_ogc_feature(
     Items arriving already mapped (the canonical ``get_item``/``stream_items``
     path) skip the fallback and are unaffected.
     """
+    # -- 1. Map raw DB row -> Feature (if not already mapped) -----------------
     from geojson_pydantic import Feature as _GeoJSONFeature
 
-    # -- 1. Map raw DB row -> Feature (if not already mapped) -----------------
-    if not isinstance(item, _GeoJSONFeature):
-        items_mod = get_protocol(ItemsProtocol)
-        if items_mod and layer_config:
-            item = items_mod.map_row_to_feature(
-                item, layer_config, read_policy=read_policy
-            )
-        else:
-            logger.warning(
-                "Cannot map DB row: ItemsProtocol unavailable or no layer_config. "
-                "Returning empty feature."
-            )
-            item = _GeoJSONFeature(type="Feature", geometry=None, properties={})
+    item = cast(
+        _GeoJSONFeature,
+        resolve_mapped_feature(item, layer_config, read_policy=read_policy),
+    )
 
-    item = cast(_GeoJSONFeature, item)
     # -- 2. Extract id (never serialise None as the string 'None') ------------
     feature_id = item.id if item.id is not None else None
 

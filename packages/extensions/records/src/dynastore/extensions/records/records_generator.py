@@ -27,16 +27,19 @@ capability (RFC #2550), resolved by :func:`collection_has_geometry`.
 """
 
 import logging
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Union, cast
 
 from geojson_pydantic import Feature as _GeoJSONFeature
 
-from dynastore.models.protocols import ItemsProtocol
 from dynastore.models.localization import LocalizedText
 from dynastore.models.shared_models import Link
 from dynastore.models.driver_context import DriverContext
 from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
 from dynastore.tools.discovery import get_protocol
+from dynastore.extensions.tools.ogc_row_mapping import (
+    parse_temporal_range,
+    resolve_mapped_feature,
+)
 
 from . import records_models as rm
 
@@ -138,17 +141,10 @@ def db_row_to_record(
     don't pass it keep the byte-identical geometry-less behaviour.
     """
     # Map raw DB row via sidecar pipeline if needed
-    if not isinstance(item, _GeoJSONFeature):
-        items_mod = get_protocol(ItemsProtocol)
-        if items_mod and layer_config:
-            item = items_mod.map_row_to_feature(
-                item, layer_config, read_policy=read_policy
-            )
-        else:
-            logger.warning(
-                "Cannot map DB row: ItemsProtocol unavailable or no layer_config."
-            )
-            item = _GeoJSONFeature(type="Feature", geometry=None, properties={})
+    item = cast(
+        _GeoJSONFeature,
+        resolve_mapped_feature(item, layer_config, read_policy=read_policy),
+    )
 
     # Extract properties
     props = dict(item.properties or {}) if hasattr(item, "properties") else {}
@@ -291,8 +287,6 @@ def collection_to_records_collection(
 
 def _extract_time(props: Dict[str, Any]) -> Optional[rm.RecordTime]:
     """Extract temporal information from properties."""
-    import re
-
     # Direct time object
     time_val = props.pop("time", None)
     if time_val and isinstance(time_val, dict):
@@ -301,19 +295,9 @@ def _extract_time(props: Dict[str, Any]) -> Optional[rm.RecordTime]:
     # From validity range (PG tstzrange)
     validity = props.pop("validity", None)
     if validity is not None:
-        try:
-            if hasattr(validity, "lower"):
-                start = _to_iso(validity.lower) if validity.lower else None
-                end = _to_iso(validity.upper) if validity.upper else None
-                return rm.RecordTime(interval=[start, end])
-            match = re.search(r"[\[\(]([^,]*),\s*([^\]\)]*)", str(validity))
-            if match:
-                s, e = match.groups()
-                start = s.strip().strip('"') if s.strip() and s.strip() != "-infinity" else None
-                end = e.strip().strip('"') if e.strip() and e.strip() != "infinity" else None
-                return rm.RecordTime(interval=[start, end])
-        except Exception as exc:
-            logger.warning("Failed to parse validity range %s: %s", validity, exc)
+        parsed = parse_temporal_range(validity)
+        if parsed is not None:
+            return rm.RecordTime(interval=[parsed[0], parsed[1]])
 
     # From valid_from / valid_to
     vf = props.pop("valid_from", None)
