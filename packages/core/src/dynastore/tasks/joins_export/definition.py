@@ -34,11 +34,15 @@ from dynastore.modules.processes.schema_gen import pydantic_to_process_inputs
 
 from .models import JoinsExportRequest
 
-JOINS_EXPORT_PROCESS_DEFINITION = Process(
-    id="joins_export",
-    version="1.0.0",
-    title="OGC API - Joins Export",
-    description=(
+# title/description are plain str; Process.title/.description are typed
+# CoercibleLocalizedText (accepts str at runtime via a BeforeValidator, but not
+# statically as a `Process(title=...)` kwarg). model_validate() runs the same
+# validators against an untyped mapping, same as the ProcessOutput below.
+JOINS_EXPORT_PROCESS_DEFINITION = Process.model_validate({
+    "id": "joins_export",
+    "version": "1.0.0",
+    "title": "OGC API - Joins Export",
+    "description": (
         "Heavy, non-paginated counterpart to the synchronous /join endpoint. "
         "Joins a primary collection with a secondary source (a registered "
         "collection or an inline BigQuery target) over its full extent and "
@@ -49,9 +53,9 @@ JOINS_EXPORT_PROCESS_DEFINITION = Process(
         "location. Use this for dense-geometry or whole-collection joins that a "
         "single synchronous page cannot carry."
     ),
-    scopes=[ProcessScope.COLLECTION],
-    inputs=pydantic_to_process_inputs(JoinsExportRequest),
-    outputs={
+    "scopes": [ProcessScope.COLLECTION],
+    "inputs": pydantic_to_process_inputs(JoinsExportRequest),
+    "outputs": {
         "result": ProcessOutput.model_validate(
             {
                 "title": "Result",
@@ -63,6 +67,6 @@ JOINS_EXPORT_PROCESS_DEFINITION = Process(
             }
         )
     },
-    jobControlOptions=[JobControlOptions.ASYNC_EXECUTE],
-    outputTransmission=[TransmissionMode.REFERENCE],
-)
+    "jobControlOptions": [JobControlOptions.ASYNC_EXECUTE],
+    "outputTransmission": [TransmissionMode.REFERENCE],
+})

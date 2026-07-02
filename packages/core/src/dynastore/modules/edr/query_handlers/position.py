@@ -95,7 +95,7 @@ def extract_point_values(
                 continue
             arr = ds.read(
                 band_idx,
-                window=rasterio.windows.Window(box.col_off, box.row_off, box.width, box.height),
+                window=rasterio.windows.Window(box.col_off, box.row_off, box.width, box.height),  # type: ignore
             )
             values[band_idx] = float(arr.flat[0]) if arr.size > 0 else None
         return values

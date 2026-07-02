@@ -443,16 +443,24 @@ class RenderPreseedTask(TaskProtocol):
             from dynastore.modules import get_protocol
             from dynastore.models.query_builder import QueryRequest
             from dynastore.extensions.ogc_base import ogc_asset_href
+            from dynastore.modules.db_config.query_executor import managed_transaction
+            from dynastore.tools.protocol_helpers import get_engine
 
             items_svc = get_protocol(ItemQueryProtocol)
             if items_svc is None:
                 return None
 
-            result = await items_svc.get_features(
-                catalog_id,
-                collection_id,
-                QueryRequest(limit=1),
-            )
+            engine = get_engine()
+            if engine is None:
+                return None
+
+            async with managed_transaction(engine) as conn:
+                result = await items_svc.get_features(
+                    conn,
+                    catalog_id,
+                    collection_id,
+                    request=QueryRequest(limit=1),
+                )
             items: List[Any] = getattr(result, "features", None) or []
             if not items:
                 return None

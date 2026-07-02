@@ -41,9 +41,14 @@ from fastapi import HTTPException
 # level, so the stub must be in sys.modules first).
 # ---------------------------------------------------------------------------
 
-def _install_osgeo_stubs() -> None:
+def _install_osgeo_stubs() -> bool:
+    """Install bare osgeo stubs; returns True if this call installed them
+    (``osgeo`` was absent), i.e. it is safe for the caller to remove them
+    again once the module import that needed them has completed — see
+    ``_uninstall_osgeo_stubs``.
+    """
     if "osgeo" in sys.modules:
-        return
+        return False
     osgeo = types.ModuleType("osgeo")
     osgeo.__version__ = "3.x.stub"  # type: ignore[attr-defined]
 
@@ -75,11 +80,31 @@ def _install_osgeo_stubs() -> None:
         "osgeo.ogr": ogr,
         "osgeo.osr": osr,
     })
+    return True
 
 
-_install_osgeo_stubs()
+def _uninstall_osgeo_stubs() -> None:
+    """Remove the stub entries installed by ``_install_osgeo_stubs``.
+
+    ``maps_service`` binds ``gdal``/``ogr``/``osr`` into its own module
+    globals at import time, so these ``sys.modules`` entries aren't needed
+    afterwards. Leaving them registered shadows the real ``osgeo`` package
+    for every test module collected later in the same process — a later
+    ``from osgeo import gdal; gdal.UseExceptions()`` (e.g.
+    ``dynastore.modules.gdal.service``) would resolve to this bare stub and
+    raise ``AttributeError: module 'osgeo.gdal' has no attribute
+    'UseExceptions'`` instead of importing the real bindings.
+    """
+    for name in ("osgeo.osr", "osgeo.ogr", "osgeo.gdal", "osgeo"):
+        sys.modules.pop(name, None)
+
+
+_we_installed_osgeo_stubs = _install_osgeo_stubs()
 
 from dynastore.extensions.maps import maps_service as ms  # noqa: E402
+
+if _we_installed_osgeo_stubs:
+    _uninstall_osgeo_stubs()
 
 
 # ---------------------------------------------------------------------------

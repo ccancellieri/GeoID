@@ -191,6 +191,14 @@ class SidecarGeometryFetcher:
         """Resolve the physical layout via the preferred or legacy path."""
         if self._layout_resolver is not None:
             return await self._layout_resolver(catalog_id, collection_id)
+        # Legacy path: the constructor docstring requires the trio to be set
+        # whenever layout_resolver isn't. Assert narrows for pyright and turns
+        # a mis-wired instance into a clear error instead of a bare TypeError.
+        assert (
+            self._resolve_schema is not None
+            and self._hub_table_for_collection is not None
+            and self._geometries_table_for_collection is not None
+        ), "GeometryFetcher requires either layout_resolver or the legacy schema/hub/geometries resolver trio"
         schema = await self._resolve_schema(catalog_id)
         hub = await self._hub_table_for_collection(catalog_id, collection_id)
         geoms = await self._geometries_table_for_collection(

@@ -34,20 +34,25 @@ from dynastore.modules.processes.schema_gen import pydantic_to_process_inputs
 
 from .models import DwhJoinExportRequest
 
-DWH_JOIN_EXPORT_PROCESS_DEFINITION = Process(
-    id="dwh_join",
-    version="1.0.0",
-    title="DWH Join Export",
-    description=(
+DWH_JOIN_EXPORT_PROCESS_DEFINITION = Process.model_validate({
+    "id": "dwh_join",
+    "version": "1.0.0",
+    # title/description are plain str; Process.title/.description are typed
+    # CoercibleLocalizedText (accepts str at runtime via a BeforeValidator, but
+    # not statically as a `Process(title=...)` kwarg). model_validate() runs
+    # the same validators against an untyped mapping, same as the ProcessOutput
+    # construction below.
+    "title": "DWH Join Export",
+    "description": (
         "Joins catalog features with DWH query results and exports the result to "
         "the catalog's Cloud Storage bucket. The artifact is returned by reference "
         "as a time-limited signed URL: the 'result' output of the job's results "
         "document (a link), and also the job's status message. The server owns "
         "the storage location."
     ),
-    scopes=[ProcessScope.COLLECTION],
-    inputs=pydantic_to_process_inputs(DwhJoinExportRequest),
-    outputs={
+    "scopes": [ProcessScope.COLLECTION],
+    "inputs": pydantic_to_process_inputs(DwhJoinExportRequest),
+    "outputs": {
         "result": ProcessOutput.model_validate(
             {
                 "title": "Result",
@@ -59,6 +64,6 @@ DWH_JOIN_EXPORT_PROCESS_DEFINITION = Process(
             }
         )
     },
-    jobControlOptions=[JobControlOptions.ASYNC_EXECUTE],
-    outputTransmission=[TransmissionMode.REFERENCE],
-)
+    "jobControlOptions": [JobControlOptions.ASYNC_EXECUTE],
+    "outputTransmission": [TransmissionMode.REFERENCE],
+})

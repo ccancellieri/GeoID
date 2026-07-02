@@ -136,7 +136,7 @@ def read_scaled(
     from rasterio.enums import Resampling
     from rasterio.windows import Window
 
-    win = Window(box.col_off, box.row_off, box.width, box.height)
+    win = Window(box.col_off, box.row_off, box.width, box.height)  # type: ignore
     if out_shape is None:
         out_shape = (box.height, box.width)
 

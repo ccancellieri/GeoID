@@ -28,15 +28,19 @@ from dynastore.modules.gdal.models import RasterInfo, VectorInfo
 from dynastore.modules.processes.models import (
     JobControlOptions,
     Process,
-    ProcessInput,
     ProcessOutput,
     ProcessScope,
 )
 
-GDALINFO_PROCESS_DEFINITION = Process(
-    id="gdal",
-    title="GDAL Info Task",
-    description=(
+# title/description throughout are plain str; Process/ProcessInput/ProcessOutput
+# `.title`/`.description` are typed CoercibleLocalizedText (accepts str at
+# runtime via a BeforeValidator, but not statically as a `Model(title=...)`
+# kwarg). model_validate() runs the same validators against an untyped
+# mapping, same pattern as tasks/dwh_join/definition.py.
+GDALINFO_PROCESS_DEFINITION = Process.model_validate({
+    "id": "gdal",
+    "title": "GDAL Info Task",
+    "description": (
         "Calculates GDAL/OGR information for an asset and enriches its metadata. "
         "Targets a single asset identified by ``asset_id`` in ``inputs``. Run it "
         "at the catalog mount for a catalog-level asset, or the collection mount "
@@ -44,58 +48,58 @@ GDALINFO_PROCESS_DEFINITION = Process(
         "the collection mount) are taken from the URL path. The task resolves the "
         "asset's URI itself — callers do not supply it."
     ),
-    version="1.0.0",
-    scopes=[ProcessScope.CATALOG, ProcessScope.COLLECTION],
+    "version": "1.0.0",
+    "scopes": [ProcessScope.CATALOG, ProcessScope.COLLECTION],
     # Async-first: with no client preference, gdal offloads to a Cloud Run job
     # (the default everywhere). Sync execution is opt-in via ``Prefer:
     # respond-sync`` and is only honoured on a service that carries a sync
     # runner able to handle gdal in-process (e.g. maps, which ships osgeo).
     # Order matters: _resolve_execution_mode picks the first declared mode with
     # a capable runner when the caller expresses no preference.
-    jobControlOptions=[
+    "jobControlOptions": [
         JobControlOptions.ASYNC_EXECUTE,
         JobControlOptions.SYNC_EXECUTE,
     ],
-    inputs={
-        "asset_id": ProcessInput(
-            title="Asset ID",
-            description="Identifier of the asset to inspect (required).",
-            schema={"type": "string"},
-        ),
-        "catalog_id": ProcessInput(
-            title="Catalog ID",
-            description=(
+    "inputs": {
+        "asset_id": {
+            "title": "Asset ID",
+            "description": "Identifier of the asset to inspect (required).",
+            "schema": {"type": "string"},
+        },
+        "catalog_id": {
+            "title": "Catalog ID",
+            "description": (
                 "Catalog owning the asset (required). Taken from the URL path."
             ),
-            schema={"type": "string"},
-        ),
-        "collection_id": ProcessInput(
-            title="Collection ID",
-            description=(
+            "schema": {"type": "string"},
+        },
+        "collection_id": {
+            "title": "Collection ID",
+            "description": (
                 "Collection owning the asset, when collection-level. Taken from "
                 "the URL path at the collection mount."
             ),
-            schema={"type": ["string", "null"]},
-        ),
-        "asset_metadata": ProcessInput(
-            title="Asset Metadata Override",
-            description=(
+            "schema": {"type": ["string", "null"]},
+        },
+        "asset_metadata": {
+            "title": "Asset Metadata Override",
+            "description": (
                 "Optional metadata patch merged onto the asset alongside the "
                 "computed ``gdalinfo`` block."
             ),
-            schema={"type": "object", "additionalProperties": True},
-        ),
+            "schema": {"type": "object", "additionalProperties": True},
+        },
     },
-    outputs={
-        "info": ProcessOutput(
-            title="Result Info",
-            description="The calculated GDAL/OGR information.",
-            schema={
+    "outputs": {
+        "info": ProcessOutput.model_validate({
+            "title": "Result Info",
+            "description": "The calculated GDAL/OGR information.",
+            "schema": {
                 "oneOf": [
                     RasterInfo.model_json_schema(),
                     VectorInfo.model_json_schema(),
                 ]
             },
-        )
+        })
     },
-)
+})

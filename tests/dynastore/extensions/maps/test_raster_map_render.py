@@ -47,13 +47,18 @@ import pytest
 # we need those entries in sys.modules BEFORE importing maps_service.
 # ---------------------------------------------------------------------------
 
-def _install_stubs() -> None:
+def _install_stubs() -> bool:
     """Idempotently insert lightweight stubs for osgeo into sys.modules.
 
     ``renderer.py`` uses osgeo type annotations at module level
     (``ogr.Geometry``, ``ogr.Layer``, ``osr.SpatialReference``, …) so the
     stubs must expose those names as bare ``object`` stand-ins to avoid
     ``AttributeError`` during collection.
+
+    Returns ``True`` if this call installed the stubs (``osgeo`` was absent),
+    ``False`` if a real (or already-stubbed) ``osgeo`` was already resident.
+    Callers use the return value to know whether it is safe to remove the
+    entries again afterwards — see ``_uninstall_stubs`` below.
     """
     if "osgeo" not in sys.modules:
         osgeo = types.ModuleType("osgeo")
@@ -85,12 +90,34 @@ def _install_stubs() -> None:
         sys.modules["osgeo.gdal"] = gdal
         sys.modules["osgeo.ogr"] = ogr
         sys.modules["osgeo.osr"] = osr
+        return True
+    return False
 
 
-_install_stubs()
+def _uninstall_stubs() -> None:
+    """Remove the stub entries installed by ``_install_stubs``.
+
+    ``maps_service`` (imported right below) binds ``gdal``/``ogr``/``osr``
+    into its own module globals at import time, so it no longer needs these
+    ``sys.modules`` entries once the import completes. Leaving the bare
+    ``types.ModuleType`` stand-ins registered under ``osgeo``/``osgeo.gdal``/
+    etc. shadows the real package for every test module collected afterwards
+    in the same process — any later ``from osgeo import gdal; gdal.UseExceptions()``
+    (e.g. ``dynastore.modules.gdal.service``) would resolve to this stub and
+    raise ``AttributeError: module 'osgeo.gdal' has no attribute
+    'UseExceptions'`` instead of importing the real bindings.
+    """
+    for name in ("osgeo.osr", "osgeo.ogr", "osgeo.gdal", "osgeo"):
+        sys.modules.pop(name, None)
+
+
+_we_installed_stubs = _install_stubs()
 
 # Now it is safe to import maps_service.
 from dynastore.extensions.maps import maps_service as ms  # noqa: E402
+
+if _we_installed_stubs:
+    _uninstall_stubs()
 
 
 # ---------------------------------------------------------------------------

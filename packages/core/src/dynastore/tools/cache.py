@@ -429,6 +429,18 @@ def _ev_tombstone(ver: int) -> Dict[str, Any]:
     return {_EV_VER: ver, _EV_TOMB: True}
 
 
+# CacheBackend.set() is typed `value: bytes` ("Backends store raw bytes;
+# the Cache wrapper handles serialization" — see models/protocols/cache.py).
+# TieredAsyncBackend stores version envelopes (plain dicts) directly and
+# relies on its backends being object-passthrough (NullSerializer) tiers —
+# same runtime contract LocalCache uses via `self._serializer.dumps()`.
+# Routing envelopes through NullSerializer.dumps() here is a no-op at
+# runtime (it returns the value unchanged) but gives pyright a `bytes`-typed
+# value at the `CacheBackend.set()` call sites, matching that convention
+# without changing the CacheBackend interface or backend behavior.
+_ENVELOPE_SERIALIZER = NullSerializer()
+
+
 def _ev_parse(data: Any) -> "tuple[int, Any, bool]":
     """Parse a stored value.
 
@@ -591,12 +603,16 @@ class TieredAsyncBackend:
                 # Propagate tombstone to L1 so subsequent reads don't serve stale data.
                 if l1_present and not l1_tomb:
                     await self._backends[0].set(
-                        key, _ev_tombstone(l2_ver), ttl=self._l1_ttl_cap
+                        key,
+                        _ENVELOPE_SERIALIZER.dumps(_ev_tombstone(l2_ver)),
+                        ttl=self._l1_ttl_cap,
                     )
                 return None
             # Refresh L1 from L2 (version-guarded write).
             await self._backends[0].set(
-                key, _ev_wrap(l2_val, l2_ver), ttl=self._l1_ttl_cap
+                key,
+                _ENVELOPE_SERIALIZER.dumps(_ev_wrap(l2_val, l2_ver)),
+                ttl=self._l1_ttl_cap,
             )
             return l2_val
 
@@ -624,7 +640,7 @@ class TieredAsyncBackend:
         writes are skipped and ``False`` is returned.
         """
         ver = time.time_ns()
-        envelope = _ev_wrap(value, ver)
+        envelope = _ENVELOPE_SERIALIZER.dumps(_ev_wrap(value, ver))
 
         l1_ttl: Optional[float] = (
             min(ttl, self._l1_ttl_cap) if ttl is not None else self._l1_ttl_cap
@@ -670,7 +686,7 @@ class TieredAsyncBackend:
         """
         if key is not None:
             ver = time.time_ns()
-            tombstone = _ev_tombstone(ver)
+            tombstone = _ENVELOPE_SERIALIZER.dumps(_ev_tombstone(ver))
             # L1 tombstone — synchronous, always fast.
             await self._backends[0].set(key, tombstone, ttl=self._l1_ttl_cap)
             # L2+ tombstone — synchronous so other instances see it immediately.

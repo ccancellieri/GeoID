@@ -85,14 +85,22 @@ def create_process_definition(
         raise ValueError(
             f"Process '{id}' must declare at least one ProcessScope (got empty list)."
         )
-    return Process(
-        id=id,
-        title=title,
-        description=description,
-        version=version,
-        scopes=list(scopes),
-        jobControlOptions=job_control_options or [JobControlOptions.ASYNC_EXECUTE],
-        outputTransmission=output_transmission or [TransmissionMode.REFERENCE],
-        inputs=inputs,
-        outputs={} # Default to empty outputs for now as per ingestion/tiles usage
-    )
+    # title/description are plain `str` here; `Process.title`/`.description` are
+    # typed `CoercibleLocalizedText` (a str-or-{lang:text} union with a
+    # BeforeValidator that accepts plain str at runtime). The validator makes a
+    # bare str a legal *runtime* value but not a legal *static* one for the
+    # `Process(title=...)` constructor, so pyright flags it. model_validate()
+    # takes an untyped mapping and runs the same validators, sidestepping the
+    # mismatch — same pattern already used for ProcessOutput in
+    # tasks/dwh_join/definition.py.
+    return Process.model_validate({
+        "id": id,
+        "title": title,
+        "description": description,
+        "version": version,
+        "scopes": list(scopes),
+        "jobControlOptions": job_control_options or [JobControlOptions.ASYNC_EXECUTE],
+        "outputTransmission": output_transmission or [TransmissionMode.REFERENCE],
+        "inputs": inputs,
+        "outputs": {},  # Default to empty outputs for now as per ingestion/tiles usage
+    })

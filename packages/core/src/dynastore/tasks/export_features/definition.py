@@ -34,22 +34,26 @@ from dynastore.modules.processes.schema_gen import pydantic_to_process_inputs
 
 from dynastore.modules.features_exporter.models import ExportFeaturesRequest
 
-EXPORT_FEATURES_PROCESS_DEFINITION = Process(
-    id="export_features",
-    version="1.0.0",
-    title="Export Features",
-    description=(
+# title/description are plain str; Process.title/.description are typed
+# CoercibleLocalizedText (accepts str at runtime via a BeforeValidator, but not
+# statically as a `Process(title=...)` kwarg). model_validate() runs the same
+# validators against an untyped mapping, same as the ProcessOutput below.
+EXPORT_FEATURES_PROCESS_DEFINITION = Process.model_validate({
+    "id": "export_features",
+    "version": "1.0.0",
+    "title": "Export Features",
+    "description": (
         "Exports features from a collection to a file in server-owned Cloud "
         "Storage with optional CQL filtering and property projection. The "
         "artifact is returned as a time-limited signed URL in the job message."
     ),
-    scopes=[ProcessScope.COLLECTION],
-    inputs=pydantic_to_process_inputs(ExportFeaturesRequest),
-    outputs={
+    "scopes": [ProcessScope.COLLECTION],
+    "inputs": pydantic_to_process_inputs(ExportFeaturesRequest),
+    "outputs": {
         "result": ProcessOutput.model_validate(
             {"title": "Result", "schema": {"type": "string", "format": "uri"}}
         )
     },
-    jobControlOptions=[JobControlOptions.ASYNC_EXECUTE],
-    outputTransmission=[TransmissionMode.REFERENCE],
-)
+    "jobControlOptions": [JobControlOptions.ASYNC_EXECUTE],
+    "outputTransmission": [TransmissionMode.REFERENCE],
+})

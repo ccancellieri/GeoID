@@ -1300,18 +1300,24 @@ class GCPModule(
                 # No definition found; use task_type (already in hyphenated form) as process id
                 process_id = task_type
                 if process_id not in seen_ids:
-                    synthetic = Process(
-                        id=process_id,
-                        title=f"Cloud Run Job: {job_name}",
-                        description=f"External Cloud Run job deployed as {job_name}",
-                        version="1.0.0",
-                        scopes=[ProcessScope.PLATFORM],
-                        jobControlOptions=[JobControlOptions.ASYNC_EXECUTE],
-                        outputTransmission=[TransmissionMode.VALUE],
-                        inputs={},
-                        outputs={},
-                        links=[],
-                    )
+                    # title/description are plain f-strings; Process.title/
+                    # .description are typed CoercibleLocalizedText (accepts str
+                    # at runtime via a BeforeValidator, but not statically as a
+                    # `Process(title=...)` kwarg). model_validate() runs the same
+                    # validators against an untyped mapping — same pattern as
+                    # tasks/dwh_join/definition.py.
+                    synthetic = Process.model_validate({
+                        "id": process_id,
+                        "title": f"Cloud Run Job: {job_name}",
+                        "description": f"External Cloud Run job deployed as {job_name}",
+                        "version": "1.0.0",
+                        "scopes": [ProcessScope.PLATFORM],
+                        "jobControlOptions": [JobControlOptions.ASYNC_EXECUTE],
+                        "outputTransmission": [TransmissionMode.VALUE],
+                        "inputs": {},
+                        "outputs": {},
+                        "links": [],
+                    })
                     result.append(synthetic)
                     seen_ids.add(process_id)
                     logger.info(

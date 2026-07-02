@@ -143,9 +143,20 @@ class JoinsExportTask(
                     elif isinstance(secondary, NamedSecondarySpec):
                         secondary_index = await index_secondary(
                             stream_features(
+                                # Every field is passed explicitly (matching
+                                # the FeatureStreamConfig.__init__ default for
+                                # each) — see the primary_stream construction
+                                # below for why: pyright doesn't resolve the
+                                # `Field(None, ...)` defaults on this model.
                                 FeatureStreamConfig(
                                     catalog=request.catalog,
                                     collection=secondary.ref,
+                                    cql_filter=None,
+                                    property_names=None,
+                                    limit=None,
+                                    offset=None,
+                                    include_geometry=True,
+                                    target_srid=None,
                                 ),
                                 engine,
                             ),
@@ -181,6 +192,12 @@ class JoinsExportTask(
                                 else None
                             ),
                             property_names=property_names,
+                            # paging is None on JoinsExportRequest — run_join
+                            # yields every matched feature (no offset/limit
+                            # bound); passed explicitly since pyright doesn't
+                            # resolve this model's `Field(None, ...)` defaults.
+                            limit=None,
+                            offset=None,
                             include_geometry=request.projection.with_geometry,
                             target_srid=request.projection.destination_crs,
                         ),
