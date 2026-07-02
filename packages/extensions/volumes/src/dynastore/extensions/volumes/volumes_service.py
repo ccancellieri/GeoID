@@ -256,7 +256,15 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
     async def list_3d_collections(
         self,
         catalog_id: str,
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of collections to return. Omitted falls back "
+                "to the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         bbox: Optional[str] = Query(None),
         language: str = Depends(get_language),
@@ -267,6 +275,13 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
         the explicit marker ``geovolumes:enabled``. The optional ``bbox``
         parameter (4 or 6 comma-separated floats) filters by spatial extent.
         """
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        cfg = await self._get_volumes_config(catalog_id)
+        limit = resolve_page_limit(
+            limit, default_limit=cfg.default_limit, max_limit=cfg.max_limit,
+        )
+
         parsed_bbox: Optional[Tuple] = None
         if bbox is not None:
             try:
@@ -320,7 +335,15 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
         self,
         catalog_id: str,
         collection_id: str,
-        limit: int = Query(10000, ge=1, le=100000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of items to stream. Omitted falls back to "
+                "the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
     ) -> StreamingResponse:
         """Stream a CityJSONSeq response for all items in a 3D collection.
 
@@ -337,6 +360,15 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
                 status_code=404,
                 detail="Collection is not a 3D GeoVolumes container.",
             )
+
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        cfg = await self._get_volumes_config(catalog_id, collection_id)
+        limit = resolve_page_limit(
+            limit,
+            default_limit=cfg.stream_default_limit,
+            max_limit=cfg.stream_max_limit,
+        )
 
         extras = _get_extras(coll)
         header = _build_cityjsonseq_header(extras)

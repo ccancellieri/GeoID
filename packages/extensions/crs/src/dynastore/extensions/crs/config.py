@@ -18,6 +18,7 @@
 
 from dynastore.models.plugin_config import PluginConfig
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
+from dynastore.models.mutability import Mutable
 from typing import ClassVar, Tuple
 
 
@@ -25,4 +26,8 @@ class CrsPluginConfig(ExposableConfigMixin, PluginConfig):
     """Service-exposure config for the crs extension."""
     _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "crs")
 
-    # `enabled` inherited from ExposableConfigMixin — no further fields.
+    # `enabled` inherited from ExposableConfigMixin.
+
+    # Pagination policy (OGC API - Features Part 1 Core, /req/core/fc-limit-*)
+    default_limit: Mutable[int] = 20
+    max_limit: Mutable[int] = 1000

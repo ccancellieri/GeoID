@@ -21,10 +21,13 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
-from typing import FrozenSet, List, Union, Any, Optional
+from typing import TYPE_CHECKING, FrozenSet, List, Union, Any, Optional
 
 import jsonschema as _jsonschema_scope_gate  # noqa: F401  # SCOPE gate: extension_processes requires jsonschema
 _ = _jsonschema_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
+
+if TYPE_CHECKING:
+    from dynastore.extensions.processes.config import ProcessesPluginConfig
 
 from pydantic import ValidationError
 
@@ -92,6 +95,27 @@ def _external_url(url: Any) -> str:
     no-op otherwise (local/dev), so the inner hop stays unaffected.
     """
     return enforce_https(str(url))
+
+
+async def _get_processes_config(catalog_id: Optional[str] = None) -> "ProcessesPluginConfig":
+    """Fetch ``ProcessesPluginConfig`` via the platform configs service.
+
+    These job/log-listing routes are module-level ``@router`` functions (not
+    ``ProcessesService`` methods), so ``OGCServiceMixin._get_plugin_config``
+    isn't reachable via ``self``. Falls back to a default-constructed config
+    when the configs service is unavailable, mirroring that helper.
+    """
+    from dynastore.extensions.processes.config import ProcessesPluginConfig
+    from dynastore.models.protocols import ConfigsProtocol
+    from dynastore.tools.discovery import get_protocol
+
+    try:
+        configs_svc = get_protocol(ConfigsProtocol)
+        if configs_svc is not None:
+            return await configs_svc.get_config(ProcessesPluginConfig, catalog_id)
+    except Exception:  # pragma: no cover - defensive fallback
+        pass
+    return ProcessesPluginConfig()
 
 # --- OGC Processes Conformance URIs ---
 PROCESSES_CONFORMANCE = [
@@ -1178,12 +1202,29 @@ async def _job_logs_response(
 async def get_job_logs(
     job_id: uuid.UUID,
     request: Request,
-    limit: int = Query(200, ge=1, le=1000),
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        description=(
+            "Maximum number of log entries to return. Omitted falls back to "
+            "the configured default; a value above the configured maximum "
+            "is clamped, not rejected (fc-limit-response-1)."
+        ),
+    ),
     cursor: Optional[str] = None,
     order: str = Query("asc", pattern="^(asc|desc)$"),
     conn: AsyncConnection = Depends(get_async_connection),
 ) -> JSONResponse:
     """Best-effort remote execution logs for a job (System context, vendor extension)."""
+    from dynastore.extensions.tools.pagination import resolve_page_limit
+
+    processes_config = await _get_processes_config()
+    limit = resolve_page_limit(
+        limit,
+        default_limit=processes_config.logs_default_limit,
+        max_limit=processes_config.logs_max_limit,
+    )
+
     task = await tasks_module.get_task_by_id_unscoped(conn, job_id)
     if not task or task.type != "process":
         raise HTTPException(
@@ -1201,12 +1242,29 @@ async def get_job_logs_catalog(
     catalog_id: str,
     job_id: uuid.UUID,
     request: Request,
-    limit: int = Query(200, ge=1, le=1000),
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        description=(
+            "Maximum number of log entries to return. Omitted falls back to "
+            "the configured default; a value above the configured maximum "
+            "is clamped, not rejected (fc-limit-response-1)."
+        ),
+    ),
     cursor: Optional[str] = None,
     order: str = Query("asc", pattern="^(asc|desc)$"),
     conn: AsyncConnection = Depends(get_async_connection),
 ) -> JSONResponse:
     """Best-effort remote execution logs for a job (Catalog context, vendor extension)."""
+    from dynastore.extensions.tools.pagination import resolve_page_limit
+
+    processes_config = await _get_processes_config(catalog_id)
+    limit = resolve_page_limit(
+        limit,
+        default_limit=processes_config.logs_default_limit,
+        max_limit=processes_config.logs_max_limit,
+    )
+
     task = await _get_job_internal(job_id, catalog_id, conn)
     return await _job_logs_response(task, limit=limit, cursor=cursor, order=order, request=request)
 
@@ -1220,12 +1278,29 @@ async def get_job_logs_collection(
     collection_id: str,
     job_id: uuid.UUID,
     request: Request,
-    limit: int = Query(200, ge=1, le=1000),
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        description=(
+            "Maximum number of log entries to return. Omitted falls back to "
+            "the configured default; a value above the configured maximum "
+            "is clamped, not rejected (fc-limit-response-1)."
+        ),
+    ),
     cursor: Optional[str] = None,
     order: str = Query("asc", pattern="^(asc|desc)$"),
     conn: AsyncConnection = Depends(get_async_connection),
 ) -> JSONResponse:
     """Best-effort remote execution logs for a job (Collection context, vendor extension)."""
+    from dynastore.extensions.tools.pagination import resolve_page_limit
+
+    processes_config = await _get_processes_config(catalog_id)
+    limit = resolve_page_limit(
+        limit,
+        default_limit=processes_config.logs_default_limit,
+        max_limit=processes_config.logs_max_limit,
+    )
+
     task = await _get_job_internal(job_id, catalog_id, conn)
     if task.collection_id and task.collection_id != collection_id:
         raise HTTPException(
@@ -1243,12 +1318,29 @@ async def get_job_logs_collection(
 )
 async def list_jobs(
     request: Request,
-    limit: int = Query(20, ge=1, le=1000),
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        description=(
+            "Maximum number of jobs to return. Omitted falls back to the "
+            "configured default; a value above the configured maximum is "
+            "clamped, not rejected (fc-limit-response-1)."
+        ),
+    ),
     offset: int = Query(0, ge=0),
     conn: AsyncConnection = Depends(get_async_connection),
     language: str = Depends(get_language),
 ) -> JSONResponse:
     """Lists jobs (System context)."""
+    from dynastore.extensions.tools.pagination import resolve_page_limit
+
+    processes_config = await _get_processes_config()
+    limit = resolve_page_limit(
+        limit,
+        default_limit=processes_config.jobs_default_limit,
+        max_limit=processes_config.jobs_max_limit,
+    )
+
     tasks = await tasks_module.list_tasks(conn, schema="public", limit=limit, offset=offset, kind="process")
     jobs = [_task_to_status_info(t, request) for t in tasks]
     links = [
@@ -1294,12 +1386,29 @@ async def list_jobs(
 async def list_jobs_catalog(
     catalog_id: str,
     request: Request,
-    limit: int = Query(20, ge=1, le=1000),
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        description=(
+            "Maximum number of jobs to return. Omitted falls back to the "
+            "configured default; a value above the configured maximum is "
+            "clamped, not rejected (fc-limit-response-1)."
+        ),
+    ),
     offset: int = Query(0, ge=0),
     conn: AsyncConnection = Depends(get_async_connection),
     language: str = Depends(get_language),
 ) -> JSONResponse:
     """Lists jobs (Catalog context)."""
+    from dynastore.extensions.tools.pagination import resolve_page_limit
+
+    processes_config = await _get_processes_config(catalog_id)
+    limit = resolve_page_limit(
+        limit,
+        default_limit=processes_config.jobs_default_limit,
+        max_limit=processes_config.jobs_max_limit,
+    )
+
     schema = await _resolve_catalog_schema(catalog_id, conn)
     tasks = await tasks_module.list_tasks(conn, schema=schema, limit=limit, offset=offset, kind="process")
     jobs = [_task_to_status_info(t, request) for t in tasks]
@@ -1347,12 +1456,29 @@ async def list_jobs_collection(
     catalog_id: str,
     collection_id: str,
     request: Request,
-    limit: int = Query(20, ge=1, le=1000),
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        description=(
+            "Maximum number of jobs to return. Omitted falls back to the "
+            "configured default; a value above the configured maximum is "
+            "clamped, not rejected (fc-limit-response-1)."
+        ),
+    ),
     offset: int = Query(0, ge=0),
     conn: AsyncConnection = Depends(get_async_connection),
     language: str = Depends(get_language),
 ) -> JSONResponse:
     """Lists jobs (Collection context). Filters by collection_id at the DB layer."""
+    from dynastore.extensions.tools.pagination import resolve_page_limit
+
+    processes_config = await _get_processes_config(catalog_id)
+    limit = resolve_page_limit(
+        limit,
+        default_limit=processes_config.jobs_default_limit,
+        max_limit=processes_config.jobs_max_limit,
+    )
+
     schema = await _resolve_catalog_schema(catalog_id, conn)
     tasks = await tasks_module.list_tasks(
         conn,

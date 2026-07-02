@@ -18,6 +18,7 @@
 
 from dynastore.models.plugin_config import PluginConfig
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
+from dynastore.models.mutability import Mutable
 from typing import ClassVar, Tuple
 
 
@@ -25,4 +26,10 @@ class ProcessesPluginConfig(ExposableConfigMixin, PluginConfig):
     """Service-exposure config for the processes extension."""
     _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "processes")
 
-    # `enabled` inherited from ExposableConfigMixin — no further fields.
+    # `enabled` inherited from ExposableConfigMixin.
+
+    # --- Pagination policy (OGC API - Features Part 1 Core, /req/core/fc-limit-*) ---
+    jobs_default_limit: Mutable[int] = 20
+    jobs_max_limit: Mutable[int] = 1000
+    logs_default_limit: Mutable[int] = 200
+    logs_max_limit: Mutable[int] = 1000

@@ -573,11 +573,28 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
 
     async def list_catalogs(
         self,
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of catalogs to return. Omitted falls back to "
+                "the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         language: str = Depends(get_language),
     ):
         """List catalogs available to the Coverages service."""
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        coverages_config = await self._get_plugin_config(CoveragesConfig)
+        limit = resolve_page_limit(
+            limit,
+            default_limit=coverages_config.default_limit,
+            max_limit=coverages_config.max_limit,
+        )
+
         catalogs_svc = await self._get_catalogs_service()
         catalogs = await catalogs_svc.list_catalogs(limit=limit, offset=offset)
         return {
@@ -593,11 +610,28 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
     async def list_collections(
         self,
         catalog_id: str,
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of collections to return. Omitted falls back "
+                "to the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         language: str = Depends(get_language),
     ):
         """List collections in a catalog (web-browser navigation)."""
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        coverages_config = await self._get_plugin_config(CoveragesConfig, catalog_id)
+        limit = resolve_page_limit(
+            limit,
+            default_limit=coverages_config.default_limit,
+            max_limit=coverages_config.max_limit,
+        )
+
         catalogs_svc = await self._get_catalogs_service()
         collections = await catalogs_svc.list_collections(
             catalog_id, limit=limit, offset=offset

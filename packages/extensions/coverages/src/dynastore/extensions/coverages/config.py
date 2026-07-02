@@ -34,6 +34,10 @@ class CoveragesConfig(ExposableConfigMixin, PluginConfig):
     default_block_size: Mutable[int] = 512
     default_style_id: Mutable[Optional[str]] = None
 
+    # Pagination policy (OGC API - Features Part 1 Core, /req/core/fc-limit-*)
+    default_limit: Mutable[int] = 100
+    max_limit: Mutable[int] = 1000
+
 
 # Backward-compatible alias — historical name used elsewhere in the codebase.
 CoveragesPluginConfig = CoveragesConfig

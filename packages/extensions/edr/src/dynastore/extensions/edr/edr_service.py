@@ -263,10 +263,28 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
 
     async def list_catalogs(
         self,
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of catalogs to return. Omitted falls back to "
+                "the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
     ):
         """List catalogs available to the EDR service (web-browser nav)."""
+        from dynastore.extensions.edr.config import EDRConfig
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        edr_config = await self._get_plugin_config(EDRConfig)
+        limit = resolve_page_limit(
+            limit,
+            default_limit=edr_config.default_limit,
+            max_limit=edr_config.max_limit,
+        )
+
         catalogs_svc = await self._get_catalogs_service()
         catalogs = await catalogs_svc.list_catalogs(limit=limit, offset=offset)
         return {

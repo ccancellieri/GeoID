@@ -201,9 +201,25 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
 
     async def list_catalogs(
         self,
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of catalogs to return. Omitted falls back to "
+                "the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
     ) -> JSONResponse:
+        from dynastore.extensions.moving_features.config import MovingFeaturesPluginConfig
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        mf_config = await self._get_plugin_config(MovingFeaturesPluginConfig)
+        limit = resolve_page_limit(
+            limit, default_limit=mf_config.default_limit, max_limit=mf_config.max_limit,
+        )
+
         catalogs_svc = await self._get_catalogs_service()
         catalogs = await catalogs_svc.list_catalogs(limit=limit, offset=offset)
         return JSONResponse(
@@ -238,10 +254,27 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
     async def list_collections(
         self,
         catalog_id: str,
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of collections to return. Omitted falls back "
+                "to the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
     ) -> JSONResponse:
         validate_sql_identifier(catalog_id)
+
+        from dynastore.extensions.moving_features.config import MovingFeaturesPluginConfig
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        mf_config = await self._get_plugin_config(MovingFeaturesPluginConfig, catalog_id)
+        limit = resolve_page_limit(
+            limit, default_limit=mf_config.default_limit, max_limit=mf_config.max_limit,
+        )
+
         catalogs_svc = await self._get_catalogs_service()
         collections = await catalogs_svc.list_collections(
             catalog_id, limit=limit, offset=offset
@@ -277,7 +310,16 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
         catalog_id: str,
         collection_id: str,
         conn: AsyncConnection = Depends(get_async_connection),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of moving features to return. Omitted falls "
+                "back to the configured default; a value above the "
+                "configured maximum is clamped, not rejected "
+                "(fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         bbox: Optional[str] = Query(
             None,
@@ -294,6 +336,16 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
         if not await catalog_module.get_collection(catalog_id, collection_id):
             raise HTTPException(status_code=404, detail="Collection not found.")
         internal_id = await self._resolve_internal_catalog_id(catalog_id)
+
+        from dynastore.extensions.moving_features.config import MovingFeaturesPluginConfig
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        mf_config = await self._get_plugin_config(
+            MovingFeaturesPluginConfig, catalog_id, collection_id,
+        )
+        limit = resolve_page_limit(
+            limit, default_limit=mf_config.default_limit, max_limit=mf_config.max_limit,
+        )
 
         if bbox and intersects:
             raise HTTPException(

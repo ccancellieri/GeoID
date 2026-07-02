@@ -31,3 +31,7 @@ class EDRConfig(ExposableConfigMixin, PluginConfig):
     max_items_per_query: Mutable[int] = 100
     request_deadline_soft_s: Mutable[int] = 60
     request_deadline_hard_s: Mutable[int] = 120
+
+    # Pagination policy (OGC API - Features Part 1 Core, /req/core/fc-limit-*)
+    default_limit: Mutable[int] = 100
+    max_limit: Mutable[int] = 1000

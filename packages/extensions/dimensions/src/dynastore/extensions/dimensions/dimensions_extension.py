@@ -43,13 +43,16 @@ The extension declares OGC API - Dimensions conformance as a
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from fastapi import APIRouter, FastAPI, Query, Request
 
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.models.driver_context import DriverContext
+
+if TYPE_CHECKING:
+    from dynastore.extensions.dimensions.config import DimensionsPluginConfig
 
 # ``ogc_dimensions`` is an optional extra (extension_dimensions).
 # Imported at module top so a missing dep is caught at entry-point load time
@@ -683,6 +686,27 @@ async def materialize_all_dimensions(
 # ---------------------------------------------------------------------------
 
 
+async def _get_dimensions_config() -> "DimensionsPluginConfig":
+    """Fetch ``DimensionsPluginConfig`` via the platform configs service.
+
+    ``search_route`` is a module-level ``@router`` function (not a
+    ``DimensionsExtension`` method), so ``OGCServiceMixin._get_plugin_config``
+    isn't reachable via ``self``. Falls back to a default-constructed config
+    when the configs service is unavailable, mirroring that helper.
+    """
+    from dynastore.extensions.dimensions.config import DimensionsPluginConfig
+    from dynastore.models.protocols import ConfigsProtocol
+    from dynastore.tools.discovery import get_protocol
+
+    try:
+        configs_svc = get_protocol(ConfigsProtocol)
+        if configs_svc is not None:
+            return await configs_svc.get_config(DimensionsPluginConfig)
+    except Exception:  # pragma: no cover - defensive fallback
+        pass
+    return DimensionsPluginConfig()
+
+
 def _similarity_feature(row: Dict[str, Any]) -> Dict[str, Any]:
     """Wrap one ``{id, name, score}`` ranked member as a GeoJSON Feature."""
     return {
@@ -713,7 +737,15 @@ async def search_route(
     like: Optional[str] = Query(None, description="Pattern match (fnmatch)"),
     extent_min: Optional[str] = Query(None, description="Extent minimum"),
     extent_max: Optional[str] = Query(None, description="Extent maximum"),
-    limit: int = Query(100, ge=1, le=10000),
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        description=(
+            "Maximum number of dimension members to return. Omitted falls "
+            "back to the configured default; a value above the configured "
+            "maximum is clamped, not rejected (fc-limit-response-1)."
+        ),
+    ),
     language: Optional[str] = Query(None, description="RFC 5646 Language-Tag."),
 ):
     """Search dimension members.
@@ -725,6 +757,13 @@ async def search_route(
     are delegated unchanged to the upstream ogc-dimensions in-memory search,
     keeping a single source of truth for those protocols.
     """
+    from dynastore.extensions.tools.pagination import resolve_page_limit
+
+    dims_config = await _get_dimensions_config()
+    limit = resolve_page_limit(
+        limit, default_limit=dims_config.default_limit, max_limit=dims_config.max_limit,
+    )
+
     if similar is not None:
         rows = await search_similar(dimension_id, similar, limit=limit)
         features = [_similarity_feature(r) for r in rows]

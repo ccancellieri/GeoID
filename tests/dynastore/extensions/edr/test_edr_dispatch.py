@@ -110,3 +110,78 @@ def test_resolve_band_names_with_filter():
 def test_resolve_band_names_empty_item_returns_value_sentinel():
     from dynastore.extensions.edr.edr_service import _resolve_band_names
     assert _resolve_band_names({}, None) == ["value"]
+
+
+# ---------------------------------------------------------------------------
+# list_catalogs — OGC API - Features Part 1 Core /req/core/fc-limit-response-1
+# ---------------------------------------------------------------------------
+
+
+def _wire_edr_service(monkeypatch, svc, captured):
+    from dynastore.extensions.edr.config import EDRConfig
+
+    async def _fake_list_catalogs(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    class _FakeCatalogs:
+        list_catalogs = staticmethod(_fake_list_catalogs)
+
+    async def _get_catalogs_service():
+        return _FakeCatalogs()
+
+    async def _get_configs_service():
+        class _Cfg:
+            async def get_config(self, cls, catalog_id=None, collection_id=None):
+                return EDRConfig()
+
+        return _Cfg()
+
+    monkeypatch.setattr(svc, "_get_catalogs_service", _get_catalogs_service, raising=False)
+    monkeypatch.setattr(svc, "_get_configs_service", _get_configs_service, raising=False)
+
+
+@pytest.mark.asyncio
+async def test_list_catalogs_over_max_limit_clamps_instead_of_erroring(monkeypatch):
+    """A ``limit`` above the configured maximum (1000 by default) is clamped,
+    not rejected. The handler never sees a value above 1000 — the FastAPI
+    ``le=`` gate that used to 422 here was removed; ``resolve_page_limit`` is
+    now the sole enforcement point."""
+    from dynastore.extensions.edr.edr_service import EDRService
+
+    svc = EDRService.__new__(EDRService)
+    captured: dict = {}
+    _wire_edr_service(monkeypatch, svc, captured)
+
+    await svc.list_catalogs(limit=5000, offset=0)
+
+    assert captured["limit"] == 1000
+
+
+@pytest.mark.asyncio
+async def test_list_catalogs_omitted_limit_uses_configured_default(monkeypatch):
+    """``limit=None`` (query param omitted) falls back to the configured
+    default (100), not an unbounded scan."""
+    from dynastore.extensions.edr.edr_service import EDRService
+
+    svc = EDRService.__new__(EDRService)
+    captured: dict = {}
+    _wire_edr_service(monkeypatch, svc, captured)
+
+    await svc.list_catalogs(limit=None, offset=0)
+
+    assert captured["limit"] == 100
+
+
+@pytest.mark.asyncio
+async def test_list_catalogs_in_range_limit_is_unchanged(monkeypatch):
+    """Existing in-range behaviour is preserved."""
+    from dynastore.extensions.edr.edr_service import EDRService
+
+    svc = EDRService.__new__(EDRService)
+    captured: dict = {}
+    _wire_edr_service(monkeypatch, svc, captured)
+
+    await svc.list_catalogs(limit=250, offset=0)
+
+    assert captured["limit"] == 250

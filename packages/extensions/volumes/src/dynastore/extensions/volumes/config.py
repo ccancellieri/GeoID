@@ -47,6 +47,16 @@ class VolumesConfig(ExposableConfigMixin, PluginConfig):
 
     _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "volumes")
 
+    # Pagination policy (OGC API - Features Part 1 Core, /req/core/fc-limit-*).
+    # Two pairs: the collection listing shares the platform-wide 100/1000
+    # convention, while the CityJSONSeq item stream is a bulk-export path
+    # with a much higher default/ceiling (mirrors the pre-existing
+    # 10 000/100 000 values on ``stream_cityjsonseq``).
+    default_limit: Mutable[int] = 100
+    max_limit: Mutable[int] = 1000
+    stream_default_limit: Mutable[int] = 10_000
+    stream_max_limit: Mutable[int] = 100_000
+
     max_features_per_tile: Mutable[int] = Field(default=10_000, ge=1)
     max_tree_depth: Mutable[int] = Field(default=20, ge=0, le=32)
     on_demand_cache_ttl_s: Mutable[int] = Field(default=3600, ge=0)

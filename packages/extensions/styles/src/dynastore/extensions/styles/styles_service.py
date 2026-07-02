@@ -367,7 +367,15 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         catalog_id: str,
         collection_id: str,
         conn: AsyncConnection = Depends(get_async_connection),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of styles to return. Omitted falls back to "
+                "the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> StyleList:
@@ -380,6 +388,16 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
             raise HTTPException(status_code=404, detail="Collection not found.")
 
         internal_catalog_id = await self._resolve_internal_catalog_id(catalog_id)
+
+        from dynastore.extensions.styles.config import StylesPluginConfig
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        styles_config = await self._get_plugin_config(
+            StylesPluginConfig, catalog_id, collection_id,
+        )
+        limit = resolve_page_limit(
+            limit, default_limit=styles_config.default_limit, max_limit=styles_config.max_limit,
+        )
 
         styles, total = await styles_db.list_styles_for_collection(
             conn,
@@ -624,9 +642,25 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
     async def list_all_styles(
         self,
         conn: AsyncConnection = Depends(get_async_connection),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of styles to return. Omitted falls back to "
+                "the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
     ) -> JSONResponse:
+        from dynastore.extensions.styles.config import StylesPluginConfig
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        styles_config = await self._get_plugin_config(StylesPluginConfig)
+        limit = resolve_page_limit(
+            limit, default_limit=styles_config.default_limit, max_limit=styles_config.max_limit,
+        )
+
         styles = await styles_db.list_all_styles(conn, limit=limit, offset=offset)
         return JSONResponse(
             content={

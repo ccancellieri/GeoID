@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 import pyproj as _pyproj_scope_gate  # noqa: F401  # SCOPE gate: extension_crs requires module_crs (pyproj)
 _ = _pyproj_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status, Request, FastAPI
@@ -25,6 +25,9 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.tools.db import get_async_connection
+
+if TYPE_CHECKING:
+    from dynastore.extensions.crs.config import CrsPluginConfig
 
 from dynastore.modules.crs.models import CRS, CRSCreate, CRSDefinition, CRSLink, CustomCRSList, GlobalCRSList
 
@@ -193,6 +196,23 @@ class CRSExtension(ExtensionProtocol):
             raise HTTPException(status_code=503, detail="CRS service not registered")
         return svc
 
+    async def _get_crs_config(self, catalog_id: Optional[str] = None) -> "CrsPluginConfig":
+        """Fetch ``CrsPluginConfig`` via the platform configs service.
+
+        ``CRSExtension`` doesn't inherit ``OGCServiceMixin``, so this mirrors
+        its ``_get_plugin_config`` helper directly: falls back to a
+        default-constructed config when the configs service is unavailable.
+        """
+        from dynastore.extensions.crs.config import CrsPluginConfig
+        from dynastore.models.protocols import ConfigsProtocol
+
+        try:
+            configs_svc = get_protocol(ConfigsProtocol)
+            if configs_svc is not None:
+                return await configs_svc.get_config(CrsPluginConfig, catalog_id)
+        except Exception:  # pragma: no cover - defensive fallback
+            pass
+        return CrsPluginConfig()
 
     async def _resolve_internal_catalog_id(
         self,
@@ -252,10 +272,27 @@ class CRSExtension(ExtensionProtocol):
         self,
         catalog_id: str,
         conn: AsyncConnection = Depends(get_async_connection),
-        limit: int = Query(20, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of CRS definitions to return. Omitted falls "
+                "back to the configured default; a value above the "
+                "configured maximum is clamped, not rejected "
+                "(fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0)
     ) -> CustomCRSList:
         internal_id = await self._resolve_internal_catalog_id(catalog_id, conn)
+
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        crs_config = await self._get_crs_config(catalog_id)
+        limit = resolve_page_limit(
+            limit, default_limit=crs_config.default_limit, max_limit=crs_config.max_limit,
+        )
+
         results, total = await self.crs.list_crs(conn, internal_id, limit, offset)
         crs_list = [c.model_copy(update={"catalog_id": catalog_id}) for c in results]
         return CustomCRSList(crs=crs_list, numberMatched=total, numberReturned=len(crs_list))
@@ -265,10 +302,27 @@ class CRSExtension(ExtensionProtocol):
         catalog_id: str,
         q: str = Query(..., description="Search term."),
         conn: AsyncConnection = Depends(get_async_connection),
-        limit: int = Query(20, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of CRS definitions to return. Omitted falls "
+                "back to the configured default; a value above the "
+                "configured maximum is clamped, not rejected "
+                "(fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0)
     ) -> CustomCRSList:
         internal_id = await self._resolve_internal_catalog_id(catalog_id, conn)
+
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        crs_config = await self._get_crs_config(catalog_id)
+        limit = resolve_page_limit(
+            limit, default_limit=crs_config.default_limit, max_limit=crs_config.max_limit,
+        )
+
         results, total = await self.crs.search_crs(conn, internal_id, q, limit, offset)
         crs_list = [c.model_copy(update={"catalog_id": catalog_id}) for c in results]
         return CustomCRSList(crs=crs_list, numberMatched=total, numberReturned=len(crs_list))
@@ -318,7 +372,15 @@ class CRSExtension(ExtensionProtocol):
     async def list_global_crs_endpoint(
         self,
         request: Request,
-        limit: int = Query(20, ge=1, le=1000, description="Page size."),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Page size. Omitted falls back to the configured default; a "
+                "value above the configured maximum is clamped, not rejected "
+                "(fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0, description="Number of CRS to skip."),
         authority: str = Query(
             "EPSG",
@@ -332,6 +394,13 @@ class CRSExtension(ExtensionProtocol):
         globally-defined authority CRS are listed; tenant-registered custom CRS
         are served per-catalog under ``/crs/catalogs/{catalog_id}/...``.
         """
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        crs_config = await self._get_crs_config()
+        limit = resolve_page_limit(
+            limit, default_limit=crs_config.default_limit, max_limit=crs_config.max_limit,
+        )
+
         uris, total = _list_global_crs(authority, limit, offset)
 
         base = str(request.url).split("?", 1)[0]

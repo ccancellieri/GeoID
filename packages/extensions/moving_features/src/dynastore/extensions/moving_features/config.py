@@ -17,6 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
+from dynastore.models.mutability import Mutable
 from dynastore.models.plugin_config import PluginConfig
 from typing import ClassVar, Tuple
 
@@ -25,4 +26,8 @@ class MovingFeaturesPluginConfig(ExposableConfigMixin, PluginConfig):
     """Service-exposure config for the moving_features extension."""
     _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "moving_features")
 
-    # `enabled` inherited from ExposableConfigMixin — no further fields.
+    # `enabled` inherited from ExposableConfigMixin.
+
+    # Pagination policy (OGC API - Features Part 1 Core, /req/core/fc-limit-*)
+    default_limit: Mutable[int] = 100
+    max_limit: Mutable[int] = 1000

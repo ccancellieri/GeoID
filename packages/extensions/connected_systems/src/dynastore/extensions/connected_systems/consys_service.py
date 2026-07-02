@@ -241,7 +241,15 @@ class ConnectedSystemsService(
     async def list_systems(
         self,
         catalog_id: str = Query(..., description="Catalog identifier"),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of systems to return. Omitted falls back to "
+                "the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         conn: AsyncConnection = Depends(get_async_connection),
         # Accepted for uniform protocol consistency; connected-systems reads go through
@@ -251,6 +259,15 @@ class ConnectedSystemsService(
         validate_sql_identifier(catalog_id)
         await self._require_catalog_ready(catalog_id)
         internal_id = await self._resolve_internal_catalog_id(catalog_id)
+
+        from dynastore.extensions.connected_systems.config import ConnectedSystemsPluginConfig
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        cs_config = await self._get_plugin_config(ConnectedSystemsPluginConfig, catalog_id)
+        limit = resolve_page_limit(
+            limit, default_limit=cs_config.default_limit, max_limit=cs_config.max_limit,
+        )
+
         results, total = await consys_db.list_systems(conn, internal_id, limit=limit, offset=offset)
         systems = [s.model_copy(update={"catalog_id": catalog_id}) for s in results]
         return SystemList(systems=systems, numberMatched=total, numberReturned=len(systems))
@@ -373,7 +390,15 @@ class ConnectedSystemsService(
         self,
         system_id: str,
         catalog_id: str = Query(..., description="Catalog identifier"),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of deployments to return. Omitted falls back "
+                "to the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         conn: AsyncConnection = Depends(get_async_connection),
         # Accepted for uniform protocol consistency; connected-systems reads go through
@@ -385,6 +410,15 @@ class ConnectedSystemsService(
         existing = await consys_db.get_system(conn, internal_id, system_id)
         if not existing:
             raise HTTPException(status_code=404, detail="System not found.")
+
+        from dynastore.extensions.connected_systems.config import ConnectedSystemsPluginConfig
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        cs_config = await self._get_plugin_config(ConnectedSystemsPluginConfig, catalog_id)
+        limit = resolve_page_limit(
+            limit, default_limit=cs_config.default_limit, max_limit=cs_config.max_limit,
+        )
+
         results = await consys_db.list_deployments_for_system(
             conn, internal_id, system_id, limit=limit, offset=offset
         )
@@ -394,7 +428,15 @@ class ConnectedSystemsService(
         self,
         system_id: str,
         catalog_id: str = Query(..., description="Catalog identifier"),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of datastreams to return. Omitted falls back "
+                "to the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         conn: AsyncConnection = Depends(get_async_connection),
         # Accepted for uniform protocol consistency; connected-systems reads go through
@@ -406,6 +448,15 @@ class ConnectedSystemsService(
         existing = await consys_db.get_system(conn, internal_id, system_id)
         if not existing:
             raise HTTPException(status_code=404, detail="System not found.")
+
+        from dynastore.extensions.connected_systems.config import ConnectedSystemsPluginConfig
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        cs_config = await self._get_plugin_config(ConnectedSystemsPluginConfig, catalog_id)
+        limit = resolve_page_limit(
+            limit, default_limit=cs_config.default_limit, max_limit=cs_config.max_limit,
+        )
+
         results = await consys_db.list_datastreams_for_system(
             conn, internal_id, system_id, limit=limit, offset=offset
         )
@@ -418,7 +469,15 @@ class ConnectedSystemsService(
     async def list_datastreams(
         self,
         catalog_id: str = Query(..., description="Catalog identifier"),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of datastreams to return. Omitted falls back "
+                "to the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         conn: AsyncConnection = Depends(get_async_connection),
         # Accepted for uniform protocol consistency; connected-systems reads go through
@@ -427,6 +486,15 @@ class ConnectedSystemsService(
     ) -> List[DataStream]:
         validate_sql_identifier(catalog_id)
         internal_id = await self._resolve_internal_catalog_id(catalog_id)
+
+        from dynastore.extensions.connected_systems.config import ConnectedSystemsPluginConfig
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        cs_config = await self._get_plugin_config(ConnectedSystemsPluginConfig, catalog_id)
+        limit = resolve_page_limit(
+            limit, default_limit=cs_config.default_limit, max_limit=cs_config.max_limit,
+        )
+
         results = await consys_db.list_datastreams(conn, internal_id, limit=limit, offset=offset)
         return [ds.model_copy(update={"catalog_id": catalog_id}) for ds in results]
 
@@ -484,7 +552,15 @@ class ConnectedSystemsService(
         self,
         datastream_id: str,
         catalog_id: str = Query(..., description="Catalog identifier"),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of observations to return. Omitted falls back "
+                "to the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
         offset: int = Query(0, ge=0),
         datetime: Optional[str] = Query(None, description="Temporal filter (ISO 8601 instant or interval)."),
         bbox: Optional[str] = Query(
@@ -503,6 +579,14 @@ class ConnectedSystemsService(
         parsed_bbox: Optional[Tuple[float, float, float, float]] = None
         if bbox:
             parsed_bbox = parse_bbox_string(bbox)
+
+        from dynastore.extensions.connected_systems.config import ConnectedSystemsPluginConfig
+        from dynastore.extensions.tools.pagination import resolve_page_limit
+
+        cs_config = await self._get_plugin_config(ConnectedSystemsPluginConfig, catalog_id)
+        limit = resolve_page_limit(
+            limit, default_limit=cs_config.default_limit, max_limit=cs_config.max_limit,
+        )
 
         results = await consys_db.list_observations(
             conn, internal_id, datastream_id, limit=limit, offset=offset, datetime=datetime, bbox=parsed_bbox
