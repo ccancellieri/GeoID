@@ -1297,7 +1297,10 @@ class ItemsElasticsearchDriver(
         from datetime import datetime, timezone
 
         from dynastore.modules.elasticsearch.canonical_doc import build_canonical_index_doc
-        from dynastore.modules.catalog.canonical_index_read import CanonicalIndexInput
+        from dynastore.modules.catalog.canonical_index_read import (
+            CanonicalIndexInput,
+            canonical_input_from_feature,
+        )
 
         items = self._normalize_entities(entities)
         if not items:
@@ -1463,43 +1466,33 @@ class ItemsElasticsearchDriver(
                 # (assets, stac_extensions) lives only in the inbound feature doc
                 # and must be threaded through to the ES _source so
                 # unproject_item_from_es can surface them on read.
-                raw_props = stac_doc.get("properties") or {}
-                from dynastore.modules.storage.computed_fields import SYSTEM_FIELD_KEYS as _SFK
-                _sys_keys = frozenset(_SFK)
-                user_props = {k: v for k, v in raw_props.items() if k not in _sys_keys}
-                geom = stac_doc.get("geometry")
-                bbox_val = stac_doc.get("bbox")
-                fallback_row: Dict[str, Any] = {"geoid": geoid_for_id or base_id}
-                if external_id is not None:
-                    fallback_row["external_id"] = str(external_id)
-                if asset_id is not None:
-                    fallback_row["asset_id"] = str(asset_id)
-
-                # Collect per-item STAC reserved members present in the
-                # serialized feature.  ``assets`` and ``stac_extensions`` are
-                # already in ``_RESERVED_MEMBER_KEYS`` so unproject_item_from_es
-                # passes them through verbatim — they just need to be stored.
-                _stac_reserved: Dict[str, Any] = {}
-                _raw_assets = stac_doc.get("assets")
-                if _raw_assets is not None:
-                    _stac_reserved["assets"] = _raw_assets
-                _raw_exts = stac_doc.get("stac_extensions")
-                if _raw_exts is not None:
-                    _stac_reserved["stac_extensions"] = _raw_exts
-
+                #
+                # Built via canonical_input_from_feature — the same
+                # database-free canonical-input producer used by
+                # ItemsElasticsearchDriver.index()/index_bulk() (the Indexer
+                # protocol surface) — instead of a third hand-rolled
+                # reimplementation of the same feature-to-canonical-input
+                # shape (#2732 step 2).
+                fallback_geoid = geoid_for_id or base_id
+                ci = canonical_input_from_feature(
+                    stac_doc, catalog_id, collection_id,
+                    geoid=fallback_geoid,
+                    external_id=external_id,
+                    asset_id=asset_id,
+                )
                 es_doc = build_canonical_index_doc(
-                    fallback_row,
-                    resolved_sidecars=[],
+                    ci.row,
+                    resolved_sidecars=ci.resolved_sidecars,
                     known_fields=known_fields,
                     catalog_id=catalog_id,
                     collection_id=collection_id,
-                    geometry=geom if isinstance(geom, dict) else None,
-                    bbox=list(bbox_val) if bbox_val is not None else None,
-                    user_properties=user_props or None,
-                    access=None,
-                    stac_reserved_members=_stac_reserved or None,
+                    geometry=ci.geometry,
+                    bbox=ci.bbox,
+                    user_properties=ci.user_properties,
+                    access=ci.access,
+                    stac_reserved_members=ci.stac_reserved_members,
                 )
-                doc_id = geoid_for_id or base_id
+                doc_id = fallback_geoid
                 logger.debug(
                     "write_entities: no raw PG row for geoid=%s in %s/%s — "
                     "using feature-derived fallback doc",

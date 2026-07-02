@@ -314,6 +314,25 @@ async def reindex_collection_into_index(
     equals the reader this function raises ``ValueError`` immediately — a reindex that
     reads and writes to the same driver is a no-op at best and a data hazard at worst.
 
+    Doc build (#2732 step 2): each page is handed to the writer's own
+    ``write_entities()`` — the same write entry point used by direct STAC/Features
+    ingest and by the storage-plane drain's ``BulkIndexer`` adapter. For
+    :class:`~dynastore.modules.storage.drivers.elasticsearch.ItemsElasticsearchDriver`,
+    ``write_entities()`` re-resolves each item's canonical PG row via
+    :func:`~dynastore.modules.catalog.canonical_index_read.read_canonical_index_inputs`
+    and assembles the ``_source`` via
+    :func:`~dynastore.modules.elasticsearch.canonical_doc.build_canonical_index_doc` —
+    the identical function the drain's ``StorageDrainTask`` calls — so a rebuilt
+    index and a drain-written index converge on the same canonical shape for the
+    same stored item. The no-PG-row fallback (file-backed collections) is built via
+    :func:`~dynastore.modules.catalog.canonical_index_read.canonical_input_from_feature`,
+    also shared with the driver's ``Indexer``-protocol ``index()``/``index_bulk()``
+    methods. This function deliberately does NOT call the ``BulkIndexer``/
+    ``IndexableOp`` surface the drain uses directly: that would drop
+    ``write_entities()``'s ``ensure_storage()`` (index/mapping creation) and
+    geometry-simplification steps, neither of which the drain's adapter performs
+    today — see the PR description for the field-level comparison.
+
     The read page (and write chunk, before byte-bounded sub-chunking) is sized via
     :func:`_resolve_read_page`: an explicitly supplied ``page_size`` governs verbatim;
     when omitted (``None``), the writer's ``preferred_chunk_size`` is used as the

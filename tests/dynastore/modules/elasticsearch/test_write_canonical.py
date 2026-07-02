@@ -749,6 +749,210 @@ class TestWriteEntitiesCanonicalSource:
 
 
 # ---------------------------------------------------------------------------
+# #2732 step 2 — write_entities' no-PG-row fallback shares
+# canonical_input_from_feature with index()/index_bulk() (single source)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteEntitiesFallbackUsesCanonicalInputFromFeature:
+    """``write_entities``' no-PG-row fallback must be built from
+    ``canonical_input_from_feature`` — the same database-free canonical-input
+    producer already used by ``index()``/``index_bulk()`` — rather than a
+    third hand-rolled reimplementation of the same feature-to-canonical-input
+    shape."""
+
+    @pytest.mark.asyncio
+    async def test_fallback_doc_matches_canonical_input_from_feature_reference(self):
+        """write_entities' fallback _source must be byte-identical to
+        build_canonical_index_doc(canonical_input_from_feature(...))."""
+        from dynastore.modules.catalog.canonical_index_read import (
+            canonical_input_from_feature,
+        )
+        from dynastore.modules.elasticsearch.canonical_doc import (
+            build_canonical_index_doc,
+        )
+        from dynastore.modules.storage.drivers.elasticsearch import (
+            ItemsElasticsearchDriver,
+        )
+
+        geoid = "fallback-geoid-0001"
+        ext_id = "EXT-FALLBACK"
+        stac_doc = {
+            "id": ext_id,
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [1.0, 2.0]},
+            "bbox": [1.0, 2.0, 1.0, 2.0],
+            "properties": {"NAME": "Fallback item", "geoid": geoid},
+            "assets": {"thumbnail": {"href": "https://example.org/t.png"}},
+            "stac_extensions": ["https://stac-extensions.github.io/x/v1.0.0/schema.json"],
+            "geoid": geoid,
+        }
+
+        driver = ItemsElasticsearchDriver.__new__(ItemsElasticsearchDriver)
+        feature = MagicMock()
+        feature.id = ext_id
+        feature.geometry = stac_doc["geometry"]
+        feature.properties = stac_doc["properties"]
+        feature.model_dump = MagicMock(return_value=dict(stac_doc))
+
+        mock_config = MagicMock()
+        mock_config.simplify_geometry = False
+        mock_config.simplify_target_bytes = None
+        mock_config.external_id_path = MagicMock(return_value=None)
+        mock_config.on_batch_conflict = None
+        mock_config.on_conflict = None
+        mock_config.validity = None
+
+        captured_bulk: List[Dict] = []
+
+        async def _fake_bulk(body, params=None):
+            captured_bulk.extend(body)
+            return {
+                "errors": False,
+                "items": [{"index": {"_id": geoid, "_index": "test", "status": 200}}],
+            }
+
+        es_mock = AsyncMock()
+        es_mock.bulk = _fake_bulk
+
+        with (
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch._es_client_required",
+                return_value=es_mock,
+            ),
+            patch.object(driver, "get_driver_config", new=AsyncMock(return_value=mock_config)),
+            patch.object(driver, "_enforce_field_constraints", new=AsyncMock()),
+            patch.object(driver, "_resolve_write_policy", new=AsyncMock(return_value=mock_config)),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.resolve_catalog_known_fields",
+                new=AsyncMock(return_value={}),
+            ),
+            # No PG row — forces the fallback branch.
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+                new=AsyncMock(return_value={}),
+            ),
+        ):
+            await driver.write_entities("cat1", "col1", [feature])
+
+        doc_lines = [b for b in captured_bulk if isinstance(b, dict) and "index" not in b]
+        assert len(doc_lines) == 1, f"Expected 1 fallback doc; got {captured_bulk}"
+        fallback_doc = doc_lines[0]
+
+        # Reference doc built directly via the shared canonical-input +
+        # canonical-doc functions, exactly as index()/index_bulk() do.
+        ci_expected = canonical_input_from_feature(
+            stac_doc, "cat1", "col1",
+            geoid=geoid, external_id=None, asset_id=None,
+        )
+        expected_doc = build_canonical_index_doc(
+            ci_expected.row,
+            resolved_sidecars=ci_expected.resolved_sidecars,
+            known_fields={},
+            catalog_id="cat1",
+            collection_id="col1",
+            geometry=ci_expected.geometry,
+            bbox=ci_expected.bbox,
+            user_properties=ci_expected.user_properties,
+            access=ci_expected.access,
+            stac_reserved_members=ci_expected.stac_reserved_members,
+        )
+
+        assert fallback_doc == expected_doc, (
+            f"write_entities fallback diverges from canonical_input_from_feature "
+            f"reference:\nfallback: {fallback_doc}\nexpected: {expected_doc}"
+        )
+        # Reserved STAC members preserved (not leaked into properties.extras).
+        assert fallback_doc.get("assets") == stac_doc["assets"]
+        assert fallback_doc.get("stac_extensions") == stac_doc["stac_extensions"]
+        assert "assets" not in fallback_doc.get("properties", {})
+        assert "stac_extensions" not in fallback_doc.get("properties", {})
+
+    @pytest.mark.asyncio
+    async def test_fallback_picks_up_reserved_members_nested_in_properties(self):
+        """Bug fix: the old inline fallback only checked top-level
+        ``assets``/``stac_extensions`` on the feature dict, silently leaving
+        a duplicate copy in ``properties`` (and missing them entirely when
+        only present inside ``properties``). ``canonical_input_from_feature``
+        checks both locations and always strips them from ``properties``."""
+        from dynastore.modules.storage.drivers.elasticsearch import (
+            ItemsElasticsearchDriver,
+        )
+
+        geoid = "fallback-geoid-0002"
+        ext_id = "EXT-FALLBACK-2"
+        stac_doc = {
+            "id": ext_id,
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [3.0, 4.0]},
+            "properties": {
+                "NAME": "Nested reserved members",
+                "geoid": geoid,
+                # Reserved members present ONLY inside properties (no
+                # top-level "assets"/"stac_extensions" keys on the feature).
+                "assets": {"thumbnail": {"href": "https://example.org/t.png"}},
+                "stac_extensions": ["https://stac-extensions.github.io/y/v1.0.0/schema.json"],
+            },
+            "geoid": geoid,
+        }
+
+        driver = ItemsElasticsearchDriver.__new__(ItemsElasticsearchDriver)
+        feature = MagicMock()
+        feature.id = ext_id
+        feature.geometry = stac_doc["geometry"]
+        feature.properties = stac_doc["properties"]
+        feature.model_dump = MagicMock(return_value=dict(stac_doc))
+
+        mock_config = MagicMock()
+        mock_config.simplify_geometry = False
+        mock_config.simplify_target_bytes = None
+        mock_config.external_id_path = MagicMock(return_value=None)
+        mock_config.on_batch_conflict = None
+        mock_config.on_conflict = None
+        mock_config.validity = None
+
+        captured_bulk: List[Dict] = []
+
+        async def _fake_bulk(body, params=None):
+            captured_bulk.extend(body)
+            return {
+                "errors": False,
+                "items": [{"index": {"_id": geoid, "_index": "test", "status": 200}}],
+            }
+
+        es_mock = AsyncMock()
+        es_mock.bulk = _fake_bulk
+
+        with (
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch._es_client_required",
+                return_value=es_mock,
+            ),
+            patch.object(driver, "get_driver_config", new=AsyncMock(return_value=mock_config)),
+            patch.object(driver, "_enforce_field_constraints", new=AsyncMock()),
+            patch.object(driver, "_resolve_write_policy", new=AsyncMock(return_value=mock_config)),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.resolve_catalog_known_fields",
+                new=AsyncMock(return_value={}),
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+                new=AsyncMock(return_value={}),
+            ),
+        ):
+            await driver.write_entities("cat1", "col1", [feature])
+
+        doc_lines = [b for b in captured_bulk if isinstance(b, dict) and "index" not in b]
+        assert len(doc_lines) == 1
+        fallback_doc = doc_lines[0]
+
+        assert fallback_doc.get("assets") == stac_doc["properties"]["assets"]
+        assert fallback_doc.get("stac_extensions") == stac_doc["properties"]["stac_extensions"]
+        assert "assets" not in fallback_doc.get("properties", {})
+        assert "stac_extensions" not in fallback_doc.get("properties", {})
+
+
+# ---------------------------------------------------------------------------
 # Pass-C Task 1 — convergence invariant: write_entities ≡ index_bulk
 # ---------------------------------------------------------------------------
 
