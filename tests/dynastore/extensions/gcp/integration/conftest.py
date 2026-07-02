@@ -17,7 +17,6 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import pytest
-import pytest_asyncio
 import os
 
 from tests._repo_paths import CORE_SRC
@@ -40,25 +39,5 @@ def gcp_integration_env():
         os.environ.setdefault("REGION", _REAL_REGION)
 
 
-@pytest_asyncio.fixture
-async def catalog_cleaner(app_lifespan):
-    """
-    Tracks catalog IDs created during a test and force-deletes them on teardown.
-    Usage: add ``catalog_cleaner`` to the test signature, then call
-    ``catalog_cleaner(catalog_id)`` after each successful catalog creation.
-    """
-    ids: list = []
-    yield ids.append
-
-    from dynastore.tools.discovery import get_protocol
-    from dynastore.models.protocols import CatalogsProtocol
-    from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry
-
-    catalogs = get_protocol(CatalogsProtocol)
-    if catalogs:
-        for cid in ids:
-            try:
-                await catalogs.delete_catalog(cid, force=True)
-            except Exception:
-                pass
-        await lifecycle_registry.wait_for_all_tasks()
+# ``catalog_cleaner`` is inherited from tests/dynastore/conftest.py via
+# pytest's directory-based conftest resolution; do not redefine it here.

@@ -90,24 +90,5 @@ async def disable_managed_eventing(app_lifespan):
         )
 
 
-@pytest_asyncio.fixture
-async def catalog_cleaner(app_lifespan):
-    """
-    Tracks catalog IDs created during a test and force-deletes them on teardown.
-    Call ``catalog_cleaner(catalog_id)`` after each successful catalog creation.
-    """
-    ids: list = []
-    yield ids.append
-
-    from dynastore.tools.discovery import get_protocol
-    from dynastore.models.protocols import CatalogsProtocol
-    from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry
-
-    catalogs = get_protocol(CatalogsProtocol)
-    if catalogs:
-        for cid in ids:
-            try:
-                await catalogs.delete_catalog(cid, force=True)
-            except Exception:
-                pass
-        await lifecycle_registry.wait_for_all_tasks()
+# ``catalog_cleaner`` is inherited from tests/dynastore/conftest.py via
+# pytest's directory-based conftest resolution; do not redefine it here.
