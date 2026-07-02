@@ -80,3 +80,79 @@ def test_single_batch_passthrough_preserves_failures() -> None:
     )
     assert accumulated["es"].failed == 1
     assert accumulated["es"].failures == [{"id": "a"}]
+
+
+def _large_geometry_payload(feature_idx: int) -> Dict[str, Any]:
+    """A GeoJSON-shaped payload sized like a dense GAUL admin-boundary
+    polygon (~thousands of coordinate pairs), the kind of doc an ES driver
+    echoes onto a ``BulkResult.failures`` entry when a bulk write fails."""
+    ring = [[float(i), float(-i)] for i in range(3000)]
+    return {
+        "type": "Feature",
+        "id": f"geoid-{feature_idx}",
+        "geometry": {"type": "Polygon", "coordinates": [ring]},
+        "properties": {"NAME": f"region-{feature_idx}"},
+    }
+
+
+def test_accumulated_failures_stay_o_of_batch_with_large_geometry_payloads() -> None:
+    """Simulate a GAUL-scale ingest (500 synthetic dense-polygon features,
+    batched at the ≤50-row default) where every batch's secondary-index
+    dispatch fails and each failure echoes the full document (geometry
+    included) — the exact shape #2656's commit message describes as the OOM
+    trigger. The retained sample must stay bounded at
+    ``_MAX_ACCUMULATED_FAILURE_SAMPLES`` regardless of how many of the 500
+    features were processed, so peak memory for this accumulator is O(batch)
+    rather than O(dataset)."""
+    accumulated: Dict[str, Any] = {}
+
+    n_features = 500
+    batch_size = 50  # matches run_ingestion_task's new database_batch_size default
+    feature_idx = 0
+    n_batches = 0
+    while feature_idx < n_features:
+        batch_features = list(range(feature_idx, min(feature_idx + batch_size, n_features)))
+        batch = {
+            "es": BulkResult(
+                total=len(batch_features),
+                succeeded=0,
+                failed=len(batch_features),
+                failures=[
+                    {
+                        "id": f"geoid-{i}",
+                        "reason": "bulk_write_failed",
+                        "payload": _large_geometry_payload(i),
+                    }
+                    for i in batch_features
+                ],
+            )
+        }
+        _merge_index_results(accumulated, batch)
+        feature_idx += batch_size
+        n_batches += 1
+
+    merged = accumulated["es"]
+
+    # Exact counts survive every merge regardless of the sample cap.
+    assert merged.total == n_features
+    assert merged.failed == n_features
+    assert merged.succeeded == 0
+
+    # The retained sample never exceeds the cap — NOT one entry per feature.
+    assert len(merged.failures) <= _MAX_ACCUMULATED_FAILURE_SAMPLES
+    assert len(merged.failures) < n_features, (
+        "the failure-detail sample must not grow with the dataset size"
+    )
+
+    # The bound is on entry COUNT, so bytes retained are bounded too: with
+    # each echoed payload ~100+ KB (dense polygon), an unbounded concat over
+    # n_batches would retain tens of MB; the capped sample retains at most
+    # MAX_ACCUMULATED_FAILURE_SAMPLES payloads regardless of n_features.
+    import sys
+
+    retained_bytes = sum(sys.getsizeof(str(f)) for f in merged.failures)
+    naive_unbounded_bytes = retained_bytes * (n_features / max(len(merged.failures), 1))
+    assert retained_bytes < naive_unbounded_bytes, (
+        "sanity check: bounded retention must be smaller than the naive "
+        "per-feature-retained projection"
+    )

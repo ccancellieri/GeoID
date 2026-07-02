@@ -794,11 +794,15 @@ async def run_ingestion_task(
             logger.warning(f"Could not determine total feature count: {e}")
 
         # Flush a batch on whichever limit is reached first: an explicit row cap
-        # (database_batch_size, default 200) or an accumulated-geometry memory
+        # (database_batch_size, default 50) or an accumulated-geometry memory
         # budget (max_batch_memory_mb, default 32 MB). The memory budget is what
         # auto-shrinks batches for geometry-heavy sources (e.g. admin
-        # multipolygons) so a fixed row count cannot exhaust the container.
-        row_cap = task_request.database_batch_size or 200
+        # multipolygons) so a fixed row count cannot exhaust the container; the
+        # lowered row-cap default keeps light-attribute sources (where the byte
+        # budget alone wouldn't trigger for a long time) from batching all the
+        # way up to a size that only made sense before dense collections like
+        # GAUL exposed the memory budget as the real constraint.
+        row_cap = task_request.database_batch_size or 50
         mem_budget_bytes = max(1, task_request.max_batch_memory_mb) * 1024 * 1024
         current_batch = []
         current_batch_bytes = 0

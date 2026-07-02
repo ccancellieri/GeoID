@@ -127,14 +127,20 @@ def test_max_batch_memory_default_is_32mb() -> None:
     )
 
 
-def test_row_cap_default_is_200() -> None:
-    """run_ingestion_task must fall back to 200, not 500, when database_batch_size
-    is unset. 500 dense admin polygons at ~200 KB each = 100 MB per batch, which
-    matches the old OOM trigger on GAUL-class sources."""
+def test_row_cap_default_is_50() -> None:
+    """run_ingestion_task must fall back to 50, not a higher row count, when
+    database_batch_size is unset. Dense admin-boundary sources (e.g. GAUL: 3103
+    features, avg ~100+ KB each) rely on the memory budget to shrink batches
+    well below any row-count cap, but light-attribute sources have no large
+    geometry to trip that budget — the row cap alone must already be
+    conservative enough to keep a batch's write/read-back/report footprint
+    bounded regardless of geometry density."""
     src = inspect.getsource(run_ingestion_task)
-    assert "or 200" in src, (
-        "run_ingestion_task row_cap fallback is no longer 200. "
-        "The higher default risks OOM on geometry-heavy sources; restore 'or 200'."
+    assert "or 50" in src, (
+        "run_ingestion_task row_cap fallback is no longer 50. "
+        "A higher default risks a large batch footprint on geometry-heavy "
+        "sources when the byte budget alone doesn't trigger soon enough; "
+        "restore 'or 50'."
     )
 
 

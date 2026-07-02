@@ -104,7 +104,7 @@ class TaskIngestionRequest(BaseModel):
     reporting: Optional[IngestionReportingConfig] = Field(default=None, description="Configuration for generating detailed ingestion reports.")
     pre_operations: Optional[Dict[str, Dict[str, Any]]] = Field(default=None, description="Configuration for pre-ingestion operations.")
     post_operations: Optional[Dict[str, Dict[str, Any]]] = Field(default=None, description="Configuration for post-ingestion operations.")
-    database_batch_size: Optional[int] = Field(default=None, description="Maximum number of records per write batch (defaults to 200 when unset). A batch is flushed when this row cap OR max_batch_memory_mb is reached, whichever comes first.")
+    database_batch_size: Optional[int] = Field(default=None, description="Maximum number of records per write batch (defaults to 50 when unset). A batch is flushed when this row cap OR max_batch_memory_mb is reached, whichever comes first. The conservative default keeps dense-geometry sources (e.g. admin-boundary polygons) safely under the memory budget without per-request tuning.")
     max_batch_memory_mb: int = Field(default=32, description="Approximate geometry memory budget (in MB) accumulated before a batch is flushed. Bounds peak memory for geometry-heavy sources independently of the row count: a batch flushes when either this budget or database_batch_size is reached. Conservative default (32 MB) prevents OOM on dense polygon sources such as large admin-boundary datasets.")
     offset: int = Field(default=0, description="Number of records to skip from the beginning of the source file.")
     limit: Optional[int] = Field(default=None, description="Maximum number of records to process from the source file.")
