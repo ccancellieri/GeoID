@@ -2396,7 +2396,12 @@ class CatalogService(CatalogsProtocol):
                     checklist=json.dumps(checklist),
                 )
 
-                # Enqueue catalog_provision task with operation='deprovision_hard'
+                # Enqueue catalog_provision task with operation='deprovision_hard'.
+                # dedup_key makes a repeat DELETE on the same catalog (client
+                # retry after a slow/dropped response, or the stress-test
+                # runbook's re-issue-until-204 loop) a no-op re-enqueue instead
+                # of spawning a second concurrent deprovision run, and lets the
+                # HTTP layer look the task back up to report a 202 status link.
                 from dynastore.modules.tasks.models import TaskCreate
                 from dynastore.modules.tasks.tasks_module import create_task
 
@@ -2410,6 +2415,7 @@ class CatalogService(CatalogsProtocol):
                     },
                     caller_id="system",
                     type="task",
+                    dedup_key=f"catalog_provision:deprovision_hard:{catalog_id}",
                 )
                 await create_task(conn, task_request, catalog_id)
 
@@ -2440,6 +2446,41 @@ class CatalogService(CatalogsProtocol):
         # Post-transaction cleanup
         _invalidate_catalog_model_cache(catalog_id)
         return True
+
+    async def get_hard_delete_task(self, catalog_id: str) -> Optional[Any]:
+        """Look up the in-flight deprovision task for a hard-deleted catalog.
+
+        ``delete_catalog(force=True)`` enqueues a ``catalog_provision`` task
+        with a deterministic ``dedup_key`` (``catalog_provision:deprovision_hard:
+        {internal_id}``). The HTTP layer calls this right after ``delete_catalog``
+        returns to build a 202 status link. Resolution must tolerate a row that
+        was just tombstoned by that same call, so a live-row lookup is tried
+        first and a tombstone-inclusive fallback second.
+        """
+        internal_id = await self.resolve_catalog_id(catalog_id, allow_missing=True)
+        if internal_id is None:
+            internal_id = await self._get_tombstoned_catalog_id_by_external_id_db(
+                catalog_id
+            )
+        if internal_id is None:
+            return None
+
+        from dynastore.modules.tasks.models import Task
+        from dynastore.modules.tasks.tasks_module import get_task_schema
+
+        task_schema = get_task_schema()
+        dedup_key = f"catalog_provision:deprovision_hard:{internal_id}"
+        async with managed_transaction(get_catalog_engine()) as conn:
+            row = await DQLQuery(
+                f"SELECT * FROM {task_schema}.tasks"
+                " WHERE dedup_key = :dedup_key AND catalog_id = :catalog_id"
+                " AND status NOT IN ('COMPLETED', 'FAILED', 'DEAD_LETTER')"
+                " ORDER BY timestamp DESC LIMIT 1;",
+                result_handler=ResultHandler.ONE_DICT,
+            ).execute(conn, dedup_key=dedup_key, catalog_id=internal_id)
+        if row is None:
+            return None
+        return Task.model_validate(row)
 
     async def list_collections(
         self,

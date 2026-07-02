@@ -846,6 +846,9 @@ class CatalogModule(ModuleProtocol):
             catalog_id, force=force, ctx=ctx
         )
 
+    async def get_hard_delete_task(self, catalog_id: str) -> Optional[Any]:
+        return await self._cs.get_hard_delete_task(catalog_id)
+
     async def delete_catalog_language(
         self, catalog_id: str, lang: str, ctx: Optional[DriverContext] = None
     ) -> bool:

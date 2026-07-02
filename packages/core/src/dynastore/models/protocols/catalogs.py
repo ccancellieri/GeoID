@@ -234,6 +234,20 @@ class CatalogsProtocol(ItemCrudProtocol, ItemQueryProtocol, ItemIntrospectionPro
         """
         ...
 
+    async def get_hard_delete_task(
+        self, catalog_id: str,
+    ) -> Optional[Any]:
+        """
+        Look up the in-flight ``catalog_provision`` deprovision task a prior
+        ``delete_catalog(force=True)`` call enqueued for ``catalog_id``.
+
+        Resolves both live and just-tombstoned rows so a caller polling right
+        after the DELETE request still gets a hit. Returns ``None`` when
+        nothing is in flight (no hard delete was ever enqueued, or it has
+        already reached a terminal state).
+        """
+        ...
+
     async def update_provisioning_status(
         self, catalog_id: str, status: str, ctx: Optional["DriverContext"] = None,
     ) ->bool:

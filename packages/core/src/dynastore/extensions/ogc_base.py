@@ -865,8 +865,19 @@ class OGCServiceMixin:
         catalog_id: str,
         force: bool,
         db_resource: Any,
+        request: Optional[Request] = None,
     ) -> Response:
-        """Shared delete-catalog body used by Features and STAC."""
+        """Shared delete-catalog body used by Features and STAC.
+
+        Soft delete (force=False): synchronous tombstone; returns 204.
+        Hard delete (force=True): ``CatalogsProtocol.delete_catalog`` tombstones
+        the row and enqueues a durable ``catalog_provision`` deprovision task
+        (schema drop + external-resource teardown) rather than dropping the
+        schema inline — the request never blocks on the teardown itself. This
+        returns 202 with a Location header pointing at the polling endpoint
+        when a teardown task is in flight, or 204 when there was nothing to
+        tear down (no active provisioners for this catalog).
+        """
         catalogs_svc = await self._get_catalogs_service()
         ctx = DriverContext(db_resource=db_resource) if db_resource is not None else None
         delete_kwargs: Dict[str, Any] = {}
@@ -880,7 +891,60 @@ class OGCServiceMixin:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Catalog '{catalog_id}' not found.",
             )
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+        if not force:
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+        # Hard delete: report the teardown task delete_catalog() enqueued so
+        # the caller can poll instead of assuming the drop already finished.
+        task = await catalogs_svc.get_hard_delete_task(catalog_id)
+        if task is None:
+            # No active provisioners: delete_catalog() already purged inline.
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+        import json as _json
+
+        from dynastore.extensions.tools.url import enforce_https
+
+        task_id_str = str(task.task_id if hasattr(task, "task_id") else task.jobID)
+        if request is not None:
+            try:
+                raw_url = request.url_for(
+                    "get_task_status_catalog",
+                    catalog_id=catalog_id,
+                    task_id=task_id_str,
+                )
+                status_url = enforce_https(str(raw_url))
+            except Exception:
+                # url_for fails when the tasks extension isn't mounted; fall
+                # back to a path-relative construction.
+                base = enforce_https(str(request.base_url).rstrip("/"))
+                root_path = request.scope.get("root_path", "").rstrip("/")
+                status_url = (
+                    f"{base}{root_path}/task/catalogs/{catalog_id}/tasks/{task_id_str}"
+                )
+        else:
+            status_url = f"/task/catalogs/{catalog_id}/tasks/{task_id_str}"
+
+        body = _json.dumps({
+            "status": task.status if hasattr(task, "status") else "PENDING",
+            "task_id": task_id_str,
+            "catalog_id": catalog_id,
+            "links": [
+                {
+                    "rel": "monitor",
+                    "href": status_url,
+                    "type": "application/json",
+                    "title": "Deletion status",
+                }
+            ],
+        })
+        return Response(
+            status_code=status.HTTP_202_ACCEPTED,
+            headers={"Location": status_url},
+            media_type="application/json",
+            content=body,
+        )
 
     # ------------------------------------------------------------------
     # Shared rename-if-changed helpers (used by both PUT and PATCH paths)

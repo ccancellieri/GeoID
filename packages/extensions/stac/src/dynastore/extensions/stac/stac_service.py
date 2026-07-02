@@ -853,7 +853,7 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             ),
         ),
     ):
-        return await self._ogc_delete_catalog(catalog_id, force, None)
+        return await self._ogc_delete_catalog(catalog_id, force, None, request=request)
 
     async def replace_stac_collection(
         self,

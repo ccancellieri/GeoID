@@ -554,7 +554,7 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         force: bool = Query(False),
         conn: AsyncConnection = Depends(get_async_connection),
     ):
-        return await self._ogc_delete_catalog(catalog_id, force, conn)
+        return await self._ogc_delete_catalog(catalog_id, force, conn, request=request)
 
     # --- Collection Endpoints ---
     async def list_collections_in_catalog(
