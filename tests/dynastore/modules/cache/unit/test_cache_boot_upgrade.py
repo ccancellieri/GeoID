@@ -229,6 +229,162 @@ async def test_boot_upgrade_retries_transient_valkey_probe_failure(monkeypatch):
     assert cm._current_backend is None
 
 
+async def test_boot_upgrade_rebuilds_snapshot_once_db_pool_becomes_ready(
+    monkeypatch,
+):
+    """#2857: the boot-upgrade loop must re-run build_engine_snapshot itself,
+    not just re-probe a snapshot dict nothing else will ever populate.
+
+    Models the exact production race: ``DBConfigModule``'s own one-shot
+    ``refresh_snapshot_until_ready`` background task already exhausted its
+    retry budget with the resolver snapshot still empty (the DB pool wasn't
+    up yet during that window), the SAME way it always does in production
+    because ``CacheModule`` (priority 9) is sequenced strictly before
+    ``DBService`` (priority 10) installs the pool. The pool then genuinely
+    comes up a couple of attempts into the boot-upgrade loop.
+
+    Uses a *real* ``EngineInstanceCache`` wired with ``make_resolver`` /
+    ``make_writer`` over a snapshot dict that starts empty and — crucially —
+    stays permanently empty unless something calls the on-demand
+    ``engine_snapshot_refresh`` callable published on ``app_state``. Before
+    the fix, ``_boot_upgrade_to_valkey`` never called it, so
+    ``engine_cache.get`` would KeyError for the whole retry budget even
+    once the pool was ready.
+    """
+    import dynastore.modules.cache.cache_module as cm
+    import dynastore.tools.cache as dcache
+    import dynastore.tools.cache_valkey as cv
+    from dynastore.modules.cache.cache_module import CacheModule
+    from dynastore.modules.db_config.engine_config import ValkeyEngineConfig
+    from dynastore.modules.db_config.engine_instance_cache import EngineInstanceCache
+    from dynastore.modules.db_config.engine_resolver import make_resolver, make_writer
+
+    _reset_module_state()
+
+    snapshot: dict = {}
+    engine_cache = EngineInstanceCache(
+        engine_resolver=make_resolver(snapshot),
+        engine_writer=make_writer(snapshot),
+    )
+
+    sentinel_client = object()
+
+    async def _fake_engine_init(self: ValkeyEngineConfig) -> object:
+        return sentinel_client
+
+    monkeypatch.setattr(ValkeyEngineConfig, "engine_init", _fake_engine_init)
+
+    # The DB pool "comes up" on the 2nd on-demand refresh attempt — the
+    # first still observes ``db_resource is None`` and adds nothing.
+    pool_ready_after = 2
+    calls = {"n": 0}
+
+    async def _snapshot_refresh() -> bool:
+        calls["n"] += 1
+        if calls["n"] < pool_ready_after:
+            return False
+        cfg = ValkeyEngineConfig()
+        snapshot["valkey_engine_config"] = cfg
+        snapshot["valkey_engine"] = cfg
+        return True
+
+    monkeypatch.setattr(cv, "_CACHE_DEPS_OK", True)
+    monkeypatch.setattr(cv, "ValkeyCacheBackend", _FakeBackend)
+
+    fake_mgr = _FakeManager()
+    monkeypatch.setattr(dcache, "get_cache_manager", lambda: fake_mgr)
+
+    async def _no_cfg(*_a: Any, **_kw: Any) -> Any:
+        from dynastore.modules.cache.cache_config import CachePluginConfig
+
+        return CachePluginConfig()
+
+    monkeypatch.setattr(cm, "_load_cache_config", _no_cfg)
+    monkeypatch.setattr(cm, "_BOOT_UPGRADE_INITIAL_DELAY", 0.01)
+    monkeypatch.setattr(cm, "_BOOT_UPGRADE_MAX_DELAY", 0.02)
+
+    app_state = types.SimpleNamespace(
+        engine_cache=engine_cache,
+        engine_snapshot_refresh=_snapshot_refresh,
+    )
+    module = CacheModule(app_state=app_state)
+
+    async with module.lifespan(app_state):
+        # Boot race still lost at module entry — same as production.
+        assert cm._current_backend is None
+
+        for _ in range(300):
+            if cm._current_backend is not None:
+                break
+            await asyncio.sleep(0.01)
+
+        assert isinstance(cm._current_backend, _FakeBackend), (
+            "boot upgrade must rebuild the snapshot via "
+            "engine_snapshot_refresh and register a Valkey backend once "
+            "the DB pool becomes ready — without rebuilding, "
+            "engine_cache.get would KeyError forever against a "
+            "permanently empty snapshot"
+        )
+        assert calls["n"] >= pool_ready_after, (
+            "the boot-upgrade loop must call engine_snapshot_refresh on "
+            "more than one attempt"
+        )
+        assert fake_mgr.registered and isinstance(
+            fake_mgr.registered[-1], _FakeBackend
+        )
+
+    assert cm._current_backend is None
+
+
+async def test_boot_upgrade_stays_local_when_snapshot_never_rebuilds(
+    monkeypatch,
+):
+    """Regression guard: without a working snapshot_refresh, an empty
+    resolver snapshot must never spontaneously resolve — pins the pre-fix
+    failure mode so a future change can't silently reintroduce it.
+    """
+    import dynastore.modules.cache.cache_module as cm
+    import dynastore.tools.cache_valkey as cv
+    from dynastore.modules.cache.cache_module import CacheModule
+    from dynastore.modules.db_config.engine_instance_cache import EngineInstanceCache
+    from dynastore.modules.db_config.engine_resolver import make_resolver, make_writer
+
+    _reset_module_state()
+
+    snapshot: dict = {}
+    engine_cache = EngineInstanceCache(
+        engine_resolver=make_resolver(snapshot),
+        engine_writer=make_writer(snapshot),
+    )
+
+    monkeypatch.setattr(cv, "_CACHE_DEPS_OK", True)
+    monkeypatch.setattr(cv, "ValkeyCacheBackend", _FakeBackend)
+
+    async def _no_cfg(*_a: Any, **_kw: Any) -> Any:
+        from dynastore.modules.cache.cache_config import CachePluginConfig
+
+        return CachePluginConfig()
+
+    monkeypatch.setattr(cm, "_load_cache_config", _no_cfg)
+    monkeypatch.setattr(cm, "_BOOT_UPGRADE_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(cm, "_BOOT_UPGRADE_INITIAL_DELAY", 0.001)
+    monkeypatch.setattr(cm, "_BOOT_UPGRADE_MAX_DELAY", 0.001)
+
+    # No engine_snapshot_refresh on app_state at all (back-compat / never
+    # wired) — the snapshot has no way to ever gain an entry.
+    app_state = types.SimpleNamespace(engine_cache=engine_cache)
+    module = CacheModule(app_state=app_state)
+
+    async with module.lifespan(app_state):
+        await asyncio.sleep(0.05)
+        assert cm._current_backend is None, (
+            "an empty resolver snapshot with no refresher wired must stay "
+            "LOCAL — it has no path to ever resolve 'valkey_engine'"
+        )
+
+    assert cm._current_backend is None
+
+
 async def test_degraded_boot_registers_apply_handler(monkeypatch):
     """The apply handler is live even when boot degrades to LOCAL.
 

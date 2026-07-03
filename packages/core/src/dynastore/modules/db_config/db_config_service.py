@@ -19,9 +19,10 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 from contextlib import asynccontextmanager, AsyncExitStack
-from typing import Any, Dict, Optional, Protocol, runtime_checkable
+from typing import Any, Awaitable, Callable, Dict, Optional, Protocol, runtime_checkable
 
 from dynastore.modules import ModuleProtocol
 from dynastore.tools.background_service import BackgroundSupervisor, ServiceContext
@@ -40,6 +41,7 @@ from .engine_resolver import (
     make_resolver,
     make_writer,
     refresh_snapshot_until_ready,
+    try_refresh_snapshot_once,
 )
 from .platform_config_service import PlatformConfigService
 
@@ -61,6 +63,16 @@ class DBConfigAppState(Protocol):
     # cache even though the snapshot would have resolved a moment later.
     # See GeoID #833.
     engine_snapshot_refresh_task: "Optional[asyncio.Task[bool]]"
+    # On-demand single-attempt re-resolver, bound to the same snapshot dict
+    # and ``PlatformConfigService`` used above.  ``engine_snapshot_refresh_task``
+    # is a ONE-SHOT background retry that gives up permanently once its own
+    # budget is exhausted — nothing re-runs ``build_engine_snapshot`` after
+    # that, so a caller whose own recovery loop wakes up later (e.g.
+    # ``CacheModule``'s boot-upgrade loop, once the DB pool is genuinely up)
+    # would otherwise probe a snapshot dict that can never be populated
+    # again. Callers with their own retry cadence call this once per
+    # attempt instead of re-probing a dead snapshot. See GeoID #2857.
+    engine_snapshot_refresh: "Callable[[], Awaitable[bool]]"
 
 
 class DBConfigModule(ModuleProtocol):
@@ -78,8 +90,15 @@ class DBConfigModule(ModuleProtocol):
 
     async def _build_engine_cache(
         self, pcfg: PlatformConfigService, app_state: "DBConfigAppState"
-    ) -> tuple[EngineInstanceCache, "Optional[asyncio.Task[bool]]", BackgroundSupervisor, asyncio.Event]:
-        """Snapshot platform engines + return (cache, refresh_task, supervisor, shutdown).
+    ) -> tuple[
+        EngineInstanceCache,
+        "Optional[asyncio.Task[bool]]",
+        BackgroundSupervisor,
+        asyncio.Event,
+        "Callable[[], Awaitable[bool]]",
+    ]:
+        """Snapshot platform engines + return (cache, refresh_task, supervisor,
+        shutdown, on_demand_refresh).
 
         The initial ``build_engine_snapshot`` call runs synchronously, but at
         this point in lifespan ``DBService`` (priority 10) has not yet
@@ -127,7 +146,15 @@ class DBConfigModule(ModuleProtocol):
                 refresh_snapshot_until_ready(snapshot, pcfg),
                 name="engine_snapshot_refresh",
             )
-        return cache, refresh_task, supervisor, sweep_shutdown
+        # Bound to this same ``snapshot`` dict + ``pcfg`` — a single
+        # ``build_engine_snapshot`` attempt any later recovery loop can call
+        # on its own cadence, reusing the one machinery that actually
+        # populates the snapshot rather than re-probing a dict nothing else
+        # will ever write to again once ``refresh_task`` exhausts. #2857
+        on_demand_refresh = functools.partial(
+            try_refresh_snapshot_once, snapshot, pcfg
+        )
+        return cache, refresh_task, supervisor, sweep_shutdown, on_demand_refresh
 
     @staticmethod
     async def _cancel_refresh_task(task: "asyncio.Task[bool]") -> None:
@@ -200,7 +227,7 @@ class DBConfigModule(ModuleProtocol):
             # engine configs at boot, exposes lazy-instantiating cache.
             # Until F.4c lands, no driver consumes this in production paths,
             # but admin tooling + tests use it via app_state.engine_cache.
-            engine_cache, refresh_task, sweep_supervisor, sweep_shutdown = (
+            engine_cache, refresh_task, sweep_supervisor, sweep_shutdown, on_demand_refresh = (
                 await self._build_engine_cache(pcfg, app_state)
             )
             app_state.engine_cache = engine_cache
@@ -209,6 +236,12 @@ class DBConfigModule(ModuleProtocol):
             # engine_cache.get(...) — #833.  None when the synchronous initial
             # build already populated the snapshot (no race to bridge).
             app_state.engine_snapshot_refresh_task = refresh_task
+            # Publish the on-demand single-attempt refresher so a later
+            # recovery loop (e.g. CacheModule's boot-upgrade loop) can
+            # re-run build_engine_snapshot itself instead of only ever
+            # re-probing a snapshot dict that the one-shot refresh_task
+            # above stopped writing to once its own budget exhausted. #2857
+            app_state.engine_snapshot_refresh = on_demand_refresh
             if refresh_task is not None:
                 stack.push_async_callback(
                     self._cancel_refresh_task, refresh_task

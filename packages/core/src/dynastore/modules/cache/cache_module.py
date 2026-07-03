@@ -50,7 +50,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Optional
 
 from dynastore.modules.protocols import ModuleProtocol
 from dynastore.tools.async_utils import LoopLocalLock
@@ -744,7 +744,10 @@ def _unregister_engine_apply_handlers() -> None:
         pass
 
 
-async def _boot_upgrade_to_valkey(engine_cache: "EngineInstanceCache") -> None:
+async def _boot_upgrade_to_valkey(
+    engine_cache: "EngineInstanceCache",
+    snapshot_refresh: "Optional[Callable[[], Any]]" = None,
+) -> None:
     """Upgrade a boot-order LOCAL fallback to the shared Valkey backend.
 
     CacheModule (priority 9) initialises before DBService (priority 10)
@@ -760,12 +763,31 @@ async def _boot_upgrade_to_valkey(engine_cache: "EngineInstanceCache") -> None:
     Without this, a boot-order degrade to LOCAL latches per-instance for the
     whole process lifetime — the snapshot refresh repopulates the engine
     cache moments later, but CacheModule never re-checks it.
+
+    ``snapshot_refresh`` (``app_state.engine_snapshot_refresh`` — #2857):
+    re-runs ``build_engine_snapshot`` once per attempt, BEFORE probing
+    ``engine_cache.get``.  ``DBConfigModule``'s own one-shot background
+    retry (``engine_snapshot_refresh_task``) gives up permanently once its
+    own budget is exhausted and nothing else ever writes to the snapshot
+    dict again — so without this, this loop only ever re-probes a snapshot
+    that can never become non-empty, and always exhausts its own budget
+    too, even once the DB pool is genuinely up.  ``None`` only in tests
+    that pre-date #2857 or stub ``engine_cache`` directly.
     """
     delay = _BOOT_UPGRADE_INITIAL_DELAY
     for attempt in range(1, _BOOT_UPGRADE_MAX_ATTEMPTS + 1):
         if _current_backend is not None:
             # Already upgraded (e.g. via a concurrent config apply).
             return
+        if snapshot_refresh is not None:
+            try:
+                await snapshot_refresh()
+            except Exception:
+                logger.debug(
+                    "CacheModule: boot-upgrade snapshot refresh attempt "
+                    "%d/%d failed", attempt, _BOOT_UPGRADE_MAX_ATTEMPTS,
+                    exc_info=True,
+                )
         try:
             await engine_cache.get("valkey_engine")
         except Exception:
@@ -808,6 +830,7 @@ async def _boot_upgrade_to_valkey(engine_cache: "EngineInstanceCache") -> None:
 @asynccontextmanager
 async def _degraded_local_lifespan(
     engine_cache: "Optional[EngineInstanceCache]",
+    snapshot_refresh: "Optional[Callable[[], Any]]" = None,
 ) -> AsyncGenerator[None, None]:
     """Yield in LOCAL-cache mode while keeping a live path back to Valkey.
 
@@ -817,6 +840,11 @@ async def _degraded_local_lifespan(
     is impossible.  Registers the apply handlers and spawns a bounded
     background upgrade task, then cleans both up on shutdown (closing the
     Valkey backend if the upgrade succeeded).
+
+    ``snapshot_refresh`` — ``app_state.engine_snapshot_refresh`` (#2857) —
+    is forwarded to :func:`_boot_upgrade_to_valkey` so each retry attempt
+    can re-run ``build_engine_snapshot`` instead of only re-probing a
+    snapshot dict the boot-time one-shot retry already gave up on.
     """
     global _current_backend
     upgrade_task: Optional["asyncio.Task[None]"] = None
@@ -825,7 +853,7 @@ async def _degraded_local_lifespan(
         _register_engine_apply_handlers()
         handlers_registered = True
         upgrade_task = asyncio.create_task(
-            _boot_upgrade_to_valkey(engine_cache),
+            _boot_upgrade_to_valkey(engine_cache, snapshot_refresh),
             name="cache-boot-upgrade-to-valkey",
         )
     try:
@@ -876,6 +904,13 @@ class CacheModule(ModuleProtocol):
         engine_cache: Optional[EngineInstanceCache] = getattr(
             app_state, "engine_cache", None
         )
+        # On-demand single-attempt snapshot re-resolver (#2857) — forwarded
+        # to the boot-upgrade recovery loop so it can re-run
+        # build_engine_snapshot itself once the DB pool comes up, instead of
+        # only ever re-probing a snapshot dict the boot-time one-shot retry
+        # already gave up on.  ``getattr`` keeps back-compat with test
+        # stubs that pre-date #2857.
+        snapshot_refresh = getattr(app_state, "engine_snapshot_refresh", None)
         backend = None
         client = None
         engine_mode = False
@@ -980,7 +1015,7 @@ class CacheModule(ModuleProtocol):
             # DBService (10) + config seeding (15), i.e. after this module
             # yields.  Keep a live path back to Valkey instead of latching
             # LOCAL for the process lifetime.
-            async with _degraded_local_lifespan(engine_cache):
+            async with _degraded_local_lifespan(engine_cache, snapshot_refresh):
                 yield
             return
 
@@ -1049,7 +1084,7 @@ class CacheModule(ModuleProtocol):
             await backend.close()
             # Transient boot probe failure: keep the apply handler live and
             # attempt one background reconnect rather than latching LOCAL.
-            async with _degraded_local_lifespan(engine_cache):
+            async with _degraded_local_lifespan(engine_cache, snapshot_refresh):
                 yield
             return
 

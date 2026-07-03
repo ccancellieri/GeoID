@@ -145,6 +145,25 @@ async def build_engine_snapshot(
     return snapshot
 
 
+async def _snapshot_attempt(
+    snapshot: Dict[str, EngineConfig], pcfg: "PlatformConfigService"
+) -> int:
+    """Run one ``build_engine_snapshot`` pass into ``snapshot``.
+
+    Shared by :func:`refresh_snapshot_until_ready` (bounded retry loop with
+    its own backoff + exhaustion logging) and
+    :func:`try_refresh_snapshot_once` (single on-demand attempt for a
+    caller that owns its own retry cadence). Returns the number of
+    registered engine kinds currently present in ``snapshot``.
+    """
+    await build_engine_snapshot(pcfg, into=snapshot)
+    return sum(
+        1
+        for class_key in list_registered_engines()
+        if class_key in snapshot
+    )
+
+
 async def refresh_snapshot_until_ready(
     snapshot: Dict[str, EngineConfig],
     pcfg: "PlatformConfigService",
@@ -169,12 +188,7 @@ async def refresh_snapshot_until_ready(
     expected = len(list_registered_engines())
     delay = initial_delay
     for attempt in range(1, max_attempts + 1):
-        await build_engine_snapshot(pcfg, into=snapshot)
-        loaded = sum(
-            1
-            for class_key in list_registered_engines()
-            if class_key in snapshot
-        )
+        loaded = await _snapshot_attempt(snapshot, pcfg)
         if loaded > 0:
             logger.info(
                 "engine snapshot ready: attempt=%d loaded=%d/%d",
@@ -192,6 +206,26 @@ async def refresh_snapshot_until_ready(
         max_attempts, expected,
     )
     return False
+
+
+async def try_refresh_snapshot_once(
+    snapshot: Dict[str, EngineConfig], pcfg: "PlatformConfigService"
+) -> bool:
+    """Single on-demand ``build_engine_snapshot`` attempt — #2857.
+
+    For a caller that already owns its own retry loop and cadence (e.g.
+    ``CacheModule``'s boot-upgrade recovery loop) and just wants "try to
+    resolve the snapshot again right now" on each of its own attempts,
+    without nesting :func:`refresh_snapshot_until_ready`'s independent
+    backoff loop or triggering its terminal-exhaustion ``ERROR`` log on
+    every single miss.
+
+    Mutates ``snapshot`` in place, same as :func:`refresh_snapshot_until_ready`.
+    Returns ``True`` when the snapshot has at least one entry after this
+    attempt.
+    """
+    loaded = await _snapshot_attempt(snapshot, pcfg)
+    return loaded > 0
 
 
 def make_resolver(
@@ -245,4 +279,5 @@ __all__ = [
     "make_resolver",
     "make_writer",
     "refresh_snapshot_until_ready",
+    "try_refresh_snapshot_once",
 ]

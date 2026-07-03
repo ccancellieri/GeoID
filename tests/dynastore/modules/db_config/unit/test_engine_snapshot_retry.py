@@ -171,6 +171,78 @@ async def test_refresh_returns_false_when_budget_exhausted_and_logs_error(
 
 
 # --------------------------------------------------------------------------
+# try_refresh_snapshot_once — #2857 on-demand single attempt
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_try_refresh_snapshot_once_returns_false_while_pool_not_ready(
+    pcfg_stub, caplog,
+):
+    """A single on-demand attempt during the boot race returns False and
+    must NOT log the bounded-retry-loop's terminal ERROR — that log is
+    reserved for refresh_snapshot_until_ready's own budget exhaustion, not
+    every miss from a caller with its own outer retry cadence.
+    """
+    pcfg_stub.get_config.side_effect = RuntimeError("db_resource is None")
+
+    snapshot: dict[str, EngineConfig] = {}
+    with caplog.at_level("ERROR", logger="dynastore.modules.db_config.engine_resolver"):
+        ok = await er.try_refresh_snapshot_once(snapshot, pcfg_stub)
+
+    assert ok is False
+    assert snapshot == {}
+    assert not any(
+        "retry budget exhausted" in rec.getMessage() for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_try_refresh_snapshot_once_populates_snapshot_once_ready(
+    pcfg_stub,
+):
+    """Once the DB pool is up, a single attempt is enough to populate the
+    snapshot — the contract a caller like CacheModule's boot-upgrade loop
+    relies on when it calls this once per retry attempt.
+    """
+    pcfg_stub.get_config.return_value = PostgresqlEngineConfig()
+
+    snapshot: dict[str, EngineConfig] = {}
+    ok = await er.try_refresh_snapshot_once(snapshot, pcfg_stub)
+
+    assert ok is True
+    assert "postgresql_engine_config" in snapshot
+
+
+@pytest.mark.asyncio
+async def test_try_refresh_snapshot_once_mutates_same_dict_across_calls(
+    pcfg_stub,
+):
+    """Repeated on-demand attempts, like refresh_snapshot_until_ready, must
+    mutate the SAME dict in place so a resolver closure built once observes
+    a later successful attempt without being rebuilt.
+    """
+    state = {"ready": False}
+
+    def _gated(cls):
+        if not state["ready"]:
+            raise RuntimeError("db_resource is None")
+        return cls()
+
+    pcfg_stub.get_config.side_effect = _gated
+
+    snapshot: dict[str, EngineConfig] = {}
+    resolver = er.make_resolver(snapshot)
+
+    assert await er.try_refresh_snapshot_once(snapshot, pcfg_stub) is False
+    assert resolver("valkey_engine") is None
+
+    state["ready"] = True
+    assert await er.try_refresh_snapshot_once(snapshot, pcfg_stub) is True
+    assert isinstance(resolver("valkey_engine"), ValkeyEngineConfig)
+
+
+# --------------------------------------------------------------------------
 # make_resolver observes mutation in place
 # --------------------------------------------------------------------------
 
