@@ -47,6 +47,14 @@ class MappingEntry(TypedDict):
     title: str
     region_ids_file: str
     bbox: List[float]
+    layer_name: str
+    server_type: str
+    server_subdomains: List[str]
+    server_min_zoom: int
+    server_max_native_zoom: int
+    server_max_zoom: int
+    unique_id_prop: str
+    digits: int
 
 
 def _load_template():

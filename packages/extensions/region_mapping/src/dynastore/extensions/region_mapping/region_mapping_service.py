@@ -29,11 +29,12 @@ had an open bug (dynastore#448 Status).
 
 Routes:
 
-* ``POST   /region-mappings``                       -- register/re-apply a mapping
-* ``DELETE /region-mappings/{mapping_id}``           -- revoke a mapping (all its claims)
-* ``GET    /region-mappings``                        -- list claim rows (CQL2 filter)
-* ``GET    /region-mappings/region.json``            -- ``{"regionWmsMap": {...}}``
-* ``GET    /region-mappings/{mapping_id}/regionIds``  -- sorted distinct values
+* ``POST   /region-mappings``                           -- register/re-apply a mapping
+* ``DELETE /region-mappings/{mapping_id}``               -- revoke a mapping (all its claims)
+* ``GET    /region-mappings``                            -- list claim rows (CQL2 filter)
+* ``GET    /region-mappings/region.json``                -- ``{"regionWmsMap": {...}}``
+* ``GET    /region-mappings/{mapping_id}/regionIds``      -- sorted distinct values
+* ``GET    /region-mappings/{mapping_id}/regionIds.csv``  -- same values, as a downloadable CSV
 
 REGISTRATION IS PUBLICATION -- unchanged from dynastore#443. Applying a
 mapping via ``POST`` is an explicit decision to publish, to anyone who can
@@ -56,18 +57,24 @@ this extension does not assume or automate that decision.
 """
 from __future__ import annotations
 
+import csv
+import io
 import logging
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlsplit, urlunsplit
 
-from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from dynastore.extensions.protocols import ExtensionProtocol
+from dynastore.extensions.tools.language_utils import get_language
 from dynastore.extensions.tools.query import resolve_queryable_property_names
+from dynastore.extensions.tools.response_i18n import resolve_localized
 from dynastore.extensions.tools.url import get_root_url
 from dynastore.models.protocols.catalogs import CatalogsProtocol
+from dynastore.models.protocols.configs import ConfigsProtocol
 from dynastore.modules.tools.cql import parse_cql_filter
 from dynastore.tools.discovery import get_protocol
 from dynastore.tools.protocol_helpers import get_engine
@@ -75,6 +82,7 @@ from dynastore.tools.protocol_helpers import get_engine
 from . import registry_queries as _q
 from . import registry_store as _store
 from .claims import fetch_collection_bbox, fetch_distinct_region_ids
+from .config import RegionMappingConfig
 from .lifecycle import register_region_mapping_cleanup_subscriber
 from .templates import render_definitions
 
@@ -115,8 +123,42 @@ class RegisterMappingRequest(BaseModel):
     extra_aliases: List[str] = Field(
         default_factory=list, description="Additional alias strings TerriaJS should also accept.",
     )
-    title: Optional[str] = Field(
-        default=None, description="Human-readable description; defaults to the collection id.",
+    title: Optional[Union[str, Dict[str, str]]] = Field(
+        default=None,
+        description=(
+            "TerriaJS's regionWmsMap 'description' -- used in GUI elements and "
+            "error messages. Defaults to the collection id. A plain string is "
+            "stored under the request's language (see the `lang` query "
+            "parameter, same convention as the rest of the platform); a "
+            "{lang: text} dict is stored as given."
+        ),
+    )
+    layer_name: str = Field(
+        default="default",
+        description="TerriaJS layerName -- the tile layer within this mapping's server.",
+    )
+    server_type: str = Field(
+        default="MVT", description="TerriaJS serverType, e.g. 'MVT' or 'WMS'.",
+    )
+    server_subdomains: List[str] = Field(
+        default_factory=list,
+        description="TerriaJS serverSubdomains, for {s}-templated tile server URLs.",
+    )
+    server_min_zoom: int = Field(default=0, ge=0, description="TerriaJS serverMinZoom.")
+    server_max_native_zoom: int = Field(
+        default=12, ge=0, description="TerriaJS serverMaxNativeZoom.",
+    )
+    server_max_zoom: int = Field(default=28, ge=0, description="TerriaJS serverMaxZoom.")
+    unique_id_prop: Optional[str] = Field(
+        default=None,
+        description=(
+            "TerriaJS uniqueIdProp, when it differs from regionProp (`column`). "
+            "Defaults to `column` if not given."
+        ),
+    )
+    digits: int = Field(
+        default=255,
+        description="TerriaJS digits -- left-zero-pad width for numeric region codes.",
     )
 
 
@@ -133,7 +175,15 @@ class ClaimOut(BaseModel):
     src_collection: str
     region_prop: str
     alias: Optional[str] = None
-    title: Optional[str] = None
+    title: Optional[Any] = None
+    layer_name: Optional[str] = None
+    server_type: Optional[str] = None
+    server_subdomains: Optional[List[str]] = None
+    server_min_zoom: Optional[int] = None
+    server_max_native_zoom: Optional[int] = None
+    server_max_zoom: Optional[int] = None
+    unique_id_prop: Optional[str] = None
+    digits: Optional[int] = None
 
 
 class RegisterMappingResponse(BaseModel):
@@ -180,6 +230,26 @@ def _parse_cql(filter_text: Optional[str]) -> tuple[str, Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+def _default_maps_base_url(catalog_base_url: str) -> str:
+    """Sibling-path fallback when ``RegionMappingConfig.maps_base_url`` is unset.
+
+    Swaps this request's own last gateway-path segment for ``maps``, e.g.
+    ``.../api/catalog`` -> ``.../api/maps``. Only correct when the deployment
+    follows that convention; set the config explicitly otherwise.
+    """
+    scheme, netloc, path, _, _ = urlsplit(catalog_base_url)
+    segments = path.rstrip("/").split("/")
+    if segments:
+        segments[-1] = "maps"
+    return urlunsplit((scheme, netloc, "/".join(segments), "", ""))
+
+
+async def _get_maps_base_url(base_url: str) -> str:
+    configs = get_protocol(ConfigsProtocol)
+    config = await configs.get_config(RegionMappingConfig) if configs else RegionMappingConfig()
+    return config.maps_base_url or _default_maps_base_url(base_url)
+
+
 async def _build_definitions(
     request: Request,
     *,
@@ -190,6 +260,7 @@ async def _build_definitions(
     cql_params: Dict[str, Any],
     limit: int,
     offset: int,
+    language: str,
 ) -> Dict[str, Any]:
     alias_ci = alias.strip().casefold() if alias else None
 
@@ -216,6 +287,7 @@ async def _build_definitions(
 
     page = list(by_mapping.items())[offset: offset + limit]
     base_url = get_root_url(request)
+    maps_base_url = await _get_maps_base_url(base_url)
 
     entries = []
     for mapping_id, record in page:
@@ -225,14 +297,14 @@ async def _build_definitions(
         src_catalog = record.get("src_catalog", "")
         src_collection = record.get("src_collection", "")
         region_prop = record.get("region_prop", "")
-        title = record.get("title") or src_collection
+        title = resolve_localized(record.get("title"), language) or src_collection
 
         bbox = await fetch_collection_bbox(src_catalog, src_collection)
 
         entries.append({
             "key": f"{src_catalog}_{src_collection}".upper(),
             "server": (
-                f"{base_url}/maps/tiles/catalogs/{src_catalog}/tiles/"
+                f"{maps_base_url}/tiles/catalogs/{src_catalog}/tiles/"
                 f"{{z}}/{{x}}/{{y}}.mvt?collections={src_collection}"
             ),
             "region_prop": region_prop,
@@ -240,6 +312,14 @@ async def _build_definitions(
             "title": title,
             "region_ids_file": f"{base_url}/region-mappings/{mapping_id}/regionIds",
             "bbox": bbox,
+            "layer_name": record.get("layer_name") or "default",
+            "server_type": record.get("server_type") or "MVT",
+            "server_subdomains": record.get("server_subdomains") or [],
+            "server_min_zoom": record.get("server_min_zoom", 0),
+            "server_max_native_zoom": record.get("server_max_native_zoom", 12),
+            "server_max_zoom": record.get("server_max_zoom", 28),
+            "unique_id_prop": record.get("unique_id_prop") or region_prop,
+            "digits": record.get("digits", 255),
         })
     return render_definitions(entries)
 
@@ -273,7 +353,10 @@ class RegionMappingService(ExtensionProtocol):
         status_code=status.HTTP_201_CREATED,
         summary="Claim a collection's region-id column for TerriaJS WMS region mapping.",
     )
-    async def register_mapping(payload: RegisterMappingRequest) -> RegisterMappingResponse:  # type: ignore[reportGeneralTypeIssues]
+    async def register_mapping(
+        payload: RegisterMappingRequest,  # type: ignore[reportGeneralTypeIssues]
+        lang: str = Depends(get_language),
+    ) -> RegisterMappingResponse:
         """Register (or idempotently re-apply) one mapping's claim set.
 
         A claim already owned by a *different* mapping is a genuine PG
@@ -311,7 +394,13 @@ class RegionMappingService(ExtensionProtocol):
                 engine,
                 catalog_id=payload.catalog, collection_id=payload.collection,
                 column=payload.column, alias=payload.alias,
-                extra_aliases=tuple(payload.extra_aliases), title=payload.title,
+                extra_aliases=tuple(payload.extra_aliases), title=payload.title, lang=lang,
+                layer_name=payload.layer_name, server_type=payload.server_type,
+                server_subdomains=payload.server_subdomains,
+                server_min_zoom=payload.server_min_zoom,
+                server_max_native_zoom=payload.server_max_native_zoom,
+                server_max_zoom=payload.server_max_zoom,
+                unique_id_prop=payload.unique_id_prop, digits=payload.digits,
             )
         except ValueError as ve:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve)) from ve
@@ -356,15 +445,19 @@ class RegionMappingService(ExtensionProtocol):
         ),
         limit: int = Query(_DEFAULT_LIMIT, ge=1, le=1000, description="Claims per page."),
         offset: int = Query(0, ge=0, description="Claims to skip."),
+        language: str = Depends(get_language),
     ) -> ClaimListResponse:
         cql_where, cql_params = _parse_cql(filter)
         rows = await _store.list_claims(
             mapping_id=mapping_id, role=role, src_catalog=catalog, src_collection=collection,
             cql_where=cql_where, cql_params=cql_params, limit=limit, offset=offset,
         )
-        return ClaimListResponse(
-            items=[ClaimOut.model_validate(row) for row in rows], limit=limit, offset=offset,
-        )
+        items = []
+        for row in rows:
+            row = dict(row)
+            row["title"] = resolve_localized(row.get("title"), language)
+            items.append(ClaimOut.model_validate(row))
+        return ClaimListResponse(items=items, limit=limit, offset=offset)
 
     # -------------------------------------------------------------------
     # GET /region-mappings/region.json
@@ -390,6 +483,7 @@ class RegionMappingService(ExtensionProtocol):
         ),
         limit: int = Query(_DEFAULT_LIMIT, ge=1, le=1000, description="Mappings per page."),
         offset: int = Query(0, ge=0, description="Mappings to skip."),
+        language: str = Depends(get_language),
     ) -> Dict[str, Any]:
         """Return ``{"regionWmsMap": {...}}`` -- one entry per registered mapping."""
         if get_protocol(CatalogsProtocol) is None:
@@ -398,6 +492,7 @@ class RegionMappingService(ExtensionProtocol):
         return await _build_definitions(
             request, catalog=catalog, collection=collection, alias=alias,
             cql_where=cql_where, cql_params=cql_params, limit=limit, offset=offset,
+            language=language,
         )
 
     # -------------------------------------------------------------------
@@ -422,3 +517,42 @@ class RegionMappingService(ExtensionProtocol):
             record.get("src_catalog", ""), record.get("src_collection", ""), region_prop,
         )
         return {"layer": "default", "property": region_prop, "values": values}
+
+    # -------------------------------------------------------------------
+    # GET /region-mappings/{mapping_id}/regionIds.csv
+    # -------------------------------------------------------------------
+
+    @router.get(
+        "/{mapping_id}/regionIds.csv",
+        summary="Downloadable CSV template of this mapping's region-id values.",
+    )
+    async def get_region_ids_csv(mapping_id: str):  # type: ignore[reportGeneralTypeIssues]
+        """One column of every distinct region-id value, headed by the
+        mapping's alias -- the exact CSV column name TerriaJS matches
+        against. A ready-to-fill template for testing/seeding a
+        region-mapped CSV catalog item, built from the same live values as
+        ``GET .../regionIds``.
+        """
+        if get_protocol(CatalogsProtocol) is None:
+            raise HTTPException(status_code=503, detail="Catalogs service not available.")
+        record = await _store.fetch_mapping_primary(mapping_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404, detail=f"Region mapping {mapping_id!r} not found.",
+            )
+        header = record.get("alias") or record.get("region_prop") or "region_id"
+        values = await fetch_distinct_region_ids(
+            record.get("src_catalog", ""), record.get("src_collection", ""),
+            record.get("region_prop", ""),
+        )
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow([header])
+        writer.writerows([value] for value in values)
+
+        return Response(
+            content=buffer.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{mapping_id}.csv"'},
+        )

@@ -2,17 +2,17 @@
   "regionWmsMap": {
     {%- for m in mappings %}
     {{ m.key | tojson }}: {
-      "layerName": "default",
+      "layerName": {{ m.layer_name | tojson }},
       "server": {{ m.server | tojson }},
-      "serverType": "MVT",
-      "serverSubdomains": [],
-      "serverMinZoom": 0,
-      "serverMaxNativeZoom": 12,
-      "serverMaxZoom": 28,
+      "serverType": {{ m.server_type | tojson }},
+      "serverSubdomains": {{ m.server_subdomains | tojson }},
+      "serverMinZoom": {{ m.server_min_zoom | tojson }},
+      "serverMaxNativeZoom": {{ m.server_max_native_zoom | tojson }},
+      "serverMaxZoom": {{ m.server_max_zoom | tojson }},
       "regionProp": {{ m.region_prop | tojson }},
-      "uniqueIdProp": {{ m.region_prop | tojson }},
+      "uniqueIdProp": {{ m.unique_id_prop | tojson }},
       "aliases": {{ m.aliases | tojson }},
-      "digits": 255,
+      "digits": {{ m.digits | tojson }},
       "description": {{ m.title | tojson }},
       "regionIdsFile": {{ m.region_ids_file | tojson }},
       "bbox": {{ m.bbox | tojson }}

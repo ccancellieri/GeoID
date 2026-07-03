@@ -58,29 +58,52 @@ _QUALIFIED_TABLE = f"{SCHEMA}.{TABLE}"
 # Every column on the table — the whitelist backing both the CQL2 filter
 # pipeline (GET /region-mappings, GET /region-mappings/region.json) and the
 # API's list/select projections. No other property name is ever accepted.
+#
+# ``title`` is JSONB (multilanguage — see ``RegisterMappingRequest.title``);
+# an exact-match CQL2 filter against it only matches the literal on-disk
+# JSON representation, not a resolved-language value. Left in the whitelist
+# for consistency (still a legitimate column to project/order by), not
+# because equality filtering on it is generally useful.
 ALLOWED_COLUMNS: Tuple[str, ...] = (
     "claim_ci", "claim", "mapping_id", "role",
     "src_catalog", "src_collection", "region_prop",
-    "alias", "title", "created_at", "updated_at",
+    "alias", "title",
+    "layer_name", "server_type", "server_min_zoom",
+    "server_max_native_zoom", "server_max_zoom", "unique_id_prop", "digits",
+    "created_at", "updated_at",
 )
 
 # ---------------------------------------------------------------------------
 # DDL — schema/table/index, IF NOT EXISTS only.
 # ---------------------------------------------------------------------------
 
+# Every mapping-level column below (everything but the claim identity —
+# claim_ci/claim/mapping_id/role) is duplicated onto every claim row sharing
+# a mapping_id, exactly like the pre-existing title/alias/region_prop
+# columns -- the table is one row per *claim*, not one row per *mapping*
+# (see module docstring). ``apply_mapping`` writes the same values into every
+# row of a mapping's claim set.
 _TABLE_DDL = f"""
 CREATE TABLE IF NOT EXISTS {_QUALIFIED_TABLE} (
-    claim_ci       TEXT NOT NULL PRIMARY KEY,
-    claim          TEXT NOT NULL,
-    mapping_id     TEXT NOT NULL,
-    role           TEXT NOT NULL,
-    src_catalog    TEXT NOT NULL,
-    src_collection TEXT NOT NULL,
-    region_prop    TEXT NOT NULL,
-    alias          TEXT,
-    title          TEXT,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    claim_ci                TEXT NOT NULL PRIMARY KEY,
+    claim                   TEXT NOT NULL,
+    mapping_id              TEXT NOT NULL,
+    role                    TEXT NOT NULL,
+    src_catalog             TEXT NOT NULL,
+    src_collection          TEXT NOT NULL,
+    region_prop             TEXT NOT NULL,
+    alias                   TEXT,
+    title                   JSONB,
+    layer_name              TEXT NOT NULL DEFAULT 'default',
+    server_type             TEXT NOT NULL DEFAULT 'MVT',
+    server_subdomains       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    server_min_zoom         INTEGER NOT NULL DEFAULT 0,
+    server_max_native_zoom  INTEGER NOT NULL DEFAULT 12,
+    server_max_zoom         INTEGER NOT NULL DEFAULT 28,
+    unique_id_prop          TEXT,
+    digits                  INTEGER NOT NULL DEFAULT 255,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 """
 
@@ -121,14 +144,22 @@ async def ensure_mappings_table(engine: Any) -> None:
 UPDATE_OWN_CLAIM = DQLQuery(
     f"""
     UPDATE {_QUALIFIED_TABLE} SET
-        claim          = :claim,
-        role           = :role,
-        src_catalog    = :src_catalog,
-        src_collection = :src_collection,
-        region_prop    = :region_prop,
-        alias          = :alias,
-        title          = :title,
-        updated_at     = NOW()
+        claim                  = :claim,
+        role                   = :role,
+        src_catalog            = :src_catalog,
+        src_collection         = :src_collection,
+        region_prop            = :region_prop,
+        alias                  = :alias,
+        title                  = CAST(:title AS jsonb),
+        layer_name             = :layer_name,
+        server_type            = :server_type,
+        server_subdomains      = CAST(:server_subdomains AS jsonb),
+        server_min_zoom        = :server_min_zoom,
+        server_max_native_zoom = :server_max_native_zoom,
+        server_max_zoom        = :server_max_zoom,
+        unique_id_prop         = :unique_id_prop,
+        digits                 = :digits,
+        updated_at             = NOW()
     WHERE claim_ci = :claim_ci AND mapping_id = :mapping_id
     RETURNING *
     """,
@@ -138,9 +169,13 @@ UPDATE_OWN_CLAIM = DQLQuery(
 INSERT_CLAIM = DQLQuery(
     f"""
     INSERT INTO {_QUALIFIED_TABLE}
-        (claim_ci, claim, mapping_id, role, src_catalog, src_collection, region_prop, alias, title)
+        (claim_ci, claim, mapping_id, role, src_catalog, src_collection, region_prop, alias,
+         title, layer_name, server_type, server_subdomains, server_min_zoom,
+         server_max_native_zoom, server_max_zoom, unique_id_prop, digits)
     VALUES
-        (:claim_ci, :claim, :mapping_id, :role, :src_catalog, :src_collection, :region_prop, :alias, :title)
+        (:claim_ci, :claim, :mapping_id, :role, :src_catalog, :src_collection, :region_prop, :alias,
+         CAST(:title AS jsonb), :layer_name, :server_type, CAST(:server_subdomains AS jsonb),
+         :server_min_zoom, :server_max_native_zoom, :server_max_zoom, :unique_id_prop, :digits)
     RETURNING *
     """,
     result_handler=ResultHandler.ONE_DICT,

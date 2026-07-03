@@ -28,9 +28,11 @@ write.
 """
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+from dynastore.models.localization import LocalizedText
 from dynastore.modules.db_config.exceptions import UniqueViolationError
 from dynastore.modules.db_config.query_executor import DbResource, managed_transaction
 from dynastore.tools.cache import cache_clear, cached
@@ -71,7 +73,16 @@ async def apply_mapping(
     column: str,
     alias: str,
     extra_aliases: Sequence[str],
-    title: Optional[str],
+    title: Optional[Union[str, Dict[str, str]]],
+    lang: str = "en",
+    layer_name: str = "default",
+    server_type: str = "MVT",
+    server_subdomains: Optional[Sequence[str]] = None,
+    server_min_zoom: int = 0,
+    server_max_native_zoom: int = 12,
+    server_max_zoom: int = 28,
+    unique_id_prop: Optional[str] = None,
+    digits: int = 255,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Register (or re-apply) one mapping's claim set.
 
@@ -84,10 +95,20 @@ async def apply_mapping(
     of the *same* mapping (both see ``UPDATE_OWN_CLAIM`` touch 0 rows) resolve
     without a spurious conflict -- see :func:`_insert_claim_idempotent`.
 
+    ``title`` (TerriaJS's ``description``) accepts a plain string -- wrapped
+    under ``lang`` via :meth:`LocalizedText.delocalize_input`, the same
+    single-language-input convention as the rest of the platform -- or an
+    already language-keyed dict, stored as-is. The remaining keyword
+    arguments are the rest of the TerriaJS ``regionWmsMap`` entry
+    (dynastore#443) that used to be hardcoded in ``definitions.json.j2``;
+    every claim row of a mapping carries the same values, exactly like the
+    pre-existing ``title``/``alias``/``region_prop`` duplication.
+
     Returns ``(mapping_id, claim_rows)``.
     """
     mapping_id = mapping_id_for(catalog_id, collection_id)
-    row_title = title or collection_id
+    row_title = LocalizedText.delocalize_input(title, lang) if title else {lang: collection_id}
+    row_subdomains = list(server_subdomains) if server_subdomains else []
 
     claims = compute_claim_set(
         catalog_id=catalog_id, collection_id=collection_id,
@@ -103,7 +124,13 @@ async def apply_mapping(
             params = dict(
                 claim_ci=claim_ci, claim=claim, mapping_id=mapping_id, role=role,
                 src_catalog=catalog_id, src_collection=collection_id,
-                region_prop=column, alias=alias, title=row_title,
+                region_prop=column, alias=alias, title=json.dumps(row_title),
+                layer_name=layer_name, server_type=server_type,
+                server_subdomains=json.dumps(row_subdomains),
+                server_min_zoom=server_min_zoom,
+                server_max_native_zoom=server_max_native_zoom,
+                server_max_zoom=server_max_zoom,
+                unique_id_prop=unique_id_prop, digits=digits,
             )
             row = await _q.UPDATE_OWN_CLAIM.execute(conn, **params)
             if row is None:

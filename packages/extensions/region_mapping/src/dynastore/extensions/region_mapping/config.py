@@ -1,0 +1,48 @@
+#    Copyright 2026 FAO
+#
+#    Licensed under the Apache License, Version 2.0 (the "License");
+#    you may not use this file except in compliance with the License.
+#    You may obtain a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS,
+#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#    See the License for the specific language governing permissions and
+#    limitations under the License.
+#
+#    Author: Carlo Cancellieri (ccancellieri@gmail.com)
+#    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
+#    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
+
+from typing import ClassVar, Optional, Tuple
+
+from pydantic import Field
+
+from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
+from dynastore.models.mutability import Mutable
+from dynastore.models.plugin_config import PluginConfig
+
+
+class RegionMappingConfig(ExposableConfigMixin, PluginConfig):
+    """Platform-level settings for the region_mapping extension."""
+
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "extensions", "region_mapping")
+
+    # `enabled` inherited from ExposableConfigMixin.
+
+    maps_base_url: Mutable[Optional[str]] = Field(
+        default=None,
+        description=(
+            "Public base URL of the deployment's tile-serving machine (the "
+            "one hosting the `tiles` extension, gatewayed e.g. as "
+            "'.../api/maps'), used to build the TerriaJS 'server' URL in "
+            "region.json. That machine is a sibling to this one under the "
+            "API gateway, not nested under it, so it cannot be derived from "
+            "the incoming request's own root_path. When left unset, falls "
+            "back to swapping this request's own last root_path segment for "
+            "'maps' -- correct only when the deployment follows that exact "
+            "sibling-naming convention; set this explicitly otherwise."
+        ),
+    )

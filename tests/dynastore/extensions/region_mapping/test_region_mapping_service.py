@@ -327,6 +327,68 @@ async def test_definitions_shape_and_prefixed_alias(monkeypatch: pytest.MonkeyPa
     assert "collections=countries" in entry["server"]
 
 
+def test_default_maps_base_url_swaps_last_path_segment_for_maps() -> None:
+    """The maps machine is a sibling gateway path, not nested under this
+    service's own root_path -- e.g. '.../api/catalog' -> '.../api/maps',
+    never '.../api/catalog/maps'."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    assert svc._default_maps_base_url(
+        "https://data.review.fao.org/geospatial/dev/api/catalog"
+    ) == "https://data.review.fao.org/geospatial/dev/api/maps"
+
+
+@pytest.mark.asyncio
+async def test_get_maps_base_url_honours_configured_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicitly configured ``maps_base_url`` wins over the sibling-path
+    fallback -- required for deployments that don't follow that convention."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+    from dynastore.extensions.region_mapping.config import RegionMappingConfig
+    from dynastore.models.protocols.configs import ConfigsProtocol
+
+    configs = MagicMock()
+    configs.get_config = AsyncMock(
+        return_value=RegionMappingConfig(maps_base_url="https://tiles.example.org")
+    )
+
+    def _fake_get_protocol(protocol_type: Any) -> Any:
+        return configs if protocol_type is ConfigsProtocol else None
+
+    monkeypatch.setattr(svc, "get_protocol", _fake_get_protocol)
+
+    result = await svc._get_maps_base_url("https://data.review.fao.org/geospatial/dev/api/catalog")
+
+    assert result == "https://tiles.example.org"
+
+
+@pytest.mark.asyncio
+async def test_definitions_server_url_is_sibling_to_catalog_not_nested_under_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test: the 'server' tile URL must point at the sibling maps
+    machine (e.g. '.../api/maps/tiles/...'), not '.../api/catalog/maps/tiles/...'."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    app = _app(monkeypatch, _StubCatalogs({}))
+    monkeypatch.setattr(
+        svc._store, "fetch_primary_records",
+        AsyncMock(return_value=[{
+            "mapping_id": "gaul_demo_gaul_level_1", "claim": "iso3", "src_catalog": "gaul_demo",
+            "src_collection": "gaul_level_1", "region_prop": "ISO3_CODE", "title": "GAUL level 1",
+        }]),
+    )
+    monkeypatch.setattr(svc._store, "fetch_claims_for_mapping", AsyncMock(return_value=[{"claim": "iso3"}]))
+    monkeypatch.setattr(svc, "fetch_collection_bbox", AsyncMock(return_value=[0.0, 0.0, 1.0, 1.0]))
+
+    transport = ASGITransport(app=app, root_path="/geospatial/dev/api/catalog")
+    async with AsyncClient(transport=transport, base_url="http://data.review.fao.org") as client:
+        resp = await client.get("/geospatial/dev/api/catalog/region-mappings/region.json")
+
+    entry = resp.json()["regionWmsMap"]["GAUL_DEMO_GAUL_LEVEL_1"]
+    assert entry["server"].startswith("http://data.review.fao.org/geospatial/dev/api/maps/")
+    assert "/api/catalog/maps/" not in entry["server"]
+
+
 @pytest.mark.asyncio
 async def test_definitions_pagination(monkeypatch: pytest.MonkeyPatch) -> None:
     from dynastore.extensions.region_mapping import region_mapping_service as svc
@@ -412,3 +474,192 @@ async def test_region_ids_unknown_mapping_returns_404(monkeypatch: pytest.Monkey
         resp = await client.get("/region-mappings/does-not-exist/regionIds")
 
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# GET /region-mappings/{mapping_id}/regionIds.csv
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_region_ids_csv_headed_by_alias_one_value_per_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    app = _app(monkeypatch, _StubCatalogs({}))
+    monkeypatch.setattr(
+        svc._store, "fetch_mapping_primary",
+        AsyncMock(return_value={
+            "src_catalog": "fao", "src_collection": "countries",
+            "region_prop": "adm0_code", "alias": "iso3",
+        }),
+    )
+    monkeypatch.setattr(svc, "fetch_distinct_region_ids", AsyncMock(return_value=["DEU", "FRA", "ITA"]))
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/region-mappings/fao_countries/regionIds.csv")
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/csv")
+    assert 'filename="fao_countries.csv"' in resp.headers["content-disposition"]
+    assert resp.text.splitlines() == ["iso3", "DEU", "FRA", "ITA"]
+
+
+@pytest.mark.asyncio
+async def test_region_ids_csv_falls_back_to_region_prop_without_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No registered alias on this row -- header falls back to the region
+    property name rather than an empty column header."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    app = _app(monkeypatch, _StubCatalogs({}))
+    monkeypatch.setattr(
+        svc._store, "fetch_mapping_primary",
+        AsyncMock(return_value={
+            "src_catalog": "fao", "src_collection": "countries", "region_prop": "adm0_code",
+        }),
+    )
+    monkeypatch.setattr(svc, "fetch_distinct_region_ids", AsyncMock(return_value=["DEU"]))
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/region-mappings/fao_countries/regionIds.csv")
+
+    assert resp.text.splitlines() == ["adm0_code", "DEU"]
+
+
+@pytest.mark.asyncio
+async def test_region_ids_csv_unknown_mapping_returns_404(monkeypatch: pytest.MonkeyPatch) -> None:
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    app = _app(monkeypatch, _StubCatalogs({}))
+    monkeypatch.setattr(svc._store, "fetch_mapping_primary", AsyncMock(return_value=None))
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/region-mappings/does-not-exist/regionIds.csv")
+
+    assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# TerriaJS parameters + multilanguage description (dynastore#443 follow-up)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_register_mapping_passes_terria_params_and_lang_to_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every new TerriaJS field on the request body, plus the resolved
+    `lang`, must reach ``registry_store.apply_mapping`` unchanged."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    catalogs = _StubCatalogs({("fao", "countries"): MagicMock()})
+    app = _app(monkeypatch, catalogs)
+
+    captured: Dict[str, Any] = {}
+
+    async def _apply_mapping(engine: Any, **kwargs: Any):
+        captured.update(kwargs)
+        return "fao_countries", []
+
+    monkeypatch.setattr(svc._store, "apply_mapping", _apply_mapping)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/region-mappings?lang=it",
+            json={
+                "catalog": "fao", "collection": "countries", "column": "adm0_code",
+                "alias": "country", "title": "Paesi",
+                "layer_name": "gaul_layer", "server_type": "WMS",
+                "server_subdomains": ["a", "b"], "server_min_zoom": 2,
+                "server_max_native_zoom": 8, "server_max_zoom": 20,
+                "unique_id_prop": "internal_id", "digits": 4,
+            },
+        )
+
+    assert resp.status_code == 201, resp.text
+    assert captured["lang"] == "it"
+    assert captured["title"] == "Paesi"
+    assert captured["layer_name"] == "gaul_layer"
+    assert captured["server_type"] == "WMS"
+    assert captured["server_subdomains"] == ["a", "b"]
+    assert captured["server_min_zoom"] == 2
+    assert captured["server_max_native_zoom"] == 8
+    assert captured["server_max_zoom"] == 20
+    assert captured["unique_id_prop"] == "internal_id"
+    assert captured["digits"] == 4
+
+
+@pytest.mark.asyncio
+async def test_definitions_honours_per_mapping_terria_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-default layerName/serverType/zoom/digits/uniqueIdProp stored on a
+    claim row all render through to region.json -- proves they are
+    genuinely per-mapping now, not the old hardcoded template constants."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    app = _app(monkeypatch, _StubCatalogs({}))
+    primary = {
+        "mapping_id": "fao_countries", "claim": "country", "src_catalog": "fao",
+        "src_collection": "countries", "region_prop": "adm0_code", "title": "Countries",
+        "layer_name": "gaul_layer", "server_type": "WMS", "server_subdomains": ["a", "b"],
+        "server_min_zoom": 2, "server_max_native_zoom": 8, "server_max_zoom": 20,
+        "unique_id_prop": "internal_id", "digits": 4,
+    }
+    monkeypatch.setattr(svc._store, "fetch_primary_records", AsyncMock(return_value=[primary]))
+    monkeypatch.setattr(svc._store, "fetch_claims_for_mapping", AsyncMock(return_value=[]))
+    monkeypatch.setattr(svc, "fetch_collection_bbox", AsyncMock(return_value=[0.0, 0.0, 1.0, 1.0]))
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/region-mappings/region.json")
+
+    entry = resp.json()["regionWmsMap"]["FAO_COUNTRIES"]
+    assert entry["layerName"] == "gaul_layer"
+    assert entry["serverType"] == "WMS"
+    assert entry["serverSubdomains"] == ["a", "b"]
+    assert entry["serverMinZoom"] == 2
+    assert entry["serverMaxNativeZoom"] == 8
+    assert entry["serverMaxZoom"] == 20
+    assert entry["uniqueIdProp"] == "internal_id"
+    assert entry["digits"] == 4
+
+
+@pytest.mark.asyncio
+async def test_definitions_resolves_description_to_requested_language(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A multilanguage ``title`` resolves to the caller's ``?lang=``, falling
+    back to English when the requested language is missing."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    app = _app(monkeypatch, _StubCatalogs({}))
+    primary = {
+        "mapping_id": "fao_countries", "claim": "country", "src_catalog": "fao",
+        "src_collection": "countries", "region_prop": "adm0_code",
+        "title": {"en": "Countries", "it": "Paesi"},
+    }
+    monkeypatch.setattr(svc._store, "fetch_primary_records", AsyncMock(return_value=[primary]))
+    monkeypatch.setattr(svc._store, "fetch_claims_for_mapping", AsyncMock(return_value=[]))
+    monkeypatch.setattr(svc, "fetch_collection_bbox", AsyncMock(return_value=[0.0, 0.0, 1.0, 1.0]))
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp_it = await client.get("/region-mappings/region.json", params={"lang": "it"})
+        resp_default = await client.get("/region-mappings/region.json")
+        resp_missing = await client.get("/region-mappings/region.json", params={"lang": "fr"})
+
+    entry_it = resp_it.json()["regionWmsMap"]["FAO_COUNTRIES"]
+    entry_default = resp_default.json()["regionWmsMap"]["FAO_COUNTRIES"]
+    entry_missing = resp_missing.json()["regionWmsMap"]["FAO_COUNTRIES"]
+
+    assert entry_it["description"] == "Paesi"
+    assert entry_default["description"] == "Countries"
+    assert entry_missing["description"] == "Countries"  # falls back to 'en'
