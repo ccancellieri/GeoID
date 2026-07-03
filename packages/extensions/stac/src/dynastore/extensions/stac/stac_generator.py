@@ -531,22 +531,25 @@ async def create_catalog(
                 )
             )
 
-    catalogs_svc = get_protocol(CatalogsProtocol)
-    if not catalogs_svc:
-        raise RuntimeError("CatalogsProtocol not available")
-    collections = await cast(CatalogsProtocol, catalogs_svc).list_collections(catalog_id, lang=lang, limit=1000)
-    for coll in collections:
-        # Localize collection summary for the link title; use the public label
-        collection_id = _public_id(coll)
-        collection_href = f"{base_url}/collections/{collection_id}"
-        catalog.add_link(
-            pystac.Link(
-                rel="child",
-                target=collection_href,
-                title=coll.title.resolve(lang) if coll.title else collection_id,
-                media_type="application/json",
-            )
+    # Collection discovery is via the "data" link to the paginated
+    # /collections endpoint (STAC API core / Collection Search), not one
+    # "child" link per collection. Minting a child link per collection used
+    # to require hydrating every collection through the routed READ driver
+    # (a PG existence lookup plus a CollectionStore router fan-out each),
+    # which made this landing page's cost scale with the catalog's
+    # collection count instead of being O(1) — past a couple thousand
+    # collections the request no longer completed before the gateway
+    # timeout (#2865). STAC Browser and other STAC API clients already walk
+    # "data" to page through collections, so dropping the per-collection
+    # links loses no discoverability.
+    catalog.add_link(
+        pystac.Link(
+            rel="data",
+            target=f"{base_url}/collections",
+            media_type="application/json",
+            title="Collections",
         )
+    )
     catalog.set_root(catalog)
     return catalog.to_dict()
 
