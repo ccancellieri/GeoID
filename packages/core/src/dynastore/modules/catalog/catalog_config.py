@@ -144,6 +144,32 @@ class CollectionPluginConfig(PluginConfig):
         ),
     )
 
+    sync_ingest_batch_rows: Mutable[int] = Field(
+        default=500,
+        ge=1,
+        le=10000,
+        description=(
+            "Row cap per upsert() call when a synchronous POST "
+            "/collections/{id}/items bulk request is sub-batched "
+            "(OGCTransactionMixin._ingest_items). A payload at or under this "
+            "size, and under sync_ingest_batch_memory_mb, is written in a "
+            "single call — unchanged pre-existing behaviour. Larger payloads "
+            "are split so the synchronous request path never holds the whole "
+            "FeatureCollection in memory at once."
+        ),
+    )
+
+    sync_ingest_batch_memory_mb: Mutable[int] = Field(
+        default=32,
+        ge=1,
+        description=(
+            "Accumulated-geometry memory budget (MiB) per upsert() call for "
+            "the same synchronous bulk-POST sub-batching described on "
+            "sync_ingest_batch_rows. Whichever limit is reached first — row "
+            "count or byte budget — flushes the current sub-batch."
+        ),
+    )
+
 
 CollectionPluginConfig.model_rebuild()
 

@@ -1554,6 +1554,20 @@ class OGCTransactionMixin:
         ``(accepted_rows, rejections, was_single, batch_size)``
         where *was_single* is ``True`` when the caller sent a lone item
         (not wrapped in a collection/array).
+
+        A single item, or a multi-item payload that fits under both the
+        collection's ``sync_ingest_batch_rows`` row cap and
+        ``sync_ingest_batch_memory_mb`` byte budget (``CollectionPluginConfig``),
+        is written with ONE ``upsert()`` call, exactly as before — full
+        upserted rows land in ``accepted_rows``, which callers building a
+        protocol-specific 201 body rely on. A multi-item payload that
+        exceeds either bound is sub-batched instead, mirroring the bounded
+        batching the async ingestion task already applies (#2657 bounds the
+        remaining unbounded path — the one direct synchronous bulk POST):
+        each sub-batch is upserted, reduced to accepted ID strings, and
+        discarded before the next sub-batch is prepared, so the whole
+        FeatureCollection is never held in memory at once. In that case
+        ``accepted_rows`` holds accumulated ID strings rather than rows.
         """
         from dynastore.modules.storage.errors import ConflictError, SidecarRejectedError
 
@@ -1582,59 +1596,185 @@ class OGCTransactionMixin:
         # the driver can use any type-specific fast-paths it provides.
         catalogs_svc = await self._get_catalogs_service()  # type: ignore[attr-defined]
 
+        # A multi-item payload is sub-batched once it exceeds the row cap,
+        # or — for a payload under the row cap but with individually large
+        # geometries — once its accumulated estimated byte size exceeds the
+        # memory budget. A single item is never split.
+        needs_split = False
+        row_cap = 0
+        byte_budget = 0
+        if not was_single:
+            from dynastore.modules.catalog.catalog_config import CollectionPluginConfig
+            from dynastore.tasks.ingestion.main_ingestion import _estimate_feature_bytes
+
+            col_config = await self._get_plugin_config(  # type: ignore[attr-defined]
+                CollectionPluginConfig, catalog_id, collection_id
+            )
+            row_cap = col_config.sync_ingest_batch_rows
+            byte_budget = max(1, col_config.sync_ingest_batch_memory_mb) * 1024 * 1024
+
+            if batch_size > row_cap:
+                needs_split = True
+            else:
+                total_bytes = 0
+                for item in items_list:
+                    _dump = getattr(item, "model_dump", None)
+                    total_bytes += _estimate_feature_bytes(
+                        _dump() if callable(_dump) else item
+                    )
+                    if total_bytes > byte_budget:
+                        needs_split = True
+                        break
+
         rejections: list[SidecarRejection] = []
-        # Seed the typed out-list so the PG write path can record per-row
-        # SidecarRejectedError events without collapsing the whole batch.
-        # The core service reads/writes ``ctx.extensions["_rejections"]``.
-        ctx.extensions["_rejections"] = []
-        try:
-            created = await catalogs_svc.upsert(
-                catalog_id, collection_id, items=payload, ctx=ctx
-            )
-        except SidecarRejectedError as rej:
-            # Non-PG primary drivers still surface rejections as a single
-            # batch-level exception; PG now catches per-row and delivers via
-            # the out-list below, so we only reach here when the primary
-            # driver aborted the whole payload.
-            rejections.append(
-                SidecarRejection(
-                    geoid=rej.geoid,
-                    external_id=rej.external_id,
-                    sidecar_id=rej.sidecar_id,
-                    matcher=rej.matcher,
-                    reason=rej.reason,
-                    message=str(rej),
-                    policy_source=policy_source,
-                )
-            )
-            created = []
-        except ConflictError as exc:
-            # on_batch_conflict=refuse_batch: duplicate detected → abort batch → 409.
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail=str(exc)
-            ) from exc
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-            ) from exc
+        accepted_rows: list[Any]
 
-        # Drain per-row rejections delivered via the DriverContext out-list.
-        for entry in ctx.extensions.pop("_rejections", []) or []:
-            rejections.append(
-                SidecarRejection(
-                    geoid=entry.get("geoid"),
-                    external_id=entry.get("external_id"),
-                    sidecar_id=entry.get("sidecar_id"),
-                    matcher=entry.get("matcher"),
-                    reason=entry.get("reason") or "sidecar_rejected",
-                    message=entry.get("message") or "",
-                    policy_source=policy_source,
-                )
-            )
+        if needs_split:
+            from dynastore.models.protocols.indexer import MAX_ACCUMULATED_FAILURE_SAMPLES
+            from dynastore.modules.catalog.item_service import _merge_index_results_into
 
-        accepted_rows: list[Any] = (
-            created if isinstance(created, list) else ([created] if created else [])
-        )
+            accepted_ids: list[str] = []
+            index_results: Dict[str, Any] = {}
+            current_batch: list[Any] = []
+            current_batch_bytes = 0
+
+            async def _flush(sub_batch: "list[Any]") -> None:
+                # Seed the typed out-list so the PG write path can record
+                # per-row SidecarRejectedError events without collapsing the
+                # whole sub-batch. The core service reads/writes
+                # ``ctx.extensions["_rejections"]``.
+                ctx.extensions["_rejections"] = []
+                try:
+                    created = await catalogs_svc.upsert(
+                        catalog_id, collection_id, items=sub_batch, ctx=ctx
+                    )
+                except SidecarRejectedError as rej:
+                    # Non-PG primary drivers still surface rejections as a
+                    # single batch-level exception; PG now catches per-row
+                    # and delivers via the out-list below, so we only reach
+                    # here when the primary driver aborted the sub-batch.
+                    rejections.append(
+                        SidecarRejection(
+                            geoid=rej.geoid,
+                            external_id=rej.external_id,
+                            sidecar_id=rej.sidecar_id,
+                            matcher=rej.matcher,
+                            reason=rej.reason,
+                            message=str(rej),
+                            policy_source=policy_source,
+                        )
+                    )
+                    created = []
+                except ConflictError as exc:
+                    # on_batch_conflict=refuse_batch: duplicate detected → abort → 409.
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+                    ) from exc
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+                    ) from exc
+
+                # Drain per-row rejections delivered via the DriverContext out-list.
+                for entry in ctx.extensions.pop("_rejections", []) or []:
+                    rejections.append(
+                        SidecarRejection(
+                            geoid=entry.get("geoid"),
+                            external_id=entry.get("external_id"),
+                            sidecar_id=entry.get("sidecar_id"),
+                            matcher=entry.get("matcher"),
+                            reason=entry.get("reason") or "sidecar_rejected",
+                            message=entry.get("message") or "",
+                            policy_source=policy_source,
+                        )
+                    )
+                # Bound the accumulated rejection samples across sub-batches
+                # the same way the indexer/ingestion-task accumulators do —
+                # keep the most recent MAX_ACCUMULATED_FAILURE_SAMPLES.
+                if len(rejections) > MAX_ACCUMULATED_FAILURE_SAMPLES:
+                    rejections[:] = rejections[-MAX_ACCUMULATED_FAILURE_SAMPLES:]
+
+                # Reduce this sub-batch's accepted rows to ID strings
+                # immediately and let the full rows fall out of scope —
+                # no Feature body from this sub-batch survives past here.
+                batch_rows = (
+                    created if isinstance(created, list) else ([created] if created else [])
+                )
+                accepted_ids.extend(self._resolve_accepted_ids(batch_rows))
+                _merge_index_results_into(
+                    index_results, ctx.extensions.pop("_index_results", None) or {}
+                )
+
+            for item in items_list:
+                current_batch.append(item)
+                _dump = getattr(item, "model_dump", None)
+                current_batch_bytes += _estimate_feature_bytes(
+                    _dump() if callable(_dump) else item
+                )
+                if len(current_batch) >= row_cap or current_batch_bytes >= byte_budget:
+                    await _flush(current_batch)
+                    current_batch = []
+                    current_batch_bytes = 0
+            if current_batch:
+                await _flush(current_batch)
+
+            if index_results:
+                ctx.extensions["_index_results"] = index_results
+
+            accepted_rows = list(accepted_ids)
+        else:
+            # Seed the typed out-list so the PG write path can record per-row
+            # SidecarRejectedError events without collapsing the whole batch.
+            # The core service reads/writes ``ctx.extensions["_rejections"]``.
+            ctx.extensions["_rejections"] = []
+            try:
+                created = await catalogs_svc.upsert(
+                    catalog_id, collection_id, items=payload, ctx=ctx
+                )
+            except SidecarRejectedError as rej:
+                # Non-PG primary drivers still surface rejections as a single
+                # batch-level exception; PG now catches per-row and delivers via
+                # the out-list below, so we only reach here when the primary
+                # driver aborted the whole payload.
+                rejections.append(
+                    SidecarRejection(
+                        geoid=rej.geoid,
+                        external_id=rej.external_id,
+                        sidecar_id=rej.sidecar_id,
+                        matcher=rej.matcher,
+                        reason=rej.reason,
+                        message=str(rej),
+                        policy_source=policy_source,
+                    )
+                )
+                created = []
+            except ConflictError as exc:
+                # on_batch_conflict=refuse_batch: duplicate detected → abort batch → 409.
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+                ) from exc
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+                ) from exc
+
+            # Drain per-row rejections delivered via the DriverContext out-list.
+            for entry in ctx.extensions.pop("_rejections", []) or []:
+                rejections.append(
+                    SidecarRejection(
+                        geoid=entry.get("geoid"),
+                        external_id=entry.get("external_id"),
+                        sidecar_id=entry.get("sidecar_id"),
+                        matcher=entry.get("matcher"),
+                        reason=entry.get("reason") or "sidecar_rejected",
+                        message=entry.get("message") or "",
+                        policy_source=policy_source,
+                    )
+                )
+
+            accepted_rows = (
+                created if isinstance(created, list) else ([created] if created else [])
+            )
 
         if not accepted_rows and not rejections:
             raise HTTPException(
@@ -1652,6 +1792,12 @@ class OGCTransactionMixin:
         """Extract the logical string ID from each upserted row."""
         ids: list[str] = []
         for row in accepted_rows:
+            if isinstance(row, str):
+                # Sub-batched bulk ingest (#2657) already resolved each
+                # sub-batch's IDs before discarding its full rows — pass a
+                # pre-resolved ID straight through instead of re-deriving it.
+                ids.append(row)
+                continue
             props = getattr(row, "properties", None) or {}
             fid = (
                 getattr(row, "id", None)
