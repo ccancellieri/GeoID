@@ -193,6 +193,17 @@ class CollectionsProtocol(Protocol):
         """
         ...
 
+    async def list_collection_id_pairs(
+        self,
+        catalog_id: str,
+        ctx: Optional["DriverContext"] = None,
+    ) -> List[Tuple[str, Optional[str]]]:
+        """
+        Lists (internal id, external_id) pairs for every active collection
+        in a catalog, without hydrating full collection models.
+        """
+        ...
+
     # === Metadata and Physical Resolution ===
 
     async def resolve_datasource(

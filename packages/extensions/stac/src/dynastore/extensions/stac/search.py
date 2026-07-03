@@ -756,7 +756,8 @@ async def _expand_collections_for_search(
     Returns the request unchanged when the catalog has no collections;
     otherwise returns a copy scoped to every collection id. An unscoped
     request is expanded to every collection of the catalog (one
-    ``list_collections`` round-trip). An explicitly-scoped request has its
+    ``list_collection_id_pairs`` round-trip — id/external_id pairs only, no
+    per-collection metadata hydration). An explicitly-scoped request has its
     external collection ids resolved to internal ids (see
     :func:`_resolve_scoped_collection_ids`) — unresolvable/internal-shaped
     ids are dropped rather than passed through.
@@ -769,12 +770,11 @@ async def _expand_collections_for_search(
             search_request.model_copy(update={"collections": internal_ids}),
             coll_ext_id_map,
         )
-    all_collections = await catalogs.list_collections(
-        cat_id, limit=1000, ctx=DriverContext(db_resource=db_resource)
+    pairs = await catalogs.list_collection_id_pairs(
+        cat_id, ctx=DriverContext(db_resource=db_resource)
     )
     coll_ext_id_map: Dict[str, str] = {
-        c.id: (getattr(c, "external_id", None) or c.id)
-        for c in (all_collections or [])
+        cid: (ext_id or cid) for cid, ext_id in (pairs or [])
     }
     all_cids = list(coll_ext_id_map.keys())
     if not all_cids:

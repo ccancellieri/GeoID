@@ -18,7 +18,7 @@
 
 import logging
 import json
-from typing import FrozenSet, List, Optional, Any, Dict, Union, Set, TYPE_CHECKING
+from typing import FrozenSet, List, Optional, Any, Dict, Tuple, Union, Set, TYPE_CHECKING
 from dynastore.tools.cache import cached
 from dynastore.models.driver_context import DriverContext
 
@@ -311,6 +311,25 @@ def _make_collection_list_ids_query(phys_schema: str) -> DQLQuery:
         "WHERE deleted_at IS NULL AND lifecycle_status IS NULL "
         "ORDER BY id LIMIT :limit OFFSET :offset;",
         result_handler=ResultHandler.ALL_SCALARS,
+    )
+
+
+def _make_collection_list_id_pairs_query(phys_schema: str) -> DQLQuery:
+    """SELECT (id, external_id) of every ACTIVE collection in ``phys_schema``.
+
+    Unlike :func:`_make_collection_list_ids_query`, this returns both columns
+    already present on the thin PG registry row and is unpaginated — callers
+    that only need the internal/external id mapping (not the full hydrated
+    :class:`Collection` model) can build it from a single round-trip instead
+    of hydrating every collection via the routed metadata store. Same
+    ``deleted_at``/``lifecycle_status`` visibility predicate as the ids-only
+    query, so provisioning/deleting collections stay hidden.
+    """
+    return DQLQuery(
+        f'SELECT id, external_id FROM "{phys_schema}".collections '
+        "WHERE deleted_at IS NULL AND lifecycle_status IS NULL "
+        "ORDER BY id;",
+        result_handler=ResultHandler.ALL,
     )
 
 
@@ -1636,6 +1655,39 @@ class CollectionService:
                 if model is not None:
                     collections.append(model)
             return collections
+
+    async def list_collection_id_pairs(
+        self,
+        catalog_id: str,
+        ctx: Optional["DriverContext"] = None,
+    ) -> List[Tuple[str, Optional[str]]]:
+        """List every active collection's (internal id, external_id) pair.
+
+        Reads straight off the thin PG registry — no per-collection metadata
+        hydration — for callers that only need the internal/external id
+        mapping (e.g. scoping an unbounded search to every collection of a
+        catalog). Unpaginated: returns every row matching the same
+        ``deleted_at``/``lifecycle_status`` visibility predicate as
+        :func:`list_collections`.
+        """
+        # Phase 2: resolve external catalog_id → internal at the public boundary.
+        # Passthrough when no mapping exists so callers with already-internal ids work.
+        catalogs = get_protocol(CatalogsProtocol)
+        if catalogs is not None:
+            _cat_internal = await catalogs.resolve_catalog_id(catalog_id, allow_missing=True)
+            if _cat_internal is not None:
+                catalog_id = _cat_internal
+
+        db_resource = ctx.db_resource if ctx else None
+
+        async with managed_transaction(db_resource or self.engine) as conn:
+            phys_schema = await self._resolve_physical_schema(
+                catalog_id, db_resource=conn
+            )
+            if not phys_schema:
+                return []
+            rows = await _make_collection_list_id_pairs_query(phys_schema).execute(conn)
+            return [(row[0], row[1]) for row in (rows or [])]
 
     async def update_collection(
         self,

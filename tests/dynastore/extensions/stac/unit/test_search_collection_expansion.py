@@ -28,8 +28,9 @@ ES search driver answered ``numberMatched: 0`` to ``GET /search`` and to
 
 ``_expand_collections_for_search`` closes that hole: an unscoped request is
 rewritten to explicitly scope ALL collections of the catalog (single
-``list_collections`` round-trip, reused downstream), after which the dispatch
-decision matrix applies unchanged. An empty catalog passes through untouched.
+``list_collection_id_pairs`` round-trip, reused downstream), after which the
+dispatch decision matrix applies unchanged. An empty catalog passes through
+untouched.
 
 An *explicitly* scoped request goes through ``_resolve_scoped_collection_ids``
 (#2786): ES canonical docs and the PG hydration path key ``collection_id`` on
@@ -44,7 +45,7 @@ fallback already treats an unknown collection.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
@@ -75,23 +76,35 @@ class _FakeCollections:
 
 
 class _FakeCatalogs:
-    """CatalogsProtocol stand-in — records ``list_collections`` calls."""
+    """CatalogsProtocol stand-in — records ``list_collection_id_pairs`` calls."""
 
     def __init__(
         self,
         collection_ids: Optional[List[str]] = None,
         external_to_internal: Optional[Dict[str, str]] = None,
         internal_catalog_id: str = "cat-1",
+        id_pairs: Optional[List[Tuple[str, Optional[str]]]] = None,
     ):
         self._ids = collection_ids or []
+        self._id_pairs = id_pairs if id_pairs is not None else [
+            (cid, None) for cid in self._ids
+        ]
         self.calls: list = []
+        self.list_collections_calls: list = []
         self.collections = _FakeCollections(external_to_internal or {})
         self._internal_catalog_id = internal_catalog_id
+
+    async def list_collection_id_pairs(
+        self, catalog_id: str, ctx: Any = None
+    ) -> List[Tuple[str, Optional[str]]]:
+        self.calls.append({"catalog_id": catalog_id})
+        return self._id_pairs
 
     async def list_collections(
         self, catalog_id: str, *args: Any, limit: int = 1000, ctx: Any = None, **kw: Any
     ) -> List[_Coll]:
-        self.calls.append({"catalog_id": catalog_id, "limit": limit})
+        # Retained only to prove the expansion path never calls it (#2865).
+        self.list_collections_calls.append({"catalog_id": catalog_id, "limit": limit})
         return [_Coll(cid) for cid in self._ids]
 
     async def resolve_catalog_id(
@@ -117,6 +130,50 @@ async def test_unscoped_request_expands_to_all_catalog_collections():
     assert catalogs.calls and catalogs.calls[0]["catalog_id"] == "cat-1"
     # The original request object is not mutated in place.
     assert req.collections is None
+
+
+@pytest.mark.asyncio
+async def test_unscoped_request_uses_id_pairs_not_list_collections():
+    """#2865: expansion must use the cheap id-pair query, never the
+    hydrating ``list_collections`` (the O(N) driver fan-out that hung
+    ``/search`` on a 1,971-collection catalog)."""
+    catalogs = _FakeCatalogs(["c-alpha", "c-beta"])
+    req = _request(collections=None)
+
+    await _expand_collections_for_search(catalogs, "cat-1", req, db_resource=None)
+
+    assert len(catalogs.calls) == 1
+    assert catalogs.list_collections_calls == []
+
+
+@pytest.mark.asyncio
+async def test_unscoped_request_expands_beyond_former_1000_limit():
+    """Proves the old ``limit=1000`` truncation is gone: all 1,971 pairs
+    come back, not just the first 1,000."""
+    pairs = [(f"col_{i:04d}", f"ext-{i}") for i in range(1971)]
+    catalogs = _FakeCatalogs(id_pairs=pairs)
+    req = _request(collections=None)
+
+    out, coll_ext_id_map = await _expand_collections_for_search(
+        catalogs, "cat-1", req, db_resource=None
+    )
+
+    assert len(out.collections) == 1971
+    assert set(out.collections) == {cid for cid, _ in pairs}
+    for cid, ext_id in pairs:
+        assert coll_ext_id_map[cid] == ext_id
+
+
+@pytest.mark.asyncio
+async def test_unscoped_request_falls_back_to_internal_id_when_external_id_none():
+    catalogs = _FakeCatalogs(id_pairs=[("c-alpha", None), ("c-beta", "ext-beta")])
+    req = _request(collections=None)
+
+    out, coll_ext_id_map = await _expand_collections_for_search(
+        catalogs, "cat-1", req, db_resource=None
+    )
+
+    assert coll_ext_id_map == {"c-alpha": "c-alpha", "c-beta": "ext-beta"}
 
 
 @pytest.mark.asyncio

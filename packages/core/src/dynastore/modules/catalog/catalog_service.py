@@ -2595,6 +2595,13 @@ class CatalogService(CatalogsProtocol):
             catalog_id, limit=limit, offset=offset, lang=lang, ctx=ctx, q=q, hints=hints,
         )
 
+    async def list_collection_id_pairs(
+        self,
+        catalog_id: str,
+        ctx: Optional["DriverContext"] = None,
+    ):
+        return await self._col_svc.list_collection_id_pairs(catalog_id, ctx=ctx)
+
     async def get_collection_model(
         self,
         catalog_id: str,
