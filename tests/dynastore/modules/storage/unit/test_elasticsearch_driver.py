@@ -1096,10 +1096,181 @@ class TestWriteEntitiesTenantIndex:
 
         body = es.bulk_calls[0]["body"]
         action_id = body[0]["index"]["_id"]
-        # doc id should be EXT-1 followed by an underscore + 14-digit-ish
-        # timestamp suffix (YYYYMMDDTHHMMSS + microseconds).
-        assert action_id.startswith("EXT-1_")
-        assert len(action_id) > len("EXT-1_")
+        # doc id is geoid-based (write_entities: "UPDATE: stable doc_id=geoid"),
+        # not external_id-based. With no PG-assigned geoid and no PG canonical
+        # for this collection, the top-level feature id ("f1") is the geoid
+        # fallback; NEW_VERSION appends an underscore + 14-digit-ish timestamp
+        # (YYYYMMDDTHHMMSS + microseconds) suffix to it.
+        assert action_id.startswith("f1_")
+        assert len(action_id) > len("f1_")
+
+
+class TestWriteEntitiesPgCanonicalDetection:
+    """#2864 — routing-based detection of "does this collection's WRITE
+    routing have a PG canonical", and the resulting fork in
+    ``write_entities``: PG-canonical present -> unchanged batched-PG-read
+    hydration; absent -> feature-derived ``_source``, no PG read attempted,
+    no ``_fetch_raw_rows`` "cannot resolve physical table" RuntimeError.
+    """
+
+    @staticmethod
+    def _feature(item_id="f1", geometry=None, properties=None):
+        from dynastore.models.ogc import Feature
+        return Feature.model_validate({
+            "id": item_id,
+            "type": "Feature",
+            "geometry": geometry or {"type": "Point", "coordinates": [12.0, 41.9]},
+            "properties": properties or {"name": "Rome"},
+        })
+
+    @staticmethod
+    def _resolved_driver(*, has_resolve_physical_table: bool):
+        from dynastore.modules.storage.router import ResolvedDriver
+
+        driver = MagicMock(spec=[] if not has_resolve_physical_table else ["resolve_physical_table"])
+        return ResolvedDriver(driver=driver)
+
+    @pytest.mark.asyncio
+    async def test_es_only_routing_skips_pg_read_and_writes_from_feature(self):
+        """ES-only routing (no PG driver in WRITE fan-out): write_entities
+        must NOT call read_canonical_index_inputs at all, must NOT raise the
+        _fetch_raw_rows RuntimeError, and must still issue a _bulk write
+        whose _source carries the search-critical fields derived from the
+        feature (geometry, bbox, properties, id/geoid identity)."""
+        from dynastore.modules.storage.driver_config import (
+            ItemsWritePolicy, WriteConflictPolicy,
+        )
+
+        es = _StubEs(exists=True)
+        policy = ItemsWritePolicy(on_conflict=WriteConflictPolicy.UPDATE)
+        canonical_read_mock = AsyncMock(
+            side_effect=RuntimeError(
+                "canonical_index_read._fetch_raw_rows: cannot resolve "
+                "physical table for cat1/col1"
+            )
+        )
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.modules.elasticsearch.client.get_index_prefix",
+            return_value="dynastore",
+        ), patch.object(
+            ItemsElasticsearchDriver, "_resolve_write_policy",
+            AsyncMock(return_value=policy),
+        ), patch.object(
+            ItemsElasticsearchDriver, "_enforce_field_constraints",
+            AsyncMock(return_value=None),
+        ), patch(
+            "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+            new=canonical_read_mock,
+        ), patch(
+            "dynastore.modules.storage.router.get_write_drivers",
+            new=AsyncMock(return_value=[
+                self._resolved_driver(has_resolve_physical_table=False),
+            ]),
+        ):
+            driver = ItemsElasticsearchDriver()
+            written = await driver.write_entities(
+                "cat1", "col1", [self._feature("f1")],
+            )
+
+        # The batched PG read was never attempted — routing-based detection,
+        # not exception-based (would have raised RuntimeError if called).
+        canonical_read_mock.assert_not_awaited()
+        assert len(written) == 1
+        assert len(es.bulk_calls) == 1
+        doc = es.bulk_calls[0]["body"][1]
+        assert doc["id"] == "f1"
+        assert doc["geometry"]["type"] == "Point"
+        assert list(doc["geometry"]["coordinates"]) == pytest.approx([12.0, 41.9])
+        assert doc["bbox"] == pytest.approx([12.0, 41.9, 12.0, 41.9])
+        assert doc["properties"]["extras"]["name"] == "Rome"
+
+    @pytest.mark.asyncio
+    async def test_pg_canonical_routing_still_uses_hydration_path_unchanged(self):
+        """Pin: a collection whose WRITE routing DOES resolve a PG-capable
+        driver must still go through read_canonical_index_inputs — the fix
+        must not divert PG-backed writes onto the feature-only path."""
+        from dynastore.modules.storage.driver_config import (
+            ItemsWritePolicy, WriteConflictPolicy,
+        )
+        from dynastore.modules.catalog.canonical_index_read import CanonicalIndexInput
+
+        es = _StubEs(exists=True)
+        policy = ItemsWritePolicy(on_conflict=WriteConflictPolicy.UPDATE)
+        canonical_read_mock = AsyncMock(
+            return_value={
+                "f1": CanonicalIndexInput(
+                    row={"geoid": "f1"},
+                    geometry={"type": "Point", "coordinates": [1.0, 2.0]},
+                    bbox=[1.0, 2.0, 1.0, 2.0],
+                    user_properties={"from_pg": True},
+                )
+            }
+        )
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.modules.elasticsearch.client.get_index_prefix",
+            return_value="dynastore",
+        ), patch.object(
+            ItemsElasticsearchDriver, "_resolve_write_policy",
+            AsyncMock(return_value=policy),
+        ), patch.object(
+            ItemsElasticsearchDriver, "_enforce_field_constraints",
+            AsyncMock(return_value=None),
+        ), patch(
+            "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+            new=canonical_read_mock,
+        ), patch(
+            "dynastore.modules.storage.router.get_write_drivers",
+            new=AsyncMock(return_value=[
+                self._resolved_driver(has_resolve_physical_table=True),
+            ]),
+        ):
+            driver = ItemsElasticsearchDriver()
+            await driver.write_entities("cat1", "col1", [self._feature("f1")])
+
+        canonical_read_mock.assert_awaited_once()
+        doc = es.bulk_calls[0]["body"][1]
+        # Hydrated from the mocked PG canonical row, not the feature.
+        assert doc["properties"]["extras"]["from_pg"] is True
+        assert doc["geometry"]["type"] == "Point"
+        assert list(doc["geometry"]["coordinates"]) == pytest.approx([1.0, 2.0])
+
+    @pytest.mark.asyncio
+    async def test_write_drivers_resolution_failure_degrades_to_feature_only(self):
+        """A routing-resolution error (e.g. ConfigResolutionError) must not
+        block the ES write — it degrades to "no PG canonical" and the write
+        still succeeds via the feature-derived fallback."""
+        from dynastore.modules.storage.driver_config import (
+            ItemsWritePolicy, WriteConflictPolicy,
+        )
+
+        es = _StubEs(exists=True)
+        policy = ItemsWritePolicy(on_conflict=WriteConflictPolicy.UPDATE)
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.modules.elasticsearch.client.get_index_prefix",
+            return_value="dynastore",
+        ), patch.object(
+            ItemsElasticsearchDriver, "_resolve_write_policy",
+            AsyncMock(return_value=policy),
+        ), patch.object(
+            ItemsElasticsearchDriver, "_enforce_field_constraints",
+            AsyncMock(return_value=None),
+        ), patch(
+            "dynastore.modules.storage.router.get_write_drivers",
+            new=AsyncMock(side_effect=RuntimeError("routing unavailable")),
+        ):
+            driver = ItemsElasticsearchDriver()
+            written = await driver.write_entities(
+                "cat1", "col1", [self._feature("f1")],
+            )
+
+        assert len(written) == 1
+        assert len(es.bulk_calls) == 1
 
 
 class TestWriteEntitiesGeometryPolicy:

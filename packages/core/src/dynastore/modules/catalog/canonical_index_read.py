@@ -39,6 +39,33 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# shapely is an optional dependency elsewhere in this codebase (SCOPE-trimmed
+# deployments may omit it) — guard the same way
+# ``dynastore.tools.geometry_normalize`` does so a missing bbox on a
+# database-free feature (:func:`canonical_input_from_feature`) degrades to
+# ``None`` instead of an ImportError.
+try:
+    from shapely.geometry import shape as _shapely_shape
+
+    _SHAPELY_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised only without shapely
+    _SHAPELY_AVAILABLE = False
+
+
+def _bbox_from_geometry(geometry: Optional[Dict[str, Any]]) -> Optional[List[float]]:
+    """Best-effort ``[minx, miny, maxx, maxy]`` bbox from a GeoJSON geometry.
+
+    Returns ``None`` when *geometry* is falsy, unparseable, or shapely is
+    unavailable — callers treat ``None`` as "no bbox available", the same
+    degrade-safe contract the rest of this module uses.
+    """
+    if not geometry or not _SHAPELY_AVAILABLE:
+        return None
+    try:
+        return list(_shapely_shape(geometry).bounds)
+    except Exception:
+        return None
+
 
 def _get_db_engine() -> Optional[Any]:
     """Resolve a DB engine via the registered DatabaseProtocol.
@@ -588,7 +615,13 @@ def canonical_input_from_feature(
     geom = feature.get("geometry")
     geometry = geom if isinstance(geom, dict) else None
     bbox_val = feature.get("bbox")
-    bbox = list(bbox_val) if bbox_val is not None else None
+    # Fall back to a shapely-computed bbox when the feature doesn't carry one
+    # explicitly (#2864) — ES spatial filtering/sort relies on ``bbox`` being
+    # present, and a PG-hydrated canonical doc always has one (PG sidecar
+    # computes it), so the feature-only path must not silently omit it.
+    bbox = (
+        list(bbox_val) if bbox_val is not None else _bbox_from_geometry(geometry)
+    )
 
     row: Dict[str, Any] = {"geoid": geoid}
     if external_id is not None:

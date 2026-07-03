@@ -1549,10 +1549,24 @@ class ItemsElasticsearchDriver(
             )
             item_geoids.append(geoid_for_item)
 
-        # Batch-fetch canonical inputs for all non-None geoids.
+        # Batch-fetch canonical inputs for all non-None geoids — but only when
+        # this collection's WRITE routing actually resolves a PG-capable
+        # driver (#2864). Pure ES-only routing (``_items_routing_es()`` — the
+        # ``items_es_public`` preset used by ``stac_harvest``) has no PG WRITE
+        # entry, so every batched read would deterministically raise
+        # ``canonical_index_read._fetch_raw_rows``'s "cannot resolve physical
+        # table" RuntimeError (#2731 made that failure loud on purpose — it
+        # must not be swallowed for PG-backed collections). Checking routing
+        # capability up front, rather than catching that RuntimeError, keeps
+        # genuine PG failures on PG-backed collections visible while letting
+        # ES-only collections skip straight to the per-item feature-derived
+        # fallback below (``ci is None`` branch), which is a database-free
+        # equivalent of the canonical shape.
         batch_geoids = [g for g in item_geoids if g is not None]
         canonical_inputs: Dict[str, Any] = {}
-        if batch_geoids:
+        if batch_geoids and await self._collection_has_pg_write_canonical(
+            catalog_id, collection_id,
+        ):
             canonical_inputs = await read_canonical_index_inputs(
                 catalog_id, collection_id, batch_geoids, db_resource=db_resource,
             )
@@ -1827,6 +1841,39 @@ class ItemsElasticsearchDriver(
             return False
 
         await check_unique(ft.fields, feature_dicts, exists=_exists)
+
+    @staticmethod
+    async def _collection_has_pg_write_canonical(
+        catalog_id: str, collection_id: str,
+    ) -> bool:
+        """Routing-based signal: does this collection's WRITE fan-out include
+        a PG-capable driver — one that can resolve/pin a physical table?
+
+        Used by :meth:`write_entities` to decide whether the canonical ES
+        envelope can be hydrated from PostgreSQL
+        (:func:`~dynastore.modules.catalog.canonical_index_read.read_canonical_index_inputs`)
+        or must be built directly from the feature payload
+        (:func:`~dynastore.modules.catalog.canonical_index_read.canonical_input_from_feature`).
+        Mirrors the same ``hasattr(driver, "resolve_physical_table")`` capability
+        check ``ItemService._resolve_physical_table`` uses — only
+        ``ItemsPostgresqlDriver`` implements it. Checking this up front (instead
+        of catching the ``RuntimeError`` a PG-less batched read would raise) keeps
+        a genuine PG failure on a PG-backed collection visible instead of being
+        folded into the same except clause as "no PG canonical at all".
+
+        Degrade-safe: any routing-resolution failure is treated as "no PG
+        canonical" — a resolution error here must not block the ES write, it
+        just means the write falls back to the feature-derived doc.
+        """
+        try:
+            from dynastore.modules.storage.router import get_write_drivers
+            write_drivers = await get_write_drivers(catalog_id, collection_id)
+        except Exception:
+            return False
+        return any(
+            hasattr(resolved.driver, "resolve_physical_table")
+            for resolved in write_drivers
+        )
 
     @staticmethod
     async def _resolve_write_policy(

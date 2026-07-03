@@ -27,6 +27,8 @@ only a PG row + sidecars can supply.
 """
 from __future__ import annotations
 
+import pytest
+
 
 def _feature_dict():
     return {
@@ -86,6 +88,27 @@ def test_canonical_input_from_feature_threads_external_and_asset_id():
     )
     assert ci.row["external_id"] == "ext-9"
     assert ci.row["asset_id"] == "asset-7"
+
+
+def test_canonical_input_from_feature_computes_bbox_from_geometry_when_absent():
+    """#2864: a feature with no explicit ``bbox`` still yields one — computed
+    from ``geometry`` — so the ES-only write path's ``_source`` doesn't
+    silently omit bbox (spatial filtering/sort depend on it)."""
+    from dynastore.modules.catalog.canonical_index_read import canonical_input_from_feature
+    feat = _feature_dict()
+    del feat["bbox"]
+    ci = canonical_input_from_feature(feat, "cat1", "col1", geoid="geo-123")
+    assert ci.bbox == pytest.approx([12.0, 41.9, 12.0, 41.9])
+
+
+def test_canonical_input_from_feature_bbox_none_when_no_geometry():
+    """No geometry, no explicit bbox → bbox stays None (nothing to derive)."""
+    from dynastore.modules.catalog.canonical_index_read import canonical_input_from_feature
+    feat = _feature_dict()
+    del feat["bbox"]
+    feat["geometry"] = None
+    ci = canonical_input_from_feature(feat, "cat1", "col1", geoid="geo-123")
+    assert ci.bbox is None
 
 
 def test_canonical_input_from_feature_no_pg_no_sidecars():
