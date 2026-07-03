@@ -46,6 +46,7 @@ from sqlalchemy.engine import Engine
 from dynastore.modules import ModuleProtocol
 from dynastore.modules.db_config.db_config import DBConfig
 from dynastore.modules.db_config.db_timeout_config import (
+    clamp_serving_statement_timeout,
     lock_safety_server_settings,
     resolve_timeout_settings,
 )
@@ -271,6 +272,20 @@ class DBService(ModuleProtocol, DatabaseProtocol):
                         idle_in_transaction_session_timeout,
                     ) = resolve_timeout_settings(db_config)
 
+                    # Cap the shared serving engine's session statement_timeout
+                    # below the load-balancer/Cloud Run deadline (#2898).
+                    # DB_STATEMENT_TIMEOUT resolves to "0" (disabled, dev) or
+                    # values like "90s" (prod) that sit ABOVE the 60s LB
+                    # timeout, so a stuck query holds its connection to that
+                    # ceiling instead of being cancelled and reclaimed
+                    # server-side. This only affects the shared serving
+                    # engine -- task-side engines never apply statement_timeout,
+                    # and SET LOCAL overrides within a transaction still win.
+                    statement_timeout = clamp_serving_statement_timeout(
+                        statement_timeout,
+                        db_config.serving_statement_timeout_ceiling_seconds,
+                    )
+
                     # 1. Create Engine
                     app_state.engine = create_async_engine(
                         normalize_db_url(db_config.database_url, is_async=True),
@@ -343,11 +358,12 @@ class DBService(ModuleProtocol, DatabaseProtocol):
                                     idle_in_transaction_session_timeout,
                                 ),
                                 # statement_timeout bounds total statement EXECUTION
-                                # (not just the lock wait). "0" = disabled (default,
-                                # historical behaviour). Set DB_STATEMENT_TIMEOUT just
-                                # under pool_command_timeout to turn a silent 60s
-                                # client-side cancel into a logged 57014 naming the
-                                # slow query. SET LOCAL in long jobs overrides it.
+                                # (not just the lock wait). DB_STATEMENT_TIMEOUT
+                                # resolves to "0" (disabled) or a configured value,
+                                # but this shared serving engine always applies the
+                                # clamped value (see clamp_serving_statement_timeout
+                                # above, #2898) so it never exceeds the LB deadline.
+                                # SET LOCAL in long jobs overrides it.
                                 "statement_timeout": statement_timeout,
                             },
                         },

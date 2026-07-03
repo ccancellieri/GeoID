@@ -328,6 +328,18 @@ class DBConfig:
     #   DB_POOL_ACQUIRE_TIMEOUT=10  # review / staging — fail very fast
     #   DB_POOL_ACQUIRE_TIMEOUT=30  # production default
     pool_acquire_timeout: int = _cfg_int("DB_POOL_ACQUIRE_TIMEOUT", 30)
+    # Ceiling (seconds) the shared SERVING engine's effective statement_timeout
+    # is clamped to, regardless of what DB_STATEMENT_TIMEOUT resolves to
+    # (see clamp_serving_statement_timeout in db_timeout_config.py). Exists
+    # because DB_STATEMENT_TIMEOUT is disabled ("0") in dev and set to "90s"
+    # in production -- both above the 60s load-balancer/Cloud Run deadline, so
+    # a stuck interactive query holds its connection to that ceiling instead
+    # of being cancelled and reclaimed server-side (#2898). 55s sits below the
+    # 60s LB timeout and at/under pool_command_timeout. Task-side engines are
+    # unaffected -- they never apply statement_timeout at all.
+    serving_statement_timeout_ceiling_seconds: int = _cfg_int(
+        "DB_SERVING_STATEMENT_TIMEOUT_CEILING", 55
+    )
 
     def validate_pool_sizing(self) -> None:
         """Make a dangerously-small pool LOUD and SAFE at startup.

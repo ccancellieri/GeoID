@@ -177,6 +177,13 @@ _max_background_db_concurrency: int = 2
 # the tile read path to fail fast instead of waiting 30 s on a saturated pool.
 _foreground_pool_acquire_timeout_s: float = 3.0
 
+# Fallback for the pool-acquire WARN logging threshold (seconds). Mirrors the
+# default of ConnectionHealthConfig.pool_acquire_warn_seconds. A pool-acquire
+# wait at or above this threshold is logged at WARNING (with pool occupancy
+# stats) instead of the routine INFO/DEBUG lines, so a pool sliding towards
+# saturation is visible in the service's own logs before it wedges (#2898).
+_pool_acquire_warn_seconds: float = 5.0
+
 # Fallback for the pool-saturation Retry-After hint (seconds). Mirrors the
 # default of ConnectionHealthConfig.pool_saturation_retry_after_seconds. Used
 # when a foreground DB pool-acquire hits the bounded pool_acquire_timeout
@@ -286,6 +293,17 @@ def resolve_foreground_pool_acquire_timeout() -> float:
     directly.
     """
     return _foreground_pool_acquire_timeout_s
+
+
+def resolve_pool_acquire_warn_seconds() -> float:
+    """Return the fallback pool-acquire WARN logging threshold in seconds.
+
+    Used as the fallback when the config service is unavailable. The live path
+    reads ``ConnectionHealthConfig.pool_acquire_warn_seconds`` from the
+    central cached getter. Tests may replace ``_pool_acquire_warn_seconds``
+    directly.
+    """
+    return _pool_acquire_warn_seconds
 
 
 def resolve_pool_saturation_retry_after_seconds() -> int:
@@ -449,6 +467,23 @@ class ConnectionHealthConfig(PluginConfig):
             "all other routes keep the full pool_acquire_timeout. "
             "Hot-reloadable — changes take effect immediately without a pod restart. "
             "Must be in [0.5, 15.0] seconds."
+        ),
+    )
+
+    pool_acquire_warn_seconds: Mutable[float] = Field(
+        default=5.0,
+        ge=0.5,
+        le=60.0,
+        description=(
+            "Pool-acquire wait (seconds) at or above which "
+            "_acquire_async_engine_connection logs at WARNING (with pool "
+            "occupancy stats -- size/checkedin/checkedout/overflow) instead "
+            "of the routine INFO/DEBUG lines. A wedged or saturating pool "
+            "otherwise produces zero application log lines until a request "
+            "either succeeds or hits the bounded pool_acquire_timeout, "
+            "leaving an outage invisible from the service's own logs "
+            "(#2898). Hot-reloadable -- changes take effect immediately "
+            "without a pod restart. Must be in [0.5, 60.0] seconds."
         ),
     )
 

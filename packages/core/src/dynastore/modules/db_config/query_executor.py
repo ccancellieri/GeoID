@@ -35,6 +35,7 @@ from dynastore.modules.db_config.connection_health_config import (
     resolve_foreground_pool_acquire_timeout,
     resolve_max_background_db_concurrency,
     resolve_max_concurrent_connection_retries,
+    resolve_pool_acquire_warn_seconds,
     resolve_pool_hygiene_reacquire_attempts,
     resolve_pool_saturation_retry_after_seconds,
     resolve_provisioning_retry_config,
@@ -1644,6 +1645,31 @@ async def _read_live_fg_acquire_timeout() -> float:
     return resolve_foreground_pool_acquire_timeout()
 
 
+async def _read_live_pool_acquire_warn_seconds() -> float:
+    """Read ``ConnectionHealthConfig.pool_acquire_warn_seconds`` live.
+
+    Per-call read from the central cached config getter so operators can
+    tune the pool-acquire WARN logging threshold (#2898) without a pod
+    restart. Falls back to :func:`resolve_pool_acquire_warn_seconds` when
+    the config service is unavailable.
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.db_config.connection_health_config import (
+            ConnectionHealthConfig,
+        )
+        from dynastore.tools.discovery import get_protocol
+
+        svc = get_protocol(PlatformConfigsProtocol)
+        if svc is not None:
+            cfg = await svc.get_config(ConnectionHealthConfig)
+            if isinstance(cfg, ConnectionHealthConfig):
+                return cfg.pool_acquire_warn_seconds
+    except Exception:
+        pass
+    return resolve_pool_acquire_warn_seconds()
+
+
 async def _read_live_pool_saturation_retry_after() -> int:
     """Read ``ConnectionHealthConfig.pool_saturation_retry_after_seconds`` live.
 
@@ -1963,6 +1989,35 @@ async def _drain_rollback_exit(txn_cm: Any, exc: BaseException) -> None:
         )
 
 
+def _format_pool_stats(engine: AsyncEngine) -> str:
+    """Best-effort pool occupancy snapshot for pool-acquire log lines (#2898).
+
+    A wedged/saturating pool otherwise produces log lines with no indication
+    of *how* saturated the pool was, making the outage invisible until a
+    request fails outright. Every attribute access is guarded -- some pool
+    implementations exercised in tests (``NullPool``, ``StaticPool``) do not
+    implement ``size()``/``checkedin()``/``checkedout()``/``overflow()``, and
+    a failure here must never break connection acquisition. Returns ``""``
+    when stats are unavailable.
+    """
+    try:
+        pool = getattr(engine, "pool", None)
+        if pool is None:
+            return ""
+        size = getattr(pool, "size", None)
+        checkedin = getattr(pool, "checkedin", None)
+        checkedout = getattr(pool, "checkedout", None)
+        overflow = getattr(pool, "overflow", None)
+        if not all(callable(f) for f in (size, checkedin, checkedout, overflow)):
+            return ""
+        return (
+            f" pool_size={size()} checkedin={checkedin()} "
+            f"checkedout={checkedout()} overflow={overflow()}"
+        )
+    except Exception:
+        return ""
+
+
 @retry_on_transient_connect()
 async def _acquire_async_engine_connection(engine: AsyncEngine) -> AsyncConnection:
     """Pool-hygienized async connection from an :class:`AsyncEngine`.
@@ -1993,8 +2048,9 @@ async def _acquire_async_engine_connection(engine: AsyncEngine) -> AsyncConnecti
         # the HTTP boundary maps it to a clean 503 instead of an opaque 500.
         wait_s = time.monotonic() - t0
         logger.warning(
-            "db_pool_acquire failed service=%s wait_seconds=%.4f saturated=true%s",
+            "db_pool_acquire failed service=%s wait_seconds=%.4f saturated=true%s%s",
             _SERVICE_NAME_FOR_METRICS, wait_s, _acquire_scope_suffix(),
+            _format_pool_stats(engine),
         )
         retry_after = await _read_live_pool_saturation_retry_after()
         raise PoolSaturationError(
@@ -2012,7 +2068,18 @@ async def _acquire_async_engine_connection(engine: AsyncEngine) -> AsyncConnecti
         raise
     wait_s = time.monotonic() - t0
     slow_threshold_s = resolve_slow_pool_acquire_threshold()
-    if wait_s >= slow_threshold_s:
+    warn_threshold_s = await _read_live_pool_acquire_warn_seconds()
+    if wait_s >= warn_threshold_s:
+        # A successful-but-slow acquire crossing this (hot-reloadable, #2898)
+        # threshold means the pool is sliding towards saturation -- surface
+        # it at WARNING with occupancy stats instead of letting it blend into
+        # the routine INFO/DEBUG lines below.
+        logger.warning(
+            "db_pool_acquire slow service=%s wait_seconds=%.4f threshold=%.2f%s%s",
+            _SERVICE_NAME_FOR_METRICS, wait_s, warn_threshold_s,
+            _acquire_scope_suffix(), _format_pool_stats(engine),
+        )
+    elif wait_s >= slow_threshold_s:
         logger.info(
             "db_pool_acquire slow service=%s wait_seconds=%.4f threshold=%.2f%s",
             _SERVICE_NAME_FOR_METRICS, wait_s, slow_threshold_s,

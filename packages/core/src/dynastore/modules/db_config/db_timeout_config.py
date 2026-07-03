@@ -37,7 +37,63 @@ Related issues:
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
+
+
+def _parse_pg_interval_seconds(value: str) -> Optional[int]:
+    """Parse a small subset of PostgreSQL interval syntax into seconds.
+
+    Understands a bare integer (seconds), an ``s`` suffix (seconds), and a
+    ``min`` suffix (minutes). Returns ``None`` for anything else -- including
+    the disabled sentinel ``"0"`` is left to the caller, since 0 parses fine
+    as an integer but means "no timeout", not "0 seconds".
+    """
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    if text.endswith("min"):
+        try:
+            return int(text[: -len("min")]) * 60
+        except ValueError:
+            return None
+    if text.endswith("s"):
+        try:
+            return int(text[: -len("s")])
+        except ValueError:
+            return None
+    return None
+
+
+def clamp_serving_statement_timeout(statement_timeout: str, ceiling_seconds: int) -> str:
+    """Clamp a resolved ``statement_timeout`` to ``ceiling_seconds`` for the
+    shared serving engine (#2898).
+
+    ``DBConfig.statement_timeout`` is disabled ("0") in dev and set to "90s"
+    in production -- both above the load balancer's 60s deadline, so a stuck
+    interactive query on the shared serving engine holds its connection past
+    the client's timeout instead of being cancelled and reclaimed server-side.
+    This clamps the effective value below that ceiling without touching the
+    configured ``DB_STATEMENT_TIMEOUT`` itself, so long-running task/job
+    engines (which never call this) and ``SET LOCAL`` overrides within a
+    transaction are unaffected.
+
+    Fails safe: an unparseable, disabled ("0"), or non-positive value clamps
+    to the ceiling; a value already at or below the ceiling is returned
+    unchanged (reformatted as ``"<seconds>s"``); a value above the ceiling is
+    clamped to it. Never raises -- a malformed input must not break engine
+    construction.
+    """
+    try:
+        parsed = _parse_pg_interval_seconds(statement_timeout)
+        if parsed is None or parsed <= 0 or parsed > ceiling_seconds:
+            return f"{ceiling_seconds}s"
+        return f"{parsed}s"
+    except Exception:
+        return f"{ceiling_seconds}s"
 
 
 def resolve_timeout_settings(

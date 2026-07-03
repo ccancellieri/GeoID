@@ -106,6 +106,33 @@ def test_engine_server_settings_include_lock_timeout():
     )
 
 
+def test_statement_timeout_is_clamped_before_reaching_server_settings():
+    """#2898 source-pin: the shared serving engine's ``statement_timeout``
+    must be run through ``clamp_serving_statement_timeout`` before it is fed
+    into ``server_settings`` -- not the raw value from
+    ``resolve_timeout_settings``. ``DBConfig.statement_timeout`` resolves to
+    ``"0"`` (disabled, dev) or values like ``"90s"`` (prod) that sit above
+    the 60s load-balancer/Cloud Run deadline; without the clamp, a stuck
+    query holds its connection to that ceiling instead of being cancelled
+    and reclaimed server-side. A future edit that drops the clamp call
+    (e.g. reverting to the raw ``resolve_timeout_settings`` tuple) must fail
+    this test.
+    """
+    source = _db_service_source()
+    assert "clamp_serving_statement_timeout(" in source, (
+        "db_service.py must call clamp_serving_statement_timeout() on the "
+        "resolved statement_timeout for the shared serving engine (#2898)."
+    )
+    clamp_idx = source.index("clamp_serving_statement_timeout(")
+    settings_idx = source.index('"statement_timeout": statement_timeout,')
+    assert clamp_idx < settings_idx, (
+        "clamp_serving_statement_timeout(...) must be assigned back to "
+        "statement_timeout BEFORE it is placed in server_settings, so the "
+        "clamped value (not the raw resolve_timeout_settings() value) is "
+        "what the engine actually applies."
+    )
+
+
 # create_async_engine() sites that do NOT route through
 # task_engine_connect_args() / lock_safety_server_settings() — a justified,
 # reviewed exception, not a silent gap:

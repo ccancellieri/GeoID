@@ -39,6 +39,7 @@ from dynastore.modules.db_config.connection_health_config import (
     resolve_leadership_config,
     resolve_slow_pool_acquire_threshold,
     resolve_max_concurrent_connection_retries,
+    resolve_pool_acquire_warn_seconds,
     resolve_pool_saturation_retry_after_seconds,
 )
 
@@ -105,6 +106,22 @@ class TestConfigClasses:
         assert ConnectionHealthConfig(pool_saturation_retry_after_seconds=1).pool_saturation_retry_after_seconds == 1
         assert ConnectionHealthConfig(pool_saturation_retry_after_seconds=300).pool_saturation_retry_after_seconds == 300
 
+    def test_pool_acquire_warn_seconds_default(self):
+        config = ConnectionHealthConfig()
+        assert config.pool_acquire_warn_seconds == 5.0
+
+    def test_pool_acquire_warn_seconds_bounds(self):
+        """ge=0.5 and le=60.0 are enforced by Pydantic, matching the sibling
+        foreground_pool_acquire_timeout_s bounds pattern."""
+        with pytest.raises(Exception):
+            ConnectionHealthConfig(pool_acquire_warn_seconds=0.4)
+        with pytest.raises(Exception):
+            ConnectionHealthConfig(pool_acquire_warn_seconds=60.1)
+
+    def test_pool_acquire_warn_seconds_valid_range(self):
+        assert ConnectionHealthConfig(pool_acquire_warn_seconds=0.5).pool_acquire_warn_seconds == 0.5
+        assert ConnectionHealthConfig(pool_acquire_warn_seconds=60.0).pool_acquire_warn_seconds == 60.0
+
 
 class TestResolveReadsSnapshot:
     """``resolve_*`` returns the validated class defaults out of the box."""
@@ -147,3 +164,15 @@ class TestResolveReadsSnapshot:
             assert resolve_pool_saturation_retry_after_seconds() == 10
         finally:
             chc._pool_saturation_retry_after_seconds = original
+
+    def test_pool_acquire_warn_seconds_default(self):
+        assert resolve_pool_acquire_warn_seconds() == 5.0
+
+    def test_pool_acquire_warn_seconds_reads_module_global(self):
+        import dynastore.modules.db_config.connection_health_config as chc
+        original = chc._pool_acquire_warn_seconds
+        try:
+            chc._pool_acquire_warn_seconds = 12.0
+            assert resolve_pool_acquire_warn_seconds() == 12.0
+        finally:
+            chc._pool_acquire_warn_seconds = original

@@ -33,6 +33,8 @@ that the happy path (pool not saturated) is unaffected by the new branch.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Optional
 
 import pytest
@@ -59,6 +61,29 @@ class _FakeConn:
         pass
 
 
+class _FakePool:
+    """Duck-typed pool exposing the four stats methods
+    ``_format_pool_stats`` reads (#2898)."""
+
+    def __init__(self, *, size=10, checkedin=6, checkedout=4, overflow=0) -> None:
+        self._size = size
+        self._checkedin = checkedin
+        self._checkedout = checkedout
+        self._overflow = overflow
+
+    def size(self):
+        return self._size
+
+    def checkedin(self):
+        return self._checkedin
+
+    def checkedout(self):
+        return self._checkedout
+
+    def overflow(self):
+        return self._overflow
+
+
 class _FakeEngine:
     """Minimal duck-typed engine: only ``connect()`` is exercised by
     ``_acquire_async_engine_connection``."""
@@ -67,6 +92,7 @@ class _FakeEngine:
         self._raise_timeout = raise_timeout
         self._conn = conn or _FakeConn()
         self.connect_calls = 0
+        self.pool = _FakePool()
 
     async def connect(self):
         self.connect_calls += 1
@@ -115,3 +141,117 @@ async def test_normal_path_unaffected_by_saturation_handling():
     assert result is conn
     assert engine.connect_calls == 1
     assert conn.rollback_calls == 1  # reset-on-checkout hygiene still runs
+
+
+@pytest.mark.asyncio
+async def test_saturated_pool_warning_includes_pool_stats(monkeypatch, caplog):
+    """The pool-saturation WARNING (#2898) carries occupancy stats
+    (``checkedout=``/``overflow=``) so an operator can see how saturated the
+    pool was from this one log line, without correlating a second source."""
+    from dynastore.modules.db_config import query_executor as qe
+
+    async def _fast_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(qe.asyncio, "sleep", _fast_sleep, raising=True)
+
+    engine = _FakeEngine(raise_timeout=True)
+
+    with caplog.at_level(logging.WARNING, logger=qe.logger.name):
+        with pytest.raises(PoolSaturationError):
+            await _acquire_async_engine_connection(engine)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("checkedout=" in m and "overflow=" in m for m in warnings), warnings
+
+
+@pytest.mark.asyncio
+async def test_slow_successful_acquire_warns_with_pool_stats(monkeypatch, caplog):
+    """A successful acquire whose wait crosses
+    ``ConnectionHealthConfig.pool_acquire_warn_seconds`` must emit a WARNING
+    carrying pool stats (#2898), not just the routine INFO line. The
+    threshold itself is monkeypatched (rather than the global stdlib clock)
+    so a small, real ``asyncio.sleep`` reliably crosses it without touching
+    process-wide timing used by other fixtures/plugins."""
+    from dynastore.modules.db_config import query_executor as qe
+
+    monkeypatch.setattr(qe, "resolve_pool_acquire_warn_seconds", lambda: 0.01)
+
+    conn = _FakeConn()
+    engine = _FakeEngine(raise_timeout=False, conn=conn)
+
+    async def _slow_connect():
+        engine.connect_calls += 1
+        await asyncio.sleep(0.05)
+        return conn
+
+    engine.connect = _slow_connect
+
+    with caplog.at_level(logging.WARNING, logger=qe.logger.name):
+        result = await _acquire_async_engine_connection(engine)
+
+    assert result is conn
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("checkedout=" in m and "overflow=" in m for m in warnings), warnings
+
+
+@pytest.mark.asyncio
+async def test_slow_successful_acquire_warns_using_live_config_threshold(monkeypatch, caplog):
+    """``pool_acquire_warn_seconds`` is read from the live
+    ``ConnectionHealthConfig`` (not just the module-global fallback), so
+    operators can hot-reload the WARN threshold without a pod restart
+    (#2898). The module-global fallback stays at its 5 s default here --
+    only a genuinely live read of the 0.5 s config value (its allowed
+    minimum) can make this ~0.55 s connect delay cross the threshold,
+    proving the value comes from the config service rather than
+    resolve_pool_acquire_warn_seconds()."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from dynastore.modules.db_config import query_executor as qe
+    from dynastore.modules.db_config.connection_health_config import (
+        ConnectionHealthConfig,
+    )
+
+    live_cfg = ConnectionHealthConfig(pool_acquire_warn_seconds=0.5)
+    config_mock = MagicMock()
+    config_mock.get_config = AsyncMock(return_value=live_cfg)
+    monkeypatch.setattr(
+        "dynastore.tools.discovery.get_protocol",
+        lambda *_a, **_kw: config_mock,
+    )
+
+    conn = _FakeConn()
+    engine = _FakeEngine(raise_timeout=False, conn=conn)
+
+    async def _slow_connect():
+        engine.connect_calls += 1
+        await asyncio.sleep(0.55)
+        return conn
+
+    engine.connect = _slow_connect
+
+    with caplog.at_level(logging.WARNING, logger=qe.logger.name):
+        result = await _acquire_async_engine_connection(engine)
+
+    assert result is conn
+    config_mock.get_config.assert_awaited_once()
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("checkedout=" in m and "overflow=" in m for m in warnings), warnings
+
+
+@pytest.mark.asyncio
+async def test_fast_successful_acquire_does_not_warn(caplog):
+    """A fast acquire (well below the default pool_acquire_warn_seconds)
+    must not emit a WARNING -- the WARN threshold is deliberately above the
+    existing slow_pool_acquire_threshold_seconds INFO threshold, not a
+    replacement for it."""
+    from dynastore.modules.db_config import query_executor as qe
+
+    conn = _FakeConn()
+    engine = _FakeEngine(raise_timeout=False, conn=conn)
+
+    with caplog.at_level(logging.WARNING, logger=qe.logger.name):
+        result = await _acquire_async_engine_connection(engine)
+
+    assert result is conn
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
