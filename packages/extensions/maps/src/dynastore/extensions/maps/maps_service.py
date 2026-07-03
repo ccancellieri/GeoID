@@ -51,6 +51,7 @@ from dynastore.modules.storage.drivers.pg_sidecars import (
     driver_sidecars,
 )
 from . import maps_db
+from .maps_tile_cache import try_mvt_cache_layers, MVT_TILE_SRID
 from dynastore.models.localization import LocalizedText
 from .maps_models import MapsLandingPage, DatasetMaps, MapContent, Link
 from .maps_config import MapsConfig
@@ -648,6 +649,9 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         # CPU-bound render below, so a pooled slot is never held across
         # run_in_executor (GeoID #703).
         db_engine = get_async_engine(request)
+        # Connection 1: validation + config + style only. Released before both
+        # the (possibly slow) MVT cache reads and the CPU-bound render, so a
+        # pooled slot is never held across external I/O or the executor (#703).
         async with managed_transaction(db_engine) as conn:
             ctx = DriverContext(db_resource=conn)
 
@@ -657,25 +661,9 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
 
             if not catalogs_svc:
                 raise HTTPException(status_code=500, detail="Catalogs service not available.")
-            try:
-                layer_config, layers_data = await asyncio.gather(
-                    catalogs_svc.get_collection_config(dataset, valid_collections[0], ctx=ctx),
-                    maps_db.get_features_for_rendering(
-                        conn=conn,
-                        schema=dataset,
-                        collections=valid_collections,
-                        bbox=bbox_list,
-                        crs=crs,
-                        width=width,
-                        height=height,
-                        bbox_srid=bbox_srid,
-                        datetime_str=datetime,
-                        subset_params=parse_subset_parameter(subset),
-                    ),
-                )
-            except ValueError as e:
-                logger.error(f"Data Error: {e}")
-                raise HTTPException(status_code=400, detail=str(e)) from e
+            layer_config = await catalogs_svc.get_collection_config(
+                dataset, valid_collections[0], ctx=ctx
+            )
             if layer_config is None:
                 raise HTTPException(
                     status_code=404,
@@ -686,6 +674,51 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
                 conn, dataset, valid_collections[0] if valid_collections else None, style
             )
 
+        # Best-effort fast path: a default-style, unfiltered, single-collection
+        # vector map can be assembled from the cached MVT pyramid, skipping the
+        # PostGIS geometry fetch + simplification. Returns None (→ source render)
+        # unless the tiles module is loaded, caching is enabled, and every
+        # covering tile is present. OGC semantics are identical either way.
+        layers_data = None
+        render_source_srid = _resolve_target_srid(layer_config)
+        if (
+            style_to_render is None
+            and datetime is None
+            and subset is None
+            and len(valid_collections) == 1
+        ):
+            mvt_layers = await try_mvt_cache_layers(
+                catalog_id=dataset,
+                collection_id=valid_collections[0],
+                bbox=bbox_list,
+                bbox_srid=bbox_srid,
+                width=width,
+                height=height,
+            )
+            if mvt_layers is not None:
+                layers_data = mvt_layers
+                render_source_srid = MVT_TILE_SRID
+
+        if layers_data is None:
+            # Connection 2: source geometry fetch (short-lived, released before render).
+            async with managed_transaction(db_engine) as conn:
+                try:
+                    layers_data = await maps_db.get_features_for_rendering(
+                        conn=conn,
+                        schema=dataset,
+                        collections=valid_collections,
+                        bbox=bbox_list,
+                        crs=crs,
+                        width=width,
+                        height=height,
+                        bbox_srid=bbox_srid,
+                        datetime_str=datetime,
+                        subset_params=parse_subset_parameter(subset),
+                    )
+                except ValueError as e:
+                    logger.error(f"Data Error: {e}")
+                    raise HTTPException(status_code=400, detail=str(e)) from e
+
         # Render (CPU-bound, no DB connection held)
         try:
             loop = asyncio.get_running_loop()
@@ -693,7 +726,7 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
                 MapsService.process_pool,
                 render_map_image,
                 width, height, bbox_list, crs,
-                _resolve_target_srid(layer_config),
+                render_source_srid,
                 layers_data, style_to_render,
                 transparent, bgcolor, bbox_srid,
             )

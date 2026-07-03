@@ -21,7 +21,9 @@ from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
 from pydantic import Field, field_serializer, field_validator
 from dynastore.models.mutability import Mutable
 from dynastore.models.plugin_config import PluginConfig
+from dynastore.models.protocols.configs import ConfigsProtocol
 from dynastore.extensions.tools.exposure_mixin import ExposableConfigMixin
+from dynastore.tools.discovery import get_protocol
 from dynastore.tools.geospatial import SimplificationAlgorithm
 from dynastore.modules.tiles.tiles_writers import TileWriterConfig, resolve_writer_config_entry
 
@@ -152,6 +154,42 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
             "``TilesPreseedConfig.preseed_tile_timeout_seconds``."
         ),
     )
+
+
+async def cache_on_demand_enabled(
+    catalog_id: str,
+    collection_id: Optional[str] = None,
+    *,
+    catalog_config: Optional["TilesConfig"] = None,
+) -> bool:
+    """Resolve the operator's per-catalog/collection ``cache_on_demand`` intent.
+
+    The catalog setting gates first: if disabled there, caching is off
+    regardless of the collection. When ``collection_id`` is given, the
+    collection's own ``TilesConfig`` can further opt out, defaulting to the
+    catalog's value if unset. Pass an already-loaded ``catalog_config`` to
+    skip the catalog config fetch (the hot vector-tile path already has one).
+
+    Any config-load failure fails closed (returns ``False``) rather than
+    raising, since callers use this to gate a best-effort accelerator.
+    """
+    mgr = get_protocol(ConfigsProtocol)
+    if mgr is None:
+        return False
+    try:
+        cat = catalog_config
+        if cat is None:
+            cat = await mgr.get_config(TilesConfig, catalog_id)
+        catalog_cache = getattr(cat, "cache_on_demand", True)
+        if not catalog_cache:
+            return False
+        if collection_id is None:
+            return bool(catalog_cache)
+        coll = await mgr.get_config(TilesConfig, catalog_id, collection_id)
+        return bool(getattr(coll, "cache_on_demand", catalog_cache))
+    except Exception as exc:
+        logger.debug("cache_on_demand_enabled: config check failed: %s", exc)
+        return False
 
 
 class TilesCachingConfig(PluginConfig):

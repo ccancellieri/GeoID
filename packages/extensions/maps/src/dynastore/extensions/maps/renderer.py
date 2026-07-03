@@ -414,6 +414,31 @@ def _reproject_bbox(
     return [min(xs), min(ys), max(xs), max(ys)]
 
 
+def reproject_bbox_epsg(
+    bbox: List[float], src_epsg: int, dst_epsg: int
+) -> Optional[List[float]]:
+    """Reproject an axis-aligned bbox between EPSG codes, failing closed.
+
+    Thin public wrapper around ``_reproject_bbox`` for callers that only have
+    EPSG codes on hand rather than a resolved ``osr.SpatialReference`` (e.g.
+    the MVT cache fast path). Unlike ``_reproject_bbox``, this never raises:
+    an unresolvable EPSG code (or any other CRS failure) yields ``None``
+    instead of propagating a GDAL/OGR exception, since callers use this to
+    gate a best-effort accelerator that must fall back cleanly.
+    """
+    try:
+        if int(src_epsg) == int(dst_epsg):
+            return list(bbox)
+        gdal_major_version = int(gdal_version.split(".")[0])
+        target_srs = osr.SpatialReference()
+        target_srs.ImportFromEPSG(int(dst_epsg))
+        if gdal_major_version >= 3:
+            target_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        return _reproject_bbox(bbox, src_epsg, target_srs, gdal_major_version)
+    except Exception:
+        return None
+
+
 def render_map_image(
     width: int,
     height: int,

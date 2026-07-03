@@ -70,6 +70,7 @@ from dynastore.modules.tiles.tiles_module import TileStorageProtocol, TileArchiv
 from dynastore.modules.tiles.tiles_config import (
     TilesConfig,
     TilesCachingConfig,
+    cache_on_demand_enabled,
 )
 from dynastore.modules.tiles.tiles_models import (
     TileMatrixSetList,
@@ -1135,15 +1136,13 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         collections: List[str],
         catalog_config: TilesConfig,
     ) -> bool:
-        catalog_cache = getattr(catalog_config, "cache_on_demand", True)
-        if not catalog_cache:
-            return False
-        if len(collections) == 1:
-            coll_config = await config_manager.get_config(
-                TilesConfig, dataset, collections[0]
-            )
-            return getattr(coll_config, "cache_on_demand", catalog_cache)
-        return catalog_cache
+        # config_manager is unused here: catalog_config is already loaded and
+        # cache_on_demand_enabled resolves its own protocol for the (at most
+        # one) collection config fetch below.
+        collection_id = collections[0] if len(collections) == 1 else None
+        return await cache_on_demand_enabled(
+            dataset, collection_id, catalog_config=catalog_config
+        )
 
     @staticmethod
     def _generate_params_hash(*args) -> Optional[str]:
