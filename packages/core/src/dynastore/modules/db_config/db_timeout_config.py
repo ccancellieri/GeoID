@@ -24,11 +24,15 @@ every PostgreSQL connection via asyncpg's ``server_settings``.  They are
 configured via environment variables (DB_LOCK_TIMEOUT, DB_STATEMENT_TIMEOUT,
 DB_IDLE_IN_TRANSACTION_TIMEOUT) and resolved once at startup by ``DBConfig``
 using the env → db_config.json → code-default cascade defined there.
+Task-side ad-hoc engines (see ``task_engine_connect_args`` below) use a
+separate, more generous idle budget (DB_TASK_IDLE_IN_TRANSACTION_TIMEOUT)
+since they interleave PG transactions with slower secondary-store I/O.
 
 Related issues:
 - #2343 — DB pool starvation (idle_in_txn)
 - #2344 — Leader-loop lock hold
 - #2340 — Async catalog hard-delete
+- #2837 — task engines regressed onto the 10s serving budget
 """
 
 from __future__ import annotations
@@ -77,17 +81,25 @@ def task_engine_connect_args(db_config) -> Dict[str, Dict[str, str]]:
     """``connect_args`` carrying the lock-safety ``server_settings`` for a
     task-side, NullPool-backed ad-hoc async engine.
 
-    Resolves ``lock_timeout`` / ``idle_in_transaction_session_timeout`` from
-    ``db_config`` via :func:`resolve_timeout_settings` and wraps them via
-    :func:`lock_safety_server_settings`. Intended for the short-lived,
-    single-use engines built outside the shared engine (see #2832) — pass
-    the result straight as the engine's ``connect_args`` keyword.
+    Resolves ``lock_timeout`` from ``db_config`` via
+    :func:`resolve_timeout_settings` (same value as the shared engine), but
+    the idle-in-transaction budget uses ``db_config.task_idle_in_transaction_session_timeout``
+    instead of the shared ``idle_in_transaction_session_timeout``. Task/job
+    engines routinely interleave a PG transaction with slow secondary-store
+    I/O (e.g. ES bulk writes during reindex/drain) — the serving-tier 10s
+    default kills them mid-write, which is what regressed in #2837. The
+    task-tier value keeps the same lock-safety net (#2832) with a budget
+    that actually fits that access pattern.
+
+    Wraps the result via :func:`lock_safety_server_settings`. Intended for
+    the short-lived, single-use engines built outside the shared engine —
+    pass the result straight as the engine's ``connect_args`` keyword.
     """
-    lock_timeout, _statement_timeout, idle_in_transaction_session_timeout = (
+    lock_timeout, _statement_timeout, _idle_in_transaction_session_timeout = (
         resolve_timeout_settings(db_config)
     )
     return {
         "server_settings": lock_safety_server_settings(
-            lock_timeout, idle_in_transaction_session_timeout
+            lock_timeout, db_config.task_idle_in_transaction_session_timeout
         ),
     }

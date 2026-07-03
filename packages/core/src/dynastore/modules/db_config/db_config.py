@@ -300,6 +300,17 @@ class DBConfig:
     idle_in_transaction_session_timeout: str = _cfg_str(
         "DB_IDLE_IN_TRANSACTION_TIMEOUT", "10s"
     )
+    # Task-side counterpart of idle_in_transaction_session_timeout above,
+    # applied only to the ad-hoc engines task/job code builds for itself
+    # (see task_engine_connect_args in db_timeout_config.py). Those engines
+    # routinely interleave a PG transaction with slow secondary-store I/O
+    # (ES bulk writes during reindex/drain); the 10s serving-tier budget
+    # kills them mid-write (#2837 regression). Still bounded — well short of
+    # unbounded — so a genuinely frozen task can't hold locks forever, which
+    # was the #2832 goal.
+    task_idle_in_transaction_session_timeout: str = _cfg_str(
+        "DB_TASK_IDLE_IN_TRANSACTION_TIMEOUT", "300s"
+    )
     # How long SQLAlchemy's QueuePool will wait for a free connection before
     # raising ``sqlalchemy.exc.TimeoutError`` (fail-fast, not wedge).
     #
