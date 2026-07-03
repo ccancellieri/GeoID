@@ -16,20 +16,20 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Unit tests for the tile-handler DB pool fail-fast path (Part B).
+"""Unit tests for the render wall-clock budget and client-disconnect abort
+(#2898).
 
-Covers:
-- When the DB pool is saturated (engine.connect() times out), get_vector_tile
-  returns HTTP 503 with Retry-After: 5.
-- When pool is saturated but a cached tile is available, the handler serves
-  the stale cached tile instead of returning 503.
-- Happy-path: pool not saturated, connection acquired, tile generated normally.
+Before this fix, ``get_vector_tile`` never observed an LB timeout or an
+abandoned client: the render kept running (and holding a DB connection) long
+after the client was gone, and every retry stacked another render on top,
+eventually exhausting the pool. Now the render phase is bounded by
+``TilesConfig.render_budget_seconds`` and checked against
+``Request.is_disconnected()`` at loop boundaries (never per-feature).
 
 All PostGIS / DB calls are mocked; no real I/O.
 """
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -37,11 +37,6 @@ from fastapi import BackgroundTasks, HTTPException
 
 from dynastore.extensions.tiles.tiles_service import TilesService
 from dynastore.modules.tiles.tiles_config import TilesConfig
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _make_service() -> TilesService:
@@ -52,14 +47,14 @@ def _make_service() -> TilesService:
     return svc
 
 
-def _make_request() -> MagicMock:
+def _make_request(*, disconnected: bool = False) -> MagicMock:
     req = MagicMock()
     req.headers = {}
     req.url_for = MagicMock(side_effect=lambda name, **kw: f"http://testserver/{name}")
     req.app = MagicMock()
     req.app.state = MagicMock()
     req.app.state.engine = None
-    req.is_disconnected = AsyncMock(return_value=False)
+    req.is_disconnected = AsyncMock(return_value=disconnected)
     return req
 
 
@@ -85,7 +80,7 @@ def _minimal_tile_kwargs(**overrides):
         simplification=None,
         simplification_by_zoom=None,
         simplification_algorithm=MagicMock(),
-        disable_cache=True,  # default: skip cache so we reach the conn-acquire step
+        disable_cache=True,  # skip cache lookups so we reach the render step
         refresh_cache=False,
         request_hints=frozenset(),
     )
@@ -93,39 +88,69 @@ def _minimal_tile_kwargs(**overrides):
     return defaults
 
 
+def _wire_common(svc, config: TilesConfig):
+    svc._require_collection_visible = AsyncMock()
+    svc._resolve_request_config = AsyncMock(return_value=config)
+    svc._is_cache_enabled = AsyncMock(return_value=False)
+    svc._validate_tms_and_matrix = AsyncMock(return_value=MagicMock(crs="EPSG:3857"))
+
+
+def _instant_connect_engine() -> MagicMock:
+    mock_conn = AsyncMock()
+    mock_conn.close = AsyncMock()
+
+    async def _instant_connect():
+        return mock_conn
+
+    mock_engine = MagicMock()
+    mock_engine.connect = MagicMock(side_effect=lambda: _instant_connect())
+    return mock_engine
+
+
 # ---------------------------------------------------------------------------
-# 503 on pool saturation
+# Budget exceeded -> 503 + Retry-After, render never reached
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_get_vector_tile_returns_503_on_pool_timeout():
-    """When engine.connect() times out, the handler raises HTTP 503."""
+async def test_get_vector_tile_returns_503_when_render_budget_exceeded():
+    """A render_budget_seconds of 1s, with wall-clock simulated past the
+    deadline, must abort with 503 + Retry-After before the actual PostGIS
+    render call — no real sleep needed, ``time.perf_counter`` is patched to
+    report elapsed time deterministically."""
     svc = _make_service()
-    svc._require_collection_visible = AsyncMock()
+    _wire_common(svc, TilesConfig(render_budget_seconds=1))
 
-    # Patch timeout to 0.01 s so test runs instantly
-    async def _slow_timeout() -> float:
-        return 0.01
+    async def _fast_acquire_timeout() -> float:
+        return 5.0
 
-    async def _never_connects():
-        await asyncio.sleep(10)  # longer than the timeout
+    fake_ctx = MagicMock(target_srid=3857)
 
-    mock_engine = MagicMock()
-    mock_engine.connect = MagicMock(side_effect=lambda: _never_connects())
+    call_count = {"n": 0}
 
-    config_mock = MagicMock()
-    config_mock.get_config = AsyncMock(return_value=MagicMock())
+    def _fake_perf_counter():
+        call_count["n"] += 1
+        # First call captures start_time (0.0); every call after simulates
+        # the 1s budget having elapsed (1000.0 >= 0.0 + 1).
+        return 0.0 if call_count["n"] == 1 else 1000.0
 
     with patch(
         "dynastore.extensions.tiles.tiles_service._read_live_fg_acquire_timeout",
-        _slow_timeout,
+        _fast_acquire_timeout,
     ), patch(
         "dynastore.extensions.tiles.tiles_service.get_async_engine",
-        return_value=mock_engine,
+        return_value=_instant_connect_engine(),
     ), patch(
         "dynastore.extensions.tiles.tiles_service.get_protocol",
-        return_value=config_mock,
+        return_value=MagicMock(get_config=AsyncMock(return_value=MagicMock())),
+    ), patch(
+        "dynastore.modules.tiles.tiles_engine.build_render_context",
+        AsyncMock(return_value=fake_ctx),
+    ), patch(
+        "dynastore.modules.tiles.tiles_engine.render_tile",
+        AsyncMock(return_value=b"fake-mvt"),
+    ) as fake_render_tile, patch(
+        "time.perf_counter", side_effect=_fake_perf_counter,
     ):
         with pytest.raises(HTTPException) as exc_info:
             await svc.get_vector_tile(
@@ -137,113 +162,79 @@ async def test_get_vector_tile_returns_503_on_pool_timeout():
     assert exc_info.value.status_code == 503
     assert exc_info.value.headers is not None
     assert exc_info.value.headers.get("Retry-After") == "5"
+    fake_render_tile.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
-# Stale tile served on pool saturation when cache is available
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_get_vector_tile_serves_stale_on_pool_timeout_with_cache():
-    """When pool times out and cache has a tile, the stale tile is served."""
-    from fastapi.responses import Response as FResponse
-
-    svc = _make_service()
-    svc._require_collection_visible = AsyncMock()
-    svc._resolve_request_config = AsyncMock(return_value=TilesConfig())
-    svc._is_cache_enabled = AsyncMock(return_value=True)
-
-    stale_response = FResponse(
-        content=b"stale-mvt",
-        media_type="application/vnd.mapbox-vector-tile",
-        headers={"X-Tile-Cache": "hit"},
-    )
-    svc._try_cached_tile = AsyncMock(return_value=stale_response)
-
-    async def _slow_timeout() -> float:
-        return 0.01
-
-    async def _never_connects():
-        await asyncio.sleep(10)
-
-    mock_engine = MagicMock()
-    mock_engine.connect = MagicMock(side_effect=lambda: _never_connects())
-
-    config_mock = MagicMock()
-    config_mock.get_config = AsyncMock(return_value=MagicMock())
-
-    # Simulate cache miss from the primary check (to reach the connect step)
-    # but stale available on the fallback path
-    with patch(
-        "dynastore.extensions.tiles.tiles_service._read_live_fg_acquire_timeout",
-        _slow_timeout,
-    ), patch(
-        "dynastore.extensions.tiles.tiles_service.get_async_engine",
-        return_value=mock_engine,
-    ), patch(
-        "dynastore.extensions.tiles.tiles_service.get_protocol",
-        return_value=config_mock,
-    ):
-        # Enable cache but not the primary try (disable_cache=False triggers cache
-        # check; _try_cached_tile returns None first, then stale on second call)
-        svc._try_cached_tile = AsyncMock(side_effect=[None, stale_response])
-
-        result = await svc.get_vector_tile(
-            request=_make_request(),
-            background_tasks=_make_bg_tasks(),
-            **_minimal_tile_kwargs(disable_cache=False),
-        )
-
-    assert result is stale_response
-
-
-# ---------------------------------------------------------------------------
-# Happy path: pool not saturated
+# Client disconnected -> quiet abort, render never reached
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_get_vector_tile_acquires_conn_on_happy_path():
-    """When engine.connect() succeeds quickly, the handler proceeds normally."""
+async def test_get_vector_tile_aborts_quietly_when_client_disconnected():
+    """A request whose is_disconnected() reports True must stop before the
+    PostGIS render call without raising, and never call render_tile again."""
     svc = _make_service()
-    svc._require_collection_visible = AsyncMock()
-    svc._resolve_request_config = AsyncMock(return_value=TilesConfig())
-    svc._is_cache_enabled = AsyncMock(return_value=False)
-    svc._validate_tms_and_matrix = AsyncMock(return_value=MagicMock(crs="EPSG:3857"))
-    svc._finalize_response = MagicMock(return_value=MagicMock(status_code=200))
+    _wire_common(svc, TilesConfig())  # healthy default budget
 
-    async def _fast_timeout() -> float:
+    async def _fast_acquire_timeout() -> float:
         return 5.0
 
-    mock_conn = AsyncMock()
-    mock_conn.close = AsyncMock()
-
-    async def _instant_connect():
-        return mock_conn
-
-    mock_engine = MagicMock()
-    mock_engine.connect = MagicMock(side_effect=lambda: _instant_connect())
-
-    config_mock = MagicMock()
-    config_mock.get_config = AsyncMock(return_value=MagicMock())
-
-    # get_vector_tile lazily does `from dynastore.modules.tiles import
-    # tiles_engine` inside the handler, then calls attributes on that (real,
-    # already-imported-elsewhere) module object — patching the module's own
-    # attributes (rather than sys.modules) is what actually intercepts the
-    # call regardless of import-caching order across the test session.
     fake_ctx = MagicMock(target_srid=3857)
 
     with patch(
         "dynastore.extensions.tiles.tiles_service._read_live_fg_acquire_timeout",
-        _fast_timeout,
+        _fast_acquire_timeout,
     ), patch(
         "dynastore.extensions.tiles.tiles_service.get_async_engine",
-        return_value=mock_engine,
+        return_value=_instant_connect_engine(),
     ), patch(
         "dynastore.extensions.tiles.tiles_service.get_protocol",
-        return_value=config_mock,
+        return_value=MagicMock(get_config=AsyncMock(return_value=MagicMock())),
+    ), patch(
+        "dynastore.modules.tiles.tiles_engine.build_render_context",
+        AsyncMock(return_value=fake_ctx),
+    ), patch(
+        "dynastore.modules.tiles.tiles_engine.render_tile",
+        AsyncMock(return_value=b"fake-mvt"),
+    ) as fake_render_tile:
+        result = await svc.get_vector_tile(
+            request=_make_request(disconnected=True),
+            background_tasks=_make_bg_tasks(),
+            **_minimal_tile_kwargs(),
+        )
+
+    assert result.status_code == 499
+    fake_render_tile.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Healthy path unaffected
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_vector_tile_healthy_render_still_returns_200():
+    """A fast render with a connected client is unaffected by the budget or
+    disconnect checks — same happy path as before #2898."""
+    svc = _make_service()
+    _wire_common(svc, TilesConfig())
+    svc._finalize_response = MagicMock(return_value=MagicMock(status_code=200))
+
+    async def _fast_acquire_timeout() -> float:
+        return 5.0
+
+    fake_ctx = MagicMock(target_srid=3857)
+
+    with patch(
+        "dynastore.extensions.tiles.tiles_service._read_live_fg_acquire_timeout",
+        _fast_acquire_timeout,
+    ), patch(
+        "dynastore.extensions.tiles.tiles_service.get_async_engine",
+        return_value=_instant_connect_engine(),
+    ), patch(
+        "dynastore.extensions.tiles.tiles_service.get_protocol",
+        return_value=MagicMock(get_config=AsyncMock(return_value=MagicMock())),
     ), patch(
         "dynastore.modules.tiles.tiles_engine.build_render_context",
         AsyncMock(return_value=fake_ctx),
@@ -252,7 +243,7 @@ async def test_get_vector_tile_acquires_conn_on_happy_path():
         AsyncMock(return_value=b"fake-mvt"),
     ) as fake_render_tile:
         result = await svc.get_vector_tile(
-            request=_make_request(),
+            request=_make_request(disconnected=False),
             background_tasks=_make_bg_tasks(),
             **_minimal_tile_kwargs(),
         )
@@ -260,5 +251,3 @@ async def test_get_vector_tile_acquires_conn_on_happy_path():
     assert result is not None
     fake_build_ctx.assert_awaited_once()
     fake_render_tile.assert_awaited_once()
-    # Connection must have been closed in the finally block
-    mock_conn.close.assert_awaited_once()

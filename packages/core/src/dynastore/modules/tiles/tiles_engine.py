@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from dynastore.tools.cache import cached
 from dynastore.tools.geospatial import SimplificationAlgorithm
@@ -37,6 +37,25 @@ from dynastore.modules.tiles.tiles_source import TileSourceProtocol, TileSourceN
 from dynastore.modules.tiles.tms_definitions import BUILTIN_TILE_MATRIX_SETS
 
 logger = logging.getLogger(__name__)
+
+# Returns None to continue, or a short reason string ("budget" /
+# "disconnected") to abort. Checked at loop boundaries only (never
+# per-feature) so it adds no measurable overhead to the render itself.
+ShouldAbort = Callable[[], Awaitable[Optional[str]]]
+
+
+class RenderAborted(Exception):
+    """Raised when a ``should_abort`` callback reports the render must stop.
+
+    ``reason`` is the string returned by the callback (e.g. ``"budget"`` or
+    ``"disconnected"``) so callers can respond differently — a request-scoped
+    caller typically maps ``"budget"`` to a 503 and ``"disconnected"`` to a
+    quiet drop.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"render aborted: {reason}")
 
 try:
     import morecantile
@@ -99,6 +118,7 @@ async def build_render_context(
     *,
     engine: Any = None,
     morecantile_compatible: bool = False,
+    should_abort: Optional[ShouldAbort] = None,
 ) -> Optional[TileRenderContext]:
     """Resolve metadata, TMS, target SRID, and TileSource for a tile render.
 
@@ -106,6 +126,13 @@ async def build_render_context(
     exactly one registered ``TileSourceProtocol`` (PostGIS) so this is
     sufficient; a future multi-driver render would need a per-collection
     source lookup instead.
+
+    ``should_abort``, when given, is checked once per collection before its
+    metadata is resolved — the natural loop boundary here (#2898). Raises
+    :class:`RenderAborted` immediately when it reports a reason, so a slow
+    multi-collection resolution (or a client that already disconnected)
+    doesn't keep spending routing/DB work on collections that will never be
+    used.
 
     Returns ``None`` when no collection's metadata resolves or the TMS can't
     be resolved (both cases are already logged by the callee). Raises
@@ -120,6 +147,10 @@ async def build_render_context(
 
     resolved_collections: List[Dict[str, Any]] = []
     for coll_id in collection_ids:
+        if should_abort is not None:
+            reason = await should_abort()
+            if reason:
+                raise RenderAborted(reason)
         meta = await tiles_module.get_tile_resolution_params(catalog_id, coll_id)
         if meta:
             resolved_collections.append(meta)

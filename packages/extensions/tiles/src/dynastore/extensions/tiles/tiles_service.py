@@ -826,6 +826,22 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 config_manager, dataset
             )
 
+            # Render wall-clock budget + client-disconnect check (#2898).
+            # Checked only at the render-phase loop boundaries below (never
+            # per-feature) — the cache lookup/redirect path above never calls
+            # this, so it stays unaffected. ``render_deadline`` is measured
+            # from ``start_time`` (function entry, same baseline as every
+            # ``duration_ms`` log in this handler) so the budget bounds the
+            # whole request, not just the render phase in isolation.
+            render_deadline = start_time + tiles_config.render_budget_seconds
+
+            async def _should_abort() -> Optional[str]:
+                if time.perf_counter() >= render_deadline:
+                    return "budget"
+                if await request.is_disconnected():
+                    return "disconnected"
+                return None
+
             # 2. Storage & Cache Resolution
             cache_enabled = await self._is_cache_enabled(
                 config_manager, dataset, requested_cols_list, tiles_config
@@ -965,10 +981,15 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             try:
                 ctx = await tiles_engine.build_render_context(
                     dataset, requested_cols_list, tileMatrixSetId, engine=conn,
+                    should_abort=_should_abort,
                 )
             except TileSourceNotSupported as exc:
                 logger.error("get_vector_tile: %s", exc)
                 raise HTTPException(status_code=500, detail=str(exc)) from exc
+            except tiles_engine.RenderAborted as exc:
+                return self._handle_render_aborted(
+                    exc.reason, dataset, collections, z, x, y, start_time,
+                )
 
             if ctx is None:
                 logger.warning(
@@ -1008,6 +1029,16 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                                     "X-Tile-Source": "pmtiles_archive",
                                 },
                             )
+
+            # Render-budget/disconnect boundary (#2898) ahead of the actual
+            # PostGIS statement — the last point where aborting still saves
+            # real work (the render itself is a single query, so there is no
+            # further loop boundary inside it to check).
+            _abort_reason = await _should_abort()
+            if _abort_reason:
+                return self._handle_render_aborted(
+                    _abort_reason, dataset, collections, z, x, y, start_time,
+                )
 
             # Retrieve MVT content via the unified render engine — L1 cache
             # enabled (the live request-serving path); the preseed task
@@ -1117,6 +1148,44 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
     # MVT generation itself (with its L1 in-process cache) moved to
     # dynastore.modules.tiles.tiles_engine.render_tile — shared with the
     # preseed task rather than duplicated here.
+
+    @staticmethod
+    def _handle_render_aborted(
+        reason: str,
+        dataset: str,
+        collections: str,
+        z: int,
+        x: int,
+        y: int,
+        start_time: float,
+    ) -> Response:
+        """Handle a render aborted via ``ShouldAbort`` (#2898).
+
+        ``reason="budget"``: the render exceeded ``TilesConfig.render_budget_seconds``
+        — logged once at WARNING and mirrors the pool-saturation fail-fast
+        (503 + ``Retry-After``) so a stacking client sees the same backoff
+        signal. ``reason="disconnected"``: the client already gave up (LB
+        timeout/retry) — logged at INFO since it's an expected outcome, not a
+        failure, and the render stops quietly.
+        """
+        elapsed_s = time.perf_counter() - start_time
+        if reason == "budget":
+            logger.warning(
+                "get_vector_tile: render budget exceeded elapsed=%.1fs "
+                "catalog=%s collections=%s z=%s x=%s y=%s — aborting render",
+                elapsed_s, dataset, collections, z, x, y,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Tile render exceeded its time budget, try again shortly.",
+                headers={"Retry-After": "5"},
+            )
+        logger.info(
+            "get_vector_tile: client disconnected elapsed=%.1fs "
+            "catalog=%s collections=%s z=%s x=%s y=%s — aborting render",
+            elapsed_s, dataset, collections, z, x, y,
+        )
+        return Response(status_code=499)
 
     @staticmethod
     async def _resolve_request_config(

@@ -54,6 +54,7 @@ def _make_request() -> MagicMock:
     req.app = MagicMock()
     req.app.state = MagicMock()
     req.app.state.engine = None
+    req.is_disconnected = AsyncMock(return_value=False)
     return req
 
 

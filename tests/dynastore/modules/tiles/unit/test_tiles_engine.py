@@ -127,6 +127,43 @@ async def test_build_render_context_srid_failure_falls_back_to_3857(
 
 
 @pytest.mark.asyncio
+async def test_build_render_context_raises_render_aborted_when_should_abort_fires(
+    patched_tiles_module, patched_driver, patched_source,
+):
+    """``should_abort`` is checked once per collection, before its metadata
+    is resolved (#2898) — a reason returned there must stop the loop
+    immediately rather than resolving any further collections."""
+
+    async def _always_abort():
+        return "budget"
+
+    with pytest.raises(tiles_engine.RenderAborted) as exc_info:
+        await tiles_engine.build_render_context(
+            "cat1", ["coll1", "coll2"], "WebMercatorQuad",
+            should_abort=_always_abort,
+        )
+    assert exc_info.value.reason == "budget"
+    # Aborted before the first collection's metadata was even resolved.
+    patched_tiles_module.get_tile_resolution_params.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_build_render_context_ignores_should_abort_when_none_reported(
+    patched_tiles_module, patched_driver, patched_source,
+):
+    """When ``should_abort`` returns None every time, resolution proceeds
+    normally."""
+
+    async def _never_abort():
+        return None
+
+    ctx = await tiles_engine.build_render_context(
+        "cat1", ["coll1"], "WebMercatorQuad", should_abort=_never_abort,
+    )
+    assert ctx is not None
+
+
+@pytest.mark.asyncio
 async def test_render_tile_without_l1_cache_dispatches_to_source(
     patched_tiles_module, patched_driver, patched_source,
 ):

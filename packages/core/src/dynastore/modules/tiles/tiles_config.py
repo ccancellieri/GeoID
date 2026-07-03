@@ -155,6 +155,23 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
         ),
     )
 
+    # --- Render wall-clock budget (#2898) ---
+    render_budget_seconds: Mutable[int] = Field(
+        default=55,
+        ge=1,
+        description=(
+            "Wall-clock budget for the whole ``get_vector_tile`` render "
+            "phase (context resolution through rendered bytes), kept below "
+            "the 60s load-balancer timeout so an abandoned render never "
+            "outlives the client's request. Exceeding it aborts the render "
+            "and returns 503 with ``Retry-After``, mirroring the pool-"
+            "saturation fail-fast. Distinct from "
+            "``live_tile_timeout_seconds``, which bounds only the final "
+            "PostGIS statement — a slow multi-collection routing "
+            "resolution ahead of that statement is not covered by it."
+        ),
+    )
+
 
 async def cache_on_demand_enabled(
     catalog_id: str,
