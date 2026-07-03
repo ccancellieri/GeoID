@@ -1700,8 +1700,16 @@ async def search_collections(
     # ``collection_stac`` (links / assets / extent / providers /
     # summaries / item_assets).  Text-match filters land on the CORE
     # alias (``mc``), spatial filters on the STAC alias (``ms``).
+    # ``external_id`` must be selected alongside the internal ``id`` so
+    # ``Collection.model_validate(row)`` below populates it — without it the
+    # model's ``external_id`` field stays None and
+    # ``BaseMetadata._serialize_public_id`` (shared_models.py) has nothing to
+    # swap onto the wire ``id``, leaking the internal ``col_...`` token on
+    # every collection this query serves (Collection Search branch and the
+    # PG plain-listing fallback both consume it via
+    # ``_pg_collections_to_stac_dicts`` in stac_service.py). Refs #2853.
     _meta_cols = (
-        "c.id, c.catalog_id, "
+        "c.id, c.external_id, c.catalog_id, "
         "mc.title, mc.description, mc.keywords, mc.license, "
         "ms.links, ms.assets, ms.extent, ms.providers, ms.summaries, "
         "ms.item_assets, mc.extra_metadata"

@@ -207,3 +207,103 @@ def test_pg_collections_to_stac_dicts_keeps_null_extent_rows():
 
     real_extent_dict = stac_dicts[1]
     assert real_extent_dict["extent"]["spatial"]["bbox"] == [[10.0, 20.0, 30.0, 40.0]]
+
+
+def test_pg_collections_to_stac_dicts_restores_external_id():
+    """Both the Collection Search branch and the plain-listing PG fallback
+    render collections through this converter, and both must emit the
+    renamable public ``external_id`` as the wire ``id`` — never the immutable
+    internal ``col_...`` token (#2853). ``stac_localize`` -> ``Collection.
+    localize`` -> ``model_dump`` runs ``BaseMetadata._serialize_public_id``,
+    which swaps ``id`` for ``external_id`` when the latter is set; this only
+    happens if the caller populated ``external_id`` on the model in the first
+    place (search.py's ``search_collections`` query)."""
+    coll = Collection(
+        id="col_aiktcdobguu7p",
+        external_id="afg-soil-erosion-change",
+        description="a collection with a renamed public label",
+        license="proprietary",
+        extent=None,
+    )
+
+    stac_dicts = _pg_collections_to_stac_dicts([coll], language="en")
+
+    assert len(stac_dicts) == 1
+    assert stac_dicts[0]["id"] == "afg-soil-erosion-change"
+    assert not stac_dicts[0]["id"].startswith("col_")
+
+
+def test_pg_collections_to_stac_dicts_no_internal_id_leaks_across_page():
+    """A mixed page (renamed + never-renamed collections) must never surface
+    a ``col_``-prefixed id: a collection with no ``external_id`` set falls
+    back to its (already-public) ``id`` as assigned at creation time, never
+    an internal physical token."""
+    renamed = Collection(
+        id="col_apflosquc39nt",
+        external_id="agera5-et0",
+        description="renamed collection",
+        license="proprietary",
+        extent=None,
+    )
+    never_renamed = Collection(
+        id="never-renamed-collection",
+        description="collection whose public id was never changed",
+        license="proprietary",
+        extent=None,
+    )
+
+    stac_dicts = _pg_collections_to_stac_dicts([renamed, never_renamed], language="en")
+
+    ids = [d["id"] for d in stac_dicts]
+    assert ids == ["agera5-et0", "never-renamed-collection"]
+    assert all(not i.startswith("col_") for i in ids)
+
+
+@pytest.mark.asyncio
+async def test_search_collections_query_selects_external_id(monkeypatch):
+    """``search_collections`` (search.py) must select ``c.external_id``
+    alongside ``c.id`` — this is the only source of the value that
+    ``Collection.model_validate(row)`` (and, downstream,
+    ``BaseMetadata._serialize_public_id``) needs to restore the public id on
+    the wire. Without this column the model's ``external_id`` stays ``None``
+    and every collection this query serves renders its internal ``col_...``
+    token as ``id`` (#2853)."""
+    import dynastore.extensions.stac.search as stac_search
+    from dynastore.extensions.stac.search import CollectionSearchRequest, ResultHandler
+
+    captured: list[str] = []
+
+    class _DQLStub:
+        def __init__(self, sql, result_handler=None, **_kw):
+            self.sql = sql
+            self.result_handler = result_handler
+            captured.append(sql)
+
+        async def execute(self, *_a, **_kw):
+            if self.result_handler == ResultHandler.SCALAR_ONE_OR_NONE:
+                return 1
+            return []
+
+    async def _none(*_a, **_kw):
+        return None
+
+    class _FakeCatalogs:
+        async def resolve_physical_schema(self, _cid, ctx=None):
+            return "phys_test"
+
+    import dynastore.models.protocols.visibility as visibility
+
+    monkeypatch.setattr(stac_search, "DQLQuery", _DQLStub)
+    monkeypatch.setattr(stac_search, "get_protocol", lambda _proto: _FakeCatalogs())
+    monkeypatch.setattr(visibility, "resolve_catalog_listing_ids", _none)
+    monkeypatch.setattr(visibility, "resolve_collection_listing_ids", _none)
+
+    req = CollectionSearchRequest(catalog_id="cat", limit=10, offset=0)
+    await stac_search.search_collections(None, req)
+
+    assert captured, "expected at least one query to be issued"
+    data_query = captured[-1]
+    assert "c.external_id" in data_query, (
+        "search_collections must select c.external_id so Collection.model_validate "
+        "populates it and the wire id is restored to the public label:\n" + data_query
+    )
