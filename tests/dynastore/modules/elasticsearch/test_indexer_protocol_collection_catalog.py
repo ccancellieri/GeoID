@@ -319,13 +319,45 @@ def _asset_op(op_type: str = "upsert", entity_id: str = "a-1",
     )
 
 
-class _AssetDriverStub(AssetElasticsearchDriver):
-    """Capture index_asset / delete_asset / ensure_storage invocations."""
+class _StubAssetIndices:
+    """Minimal ``es.indices`` stub — index already exists, nothing to create."""
 
-    def __init__(self) -> None:
+    async def exists(self, *, index, **kwargs):
+        return True
+
+    async def create(self, *, index, body=None, **kwargs):
+        pass
+
+
+class _StubAssetBulkEs:
+    """ES client stub for :meth:`AssetElasticsearchDriver.index_bulk`
+    (#2863) — the real code path now builds one ``_bulk`` request instead
+    of delegating per-op to ``index_asset``/``delete_asset``, so exercising
+    it needs an ES double rather than driver-method overrides."""
+
+    def __init__(self, bulk_response: Dict[str, Any] | None = None) -> None:
+        self.indices = _StubAssetIndices()
+        self.bulk_calls: List[Dict[str, Any]] = []
+        self.bulk_response = bulk_response if bulk_response is not None else {"items": []}
+
+    async def bulk(self, *, body, **kwargs):
+        self.bulk_calls.append({"body": body})
+        return self.bulk_response
+
+
+class _AssetDriverStub(AssetElasticsearchDriver):
+    """Capture index_asset / delete_asset / ensure_storage invocations for
+    the single-op ``index()`` path; stubs the ES client for ``index_bulk``,
+    which goes straight to a real ``_bulk`` call (#2863)."""
+
+    def __init__(self, bulk_response: Dict[str, Any] | None = None) -> None:
         self.indexed: List[tuple] = []
         self.deleted: List[tuple] = []
         self.ensured: List[tuple] = []
+        self.es = _StubAssetBulkEs(bulk_response=bulk_response)
+
+    def _get_client(self):  # type: ignore[override]
+        return self.es
 
     async def ensure_storage(  # type: ignore[override]
         self, catalog_id: Any = None, collection_id: Any = None,
@@ -399,17 +431,23 @@ async def test_asset_index_skips_non_asset_entity_type():
 @pytest.mark.asyncio
 async def test_asset_index_bulk_per_op_failure_isolated():
     """One failing op must not poison the rest — failure recorded with the
-    asset driver's ``{"id", "reason"}`` failure shape."""
-    d = _AssetDriverStub()
+    asset driver's ``{"id", "reason"}`` failure shape.
 
-    original_index = d.index_asset
-
-    async def boom(catalog_id, asset_doc, **kw):
-        if asset_doc.get("asset_id") == "boom":
-            raise RuntimeError("ES timeout")
-        await original_index(catalog_id, asset_doc, **kw)
-
-    d.index_asset = boom  # type: ignore[assignment]
+    Refs #2863: ``index_bulk`` now builds a single ``_bulk`` request
+    instead of delegating per-op to ``index_asset``, so per-op isolation
+    is driven by the ES bulk response's per-item ``error``, not a raised
+    exception from an overridden driver method."""
+    d = _AssetDriverStub(bulk_response={
+        "errors": True,
+        "items": [
+            {"index": {"_id": "a-a", "status": 201}},
+            {"index": {
+                "_id": "boom", "status": 400,
+                "error": {"type": "mapper_parsing_exception", "reason": "ES timeout"},
+            }},
+            {"index": {"_id": "a-c", "status": 201}},
+        ],
+    })
 
     result = await d.index_bulk(_ctx("cat-x", "col-y"), [
         _asset_op("upsert", "a-a"),
@@ -421,6 +459,8 @@ async def test_asset_index_bulk_per_op_failure_isolated():
     assert result.failed == 1
     assert result.failures[0]["id"] == "boom"
     assert "ES timeout" in result.failures[0]["reason"]
+    # One _bulk call for the whole batch — not one PUT per op.
+    assert len(d.es.bulk_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -428,7 +468,10 @@ async def test_asset_index_bulk_skips_non_asset_ops_in_total_but_not_succeeded()
     """Non-asset ops in a mixed batch are silently skipped — neither
     counted as succeeded nor failed, but ``total`` reflects the input
     length.  This matches the per-op :meth:`index` skip behaviour."""
-    d = _AssetDriverStub()
+    d = _AssetDriverStub(bulk_response={
+        "errors": False,
+        "items": [{"index": {"_id": "a-a", "status": 201}}],
+    })
     result = await d.index_bulk(_ctx("cat-x", "col-y"), [
         _asset_op("upsert", "a-a"),
         _asset_op("upsert", "skip", entity_type="collection"),
@@ -436,4 +479,5 @@ async def test_asset_index_bulk_skips_non_asset_ops_in_total_but_not_succeeded()
     assert result.total == 2
     assert result.succeeded == 1
     assert result.failed == 0
-    assert len(d.indexed) == 1
+    # Only the asset op was submitted to _bulk — action + doc for "a-a".
+    assert len(d.es.bulk_calls[0]["body"]) == 2

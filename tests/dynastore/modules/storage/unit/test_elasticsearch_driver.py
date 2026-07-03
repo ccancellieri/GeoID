@@ -1645,3 +1645,305 @@ class TestGetDriverConfigDispatchesPerSubclass:
         assert ItemsElasticsearchPrivateDriver._driver_config_class is ItemsElasticsearchPrivateDriverConfig
         assert ItemsElasticsearchEnvelopeDriver._driver_config_class is ItemsElasticsearchEnvelopeDriverConfig
         assert AssetElasticsearchDriver._driver_config_class is AssetElasticsearchDriverConfig
+
+
+# ---------------------------------------------------------------------------
+# #2863 — asset driver index-existence caching + bulk batching
+# ---------------------------------------------------------------------------
+#
+# Refs #2863: harvest with_assets=true into an ES-primary catalog indexed
+# items and especially assets one document at a time, with an
+# ``indices.exists`` HEAD before EVERY PUT (index creation is a
+# once-per-catalog event) — millions of sequential HEAD+PUT round trips
+# exhausted the shared AsyncOpenSearch client's connection pool and, since
+# harvest tolerates per-write failures (#2828), silently dropped data.
+#
+# Each test below uses a catalog id unique to that test (mirroring
+# ``test_write_entities_ensures_index_once_per_catalog``'s
+# ``_ITEMS_INDEX_ENSURED_CATALOGS.discard`` idiom) so the process-lifetime
+# ``@cached`` entries one test creates cannot leak into another.
+
+
+def _index_not_found_error(index_name: str) -> Exception:
+    """Build an exception shaped like opensearch-py's
+    ``index_not_found_exception`` (``exc.info['error']['type']``), the
+    signal :func:`dynastore.modules.storage.drivers.elasticsearch._is_index_not_found`
+    / ``_bulk_response_missing_index`` key off of."""
+    exc = Exception(f"index_not_found_exception: no such index [{index_name}]")
+    exc.info = {"error": {"type": "index_not_found_exception", "index": index_name}}  # type: ignore[attr-defined]
+    return exc
+
+
+class TestAssetIndexExistenceCache:
+    """``AssetElasticsearchDriver`` HEAD-before-write caching (#2863)."""
+
+    def _patches(self, es):
+        return [
+            patch(
+                "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+            ),
+            patch(
+                "dynastore.modules.elasticsearch.client.get_index_prefix",
+                return_value="dynastore",
+            ),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_index_asset_head_fires_once_per_catalog(self):
+        from dynastore.modules.storage.drivers.elasticsearch import AssetElasticsearchDriver
+
+        es = _StubEs(exists=False)
+        es.index = AsyncMock(return_value={"result": "created"})
+        patches = self._patches(es)
+        for p in patches:
+            p.start()
+        try:
+            driver = AssetElasticsearchDriver()
+            await driver.index_asset("catAssetCache1", {"asset_id": "a1"})
+            await driver.index_asset("catAssetCache1", {"asset_id": "a2"})
+            await driver.index_asset("catAssetCache1", {"asset_id": "a3"})
+        finally:
+            for p in patches:
+                p.stop()
+
+        # HEAD + create fire once; the third write skips both entirely.
+        assert len(es.indices.exists_calls) == 1
+        assert len(es.indices.create_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_write_entities_head_fires_once_per_catalog(self):
+        from dynastore.modules.storage.drivers.elasticsearch import AssetElasticsearchDriver
+
+        es = _StubEs(exists=False)
+        patches = self._patches(es)
+        for p in patches:
+            p.start()
+        try:
+            driver = AssetElasticsearchDriver()
+            await driver.write_entities(
+                "catAssetCache2", "col1", [{"asset_id": "a1"}],
+            )
+            await driver.write_entities(
+                "catAssetCache2", "col1", [{"asset_id": "a2"}],
+            )
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert len(es.indices.exists_calls) == 1
+        assert len(es.indices.create_calls) == 1
+        assert len(es.bulk_calls) == 2  # the bulk write itself is never cached
+
+    @pytest.mark.asyncio
+    async def test_index_bulk_head_fires_once_and_batches_ops(self):
+        """``index_bulk`` reuses ``_ensure_index_cached`` AND issues exactly
+        one ``_bulk`` call for the whole op batch instead of one HEAD+PUT
+        per op (#2863)."""
+        from dynastore.models.protocols.indexer import IndexContext, IndexOp
+        from dynastore.modules.storage.drivers.elasticsearch import AssetElasticsearchDriver
+
+        es = _StubEs(exists=False)
+        es.bulk_result = {
+            "items": [
+                {"index": {"_id": "a1", "status": 201}},
+                {"index": {"_id": "a2", "status": 201}},
+                {"delete": {"_id": "a3", "status": 200}},
+            ],
+        }
+
+        async def _bulk(*, body, params=None, **kwargs):
+            es.bulk_calls.append({"body": body, "params": params})
+            return es.bulk_result
+
+        es.bulk = _bulk
+
+        ctx = IndexContext(catalog="catAssetCache3", collection="col1", entity_type="asset")
+        ops = [
+            IndexOp(op_type="upsert", entity_type="asset", entity_id="a1",
+                    payload={"asset_id": "a1"}),
+            IndexOp(op_type="upsert", entity_type="asset", entity_id="a2",
+                    payload={"asset_id": "a2"}),
+            IndexOp(op_type="delete", entity_type="asset", entity_id="a3"),
+        ]
+
+        patches = self._patches(es)
+        for p in patches:
+            p.start()
+        try:
+            driver = AssetElasticsearchDriver()
+            result = await driver.index_bulk(ctx, ops)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert len(es.indices.exists_calls) == 1
+        assert len(es.indices.create_calls) == 1
+        assert len(es.bulk_calls) == 1  # ONE _bulk call for the whole batch
+        # 2 upsert actions (action + doc) + 1 delete action = 5 body entries.
+        assert len(es.bulk_calls[0]["body"]) == 5
+        assert result.total == 3
+        assert result.succeeded == 3
+        assert result.failed == 0
+
+    @pytest.mark.asyncio
+    async def test_index_bulk_per_item_error_does_not_fail_whole_batch(self):
+        """One poison doc in a batch is reported in ``BulkResult.failures``
+        — it must not take the other, good docs down with it (#2828 parity)."""
+        from dynastore.models.protocols.indexer import IndexContext, IndexOp
+        from dynastore.modules.storage.drivers.elasticsearch import AssetElasticsearchDriver
+
+        es = _StubEs(exists=True)
+        es.bulk_result = {
+            "errors": True,
+            "items": [
+                {"index": {"_id": "a1", "status": 201}},
+                {"index": {
+                    "_id": "a2", "status": 400,
+                    "error": {"type": "mapper_parsing_exception", "reason": "boom"},
+                }},
+            ],
+        }
+
+        async def _bulk(*, body, params=None, **kwargs):
+            es.bulk_calls.append({"body": body, "params": params})
+            return es.bulk_result
+
+        es.bulk = _bulk
+
+        ctx = IndexContext(catalog="catAssetCache4", collection="col1", entity_type="asset")
+        ops = [
+            IndexOp(op_type="upsert", entity_type="asset", entity_id="a1",
+                    payload={"asset_id": "a1"}),
+            IndexOp(op_type="upsert", entity_type="asset", entity_id="a2",
+                    payload={"asset_id": "a2"}),
+        ]
+
+        patches = self._patches(es)
+        for p in patches:
+            p.start()
+        try:
+            driver = AssetElasticsearchDriver()
+            result = await driver.index_bulk(ctx, ops)
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert result.total == 2
+        assert result.succeeded == 1
+        assert result.failed == 1
+        assert result.failures[0]["id"] == "a2"
+        assert "boom" in result.failures[0]["reason"]
+
+    @pytest.mark.asyncio
+    async def test_index_asset_invalidates_cache_on_index_not_found(self):
+        """A write that fails with ``index_not_found_exception`` (the index
+        was cached as existing, then dropped/rotated out from under this
+        worker) forces the NEXT write to re-check instead of trusting the
+        stale cache entry forever (#2863)."""
+        from dynastore.modules.storage.drivers.elasticsearch import AssetElasticsearchDriver
+
+        es = _StubEs(exists=True)  # first ensure_index call: index already exists
+        boom = _index_not_found_error("dynastore-catAssetCache5-assets")
+
+        async def _index_boom(*, index, id, body, **kwargs):
+            raise boom
+
+        es.index = _index_boom
+
+        patches = self._patches(es)
+        for p in patches:
+            p.start()
+        try:
+            driver = AssetElasticsearchDriver()
+            with pytest.raises(Exception):
+                await driver.index_asset("catAssetCache5", {"asset_id": "a1"})
+            assert len(es.indices.exists_calls) == 1  # first ensure: cache miss
+
+            # Cache was invalidated by the index_not_found failure — the next
+            # write re-checks (a second HEAD) instead of trusting the stale
+            # "exists" entry and PUTting straight into the same 404 forever.
+            async def _index_ok(*, index, id, body, **kwargs):
+                return {"result": "created"}
+
+            es.index = _index_ok
+            await driver.index_asset("catAssetCache5", {"asset_id": "a2"})
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert len(es.indices.exists_calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_write_entities_bulk_missing_index_invalidates_cache(self):
+        """Same invalidation contract as above, through the ``_bulk`` response
+        shape (``resp["items"][i]["index"]["error"]["type"]``) rather than a
+        raised exception."""
+        from dynastore.modules.storage.drivers.elasticsearch import AssetElasticsearchDriver
+
+        es = _StubEs(exists=True)
+        es.bulk_result = {
+            "errors": True,
+            "items": [{
+                "index": {
+                    "_id": "a1", "status": 404,
+                    "error": {"type": "index_not_found_exception", "reason": "no such index"},
+                },
+            }],
+        }
+
+        async def _bulk(*, body, params=None, **kwargs):
+            es.bulk_calls.append({"body": body, "params": params})
+            return es.bulk_result
+
+        es.bulk = _bulk
+
+        patches = self._patches(es)
+        for p in patches:
+            p.start()
+        try:
+            driver = AssetElasticsearchDriver()
+            with pytest.raises(Exception):
+                await driver.write_entities(
+                    "catAssetCache6", "col1", [{"asset_id": "a1"}],
+                )
+            assert len(es.indices.exists_calls) == 1
+
+            es.bulk_result = {"errors": False, "items": [
+                {"index": {"_id": "a2", "status": 201}},
+            ]}
+            await driver.write_entities(
+                "catAssetCache6", "col1", [{"asset_id": "a2"}],
+            )
+        finally:
+            for p in patches:
+                p.stop()
+
+        # Second write re-checked the index (cache was invalidated).
+        assert len(es.indices.exists_calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_drop_storage_catalog_scope_invalidates_cache(self):
+        """Dropping the whole per-catalog assets index must evict it from
+        the existence cache — otherwise the next write skips the HEAD and
+        PUTs straight into a 404 (#2863)."""
+        from dynastore.modules.storage.drivers.elasticsearch import AssetElasticsearchDriver
+
+        es = _StubEs(exists=False)
+        es.index = AsyncMock(return_value={"result": "created"})
+        patches = self._patches(es)
+        for p in patches:
+            p.start()
+        try:
+            driver = AssetElasticsearchDriver()
+            await driver.index_asset("catAssetCache7", {"asset_id": "a1"})
+            assert len(es.indices.exists_calls) == 1
+
+            await driver.drop_storage("catAssetCache7")
+
+            await driver.index_asset("catAssetCache7", {"asset_id": "a2"})
+        finally:
+            for p in patches:
+                p.stop()
+
+        # drop_storage evicted the cache entry — the write after it re-checks.
+        assert len(es.indices.exists_calls) == 2

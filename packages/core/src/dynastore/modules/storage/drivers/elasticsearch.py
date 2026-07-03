@@ -81,6 +81,7 @@ from dynastore.modules.storage.driver_config import (
 from dynastore.modules.storage.errors import SoftDeleteNotSupportedError
 from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.routing_config import Operation
+from dynastore.tools.cache import cached
 
 # Canonical ES write-boundary imports (#1800 Task 5).
 # Imported at module level so tests can patch them as module attributes.
@@ -173,6 +174,85 @@ _ALIAS_REGISTERED_CATALOGS: set = set()
 # list/search never matches and items are retrievable by id but invisible to
 # ``_search``. Bounded to one ensure per (catalog, process) lifetime.
 _ITEMS_INDEX_ENSURED_CATALOGS: set = set()
+
+# Memoizes index-existence confirmations via the codebase's central
+# ``@cached`` decorator (#2863) rather than a bespoke module-level set —
+# same SSOT every other process-local cache in this codebase goes through.
+# Keyed only on ``index_name`` (``es``/``mapping``/``settings_fn`` are
+# ignored: the ES client is a per-process singleton and the mapping/settings
+# resolver are constant per driver), so the ``indices.exists`` HEAD this
+# delegates to :meth:`_ElasticsearchBase._ensure_index` only ever fires once
+# per index per process instead of once per write — a HEAD before every
+# single-doc PUT was the amplification pattern that starved the shared
+# AsyncOpenSearch client pool under harvest load: millions of sequential
+# HEAD+PUT round trips exhausted the connection pool and tolerated
+# per-write failures (#2828) silently dropped the data.
+#
+# ``distributed=False`` / ``ttl=None``: this is an in-process fact (matches
+# the issue's "cache existence in-process" ask), not something to share via
+# the L2/Valkey tier — the cached value never expires on its own because
+# index creation is a once-per-catalog event; only an actual "index is
+# gone" write failure should force a re-check (see
+# :func:`_invalidate_ensured_index`). ``@cached`` only memoizes a result on
+# success, so a failed create is never cached and the next call retries for
+# real.
+@cached(
+    maxsize=4096,
+    ttl=None,
+    namespace="es_index_ensured",
+    ignore=["es", "mapping", "settings_fn"],
+    distributed=False,
+)
+async def _ensure_index_once(
+    es: Any, index_name: str, mapping: Dict[str, Any], settings_fn: Any,
+) -> bool:
+    await _ElasticsearchBase._ensure_index(es, index_name, mapping, settings_fn)
+    return True
+
+
+def _invalidate_ensured_index(index_name: str) -> None:
+    """Force the next :meth:`_ElasticsearchBase._ensure_index_cached` call
+    for *index_name* to re-check (and re-create if needed) instead of
+    trusting a stale cache entry (#2863). Call this after a write fails
+    with ``index_not_found_exception`` — the only failure mode that means
+    the cached "exists" assumption is wrong (an index dropped or rotated
+    out from under a running worker). ``es``/``mapping``/``settings_fn`` are
+    ignored by the cache key (see :func:`_ensure_index_once`), so any
+    placeholder value works for them here.
+    """
+    _ensure_index_once.cache_invalidate(None, index_name, None, None)
+
+
+def _bulk_response_missing_index(resp: Any) -> bool:
+    """True if any item in an ES ``_bulk`` response failed with
+    ``index_not_found_exception``.
+
+    Used to decide whether to call :func:`_invalidate_ensured_index` after a
+    bulk write — a plain per-doc rejection (mapping mismatch, version
+    conflict, …) does not mean the index itself is gone, so only this
+    specific error type triggers a cache invalidation.
+    """
+    if not isinstance(resp, dict):
+        return False
+    for item in resp.get("items", []) or []:
+        entry = next(iter(item.values())) if isinstance(item, dict) and item else {}
+        err = entry.get("error") if isinstance(entry, dict) else None
+        if isinstance(err, dict) and err.get("type") == "index_not_found_exception":
+            return True
+    return False
+
+
+def _is_index_not_found(exc: BaseException) -> bool:
+    """True when *exc* is an ES/OpenSearch ``index_not_found_exception``
+    raised by a single-document call (``index``/``get``/``delete``), the
+    non-bulk counterpart of :func:`_bulk_response_missing_index`.
+    """
+    info = getattr(exc, "info", None)
+    if isinstance(info, dict):
+        err = info.get("error")
+        if isinstance(err, dict) and err.get("type") == "index_not_found_exception":
+            return True
+    return "index_not_found_exception" in str(exc)
 
 
 async def _ensure_in_public_alias_once(catalog_id: str, index_name: str) -> None:
@@ -331,6 +411,129 @@ class _ElasticsearchBase:
         if isinstance(entity, dict):
             return entity.get("id")
         return None
+
+    # ------------------------------------------------------------------
+    # Shared index bootstrap and bulk tally helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _ensure_index(
+        es: Any,
+        index_name: str,
+        mapping: Dict[str, Any],
+        settings_fn: Any,
+    ) -> None:
+        """Idempotently create ``index_name`` if absent (race-tolerant).
+
+        Used by every ES driver's write/index/ensure_storage paths — a
+        single code path for the create-if-absent + swallow
+        ``resource_already_exists`` pattern.
+
+        ``settings_fn`` must be an async callable with no required arguments
+        that returns the index settings dict (e.g.
+        ``get_private_items_index_settings``).
+
+        The public items driver's ``ensure_storage`` is NOT routed here
+        because it carries additional alias-enrolment logic
+        (``_ensure_in_public_alias_once``) that is public-only behaviour.
+
+        Unconditional — issues the ``indices.exists`` HEAD every call. Use
+        :meth:`_ensure_index_cached` on a hot write path where that HEAD
+        would otherwise fire on every single document (#2863).
+        """
+        if not await es.indices.exists(index=index_name):
+            try:
+                await es.indices.create(
+                    index=index_name,
+                    body={
+                        "settings": await settings_fn(),
+                        "mappings": mapping,
+                    },
+                )
+            except Exception as exc:
+                if "resource_already_exists" not in str(exc):
+                    raise
+
+    @staticmethod
+    async def _ensure_index_cached(
+        es: Any,
+        index_name: str,
+        mapping: Dict[str, Any],
+        settings_fn: Any,
+    ) -> None:
+        """Same contract as :meth:`_ensure_index`, memoized per index name
+        via the shared ``@cached`` machinery (#2863) — see
+        :func:`_ensure_index_once`.
+
+        Once an index is confirmed to exist (created here or found already
+        present), the ``indices.exists`` HEAD is skipped on every later call
+        for that same index in this process — issuing it before every single
+        write was pure amplification, since index creation is a
+        once-per-catalog event. This is opt-in (a distinct method from
+        :meth:`_ensure_index`) so existing callers keep their current
+        per-call HEAD behaviour unless they explicitly adopt the cache; call
+        :func:`_invalidate_ensured_index` after a write fails with
+        ``index_not_found_exception`` to force a re-check.
+        """
+        await _ensure_index_once(es, index_name, mapping, settings_fn)
+
+    @staticmethod
+    def _tally_bulk_response(
+        resp: Any,
+        ops_count: int,
+        *,
+        driver_name: str = "",
+        catalog: str = "",
+        collection: str = "",
+        index_name: str = "",
+    ) -> "tuple[int, List[Dict[str, Any]]]":
+        """Parse an ES ``_bulk`` response into ``(succeeded, failures)``.
+
+        Shared by every ES driver's ``index_bulk`` path (#914 zero/zero
+        warning included) so they all log diagnostic context when ES
+        returns a response shape that yields no per-item results.
+
+        Returns
+        -------
+        succeeded : int
+        failures  : list of ``{"id": ..., "reason": ...}`` dicts
+        """
+        items = (resp or {}).get("items", []) if isinstance(resp, dict) else []
+        succeeded = 0
+        failures: List[Dict[str, Any]] = []
+        for it in items:
+            entry = next(iter(it.values())) if isinstance(it, dict) and it else {}
+            err = entry.get("error") if isinstance(entry, dict) else None
+            if err:
+                failures.append({
+                    "id": entry.get("_id"),
+                    "reason": str(
+                        err.get("reason", err) if isinstance(err, dict) else err
+                    ),
+                })
+            else:
+                succeeded += 1
+        # #914 — when the parsed result is a silent no-op (succeeded=0 with
+        # no per-item failures), log the raw response shape so operators
+        # can tell ``items=[]`` (request never hit ES) from a shape we
+        # don't parse.
+        if succeeded == 0 and not failures and ops_count > 0:
+            logger.warning(
+                "%s.index_bulk: ES bulk returned a shape that yielded "
+                "0 succeeded / 0 failed for %d ops "
+                "(catalog=%s collection=%s index=%s). resp_type=%s "
+                "resp_keys=%s items_len=%d errors=%s",
+                driver_name or "ElasticsearchBase",
+                ops_count,
+                catalog,
+                collection,
+                index_name,
+                type(resp).__name__,
+                list(resp.keys()) if isinstance(resp, dict) else None,
+                len(items),
+                resp.get("errors") if isinstance(resp, dict) else None,
+            )
+        return succeeded, failures
 
 
 # ---------------------------------------------------------------------------
@@ -495,103 +698,9 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         except Exception:  # noqa: BLE001 — degrade to the next configured driver
             return False
 
-    # ------------------------------------------------------------------
-    # Shared index bootstrap and bulk tally helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    async def _ensure_index(
-        es: Any,
-        index_name: str,
-        mapping: Dict[str, Any],
-        settings_fn: Any,
-    ) -> None:
-        """Idempotently create ``index_name`` if absent (race-tolerant).
-
-        Used by the private and envelope drivers' write/index/ensure_storage
-        paths — a single code path for the create-if-absent + swallow
-        ``resource_already_exists`` pattern.
-
-        ``settings_fn`` must be an async callable with no required arguments
-        that returns the index settings dict (e.g.
-        ``get_private_items_index_settings``).
-
-        The public driver's ``ensure_storage`` is NOT routed here because it
-        carries additional alias-enrolment logic (``_ensure_in_public_alias_once``)
-        that is public-only behaviour.
-        """
-        if await es.indices.exists(index=index_name):
-            return
-        try:
-            await es.indices.create(
-                index=index_name,
-                body={
-                    "settings": await settings_fn(),
-                    "mappings": mapping,
-                },
-            )
-        except Exception as exc:
-            if "resource_already_exists" not in str(exc):
-                raise
-
-    @staticmethod
-    def _tally_bulk_response(
-        resp: Any,
-        ops_count: int,
-        *,
-        driver_name: str = "",
-        catalog: str = "",
-        collection: str = "",
-        index_name: str = "",
-    ) -> "tuple[int, List[Dict[str, Any]]]":
-        """Parse an ES ``_bulk`` response into ``(succeeded, failures)``.
-
-        Shared by the private and envelope ``index_bulk`` paths.  The public
-        driver reuses this too (contributing the #914 zero/zero warning so
-        that all three drivers log diagnostic context when ES returns a
-        response shape that yields no per-item results).
-
-        Returns
-        -------
-        succeeded : int
-        failures  : list of ``{"id": ..., "reason": ...}`` dicts
-        """
-        items = (resp or {}).get("items", []) if isinstance(resp, dict) else []
-        succeeded = 0
-        failures: List[Dict[str, Any]] = []
-        for it in items:
-            entry = next(iter(it.values())) if isinstance(it, dict) and it else {}
-            err = entry.get("error") if isinstance(entry, dict) else None
-            if err:
-                failures.append({
-                    "id": entry.get("_id"),
-                    "reason": str(
-                        err.get("reason", err) if isinstance(err, dict) else err
-                    ),
-                })
-            else:
-                succeeded += 1
-        # #914 — when the parsed result is a silent no-op (succeeded=0 with
-        # no per-item failures), log the raw response shape so operators
-        # can tell ``items=[]`` (request never hit ES) from a shape we
-        # don't parse.
-        if succeeded == 0 and not failures and ops_count > 0:
-            logger.warning(
-                "%s.index_bulk: ES bulk returned a shape that yielded "
-                "0 succeeded / 0 failed for %d ops "
-                "(catalog=%s collection=%s index=%s). resp_type=%s "
-                "resp_keys=%s items_len=%d errors=%s",
-                driver_name or "ItemsElasticsearchBase",
-                ops_count,
-                catalog,
-                collection,
-                index_name,
-                type(resp).__name__,
-                list(resp.keys()) if isinstance(resp, dict) else None,
-                len(items),
-                resp.get("errors") if isinstance(resp, dict) else None,
-            )
-        return succeeded, failures
+    # ``_ensure_index`` / ``_tally_bulk_response`` moved to ``_ElasticsearchBase``
+    # (#2863) so the asset driver can reuse them too — they were never
+    # items-specific to begin with.
 
     # ------------------------------------------------------------------
     # Shared simplification helpers
@@ -2607,7 +2716,14 @@ class AssetElasticsearchDriver(
         *,
         db_resource: Optional[Any] = None,
     ) -> None:
-        """Index a single asset document."""
+        """Index a single asset document.
+
+        Called once per asset by ``AssetService.create_asset``/``update_asset``
+        for the ES-primary write path — the site the observed harvest
+        starvation traced back to (#2863): an ``indices.exists`` HEAD before
+        every single PUT. :meth:`_ensure_index_cached` now caches that check
+        per index name so the HEAD only fires once per (index, process).
+        """
         from dynastore.modules.elasticsearch.mappings import (
             get_assets_index_name, ASSET_MAPPING,
         )
@@ -2618,22 +2734,15 @@ class AssetElasticsearchDriver(
 
         index_name = get_assets_index_name(_get_index_prefix(), catalog_id)
         es = self._get_client()
-
-        if not await es.indices.exists(index=index_name):
-            try:
-                await es.indices.create(
-                    index=index_name,
-                    body={
-                        "settings": await get_assets_index_settings(),
-                        "mappings": ASSET_MAPPING,
-                    },
-                )
-            except Exception as exc:
-                if "resource_already_exists" not in str(exc):
-                    raise
+        await self._ensure_index_cached(es, index_name, ASSET_MAPPING, get_assets_index_settings)
 
         asset_id = asset_doc.get("asset_id", asset_doc.get("id"))
-        await es.index(index=index_name, id=asset_id, body=asset_doc)
+        try:
+            await es.index(index=index_name, id=asset_id, body=asset_doc)
+        except Exception as exc:
+            if _is_index_not_found(exc):
+                _invalidate_ensured_index(index_name)
+            raise
 
     async def delete_asset(
         self, catalog_id: str, asset_id: str,
@@ -2687,25 +2796,69 @@ class AssetElasticsearchDriver(
         await self.index_asset(ctx.catalog, doc)
 
     async def index_bulk(self, ctx, ops):
-        """Bulk-apply a batch of asset ops.
+        """Bulk-apply a batch of asset ops via a single ES ``_bulk`` call.
 
-        Delegates per-op to :meth:`index` for now — asset writes are
-        rare enough vs item writes that a single ES round-trip per op
-        isn't a hot-path concern.  A native ``_bulk`` implementation
-        can land later if profiling motivates it.
+        Previously delegated per-op to :meth:`index` — an ``indices.exists``
+        HEAD plus a single-doc PUT/DELETE for every op in the batch, the same
+        per-doc amplification pattern that starved the shared client pool
+        under harvest load (#2863). This batch already has every op in hand,
+        so it now goes through one ``_bulk`` request instead, reusing the
+        same ``_ensure_index`` / ``_tally_bulk_response`` machinery the
+        items/private/envelope drivers' ``index_bulk`` paths already use
+        rather than a parallel bulk implementation. Per-op failures are
+        reported in ``BulkResult.failures`` — one bad doc does not fail the
+        whole batch.
         """
         from dynastore.models.protocols.indexer import BulkResult
+        from dynastore.modules.elasticsearch.mappings import (
+            get_assets_index_name, ASSET_MAPPING,
+        )
+        from dynastore.modules.elasticsearch.index_config import (
+            get_assets_index_settings,
+        )
+        from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
+        from dynastore.modules.elasticsearch._mapping_errors import (
+            maybe_raise_bulk_mapping_mismatch,
+        )
 
-        succeeded = 0
-        failures: List[Dict[str, Any]] = []
-        for op in ops:
-            if op.entity_type != "asset":
+        asset_ops = [op for op in ops if op.entity_type == "asset"]
+        if not asset_ops:
+            # ``total`` reflects the full input batch (matching every other
+            # ES driver's ``index_bulk`` convention, e.g.
+            # ``ItemsElasticsearchDriver.index_bulk``) — a non-asset op is
+            # silently skipped (a different tier's Indexer fields it), not
+            # counted as succeeded or failed.
+            return BulkResult(total=len(ops))
+
+        index_name = get_assets_index_name(_get_index_prefix(), ctx.catalog)
+        es = self._get_client()
+        await self._ensure_index_cached(es, index_name, ASSET_MAPPING, get_assets_index_settings)
+
+        body: List[dict] = []
+        for op in asset_ops:
+            if op.op_type == "delete":
+                body.append({"delete": {"_index": index_name, "_id": op.entity_id}})
                 continue
-            try:
-                await self.index(ctx, op)
-                succeeded += 1
-            except Exception as exc:  # noqa: BLE001 — surface per-op failures
-                failures.append({"id": op.entity_id, "reason": str(exc)})
+            # upsert
+            doc = dict(op.payload or {})
+            doc.setdefault("asset_id", op.entity_id)
+            doc.setdefault("catalog_id", ctx.catalog)
+            if ctx.collection is not None:
+                doc.setdefault("collection_id", ctx.collection)
+            body.append({"index": {"_index": index_name, "_id": op.entity_id}})
+            body.append(doc)
+
+        resp = await es.bulk(body=body)
+        maybe_raise_bulk_mapping_mismatch(resp, index_name)
+        if _bulk_response_missing_index(resp):
+            _invalidate_ensured_index(index_name)
+        succeeded, failures = self._tally_bulk_response(
+            resp, len(asset_ops),
+            driver_name="AssetElasticsearchDriver",
+            catalog=ctx.catalog,
+            collection=ctx.collection or "",
+            index_name=index_name,
+        )
         return BulkResult(
             total=len(ops),
             succeeded=succeeded,
@@ -2737,19 +2890,7 @@ class AssetElasticsearchDriver(
         index_name = get_assets_index_name(_get_index_prefix(), catalog_id)
         items = self._normalize_entities(entities)
         es = self._get_client()
-
-        if not await es.indices.exists(index=index_name):
-            try:
-                await es.indices.create(
-                    index=index_name,
-                    body={
-                        "settings": await get_assets_index_settings(),
-                        "mappings": ASSET_MAPPING,
-                    },
-                )
-            except Exception as exc:
-                if "resource_already_exists" not in str(exc):
-                    raise
+        await self._ensure_index_cached(es, index_name, ASSET_MAPPING, get_assets_index_settings)
 
         bulk_body: list = []
         asset_ids: list = []
@@ -2772,6 +2913,8 @@ class AssetElasticsearchDriver(
             )
             resp = await es.bulk(body=bulk_body)
             maybe_raise_bulk_mapping_mismatch(resp, index_name)
+            if _bulk_response_missing_index(resp):
+                _invalidate_ensured_index(index_name)
             raise_on_bulk_errors(resp, index_name, asset_ids)
 
         return items if isinstance(items, list) else list(items)
@@ -2868,18 +3011,7 @@ class AssetElasticsearchDriver(
 
         index_name = get_assets_index_name(_get_index_prefix(), catalog_id)
         es = self._get_client()
-        if not await es.indices.exists(index=index_name):
-            try:
-                await es.indices.create(
-                    index=index_name,
-                    body={
-                        "settings": await get_assets_index_settings(),
-                        "mappings": ASSET_MAPPING,
-                    },
-                )
-            except Exception as exc:
-                if "resource_already_exists" not in str(exc):
-                    raise
+        await self._ensure_index_cached(es, index_name, ASSET_MAPPING, get_assets_index_settings)
 
     async def drop_storage(
         self,
@@ -2923,6 +3055,10 @@ class AssetElasticsearchDriver(
             await es.indices.delete(
                 index=index_name, params={"ignore_unavailable": "true"},
             )
+            # The index is gone — drop it from the existence cache (#2863) so
+            # the next write re-checks/re-creates instead of trusting a now-
+            # stale "exists" entry and PUTting straight into a 404.
+            _invalidate_ensured_index(index_name)
 
     async def export_entities(
         self,
