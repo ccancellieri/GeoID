@@ -36,6 +36,7 @@ from sqlalchemy import text, Engine
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from dynastore.modules.tasks.durable.locks import stable_lock_id_sha256 as _stable_lock_id_sha256
 from dynastore.tools.async_utils import LoopLocalLock
+from dynastore.tools.db import quote_ident
 from dynastore.modules.db_config.query_executor import (
     DQLQuery,
     DDLQuery,
@@ -1204,9 +1205,9 @@ async def force_truncate_table(conn: DbResource, schema_name: str, table_name: s
     await terminate_backends_locking_table(conn, schema_name, table_name)
     # Give a small window for backends to actually exit
     await asyncio.sleep(0.1)
-    await DDLQuery(f'DELETE FROM "{schema_name}"."{table_name}";').execute(
-        conn
-    )
+    await DDLQuery(
+        f"DELETE FROM {quote_ident(schema_name)}.{quote_ident(table_name)};"
+    ).execute(conn)
 
 
 async def force_drop_schema(conn: DbResource, schema_name: str):
@@ -1216,7 +1217,7 @@ async def force_drop_schema(conn: DbResource, schema_name: str):
     await terminate_backends_locking_schema(conn, schema_name)
     # Give a small window for backends to actually exit
     await asyncio.sleep(0.1)
-    await DDLQuery(f'DROP SCHEMA "{schema_name}" CASCADE;').execute(conn)
+    await DDLQuery(f"DROP SCHEMA {quote_ident(schema_name)} CASCADE;").execute(conn)
 
 
 # --- Safe DROP for hot relations ---
@@ -1262,15 +1263,18 @@ async def safe_drop_relation(
     kind_lower = kind.lower()
     tail = " CASCADE" if cascade else ""
     if kind_lower == "table":
-        sql = f'DROP TABLE IF EXISTS "{schema}"."{relation}"{tail};'
+        sql = f"DROP TABLE IF EXISTS {quote_ident(schema)}.{quote_ident(relation)}{tail};"
     elif kind_lower == "index":
-        sql = f'DROP INDEX IF EXISTS "{schema}"."{relation}"{tail};'
+        sql = f"DROP INDEX IF EXISTS {quote_ident(schema)}.{quote_ident(relation)}{tail};"
     elif kind_lower == "trigger":
         if not on_table:
             raise ValueError("on_table is required when kind='trigger'")
-        sql = f'DROP TRIGGER IF EXISTS "{relation}" ON "{schema}"."{on_table}"{tail};'
+        sql = (
+            f"DROP TRIGGER IF EXISTS {quote_ident(relation)} "
+            f"ON {quote_ident(schema)}.{quote_ident(on_table)}{tail};"
+        )
     elif kind_lower == "schema":
-        sql = f'DROP SCHEMA IF EXISTS "{schema}"{tail};'
+        sql = f"DROP SCHEMA IF EXISTS {quote_ident(schema)}{tail};"
     else:
         raise ValueError(f"unsupported kind: {kind!r}")
 
