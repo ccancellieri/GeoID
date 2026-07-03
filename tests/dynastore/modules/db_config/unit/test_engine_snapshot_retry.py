@@ -32,7 +32,10 @@ The fix has two halves; this file pins the resolver half:
      in place, so a long-lived resolver closure observes successful
      entries from a later retry.
   2. ``refresh_snapshot_until_ready`` retries with exponential backoff
-     until at least one engine loads or the budget is exhausted.
+     until at least one engine loads; once that bounded budget is
+     exhausted it degrades to an unbounded keep-alive retry every
+     ``max_delay`` seconds rather than stranding the snapshot empty for
+     the rest of the process's life (#2908).
 
 The cache-module half (unconditional apply-handler registration) is
 covered alongside the existing reconnect suite in
@@ -40,6 +43,8 @@ covered alongside the existing reconnect suite in
 """
 
 from __future__ import annotations
+
+import asyncio
 
 from unittest.mock import AsyncMock, MagicMock
 
@@ -110,8 +115,12 @@ async def test_build_engine_snapshot_skips_failing_engines_without_aborting(
 
 
 @pytest.mark.asyncio
-async def test_refresh_returns_true_when_db_becomes_ready(pcfg_stub):
-    """Simulate the boot-order race: first attempt fails, second succeeds."""
+async def test_refresh_returns_true_when_db_becomes_ready(pcfg_stub, caplog):
+    """Simulate the boot-order race: first attempt fails, second succeeds.
+
+    Fast path (#2908 case d): success inside the bounded budget must not
+    touch the exhaustion ``ERROR`` log at all.
+    """
     state = {"calls": 0}
 
     def _gated(cls):
@@ -133,24 +142,117 @@ async def test_refresh_returns_true_when_db_becomes_ready(pcfg_stub):
     pcfg_stub.get_config.side_effect = _gated
 
     snapshot: dict[str, EngineConfig] = {}
-    ok = await er.refresh_snapshot_until_ready(
-        snapshot,
-        pcfg_stub,
-        max_attempts=3,
-        initial_delay=0.01,
-        max_delay=0.01,
-    )
+    with caplog.at_level("ERROR", logger="dynastore.modules.db_config.engine_resolver"):
+        ok = await er.refresh_snapshot_until_ready(
+            snapshot,
+            pcfg_stub,
+            max_attempts=3,
+            initial_delay=0.01,
+            max_delay=0.01,
+        )
 
     assert ok is True
     assert snapshot, "snapshot should be populated after retry"
+    assert not any(
+        "retry budget exhausted" in rec.getMessage() for rec in caplog.records
+    ), "success inside the bounded budget must not log the exhaustion ERROR"
 
 
 @pytest.mark.asyncio
-async def test_refresh_returns_false_when_budget_exhausted_and_logs_error(
+async def test_refresh_keepalive_recovers_after_budget_exhausted(
     pcfg_stub, caplog
 ):
-    """Permanent failure: budget exhausted → False + ERROR-level surface."""
+    """#2908 cases (a)+(b): bounded budget exhausts, then keep-alive phase
+    recovers once the DB pool comes up — exactly one ERROR on exhaustion,
+    then one INFO once the keep-alive phase loads the snapshot.
+    """
+    from dynastore.modules.db_config.engine_registry import (
+        list_registered_engines,
+    )
+
+    n_engines = len(list_registered_engines())
+    # Bounded budget: max_attempts=2 → exhausts after 2 failed passes, then
+    # the keep-alive phase takes over with its own ``max_delay``-cadence
+    # sleeps. Fail every call through the bounded budget plus one keep-alive
+    # pass, then succeed.
+    state = {"calls": 0, "fail_until": 2 * n_engines + n_engines}
+
+    def _gated(cls):
+        state["calls"] += 1
+        if state["calls"] <= state["fail_until"]:
+            raise RuntimeError("db_resource is None")
+        return cls()
+
+    pcfg_stub.get_config.side_effect = _gated
+
+    snapshot: dict[str, EngineConfig] = {}
+    with caplog.at_level("INFO", logger="dynastore.modules.db_config.engine_resolver"):
+        ok = await er.refresh_snapshot_until_ready(
+            snapshot,
+            pcfg_stub,
+            max_attempts=2,
+            initial_delay=0.01,
+            max_delay=0.01,
+        )
+
+    assert ok is True
+    assert snapshot, "keep-alive phase must populate the snapshot on recovery"
+
+    error_records = [
+        rec for rec in caplog.records
+        if rec.levelname == "ERROR" and "retry budget exhausted" in rec.getMessage()
+    ]
+    assert len(error_records) == 1, (
+        "exhaustion must be logged exactly once, not on every keep-alive miss"
+    )
+
+    ready_records = [
+        rec for rec in caplog.records
+        if rec.levelname == "INFO" and "engine snapshot ready" in rec.getMessage()
+    ]
+    assert len(ready_records) == 1
+    assert "recovered" in ready_records[0].getMessage(), (
+        "the late-recovery INFO must say it recovered after exhaustion"
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_keepalive_cancellable_during_keepalive_phase(pcfg_stub):
+    """#2908 case (c): once in the unbounded keep-alive phase, cancelling
+    the task must raise ``CancelledError`` promptly — the coroutine is
+    awaited-on-cancel at lifespan teardown and must never swallow it.
+    """
     pcfg_stub.get_config.side_effect = RuntimeError("db_resource is None")
+
+    snapshot: dict[str, EngineConfig] = {}
+    task = asyncio.create_task(
+        er.refresh_snapshot_until_ready(
+            snapshot,
+            pcfg_stub,
+            max_attempts=2,
+            initial_delay=0.01,
+            max_delay=0.05,
+        )
+    )
+
+    # Give the bounded budget time to exhaust and enter the keep-alive
+    # ``asyncio.sleep(max_delay)`` — a handful of the 0.01s/0.05s delays.
+    await asyncio.sleep(0.1)
+    assert not task.done(), "task should still be alive in the keep-alive phase"
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_refresh_returns_false_when_no_engines_registered(
+    pcfg_stub, monkeypatch, caplog
+):
+    """Degenerate case: no registered engine kinds → nothing to ever wait
+    for, so the keep-alive phase must not spin forever; return False.
+    """
+    monkeypatch.setattr(er, "list_registered_engines", lambda: {})
 
     snapshot: dict[str, EngineConfig] = {}
     with caplog.at_level("ERROR", logger="dynastore.modules.db_config.engine_resolver"):
@@ -164,10 +266,6 @@ async def test_refresh_returns_false_when_budget_exhausted_and_logs_error(
 
     assert ok is False
     assert snapshot == {}
-    assert any(
-        "retry budget exhausted" in rec.getMessage()
-        for rec in caplog.records
-    ), "must log a structured ERROR when retry budget is exhausted"
 
 
 # --------------------------------------------------------------------------

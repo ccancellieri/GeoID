@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Callable, Dict, Optional, TYPE_CHECKING
 
 from dynastore.modules.db_config.engine_config import EngineConfig
@@ -179,14 +180,31 @@ async def refresh_snapshot_until_ready(
     :func:`make_resolver` closure observes the populated state without
     needing to be rebuilt.
 
-    Returns ``True`` when the snapshot has at least one entry, ``False`` if
-    the retry budget is exhausted with the snapshot still empty.  A failed
-    retry budget is reported as ``ERROR`` so the next regression of the
-    boot-order race is operationally visible — parity with #778's surfacing
-    fix.
+    Runs the bounded ``max_attempts`` schedule first (exponential backoff
+    from ``initial_delay`` up to ``max_delay`` — by default totalling
+    ~132.5s). If the snapshot is still empty once that budget is spent,
+    this does NOT give up: it logs a single ``ERROR`` (operational
+    visibility — parity with #778's surfacing fix) and then degrades to
+    an unbounded keep-alive phase, retrying every ``max_delay`` seconds
+    until an entry loads or the caller cancels this coroutine (it is
+    awaited-on-cancel at lifespan teardown — see
+    :meth:`DBConfigModule._cancel_refresh_task`). A boot slow enough to
+    outlast the bounded budget (#2908 — a connection pool that took
+    ~156s to come up against a ~132.5s default budget) used to strand
+    the snapshot empty for the rest of the process's life, with
+    :class:`EngineInstanceCache` raising ``KeyError`` on every ref until
+    a restart; now it just keeps trying.
+
+    Returns ``True`` once the snapshot has at least one entry — from
+    either phase. Only returns ``False`` in the degenerate case where
+    :func:`list_registered_engines` is empty, i.e. there is nothing to
+    ever wait for. Otherwise the only way out without an entry is
+    cancellation, which raises ``asyncio.CancelledError`` rather than
+    returning.
     """
     expected = len(list_registered_engines())
     delay = initial_delay
+    attempt = 0
     for attempt in range(1, max_attempts + 1):
         loaded = await _snapshot_attempt(snapshot, pcfg)
         if loaded > 0:
@@ -198,14 +216,33 @@ async def refresh_snapshot_until_ready(
         if attempt < max_attempts:
             await asyncio.sleep(delay)
             delay = min(delay * 2, max_delay)
+
     logger.error(
         "engine snapshot: retry budget exhausted (attempts=%d, loaded=0/%d) — "
-        "EngineInstanceCache will return KeyError for every ref until the "
-        "next process restart.  Likely root cause: DB pool never became "
-        "available during the retry window.",
-        max_attempts, expected,
+        "degrading to a keep-alive retry every %.1fs until the DB pool "
+        "comes up or this task is cancelled at teardown. Likely root "
+        "cause: DB pool has not become available yet.",
+        max_attempts, expected, max_delay,
     )
-    return False
+    if expected == 0:
+        # Nothing is ever going to load — an unbounded loop here would
+        # spin forever with no way to reach loaded > 0.
+        return False
+
+    keepalive_started = time.monotonic()
+    while True:
+        await asyncio.sleep(max_delay)
+        attempt += 1
+        loaded = await _snapshot_attempt(snapshot, pcfg)
+        if loaded > 0:
+            logger.info(
+                "engine snapshot ready: attempt=%d loaded=%d/%d "
+                "(recovered %.1fs after the %d-attempt retry budget "
+                "exhausted)",
+                attempt, loaded, expected,
+                time.monotonic() - keepalive_started, max_attempts,
+            )
+            return True
 
 
 async def try_refresh_snapshot_once(

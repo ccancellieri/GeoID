@@ -54,24 +54,28 @@ class DBConfigAppState(Protocol):
     engine: Any
     sync_engine: Any
     engine_cache: Optional[EngineInstanceCache]
-    # Bridges the priority-0 (DBConfigModule) / priority-9 (CacheModule)
-    # boot-order race: the snapshot is populated by a fire-and-forget retry
-    # task that may finish AFTER CacheModule starts.  Publishing the task
-    # handle here lets downstream priority-9 modules await its completion
-    # before reading engine_cache.get(...) — otherwise CacheModule reads an
-    # empty snapshot, raises KeyError, and degrades to the local in-memory
-    # cache even though the snapshot would have resolved a moment later.
-    # See GeoID #833.
+    # Populated by a fire-and-forget retry task (DBConfigModule, priority 0)
+    # so a long-lived resolver closure observes entries as they load.  This
+    # handle used to be awaited by downstream priority-9 CacheModule before
+    # reading engine_cache.get(...) (#833) — but that task cannot complete
+    # before DBService (priority 10) installs the pool, and module lifespans
+    # enter in strict priority order, so CacheModule awaiting it here always
+    # burned its full retry budget on every boot and would deadlock startup
+    # once #2908 made that budget an unbounded keep-alive retry instead of a
+    # bounded give-up.  CacheModule now only ever inspects this task if it is
+    # ALREADY done (never awaits a pending one); the LOCAL -> VALKEY
+    # boot-upgrade loop (#2857) is what actually bridges the late-arriving
+    # snapshot. See GeoID #833, #2908.
     engine_snapshot_refresh_task: "Optional[asyncio.Task[bool]]"
     # On-demand single-attempt re-resolver, bound to the same snapshot dict
     # and ``PlatformConfigService`` used above.  ``engine_snapshot_refresh_task``
-    # is a ONE-SHOT background retry that gives up permanently once its own
-    # budget is exhausted — nothing re-runs ``build_engine_snapshot`` after
-    # that, so a caller whose own recovery loop wakes up later (e.g.
-    # ``CacheModule``'s boot-upgrade loop, once the DB pool is genuinely up)
-    # would otherwise probe a snapshot dict that can never be populated
-    # again. Callers with their own retry cadence call this once per
-    # attempt instead of re-probing a dead snapshot. See GeoID #2857.
+    # degrades to a slow (``max_delay``-cadence) keep-alive retry once its
+    # bounded budget is exhausted rather than giving up permanently (#2908),
+    # but it is never awaited by CacheModule (see above) — the boot-upgrade
+    # loop calls this instead, on its own faster cadence, to re-run
+    # ``build_engine_snapshot`` itself rather than only re-probing a
+    # snapshot dict the background task fills far too slowly for boot-time
+    # use. See GeoID #2857.
     engine_snapshot_refresh: "Callable[[], Awaitable[bool]]"
 
 

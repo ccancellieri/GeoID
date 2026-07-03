@@ -16,7 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""CacheModule awaits the engine snapshot refresh task — #833.
+"""CacheModule's handling of the engine snapshot refresh task — #833, #2908.
 
 DBConfigModule (priority 0) populates ``app_state.engine_cache`` by handing
 the same dict to ``asyncio.create_task(refresh_snapshot_until_ready(...))``
@@ -26,9 +26,21 @@ fill the dict, raising KeyError and silently degrading to the local
 in-memory cache even though the engine snapshot would have resolved a
 moment later.
 
-The fix publishes the task handle on ``app_state.engine_snapshot_refresh_task``
-and CacheModule awaits it before any engine_cache read.  This file pins
-that contract.
+#833 originally "fixed" this by publishing the task handle on
+``app_state.engine_snapshot_refresh_task`` and having CacheModule await it
+before any engine_cache read. That was itself wrong: the task cannot
+complete before DBService (priority 10) installs the connection pool, and
+module lifespans enter in strict priority order, so CacheModule (priority
+9) awaiting it always burned the task's entire retry budget on every single
+boot — and, once #2908 made that budget degrade to an unbounded keep-alive
+retry instead of giving up, would deadlock startup outright (DBService can
+never start while CacheModule is still awaiting).
+
+CacheModule now only ever inspects the task if it is ALREADY done —
+never awaits a pending one — logging the same WARNING if it completed with
+an error. The LOCAL -> VALKEY boot-upgrade loop (#2857,
+``_boot_upgrade_to_valkey``) is what actually bridges the late-arriving
+snapshot. This file pins that contract.
 """
 
 from __future__ import annotations
@@ -45,64 +57,48 @@ def _make_app_state(**kwargs: Any) -> types.SimpleNamespace:
     return types.SimpleNamespace(**kwargs)
 
 
-async def test_cache_module_awaits_refresh_task_before_engine_cache_get(
+async def test_cache_module_does_not_await_pending_refresh_task(
     monkeypatch,
 ):
-    """The refresh task must complete before engine_cache.get is consulted.
+    """#2908: CacheModule must NOT await a still-pending refresh task.
 
-    Models the production boot-race: snapshot dict starts empty, refresh
-    task is scheduled separately and fills it asynchronously.  CacheModule
-    must NOT race into the empty dict.
+    Awaiting a pending task here would block CacheModule (priority 9) from
+    finishing its lifespan — and DBService (priority 10), the only thing
+    that can ever complete that task, cannot start until CacheModule does.
+    CacheModule must proceed immediately with whatever the snapshot
+    already has, degrade to LOCAL, and arm the #2857 boot-upgrade loop
+    instead of waiting.
     """
+    import dynastore.modules.cache.cache_module as cm
     from dynastore.modules.cache.cache_module import CacheModule
 
-    # Drive a deterministic timeline by gating the refresh task on an Event
-    # we control — the test fails fast if CacheModule reads engine_cache
-    # before the event fires.
-    refresh_started = asyncio.Event()
-    snapshot_ready = asyncio.Event()
-    get_call_count = {"n": 0}
+    cm._current_backend = None
 
-    async def _slow_refresh() -> bool:
+    refresh_started = asyncio.Event()
+
+    async def _never_completes_during_this_test() -> bool:
         refresh_started.set()
-        await asyncio.sleep(0.05)  # give CacheModule time to (incorrectly) race
-        snapshot_ready.set()
+        await asyncio.sleep(3600)  # would time the test out if ever awaited
         return True
 
-    refresh_task = asyncio.create_task(_slow_refresh())
+    refresh_task = asyncio.create_task(_never_completes_during_this_test())
 
-    # Engine cache stub: KeyError until snapshot_ready is set, then returns
-    # a sentinel client.  This is what catches a wrong-ordered await.
-    sentinel_client = object()
+    get_call_count = {"n": 0}
 
     class _EngineCacheStub:
         async def get(self, ref: str) -> object:
             get_call_count["n"] += 1
-            if not snapshot_ready.is_set():
-                raise KeyError(ref)
-            return sentinel_client
+            raise KeyError(ref)  # snapshot is still empty at this point
 
     engine_cache = _EngineCacheStub()
 
-    # CacheModule reads ValkeyCacheBackend at import-time inside the lifespan;
-    # short-circuit the backend construction so we don't need real Valkey.
+    # CacheModule reads ValkeyCacheBackend/_CACHE_DEPS_OK at import-time
+    # inside the lifespan; drive it down the full LOCAL-degrade path (rather
+    # than the deps-missing early-return) so the boot-upgrade task gets
+    # armed too.
     import dynastore.tools.cache_valkey as cv
     monkeypatch.setattr(cv, "_CACHE_DEPS_OK", True)
 
-    backend_built = {"hit": False}
-
-    class _FakeBackend:
-        def __init__(self, *a: Any, **kw: Any) -> None:
-            backend_built["hit"] = True
-            self.client = kw.get("client")
-            self._closed = False
-
-        async def close(self) -> None:
-            self._closed = True
-
-    monkeypatch.setattr(cv, "ValkeyCacheBackend", _FakeBackend)
-
-    # Short-circuit the cache-config probe so the test stays unit-tier.
     async def _no_cfg(*_a: Any, **_kw: Any) -> Any:
         from dynastore.modules.cache.cache_config import CachePluginConfig
         return CachePluginConfig()
@@ -114,21 +110,35 @@ async def test_cache_module_awaits_refresh_task_before_engine_cache_get(
     app_state = _make_app_state(
         engine_cache=engine_cache,
         engine_snapshot_refresh_task=refresh_task,
+        engine_snapshot_refresh=None,
     )
 
     module = CacheModule(app_state=app_state)
-    async with module.lifespan(app_state):
-        # Engine path must have been taken (snapshot was ready by the time
-        # the get fired) — get was called exactly once and returned the
-        # sentinel client.
-        assert backend_built["hit"] is True, (
-            "engine-mode backend must have been built — a refresh-await "
-            "failure would have left engine_cache.get KeyError-ing and the "
-            "module degrading to the local in-memory cache instead"
-        )
-        assert refresh_started.is_set()
-        assert snapshot_ready.is_set()
-        assert get_call_count["n"] == 1
+
+    async def _enter_and_check() -> bool:
+        async with module.lifespan(app_state):
+            # Lifespan reached its yield without ever awaiting refresh_task.
+            assert get_call_count["n"] == 1, (
+                "engine_cache.get must have been consulted immediately, "
+                "not gated behind the pending refresh task"
+            )
+            assert not refresh_task.done(), (
+                "refresh task must still be pending — CacheModule must not "
+                "have awaited it"
+            )
+            assert cm._current_backend is None, "still LOCAL at this point"
+            return True
+
+    # Bounded so a regression back to awaiting the pending task fails fast
+    # with a clear timeout instead of hanging the whole test run.
+    entered = await asyncio.wait_for(_enter_and_check(), timeout=2.0)
+    assert entered
+
+    refresh_task.cancel()
+    try:
+        await refresh_task
+    except asyncio.CancelledError:
+        pass
 
 
 async def test_cache_module_no_refresh_task_attr_degrades_to_local(
@@ -158,13 +168,14 @@ async def test_cache_module_no_refresh_task_attr_degrades_to_local(
 async def test_cache_module_handles_failed_refresh_task_gracefully(
     monkeypatch, caplog,
 ):
-    """Refresh task raising must not crash CacheModule.lifespan.
+    """An ALREADY-done, failed refresh task must not crash CacheModule.lifespan.
 
-    ``refresh_snapshot_until_ready`` is best-effort; if it raises (e.g.
-    cancelled on shutdown, or hits an unexpected error), CacheModule must
-    log + proceed rather than propagate.  Drives the failure deterministically
-    by pre-completing the task before lifespan starts so the await observes
-    a stored exception (not a runtime race).
+    ``refresh_snapshot_until_ready`` is best-effort; CacheModule only ever
+    inspects the task if it is already done (#2908 — see module docstring),
+    and if that inspection surfaces an exception (e.g. cancelled on
+    shutdown, or an unexpected error) it must log + proceed rather than
+    propagate.  Drives the failure deterministically by pre-completing the
+    task before lifespan starts.
     """
     from dynastore.modules.cache.cache_module import CacheModule
 
@@ -172,9 +183,8 @@ async def test_cache_module_handles_failed_refresh_task_gracefully(
         raise RuntimeError("simulated refresh failure")
 
     refresh_task = asyncio.create_task(_failing_refresh())
-    # Drain it so the exception is stored on the task before lifespan starts;
-    # CacheModule's ``await refresh_task`` will then re-raise from the
-    # already-completed task.
+    # Drain it so the exception is stored on the task, and it reports
+    # ``done() is True``, before lifespan starts.
     with pytest.raises(RuntimeError):
         await refresh_task
 

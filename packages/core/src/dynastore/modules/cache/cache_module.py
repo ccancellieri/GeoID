@@ -766,13 +766,14 @@ async def _boot_upgrade_to_valkey(
 
     ``snapshot_refresh`` (``app_state.engine_snapshot_refresh`` — #2857):
     re-runs ``build_engine_snapshot`` once per attempt, BEFORE probing
-    ``engine_cache.get``.  ``DBConfigModule``'s own one-shot background
-    retry (``engine_snapshot_refresh_task``) gives up permanently once its
-    own budget is exhausted and nothing else ever writes to the snapshot
-    dict again — so without this, this loop only ever re-probes a snapshot
-    that can never become non-empty, and always exhausts its own budget
-    too, even once the DB pool is genuinely up.  ``None`` only in tests
-    that pre-date #2857 or stub ``engine_cache`` directly.
+    ``engine_cache.get``.  ``DBConfigModule``'s own background retry
+    (``engine_snapshot_refresh_task``) is never awaited here or in
+    ``CacheModule.lifespan`` — it can't complete before ``DBService``
+    (priority 10) installs the pool, and ``CacheModule`` (priority 9) runs
+    strictly before that in the module boot order (#2908) — so without
+    this, this loop would only ever re-probe a snapshot dict nothing else
+    is writing to yet.  ``None`` only in tests that pre-date #2857 or stub
+    ``engine_cache`` directly.
     """
     delay = _BOOT_UPGRADE_INITIAL_DELAY
     for attempt in range(1, _BOOT_UPGRADE_MAX_ATTEMPTS + 1):
@@ -916,21 +917,32 @@ class CacheModule(ModuleProtocol):
         engine_mode = False
         _safe_url = "<engine>"
 
-        # GeoID #833: DBConfigModule (priority 0) fires the engine-snapshot
-        # population as a fire-and-forget asyncio.Task, so when CacheModule
-        # (priority 9) starts the engine_cache object exists but its
-        # snapshot dict is still empty.  Awaiting the published task handle
-        # bridges that race — without this, engine_cache.get raises KeyError
-        # and the module degrades to the local in-memory cache even though
-        # the engine snapshot would have resolved a moment later.
+        # GeoID #833/#2908: DBConfigModule (priority 0) fires the
+        # engine-snapshot population as a fire-and-forget asyncio.Task, but
+        # that task can never complete before DBService (priority 10)
+        # installs the connection pool — and module lifespans enter in
+        # strict priority order through a single AsyncExitStack, so
+        # DBService cannot even start until CacheModule (priority 9)
+        # finishes entering its own lifespan first.  Awaiting the task here
+        # therefore always burned its entire retry budget on every single
+        # boot (the "~2.3 min LOCAL cache" reported in #2871) and, once
+        # #2908 made that budget degrade to an unbounded keep-alive retry
+        # instead of giving up, would deadlock startup outright — the
+        # await would never return, and DBService (the only thing that can
+        # make it return) would never get to run.
+        #
+        # We only ever observe an ALREADY-completed task here — never await
+        # a pending one — so a task that failed or was cancelled before we
+        # got here still surfaces as a WARNING instead of slipping past
+        # unobserved (the original #833 TOCTOU concern). The snapshot
+        # arriving late is handled correctly below: CacheModule starts
+        # LOCAL and the boot-upgrade loop (#2857, ``_boot_upgrade_to_valkey``)
+        # re-probes the snapshot on its own cadence once the pool is up.
         # ``getattr`` keeps back-compat with test stubs that pre-date #833.
         refresh_task = getattr(app_state, "engine_snapshot_refresh_task", None)
-        if refresh_task is not None:
-            # Awaiting a completed task is cheap (immediate return/raise) so
-            # we do NOT gate on ``not done()`` — a TOCTOU race could otherwise
-            # let a task that completed-with-exception slip past unobserved.
+        if refresh_task is not None and refresh_task.done():
             try:
-                await refresh_task
+                refresh_task.result()
             except (asyncio.CancelledError, Exception) as exc:  # noqa: BLE001
                 # Failed/cancelled refresh is non-fatal here — the engine_cache
                 # read below will simply KeyError and the local in-memory
