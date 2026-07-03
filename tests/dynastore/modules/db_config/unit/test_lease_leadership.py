@@ -28,6 +28,7 @@ DB layer is mocked via monkeypatching ``managed_transaction`` in the
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
@@ -163,6 +164,29 @@ async def test_win_registers_held_lock(monkeypatch):
         assert _held_advisory_locks[lock_id][0] == "test"
     # Entry removed after exit.
     assert lock_id not in _held_advisory_locks
+
+
+@pytest.mark.asyncio
+async def test_set_local_lock_timeout_precedes_cas_insert(monkeypatch):
+    """The CAS transaction scopes its own row-lock wait via ``SET LOCAL
+    lock_timeout`` (mirrors ``safe_drop_relation``), issued before the
+    INSERT..ON CONFLICT CAS, so a losing contender fails fast instead of
+    inheriting the session-wide ``DB_LOCK_TIMEOUT``."""
+    cursor = _make_cursor(_LEASE_OWNER)
+    execute_calls, _ = _patch_managed_transaction(monkeypatch, [cursor])
+
+    async with lease_leadership(_make_engine(), 42, name="test") as (is_leader, _):
+        assert is_leader is True
+
+    sqls = [sql for sql, _ in execute_calls]
+    set_local_idx = next(
+        i for i, sql in enumerate(sqls) if sql.lstrip().upper().startswith("SET LOCAL")
+    )
+    insert_idx = next(
+        i for i, sql in enumerate(sqls) if sql.lstrip().upper().startswith("INSERT")
+    )
+    assert "lock_timeout = '500ms'" in sqls[set_local_idx]
+    assert set_local_idx < insert_idx
 
 
 # ---------------------------------------------------------------------------
@@ -602,6 +626,64 @@ async def test_breaker_recovers_half_open_to_closed_after_cooldown(monkeypatch):
     assert breaker.state_of(_LEASE_BREAKER_KEY) == "CLOSED"
 
 
+@pytest.mark.asyncio
+async def test_lock_not_available_does_not_trip_breaker(monkeypatch, caplog):
+    """A 55P03 lock-not-available CAS failure is a lost round, not a breaker
+    failure: it must not accumulate toward the failure threshold, must log at
+    DEBUG (not WARNING), and must decline (False, None) every time — even
+    past the ordinary threshold of consecutive losses."""
+    caplog.set_level(logging.DEBUG, logger=locking_tools.logger.name)
+    record_failure_calls = {"n": 0}
+    orig_record_failure = locking_tools._lease_breaker_record_failure
+
+    def _spy_record_failure(lock_name):
+        record_failure_calls["n"] += 1
+        return orig_record_failure(lock_name)
+
+    monkeypatch.setattr(locking_tools, "_lease_breaker_record_failure", _spy_record_failure)
+
+    @asynccontextmanager
+    async def _mt_lock_timeout(engine):
+        raise RuntimeError("canceling statement due to lock timeout")
+        yield None  # pragma: no cover
+
+    monkeypatch.setattr(locking_tools, "managed_transaction", _mt_lock_timeout)
+
+    # 6 consecutive losses, past the breaker's failure threshold (5).
+    for _ in range(6):
+        async with lease_leadership(_make_engine(), 42, name="test") as (is_leader, lock_conn):
+            assert is_leader is False
+            assert lock_conn is None
+        assert locking_tools._get_lease_breaker().state_of(_LEASE_BREAKER_KEY) == "CLOSED"
+
+    assert record_failure_calls["n"] == 0
+    assert not any(rec.levelno >= logging.WARNING for rec in caplog.records)
+    assert any(
+        rec.levelno == logging.DEBUG and "row-lock race" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_lock_error_still_trips_breaker(monkeypatch):
+    """Negative control: a generic non-lock DB error still counts as a
+    breaker failure and, after the threshold, opens the breaker — pinning
+    that the 55P03 carve-out is narrow and does not swallow real failures."""
+
+    @asynccontextmanager
+    async def _mt_fail(engine):
+        raise RuntimeError("db down")  # not a lock-timeout error
+        yield None  # pragma: no cover
+
+    monkeypatch.setattr(locking_tools, "managed_transaction", _mt_fail)
+
+    for _ in range(5):
+        async with lease_leadership(_make_engine(), 42, name="test") as (is_leader, _):
+            assert is_leader is False
+
+    assert locking_tools._get_lease_breaker().state_of(_LEASE_BREAKER_KEY) == "OPEN"
+
+
 # ---------------------------------------------------------------------------
 # renew_lease — CAS-on-own-owner renewal (heartbeat regime, #2597)
 # ---------------------------------------------------------------------------
@@ -940,6 +1022,8 @@ async def test_failover_within_ttl_after_simulated_crash(monkeypatch):
 
         async def _ex(sql, params=None, **kw):
             sql_str = str(sql)
+            if sql_str.lstrip().upper().startswith("SET LOCAL"):
+                return MagicMock()
             if sql_str.lstrip().upper().startswith("INSERT"):
                 result = table.cas(params["owner"], params["ttl"])
                 cur = MagicMock()

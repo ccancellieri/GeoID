@@ -211,6 +211,14 @@ async def _lease_cas_round_trip(
     async def _run_cas() -> Any:
         async with managed_transaction(engine) as _conn:
             aconn = cast(AsyncConnection, _conn)
+            # Scope the row-lock wait to this transaction (mirrors
+            # safe_drop_relation) so a losing contender fails fast on 55P03
+            # instead of inheriting the session-wide DB_LOCK_TIMEOUT. SET
+            # LOCAL is transaction-scoped, so it is safe under transaction-
+            # mode connection pooling.
+            await aconn.execute(
+                text(f"SET LOCAL lock_timeout = '{_leadership_config.lease_cas_lock_timeout_ms}ms'")
+            )
             result = await aconn.execute(
                 text(_LEASE_CAS_SQL),
                 {"lock_key": lock_id, "name": name, "owner": _LEASE_OWNER, "ttl": ttl},
@@ -220,6 +228,15 @@ async def _lease_cas_round_trip(
     try:
         row = await _run_cas()
     except Exception as exc:
+        if is_lock_not_available_error(exc):
+            # Losing the row-lock race (55P03) is an expected outcome of
+            # contention, not a DB health signal — do not feed it to the
+            # shared breaker or log it above DEBUG.
+            logger.debug(
+                "%s: lease CAS lost the row-lock race (55P03); retrying next tick.",
+                name,
+            )
+            return None
         logger.warning("%s: lease CAS failed (%s).", name, exc)
         _lease_breaker_record_failure(name)
         return None

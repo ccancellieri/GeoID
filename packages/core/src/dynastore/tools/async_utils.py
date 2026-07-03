@@ -18,6 +18,7 @@
 
 import logging
 import asyncio
+import random
 from contextlib import AbstractAsyncContextManager
 from typing import Optional, Any, Iterator, Callable, List, Awaitable, Dict, Tuple
 
@@ -635,13 +636,21 @@ async def run_leader_loop(
     )
 
     async def _sleep_cadence() -> None:
+        # Jitter the wait by +/-15% so a fleet of replicas on the same
+        # cadence doesn't herd on a shared hot row every period. The
+        # zero-cadence test/fast-loop case is left unjittered.
+        jittered = (
+            cadence_seconds * random.uniform(0.85, 1.15)
+            if cadence_seconds > 0
+            else cadence_seconds
+        )
         if shutdown_event is not None:
             try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=cadence_seconds)
+                await asyncio.wait_for(shutdown_event.wait(), timeout=jittered)
             except asyncio.TimeoutError:
                 pass
         else:
-            await asyncio.sleep(cadence_seconds)
+            await asyncio.sleep(jittered)
 
     while not is_shutdown():
         try:

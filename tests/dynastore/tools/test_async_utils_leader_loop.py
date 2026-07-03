@@ -321,3 +321,82 @@ async def test_probe_cancelled_error_propagates_without_resign():
 
     # Leadership was acquired and released (the acquirer's finally block runs)
     assert tracker.released == 1
+
+
+# ---------------------------------------------------------------------------
+# cadence jitter tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_non_leader_sleep_is_jittered(monkeypatch):
+    """The cadence sleep is jittered by the configured spread so a fleet of
+    replicas on the same cadence doesn't herd on a shared hot row."""
+    from dynastore.tools import async_utils
+
+    monkeypatch.setattr(async_utils.random, "uniform", lambda a, b: 0.9)
+
+    slept: list[float] = []
+
+    async def _fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+    tracker = _LeadershipTracker(is_leader_sequence=[False])
+
+    async def _body(lock_conn: Any) -> None:
+        pass
+
+    stop_after = {"n": 0}
+
+    def _is_shutdown():
+        stop_after["n"] += 1
+        return stop_after["n"] > 1  # stop right after the one non-leader tick
+
+    await run_leader_loop(
+        acquire_leadership=tracker.acquire,
+        on_leader=_body,
+        name="jitter-test",
+        cadence_seconds=10.0,
+        is_shutdown=_is_shutdown,
+    )
+
+    assert slept == [9.0]
+
+
+@pytest.mark.asyncio
+async def test_zero_cadence_sleep_is_not_jittered(monkeypatch):
+    """The fast-loop/test guard (``cadence_seconds == 0``) must stay exactly
+    0, not be perturbed by jitter."""
+    from dynastore.tools import async_utils
+
+    monkeypatch.setattr(async_utils.random, "uniform", lambda a, b: 0.9)
+
+    slept: list[float] = []
+
+    async def _fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+    tracker = _LeadershipTracker(is_leader_sequence=[False])
+
+    async def _body(lock_conn: Any) -> None:
+        pass
+
+    stop_after = {"n": 0}
+
+    def _is_shutdown():
+        stop_after["n"] += 1
+        return stop_after["n"] > 1  # stop right after the one non-leader tick
+
+    await run_leader_loop(
+        acquire_leadership=tracker.acquire,
+        on_leader=_body,
+        name="zero-cadence-test",
+        cadence_seconds=0.0,
+        is_shutdown=_is_shutdown,
+    )
+
+    assert slept == [0.0]

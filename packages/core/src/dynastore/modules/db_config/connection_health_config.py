@@ -108,6 +108,11 @@ class LeadershipConfig:
     # Safety margin: a tick whose timeout is within this many seconds of
     # lease_ttl_seconds risks outliving its lease under clock skew or load.
     lease_skew_margin_seconds: float = 5.0
+    # Bounds how long a contender waits on the lease row's lock before
+    # failing fast, scoped via SET LOCAL inside the CAS transaction (see
+    # locking_tools._lease_cas_round_trip). A losing contender then fails in
+    # well under a second instead of inheriting the session-wide DB_LOCK_TIMEOUT.
+    lease_cas_lock_timeout_ms: int = 500
 
 
 @dataclass
