@@ -867,6 +867,95 @@ def test_star_expansion_skips_sidecar_field_when_raw_select_override_present(
     )
 
 
+def test_star_expansion_drops_ungrouped_unaggregated_explicit_override(
+    mock_col_config, mock_registry
+):
+    """#2859: the wildcard branch's explicit-override loop must apply the
+    same ``group_by`` guard the non-wildcard branch got in #2843 — an
+    override field that is neither grouped nor aggregated cannot appear in
+    SELECT alongside an explicit GROUP BY (PostgreSQL 42803).
+
+    Repro from #2859: ``select=[FieldSelection(field="*"),
+    FieldSelection(field="extra")], group_by=["region"]``.
+    """
+    class _SidecarMock(MagicMock):
+        @classmethod
+        def serves_consumers(cls):
+            return None
+
+    mock_geom = _SidecarMock()
+    mock_geom.config.sidecar_id = "geometries"
+    mock_geom.sidecar_id = "geometries"
+    mock_geom.get_queryable_fields.return_value = {
+        "geom": FieldDefinition(
+            name="geom",
+            sql_expression="sc_geometries.geom",
+            capabilities=[FieldCapability.SPATIAL],
+            data_type="geometry(Geometry,4326)",
+        )
+    }
+    mock_geom.get_join_clause.return_value = (
+        'LEFT JOIN "schema"."table_geometries" sc_geometries '
+        "ON h.geoid = sc_geometries.geoid"
+    )
+    mock_geom.supports_aggregation.return_value = True
+    mock_geom.supports_transformation.return_value = True
+    mock_geom.get_default_sort.return_value = None
+    mock_geom.get_main_geometry_field.return_value = "geom"
+    mock_geom.get_select_fields.return_value = []
+
+    mock_attr = _SidecarMock()
+    mock_attr.config.sidecar_id = "attributes"
+    mock_attr.sidecar_id = "attributes"
+    mock_attr.get_queryable_fields.return_value = {
+        "region": FieldDefinition(
+            name="region",
+            sql_expression="sc_attributes.region",
+            data_type="string",
+            capabilities=[FieldCapability.GROUPABLE],
+        ),
+        "extra": FieldDefinition(
+            name="extra",
+            sql_expression="sc_attributes.extra",
+            data_type="string",
+        ),
+    }
+    mock_attr.get_join_clause.return_value = (
+        'LEFT JOIN "schema"."table_attributes" sc_attributes '
+        "ON h.geoid = sc_attributes.geoid"
+    )
+    mock_attr.supports_aggregation.return_value = True
+    mock_attr.supports_transformation.return_value = True
+    mock_attr.get_default_sort.return_value = None
+    mock_attr.get_main_geometry_field.return_value = None
+    # Narrowed "selective mode" projection under group_by — restricted to
+    # the grouped field, mirroring the real sidecar's group_by-aware gating
+    # (``get_select_fields(..., include_all=not query.group_by)``).
+    mock_attr.get_select_fields.return_value = ['sc_attributes.region as "region"']
+
+    mock_registry.get_sidecar.side_effect = (
+        lambda sc, lenient=True: mock_geom
+        if getattr(sc, "sidecar_type", "") == "geometries"
+        else mock_attr
+    )
+
+    optimizer = QueryOptimizer(mock_col_config)
+
+    req = QueryRequest(
+        select=[FieldSelection(field="*"), FieldSelection(field="extra")],
+        group_by=["region"],
+    )
+
+    sql, _ = optimizer.build_optimized_query(req, "schema", "table")
+
+    sql_lower = sql.lower()
+    assert "extra" not in sql_lower, (
+        f"ungrouped, unaggregated override field 'extra' must not appear in "
+        f"SELECT alongside GROUP BY:\n{sql}"
+    )
+    assert "group by" in sql_lower
+
+
 # ---------------------------------------------------------------------------
 # items_schema → field_index enrichment (regression for the empty-MVT case
 # where a VECTOR collection's ``ItemsSchema`` declares user fields that live
@@ -1295,6 +1384,80 @@ def test_validate_query_sort_defaults_and_optout(mock_col_config, mock_registry)
         QueryRequest(sort=[SortOrder(field="blob", direction="ASC")])
     )
     assert any("blob" in e and "not sortable" in e for e in bad), bad
+
+
+# ---------------------------------------------------------------------------
+# #2859 — validate_query diagnostic for a selected, ungrouped/unaggregated
+# field alongside an explicit group_by (previously a silent projection drop,
+# #2843).
+# ---------------------------------------------------------------------------
+
+
+def _group_by_fields() -> dict:
+    return {
+        "region": FieldDefinition(
+            name="region",
+            sql_expression="sc_test.region",
+            data_type="string",
+            capabilities=[FieldCapability.GROUPABLE],
+        ),
+        "id": FieldDefinition(
+            name="id", sql_expression="sc_test.id", data_type="string",
+        ),
+        "count": FieldDefinition(
+            name="count", sql_expression="sc_test.count", data_type="integer",
+        ),
+    }
+
+
+def test_validate_query_rejects_selected_ungrouped_unaggregated_field(
+    mock_col_config, mock_registry
+):
+    """``select=[id, region], group_by=[region]`` — "id" is neither grouped
+    nor aggregated. Must be reported by ``validate_query`` rather than
+    silently dropped at render time (the #2843 gap)."""
+    optimizer = _optimizer_with_fields(mock_col_config, mock_registry, _group_by_fields())
+    req = QueryRequest(
+        select=[FieldSelection(field="id"), FieldSelection(field="region")],
+        group_by=["region"],
+    )
+    errors = optimizer.validate_query(req)
+    assert any(
+        "id" in e and "neither grouped nor aggregated" in e for e in errors
+    ), errors
+
+
+def test_validate_query_allows_grouped_and_aggregated_selects(
+    mock_col_config, mock_registry
+):
+    """A field that is grouped, or aggregated, must not trigger the #2859
+    diagnostic — only a selected field that is neither must."""
+    optimizer = _optimizer_with_fields(mock_col_config, mock_registry, _group_by_fields())
+    req = QueryRequest(
+        select=[
+            FieldSelection(field="region"),
+            FieldSelection(field="count", aggregation="sum"),
+        ],
+        group_by=["region"],
+    )
+    errors = optimizer.validate_query(req)
+    assert not any("neither grouped nor aggregated" in e for e in errors), errors
+
+
+def test_validate_query_skips_ungrouped_check_for_wildcard_select(
+    mock_col_config, mock_registry
+):
+    """A wildcard select's rendered projection (sidecar expansion + explicit
+    overrides) isn't knowable at validate time, so the #2859 diagnostic must
+    not fire for it — the render-time guard in
+    ``build_optimized_query`` is the only defense there."""
+    optimizer = _optimizer_with_fields(mock_col_config, mock_registry, _group_by_fields())
+    req = QueryRequest(
+        select=[FieldSelection(field="*"), FieldSelection(field="id")],
+        group_by=["region"],
+    )
+    errors = optimizer.validate_query(req)
+    assert not any("neither grouped nor aggregated" in e for e in errors), errors
 
 
 # ---------------------------------------------------------------------------

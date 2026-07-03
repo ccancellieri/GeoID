@@ -16,19 +16,22 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Real-PG regression coverage for ``QueryRequest.group_by`` (#2829).
+"""Real-PG regression coverage for ``QueryRequest.group_by`` (#2829, #2859).
 
-Covers three request shapes against both attribute-storage shapes (JSONB blob
-and COLUMNAR sidecar table):
+Covers two successful request shapes against both attribute-storage shapes
+(JSONB blob and COLUMNAR sidecar table):
 
 - ``grouped_field_only`` — the exact shape region-mapping's
   ``fetch_distinct_region_ids`` used to issue: a single named
   ``FieldSelection``, matching ``group_by`` and ``sort`` on the same field.
 - ``empty_select`` — ``group_by`` without separately re-selecting the field
   (the caller only wants the distinct values, no explicit ``select``).
-- ``superset_select`` — a ``select`` that names a field ("id") which is
-  neither grouped nor aggregated alongside the grouped field; that field must
-  be silently dropped from the projection rather than producing a SQL error.
+
+A third shape, ``select`` naming a field ("id") that is neither grouped nor
+aggregated alongside the grouped field, is covered separately below by
+``test_group_by_rejects_selected_ungrouped_unaggregated_field``: #2859
+turned that from a silent projection drop (#2843) into an up-front
+``validate_query`` diagnostic.
 """
 
 from __future__ import annotations
@@ -65,9 +68,6 @@ pytestmark = [
 SELECT_SHAPES: Dict[str, Callable[[], List[FieldSelection]]] = {
     "grouped_field_only": lambda: [FieldSelection(field="region")],
     "empty_select": lambda: [],
-    "superset_select": lambda: [
-        FieldSelection(field="id"), FieldSelection(field="region"),
-    ],
 }
 
 
@@ -221,5 +221,38 @@ async def test_group_by_columnar_attributes(
             f"expected one row per distinct region, got {values!r} "
             "(a None/missing value here is the #2829 columnar silent-drop bug)"
         )
+    finally:
+        await catalogs.delete_catalog(catalog_id, force=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "storage_mode", [AttributeStorageMode.JSONB, AttributeStorageMode.COLUMNAR]
+)
+async def test_group_by_rejects_selected_ungrouped_unaggregated_field(
+    app_lifespan, catalog_id, collection_id, storage_mode,
+):
+    """#2859: ``select=[id, region]`` alongside ``group_by=["region"]`` names
+    "id", which is neither grouped nor aggregated. #2843 silently dropped it
+    from the projection with no signal; ``validate_query`` now rejects the
+    shape up front with a clear error instead.
+    """
+    catalogs = get_protocol(CatalogsProtocol)
+    assert catalogs is not None
+    catalog_id = f"{catalog_id}_{generate_test_id()}"
+
+    await _provision_catalog(catalogs, catalog_id)
+    try:
+        await _make_collection(catalogs, catalog_id, collection_id, storage_mode)
+        await _upsert_regions(catalogs, catalog_id, collection_id)
+
+        request = QueryRequest(
+            select=[FieldSelection(field="id"), FieldSelection(field="region")],
+            group_by=["region"],
+            sort=[SortOrder(field="region")],
+            limit=10,
+        )
+        with pytest.raises(ValueError, match="neither grouped nor aggregated"):
+            await catalogs.search_items(catalog_id, collection_id, request)
     finally:
         await catalogs.delete_catalog(catalog_id, force=True)

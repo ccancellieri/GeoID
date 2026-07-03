@@ -443,6 +443,28 @@ class QueryOptimizer:
                 if FieldCapability.GROUPABLE not in field_def.capabilities:
                     errors.append(f"Field {field} is not groupable")
 
+        # Validate select/group_by consistency (#2859): a selected field that
+        # is neither grouped nor aggregated cannot appear in the projection
+        # alongside an explicit GROUP BY. #2843 made ``build_optimized_query``
+        # silently drop that field from the render, which left a caller
+        # expecting it back with no signal it vanished — reject the shape
+        # here instead, consistent with the other diagnostics above.
+        #
+        # Skipped when the select list includes a wildcard: the wildcard's
+        # rendered SELECT list (sidecar expansion plus any explicit
+        # overrides) is only fully resolved at render time, so it is not
+        # knowable here. The render-time guard in ``build_optimized_query``
+        # is the only defense for that combination — see the guard on the
+        # wildcard branch's explicit-override loop.
+        if query.group_by and not any(sel.field == "*" for sel in query.select):
+            for sel in query.select:
+                if sel.field not in query.group_by and not sel.aggregation:
+                    errors.append(
+                        f"Field {sel.field} is selected but neither grouped "
+                        "nor aggregated; add it to group_by or apply an "
+                        "aggregation"
+                    )
+
         return errors
 
     def get_all_queryable_fields(self) -> Dict[str, FieldDefinition]:
@@ -741,6 +763,15 @@ class QueryOptimizer:
             for sel in query.select:
                 if sel.field == "*" or sel.field not in self.field_index:
                     continue
+                if query.group_by and sel.field not in query.group_by and not sel.aggregation:
+                    # #2859: mirror the non-wildcard branch's guard below
+                    # (#2843) — an explicit override selected alongside the
+                    # wildcard cannot appear in SELECT next to an explicit
+                    # GROUP BY unless it is itself grouped or aggregated.
+                    # ``validate_query`` does not catch this combination (the
+                    # wildcard's full override set is only resolved here, at
+                    # render time), so this is the sole defense for it.
+                    continue
                 _, field_def = self.field_index[sel.field]
                 expr = field_def.sql_expression
                 if sel.transformation:
@@ -792,8 +823,11 @@ class QueryOptimizer:
                     # aggregated cannot appear in SELECT alongside an explicit
                     # GROUP BY — PostgreSQL rejects it ("column ... must
                     # appear in the GROUP BY clause or be used in an
-                    # aggregate function"). Drop it from the projection
-                    # rather than erroring on the combination.
+                    # aggregate function"). #2859: this shape is now rejected
+                    # up front by ``validate_query``, so a request reaching
+                    # this point should already have the field excluded; the
+                    # drop here is defense-in-depth against a caller that
+                    # builds SQL without validating first.
                     continue
 
                 if sel.field == "geoid":
