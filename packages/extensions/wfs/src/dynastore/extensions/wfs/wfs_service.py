@@ -760,20 +760,15 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
             number_returned = len(features_list)
 
             # Pagination links for GML Response
-            base_url = str(request.url).split("?")[0]
-            original_params = dict(request.query_params)
-            
-            previous_url = None
-            if start_index > 0:
-                prev_params = original_params.copy()
-                prev_params["startIndex"] = str(max(0, start_index - count))
-                previous_url = f"{base_url}?{'&'.join([f'{k}={v}' for k, v in prev_params.items()])}"
+            from dynastore.extensions.tools.pagination import build_pagination_links
 
-            next_url = None
-            if (start_index + number_returned) < total_count:
-                next_params = original_params.copy()
-                next_params["startIndex"] = str(start_index + count)
-                next_url = f"{base_url}?{'&'.join([f'{k}={v}' for k, v in next_params.items()])}"
+            gml_page_links = dict(
+                build_pagination_links(
+                    request, start_index, count, total_count, offset_param="startIndex", raw=True
+                )
+            )
+            previous_url = gml_page_links.get("prev")
+            next_url = gml_page_links.get("next")
 
             xml_content = wfs_generator.create_feature_collection_response(
                 features_list,
@@ -788,29 +783,20 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
             return Response(content=xml_content, media_type="application/gml+xml; version=3.2")
 
         # Pagination links for OGC formats
-        base_url = str(request.url).split("?")[0]
-        original_params = dict(request.query_params)
-        
-        links = []
-        if start_index > 0:
-            prev_params = original_params.copy()
-            prev_params["startIndex"] = str(max(0, start_index - count))
-            links.append(Link(
-                rel="prev",
-                href=f"{base_url}?{'&'.join([f'{k}={v}' for k, v in prev_params.items()])}",
-                type=normalized_format,
-                title=LocalizedText(en="Previous page"),
-            ))
+        from dynastore.extensions.tools.pagination import build_pagination_links
 
-        if (start_index + count) < total_count:
-            next_params = original_params.copy()
-            next_params["startIndex"] = str(start_index + count)
-            links.append(Link(
-                rel="next",
-                href=f"{base_url}?{'&'.join([f'{k}={v}' for k, v in next_params.items()])}",
+        _rel_titles = {"prev": "Previous page", "next": "Next page"}
+        links = [
+            Link(
+                rel=rel,
+                href=href,
                 type=normalized_format,
-                title=LocalizedText(en="Next page"),
-            ))
+                title=LocalizedText(en=_rel_titles[rel]),
+            )
+            for rel, href in build_pagination_links(
+                request, start_index, count, total_count, offset_param="startIndex", raw=True
+            )
+        ]
 
         # Strip non-RFC-7946 foreign members (system/stats/access/...) that
         # internal sidecar paths inject into Feature.__pydantic_extra__.

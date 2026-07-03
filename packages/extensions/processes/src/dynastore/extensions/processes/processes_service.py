@@ -1366,39 +1366,14 @@ async def _reconcile_lapsed_list_tasks(
     return healed
 
 
-# --- OGC Part 1: List Jobs (GET /jobs) at 3 scopes ---
-
-@router.get(
-    "/jobs",
-    name="list_jobs",
-)
-async def list_jobs(
-    request: Request,
-    limit: Optional[int] = Query(
-        None,
-        ge=1,
-        description=(
-            "Maximum number of jobs to return. Omitted falls back to the "
-            "configured default; a value above the configured maximum is "
-            "clamped, not rejected (fc-limit-response-1)."
-        ),
-    ),
-    offset: int = Query(0, ge=0),
-    conn: AsyncConnection = Depends(get_async_connection),
-    language: str = Depends(get_language),
+def _build_job_list_response(
+    request: Request, tasks: List[Task], limit: int, offset: int, language: str
 ) -> JSONResponse:
-    """Lists jobs (System context)."""
-    from dynastore.extensions.tools.pagination import resolve_page_limit
-
-    processes_config = await _get_processes_config()
-    limit = resolve_page_limit(
-        limit,
-        default_limit=processes_config.jobs_default_limit,
-        max_limit=processes_config.jobs_max_limit,
-    )
-
-    tasks = await tasks_module.list_tasks(conn, schema="public", limit=limit, offset=offset, kind="process")
-    tasks = await _reconcile_lapsed_list_tasks(conn, tasks, schema="public")
+    """Build the OGC ``JobList`` response (self/prev/next links + localized
+    body) shared by all three ``list_jobs*`` scopes below. ``tasks`` is
+    already fetched (and liveness-reconciled) by the caller — only the
+    ``tasks_module.list_tasks(...)`` args differ per scope.
+    """
     jobs = [_task_to_status_info(t, request) for t in tasks]
     links = [
         models.Link(
@@ -1434,6 +1409,42 @@ async def list_jobs(
         content=_localize_job_list(job_list, language),
         headers={"Content-Language": language},
     )
+
+
+# --- OGC Part 1: List Jobs (GET /jobs) at 3 scopes ---
+
+@router.get(
+    "/jobs",
+    name="list_jobs",
+)
+async def list_jobs(
+    request: Request,
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        description=(
+            "Maximum number of jobs to return. Omitted falls back to the "
+            "configured default; a value above the configured maximum is "
+            "clamped, not rejected (fc-limit-response-1)."
+        ),
+    ),
+    offset: int = Query(0, ge=0),
+    conn: AsyncConnection = Depends(get_async_connection),
+    language: str = Depends(get_language),
+) -> JSONResponse:
+    """Lists jobs (System context)."""
+    from dynastore.extensions.tools.pagination import resolve_page_limit
+
+    processes_config = await _get_processes_config()
+    limit = resolve_page_limit(
+        limit,
+        default_limit=processes_config.jobs_default_limit,
+        max_limit=processes_config.jobs_max_limit,
+    )
+
+    tasks = await tasks_module.list_tasks(conn, schema="public", limit=limit, offset=offset, kind="process")
+    tasks = await _reconcile_lapsed_list_tasks(conn, tasks, schema="public")
+    return _build_job_list_response(request, tasks, limit, offset, language)
 
 
 @router.get(
@@ -1469,41 +1480,7 @@ async def list_jobs_catalog(
     schema = await _resolve_catalog_schema(catalog_id, conn)
     tasks = await tasks_module.list_tasks(conn, schema=schema, limit=limit, offset=offset, kind="process")
     tasks = await _reconcile_lapsed_list_tasks(conn, tasks, schema=schema)
-    jobs = [_task_to_status_info(t, request) for t in tasks]
-    links = [
-        models.Link(
-            href=_external_url(request.url),
-            rel="self",
-            type="application/json",
-            title="This document",
-        )
-    ]
-    if len(tasks) == limit:
-        next_url = str(request.url.replace_query_params(offset=offset + limit, limit=limit))
-        links.append(
-            models.Link(
-                href=_external_url(next_url),
-                rel="next",
-                type="application/json",
-                title="Next page",
-            )
-        )
-    if offset > 0:
-        prev_offset = max(0, offset - limit)
-        prev_url = str(request.url.replace_query_params(offset=prev_offset, limit=limit))
-        links.append(
-            models.Link(
-                href=_external_url(prev_url),
-                rel="prev",
-                type="application/json",
-                title="Previous page",
-            )
-        )
-    job_list = models.JobList(jobs=jobs, links=links)
-    return JSONResponse(
-        content=_localize_job_list(job_list, language),
-        headers={"Content-Language": language},
-    )
+    return _build_job_list_response(request, tasks, limit, offset, language)
 
 
 @router.get(
@@ -1547,41 +1524,7 @@ async def list_jobs_collection(
         collection_id=collection_id,
     )
     tasks = await _reconcile_lapsed_list_tasks(conn, tasks, schema=schema)
-    jobs = [_task_to_status_info(t, request) for t in tasks]
-    links = [
-        models.Link(
-            href=_external_url(request.url),
-            rel="self",
-            type="application/json",
-            title="This document",
-        )
-    ]
-    if len(tasks) == limit:
-        next_url = str(request.url.replace_query_params(offset=offset + limit, limit=limit))
-        links.append(
-            models.Link(
-                href=_external_url(next_url),
-                rel="next",
-                type="application/json",
-                title="Next page",
-            )
-        )
-    if offset > 0:
-        prev_offset = max(0, offset - limit)
-        prev_url = str(request.url.replace_query_params(offset=prev_offset, limit=limit))
-        links.append(
-            models.Link(
-                href=_external_url(prev_url),
-                rel="prev",
-                type="application/json",
-                title="Previous page",
-            )
-        )
-    job_list = models.JobList(jobs=jobs, links=links)
-    return JSONResponse(
-        content=_localize_job_list(job_list, language),
-        headers={"Content-Language": language},
-    )
+    return _build_job_list_response(request, tasks, limit, offset, language)
 
 
 # --- OGC Part 1: Dismiss Job (DELETE /jobs/{id}) at 3 scopes ---

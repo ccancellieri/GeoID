@@ -623,6 +623,9 @@ async def _list_files(
     ]
 
     # --- Build Pagination Links ---
+    # Not routed through the shared extensions.tools.pagination helper: this
+    # listing is paginated by GCS's own opaque page_token (blob_iterator),
+    # not an offset/limit the helper's offset arithmetic could reproduce.
     links = []
     base_url = str(request.url.remove_query_params(["page_token"]))
 

@@ -392,7 +392,10 @@ class CRSExtension(ExtensionProtocol):
         globally-defined authority CRS are listed; tenant-registered custom CRS
         are served per-catalog under ``/crs/catalogs/{catalog_id}/...``.
         """
-        from dynastore.extensions.tools.pagination import resolve_page_limit
+        from dynastore.extensions.tools.pagination import (
+            build_pagination_links,
+            resolve_page_limit,
+        )
 
         crs_config = await self._get_crs_config()
         limit = resolve_page_limit(
@@ -401,16 +404,9 @@ class CRSExtension(ExtensionProtocol):
 
         uris, total = _list_global_crs(authority, limit, offset)
 
-        base = str(request.url).split("?", 1)[0]
         links = [CRSLink(href=str(request.url), rel="self", type="application/json")]
-        if offset + limit < total:
-            links.append(
-                CRSLink(
-                    href=f"{base}?limit={limit}&offset={offset + limit}&authority={authority}",
-                    rel="next",
-                    type="application/json",
-                )
-            )
+        for rel, href in build_pagination_links(request, offset, limit, total, raw=True):
+            links.append(CRSLink(href=href, rel=rel, type="application/json"))
         return GlobalCRSList(
             crs=uris,
             numberMatched=total,
