@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from dynastore.modules.db_config.exceptions import UniqueViolationError
 from dynastore.modules.db_config.query_executor import DbResource, managed_transaction
 from dynastore.tools.cache import cache_clear, cached
 from dynastore.tools.protocol_helpers import get_engine
@@ -79,7 +80,9 @@ async def apply_mapping(
     updates-or-inserts every claim in the freshly computed set. A
     cross-mapping ``claim_ci`` collision surfaces PG's real ``23505`` from
     :data:`registry_queries.INSERT_CLAIM` -- never caught here, propagated to
-    the global exception-handler chain (-> HTTP 409).
+    the global exception-handler chain (-> HTTP 409). Two racing first-applies
+    of the *same* mapping (both see ``UPDATE_OWN_CLAIM`` touch 0 rows) resolve
+    without a spurious conflict -- see :func:`_insert_claim_idempotent`.
 
     Returns ``(mapping_id, claim_rows)``.
     """
@@ -105,14 +108,41 @@ async def apply_mapping(
             )
             row = await _q.UPDATE_OWN_CLAIM.execute(conn, **params)
             if row is None:
-                # Brand-new claim_ci, or one owned by a *different* mapping --
-                # INSERT's PK violation is the authoritative 23505 for the
-                # latter case.
-                row = await _q.INSERT_CLAIM.execute(conn, **params)
+                # Brand-new claim_ci, or one owned by a *different* mapping.
+                row = await _insert_claim_idempotent(conn, mapping_id, claim_ci, params)
             claim_rows.append(row)
 
     invalidate_serving_caches()
     return mapping_id, claim_rows
+
+
+async def _insert_claim_idempotent(
+    conn: Any, mapping_id: str, claim_ci: str, params: Dict[str, Any],
+) -> Dict[str, Any]:
+    """INSERT one claim, absorbing the concurrent-first-apply race.
+
+    Two racing first-applies of the *same* mapping both see
+    ``UPDATE_OWN_CLAIM`` touch 0 rows (neither's row is committed yet) and
+    both fall through to here; the loser hits PG's real ``23505`` on
+    ``claim_ci`` even though the winner's row belongs to the identical
+    mapping -- an idempotent duplicate, not a conflict.
+
+    The INSERT runs inside a SAVEPOINT: asyncpg aborts the whole surrounding
+    transaction on an uncaught error, so a caught ``23505`` must roll back
+    only this insert attempt, leaving the outer transaction usable for the
+    re-check that follows. If the surviving row belongs to ``mapping_id``,
+    return it as success. Otherwise it's a genuine cross-mapping collision --
+    re-raise so it propagates to the global exception-handler chain (->
+    HTTP 409), unchanged from before.
+    """
+    try:
+        async with conn.begin_nested():
+            return await _q.INSERT_CLAIM.execute(conn, **params)
+    except UniqueViolationError:
+        existing = await _q.SELECT_CLAIM_BY_CI.execute(conn, claim_ci=claim_ci)
+        if existing is not None and existing["mapping_id"] == mapping_id:
+            return existing
+        raise
 
 
 async def delete_mapping(engine: DbResource, mapping_id: str) -> int:

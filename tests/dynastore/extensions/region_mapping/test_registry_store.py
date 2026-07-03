@@ -38,8 +38,30 @@ def _reset_caches():
     invalidate_serving_caches()
 
 
-def _fake_managed_transaction(monkeypatch: pytest.MonkeyPatch, conn: Any = "conn") -> None:
+class _FakeConn:
+    """Stand-in for a SQLAlchemy ``AsyncConnection`` that only needs to
+    support ``begin_nested()`` -- the SAVEPOINT ``apply_mapping`` opens
+    around every ``INSERT_CLAIM`` attempt. A plain string sentinel can't
+    satisfy that, so tests exercising the insert path need this instead of
+    the bare ``"conn"`` default.
+    """
+
+    def __repr__(self) -> str:  # pragma: no cover -- debugging aid only
+        return "<_FakeConn>"
+
+    def begin_nested(self):
+        @asynccontextmanager
+        async def _savepoint():
+            yield self
+
+        return _savepoint()
+
+
+def _fake_managed_transaction(monkeypatch: pytest.MonkeyPatch, conn: Any = None) -> None:
     from dynastore.extensions.region_mapping import registry_store as store
+
+    if conn is None:
+        conn = _FakeConn()
 
     @asynccontextmanager
     async def _mt(engine: Any):
@@ -121,9 +143,45 @@ async def test_apply_mapping_propagates_unique_violation_for_cross_mapping_colli
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A claim already owned by a different mapping: UPDATE (scoped to this
-    mapping_id) finds nothing, INSERT hits the real PK violation -- which
-    must propagate, never be swallowed here (the global exception-handler
-    chain maps it to HTTP 409)."""
+    mapping_id) finds nothing, INSERT hits the real PK violation. The
+    surviving row's re-check reports a *different* mapping_id, so this must
+    propagate -- never be swallowed here (the global exception-handler chain
+    maps it to HTTP 409)."""
+    from dynastore.modules.db_config.exceptions import UniqueViolationError
+    from dynastore.extensions.region_mapping import registry_store as store
+    from dynastore.extensions.region_mapping import registry_queries as rq
+
+    _fake_managed_transaction(monkeypatch)
+
+    monkeypatch.setattr(rq.DELETE_STALE_CLAIMS, "execute", AsyncMock(return_value=[]))
+    monkeypatch.setattr(rq.UPDATE_OWN_CLAIM, "execute", AsyncMock(return_value=None))
+
+    async def _insert_conflict(conn: Any, **params: Any):
+        raise UniqueViolationError("duplicate key value violates unique constraint")
+
+    monkeypatch.setattr(rq.INSERT_CLAIM, "execute", _insert_conflict)
+    monkeypatch.setattr(
+        rq.SELECT_CLAIM_BY_CI, "execute",
+        AsyncMock(return_value={"claim_ci": "region", "mapping_id": "someone_else"}),
+    )
+
+    with pytest.raises(UniqueViolationError):
+        await store.apply_mapping(
+            object(),
+            catalog_id="who", collection_id="regions", column="region",
+            alias=None, extra_aliases=[], title=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_apply_mapping_absorbs_unique_violation_for_concurrent_same_mapping_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two racing first-applies of the SAME mapping: this transaction's
+    UPDATE finds nothing (the peer's row isn't committed yet), INSERT then
+    hits ``23505`` against the peer's now-committed row. Because the
+    surviving row's ``mapping_id`` matches ours, this must resolve as an
+    idempotent success -- not a 409 (dynastore#2824)."""
     from dynastore.modules.db_config.exceptions import UniqueViolationError
     from dynastore.extensions.region_mapping import registry_store as store
     from dynastore.extensions.region_mapping import registry_queries as rq
@@ -138,12 +196,19 @@ async def test_apply_mapping_propagates_unique_violation_for_cross_mapping_colli
 
     monkeypatch.setattr(rq.INSERT_CLAIM, "execute", _insert_conflict)
 
-    with pytest.raises(UniqueViolationError):
-        await store.apply_mapping(
-            object(),
-            catalog_id="who", collection_id="regions", column="region",
-            alias=None, extra_aliases=[], title=None,
-        )
+    winning_row = {"claim_ci": "region", "mapping_id": "who_regions", "claim": "region"}
+    monkeypatch.setattr(
+        rq.SELECT_CLAIM_BY_CI, "execute", AsyncMock(return_value=winning_row),
+    )
+
+    mapping_id, rows = await store.apply_mapping(
+        object(),
+        catalog_id="who", collection_id="regions", column="region",
+        alias=None, extra_aliases=[], title=None,
+    )
+
+    assert mapping_id == "who_regions"
+    assert winning_row in rows
 
 
 # ---------------------------------------------------------------------------
