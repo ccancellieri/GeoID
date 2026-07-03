@@ -310,7 +310,7 @@ async def test_definitions_shape_and_prefixed_alias(monkeypatch: pytest.MonkeyPa
 
     assert resp.status_code == 200
     body = resp.json()
-    entry = body["regionWmsMap"]["FAO_COUNTRIES"]
+    entry = body["regionWmsMap"]["fao_countries"]
 
     assert entry["layerName"] == "default"
     assert entry["serverType"] == "MVT"
@@ -384,9 +384,40 @@ async def test_definitions_server_url_is_sibling_to_catalog_not_nested_under_it(
     async with AsyncClient(transport=transport, base_url="http://data.review.fao.org") as client:
         resp = await client.get("/geospatial/dev/api/catalog/region-mappings/region.json")
 
-    entry = resp.json()["regionWmsMap"]["GAUL_DEMO_GAUL_LEVEL_1"]
+    entry = resp.json()["regionWmsMap"]["gaul_demo_gaul_level_1"]
     assert entry["server"].startswith("http://data.review.fao.org/geospatial/dev/api/maps/")
     assert "/api/catalog/maps/" not in entry["server"]
+
+
+@pytest.mark.asyncio
+async def test_definitions_key_case_matches_server_and_region_ids_file_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test: the regionWmsMap key must be lowercase like the tile
+    'server' URL and 'region_ids_file' URL, so it can be copy-pasted as-is."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    app = _app(monkeypatch, _StubCatalogs({}))
+    monkeypatch.setattr(
+        svc._store, "fetch_primary_records",
+        AsyncMock(return_value=[{
+            "mapping_id": "gaul_demo_gaul_level_1", "claim": "iso3", "src_catalog": "gaul_demo",
+            "src_collection": "gaul_level_1", "region_prop": "ISO3_CODE", "title": "GAUL level 1",
+        }]),
+    )
+    monkeypatch.setattr(svc._store, "fetch_claims_for_mapping", AsyncMock(return_value=[{"claim": "iso3"}]))
+    monkeypatch.setattr(svc, "fetch_collection_bbox", AsyncMock(return_value=[0.0, 0.0, 1.0, 1.0]))
+
+    transport = ASGITransport(app=app, root_path="/geospatial/dev/api/catalog")
+    async with AsyncClient(transport=transport, base_url="http://data.review.fao.org") as client:
+        resp = await client.get("/geospatial/dev/api/catalog/region-mappings/region.json")
+
+    body = resp.json()
+    assert "gaul_demo_gaul_level_1" in body["regionWmsMap"]
+    assert "GAUL_DEMO_GAUL_LEVEL_1" not in body["regionWmsMap"]
+    entry = body["regionWmsMap"]["gaul_demo_gaul_level_1"]
+    assert "gaul_demo" in entry["server"]
+    assert "gaul_demo" in entry["regionIdsFile"]
 
 
 @pytest.mark.asyncio
@@ -621,7 +652,7 @@ async def test_definitions_honours_per_mapping_terria_overrides(
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.get("/region-mappings/region.json")
 
-    entry = resp.json()["regionWmsMap"]["FAO_COUNTRIES"]
+    entry = resp.json()["regionWmsMap"]["fao_countries"]
     assert entry["layerName"] == "gaul_layer"
     assert entry["serverType"] == "WMS"
     assert entry["serverSubdomains"] == ["a", "b"]
@@ -656,9 +687,9 @@ async def test_definitions_resolves_description_to_requested_language(
         resp_default = await client.get("/region-mappings/region.json")
         resp_missing = await client.get("/region-mappings/region.json", params={"lang": "fr"})
 
-    entry_it = resp_it.json()["regionWmsMap"]["FAO_COUNTRIES"]
-    entry_default = resp_default.json()["regionWmsMap"]["FAO_COUNTRIES"]
-    entry_missing = resp_missing.json()["regionWmsMap"]["FAO_COUNTRIES"]
+    entry_it = resp_it.json()["regionWmsMap"]["fao_countries"]
+    entry_default = resp_default.json()["regionWmsMap"]["fao_countries"]
+    entry_missing = resp_missing.json()["regionWmsMap"]["fao_countries"]
 
     assert entry_it["description"] == "Paesi"
     assert entry_default["description"] == "Countries"

@@ -302,7 +302,7 @@ async def _build_definitions(
         bbox = await fetch_collection_bbox(src_catalog, src_collection)
 
         entries.append({
-            "key": f"{src_catalog}_{src_collection}".upper(),
+            "key": f"{src_catalog}_{src_collection}",
             "server": (
                 f"{maps_base_url}/tiles/catalogs/{src_catalog}/tiles/"
                 f"{{z}}/{{x}}/{{y}}.mvt?collections={src_collection}"
