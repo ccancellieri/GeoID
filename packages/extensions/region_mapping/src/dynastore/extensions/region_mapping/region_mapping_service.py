@@ -32,7 +32,7 @@ Routes:
 * ``POST   /region-mappings``                       -- register/re-apply a mapping
 * ``DELETE /region-mappings/{mapping_id}``           -- revoke a mapping (all its claims)
 * ``GET    /region-mappings``                        -- list claim rows (CQL2 filter)
-* ``GET    /region-mappings/definitions``            -- ``{"regionWmsMap": {...}}``
+* ``GET    /region-mappings/region.json``            -- ``{"regionWmsMap": {...}}``
 * ``GET    /region-mappings/{mapping_id}/regionIds``  -- sorted distinct values
 
 REGISTRATION IS PUBLICATION -- unchanged from dynastore#443. Applying a
@@ -40,6 +40,11 @@ mapping via ``POST`` is an explicit decision to publish, to anyone who can
 reach these routes, the claimed column's distinct values, the source
 collection's bbox/title, and its tile URL. There is no separate visibility
 check against the source collection's own access posture.
+
+Referential integrity: a claim row is a weak reference to its source
+collection, cleaned up best-effort on that collection's (or its catalog's)
+hard-deletion via an async, decoupled event listener -- see ``lifecycle.py``.
+The delete path itself never knows this extension exists.
 
 No IAM policy is registered here -- this extension imports nothing from
 ``AuthorizationProtocol``. On a deployment without the IAM module (e.g.
@@ -60,6 +65,7 @@ from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from dynastore.extensions.protocols import ExtensionProtocol
+from dynastore.extensions.tools.query import resolve_queryable_property_names
 from dynastore.extensions.tools.url import get_root_url
 from dynastore.models.protocols.catalogs import CatalogsProtocol
 from dynastore.modules.tools.cql import parse_cql_filter
@@ -69,6 +75,7 @@ from dynastore.tools.protocol_helpers import get_engine
 from . import registry_queries as _q
 from . import registry_store as _store
 from .claims import fetch_collection_bbox, fetch_distinct_region_ids
+from .lifecycle import register_region_mapping_cleanup_subscriber
 from .templates import render_definitions
 
 logger = logging.getLogger(__name__)
@@ -95,9 +102,15 @@ class RegisterMappingRequest(BaseModel):
             "TerriaJS should join against."
         ),
     )
-    alias: Optional[str] = Field(
-        default=None,
-        description="Canonical alias TerriaJS matches this region type against. Defaults to 'column'.",
+    alias: str = Field(
+        ...,
+        description=(
+            "Canonical alias TerriaJS's region-mapping config matches CSV "
+            "column names against (its regionProp/uniqueIdProp). Required: "
+            "TerriaJS always declares one, and the raw column name is often "
+            "a database-internal identifier a CSV header would not use, so "
+            "there is no safe default."
+        ),
     )
     extra_aliases: List[str] = Field(
         default_factory=list, description="Additional alias strings TerriaJS should also accept.",
@@ -248,6 +261,7 @@ class RegionMappingService(ExtensionProtocol):
                 "region_mapping will be unavailable until the next boot.",
                 _q.SCHEMA, _q.TABLE, exc,
             )
+        register_region_mapping_cleanup_subscriber()
         yield
 
     # -------------------------------------------------------------------
@@ -279,6 +293,17 @@ class RegionMappingService(ExtensionProtocol):
             raise HTTPException(
                 status_code=404,
                 detail=f"Collection {payload.catalog!r}/{payload.collection!r} not found.",
+            )
+
+        valid_names = await resolve_queryable_property_names(payload.catalog, payload.collection)
+        if valid_names and payload.column not in valid_names:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Property {payload.column!r} is not a queryable property of "
+                    f"{payload.catalog!r}/{payload.collection!r} -- see its "
+                    "'/queryables' for the supported names."
+                ),
             )
 
         try:
@@ -342,14 +367,14 @@ class RegionMappingService(ExtensionProtocol):
         )
 
     # -------------------------------------------------------------------
-    # GET /region-mappings/definitions
+    # GET /region-mappings/region.json
     # -------------------------------------------------------------------
 
     @router.get(
-        "/definitions",
+        "/region.json",
         summary="TerriaJS regionMapping.json-shaped WMS region definitions.",
     )
-    async def get_definitions(
+    async def get_region_json(
         request: Request,  # type: ignore[reportGeneralTypeIssues]
         catalog: Optional[str] = Query(
             None, description="Filter to mappings sourced from this catalog id.",

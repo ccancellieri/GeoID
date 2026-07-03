@@ -134,7 +134,7 @@ async def test_apply_mapping_rejects_regex_metacharacter_claims_before_any_write
         await store.apply_mapping(
             object(),
             catalog_id="fao", collection_id="countries", column="adm0.code",
-            alias=None, extra_aliases=[], title=None,
+            alias="country", extra_aliases=[], title=None,
         )
 
 
@@ -169,7 +169,7 @@ async def test_apply_mapping_propagates_unique_violation_for_cross_mapping_colli
         await store.apply_mapping(
             object(),
             catalog_id="who", collection_id="regions", column="region",
-            alias=None, extra_aliases=[], title=None,
+            alias="region_name", extra_aliases=[], title=None,
         )
 
 
@@ -204,7 +204,7 @@ async def test_apply_mapping_absorbs_unique_violation_for_concurrent_same_mappin
     mapping_id, rows = await store.apply_mapping(
         object(),
         catalog_id="who", collection_id="regions", column="region",
-        alias=None, extra_aliases=[], title=None,
+        alias="region_name", extra_aliases=[], title=None,
     )
 
     assert mapping_id == "who_regions"
@@ -247,6 +247,73 @@ async def test_delete_mapping_raises_not_found_when_no_claims_existed(
 
     with pytest.raises(store.MappingNotFoundError):
         await store.delete_mapping(object(), "does-not-exist")
+
+
+# ---------------------------------------------------------------------------
+# delete_claims_by_source_collection / delete_claims_by_source_catalog
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delete_claims_by_source_collection_returns_count_and_invalidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dynastore.extensions.region_mapping import registry_store as store
+    from dynastore.extensions.region_mapping import registry_queries as rq
+
+    _fake_managed_transaction(monkeypatch)
+    monkeypatch.setattr(
+        rq.DELETE_CLAIMS_BY_SOURCE_COLLECTION, "execute",
+        AsyncMock(return_value=[{"claim_ci": "country"}]),
+    )
+    invalidated = []
+    monkeypatch.setattr(store, "invalidate_serving_caches", lambda: invalidated.append(True))
+
+    deleted = await store.delete_claims_by_source_collection(object(), "fao", "countries")
+
+    assert deleted == 1
+    assert invalidated == [True]
+
+
+@pytest.mark.asyncio
+async def test_delete_claims_by_source_collection_noop_does_not_invalidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing was ever registered for this collection -- not an error, and
+    no reason to bust the serving caches."""
+    from dynastore.extensions.region_mapping import registry_store as store
+    from dynastore.extensions.region_mapping import registry_queries as rq
+
+    _fake_managed_transaction(monkeypatch)
+    monkeypatch.setattr(rq.DELETE_CLAIMS_BY_SOURCE_COLLECTION, "execute", AsyncMock(return_value=[]))
+    invalidated = []
+    monkeypatch.setattr(store, "invalidate_serving_caches", lambda: invalidated.append(True))
+
+    deleted = await store.delete_claims_by_source_collection(object(), "fao", "countries")
+
+    assert deleted == 0
+    assert invalidated == []
+
+
+@pytest.mark.asyncio
+async def test_delete_claims_by_source_catalog_returns_count_and_invalidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dynastore.extensions.region_mapping import registry_store as store
+    from dynastore.extensions.region_mapping import registry_queries as rq
+
+    _fake_managed_transaction(monkeypatch)
+    monkeypatch.setattr(
+        rq.DELETE_CLAIMS_BY_SOURCE_CATALOG, "execute",
+        AsyncMock(return_value=[{"claim_ci": "country"}, {"claim_ci": "adm0_code"}]),
+    )
+    invalidated = []
+    monkeypatch.setattr(store, "invalidate_serving_caches", lambda: invalidated.append(True))
+
+    deleted = await store.delete_claims_by_source_catalog(object(), "fao")
+
+    assert deleted == 2
+    assert invalidated == [True]
 
 
 # ---------------------------------------------------------------------------

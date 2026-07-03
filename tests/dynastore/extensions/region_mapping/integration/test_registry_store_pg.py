@@ -67,7 +67,7 @@ async def test_apply_mapping_full_lifecycle_against_real_postgres(db_engine) -> 
     mapping_id, rows = await store.apply_mapping(
         db_engine,
         catalog_id=catalog_id, collection_id=collection_id,
-        column=column, alias=None, extra_aliases=[], title="Countries",
+        column=column, alias=column, extra_aliases=[], title="Countries",
     )
     try:
         assert rows, "first apply must create at least one claim row"
@@ -78,7 +78,7 @@ async def test_apply_mapping_full_lifecycle_against_real_postgres(db_engine) -> 
         mapping_id_again, rows_again = await store.apply_mapping(
             db_engine,
             catalog_id=catalog_id, collection_id=collection_id,
-            column=column, alias=None, extra_aliases=[], title="Countries",
+            column=column, alias=column, extra_aliases=[], title="Countries",
         )
         assert mapping_id_again == mapping_id
         assert {row["claim_ci"] for row in rows_again} == claim_cis
@@ -90,7 +90,7 @@ async def test_apply_mapping_full_lifecycle_against_real_postgres(db_engine) -> 
             await store.apply_mapping(
                 db_engine,
                 catalog_id=catalog_id, collection_id=other_collection_id,
-                column=column, alias=None, extra_aliases=[], title="Conflict",
+                column=column, alias=column, extra_aliases=[], title="Conflict",
             )
 
         persisted = await _claims_for(db_engine, mapping_id)
@@ -125,12 +125,12 @@ async def test_apply_mapping_concurrent_first_apply_same_mapping_is_idempotent(
             store.apply_mapping(
                 engine_a,
                 catalog_id=catalog_id, collection_id=collection_id,
-                column=column, alias=None, extra_aliases=[], title="Race",
+                column=column, alias=column, extra_aliases=[], title="Race",
             ),
             store.apply_mapping(
                 engine_b,
                 catalog_id=catalog_id, collection_id=collection_id,
-                column=column, alias=None, extra_aliases=[], title="Race",
+                column=column, alias=column, extra_aliases=[], title="Race",
             ),
         )
         assert mapping_id_a == mapping_id_b

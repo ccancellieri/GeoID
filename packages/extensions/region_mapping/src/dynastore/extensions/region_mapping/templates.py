@@ -16,7 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Jinja2 rendering of ``GET /region-mappings/definitions`` (dynastore#2821).
+"""Jinja2 rendering of ``GET /region-mappings/region.json`` (dynastore#2821).
 
 The ``regionWmsMap`` shape is emitted from a template shipped as a package
 static asset (``definitions.json.j2``) rather than built up as a hardcoded

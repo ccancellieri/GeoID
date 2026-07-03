@@ -32,15 +32,17 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
-def test_compute_claim_set_default_alias_is_column() -> None:
+def test_compute_claim_set_alias_equal_to_column_is_still_one_primary() -> None:
+    """``alias`` is required now (no column fallback), but a caller is free to
+    pass the same value as ``column`` -- that must still collapse to the
+    2-claim set it always did."""
     from dynastore.extensions.region_mapping.claims import compute_claim_set
 
     claims = compute_claim_set(
         catalog_id="fao", collection_id="countries",
-        column="adm0_code", alias=None, extra_aliases=[],
+        column="adm0_code", alias="adm0_code", extra_aliases=[],
     )
 
-    # column == canonical_alias -> {column, "fao_column"} = 2 distinct claims.
     values = {claim for claim, _role in claims.values()}
     assert values == {"adm0_code", "fao_adm0_code"}
 
@@ -128,7 +130,7 @@ def test_compute_claim_set_rejects_regex_metacharacters() -> None:
     with pytest.raises(ValueError, match="regex metacharacters"):
         compute_claim_set(
             catalog_id="fao", collection_id="countries",
-            column="adm0.code", alias=None, extra_aliases=[],
+            column="adm0.code", alias="country", extra_aliases=[],
         )
 
 

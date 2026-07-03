@@ -103,23 +103,20 @@ def compute_claim_set(
     catalog_id: str,
     collection_id: str,
     column: str,
-    alias: Optional[str],
+    alias: str,
     extra_aliases: Sequence[str],
 ) -> "OrderedDict[str, Tuple[str, str]]":
     """Return ``{claim_ci: (claim, role)}`` for one ``region_mapping`` apply.
 
-    The claim set is ``{column, canonical_alias, *extra_aliases,
-    "{catalog_id}_{canonical_alias}"}`` where ``canonical_alias`` is
-    ``alias`` or, when unset, ``column`` itself. Deduplicated
-    case-insensitively (``casefold``); the entry whose ``casefold()``
-    matches ``canonical_alias``'s is ``role="primary"``, every other member
-    is ``role="alias"`` -- exactly one primary always results, even when
-    ``column`` (or an ``extra_alias``) differs from ``canonical_alias``
-    only by case.
+    The claim set is ``{column, alias, *extra_aliases,
+    "{catalog_id}_{alias}"}``. Deduplicated case-insensitively
+    (``casefold``); the entry whose ``casefold()`` matches ``alias``'s is
+    ``role="primary"``, every other member is ``role="alias"`` -- exactly
+    one primary always results, even when ``column`` (or an
+    ``extra_alias``) differs from ``alias`` only by case.
     """
-    canonical_alias = alias or column
-    canonical_alias_ci = canonical_alias.casefold()
-    candidates = [column, canonical_alias, *extra_aliases, f"{catalog_id}_{canonical_alias}"]
+    alias_ci = alias.casefold()
+    candidates = [column, alias, *extra_aliases, f"{catalog_id}_{alias}"]
 
     claims: "OrderedDict[str, Tuple[str, str]]" = OrderedDict()
     for candidate in candidates:
@@ -127,7 +124,7 @@ def compute_claim_set(
         claim_ci = candidate.casefold()
         if claim_ci in claims:
             continue
-        role = ROLE_PRIMARY if claim_ci == canonical_alias_ci else ROLE_ALIAS
+        role = ROLE_PRIMARY if claim_ci == alias_ci else ROLE_ALIAS
         claims[claim_ci] = (candidate, role)
     return claims
 

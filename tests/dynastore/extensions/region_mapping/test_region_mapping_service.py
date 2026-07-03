@@ -100,10 +100,57 @@ async def test_register_mapping_unknown_collection_returns_404(monkeypatch: pyte
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.post(
             "/region-mappings",
-            json={"catalog": "fao", "collection": "does-not-exist", "column": "adm0_code"},
+            json={
+                "catalog": "fao", "collection": "does-not-exist",
+                "column": "adm0_code", "alias": "country",
+            },
         )
 
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_register_mapping_missing_alias_returns_422(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``alias`` is required -- TerriaJS always declares one, so there is no
+    safe column-name default to fall back to."""
+    catalogs = _StubCatalogs({("fao", "countries"): MagicMock()})
+    app = _app(monkeypatch, catalogs)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/region-mappings",
+            json={"catalog": "fao", "collection": "countries", "column": "adm0_code"},
+        )
+
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_register_mapping_unknown_column_returns_400(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The claimed column must be a real queryable property of the source
+    collection -- checked once, on the write path, before any claim is
+    persisted."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    catalogs = _StubCatalogs({("fao", "countries"): MagicMock()})
+    app = _app(monkeypatch, catalogs)
+    monkeypatch.setattr(
+        svc, "resolve_queryable_property_names",
+        AsyncMock(return_value={"iso3", "title"}),
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/region-mappings",
+            json={
+                "catalog": "fao", "collection": "countries",
+                "column": "not_a_real_column", "alias": "country",
+            },
+        )
+
+    assert resp.status_code == 400
 
 
 @pytest.mark.asyncio
@@ -129,7 +176,10 @@ async def test_register_mapping_regex_metacharacter_claim_returns_400(
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.post(
             "/region-mappings",
-            json={"catalog": "fao", "collection": "countries", "column": "adm0.code"},
+            json={
+                "catalog": "fao", "collection": "countries",
+                "column": "adm0.code", "alias": "country",
+            },
         )
 
     assert resp.status_code == 400
@@ -144,7 +194,10 @@ async def test_register_mapping_no_engine_returns_503(monkeypatch: pytest.Monkey
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.post(
             "/region-mappings",
-            json={"catalog": "fao", "collection": "countries", "column": "adm0_code"},
+            json={
+                "catalog": "fao", "collection": "countries",
+                "column": "adm0_code", "alias": "country",
+            },
         )
 
     assert resp.status_code == 503
@@ -228,7 +281,7 @@ async def test_list_mappings_invalid_cql_filter_returns_400(monkeypatch: pytest.
 
 
 # ---------------------------------------------------------------------------
-# GET /region-mappings/definitions
+# GET /region-mappings/region.json
 # ---------------------------------------------------------------------------
 
 
@@ -253,7 +306,7 @@ async def test_definitions_shape_and_prefixed_alias(monkeypatch: pytest.MonkeyPa
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get("/region-mappings/definitions")
+        resp = await client.get("/region-mappings/region.json")
 
     assert resp.status_code == 200
     body = resp.json()
@@ -292,7 +345,7 @@ async def test_definitions_pagination(monkeypatch: pytest.MonkeyPatch) -> None:
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get("/region-mappings/definitions", params={"limit": 2, "offset": 1})
+        resp = await client.get("/region-mappings/region.json", params={"limit": 2, "offset": 1})
 
     body = resp.json()["regionWmsMap"]
     assert len(body) == 2
@@ -312,7 +365,7 @@ async def test_definitions_with_cql_filter_bypasses_cache(monkeypatch: pytest.Mo
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.get(
-            "/region-mappings/definitions", params={"filter": "src_catalog = 'fao'"},
+            "/region-mappings/region.json", params={"filter": "src_catalog = 'fao'"},
         )
 
     assert resp.status_code == 200

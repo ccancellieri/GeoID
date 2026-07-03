@@ -56,7 +56,7 @@ TABLE = "mappings"
 _QUALIFIED_TABLE = f"{SCHEMA}.{TABLE}"
 
 # Every column on the table — the whitelist backing both the CQL2 filter
-# pipeline (GET /region-mappings, GET /region-mappings/definitions) and the
+# pipeline (GET /region-mappings, GET /region-mappings/region.json) and the
 # API's list/select projections. No other property name is ever accepted.
 ALLOWED_COLUMNS: Tuple[str, ...] = (
     "claim_ci", "claim", "mapping_id", "role",
@@ -164,6 +164,30 @@ DELETE_CLAIMS_BY_MAPPING_ID = DQLQuery(
     f"""
     DELETE FROM {_QUALIFIED_TABLE}
     WHERE mapping_id = :mapping_id
+    RETURNING claim_ci
+    """,
+    result_handler=ResultHandler.ALL_DICTS,
+)
+
+# Referential-integrity cleanup: every claim sourced from a collection that
+# was just hard-deleted elsewhere in the platform. Fired from a best-effort
+# async event listener (lifecycle.py), never from the collection-delete
+# path itself -- see that module for why.
+DELETE_CLAIMS_BY_SOURCE_COLLECTION = DQLQuery(
+    f"""
+    DELETE FROM {_QUALIFIED_TABLE}
+    WHERE src_catalog = :catalog_id AND src_collection = :collection_id
+    RETURNING claim_ci
+    """,
+    result_handler=ResultHandler.ALL_DICTS,
+)
+
+# Same, scoped to an entire catalog (a catalog hard-delete removes every
+# collection in it in one shot).
+DELETE_CLAIMS_BY_SOURCE_CATALOG = DQLQuery(
+    f"""
+    DELETE FROM {_QUALIFIED_TABLE}
+    WHERE src_catalog = :catalog_id
     RETURNING claim_ci
     """,
     result_handler=ResultHandler.ALL_DICTS,

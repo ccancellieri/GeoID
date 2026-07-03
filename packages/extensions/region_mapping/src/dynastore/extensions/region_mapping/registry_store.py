@@ -23,7 +23,7 @@ Thin service layer between the router (``region_mapping_service.py``) and
 the raw SQL in ``registry_queries.py``: resolves the DB engine via
 ``get_engine()`` (mirrors ``dynastore.modules.local.local_upload``), owns
 the ``@cached`` read wrappers used by the hot serving paths
-(``/definitions``, ``/{mapping_id}/regionIds``), and their invalidation on
+(``/region.json``, ``/{mapping_id}/regionIds``), and their invalidation on
 write.
 """
 from __future__ import annotations
@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 # The registry is bounded by (registered collections x aliases per
 # collection) -- not by regionIds cardinality -- so a single generous fetch
 # followed by client-side grouping/pagination is simpler and cheap for
-# /region-mappings/definitions.
+# /region-mappings/region.json.
 DEFINITIONS_FETCH_CAP = 5000
 
 
@@ -69,7 +69,7 @@ async def apply_mapping(
     catalog_id: str,
     collection_id: str,
     column: str,
-    alias: Optional[str],
+    alias: str,
     extra_aliases: Sequence[str],
     title: Optional[str],
 ) -> Tuple[str, List[Dict[str, Any]]]:
@@ -87,7 +87,6 @@ async def apply_mapping(
     Returns ``(mapping_id, claim_rows)``.
     """
     mapping_id = mapping_id_for(catalog_id, collection_id)
-    canonical_alias = alias or column
     row_title = title or collection_id
 
     claims = compute_claim_set(
@@ -104,7 +103,7 @@ async def apply_mapping(
             params = dict(
                 claim_ci=claim_ci, claim=claim, mapping_id=mapping_id, role=role,
                 src_catalog=catalog_id, src_collection=collection_id,
-                region_prop=column, alias=canonical_alias, title=row_title,
+                region_prop=column, alias=alias, title=row_title,
             )
             row = await _q.UPDATE_OWN_CLAIM.execute(conn, **params)
             if row is None:
@@ -159,6 +158,33 @@ async def delete_mapping(engine: DbResource, mapping_id: str) -> int:
     return len(deleted)
 
 
+async def delete_claims_by_source_collection(
+    engine: DbResource, catalog_id: str, collection_id: str,
+) -> int:
+    """Referential-integrity cleanup: delete every claim sourced from one
+    now-deleted collection. Unlike :func:`delete_mapping`, a no-op (nothing
+    was ever registered against that collection) is not an error -- called
+    from the best-effort event listener in ``lifecycle.py``.
+    """
+    async with managed_transaction(engine) as conn:
+        deleted = await _q.DELETE_CLAIMS_BY_SOURCE_COLLECTION.execute(
+            conn, catalog_id=catalog_id, collection_id=collection_id,
+        )
+    if deleted:
+        invalidate_serving_caches()
+    return len(deleted)
+
+
+async def delete_claims_by_source_catalog(engine: DbResource, catalog_id: str) -> int:
+    """Same as :func:`delete_claims_by_source_collection`, scoped to every
+    claim sourced from an entire now-deleted catalog."""
+    async with managed_transaction(engine) as conn:
+        deleted = await _q.DELETE_CLAIMS_BY_SOURCE_CATALOG.execute(conn, catalog_id=catalog_id)
+    if deleted:
+        invalidate_serving_caches()
+    return len(deleted)
+
+
 # ---------------------------------------------------------------------------
 # Reads
 # ---------------------------------------------------------------------------
@@ -177,7 +203,7 @@ async def list_claims(
     offset: int = 0,
 ) -> List[Dict[str, Any]]:
     """Uncached claim listing -- backs ``GET /region-mappings`` and the
-    CQL2-filtered branch of ``GET /region-mappings/definitions``.
+    CQL2-filtered branch of ``GET /region-mappings/region.json``.
 
     Arbitrary filter combinations (including a caller-supplied CQL2 clause)
     are not worth caching, so this always reads through to PG.
@@ -200,7 +226,7 @@ async def fetch_primary_records(
     catalog: Optional[str], collection: Optional[str], alias_ci: Optional[str],
 ) -> List[Dict[str, Any]]:
     """Fetch the primary-role (or, when ``alias_ci`` is given, the exact
-    claim) records used to build ``/region-mappings/definitions``.
+    claim) records used to build ``/region-mappings/region.json``.
 
     Bounded by :data:`DEFINITIONS_FETCH_CAP`. Only the unfiltered (no CQL2
     ``filter=``) request path is cached -- see :func:`list_claims` for the
