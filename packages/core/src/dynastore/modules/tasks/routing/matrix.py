@@ -36,7 +36,7 @@ Two flavours:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from dynastore.modules.tasks.routing.exec_hints import ExecHint
 from dynastore.modules.tasks.routing.model import RunnerTarget
@@ -58,6 +58,20 @@ CLOUD_PROCESS_CONSUMERS: Dict[str, List[str]] = {
     "gdal": ["catalog", "maps"],
     "tiles_preseed": ["maps"],
     "tiles_export": ["maps"],
+}
+
+# Per-process Cloud Run Job task-timeout CEILINGS (seconds), written to the
+# gcp_cloud_run RunnerTarget.options so a dense/huge preseed is not killed at
+# the platform-default 3600s ceiling. This is only a ceiling — the Job still
+# exits as soon as its work completes, so a larger value never delays a normal
+# run; it only prevents premature termination of a legitimately long one.
+# 86400s = Cloud Run's maximum Job task timeout (24h). Operators can override
+# per-process via the platform routing config; for extents that need longer
+# than one Job can run, partition by bbox and fan out (each partition is an
+# independent, dedup-keyed tiles_preseed execution).
+CLOUD_PROCESS_TIMEOUT_SECONDS: Dict[str, int] = {
+    "tiles_preseed": 86400,
+    "tiles_export": 86400,
 }
 
 # Processes that must stay in-process even under the cloud profile
@@ -116,9 +130,10 @@ def build_routing_matrix(
         ``hints={BACKGROUND}``.
         All other processes offload to GCP Cloud Run Jobs: ``gcp_cloud_run``
         runner, ``consumers`` from ``CLOUD_PROCESS_CONSUMERS`` (defaulting
-        to ``["catalog"]``), ``hints={OFFLOAD, HEAVY}``.  The ``options``
-        dict is intentionally empty — job-name discovery is the runner's
-        responsibility.
+        to ``["catalog"]``), ``hints={OFFLOAD, HEAVY}``.  ``options`` carries
+        a per-process ``timeout_seconds`` ceiling for the processes listed in
+        ``CLOUD_PROCESS_TIMEOUT_SECONDS`` (heavy tile preseed) and is otherwise
+        empty — job-name discovery is the runner's responsibility.
 
     **Processes** (``kind == "process"``), onprem preset:
         Every process runs in-process: ``background`` runner,
@@ -177,11 +192,16 @@ def build_routing_matrix(
                     ]
                 else:
                     consumers = CLOUD_PROCESS_CONSUMERS.get(item.task_key, ["catalog"])
+                    _options: Dict[str, Any] = {}
+                    _timeout = CLOUD_PROCESS_TIMEOUT_SECONDS.get(item.task_key)
+                    if _timeout:
+                        _options["timeout_seconds"] = _timeout
                     processes_map[item.task_key] = [
                         RunnerTarget(
                             consumers=list(consumers),
                             runner="gcp_cloud_run",
                             hints={ExecHint.OFFLOAD, ExecHint.HEAVY},
+                            options=_options,
                         )
                     ]
             else:

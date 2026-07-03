@@ -32,6 +32,7 @@ from __future__ import annotations
 from dynastore.modules.tasks.routing.exec_hints import ExecHint
 from dynastore.modules.tasks.routing.matrix import (
     CLOUD_PROCESS_CONSUMERS,
+    CLOUD_PROCESS_TIMEOUT_SECONDS,
     LIGHTWEIGHT_PROCESSES,
     OFFLOADABLE_SYSTEM_TASKS,
     InventoryItem,
@@ -90,6 +91,31 @@ def test_cloud_tiles_preseed_consumers():
 def test_cloud_tiles_export_consumers():
     _, procs = build_routing_matrix([_proc("tiles_export")], preset="cloud")
     assert procs["tiles_export"][0].consumers == ["maps"]
+
+
+def test_cloud_tiles_preseed_carries_timeout_ceiling():
+    """Heavy tile preseed offloads with a per-process timeout ceiling in
+    options, so its Cloud Run Job is not capped at the 3600s platform default
+    (a dense layer can run far past one hour)."""
+    _, procs = build_routing_matrix([_proc("tiles_preseed")], preset="cloud")
+    t = procs["tiles_preseed"][0]
+    assert t.runner == "gcp_cloud_run"
+    assert t.options.get("timeout_seconds") == CLOUD_PROCESS_TIMEOUT_SECONDS["tiles_preseed"]
+
+
+def test_cloud_tiles_export_carries_timeout_ceiling():
+    _, procs = build_routing_matrix([_proc("tiles_export")], preset="cloud")
+    assert (
+        procs["tiles_export"][0].options.get("timeout_seconds")
+        == CLOUD_PROCESS_TIMEOUT_SECONDS["tiles_export"]
+    )
+
+
+def test_cloud_unlisted_process_has_no_timeout_override():
+    """A process not in CLOUD_PROCESS_TIMEOUT_SECONDS keeps an empty options
+    dict — the ceiling is opt-in per process, not a blanket change."""
+    _, procs = build_routing_matrix([_proc("ingestion")], preset="cloud")
+    assert procs["ingestion"][0].options == {}
 
 
 def test_cloud_unknown_process_defaults_to_catalog():

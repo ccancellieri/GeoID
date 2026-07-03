@@ -250,24 +250,26 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
         # (main_task.py) extends it while the job runs, and the
         # MaintenanceSupervisor task_reaper resets the row if the lease lapses.
         #
-        # Priority: context.execution_overrides.timeout_seconds (per-task) >
-        # TasksPluginConfig.task_timeout_seconds (platform config default).
-        # Both the Cloud Run execution timeout AND the DB lease are set to the
-        # effective value so they never diverge.
+        # Priority: context.execution_overrides.timeout_seconds (per-execution) >
+        # per-target routing options['timeout_seconds'] (per-task-type ceiling,
+        # e.g. a longer default for heavy tile-preseed processes) >
+        # TasksPluginConfig.task_timeout_seconds (platform default) > 3600.
+        # resolve_routing_terminal already layers the routing option over the
+        # platform default, so the Cloud Run Job now honors the SAME timeout the
+        # in-process SyncRunner does — previously the per-target routing option
+        # was silently dropped here and every Job was capped at the platform
+        # default regardless of its route. Both the Cloud Run execution timeout
+        # AND the DB lease are set to the effective value so they never diverge.
         _timeout_seconds = 3600
         try:
-            from dynastore.tools.discovery import get_protocol
-            from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
-            from dynastore.modules.tasks.tasks_config import TasksPluginConfig
-            _cm = get_protocol(PlatformConfigsProtocol)
-            if _cm is not None:
-                _cfg = await _cm.get_config(TasksPluginConfig)
-                if isinstance(_cfg, TasksPluginConfig):
-                    _timeout_seconds = _cfg.task_timeout_seconds
+            from dynastore.modules.tasks.execution import resolve_routing_terminal
+            _terminal = await resolve_routing_terminal(context.task_type)
+            if _terminal.timeout_seconds:
+                _timeout_seconds = int(_terminal.timeout_seconds)
         except Exception:  # noqa: BLE001 — default lease on any read failure
             pass
 
-        # Per-task override takes precedence over the platform-wide config value.
+        # Per-execution override takes precedence over the routing/config ceiling.
         _exec_overrides = context.execution_overrides
         _override_timeout = (
             _exec_overrides.timeout_seconds
@@ -277,7 +279,7 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
         _effective_timeout_seconds = _override_timeout if _override_timeout else _timeout_seconds
         if _override_timeout:
             logger.debug(
-                "GcpJobRunner: using per-task timeout=%ds (config=%ds) for '%s'.",
+                "GcpJobRunner: using per-execution timeout=%ds (routing/config=%ds) for '%s'.",
                 _effective_timeout_seconds, _timeout_seconds, context.task_type,
             )
 

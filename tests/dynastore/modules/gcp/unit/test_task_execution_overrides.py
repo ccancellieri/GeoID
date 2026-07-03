@@ -325,6 +325,69 @@ async def test_gcp_runner_falls_back_to_config_timeout_when_no_overrides():
     assert call_kwargs.get("execution_overrides") is None
 
 
+@pytest.mark.asyncio
+async def test_gcp_runner_honors_per_target_routing_timeout():
+    """With no per-execution override, GcpJobRunner must adopt the per-target
+    routing options['timeout_seconds'] (resolved via resolve_routing_terminal)
+    for the DB lease — the same ceiling the SyncRunner uses. Regression guard
+    for the previous behavior where the Cloud Run Job silently ignored the
+    routing timeout and capped every Job at the platform default."""
+    from datetime import datetime, timezone, timedelta
+
+    from dynastore.modules.gcp.gcp_runner import GcpJobRunner
+    from dynastore.modules.tasks.execution import RoutingTerminal
+    from dynastore.modules.tasks.routing.model import Action, ActionVerb
+
+    runner = GcpJobRunner()
+    claimed_id = _uuid.uuid4()
+
+    ctx = RunnerContext(
+        engine=_fake_engine(),
+        task_type="tiles_preseed",
+        caller_id="user@example.com",
+        inputs={},
+        db_schema="s_test",
+        extra_context={"task_id": str(claimed_id), "task_timestamp": "2026-01-01T00:00:00Z"},
+        execution_overrides=None,  # no per-execution override → routing ceiling applies
+    )
+
+    terminal = RoutingTerminal(
+        on_success=Action(action=ActionVerb.REPORT),
+        on_failure=Action(action=ActionVerb.DEAD_LETTER),
+        on_timeout=Action(action=ActionVerb.DEAD_LETTER),
+        timeout_seconds=86400.0,
+    )
+
+    run_job_mock = AsyncMock(return_value=None)
+    load_job_config_mock = AsyncMock(return_value={"tiles_preseed": "dynastore-tiles-preseed-job"})
+    locked_until_seen: list = []
+
+    async def _fake_claim(engine, task_id, *, owner_id, locked_until, **kw):
+        locked_until_seen.append(locked_until)
+        return True
+
+    with patch(
+        "dynastore.modules.tasks.execution.resolve_routing_terminal",
+        AsyncMock(return_value=terminal),
+    ), patch(
+        "dynastore.modules.tasks.tasks_module.claim_for_dispatch", side_effect=_fake_claim
+    ), patch(
+        "dynastore.modules.gcp.tools.jobs.load_job_config", load_job_config_mock
+    ), patch(
+        "dynastore.modules.gcp.tools.jobs.run_cloud_run_job_async", run_job_mock
+    ), patch(
+        "dynastore.modules.gcp.tools.jobs.try_load_process_definition", return_value=None
+    ):
+        await runner.run(ctx)
+
+    assert locked_until_seen, "claim_for_dispatch was not called"
+    effective_lease = locked_until_seen[0] - datetime.now(timezone.utc)
+    assert effective_lease > timedelta(seconds=86000), (
+        f"Expected lease ~86400s from the routing ceiling but got "
+        f"{effective_lease.total_seconds():.0f}s"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 5. SpawnTaskRequest carries execution_overrides field
 # ---------------------------------------------------------------------------
