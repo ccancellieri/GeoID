@@ -25,6 +25,7 @@ protocols only (no direct module imports).
 import asyncio
 import json
 import logging
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -56,6 +57,8 @@ _STRIP_LINKS = frozenset({"links"})
 # (all translations) — passing it to a write throws, which previously
 # aborted the whole harvest before any item was written.
 _WRITE_LANG = "en"
+# geoid#2890: 10 min of unbroken zero-progress write failures aborts the harvest
+_STALL_ABORT_SECONDS = 600.0
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +253,9 @@ class HarvestStats:
     items_failed: int = 0
     virtual_assets_written: int = 0
     errors: List[str] = field(default_factory=list)
+    # Monotonic timestamp of the first failure in the current unbroken
+    # zero-write streak; ``None`` while healthy.  See _STALL_ABORT_SECONDS.
+    _stall_since: Optional[float] = field(default=None, repr=False)
 
 
 # ---------------------------------------------------------------------------
@@ -570,7 +576,10 @@ async def _harvest_collection(
 
     ``source_coll`` is the raw source collection dict; ``items_iter`` yields its
     raw items.  Increments ``stats`` in place; never raises (failures are
-    recorded as soft errors).
+    recorded as soft errors) — except when a sustained zero-progress write
+    streak trips the stall abort (see ``_STALL_ABORT_SECONDS``), which raises
+    ``RuntimeError`` to stop a harvest that is stuck heartbeating but making
+    no progress (geoid#2890).
     """
     target_catalog = request.target_catalog
     coll = map_collection(source_coll)
@@ -588,6 +597,18 @@ async def _harvest_collection(
         stats.items_failed += len(batch) - written
         if err and len(stats.errors) < _MAX_RECORDED_ERRORS:
             stats.errors.append(f"items:{target_collection}:{err}")
+        if written == 0:
+            now = time.monotonic()
+            if stats._stall_since is None:
+                stats._stall_since = now
+            elapsed = now - stats._stall_since
+            if elapsed >= _STALL_ABORT_SECONDS:
+                raise RuntimeError(
+                    f"stac_harvest: aborting — no items written for "
+                    f"{elapsed:.0f}s (last error: {err})"
+                )
+        else:
+            stats._stall_since = None
         if request.with_assets:
             stats.virtual_assets_written += await _register_virtual_assets(
                 catalogs, target_catalog, target_collection, batch
