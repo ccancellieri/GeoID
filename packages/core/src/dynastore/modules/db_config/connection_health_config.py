@@ -344,7 +344,10 @@ class ConnectionHealthConfig(PluginConfig):
 
     Stored in the platform configs table and read on each LEADER_ONLY tick via
     ``PlatformConfigService.get_config(ConnectionHealthConfig)``.  All fields
-    are ``Mutable`` so operators can adjust them without restarting pods.
+    are ``Mutable`` so operators can adjust them without restarting pods,
+    with one exception: ``pool_acquire_warn_seconds`` is consumed via the
+    static fallback resolver on the universal pool-acquire path and requires
+    a pod restart to take effect (see its field description, #2908).
 
     Address: ``("platform", "db", "health")``.
     """
@@ -482,8 +485,13 @@ class ConnectionHealthConfig(PluginConfig):
             "otherwise produces zero application log lines until a request "
             "either succeeds or hits the bounded pool_acquire_timeout, "
             "leaving an outage invisible from the service's own logs "
-            "(#2898). Hot-reloadable -- changes take effect immediately "
-            "without a pod restart. Must be in [0.5, 60.0] seconds."
+            "(#2898). Read via the static resolve_pool_acquire_warn_seconds() "
+            "fallback, not the central cached config getter -- this runs on "
+            "every successful pool acquire, including the first one at cold "
+            "boot, and a live get_config() read there re-enters the acquire "
+            "path and deadlocks on the cache's per-key single-flight lock "
+            "(#2908). Changing this value requires a pod restart to take "
+            "effect. Must be in [0.5, 60.0] seconds."
         ),
     )
 

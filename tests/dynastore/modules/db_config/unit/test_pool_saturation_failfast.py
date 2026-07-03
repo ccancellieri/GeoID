@@ -34,6 +34,7 @@ that the happy path (pool not saturated) is unaffected by the new branch.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from typing import Optional
 
@@ -196,25 +197,27 @@ async def test_slow_successful_acquire_warns_with_pool_stats(monkeypatch, caplog
 
 
 @pytest.mark.asyncio
-async def test_slow_successful_acquire_warns_using_live_config_threshold(monkeypatch, caplog):
-    """``pool_acquire_warn_seconds`` is read from the live
-    ``ConnectionHealthConfig`` (not just the module-global fallback), so
-    operators can hot-reload the WARN threshold without a pod restart
-    (#2898). The module-global fallback stays at its 5 s default here --
-    only a genuinely live read of the 0.5 s config value (its allowed
-    minimum) can make this ~0.55 s connect delay cross the threshold,
-    proving the value comes from the config service rather than
-    resolve_pool_acquire_warn_seconds()."""
+async def test_slow_successful_acquire_warns_using_static_threshold(monkeypatch, caplog):
+    """``pool_acquire_warn_seconds`` is read via the static
+    ``resolve_pool_acquire_warn_seconds()`` fallback, not the live
+    ``ConnectionHealthConfig`` (#2908). Monkeypatching the config service's
+    ``get_config`` to a value that would cross the threshold must have NO
+    effect on whether the WARNING fires -- only the static resolver's return
+    value controls it, proving the acquire path never awaits the config
+    service on this branch."""
     from unittest.mock import AsyncMock, MagicMock
 
     from dynastore.modules.db_config import query_executor as qe
-    from dynastore.modules.db_config.connection_health_config import (
-        ConnectionHealthConfig,
-    )
 
-    live_cfg = ConnectionHealthConfig(pool_acquire_warn_seconds=0.5)
+    monkeypatch.setattr(qe, "resolve_pool_acquire_warn_seconds", lambda: 0.01)
+
+    # A live config read would return an unrelated (much higher) threshold;
+    # if the acquire path erroneously awaited it, this WARNING would not
+    # fire for a 0.05 s delay.
     config_mock = MagicMock()
-    config_mock.get_config = AsyncMock(return_value=live_cfg)
+    config_mock.get_config = AsyncMock(side_effect=AssertionError(
+        "acquire path must not call get_config on the success branch"
+    ))
     monkeypatch.setattr(
         "dynastore.tools.discovery.get_protocol",
         lambda *_a, **_kw: config_mock,
@@ -225,7 +228,7 @@ async def test_slow_successful_acquire_warns_using_live_config_threshold(monkeyp
 
     async def _slow_connect():
         engine.connect_calls += 1
-        await asyncio.sleep(0.55)
+        await asyncio.sleep(0.05)
         return conn
 
     engine.connect = _slow_connect
@@ -234,9 +237,32 @@ async def test_slow_successful_acquire_warns_using_live_config_threshold(monkeyp
         result = await _acquire_async_engine_connection(engine)
 
     assert result is conn
-    config_mock.get_config.assert_awaited_once()
+    config_mock.get_config.assert_not_awaited()
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert any("checkedout=" in m and "overflow=" in m for m in warnings), warnings
+
+
+def test_acquire_success_path_never_reads_live_config():
+    """Regression guard for the #2908 boot deadlock.
+
+    ``_acquire_async_engine_connection`` runs on EVERY successful pool
+    acquire, including the first one at cold boot. If this function ever
+    calls ``get_config`` on that path again, a cold-cache ``get_config``
+    call queries the DB through this same acquire function -- the outer
+    call is still holding the central ``@cached`` wrapper's per-key
+    ``asyncio.Lock``, so the inner ``get_config`` call awaits that same
+    key's lock and the process hangs forever right after the pool is
+    established (verified live on dev: deploy runs 28682367394,
+    28683333131, 28684993353). Assert the source has no ``get_config(``
+    call so nobody reintroduces a live config read here.
+    """
+    from dynastore.modules.db_config import query_executor as qe
+
+    source = inspect.getsource(qe._acquire_async_engine_connection)
+    assert "get_config(" not in source, (
+        "_acquire_async_engine_connection must not call get_config() -- "
+        "doing so re-enters the acquire path and deadlocks on cold boot (#2908)"
+    )
 
 
 @pytest.mark.asyncio

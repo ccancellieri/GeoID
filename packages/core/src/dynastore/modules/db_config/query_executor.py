@@ -1645,31 +1645,6 @@ async def _read_live_fg_acquire_timeout() -> float:
     return resolve_foreground_pool_acquire_timeout()
 
 
-async def _read_live_pool_acquire_warn_seconds() -> float:
-    """Read ``ConnectionHealthConfig.pool_acquire_warn_seconds`` live.
-
-    Per-call read from the central cached config getter so operators can
-    tune the pool-acquire WARN logging threshold (#2898) without a pod
-    restart. Falls back to :func:`resolve_pool_acquire_warn_seconds` when
-    the config service is unavailable.
-    """
-    try:
-        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
-        from dynastore.modules.db_config.connection_health_config import (
-            ConnectionHealthConfig,
-        )
-        from dynastore.tools.discovery import get_protocol
-
-        svc = get_protocol(PlatformConfigsProtocol)
-        if svc is not None:
-            cfg = await svc.get_config(ConnectionHealthConfig)
-            if isinstance(cfg, ConnectionHealthConfig):
-                return cfg.pool_acquire_warn_seconds
-    except Exception:
-        pass
-    return resolve_pool_acquire_warn_seconds()
-
-
 async def _read_live_pool_saturation_retry_after() -> int:
     """Read ``ConnectionHealthConfig.pool_saturation_retry_after_seconds`` live.
 
@@ -2068,12 +2043,21 @@ async def _acquire_async_engine_connection(engine: AsyncEngine) -> AsyncConnecti
         raise
     wait_s = time.monotonic() - t0
     slow_threshold_s = resolve_slow_pool_acquire_threshold()
-    warn_threshold_s = await _read_live_pool_acquire_warn_seconds()
+    # Deliberately the static resolver, not a live config read (#2908). This
+    # runs on EVERY successful acquire, including the very first one at cold
+    # boot. A live read here calls the central cached config getter, which
+    # on a cold cache queries the DB through this same acquire function --
+    # the outer call is still holding the central @cached wrapper's per-key
+    # asyncio.Lock, so the inner config-getter call awaits that same key's
+    # lock and the boot deadlocks silently right after the pool is
+    # established. Operators tune this threshold via a pod restart, not a
+    # live config write.
+    warn_threshold_s = resolve_pool_acquire_warn_seconds()
     if wait_s >= warn_threshold_s:
-        # A successful-but-slow acquire crossing this (hot-reloadable, #2898)
-        # threshold means the pool is sliding towards saturation -- surface
-        # it at WARNING with occupancy stats instead of letting it blend into
-        # the routine INFO/DEBUG lines below.
+        # A successful-but-slow acquire crossing this threshold means the
+        # pool is sliding towards saturation -- surface it at WARNING with
+        # occupancy stats instead of letting it blend into the routine
+        # INFO/DEBUG lines below.
         logger.warning(
             "db_pool_acquire slow service=%s wait_seconds=%.4f threshold=%.2f%s%s",
             _SERVICE_NAME_FOR_METRICS, wait_s, warn_threshold_s,
