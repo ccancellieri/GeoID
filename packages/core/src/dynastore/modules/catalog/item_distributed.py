@@ -51,6 +51,7 @@ from dynastore.modules.storage.errors import ConflictError, SidecarRejectedError
 from dynastore.models.protocols import ConfigsProtocol
 from dynastore.modules.storage.drivers.pg_sidecars.base import SidecarProtocol
 from dynastore.tools.discovery import get_protocol
+from dynastore.tools.db import qualify_table, quote_ident
 from dynastore.models.query_builder import QueryRequest
 from dynastore.modules.catalog.query_optimizer import QueryOptimizer
 
@@ -594,11 +595,11 @@ class ItemDistributedMixin(_Host):
         vals = []
         params = {}
         for k, v in data.items():
-            cols.append(f'"{k}"')
+            cols.append(quote_ident(k))
             vals.append(f":{k}")
             params[k] = v
 
-        sql = f'INSERT INTO "{schema}"."{table}" ({", ".join(cols)}) VALUES ({", ".join(vals)}) RETURNING *;'
+        sql = f'INSERT INTO {qualify_table(schema, table)} ({", ".join(cols)}) VALUES ({", ".join(vals)}) RETURNING *;'
         return await DQLQuery(sql, result_handler=ResultHandler.ONE).execute(
             conn, **params
         )
@@ -612,10 +613,10 @@ class ItemDistributedMixin(_Host):
         for k, v in data.items():
             if k == "geoid":
                 continue
-            clauses.append(f'"{k}" = :{k}')
+            clauses.append(f'{quote_ident(k)} = :{k}')
             params[k] = v
 
-        sql = f'UPDATE "{schema}"."{table}" SET {", ".join(clauses)} WHERE geoid = :geoid RETURNING *;'
+        sql = f'UPDATE {qualify_table(schema, table)} SET {", ".join(clauses)} WHERE geoid = :geoid RETURNING *;'
         return await DQLQuery(sql, result_handler=ResultHandler.ONE).execute(
             conn, **params
         )
@@ -676,7 +677,7 @@ class ItemDistributedMixin(_Host):
         updates: list = []
         params = {}
         for k, v in data.items():
-            cols.append(f'"{k}"')
+            cols.append(quote_ident(k))
             # Geometry columns: pass WKB hex through ST_GeomFromEWKB
             if k in geom_cols and isinstance(v, str):
                 vals.append(f"ST_GeomFromEWKB(decode(:{k}, 'hex'))")
@@ -695,15 +696,15 @@ class ItemDistributedMixin(_Host):
                 vals.append(f":{k}")
                 params[k] = v
             if k not in conflict_cols:
-                updates.append(f'"{k}" = EXCLUDED."{k}"')
+                updates.append(f'{quote_ident(k)} = EXCLUDED.{quote_ident(k)}')
 
-        conflict_target = ", ".join([f'"{c}"' for c in conflict_cols])
+        conflict_target = ", ".join([quote_ident(c) for c in conflict_cols])
         if updates:
             on_conflict_clause = f"DO UPDATE SET {', '.join(updates)}"
         else:
             on_conflict_clause = "DO NOTHING"
         sql = f"""
-INSERT INTO "{schema}"."{table}" ({", ".join(cols)})
+INSERT INTO {qualify_table(schema, table)} ({", ".join(cols)})
 VALUES ({", ".join(vals)})
 ON CONFLICT ({conflict_target}) {on_conflict_clause};
 """
@@ -822,9 +823,9 @@ ON CONFLICT ({conflict_target}) {on_conflict_clause};
         sql = f"""
             SELECT DISTINCT ON (s.external_id)
                 s.external_id, h.geoid, g.geometry_hash{validity_col}
-            FROM "{phys_schema}"."{phys_table}" h,
-                 "{phys_schema}"."{sc_table}" s,
-                 "{phys_schema}"."{geom_sc_table}" g
+            FROM {qualify_table(phys_schema, phys_table)} h,
+                 {qualify_table(phys_schema, sc_table)} s,
+                 {qualify_table(phys_schema, geom_sc_table)} g
             WHERE s.external_id = ANY(CAST(:ids AS TEXT[]))
               AND h.deleted_at IS NULL
               AND h.geoid = s.geoid
@@ -858,8 +859,8 @@ ON CONFLICT ({conflict_target}) {on_conflict_clause};
         sql = f"""
             SELECT DISTINCT ON (s.geometry_hash)
                 s.geometry_hash, h.geoid
-            FROM "{phys_schema}"."{phys_table}" h
-            JOIN "{phys_schema}"."{geom_sc_table}" s
+            FROM {qualify_table(phys_schema, phys_table)} h
+            JOIN {qualify_table(phys_schema, geom_sc_table)} s
               ON s.geoid = h.geoid
             WHERE s.geometry_hash = ANY(CAST(:hashes AS TEXT[]))
               AND h.deleted_at IS NULL
@@ -924,9 +925,9 @@ ON CONFLICT ({conflict_target}) {on_conflict_clause};
                     params[pk] = v
             value_tuples.append(f"({', '.join(row_vals)})")
 
-        col_list = ", ".join(f'"{c}"' for c in all_cols)
+        col_list = ", ".join(quote_ident(c) for c in all_cols)
         sql = (
-            f'INSERT INTO "{schema}"."{table}" ({col_list})\n'
+            f'INSERT INTO {qualify_table(schema, table)} ({col_list})\n'
             f"VALUES {', '.join(value_tuples)}\n"
             f"RETURNING *;"
         )
@@ -993,7 +994,8 @@ ON CONFLICT ({conflict_target}) {on_conflict_clause};
         all_cols = list(seen.keys())
 
         updates = [
-            f'"{c}" = EXCLUDED."{c}"' for c in all_cols if c not in conflict_cols
+            f'{quote_ident(c)} = EXCLUDED.{quote_ident(c)}'
+            for c in all_cols if c not in conflict_cols
         ]
         params: Dict[str, Any] = {}
         value_tuples: List[str] = []
@@ -1026,13 +1028,13 @@ ON CONFLICT ({conflict_target}) {on_conflict_clause};
                     params[pk] = v
             value_tuples.append(f"({', '.join(row_vals)})")
 
-        col_list = ", ".join(f'"{c}"' for c in all_cols)
-        conflict_target = ", ".join(f'"{c}"' for c in conflict_cols)
+        col_list = ", ".join(quote_ident(c) for c in all_cols)
+        conflict_target = ", ".join(quote_ident(c) for c in conflict_cols)
         on_conflict = (
             f"DO UPDATE SET {', '.join(updates)}" if updates else "DO NOTHING"
         )
         sql = (
-            f'INSERT INTO "{schema}"."{table}" ({col_list})\n'
+            f'INSERT INTO {qualify_table(schema, table)} ({col_list})\n'
             f"VALUES {', '.join(value_tuples)}\n"
             f"ON CONFLICT ({conflict_target}) {on_conflict};"
         )

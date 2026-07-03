@@ -374,6 +374,31 @@ class TestBatchUpsertSidecarRows:
         assert captured_params["_s_external_id_0"] == "a"
         assert captured_params["_s_external_id_1"] == "b"
 
+    @pytest.mark.asyncio
+    async def test_column_with_embedded_quote_is_escaped(
+        self, mixin: _FakeMixin
+    ) -> None:
+        """A column name carrying a literal ``"`` must be doubled, not left
+        bare, so it can't break out of its identifier quoting."""
+        payloads = [{"geoid": _geoid(), 'weird"col': "value"}]
+        captured_sql: List[str] = []
+
+        class _Cap:
+            def __init__(self, sql: str, **_kw: Any) -> None:
+                captured_sql.append(sql)
+
+            async def execute(self, conn: Any, **kwargs: Any) -> None:
+                return None
+
+        with patch("dynastore.modules.catalog.item_distributed.DQLQuery", new=_Cap):
+            await mixin._batch_upsert_sidecar_rows(
+                MagicMock(), "s", "t", payloads, conflict_cols=["geoid"],
+            )
+
+        sql = captured_sql[0]
+        assert '"weird""col"' in sql
+        assert '"weird""col" = EXCLUDED."weird""col"' in sql
+
 
 # ---------------------------------------------------------------------------
 # batch_insert_or_update_distributed — semantics
