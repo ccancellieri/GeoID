@@ -377,6 +377,43 @@ def _render_custom_style(
 # --- Main Entry Point ---
 
 
+def _reproject_bbox(
+    bbox: List[float],
+    bbox_srid: int,
+    target_srs: "osr.SpatialReference",
+    gdal_major_version: int,
+) -> List[float]:
+    """Reproject an axis-aligned ``[minx, miny, maxx, maxy]`` bbox into the
+    render CRS ``target_srs``.
+
+    Returns the bbox unchanged when the source and target CRS are the same.
+    Otherwise the four corners are transformed and the min/max taken so the
+    result stays axis-aligned (sufficient for Web-Mercator/UTM-style render
+    CRSs used here).
+    """
+    source_srs = osr.SpatialReference()
+    source_srs.ImportFromEPSG(int(bbox_srid))
+    if gdal_major_version >= 3:
+        source_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    if source_srs.IsSame(target_srs):
+        return bbox
+
+    transform = osr.CoordinateTransformation(source_srs, target_srs)
+    corners = (
+        (bbox[0], bbox[1]),
+        (bbox[0], bbox[3]),
+        (bbox[2], bbox[1]),
+        (bbox[2], bbox[3]),
+    )
+    xs: List[float] = []
+    ys: List[float] = []
+    for x, y in corners:
+        tx, ty, *_ = transform.TransformPoint(x, y)
+        xs.append(tx)
+        ys.append(ty)
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
 def render_map_image(
     width: int,
     height: int,
@@ -387,6 +424,7 @@ def render_map_image(
     style_record: Optional[Any],
     transparent: bool = True,
     bgcolor: Optional[str] = None,
+    bbox_srid: int = 4326,
 ) -> bytes:
     gdal_major_version = int(gdal_version.split(".")[0])
 
@@ -400,13 +438,22 @@ def render_map_image(
         target_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
     mem_dataset.SetProjection(target_srs.ExportToWkt())
 
+    # The geotransform describes the raster window in the *render* CRS, and the
+    # geometry below is reprojected into that same CRS. The request bbox is
+    # expressed in ``bbox_srid`` (defaults to CRS84), which need not match the
+    # render CRS — so reproject the bbox into the render CRS first. Without this,
+    # e.g. a CRS84 (degree) bbox with a default EPSG:3857 (metre) render CRS
+    # produces a metres-sized window near Null Island and every feature lands
+    # off-canvas, yielding a fully transparent image.
+    render_bbox = _reproject_bbox(bbox, bbox_srid, target_srs, gdal_major_version)
+
     geotransform = (
-        bbox[0],
-        (bbox[2] - bbox[0]) / width,
+        render_bbox[0],
+        (render_bbox[2] - render_bbox[0]) / width,
         0,
-        bbox[3],
+        render_bbox[3],
         0,
-        (bbox[1] - bbox[3]) / height,
+        (render_bbox[1] - render_bbox[3]) / height,
     )
     mem_dataset.SetGeoTransform(geotransform)
 

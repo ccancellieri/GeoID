@@ -695,7 +695,7 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
                 width, height, bbox_list, crs,
                 _resolve_target_srid(layer_config),
                 layers_data, style_to_render,
-                transparent, bgcolor,
+                transparent, bgcolor, bbox_srid,
             )
         except Exception as e:
             # Log the exception type and full traceback, not just str(e) — a
