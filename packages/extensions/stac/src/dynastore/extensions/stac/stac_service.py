@@ -20,7 +20,7 @@
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Optional, Dict, Any, Tuple, List, FrozenSet
+from typing import Optional, Dict, Any, Tuple, List, FrozenSet, cast
 
 import pystac
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Query, Request, status
@@ -776,9 +776,30 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
 
         stac_collections = _pg_collections_to_stac_dicts(collections_list, language)
 
+        # search_collections has resolved/clamped search_req.limit in place, so
+        # offset/limit are concrete ints here. Emit self + prev/next so a client
+        # can page through `matched` collections: this hand-built response
+        # previously carried no links at all, so any request with limit/offset/
+        # bbox/datetime/q/sortby came back with an empty `links` array even when
+        # more collections remained.
+        from dynastore.extensions.tools.pagination import build_pagination_links
+
+        links = [{"rel": "self", "type": "application/json", "href": str(request.url)}]
+        links += [
+            {"rel": rel, "type": "application/json", "href": href}
+            for rel, href in build_pagination_links(
+                request,
+                search_req.offset,
+                cast(int, search_req.limit),  # resolved to a concrete int by search_collections
+                total_count,
+                raw=True,
+            )
+        ]
+
         return JSONResponse(
             content={
                 "collections": stac_collections,
+                "links": links,
                 "context": {
                     "limit": search_req.limit,
                     "offset": search_req.offset,
