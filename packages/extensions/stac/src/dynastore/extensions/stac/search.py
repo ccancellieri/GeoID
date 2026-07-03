@@ -509,6 +509,7 @@ async def _maybe_dispatch_to_es_search(
     principals: Optional[List[str]] = None,
     principal: Optional[Any] = None,
     coll_ext_id_map: Optional[Dict[str, str]] = None,
+    had_explicit_scope: bool = True,
 ) -> Optional[Tuple[list, int, Optional[Dict[str, Any]]]]:
     """Dispatch a structural search to the catalog's routing-pinned items
     SEARCH driver, when one is configured and search-capable.
@@ -543,6 +544,24 @@ async def _maybe_dispatch_to_es_search(
     ``filter`` is now translated to ES Query DSL (shared CQL2→ES translator,
     queryables SSOT field mapping) and served by the ES driver too, instead of
     forcing the PG path.
+
+    ``had_explicit_scope`` distinguishes a caller-supplied ``collections=``
+    filter (bounded by what the caller asked for — the per-collection
+    verification loop below is cheap) from an auto-expanded, catalog-wide
+    scope (``_expand_collections_for_search`` rewriting a bare ``/search``
+    to every collection of the catalog — bounded only by the catalog's
+    collection count). For the latter, resolving the driver once per
+    collection turned a 1,971-collection catalog's unscoped search into a
+    45s+ hang: each resolution is a cache-keyed-per-collection config lookup
+    (``router._resolve_driver_ids_cached``), so a cold cache after a large
+    harvest meant ~2,000 sequential config round trips before the ES query
+    even ran (#2865). An auto-expanded scope instead resolves the driver
+    ONCE at catalog scope (``collection_id=None``, the documented
+    catalog-level resolution) — the same result a per-collection
+    resolution would give in the common case (no per-collection routing
+    override), matching the config waterfall's own shape where the
+    collection tier is a rare override over the catalog default, not the
+    default itself.
     """
     cids = search_request.collections or []
     if not cids:
@@ -558,20 +577,29 @@ async def _maybe_dispatch_to_es_search(
     # router resolves the driver that advertises ``ATTRIBUTE_FILTER``.
     search_hints = frozenset({Hint.ATTRIBUTE_FILTER}) if has_filter else frozenset()
 
-    # Resolve the items SEARCH driver per collection. All collections must
-    # resolve to the same driver class to be served in a single query;
-    # otherwise defer to the PG per-collection logic.
     driver: Any = None
-    for cid in cids:
+    if had_explicit_scope:
+        # Explicit, caller-bounded scope: resolve every collection so a
+        # genuinely mixed-driver selection still falls through to PG.
+        for cid in cids:
+            try:
+                resolved = await get_items_search_driver(cat_id, cid, hints=search_hints)
+            except Exception:
+                return None
+            candidate = resolved.driver
+            if driver is None:
+                driver = candidate
+            elif type(candidate) is not type(driver):
+                return None  # mixed drivers — PG path
+    else:
+        # Auto-expanded, catalog-wide scope: one catalog-level resolution
+        # instead of one per collection — see the ``had_explicit_scope``
+        # note above.
         try:
-            resolved = await get_items_search_driver(cat_id, cid, hints=search_hints)
+            resolved = await get_items_search_driver(cat_id, None, hints=search_hints)
         except Exception:
             return None
-        candidate = resolved.driver
-        if driver is None:
-            driver = candidate
-        elif type(candidate) is not type(driver):
-            return None  # mixed drivers — PG path
+        driver = resolved.driver
 
     if driver is None:
         return None
@@ -810,7 +838,7 @@ async def search_items(
     # QueryOptimizer SQL path below. See :func:`_maybe_dispatch_to_es_search`.
     search_dispatch_result = await _maybe_dispatch_to_es_search(
         cat_id, search_request, principals=principals, principal=principal,
-        coll_ext_id_map=_coll_ext_id_map,
+        coll_ext_id_map=_coll_ext_id_map, had_explicit_scope=had_explicit_scope,
     )
     if search_dispatch_result is not None:
         return search_dispatch_result
