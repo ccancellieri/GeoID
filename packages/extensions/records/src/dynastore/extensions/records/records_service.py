@@ -403,11 +403,9 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         language: str = Depends(get_language),
         request_hints: FrozenSet = Depends(parse_hints_param),
     ) -> rm.RecordsCatalogCollection:
-        catalogs_svc = await self._get_catalogs_service()
-
-        coll = await catalogs_svc.get_collection(catalog_id, collection_id, lang=language, hints=request_hints)
-        if not coll:
-            raise HTTPException(status_code=404, detail=f"Collection '{collection_id}' not found.")
+        coll = await self._resolve_collection_or_404(
+            catalog_id, collection_id, lang=language, hints=request_hints
+        )
 
         if not await self._is_records_collection(catalog_id, coll):
             raise HTTPException(status_code=404, detail=f"Collection '{collection_id}' is not a records collection.")
@@ -493,9 +491,7 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
     ) -> Response:
         catalogs_svc = await self._get_catalogs_service()
 
-        collection_meta = await catalogs_svc.get_collection(catalog_id, collection_id, lang="en")
-        if not collection_meta:
-            raise HTTPException(status_code=404, detail=f"Collection '{collection_id}' not found.")
+        await self._resolve_collection_or_404(catalog_id, collection_id, lang="en")
 
         from .config import RecordsPluginConfig
         from dynastore.extensions.tools.pagination import resolve_page_limit
