@@ -1485,6 +1485,15 @@ class ItemsElasticsearchDriver(
         if not items:
             return []
         es = _es_client_required()
+        # Resolve external ids to internal before computing the index name /
+        # routing key — mirrors count_entities/compute_extents/aggregate
+        # (#2999). Without this, a caller supplying the external catalog_id
+        # writes to a different index / routing partition than the one every
+        # read path resolves to, silently stranding documents on a shard the
+        # reads never query.
+        catalog_id, collection_id = await self._resolve_internal_ids(
+            catalog_id, collection_id
+        )
         index_name = self._items_index_name(catalog_id)
         # ES-primary (ES-only) write: ensure the tenant items index exists with
         # the correct mapping (``collection`` as keyword) and alias enrolment

@@ -1093,6 +1093,86 @@ async def test_collection_task_pre_reindex_wipe_collection_scoped():
     assert dbq["params"]["routing"] == "col1"
 
 
+class _FakeCollectionsSvc:
+    """Stub for ``CatalogsProtocol.collections`` — external → internal only,
+    mirroring the real ``resolve_collection_id`` contract used by
+    ``ItemsElasticsearchDriver._resolve_internal_ids``."""
+
+    def __init__(self, collection_map):
+        self._map = collection_map
+
+    async def resolve_collection_id(self, catalog_id, collection_id, allow_missing=False):
+        return self._map.get(collection_id)
+
+
+class _FakeCatalogsProtocol:
+    """Stub ``CatalogsProtocol`` resolving a fixed external → internal id
+    map, mirroring the real ``resolve_catalog_id`` / ``collections.
+    resolve_collection_id`` contract (``None`` on miss, passthrough left to
+    the caller)."""
+
+    def __init__(self, catalog_map, collection_map):
+        self._catalog_map = catalog_map
+        self.collections = _FakeCollectionsSvc(collection_map)
+
+    async def resolve_catalog_id(self, catalog_id, allow_missing=False):
+        return self._catalog_map.get(catalog_id)
+
+
+@pytest.mark.asyncio
+async def test_collection_task_pre_reindex_wipe_resolves_external_ids():
+    """#2999: the pre-reindex delete_by_query must resolve an EXTERNAL
+    catalog_id/collection_id to internal before computing the index name /
+    term filter / routing key — mirroring ``ItemsElasticsearchDriver``'s
+    read-path resolution (count_entities/compute_extents/aggregate/
+    read_entities) so the wipe targets the same index/routing partition the
+    write path (``write_entities``, fixed alongside this) actually indexes
+    into. Mirrors the dev divergence cited in #2999: catalog
+    external_id="gaulb" vs internal id="c_akbbm7cinmqfe".
+    """
+    es = _FakeEs()
+    fake_catalogs = _FakeCatalogsProtocol(
+        catalog_map={"gaulb": "c_akbbm7cinmqfe"},
+        collection_map={"gaul_level_1": "col_internal456"},
+    )
+
+    async def _fake_reindex(*args, **kwargs):
+        return ReindexResult(total_written=0)
+
+    def _get_protocol(proto):
+        name = getattr(proto, "__name__", str(proto))
+        if "CatalogsProtocol" in name:
+            return fake_catalogs
+        return None
+
+    with patch(
+        "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+    ), patch(
+        "dynastore.modules.elasticsearch.client.get_index_prefix",
+        return_value="dynastore",
+    ), patch(
+        "dynastore.tools.discovery.get_protocol", side_effect=_get_protocol,
+    ), patch(
+        "dynastore.tasks.elasticsearch_indexer.tasks._reindex_collection",
+        side_effect=_fake_reindex,
+    ):
+        task = BulkCollectionReindexTask()
+        await task.run(_make_payload(
+            BulkCollectionReindexInputs(
+                catalog_id="gaulb", collection_id="gaul_level_1",
+            ),
+        ))
+
+    assert es.delete_by_query_calls
+    dbq = es.delete_by_query_calls[0]
+    # Index name and routing must be built from the INTERNAL ids — matching
+    # what read_entities/write_entities target — not the raw external ids.
+    assert dbq["index"] == "dynastore-c_akbbm7cinmqfe-items"
+    assert "gaulb" not in dbq["index"]
+    assert dbq["body"] == {"query": {"term": {"collection": "col_internal456"}}}
+    assert dbq["params"]["routing"] == "col_internal456"
+
+
 @pytest.mark.asyncio
 async def test_catalog_task_pre_reindex_wipe_catalog_scoped():
     """Pre-reindex delete_by_query for BulkCatalogReindexTask uses a match_all

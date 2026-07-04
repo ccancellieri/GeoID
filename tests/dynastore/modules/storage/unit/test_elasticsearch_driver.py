@@ -1149,6 +1149,158 @@ class TestWriteEntitiesTenantIndex:
         assert len(action_id) > len("f1_")
 
 
+class TestWriteEntitiesResolvesExternalIds:
+    """write_entities must resolve an EXTERNAL catalog_id/collection_id to
+    internal before computing the index name / ``_routing`` key / stored
+    ``collection`` field — exactly like count_entities/compute_extents/
+    aggregate/read_entities already do (#2999). Before the fix, write_entities
+    used the raw (external) id verbatim: a caller supplying the external id
+    wrote to a different index / routing partition than every read path
+    resolves to, silently stranding documents on a shard reads never query.
+    """
+
+    @staticmethod
+    def _feature(item_id="f1"):
+        from dynastore.models.ogc import Feature
+        return Feature.model_validate({
+            "id": item_id,
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
+            "properties": {},
+        })
+
+    @pytest.mark.asyncio
+    async def test_write_entities_resolves_external_catalog_and_collection_id(self):
+        from dynastore.modules.storage.driver_config import (
+            ItemsWritePolicy, WriteConflictPolicy,
+        )
+
+        # Mirrors the dev divergence cited in #2999: catalog
+        # external_id="gaulb" vs internal id="c_akbbm7cinmqfe".
+        fake_catalogs = _FakeCatalogsProtocol(
+            catalog_map={"gaulb": "c_akbbm7cinmqfe"},
+            collection_map={"gaul_level_1": "col_internal456"},
+        )
+        es = _StubEs(exists=True)
+        policy = ItemsWritePolicy(on_conflict=WriteConflictPolicy.UPDATE)
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.modules.elasticsearch.client.get_index_prefix",
+            return_value="dynastore",
+        ), patch(
+            "dynastore.tools.discovery.get_protocol", return_value=fake_catalogs,
+        ), patch.object(
+            ItemsElasticsearchDriver, "_resolve_write_policy",
+            AsyncMock(return_value=policy),
+        ), patch.object(
+            ItemsElasticsearchDriver, "_enforce_field_constraints",
+            AsyncMock(return_value=None),
+        ):
+            driver = ItemsElasticsearchDriver()
+            written = await driver.write_entities(
+                "gaulb", "gaul_level_1", [self._feature("f1")],
+            )
+
+        assert len(written) == 1
+        assert len(es.bulk_calls) == 1
+        body = es.bulk_calls[0]["body"]
+        action = body[0]["index"]
+        doc = body[1]
+        # Index name and routing must be built from the INTERNAL ids —
+        # matching what read_entities/count_entities would target — not the
+        # raw external path-param ids.
+        assert action["_index"] == "dynastore-c_akbbm7cinmqfe-items"
+        assert "gaulb" not in action["_index"]
+        assert action["routing"] == "col_internal456"
+        assert doc["collection"] == "col_internal456"
+
+    @pytest.mark.asyncio
+    async def test_write_entities_passthrough_when_already_internal_or_unmapped(self):
+        """No CatalogsProtocol registered (or id unmapped) — behaves exactly
+        as before: the raw id is used verbatim."""
+        from dynastore.modules.storage.driver_config import (
+            ItemsWritePolicy, WriteConflictPolicy,
+        )
+
+        es = _StubEs(exists=True)
+        policy = ItemsWritePolicy(on_conflict=WriteConflictPolicy.UPDATE)
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.modules.elasticsearch.client.get_index_prefix",
+            return_value="dynastore",
+        ), patch(
+            "dynastore.tools.discovery.get_protocol", return_value=None,
+        ), patch.object(
+            ItemsElasticsearchDriver, "_resolve_write_policy",
+            AsyncMock(return_value=policy),
+        ), patch.object(
+            ItemsElasticsearchDriver, "_enforce_field_constraints",
+            AsyncMock(return_value=None),
+        ):
+            driver = ItemsElasticsearchDriver()
+            await driver.write_entities("cat1", "col1", [self._feature("f1")])
+
+        action = es.bulk_calls[0]["body"][0]["index"]
+        assert action["_index"] == "dynastore-cat1-items"
+        assert action["routing"] == "col1"
+
+    @pytest.mark.asyncio
+    async def test_write_and_read_routing_parity_for_diverged_ids(self):
+        """Regression for #2999: write_entities and read_entities must agree
+        on the SAME index name and ``_routing`` value for the same logical
+        (external) catalog/collection pair, even when the external and
+        internal ids diverge. Before the fix, write_entities targeted
+        ``dynastore-gaulb-items`` (built from the raw external catalog_id)
+        while read_entities (already resolving) targeted
+        ``dynastore-c_akbbm7cinmqfe-items`` — two different indices/shards,
+        so a write landed on a shard reads never queried.
+        """
+        from dynastore.modules.storage.driver_config import (
+            ItemsWritePolicy, WriteConflictPolicy,
+        )
+
+        fake_catalogs = _FakeCatalogsProtocol(
+            catalog_map={"gaulb": "c_akbbm7cinmqfe"},
+            collection_map={"gaul_level_1": "col_internal456"},
+        )
+        es = _StubEs(exists=True)
+        policy = ItemsWritePolicy(on_conflict=WriteConflictPolicy.UPDATE)
+        driver = ItemsElasticsearchDriver()
+
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.modules.elasticsearch.client.get_index_prefix",
+            return_value="dynastore",
+        ), patch(
+            "dynastore.tools.discovery.get_protocol", return_value=fake_catalogs,
+        ), patch.object(
+            ItemsElasticsearchDriver, "_resolve_write_policy",
+            AsyncMock(return_value=policy),
+        ), patch.object(
+            ItemsElasticsearchDriver, "_enforce_field_constraints",
+            AsyncMock(return_value=None),
+        ):
+            await driver.write_entities(
+                "gaulb", "gaul_level_1", [self._feature("f1")],
+            )
+            async for _ in driver.read_entities(
+                "gaulb", "gaul_level_1", entity_ids=["f1"],
+            ):
+                pass
+
+        write_action = es.bulk_calls[0]["body"][0]["index"]
+        write_index, write_routing = write_action["_index"], write_action["routing"]
+
+        read_call = es.get_calls[0]
+        read_index, read_routing = read_call["index"], read_call["params"]["routing"]
+
+        assert write_index == read_index == "dynastore-c_akbbm7cinmqfe-items"
+        assert write_routing == read_routing == "col_internal456"
+
+
 class TestWriteEntitiesPgCanonicalDetection:
     """#2864 — routing-based detection of "does this collection's WRITE
     routing have a PG canonical", and the resulting fork in
