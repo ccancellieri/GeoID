@@ -898,9 +898,9 @@ class MaintenanceSupervisor(PeriodicService):
             claimed = await repo.mark_running(conn, job_name, now=tick_now)
 
         if not claimed:
-            logger.warning(
+            logger.debug(
                 "maintenance_supervisor: job %r already claimed by another leader "
-                "— skipping this tick.",
+                "this tick (expected outcome of normal leader handoff) — skipping.",
                 job_name,
             )
             return

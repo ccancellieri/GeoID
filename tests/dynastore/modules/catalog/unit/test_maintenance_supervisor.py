@@ -655,10 +655,12 @@ def test_mark_running_sql_has_running_since_is_null_guard():
 
 @pytest.mark.asyncio
 async def test_run_job_skips_when_mark_running_returns_zero_rows(caplog):
-    """_run_job must skip dispatch and log WARNING when mark_running returns 0.
+    """_run_job must skip dispatch and log DEBUG when mark_running returns 0.
 
     A 0-rowcount from _MARK_RUNNING means another leader already claimed this
-    job. The job must NOT be dispatched and the skip must be logged at WARNING.
+    job. The job must NOT be dispatched and the skip must be logged at DEBUG
+    (this is the expected outcome of a normal leader-handoff race, not an
+    anomaly needing operator attention).
     """
     import logging
 
@@ -691,13 +693,17 @@ async def test_run_job_skips_when_mark_running_returns_zero_rows(caplog):
         mock_mtx.return_value.__aenter__ = AsyncMock(return_value=fake_conn)
         mock_mtx.return_value.__aexit__ = AsyncMock(return_value=False)
 
-        with caplog.at_level(logging.WARNING, logger="dynastore.modules.catalog.maintenance_supervisor"):
+        with caplog.at_level(logging.DEBUG, logger="dynastore.modules.catalog.maintenance_supervisor"):
             await supervisor._run_job(engine, repo_mock, JOB_TASK_REAPER, _utc(2026, 6, 10))
 
     assert dispatched == [], "dispatch must NOT be called when mark_running returns 0"
     repo_mock.mark_done.assert_not_called()
     assert any("claimed" in r.message.lower() for r in caplog.records), (
-        "Expected a WARNING about the job being claimed by another leader"
+        "Expected a DEBUG log about the job being claimed by another leader"
+    )
+    assert all(r.levelno <= logging.DEBUG for r in caplog.records), (
+        "The claim-miss log must be at DEBUG, not WARNING — it's an expected "
+        "leader-handoff race, not an anomaly"
     )
 
 
