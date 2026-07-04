@@ -689,45 +689,60 @@ class TestVersionedL2AuthoritativeRead:
 
 
 class TestConfigCachesUseTightL1Cap:
-    """Static check: correctness-critical config caches pin ``l1_ttl=2`` (#930)."""
+    """Static check: correctness-critical config caches pin a tight L1 TTL (#930).
+
+    The caches share ``DEFAULT_CONFIG_CACHE_L1_TTL`` (value: 2 seconds) rather
+    than repeating the literal — the invariant guarded here is that each
+    declares *some* ``l1_ttl=`` bound wired to that shared constant, not a
+    bespoke or missing one.
+    """
 
     def test_catalog_and_collection_caches_pass_l1_ttl(self):
         import inspect
         from dynastore.modules.catalog import config_service
+        from dynastore.tools.cache import DEFAULT_CONFIG_CACHE_L1_TTL
+
+        assert DEFAULT_CONFIG_CACHE_L1_TTL == 2
 
         src = inspect.getsource(config_service)
         # Catalog-tier
         assert 'namespace="catalog_config"' in src
         catalog_decl = src.split("_catalog_config_cache")[0].rsplit("@cached", 1)[1]
-        assert "l1_ttl=2" in catalog_decl, (
-            "_catalog_config_cache must declare l1_ttl=2 to bound the "
-            "post-PUT staleness window across Cloud Run processes (#930)"
+        assert "l1_ttl=DEFAULT_CONFIG_CACHE_L1_TTL" in catalog_decl, (
+            "_catalog_config_cache must declare l1_ttl=DEFAULT_CONFIG_CACHE_L1_TTL "
+            "to bound the post-PUT staleness window across Cloud Run processes (#930)"
         )
         # Collection-tier
         assert 'namespace="collection_config"' in src
         collection_decl = (
             src.split("_collection_config_cache")[0].rsplit("@cached", 1)[1]
         )
-        assert "l1_ttl=2" in collection_decl
+        assert "l1_ttl=DEFAULT_CONFIG_CACHE_L1_TTL" in collection_decl
 
     def test_platform_config_cache_passes_l1_ttl(self):
         import inspect
         from dynastore.modules.db_config.platform_config_service import (
             PlatformConfigService,
         )
+        from dynastore.tools.cache import DEFAULT_CONFIG_CACHE_L1_TTL
+
+        assert DEFAULT_CONFIG_CACHE_L1_TTL == 2
 
         src = inspect.getsource(PlatformConfigService._setup_cache)
-        assert "l1_ttl=2" in src, (
-            "platform_config cache must declare l1_ttl=2 (#930)"
+        assert "l1_ttl=DEFAULT_CONFIG_CACHE_L1_TTL" in src, (
+            "platform_config cache must declare l1_ttl=DEFAULT_CONFIG_CACHE_L1_TTL (#930)"
         )
 
     def test_storage_router_cache_passes_l1_ttl(self):
         import inspect
         from dynastore.modules.storage import router
+        from dynastore.tools.cache import DEFAULT_CONFIG_CACHE_L1_TTL
+
+        assert DEFAULT_CONFIG_CACHE_L1_TTL == 2
 
         src = inspect.getsource(router)
         router_decl = src.split("_resolve_driver_ids_cached")[0].rsplit("@cached", 1)[1]
-        assert "l1_ttl=2" in router_decl
+        assert "l1_ttl=DEFAULT_CONFIG_CACHE_L1_TTL" in router_decl
 
 
 class TestCachedConditionOnRead:

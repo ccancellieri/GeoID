@@ -1483,6 +1483,15 @@ _notify_backend_upgrade = _notify_backend_change
 
 DEFAULT_MAX_DISTRIBUTED_TTL: float = 3600.0
 
+# Shared TTL/L1-TTL pair for config-like caches (catalog/collection config,
+# platform config, storage router, collection model) that must self-heal
+# within a bounded cross-pod staleness window after invalidation is dropped
+# by an unreliable distributed backend. ``DEFAULT_CONFIG_CACHE_TTL`` bounds
+# the L2 window; ``DEFAULT_CONFIG_CACHE_L1_TTL`` tightens the L1 window so
+# sibling pods converge quickly after a write.
+DEFAULT_CONFIG_CACHE_TTL: float = 300.0
+DEFAULT_CONFIG_CACHE_L1_TTL: float = 2.0
+
 
 def cached(
     maxsize: int = 1024,

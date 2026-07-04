@@ -84,7 +84,7 @@ from dynastore.modules.storage.routing_config import (
 )
 from dynastore.modules.storage.driver_registry import DriverRegistry
 from dynastore.modules.storage.config_cache import get_request_driver_cache
-from dynastore.tools.cache import cached
+from dynastore.tools.cache import cached, DEFAULT_CONFIG_CACHE_TTL, DEFAULT_CONFIG_CACHE_L1_TTL
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +160,13 @@ def _resolve_driver_preferences(hints, entries) -> list:
 # ---------------------------------------------------------------------------
 
 
-@cached(maxsize=4096, ttl=300, namespace="storage_router", distributed=True, l1_ttl=2)
+@cached(
+    maxsize=4096,
+    ttl=DEFAULT_CONFIG_CACHE_TTL,
+    namespace="storage_router",
+    distributed=True,
+    l1_ttl=DEFAULT_CONFIG_CACHE_L1_TTL,
+)
 async def _resolve_driver_ids_cached(
     routing_plugin_cls: "Type[PluginConfig]",
     catalog_id: str,

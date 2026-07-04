@@ -52,7 +52,7 @@ from typing import (
 
 from dataclasses import dataclass, field as dc_field
 
-from dynastore.tools.cache import cached
+from dynastore.tools.cache import cached, DEFAULT_CONFIG_CACHE_TTL, DEFAULT_CONFIG_CACHE_L1_TTL
 
 from dynastore.modules.db_config.query_executor import (
     DDLQuery,
@@ -617,7 +617,10 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
 
     def _setup_cache(self):
         self.get_platform_config_internal_cached = cached(
-            maxsize=64, ttl=300, namespace="platform_config", l1_ttl=2,
+            maxsize=64,
+            ttl=DEFAULT_CONFIG_CACHE_TTL,
+            namespace="platform_config",
+            l1_ttl=DEFAULT_CONFIG_CACHE_L1_TTL,
         )(self._get_platform_config_internal_db)
 
     @asynccontextmanager

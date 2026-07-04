@@ -216,6 +216,21 @@ async def _seed_from_files(
             "config_seeder: bootstrap guard set — skipping non-override seeds.",
         )
 
+    # Fetched once per seeding pass rather than per seed file: ``merged`` is
+    # already deduplicated by class_key, so each iteration only ever checks
+    # membership of its own (unique) class — no iteration's write can change
+    # what a later iteration's check needs to see. A snapshot before the loop
+    # is therefore equivalent to a per-iteration re-query.
+    try:
+        existing_configs: Optional[Dict[type, Any]] = await config_mgr.list_configs()
+    except Exception as exc:  # noqa: BLE001 — degrade to apply-anyway
+        logger.debug(
+            "config_seeder: list_configs failed (%s) — applying seeds without "
+            "skip-if-existing check.",
+            exc,
+        )
+        existing_configs = None
+
     applied = 0
     skipped_initialized = 0
     skipped_unknown = 0
@@ -225,7 +240,7 @@ async def _seed_from_files(
             skipped_initialized += 1
             continue
         try:
-            outcome = await _apply_one(config_mgr, class_key, payload)
+            outcome = await _apply_one(config_mgr, class_key, payload, existing_configs)
         except Exception as exc:  # noqa: BLE001 — never fail boot
             logger.warning(
                 "config_seeder: failed to apply seed for %s: %s",
@@ -266,9 +281,15 @@ async def _seed_from_files(
 
 
 async def _apply_one(
-    config_mgr: Any, class_key: str, payload: Dict[str, Any],
+    config_mgr: Any,
+    class_key: str,
+    payload: Dict[str, Any],
+    existing_configs: Optional[Dict[type, Any]],
 ) -> str:
     """Apply a single seed payload.
+
+    ``existing_configs`` is the ``list_configs()`` snapshot taken once by the
+    caller before the seeding loop started (see ``_seed_from_files``).
 
     Returns one of: ``"applied"``, ``"skipped_existing"``,
     ``"skipped_unknown_class"``, ``"rejected_bad_value"``.
@@ -286,20 +307,12 @@ async def _apply_one(
     # Skip when a row already exists and override is False. ``get_config``
     # always returns *something* (defaults materialised on demand) so we
     # use ``list_configs`` to distinguish "stored row" from "default".
-    if not override:
-        try:
-            existing = await config_mgr.list_configs()
-            if cls in existing:
-                logger.info(
-                    "config_seeder: %s already present — skipping (override=false).",
-                    class_key,
-                )
-                return "skipped_existing"
-        except Exception as exc:  # noqa: BLE001 — degrade to apply-anyway
-            logger.debug(
-                "config_seeder: list_configs failed (%s) — applying %s anyway.",
-                exc, class_key,
-            )
+    if not override and existing_configs is not None and cls in existing_configs:
+        logger.info(
+            "config_seeder: %s already present — skipping (override=false).",
+            class_key,
+        )
+        return "skipped_existing"
 
     config = cls.model_validate(value)
     await config_mgr.set_config(cls, config)

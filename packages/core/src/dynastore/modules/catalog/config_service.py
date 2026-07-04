@@ -19,7 +19,7 @@
 import logging
 import json
 from typing import Optional, Dict, Any, Tuple, Type, Union
-from dynastore.tools.cache import cached
+from dynastore.tools.cache import cached, DEFAULT_CONFIG_CACHE_TTL, DEFAULT_CONFIG_CACHE_L1_TTL
 from dynastore.modules.storage.router import invalidate_router_cache
 
 
@@ -137,10 +137,10 @@ def _resolve(config_cls: "Union[str, Type[PluginConfig]]") -> "tuple[Type[Plugin
 
 @cached(
     maxsize=8192,
-    ttl=300,
+    ttl=DEFAULT_CONFIG_CACHE_TTL,
     namespace="catalog_config",
     ignore=["engine", "catalog_manager"],
-    l1_ttl=2,
+    l1_ttl=DEFAULT_CONFIG_CACHE_L1_TTL,
     condition=lambda v: v is not None,
 )
 async def _catalog_config_cache(
@@ -166,10 +166,10 @@ async def _catalog_config_cache(
 
 @cached(
     maxsize=16384,
-    ttl=300,
+    ttl=DEFAULT_CONFIG_CACHE_TTL,
     namespace="collection_config",
     ignore=["engine", "catalog_manager"],
-    l1_ttl=2,
+    l1_ttl=DEFAULT_CONFIG_CACHE_L1_TTL,
     condition=lambda v: v is not None,
 )
 async def _collection_config_cache(

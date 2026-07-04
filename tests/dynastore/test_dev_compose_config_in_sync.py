@@ -83,25 +83,28 @@ def test_instance_json_service_name_matches_dir(svc: str):
 
 
 def test_defaults_content_identical_across_services():
-    """Every ``defaults/*.json`` must be byte-identical across all five
-    service dirs. Catalog is the canonical reference; differences are
-    reported as service → diverging filenames so a CI failure points
-    straight at the file that drifted.
+    """Every ``defaults/<name>.json`` shared by two or more config dirs must
+    be byte-identical across all the dirs that carry it.
+
+    Not every filename is expected in every dir — e.g. ``idp-config.json``
+    only ships to the auth-fronting services and ``task-routing-config.json``
+    only to ``worker`` — so this compares content per-filename across
+    whichever dirs happen to hold it, rather than requiring the full set of
+    filenames to match everywhere. ``example`` is included: it is docs-only
+    (never copied into an image) but the README explicitly claims its
+    ``defaults/`` is covered by this drift check.
     """
-    canonical = _read_defaults_tree("catalog")
+    dirs = _SERVICES + ("example",)
+    trees = {d: _read_defaults_tree(d) for d in dirs}
+    all_names = {name for tree in trees.values() for name in tree}
+
     drift: dict[str, list[str]] = {}
-    for svc in _SERVICES:
-        if svc == "catalog":
-            continue
-        svc_tree = _read_defaults_tree(svc)
-        diverged = sorted(
-            name for name in (set(canonical) | set(svc_tree))
-            if canonical.get(name) != svc_tree.get(name)
-        )
-        if diverged:
-            drift[svc] = diverged
+    for name in sorted(all_names):
+        contents = {d: tree[name] for d, tree in trees.items() if name in tree}
+        if len(set(contents.values())) > 1:
+            drift[name] = sorted(contents)
     assert not drift, (
-        f"docker/config/<svc>/defaults/*.json has drifted from catalog/: {drift}. "
-        "Re-sync by copying catalog/defaults/<file> over the others, or update "
-        "catalog/defaults/<file> to be the new canonical version."
+        f"docker/config/<dir>/defaults/ has diverging copies of: {drift}. "
+        "Every dir sharing a defaults/<file>.json must keep it byte-identical "
+        "— re-sync from whichever copy is canonical."
     )

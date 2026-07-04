@@ -19,7 +19,7 @@
 import logging
 import json
 from typing import FrozenSet, List, Optional, Any, Dict, Tuple, Union, Set, TYPE_CHECKING
-from dynastore.tools.cache import cached
+from dynastore.tools.cache import cached, DEFAULT_CONFIG_CACHE_TTL, DEFAULT_CONFIG_CACHE_L1_TTL
 from dynastore.models.driver_context import DriverContext
 
 if TYPE_CHECKING:
@@ -70,8 +70,8 @@ def _unmark_confirmed_active(catalog_id: str, collection_id: str) -> None:
     maxsize=1024,
     namespace="collection_model",
     ignore=["service"],
-    ttl=300,
-    l1_ttl=2,
+    ttl=DEFAULT_CONFIG_CACHE_TTL,
+    l1_ttl=DEFAULT_CONFIG_CACHE_L1_TTL,
 )
 async def _collection_model_cache(
     service: "CollectionService", catalog_id: str, collection_id: str
