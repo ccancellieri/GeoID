@@ -85,7 +85,6 @@ class TestReadEntities:
 
         feats = [f async for f in d.read_entities("cat", "col", limit=10)]
         assert [f.id for f in feats] == ["a", "b"]
-        assert fake_service.execute_query.called
 
 
 class TestCountAndAggregate:

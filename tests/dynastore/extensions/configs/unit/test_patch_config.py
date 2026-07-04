@@ -89,8 +89,11 @@ async def test_patch_platform_updates_multiple_configs():
     assert "tiles_config" in result["updated"]
     assert "features_plugin_config" in result["updated"]
 
-    # Verify set_config was called twice
-    assert config_svc.set_config.call_count == 2
+    # `result["updated"]` only lists the touched plugin_ids, not the values
+    # written — check the persisted store to confirm each config landed
+    # with its own new value rather than one overwriting the other.
+    assert stored[("TilesConfig", None, None)].enabled is False
+    assert stored[("FeaturesPluginConfig", None, None)].enabled is True
 
 
 @pytest.mark.asyncio
