@@ -143,7 +143,8 @@ class PostgisTileSource(TileSourceProtocol):
             )
         except ValueError as exc:
             # Storage resolution failed mid-pipeline (e.g. driver config has no
-            # physical_table). Treat as "no features for this tile" so the
-            # caller can still emit a valid (possibly-empty) response.
+            # physical_table) — the render was never attempted, so this is
+            # `None` (not cacheable), distinct from `tiles_db`'s `b""` return
+            # for a query that ran and confirmed zero features (cacheable).
             logger.warning("PostgisTileSource: render skipped (storage unresolved): %s", exc)
             return None

@@ -1051,25 +1051,35 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             # instead of surfacing a 500; any other query failure still
             # propagates to the generic error handler.
             statement_timeout_ms = int(tiles_config.live_tile_timeout_seconds * 1000)
+            render_task: Optional["asyncio.Task[Optional[bytes]]"] = None
             try:
                 await DQLQuery(
                     f"SET LOCAL statement_timeout = {statement_timeout_ms}",
                     result_handler=ResultHandler.NONE,
                 ).execute(conn)
-                mvt_content = await tiles_engine.render_tile(
-                    conn,
-                    ctx,
-                    str(z),
-                    x,
-                    y,
-                    format=format,
-                    use_l1_cache=True,
-                    datetime_str=datetime,
-                    cql_filter=filter,
-                    subset_params=subset,  # type: ignore[arg-type]
-                    simplification=simplification,
-                    simplification_algorithm=simplification_algorithm,
+                # Render as a standalone task, awaited behind `shield` (#2898):
+                # a client disconnect cancels this coroutine, but `shield`
+                # leaves `render_task` running rather than cancelling it too,
+                # so a heavy render already under way isn't discarded. The
+                # `SET LOCAL statement_timeout` just above still bounds how
+                # long it can run either way.
+                render_task = asyncio.ensure_future(
+                    tiles_engine.render_tile(
+                        conn,
+                        ctx,
+                        str(z),
+                        x,
+                        y,
+                        format=format,
+                        use_l1_cache=True,
+                        datetime_str=datetime,
+                        cql_filter=filter,
+                        subset_params=subset,  # type: ignore[arg-type]
+                        simplification=simplification,
+                        simplification_algorithm=simplification_algorithm,
+                    )
                 )
+                mvt_content = await asyncio.shield(render_task)
             except QueryExecutionError as exc:
                 pgcode = getattr(exc.original_exception, "pgcode", None)
                 if pgcode != _QUERY_CANCELED_PGCODE:
@@ -1082,10 +1092,43 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                     dataset, collections, z, x, y,
                 )
                 mvt_content = None
+            except asyncio.CancelledError:
+                if render_task is not None and not render_task.done():
+                    # The client already gave up, so there is no response
+                    # left to send — only the cache write-back and `conn`
+                    # (still in use by the render) are left to finish.
+                    # Ownership of `conn` moves to the done-callback below;
+                    # the handler's own `finally` must not close it out from
+                    # under the still-running render.
+                    cache_id = (
+                        collections
+                        if len(requested_cols_list) > 1
+                        else requested_cols_list[0]
+                    )
+                    effective_cache_id = (
+                        f"{cache_id}@{params_hash}" if params_hash else cache_id
+                    )
+                    provider = (
+                        get_protocol(TileStorageProtocol)
+                        if cache_enabled and not disable_cache
+                        else None
+                    )
+                    render_task.add_done_callback(
+                        self._make_shielded_render_callback(
+                            conn, provider, dataset, effective_cache_id,
+                            tileMatrixSetId, z, x, y, format,
+                        )
+                    )
+                    _conn = None
+                raise
 
             # 9. Background Caching
+            # `mvt_content is not None` (not truthy) so a confirmed-empty
+            # render (`b""` — zero features, distinct from the `None` a
+            # failed/aborted render leaves above) is persisted too; otherwise
+            # every empty tile re-renders from PostGIS on every request.
             effective_cache_enabled = cache_enabled and not disable_cache
-            if mvt_content and effective_cache_enabled:
+            if mvt_content is not None and effective_cache_enabled:
                 cache_id = (
                     collections
                     if len(requested_cols_list) > 1
@@ -1188,6 +1231,82 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         return Response(status_code=499)
 
     @staticmethod
+    def _make_shielded_render_callback(
+        conn: AsyncConnection,
+        provider: Optional[TileStorageProtocol],
+        dataset: str,
+        effective_cache_id: str,
+        tms_id: str,
+        z: int,
+        x: int,
+        y: int,
+        format: str,
+    ):
+        """Build the ``add_done_callback`` for a render shielded past a
+        client disconnect (#2898).
+
+        ``add_done_callback`` requires a plain (non-async) callable, so this
+        returns one that schedules the actual persistence coroutine —
+        ``_persist_shielded_render`` — as a detached task.
+        """
+
+        def _on_done(task: "asyncio.Task[Optional[bytes]]") -> None:
+            asyncio.ensure_future(
+                TilesService._persist_shielded_render(
+                    task, conn, provider, dataset, effective_cache_id,
+                    tms_id, z, x, y, format,
+                )
+            )
+
+        return _on_done
+
+    @staticmethod
+    async def _persist_shielded_render(
+        render_task: "asyncio.Task[Optional[bytes]]",
+        conn: AsyncConnection,
+        provider: Optional[TileStorageProtocol],
+        dataset: str,
+        effective_cache_id: str,
+        tms_id: str,
+        z: int,
+        x: int,
+        y: int,
+        format: str,
+    ) -> None:
+        """Persist a render that outlived the (already-cancelled) request
+        that started it, then close the connection handed off to it.
+
+        The client is long gone by the time this runs, so there is nothing
+        left to serve — only the cache write-back (skipped on render failure
+        or when caching is disabled) and closing ``conn``.
+        """
+        try:
+            if render_task.cancelled():
+                return
+            exc = render_task.exception()
+            if exc is not None:
+                logger.warning(
+                    "get_vector_tile: shielded render failed after disconnect "
+                    "catalog=%s collection=%s z=%s x=%s y=%s: %s",
+                    dataset, effective_cache_id, z, x, y, exc,
+                )
+                return
+            result = render_task.result()
+            if result is not None and provider is not None:
+                try:
+                    await provider.save_tile(
+                        dataset, effective_cache_id, tms_id, z, x, y, result, format,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "get_vector_tile: post-disconnect save_tile failed "
+                        "catalog=%s collection=%s z=%s x=%s y=%s: %s",
+                        dataset, effective_cache_id, z, x, y, exc,
+                    )
+        finally:
+            await conn.close()
+
+    @staticmethod
     async def _resolve_request_config(
         config_manager, dataset: str
     ) -> TilesConfig:
@@ -1286,7 +1405,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         except Exception as exc:
             logger.warning("tile_cache: proxy lookup failed: %s", exc)
             return None
-        if tile:
+        if tile is not None:
             duration_ms = (time.perf_counter() - start_time) * 1000
             if serve_mode == "redirect":
                 # Proxy returned bytes while redirect mode is active.
@@ -1309,6 +1428,13 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 "z=%s x=%s y=%s duration_ms=%.2f bytes=%d",
                 dataset, cache_id, z, x, y, duration_ms, len(tile),
             )
+            if not tile:
+                # Confirmed-empty tile cached from a prior render — serve 204
+                # without falling through to a fresh PostGIS render.
+                return Response(
+                    status_code=204,
+                    headers={"X-Tile-Cache": "hit", "X-Tile-Source": "bucket_proxy"},
+                )
             return Response(
                 content=tile,
                 media_type="application/vnd.mapbox-vector-tile",
@@ -1498,13 +1624,22 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             tile = await provider.get_tile(
                 catalog_id, cache_key, tms_id, z, x, y, fmt
             )
-            if tile:
+            if tile is not None:
                 duration_ms = (time.perf_counter() - start) * 1000
                 logger.info(
                     "map_tile: cache=hit source=bucket_proxy catalog=%s "
                     "cache_key=%s z=%s x=%s y=%s duration_ms=%.2f bytes=%d",
                     catalog_id, cache_key, z, x, y, duration_ms, len(tile),
                 )
+                if not tile:
+                    return Response(
+                        status_code=204,
+                        headers={
+                            "X-Render-Cache": "hit",
+                            "X-Render-Source": "bucket_proxy",
+                            "Cache-Control": f"public, max-age={cfg.ttl_seconds}",
+                        },
+                    )
                 media_type = _FORMAT_MEDIA_TYPE.get(fmt, "application/octet-stream")
                 return Response(
                     content=tile,
@@ -1810,13 +1945,18 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             cached = await provider.get_tile(
                 internal_catalog_id, cache_id, tms_id, z, x, y, "png"
             )
-            if cached:
+            if cached is not None:
                 duration_ms = (time.perf_counter() - start) * 1000
                 logger.info(
                     "map_tile: cache=hit source=tile_storage catalog=%s cache_id=%s "
                     "z=%s x=%s y=%s duration_ms=%.2f bytes=%d",
                     internal_catalog_id, cache_id, z, x, y, duration_ms, len(cached),
                 )
+                if not cached:
+                    return Response(
+                        status_code=204,
+                        headers={"X-Render-Cache": "hit", "X-Render-Source": "tile_storage"},
+                    )
                 return Response(
                     content=cached,
                     media_type="image/png",
@@ -1864,6 +2004,15 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         finally:
             await conn.close()
 
+        # Persist on `is not None` (not truthy) so a confirmed-empty render
+        # (`b""` — zero features) is cached too; otherwise every empty tile
+        # re-renders from PostGIS on every request (#2898).
+        if tile_bytes is not None and provider and cache_enabled:
+            background_tasks.add_task(
+                provider.save_tile,
+                internal_catalog_id, cache_id, tms_id, z, x, y, tile_bytes, "png",
+            )
+
         if not tile_bytes:
             duration_ms = (time.perf_counter() - start) * 1000
             logger.info(
@@ -1872,12 +2021,6 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 internal_catalog_id, internal_collection_id, z, x, y, duration_ms,
             )
             return Response(status_code=204)
-
-        if provider and cache_enabled:
-            background_tasks.add_task(
-                provider.save_tile,
-                internal_catalog_id, cache_id, tms_id, z, x, y, tile_bytes, "png",
-            )
 
         duration_ms = (time.perf_counter() - start) * 1000
         logger.info(

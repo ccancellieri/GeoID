@@ -163,7 +163,9 @@ async def test_render_tile_falls_back_to_postgis_when_mvt_cache_absent(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_render_tile_returns_none_when_no_features_found(monkeypatch):
+async def test_render_tile_returns_empty_bytes_when_no_features_found(monkeypatch):
+    """A query that runs and confirms zero features is a cacheable empty
+    tile (`b""`), distinct from an attempt-failure (`None`) — #2898."""
     import dynastore.extensions.maps.maps_png_tilesource as mod
 
     full = 20037508.342789244
@@ -188,4 +190,4 @@ async def test_render_tile_returns_none_when_no_features_found(monkeypatch):
         x=0,
         y=0,
     )
-    assert result is None
+    assert result == b""

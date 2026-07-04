@@ -217,8 +217,12 @@ class MapsPngTileSource(TileSourceProtocol):
             # convention for the same renderer call.
             render_srid = meta.get("source_srid") or target_srid
 
-        if not layers_data:
+        if layers_data is None:
             return None
+        if not layers_data:
+            # Query ran and confirmed zero features — cacheable empty tile,
+            # distinct from the `None` attempt-failure returns above.
+            return b""
 
         return await run_in_thread(
             render_map_image,

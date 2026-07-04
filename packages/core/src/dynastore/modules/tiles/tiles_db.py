@@ -338,6 +338,12 @@ async def get_features_as_mvt_filtered(
     )
     logger.info(f"target_srid value: {all_bind_params.get('target_srid')}")
 
-    return await DQLQuery(
+    mvt = await DQLQuery(
         full_query, result_handler=ResultHandler.SCALAR_ONE_OR_NONE
     ).execute(conn, **all_bind_params)
+    # ST_AsMVT is an aggregate over `mvtgeom`, which this query always
+    # executes as a single row (no GROUP BY) — the only way this comes back
+    # None is the aggregate itself being NULL, i.e. zero features matched.
+    # Distinguish that confirmed-empty tile (`b""`, cacheable) from the
+    # earlier resolution failures above (`None`, not cacheable).
+    return mvt if mvt is not None else b""

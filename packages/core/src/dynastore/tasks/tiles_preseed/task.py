@@ -280,7 +280,11 @@ class TilePreseedTask(
                                     simplification_algorithm=runtime_config.simplification_algorithm
                                     or SimplificationAlgorithm.TOPOLOGY_PRESERVING,
                                 )
-                                if data:
+                                # `is not None` (not truthy) so a confirmed-
+                                # empty render (`b""` — zero features) is
+                                # persisted too, matching the live serving
+                                # path's cache discipline (#2898).
+                                if data is not None:
                                     await storage.save_tile(
                                         catalog_id=catalog_id, collection_id=col_id,
                                         tms_id=tms_id, z=z, x=tile.x, y=tile.y,

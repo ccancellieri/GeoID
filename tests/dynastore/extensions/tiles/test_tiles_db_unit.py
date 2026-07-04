@@ -124,6 +124,67 @@ async def test_get_features_as_mvt_filtered_query_structure():
 
 
 @pytest.mark.asyncio
+async def test_get_features_as_mvt_filtered_returns_empty_bytes_for_zero_features():
+    """``ST_AsMVT`` is a no-``GROUP BY`` aggregate over ``mvtgeom``, so the
+    final query always returns exactly one row — the *only* way its scalar
+    value comes back ``None`` is the aggregate itself being NULL, i.e. zero
+    matched features. That confirmed-empty tile must surface as ``b""``
+    (cacheable), not ``None`` (reserved for the earlier resolution-failure
+    return paths) — #2898."""
+    conn = AsyncMock()
+
+    with patch("dynastore.modules.tiles.tiles_db.DQLQuery") as MockDQLQuery:
+        mock_execute = AsyncMock()
+        mock_execute.side_effect = [
+            True,  # srid_exists
+            None,  # ST_AsMVT aggregate NULL — zero features in the tile
+        ]
+        MockDQLQuery.return_value.execute = mock_execute
+
+        tms_def = MagicMock(spec=TileMatrixSet)
+        tms_def.tileMatrices = [
+            MagicMock(
+                id="0", pointOfOrigin=[-180, 90],
+                tileWidth=256, tileHeight=256, cellSize=0.703125,
+            )
+        ]
+
+        with patch("dynastore.modules.get_protocol") as mock_get_module:
+            mock_config_manager = AsyncMock()
+            mock_config_manager.get_config.return_value = None
+            mock_catalog_module = MagicMock()
+            mock_catalog_module.get_config_manager.return_value = mock_config_manager
+            mock_get_module.return_value = mock_catalog_module
+
+            with patch("dynastore.tools.discovery.get_protocol") as mock_get_proto:
+                mock_items = AsyncMock()
+                mock_items.get_features_query.return_value = ("SELECT 1", {})
+                mock_get_proto.return_value = mock_items
+
+                result = await tiles_db.get_features_as_mvt_filtered(
+                    conn=conn,
+                    resolved_collections=[
+                        {
+                            "phys_schema": "s_test",
+                            "phys_table": "my_table",
+                            "source_srid": 4326,
+                            "simplification_by_zoom": {},
+                            "catalog_id": "my_catalog",
+                            "collection_id": "my_collection",
+                            "col_config": MagicMock(),
+                        }
+                    ],
+                    tms_def=tms_def,
+                    target_srid=3857,
+                    z="0",
+                    x=0,
+                    y=0,
+                )
+
+    assert result == b""
+
+
+@pytest.mark.asyncio
 async def test_build_collection_subquery_swallows_value_error(caplog):
     """If items_svc.get_features_query raises ValueError (storage unresolved
     mid-pipeline — e.g. driver config has no physical_table, or catalog row's
