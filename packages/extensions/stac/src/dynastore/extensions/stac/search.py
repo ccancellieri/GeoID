@@ -614,6 +614,21 @@ async def _maybe_dispatch_to_es_search(
     if not getattr(driver, "is_es_items_driver", False):
         return None
 
+    # Routing-honouring fallback (#2894): the ES driver is the configured
+    # search primary, but if its per-tenant items index does not exist (a
+    # recreated catalog whose index has not been (re)provisioned, or one
+    # that never ran the ES-secondary drain) it cannot serve. ``read_entities``
+    # / ``count_entities`` both degrade an index-missing failure to an empty
+    # result (``ignore_unavailable`` / a swallowed ``NotFoundError``) rather
+    # than raising, so the ``try/except`` below never observes it — without
+    # this check STAC search would return a confident ``numberMatched: 0``
+    # for data that is safely persisted in PostgreSQL. Mirrors the same guard
+    # ``item_query._try_driver_dispatch`` and
+    # ``extensions.tools.query.maybe_dispatch_items_to_search_driver`` apply.
+    _index_check = getattr(driver, "index_available", None)
+    if _index_check is not None and not await _index_check(cat_id):
+        return None
+
     # CQL2 filter → ES Query DSL. Only proceed when the driver advertises
     # CQL-ES support AND the filter translates; otherwise PG fallback. The
     # field mapping reuses the same ``QueryOptimizer`` queryables SSOT the PG
