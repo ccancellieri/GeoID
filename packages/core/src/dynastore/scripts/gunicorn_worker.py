@@ -40,6 +40,7 @@ fires. See ``start.sh`` for the paired ``--graceful-timeout`` budget.
 """
 
 import os
+from typing import ClassVar
 
 from uvicorn.workers import UvicornWorker
 
@@ -51,7 +52,7 @@ _DRAIN_SECONDS = int(os.environ.get("GUNICORN_DRAIN_TIMEOUT", "8"))
 class DrainAwareUvicornWorker(UvicornWorker):
     """UvicornWorker with a bounded, rather than indefinite, drain budget."""
 
-    CONFIG_KWARGS = {
+    CONFIG_KWARGS: ClassVar[dict] = {
         **UvicornWorker.CONFIG_KWARGS,
         "timeout_graceful_shutdown": _DRAIN_SECONDS,
     }

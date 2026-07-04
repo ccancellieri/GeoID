@@ -56,7 +56,6 @@ from dynastore.modules.db_config.query_executor import (
     background_managed_transaction,
 )
 from dynastore.tools.background_service import PeriodicService, PodPolicy, ServiceContext
-from dynastore.tools.protocol_helpers import get_engine
 
 logger = logging.getLogger(__name__)
 
