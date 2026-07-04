@@ -319,7 +319,11 @@ async def test_definitions_shape_and_prefixed_alias(monkeypatch: pytest.MonkeyPa
     assert entry["serverMaxZoom"] == 28
     assert entry["digits"] == 255
     assert entry["regionProp"] == "adm0_code"
-    assert entry["uniqueIdProp"] == "adm0_code"
+    # No unique_id_prop registered -- falls back to FID (TerriaJS's own
+    # client-side default), never regionProp: TerriaJS requires uniqueIdProp
+    # to be a numeric, zero-based, sequential feature index, so defaulting
+    # it to a string region code breaks matching.
+    assert entry["uniqueIdProp"] == "FID"
     assert set(entry["aliases"]) == {"country", "adm0_code", "fao_country"}
     assert entry["bbox"] == [10.0, 20.0, 30.0, 40.0]
     assert entry["regionIdsFile"].endswith("/region-mappings/fao_countries/regionIds")
@@ -472,7 +476,12 @@ async def test_definitions_with_cql_filter_bypasses_cache(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
-async def test_region_ids_returns_sorted_distinct_values(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_region_ids_returns_fid_ordered_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TerriaJS positionally matches ``values[i]`` against a feature whose
+    ``uniqueIdProp`` (FID) equals ``i`` -- so this endpoint must fetch via
+    ``fetch_region_ids_by_unique_id`` (FID-ordered), never the
+    deduplicated/alphabetically-sorted ``fetch_distinct_region_ids`` used
+    by the CSV template endpoint."""
     from dynastore.extensions.region_mapping import region_mapping_service as svc
 
     app = _app(monkeypatch, _StubCatalogs({}))
@@ -480,7 +489,13 @@ async def test_region_ids_returns_sorted_distinct_values(monkeypatch: pytest.Mon
         svc._store, "fetch_mapping_primary",
         AsyncMock(return_value={"src_catalog": "fao", "src_collection": "countries", "region_prop": "adm0_code"}),
     )
-    monkeypatch.setattr(svc, "fetch_distinct_region_ids", AsyncMock(return_value=["DEU", "FRA", "ITA"]))
+    captured: Dict[str, Any] = {}
+
+    async def _fetch_region_ids_by_unique_id(*args: Any) -> list:
+        captured["args"] = args
+        return ["FRA", "FRA", "DEU"]
+
+    monkeypatch.setattr(svc, "fetch_region_ids_by_unique_id", _fetch_region_ids_by_unique_id)
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -490,7 +505,39 @@ async def test_region_ids_returns_sorted_distinct_values(monkeypatch: pytest.Mon
     body = resp.json()
     assert body["layer"] == "default"
     assert body["property"] == "adm0_code"
-    assert body["values"] == ["DEU", "FRA", "ITA"]
+    assert body["values"] == ["FRA", "FRA", "DEU"]
+    # unique_id_prop defaults to FID (TerriaJS's own client-side default)
+    # when the mapping never explicitly registered one.
+    assert captured["args"] == ("fao", "countries", "adm0_code", "FID")
+
+
+@pytest.mark.asyncio
+async def test_region_ids_uses_registered_unique_id_prop_when_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    app = _app(monkeypatch, _StubCatalogs({}))
+    monkeypatch.setattr(
+        svc._store, "fetch_mapping_primary",
+        AsyncMock(return_value={
+            "src_catalog": "fao", "src_collection": "countries",
+            "region_prop": "adm0_code", "unique_id_prop": "row_index",
+        }),
+    )
+    captured: Dict[str, Any] = {}
+
+    async def _fetch_region_ids_by_unique_id(*args: Any) -> list:
+        captured["args"] = args
+        return ["DEU"]
+
+    monkeypatch.setattr(svc, "fetch_region_ids_by_unique_id", _fetch_region_ids_by_unique_id)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.get("/region-mappings/fao_countries/regionIds")
+
+    assert captured["args"] == ("fao", "countries", "adm0_code", "row_index")
 
 
 @pytest.mark.asyncio

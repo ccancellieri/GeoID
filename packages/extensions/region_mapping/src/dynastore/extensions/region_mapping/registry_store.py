@@ -44,6 +44,7 @@ from .claims import (
     compute_claim_set,
     fetch_collection_bbox,
     fetch_distinct_region_ids,
+    fetch_region_ids_by_unique_id,
     mapping_id_for,
 )
 
@@ -305,3 +306,4 @@ def invalidate_serving_caches() -> None:
     cache_clear(fetch_mapping_primary)
     cache_clear(fetch_collection_bbox)
     cache_clear(fetch_distinct_region_ids)
+    cache_clear(fetch_region_ids_by_unique_id)

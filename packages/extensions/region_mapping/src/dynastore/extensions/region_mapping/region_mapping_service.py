@@ -81,7 +81,11 @@ from dynastore.tools.protocol_helpers import get_engine
 
 from . import registry_queries as _q
 from . import registry_store as _store
-from .claims import fetch_collection_bbox, fetch_distinct_region_ids
+from .claims import (
+    fetch_collection_bbox,
+    fetch_distinct_region_ids,
+    fetch_region_ids_by_unique_id,
+)
 from .config import RegionMappingConfig
 from .lifecycle import register_region_mapping_cleanup_subscriber
 from .templates import render_definitions
@@ -152,8 +156,9 @@ class RegisterMappingRequest(BaseModel):
     unique_id_prop: Optional[str] = Field(
         default=None,
         description=(
-            "TerriaJS uniqueIdProp, when it differs from regionProp (`column`). "
-            "Defaults to `column` if not given."
+            "TerriaJS uniqueIdProp: a numeric, zero-based, sequential feature "
+            "index attribute used for positional row lookups -- NOT the region "
+            "code (`column`/regionProp). Defaults to `FID` if not given."
         ),
     )
     digits: int = Field(
@@ -336,7 +341,7 @@ async def _build_definitions(
             "server_min_zoom": record.get("server_min_zoom", 0),
             "server_max_native_zoom": record.get("server_max_native_zoom", 12),
             "server_max_zoom": record.get("server_max_zoom", 28),
-            "unique_id_prop": record.get("unique_id_prop") or region_prop,
+            "unique_id_prop": record.get("unique_id_prop") or "FID",
             "digits": record.get("digits", 255),
         })
     return render_definitions(entries)
@@ -531,8 +536,10 @@ class RegionMappingService(ExtensionProtocol):
                 status_code=404, detail=f"Region mapping {mapping_id!r} not found.",
             )
         region_prop = record.get("region_prop", "")
-        values = await fetch_distinct_region_ids(
-            record.get("src_catalog", ""), record.get("src_collection", ""), region_prop,
+        unique_id_prop = record.get("unique_id_prop") or "FID"
+        values = await fetch_region_ids_by_unique_id(
+            record.get("src_catalog", ""), record.get("src_collection", ""),
+            region_prop, unique_id_prop,
         )
         return {"layer": "default", "property": region_prop, "values": values}
 

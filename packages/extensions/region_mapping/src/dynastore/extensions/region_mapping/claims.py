@@ -246,3 +246,93 @@ async def fetch_distinct_region_ids(
             sql, result_handler=ResultHandler.ALL_SCALARS,
         ).execute(conn, **params)
     return sorted(str(v) for v in (values or []))
+
+
+@cached(maxsize=128, ttl=120, namespace="region_mapping_region_ids_by_unique_id")
+async def fetch_region_ids_by_unique_id(
+    src_catalog: str, src_collection: str, region_prop: str, unique_id_prop: str,
+) -> List[Optional[str]]:
+    """Per-feature ``region_prop`` values, positioned by ``unique_id_prop``.
+
+    TerriaJS's MVT region matching (``RegionProvider.processRegionIds``)
+    treats the returned array's *index* as a feature's ``uniqueIdProp``
+    value: ``values[i]`` must be the region code of the feature whose
+    ``uniqueIdProp`` equals ``i``. This is the opposite shape from
+    ``fetch_distinct_region_ids`` (deduplicated, alphabetically sorted —
+    for CSV templates): here every feature contributes one entry (region
+    codes may repeat, e.g. many admin-1 features sharing one country
+    code), indexed by its numeric unique id. Assumes ``unique_id_prop`` is
+    dense and zero-based per TerriaJS's own contract; positions with no
+    matching feature (e.g. a gap from a soft-deleted row) are ``None``,
+    which TerriaJS treats as an unmatched region rather than erroring.
+    """
+    catalogs = get_protocol(CatalogsProtocol)
+    configs = get_protocol(ConfigsProtocol)
+    if catalogs is None or configs is None:
+        return []
+
+    phys_schema = await catalogs.resolve_physical_schema(src_catalog, allow_missing=True)
+    col_config = await configs.get_config(
+        ItemsPostgresqlDriverConfig,
+        catalog_id=src_catalog,
+        collection_id=src_collection,
+    )
+    phys_table = col_config.physical_table
+    if not phys_schema or not phys_table:
+        return []
+
+    attrs_config = _find_attributes_sidecar(col_config)
+    if attrs_config is None:
+        return []
+    attrs_sidecar = SidecarRegistry.get_sidecar(attrs_config, lenient=True)
+    if not isinstance(attrs_sidecar, FeatureAttributeSidecar):
+        return []
+
+    schema = validate_sql_identifier(phys_schema)
+    hub_table = validate_sql_identifier(phys_table)
+    attrs_table = validate_sql_identifier(
+        sidecar_table_name(phys_table, attrs_config.sidecar_id)
+    )
+
+    params: Dict[str, Any] = {}
+    if attrs_sidecar.resolved_storage_mode == AttributeStorageMode.COLUMNAR:
+        declared = {attr.name for attr in (attrs_config.attribute_schema or [])}
+        if region_prop not in declared or unique_id_prop not in declared:
+            # Claimed property (or the unique-id column) isn't a
+            # materialised column on this columnar collection.
+            return []
+        region_col = validate_column_identifier(region_prop)
+        fid_col = validate_column_identifier(unique_id_prop)
+        region_expr = f's."{region_col}"'
+        fid_expr = f's."{fid_col}"'
+    else:
+        jsonb_col = validate_column_identifier(attrs_config.jsonb_column_name)
+        region_expr = f's."{jsonb_col}" ->> :region_prop'
+        fid_expr = f'(s."{jsonb_col}" ->> :unique_id_prop)::int'
+        params["region_prop"] = region_prop
+        params["unique_id_prop"] = unique_id_prop
+
+    sql = (
+        f'SELECT {region_expr} AS region_value, {fid_expr} AS fid '
+        f'FROM "{schema}"."{hub_table}" h '
+        f'JOIN "{schema}"."{attrs_table}" s ON s.geoid = h.geoid '
+        f'WHERE h.deleted_at IS NULL AND {region_expr} IS NOT NULL '
+        f'AND {fid_expr} IS NOT NULL '
+        f'ORDER BY fid ASC'
+    )
+
+    engine = get_engine()
+    if engine is None:
+        return []
+    async with managed_transaction(engine) as conn:
+        rows = await DQLQuery(
+            sql, result_handler=ResultHandler.ALL_DICTS,
+        ).execute(conn, **params)
+    if not rows:
+        return []
+
+    max_fid = max(int(row["fid"]) for row in rows)
+    ordered: List[Optional[str]] = [None] * (max_fid + 1)
+    for row in rows:
+        ordered[int(row["fid"])] = str(row["region_value"])
+    return ordered

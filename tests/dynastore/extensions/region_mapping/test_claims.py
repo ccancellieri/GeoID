@@ -239,14 +239,20 @@ def _protocol_router(*, catalogs: Any = None, configs: Any = None):
 
 @pytest.fixture(autouse=True)
 def _reset_caches():
-    from dynastore.extensions.region_mapping.claims import fetch_collection_bbox, fetch_distinct_region_ids
+    from dynastore.extensions.region_mapping.claims import (
+        fetch_collection_bbox,
+        fetch_distinct_region_ids,
+        fetch_region_ids_by_unique_id,
+    )
     from dynastore.tools.cache import cache_clear
 
     cache_clear(fetch_collection_bbox)
     cache_clear(fetch_distinct_region_ids)
+    cache_clear(fetch_region_ids_by_unique_id)
     yield
     cache_clear(fetch_collection_bbox)
     cache_clear(fetch_distinct_region_ids)
+    cache_clear(fetch_region_ids_by_unique_id)
 
 
 @pytest.mark.asyncio
@@ -368,4 +374,89 @@ async def test_fetch_distinct_region_ids_columnar_rejects_undeclared_field(
     )
 
     values = await claims.fetch_distinct_region_ids("fao", "countries", "not_declared")
+    assert values == []
+
+
+# ---------------------------------------------------------------------------
+# fetch_region_ids_by_unique_id -- FID-ordered (not deduplicated/sorted)
+# per-feature values, for TerriaJS's positional uniqueIdProp matching. Only
+# guard clauses are unit-tested here; the query itself is covered by a real-PG
+# integration test.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fetch_region_ids_by_unique_id_no_protocols_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dynastore.extensions.region_mapping import claims
+
+    monkeypatch.setattr(claims, "get_protocol", _protocol_router())
+
+    values = await claims.fetch_region_ids_by_unique_id("fao", "countries", "adm0_code", "FID")
+    assert values == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_region_ids_by_unique_id_no_physical_table_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dynastore.extensions.region_mapping import claims
+    from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
+
+    catalogs = _StubCatalogs()
+    configs = _StubConfigs(ItemsPostgresqlDriverConfig())  # physical_table unset -> pending collection
+    monkeypatch.setattr(
+        claims, "get_protocol", _protocol_router(catalogs=catalogs, configs=configs),
+    )
+
+    values = await claims.fetch_region_ids_by_unique_id("fao", "countries", "adm0_code", "FID")
+    assert values == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_region_ids_by_unique_id_no_attributes_sidecar_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dynastore.extensions.region_mapping import claims
+    from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
+
+    catalogs = _StubCatalogs()
+    col_config = ItemsPostgresqlDriverConfig(physical_table="t_abc123", sidecars=[])
+    configs = _StubConfigs(col_config)
+    monkeypatch.setattr(
+        claims, "get_protocol", _protocol_router(catalogs=catalogs, configs=configs),
+    )
+
+    values = await claims.fetch_region_ids_by_unique_id("fao", "countries", "adm0_code", "FID")
+    assert values == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_region_ids_by_unique_id_columnar_rejects_undeclared_unique_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A columnar collection whose ``attribute_schema`` declares the region
+    property but not the unique-id column has nothing to order by -- guard
+    clause short-circuits before any SQL is built."""
+    from dynastore.extensions.region_mapping import claims
+    from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
+    from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
+        AttributeSchemaEntry,
+        AttributeStorageMode,
+        FeatureAttributeSidecarConfig,
+    )
+
+    attrs = FeatureAttributeSidecarConfig(
+        storage_mode=AttributeStorageMode.COLUMNAR,
+        attribute_schema=[AttributeSchemaEntry(name="adm0_code")],
+    )
+    col_config = ItemsPostgresqlDriverConfig(physical_table="t_abc123", sidecars=[attrs])
+    catalogs = _StubCatalogs()
+    configs = _StubConfigs(col_config)
+    monkeypatch.setattr(
+        claims, "get_protocol", _protocol_router(catalogs=catalogs, configs=configs),
+    )
+
+    values = await claims.fetch_region_ids_by_unique_id("fao", "countries", "adm0_code", "FID")
     assert values == []
