@@ -321,6 +321,100 @@ async def test_cancellation_drains_rollback_before_pool_release(monkeypatch):
     assert exits and exits[-1] == "exit:CancelledError", log
     assert log.index("exit:CancelledError") < log.index("close"), log
     assert conn.closed is True
+    # #2900: a cancellation mid-transaction leaves the ROLLBACK's wire-level
+    # completion unverified from the caller's perspective — invalidate rather
+    # than return the connection to the pool unmarked.
+    assert conn.invalidated_count == 1, log
+    assert "invalidate" in log
+    assert log.index("invalidate") < log.index("close"), log
+
+
+@pytest.mark.asyncio
+async def test_failed_rollback_drain_invalidates_connection(monkeypatch):
+    """#2900: when the shielded best-effort rollback (``_drain_rollback_exit``)
+    itself raises, the connection's state is unverified — it must be
+    invalidated instead of returned to the pool unmarked. The ORIGINAL body
+    exception must still be the one re-raised, not masked by the drain
+    failure."""
+
+    qe = _patch_async_engine(monkeypatch)
+    _silence_sleep(monkeypatch, qe)
+
+    log: List[str] = []
+
+    class _FailingExitTx:
+        def __init__(self, sink: List[str]):
+            self._sink = sink
+
+        async def __aenter__(self):
+            self._sink.append("begin")
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self._sink.append(f"exit_raises:{exc_type.__name__ if exc_type else None}")
+            raise RuntimeError("rollback drain failed")
+
+    class _FailingDrainConn(_FakeConn):
+        def begin(self):  # type: ignore[override]
+            self.begin_count += 1
+            return _FailingExitTx(self._log)
+
+    conn = _FailingDrainConn(poisoned=False, log=log)
+    engine = _FakeEngine([conn])
+
+    async def _body():
+        async with qe.managed_transaction(engine):
+            raise RuntimeError("body failed")
+
+    with pytest.raises(RuntimeError, match="body failed"):
+        await _body()
+
+    assert "exit_raises:RuntimeError" in log, log
+    assert conn.invalidated_count == 1, log
+    assert conn.closed is True
+
+
+@pytest.mark.asyncio
+async def test_transient_asyncpg_body_error_invalidates_exactly_once(monkeypatch):
+    """Negative control: a transient asyncpg error raised from the body still
+    invalidates via the existing branch, and the new cancel/drain-failure
+    check does not double-invalidate on top of it."""
+    qe = _patch_async_engine(monkeypatch)
+    _silence_sleep(monkeypatch, qe)
+
+    log: List[str] = []
+
+    class _TrackingTx:
+        def __init__(self, sink: List[str]):
+            self._sink = sink
+
+        async def __aenter__(self):
+            self._sink.append("begin")
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self._sink.append(f"exit:{exc_type.__name__ if exc_type else None}")
+            return False
+
+    class _TransientConn(_FakeConn):
+        def begin(self):  # type: ignore[override]
+            self.begin_count += 1
+            return _TrackingTx(self._log)
+
+    conn = _TransientConn(poisoned=False, log=log)
+    engine = _FakeEngine([conn])
+
+    async def _body():
+        async with qe.managed_transaction(engine):
+            raise qe.AsyncpgConnectionDoesNotExistError(
+                "connection was closed in the middle of operation"
+            )
+
+    with pytest.raises(qe.AsyncpgConnectionDoesNotExistError):
+        await _body()
+
+    assert conn.invalidated_count == 1, log
+    assert conn.closed is True
 
 
 @pytest.mark.xfail(reason="#514 — same as above; retry observation point changed.", strict=False)

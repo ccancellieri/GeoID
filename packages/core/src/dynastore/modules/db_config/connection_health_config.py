@@ -177,6 +177,13 @@ _max_background_db_concurrency: int = 2
 # the tile read path to fail fast instead of waiting 30 s on a saturated pool.
 _foreground_pool_acquire_timeout_s: float = 3.0
 
+# Fallback for the lease-election pool-acquire short timeout (seconds). Mirrors
+# the default of ConnectionHealthConfig.lease_pool_acquire_timeout_s. A lease
+# tick's own cadence is typically 5-30s; queuing up to the generic 30s pool
+# timeout for a connection starves the tick of its own budget (#2900). An
+# incumbent that skips one tick this way is already tolerated by the lease TTL.
+_lease_pool_acquire_timeout_s: float = 2.0
+
 # Fallback for the pool-acquire WARN logging threshold (seconds). Mirrors the
 # default of ConnectionHealthConfig.pool_acquire_warn_seconds. A pool-acquire
 # wait at or above this threshold is logged at WARNING (with pool occupancy
@@ -293,6 +300,17 @@ def resolve_foreground_pool_acquire_timeout() -> float:
     directly.
     """
     return _foreground_pool_acquire_timeout_s
+
+
+def resolve_lease_pool_acquire_timeout_seconds() -> float:
+    """Return the fallback lease-election pool-acquire short timeout in seconds.
+
+    Used as the fallback when the config service is unavailable. The live path
+    reads ``ConnectionHealthConfig.lease_pool_acquire_timeout_s`` from the
+    central cached getter. Tests may replace ``_lease_pool_acquire_timeout_s``
+    directly.
+    """
+    return _lease_pool_acquire_timeout_s
 
 
 def resolve_pool_acquire_warn_seconds() -> float:
@@ -470,6 +488,22 @@ class ConnectionHealthConfig(PluginConfig):
             "all other routes keep the full pool_acquire_timeout. "
             "Hot-reloadable — changes take effect immediately without a pod restart. "
             "Must be in [0.5, 15.0] seconds."
+        ),
+    )
+
+    lease_pool_acquire_timeout_s: Mutable[float] = Field(
+        default=2.0,
+        ge=0.5,
+        le=15.0,
+        description=(
+            "Maximum seconds a leader-lease CAS tick may wait for a DB connection "
+            "from the pool. A lease tick's own cadence is typically 5-30 s; the "
+            "global pool_acquire_timeout (30 s by default) can queue a tick for "
+            "longer than its own cadence on a floor-sized pool, so this short "
+            "timeout bounds the pool acquire only -- an acquire timeout is treated "
+            "as a skipped tick, not a lease failure, and does not feed the "
+            "lease circuit breaker (#2900). Hot-reloadable -- changes take effect "
+            "immediately without a pod restart. Must be in [0.5, 15.0] seconds."
         ),
     )
 

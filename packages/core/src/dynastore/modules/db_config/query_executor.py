@@ -33,6 +33,7 @@ from contextlib import asynccontextmanager, contextmanager
 from dynastore.modules.db_config.connection_health_config import (
     resolve_connection_retry_config,
     resolve_foreground_pool_acquire_timeout,
+    resolve_lease_pool_acquire_timeout_seconds,
     resolve_max_background_db_concurrency,
     resolve_max_concurrent_connection_retries,
     resolve_pool_acquire_warn_seconds,
@@ -1645,6 +1646,31 @@ async def _read_live_fg_acquire_timeout() -> float:
     return resolve_foreground_pool_acquire_timeout()
 
 
+async def _read_live_lease_pool_acquire_timeout() -> float:
+    """Read ``ConnectionHealthConfig.lease_pool_acquire_timeout_s`` live.
+
+    Per-call read from the central cached config getter so operators can tune
+    the lease CAS pool-acquire fail-fast bound without a pod restart. Falls
+    back to :func:`resolve_lease_pool_acquire_timeout_seconds` when the config
+    service is unavailable.
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.db_config.connection_health_config import (
+            ConnectionHealthConfig,
+        )
+        from dynastore.tools.discovery import get_protocol
+
+        svc = get_protocol(PlatformConfigsProtocol)
+        if svc is not None:
+            cfg = await svc.get_config(ConnectionHealthConfig)
+            if isinstance(cfg, ConnectionHealthConfig):
+                return cfg.lease_pool_acquire_timeout_s
+    except Exception:
+        pass
+    return resolve_lease_pool_acquire_timeout_seconds()
+
+
 async def _read_live_pool_saturation_retry_after() -> int:
     """Read ``ConnectionHealthConfig.pool_saturation_retry_after_seconds`` live.
 
@@ -1948,20 +1974,27 @@ def _acquire_scope_suffix() -> str:
     return f" {s}" if s else ""
 
 
-async def _drain_rollback_exit(txn_cm: Any, exc: BaseException) -> None:
+async def _drain_rollback_exit(txn_cm: Any, exc: BaseException) -> bool:
     """Best-effort ROLLBACK drain used by :func:`managed_transaction` on
     the cancelled / exception exit path. Invokes the transaction context
     manager's ``__aexit__`` so SQLAlchemy emits the wire-level ROLLBACK,
     then swallows any error — the caller is already re-raising the
     original exception; a failed rollback must not mask it. See #628 for
     the IN_QUERY state-15 cascade this drain prevents.
+
+    Returns ``True`` if the drain completed cleanly, ``False`` if it
+    raised. The caller uses this to decide whether the connection's state
+    is verified enough to return to the pool, or must be invalidated
+    instead (#2900).
     """
     try:
         await txn_cm.__aexit__(type(exc), exc, exc.__traceback__)
+        return True
     except Exception as drain_exc:  # noqa: BLE001
         logger.debug(
             "managed_transaction: rollback drain failed: %s", drain_exc,
         )
+        return False
 
 
 def _format_pool_stats(engine: AsyncEngine) -> str:
@@ -2338,9 +2371,11 @@ async def managed_transaction(
                     # Detecting by cause-chain: SA wraps asyncpg errors
                     # inside DBAPIError with .orig set to the asyncpg exc.
                     _orig = getattr(exc, "orig", exc)
+                    _invalidated = False
                     if _is_transient_asyncpg_error(_orig) or _is_transient_asyncpg_error(exc):
                         try:
                             await conn.invalidate()
+                            _invalidated = True
                         except Exception:
                             # Best-effort eviction on a dead wire during cancel
                             # drain; conn.close() below still removes the slot.
@@ -2348,13 +2383,16 @@ async def managed_transaction(
                     drain_fut = asyncio.ensure_future(
                         _drain_rollback_exit(txn_cm, exc),
                     )
+                    drain_ok = True
                     try:
-                        await asyncio.shield(drain_fut)
+                        drain_ok = await asyncio.shield(drain_fut)
                     except asyncio.CancelledError:
                         # Re-fired cancellation during drain. Let the
                         # rollback task continue; ``conn.close()`` below
                         # will block on the same wire lock so the protocol
-                        # finishes draining before the pool sees it.
+                        # finishes draining before the pool sees it. The
+                        # drain's outcome is unknown from here, so treat it
+                        # as failed below and invalidate rather than guess.
                         #
                         # Edge case (#640): if a *third* cancellation
                         # arrives while the shield itself is awaiting,
@@ -2364,7 +2402,19 @@ async def managed_transaction(
                         # lock serialises them but the rollback may be
                         # abandoned. Acceptable: pool-hygiene at next
                         # acquire (#619) catches the orphaned wire.
-                        pass
+                        drain_ok = False
+                    if not _invalidated and (
+                        isinstance(exc, asyncio.CancelledError) or not drain_ok
+                    ):
+                        # A cancellation mid-transaction (the ROLLBACK may
+                        # never have reached the wire) or a rollback drain
+                        # that itself raised leaves the connection's state
+                        # unverified — invalidate it instead of returning it
+                        # to the pool unmarked (#2900).
+                        try:
+                            await conn.invalidate()
+                        except Exception:
+                            pass
                     raise
                 else:
                     await txn_cm.__aexit__(None, None, None)

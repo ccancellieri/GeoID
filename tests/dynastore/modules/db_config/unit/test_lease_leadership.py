@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 import dynastore.modules.db_config.connection_health_config as connection_health_config
 import dynastore.modules.db_config.locking_tools as locking_tools
 from dynastore.modules.db_config.connection_health_config import ConnectionRetryConfig
+from dynastore.modules.db_config.exceptions import PoolSaturationError
 from dynastore.modules.db_config.locking_tools import (
     _get_stable_lock_id,
     _held_advisory_locks,
@@ -99,12 +100,17 @@ def _patch_managed_transaction(monkeypatch, responses: list):
     raised; otherwise ``conn.execute`` returns it as a CursorResult.
 
     Calls beyond *responses* succeed silently (release UPDATE path).
+
+    Records each call's ``acquire_timeout`` kwarg in *acquire_timeouts* so
+    tests can assert the lease path passes it through.
     """
     call_idx = [0]
     execute_calls: list[tuple[str, dict]] = []
+    acquire_timeouts: list[float | None] = []
 
     @asynccontextmanager
-    async def _mock(engine):
+    async def _mock(engine, *, acquire_timeout=None):
+        acquire_timeouts.append(acquire_timeout)
         idx = call_idx[0]
         call_idx[0] += 1
 
@@ -131,7 +137,7 @@ def _patch_managed_transaction(monkeypatch, responses: list):
         yield mock_conn
 
     monkeypatch.setattr(locking_tools, "managed_transaction", _mock)
-    return execute_calls, call_idx
+    return execute_calls, call_idx, acquire_timeouts
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +179,7 @@ async def test_set_local_lock_timeout_precedes_cas_insert(monkeypatch):
     INSERT..ON CONFLICT CAS, so a losing contender fails fast instead of
     inheriting the session-wide ``DB_LOCK_TIMEOUT``."""
     cursor = _make_cursor(_LEASE_OWNER)
-    execute_calls, _ = _patch_managed_transaction(monkeypatch, [cursor])
+    execute_calls, _, _ = _patch_managed_transaction(monkeypatch, [cursor])
 
     async with lease_leadership(_make_engine(), 42, name="test") as (is_leader, _):
         assert is_leader is True
@@ -201,7 +207,7 @@ async def test_precheck_skips_cas_while_foreign_owner_live(monkeypatch):
     follower never joins the row-lock queue for an update it cannot win."""
     cursor = MagicMock()
     cursor.fetchone.return_value = ("intruder:y", True)
-    execute_calls, call_idx = _patch_managed_transaction(monkeypatch, [cursor])
+    execute_calls, call_idx, _ = _patch_managed_transaction(monkeypatch, [cursor])
 
     async with lease_leadership(_make_engine(), 42, name="test") as (is_leader, _):
         assert is_leader is False
@@ -221,7 +227,7 @@ async def test_precheck_falls_through_to_cas_after_expiry(monkeypatch):
     responses = iter([("intruder:y", False), (_LEASE_OWNER, 2)])
     cursor = MagicMock()
     cursor.fetchone.side_effect = lambda: next(responses)
-    execute_calls, _ = _patch_managed_transaction(monkeypatch, [cursor])
+    execute_calls, _, _ = _patch_managed_transaction(monkeypatch, [cursor])
 
     async with lease_leadership(_make_engine(), 42, name="test") as (is_leader, _):
         assert is_leader is True
@@ -238,7 +244,7 @@ async def test_precheck_falls_through_to_cas_when_no_row(monkeypatch):
     responses = iter([None, (_LEASE_OWNER, 1)])
     cursor = MagicMock()
     cursor.fetchone.side_effect = lambda: next(responses)
-    execute_calls, _ = _patch_managed_transaction(monkeypatch, [cursor])
+    execute_calls, _, _ = _patch_managed_transaction(monkeypatch, [cursor])
 
     async with lease_leadership(_make_engine(), 42, name="test") as (is_leader, _):
         assert is_leader is True
@@ -256,7 +262,7 @@ async def test_precheck_falls_through_to_cas_on_own_renewal(monkeypatch):
     responses = iter([(_LEASE_OWNER, True), (_LEASE_OWNER, 1)])
     cursor = MagicMock()
     cursor.fetchone.side_effect = lambda: next(responses)
-    execute_calls, _ = _patch_managed_transaction(monkeypatch, [cursor])
+    execute_calls, _, _ = _patch_managed_transaction(monkeypatch, [cursor])
 
     async with lease_leadership(_make_engine(), 42, name="test") as (is_leader, _):
         assert is_leader is True
@@ -358,7 +364,7 @@ async def test_yields_exactly_once_on_failure(monkeypatch):
 async def test_release_on_exit_issues_expire_update(monkeypatch):
     """On win exit, the finally block runs an UPDATE to expire the lease."""
     cursor = _make_cursor(_LEASE_OWNER)
-    execute_calls, _ = _patch_managed_transaction(monkeypatch, [cursor])
+    execute_calls, _, _ = _patch_managed_transaction(monkeypatch, [cursor])
 
     async with lease_leadership(_make_engine(), 42, name="test") as (is_leader, _):
         assert is_leader is True
@@ -389,7 +395,7 @@ async def test_release_failure_swallowed(monkeypatch):
 async def test_lose_no_release_update(monkeypatch):
     """On lose, the release UPDATE is NOT issued."""
     cursor = _make_cursor(None)
-    execute_calls, call_idx = _patch_managed_transaction(monkeypatch, [cursor])
+    execute_calls, call_idx, _ = _patch_managed_transaction(monkeypatch, [cursor])
 
     async with lease_leadership(_make_engine(), 42, name="test") as (is_leader, _):
         assert is_leader is False
@@ -407,7 +413,7 @@ async def test_lose_no_release_update(monkeypatch):
 async def test_body_exception_propagates_and_releases(monkeypatch):
     """A failure during the tenure propagates; the release UPDATE still runs."""
     cursor = _make_cursor(_LEASE_OWNER)
-    execute_calls, _ = _patch_managed_transaction(monkeypatch, [cursor])
+    execute_calls, _, _ = _patch_managed_transaction(monkeypatch, [cursor])
 
     with pytest.raises(RuntimeError, match="tick failed"):
         async with lease_leadership(_make_engine(), 42, name="test") as (is_leader, _):
@@ -430,7 +436,7 @@ async def test_body_exception_propagates_and_releases(monkeypatch):
 async def test_int_key_used_as_is(monkeypatch):
     """Integer key is passed directly as lock_key."""
     cursor = _make_cursor(_LEASE_OWNER)
-    execute_calls, _ = _patch_managed_transaction(monkeypatch, [cursor])
+    execute_calls, _, _ = _patch_managed_transaction(monkeypatch, [cursor])
 
     async with lease_leadership(_make_engine(), 0x4D41, name="test") as _:
         pass
@@ -444,7 +450,7 @@ async def test_int_key_used_as_is(monkeypatch):
 async def test_str_key_folded_to_int(monkeypatch):
     """String key is hashed to a stable int via _get_stable_lock_id."""
     cursor = _make_cursor(_LEASE_OWNER)
-    execute_calls, _ = _patch_managed_transaction(monkeypatch, [cursor])
+    execute_calls, _, _ = _patch_managed_transaction(monkeypatch, [cursor])
 
     async with lease_leadership(_make_engine(), "events_consumer", name="test") as _:
         pass
@@ -614,7 +620,7 @@ async def test_transient_cas_retried_then_declines(monkeypatch):
     attempts = {"n": 0}
 
     @asynccontextmanager
-    async def _mt_transient(engine):
+    async def _mt_transient(engine, *, acquire_timeout=None):
         attempts["n"] += 1
         raise OSError("connection reset by peer")  # transient → retried
         yield None  # pragma: no cover — required for asynccontextmanager
@@ -639,7 +645,7 @@ async def test_breaker_opens_after_threshold_then_short_circuits(monkeypatch):
     calls = {"n": 0}
 
     @asynccontextmanager
-    async def _mt_fail(engine):
+    async def _mt_fail(engine, *, acquire_timeout=None):
         calls["n"] += 1
         raise RuntimeError("db down")  # non-transient → 1 attempt, fast
         yield None  # pragma: no cover
@@ -670,7 +676,7 @@ async def test_breaker_recovers_half_open_to_closed_after_cooldown(monkeypatch):
     breaker.update_thresholds(failure_threshold=5, cooldown_seconds=0.05)
 
     @asynccontextmanager
-    async def _mt_fail(engine):
+    async def _mt_fail(engine, *, acquire_timeout=None):
         raise RuntimeError("db down")
         yield None  # pragma: no cover
 
@@ -687,7 +693,7 @@ async def test_breaker_recovers_half_open_to_closed_after_cooldown(monkeypatch):
     cursor = _make_cursor(_LEASE_OWNER)
 
     @asynccontextmanager
-    async def _mt_ok(engine):
+    async def _mt_ok(engine, *, acquire_timeout=None):
         conn = MagicMock()
 
         async def _ex(sql, params=None, **kw):
@@ -719,7 +725,7 @@ async def test_lock_not_available_does_not_trip_breaker(monkeypatch, caplog):
     monkeypatch.setattr(locking_tools, "_lease_breaker_record_failure", _spy_record_failure)
 
     @asynccontextmanager
-    async def _mt_lock_timeout(engine):
+    async def _mt_lock_timeout(engine, *, acquire_timeout=None):
         raise RuntimeError("canceling statement due to lock timeout")
         yield None  # pragma: no cover
 
@@ -747,7 +753,7 @@ async def test_non_lock_error_still_trips_breaker(monkeypatch):
     that the 55P03 carve-out is narrow and does not swallow real failures."""
 
     @asynccontextmanager
-    async def _mt_fail(engine):
+    async def _mt_fail(engine, *, acquire_timeout=None):
         raise RuntimeError("db down")  # not a lock-timeout error
         yield None  # pragma: no cover
 
@@ -758,6 +764,69 @@ async def test_non_lock_error_still_trips_breaker(monkeypatch):
             assert is_leader is False
 
     assert locking_tools._get_lease_breaker().state_of(_LEASE_BREAKER_KEY) == "OPEN"
+
+
+# ---------------------------------------------------------------------------
+# Bounded pool-acquire on the lease CAS (#2900)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pool_saturation_skips_tick_without_tripping_breaker(monkeypatch, caplog):
+    """A bounded pool-acquire timeout (``PoolSaturationError``) on the lease
+    CAS is a skipped tick, not a lease failure: it must not accumulate toward
+    the breaker's failure threshold, must log at DEBUG (not WARNING), and
+    must decline (False, None) every time -- even past the ordinary threshold
+    of consecutive skips."""
+    caplog.set_level(logging.DEBUG, logger=locking_tools.logger.name)
+    record_failure_calls = {"n": 0}
+    orig_record_failure = locking_tools._lease_breaker_record_failure
+
+    def _spy_record_failure(lock_name):
+        record_failure_calls["n"] += 1
+        return orig_record_failure(lock_name)
+
+    monkeypatch.setattr(locking_tools, "_lease_breaker_record_failure", _spy_record_failure)
+
+    @asynccontextmanager
+    async def _mt_saturated(engine, *, acquire_timeout=None):
+        raise PoolSaturationError("pool saturated after waiting 2.0s")
+        yield None  # pragma: no cover
+
+    monkeypatch.setattr(locking_tools, "managed_transaction", _mt_saturated)
+
+    # 6 consecutive skips, past the breaker's failure threshold (5).
+    for _ in range(6):
+        async with lease_leadership(_make_engine(), 42, name="test") as (is_leader, lock_conn):
+            assert is_leader is False
+            assert lock_conn is None
+        assert locking_tools._get_lease_breaker().state_of(_LEASE_BREAKER_KEY) == "CLOSED"
+
+    assert record_failure_calls["n"] == 0
+    assert not any(rec.levelno >= logging.WARNING for rec in caplog.records)
+    assert any(
+        rec.levelno == logging.DEBUG and "pool acquire timed out" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_lease_cas_passes_acquire_timeout_to_managed_transaction(monkeypatch):
+    """The lease CAS's own ``managed_transaction`` call is bounded by the
+    live ``lease_pool_acquire_timeout_s`` value, not the plain (unbounded)
+    acquire every other pre-#2900 caller gets."""
+    monkeypatch.setattr(
+        connection_health_config, "_lease_pool_acquire_timeout_s", 1.5
+    )
+    cursor = _make_cursor(_LEASE_OWNER)
+    _, _, acquire_timeouts = _patch_managed_transaction(monkeypatch, [cursor])
+
+    async with lease_leadership(_make_engine(), 42, name="test") as (is_leader, _):
+        assert is_leader is True
+
+    # Both the CAS and the best-effort release UPDATE go through the same
+    # bounded-acquire path.
+    assert acquire_timeouts == [1.5, 1.5]
 
 
 # ---------------------------------------------------------------------------
@@ -981,7 +1050,7 @@ async def test_heartbeat_release_cancels_heartbeat_task_and_issues_expire_update
     """Exiting the CM stops the real heartbeat task and runs the same
     best-effort expire UPDATE as lease_leadership."""
     cursor = _make_cursor(_LEASE_OWNER)
-    execute_calls, _ = _patch_managed_transaction(monkeypatch, [cursor])
+    execute_calls, _, _ = _patch_managed_transaction(monkeypatch, [cursor])
     fake_event = asyncio.Event()
 
     async def _never_ending() -> None:
@@ -1015,7 +1084,7 @@ async def test_heartbeat_body_exception_propagates_and_still_releases(monkeypatc
     """A failure during the tenure propagates; the heartbeat is still stopped
     and the release UPDATE still runs."""
     cursor = _make_cursor(_LEASE_OWNER)
-    execute_calls, _ = _patch_managed_transaction(monkeypatch, [cursor])
+    execute_calls, _, _ = _patch_managed_transaction(monkeypatch, [cursor])
     fake_event = asyncio.Event()
 
     async def _never_ending() -> None:
@@ -1093,7 +1162,7 @@ async def test_failover_within_ttl_after_simulated_crash(monkeypatch):
     monkeypatch.setattr(locking_tools._leadership_config, "lease_renew_interval_seconds", 0.03)
 
     @asynccontextmanager
-    async def _mt(engine):
+    async def _mt(engine, *, acquire_timeout=None):
         conn = MagicMock()
 
         async def _ex(sql, params=None, **kw):

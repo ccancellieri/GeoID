@@ -31,7 +31,7 @@ from dynastore.modules.db_config.connection_health_config import (
     resolve_leadership_config,
     _leadership_config,
 )
-from dynastore.modules.db_config.exceptions import DatabaseConnectionError
+from dynastore.modules.db_config.exceptions import DatabaseConnectionError, PoolSaturationError
 from dynastore.modules.db_config.instance import get_service_name
 from sqlalchemy import text, Engine
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -47,6 +47,7 @@ from dynastore.modules.db_config.query_executor import (
     sync_managed_transaction,
     retry_on_transient_connect,
     is_lock_not_available_error,
+    _read_live_lease_pool_acquire_timeout,
 )
 
 if TYPE_CHECKING:
@@ -224,9 +225,15 @@ async def _lease_cas_round_trip(
     if _get_lease_breaker().is_open(_LEASE_BREAKER_KEY):
         return None
 
+    # Bound the pool checkout to the lease tick's own cadence (#2900) instead
+    # of inheriting the generic 30s pool_acquire_timeout — on a floor-sized
+    # pool a lease tick can otherwise queue for a connection longer than the
+    # cadence it is meant to run on.
+    acquire_timeout = await _read_live_lease_pool_acquire_timeout()
+
     @retry_on_transient_connect(max_retries=3)
     async def _run_cas() -> Any:
-        async with managed_transaction(engine) as _conn:
+        async with managed_transaction(engine, acquire_timeout=acquire_timeout) as _conn:
             aconn = cast(AsyncConnection, _conn)
             # Pre-check on the SAME connection/transaction as the CAS below —
             # no extra connection checkout. A plain SELECT takes no row lock,
@@ -268,6 +275,19 @@ async def _lease_cas_round_trip(
             logger.debug(
                 "%s: lease CAS lost the row-lock race (55P03); retrying next tick.",
                 name,
+            )
+            return None
+        if isinstance(exc, PoolSaturationError):
+            # The bounded acquire above timed out — a scheduling artifact of
+            # pool pressure, not a DB health signal (#2900). An incumbent that
+            # skips one tick this way is already tolerated by the lease TTL,
+            # so treat it exactly like the 55P03 case: skip the tick without
+            # feeding the shared breaker.
+            logger.debug(
+                "%s: lease CAS skipped this tick (pool acquire timed out after %.1fs); "
+                "retrying next tick.",
+                name,
+                acquire_timeout,
             )
             return None
         logger.warning("%s: lease CAS failed (%s).", name, exc)
@@ -564,7 +584,8 @@ async def _lease_best_effort_release(engine: DbResource, lock_id: int) -> None:
     :func:`lease_leadership_with_heartbeat`.
     """
     try:
-        async with managed_transaction(engine) as _rconn:
+        acquire_timeout = await _read_live_lease_pool_acquire_timeout()
+        async with managed_transaction(engine, acquire_timeout=acquire_timeout) as _rconn:
             arconn = cast(AsyncConnection, _rconn)
             await arconn.execute(
                 text(
