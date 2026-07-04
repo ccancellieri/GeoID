@@ -166,6 +166,9 @@ async def report_failure(task_id: str, schema: str, error_message: str):
         from sqlalchemy.ext.asyncio import create_async_engine
         from sqlalchemy.pool import NullPool
 
+        from dynastore.modules.db_config.connection_poison_guard import (
+            register_connection_poison_guard,
+        )
         from dynastore.modules.db_config.db_config import DBConfig
         from dynastore.modules.db_config.db_timeout_config import (
             task_engine_connect_args,
@@ -178,6 +181,7 @@ async def report_failure(task_id: str, schema: str, error_message: str):
         engine = create_async_engine(
             db_url, poolclass=NullPool, connect_args=task_engine_connect_args(DBConfig)
         )
+        register_connection_poison_guard(engine, service="main_task.report_failure")
 
         logger.info(f"Reporting failure for task '{task_id}' in schema '{schema}'...")
         update_data = TaskUpdate(
