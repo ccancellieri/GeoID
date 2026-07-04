@@ -19,15 +19,19 @@
 """Pyogrio-backed reader — preferred for the formats it declares.
 
 Sits strictly ahead of :class:`GdalOsgeoReader` (``priority=100``) for
-the extensions listed below.  ``pyogrio.read_dataframe(..., chunksize=...)``
-reads in vectorized/Arrow-backed chunks, whereas ``GdalOsgeoReader``
-iterates one OGR feature at a time via the Python API — on an 8.4M-row
-GeoPackage that row-by-row path ran at ~27 rows/sec (GeoID #2964).
-``priority=10`` gives this reader first crack at its declared extensions;
-for any format outside that list ``can_read()`` returns False and the
-registry falls through to ``GdalOsgeoReader``, which still covers the
-~78 GDAL driver formats (Parquet, FlatGeobuf, OpenFileGDB, …) pyogrio's
-PyPI wheel doesn't support.
+the extensions listed below, reading them in vectorized/Arrow-backed
+pages instead of the row-by-row OGR iteration ``GdalOsgeoReader`` uses
+— on an 8.4M-row GeoPackage that row-by-row path ran at ~27 rows/sec
+(GeoID #2964).  ``priority=10`` gives this reader first crack at its
+declared extensions; for any format outside that list ``can_read()``
+returns False and the registry falls through to ``GdalOsgeoReader``,
+which still covers the ~78 GDAL driver formats (Parquet, FlatGeobuf,
+OpenFileGDB, …) pyogrio's PyPI wheel doesn't support.
+
+Reads are paginated via ``pyogrio.read_dataframe(..., skip_features=,
+max_features=)`` — ``read_dataframe`` has no ``chunksize`` parameter,
+so passing one silently forwards as an unrecognised GDAL open option
+and returns a single, non-chunked ``GeoDataFrame``.
 """
 
 from __future__ import annotations
@@ -54,7 +58,7 @@ class PyogrioReader(SourceReaderProtocol):
     reader_id: ClassVar[str] = "pyogrio"
     priority: ClassVar[int] = 10
     extensions: ClassVar[Tuple[str, ...]] = (
-        # Formats pyogrio reads in vectorized/Arrow-backed chunks —
+        # Formats pyogrio reads in vectorized/Arrow-backed pages —
         # dramatically faster than GdalOsgeoReader's row-by-row OGR
         # iteration (GeoID #2964).  Anything outside this list falls
         # through to GdalOsgeoReader's broader driver coverage.
@@ -77,10 +81,23 @@ class PyogrioReader(SourceReaderProtocol):
             # Stream in bounded chunks so the full source file is never
             # materialised in memory at once.  On a 300+ MB admin-boundary
             # dataset loading the entire GeoDataFrame in one call exhausts
-            # the container; chunked iteration keeps peak RSS proportional
-            # to chunk_size, not source-file size.
-            for chunk in pyogrio.read_dataframe(path, encoding=encoding, chunksize=chunk_size):
+            # the container; paginating via skip_features/max_features
+            # keeps peak RSS proportional to chunk_size, not source-file
+            # size.  (``read_dataframe`` has no ``chunksize`` kwarg — it's
+            # not a chunked-generator API — so pagination is done here.)
+            offset = 0
+            while True:
+                chunk = pyogrio.read_dataframe(
+                    path, encoding=encoding,
+                    skip_features=offset, max_features=chunk_size,
+                )
+                n = len(chunk)
+                if n == 0:
+                    break
                 yield from chunk.iterfeatures()
+                if n < chunk_size:
+                    break
+                offset += chunk_size
 
         logger.info(
             "PyogrioReader: opened %r (chunked, chunk_size=%d)", path, chunk_size,

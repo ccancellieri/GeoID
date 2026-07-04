@@ -158,8 +158,10 @@ def test_read_batch_size_forwarded_to_reader() -> None:
 
 def test_pyogrio_reader_uses_chunked_read() -> None:
     """PyogrioReader.open must not call gpd.read_file (which materialises the
-    full GeoDataFrame) but must use pyogrio.read_dataframe with chunksize so
-    large sources are streamed in bounded chunks.
+    full GeoDataFrame) but must page through pyogrio.read_dataframe via
+    skip_features/max_features so large sources are streamed in bounded
+    chunks (read_dataframe has no chunksize kwarg — it isn't a
+    chunked-generator API).
 
     This test reads the source file directly so it runs without pyogrio
     installed (pyogrio is only available in the geospatial_io scope).
@@ -173,9 +175,13 @@ def test_pyogrio_reader_uses_chunked_read() -> None:
     src = reader_file.read_text()
     assert "gpd.read_file" not in src, (
         "PyogrioReader.open still calls gpd.read_file, which loads the entire "
-        "GeoDataFrame into memory. Replace with pyogrio.read_dataframe(chunksize=...)."
+        "GeoDataFrame into memory. Replace with paginated pyogrio.read_dataframe calls."
     )
-    assert "pyogrio.read_dataframe" in src and "chunksize=chunk_size" in src, (
-        "PyogrioReader.open must call pyogrio.read_dataframe with chunksize to "
-        "stream large sources in bounded chunks."
+    assert (
+        "pyogrio.read_dataframe" in src
+        and "skip_features" in src
+        and "max_features" in src
+    ), (
+        "PyogrioReader.open must page through pyogrio.read_dataframe via "
+        "skip_features/max_features to stream large sources in bounded chunks."
     )

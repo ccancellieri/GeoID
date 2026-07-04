@@ -128,28 +128,37 @@ def test_open_chunked_yields_all_features(geojson_large_path):
 
 
 def test_open_chunk_size_forwarded_to_pyogrio(geojson_large_path):
-    """read_batch_size opt must reach pyogrio.read_dataframe as chunksize."""
+    """read_batch_size opt must page through pyogrio.read_dataframe via
+    skip_features/max_features — read_dataframe has no chunksize kwarg,
+    it's not a chunked-generator API (#2964 follow-up: the previous
+    ``chunksize=`` call silently no-op'd as an unrecognised GDAL open
+    option and iterated the returned GeoDataFrame's column names)."""
     import pyogrio
     from unittest.mock import patch
 
-    # Build a realistic stand-in: two chunks of GeoDataFrames
+    # Build a realistic stand-in: two pages of GeoDataFrames
     import geopandas as gpd
     all_feats = _GEOJSON_LARGE
     gdf = gpd.GeoDataFrame.from_features(all_feats["features"])
 
-    chunk1 = gdf.iloc[:5].copy()
-    chunk2 = gdf.iloc[5:].copy()
+    page1 = gdf.iloc[:5].copy()
+    page2 = gdf.iloc[5:].copy()
+    empty = gdf.iloc[:0].copy()
 
-    with patch.object(pyogrio, "read_dataframe", return_value=iter([chunk1, chunk2])) as mock_rdf:
+    with patch.object(
+        pyogrio, "read_dataframe", side_effect=[page1, page2, empty],
+    ) as mock_rdf:
         reader = PyogrioReader()
         with reader.open(geojson_large_path, read_batch_size=5) as records:
             feats = list(records)
 
-    mock_rdf.assert_called_once()
-    _, kwargs = mock_rdf.call_args
-    assert kwargs.get("chunksize") == 5, (
-        f"PyogrioReader did not pass chunksize=5 to pyogrio.read_dataframe; got {kwargs}"
-    )
+    assert mock_rdf.call_count == 3
+    first_kwargs = mock_rdf.call_args_list[0].kwargs
+    assert first_kwargs.get("skip_features") == 0
+    assert first_kwargs.get("max_features") == 5
+    second_kwargs = mock_rdf.call_args_list[1].kwargs
+    assert second_kwargs.get("skip_features") == 5
+    assert second_kwargs.get("max_features") == 5
     assert len(feats) == 10
 
 
@@ -161,9 +170,9 @@ def test_open_does_not_use_gpd_read_file():
     src = inspect.getsource(_R.open)
     assert "gpd.read_file" not in src, (
         "PyogrioReader.open still calls gpd.read_file, which loads the whole "
-        "GeoDataFrame into memory. Replace with pyogrio.read_dataframe(chunksize=...)."
+        "GeoDataFrame into memory. Replace with paginated pyogrio.read_dataframe calls."
     )
     assert "pyogrio.read_dataframe" in src, (
-        "PyogrioReader.open must use pyogrio.read_dataframe with chunksize to "
-        "avoid materialising the full source in memory."
+        "PyogrioReader.open must use pyogrio.read_dataframe, paginated via "
+        "skip_features/max_features, to avoid materialising the full source in memory."
     )
