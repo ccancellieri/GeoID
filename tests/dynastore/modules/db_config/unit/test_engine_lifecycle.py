@@ -67,6 +67,30 @@ def test_engine_configs_satisfy_engine_instance_protocol(cls):
     assert isinstance(cfg, EngineInstanceProtocol)
 
 
+@pytest.mark.parametrize(
+    "cls,expected",
+    [
+        (ElasticsearchEngineConfig, 0),
+        (DuckdbEngineConfig, 0),
+        (IcebergEngineConfig, 0),
+    ],
+)
+def test_non_postgresql_engines_charge_zero_connection_budget(cls, expected):
+    """Only PostgresqlEngineConfig holds real DB connections (#2963) — every
+    other engine kind reports 0 units against EngineInstanceCache's budget,
+    including DuckDB whose own ``pool_size`` governs an in-process
+    connection pool that never opens PostgreSQL connections."""
+    assert cls().connection_budget_units() == expected
+
+
+def test_postgresql_engine_charges_its_pool_size_as_connection_budget():
+    """PostgresqlEngineConfig's real asyncpg pool opens up to ``pool_size``
+    connections, so that is exactly what it charges against
+    EngineInstanceCache's fleet-wide budget (#2963)."""
+    cfg = PostgresqlEngineConfig(pool_size=42)
+    assert cfg.connection_budget_units() == 42
+
+
 # ---------------------------------------------------------------------------
 # PostgresqlEngineConfig
 # ---------------------------------------------------------------------------

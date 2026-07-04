@@ -49,6 +49,15 @@ F.6 wired the cache into ``DBConfigModule.lifespan`` and shipped
 Until F.4c's ref-keyed driver-config storage lands, no driver consumes
 the cache in production dispatch paths — admin tooling and tests
 exercise the contract end-to-end via ``app_state.engine_cache``.
+
+Because that dormancy ends once F.4c lands (#2913), the cache also
+enforces a fleet-wide connection budget (#2963): every live entry's
+``EngineConfig.connection_budget_units()`` (0 for engines that open no
+real database connections; ``pool_size`` for ``PostgresqlEngineConfig``)
+is summed against ``pool_budget``, and a ``get()`` that would push the
+running total past it raises :class:`EngineCacheBudgetExceededError`
+instead of silently instantiating another pool. Existing cached engines
+are unaffected — only NEW instantiation is gated.
 """
 
 from __future__ import annotations
@@ -61,6 +70,7 @@ from typing import Any, Callable, Dict, Optional, Protocol, runtime_checkable
 from dynastore.modules.db_config.engine_config import (
     EngineConfig,
 )
+from dynastore.modules.db_config.exceptions import EngineCacheBudgetExceededError
 from dynastore.tools.background_service import (
     Leadership,
     PeriodicService,
@@ -69,6 +79,19 @@ from dynastore.tools.background_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Default fleet-wide connection budget (#2963) — the ceiling on the SUM of
+# every live entry's ``connection_budget_units()``.  200 is a deliberately
+# conservative slice of the ~1000-connection ceiling this codebase already
+# measures for the shared AlloyDB instance (see
+# ``ScalingPolicyConfig.db_max_connections`` / ``connection_headroom`` in
+# ``modules/scaling/config.py``): it leaves ~800 connections of headroom for
+# the shared serving engine (``db_service.py``) and every other tenant that
+# was never routed through this cache.  Sizing THIS budget precisely against
+# the shared engine's own live consumption is a coordination problem for
+# whoever wires F.4c's live dispatch path (#2913) — until then the cache is
+# dormant, so this default only needs to be safely conservative, not exact.
+DEFAULT_ENGINE_CACHE_POOL_BUDGET: int = 200
 
 
 @runtime_checkable
@@ -108,6 +131,23 @@ class EngineInstanceProtocol(Protocol):
         ...
 
 
+def _connection_budget_units(engine: Any) -> int:
+    """Resolve ``engine.connection_budget_units()`` defensively (#2963).
+
+    Every concrete ``EngineConfig`` declares this method (base default 0,
+    overridden by ``PostgresqlEngineConfig`` to return ``pool_size``), but
+    ``EngineInstanceProtocol`` itself only requires ``engine_init`` /
+    ``engine_release`` — a duck-typed test double or a future engine kind
+    that skips the ``EngineConfig`` base still satisfies the protocol.  Such
+    engines are treated as costing nothing against the budget rather than
+    raising ``AttributeError`` here.
+    """
+    cost = getattr(engine, "connection_budget_units", None)
+    if cost is None:
+        return 0
+    return int(cost())
+
+
 class _Entry:
     """Internal cache entry — tracks instance + last-access time.
 
@@ -118,11 +158,14 @@ class _Entry:
     and ``_ref_locks`` already prevents double-init.
     """
 
-    __slots__ = ("instance", "last_accessed")
+    __slots__ = ("instance", "last_accessed", "budget_units")
 
-    def __init__(self, instance: Any, *, now: float) -> None:
+    def __init__(self, instance: Any, *, now: float, budget_units: int) -> None:
         self.instance = instance
         self.last_accessed = now
+        # Charged against ``EngineInstanceCache._allocated_units`` (#2963) —
+        # stored per-entry so ``evict`` can hand the exact amount back.
+        self.budget_units = budget_units
 
 
 class EngineInstanceCache:
@@ -151,6 +194,15 @@ class EngineInstanceCache:
         returns its runtime instance.  Unknown refs raise
         :class:`KeyError` — callers MUST surface as a config error
         rather than silently fall back.
+
+    Budget:
+        A running total of every live entry's ``connection_budget_units()``
+        is tracked against ``pool_budget`` (default
+        ``DEFAULT_ENGINE_CACHE_POOL_BUDGET``, #2963).  Instantiating a NEW
+        engine that would push the total over budget raises
+        :class:`~dynastore.modules.db_config.exceptions.EngineCacheBudgetExceededError`;
+        already-cached engines keep serving unaffected, and evicting one
+        frees its share for the next caller.
     """
 
     def __init__(
@@ -160,6 +212,7 @@ class EngineInstanceCache:
         engine_writer: Optional[Callable[[EngineConfig], None]] = None,
         sweep_interval_seconds: float = 60.0,
         clock: Callable[[], float] = time.monotonic,
+        pool_budget: int = DEFAULT_ENGINE_CACHE_POOL_BUDGET,
     ) -> None:
         """Construct the cache.
 
@@ -176,11 +229,21 @@ class EngineInstanceCache:
         :param sweep_interval_seconds: how often the background TTL
             sweep runs.
         :param clock: monotonic-clock callable, injectable for tests.
+        :param pool_budget: fleet-wide ceiling (#2963) on the SUM of every
+            live entry's ``connection_budget_units()``.  A ``get()`` that
+            would push the running total above this raises
+            :class:`EngineCacheBudgetExceededError` instead of instantiating
+            another engine.  Engines that report 0 units (the base
+            ``EngineConfig`` default — anything that opens no real database
+            connections) never count against it.  Defaults to
+            ``DEFAULT_ENGINE_CACHE_POOL_BUDGET``.
         """
         self._resolver = engine_resolver
         self._writer = engine_writer
         self._sweep_interval = sweep_interval_seconds
         self._clock = clock
+        self._pool_budget = pool_budget
+        self._allocated_units = 0
         self._entries: Dict[str, _Entry] = {}
         self._ref_locks: Dict[str, asyncio.Lock] = {}
         self._closed = False
@@ -200,6 +263,11 @@ class EngineInstanceCache:
             KeyError: ``engine_ref`` not found in the resolver.
             RuntimeError: engine has ``enabled=False`` (returns 503
                 semantics — caller decides how to surface).
+            EngineCacheBudgetExceededError: instantiating this ref would
+                push the cache's summed ``connection_budget_units()``
+                past ``pool_budget`` (#2963).  Only fires on a genuinely
+                NEW instantiation — already-cached refs keep serving from
+                the fast path regardless of the current budget state.
         """
         if self._closed:
             raise RuntimeError("EngineInstanceCache is closed")
@@ -240,20 +308,41 @@ class EngineInstanceCache:
             if entry is not None:
                 entry.last_accessed = self._clock()
                 return entry.instance
+            budget_units = _connection_budget_units(engine)
+            projected = self._allocated_units + budget_units
+            if projected > self._pool_budget:
+                raise EngineCacheBudgetExceededError(
+                    f"engine_ref={engine_ref!r} would need "
+                    f"{budget_units} more connection budget unit(s), "
+                    f"bringing the fleet-wide total to {projected} — over "
+                    f"pool_budget={self._pool_budget} "
+                    f"(currently allocated={self._allocated_units}).  "
+                    f"Evict an idle engine to free budget, or raise "
+                    f"EngineInstanceCache's configured pool_budget.",
+                    engine_ref=engine_ref,
+                    requested_units=budget_units,
+                    allocated_units=self._allocated_units,
+                    pool_budget=self._pool_budget,
+                )
             instance = await engine.engine_init()
-            entry = _Entry(instance, now=self._clock())
+            entry = _Entry(instance, now=self._clock(), budget_units=budget_units)
             self._entries[engine_ref] = entry
+            self._allocated_units = projected
             return instance
 
     async def evict(self, engine_ref: str) -> bool:
         """Force-evict the cached instance for ``engine_ref``.
 
         Returns True if an entry was evicted, False if no entry was
-        cached.  Used by maintenance / shutdown paths.
+        cached.  Used by maintenance / shutdown paths.  Frees the entry's
+        ``budget_units`` back to the pool budget (#2963) regardless of
+        whether ``engine_release`` below succeeds — the instance is gone
+        from the cache either way, so its budget share must be too.
         """
         entry = self._entries.pop(engine_ref, None)
         if entry is None:
             return False
+        self._allocated_units = max(0, self._allocated_units - entry.budget_units)
         engine = self._resolver(engine_ref)
         if engine is not None and isinstance(engine, EngineInstanceProtocol):
             try:
@@ -391,4 +480,5 @@ __all__ = [
     "EngineInstanceProtocol",
     "EngineInstanceCache",
     "EngineInstanceCacheSweepService",
+    "DEFAULT_ENGINE_CACHE_POOL_BUDGET",
 ]

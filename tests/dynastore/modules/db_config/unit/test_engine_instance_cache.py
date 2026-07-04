@@ -26,19 +26,19 @@ runtime resources (PG pool, ES client, etc.).
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Optional
+from typing import Optional
 from unittest.mock import AsyncMock
 
 import pytest
 
 from dynastore.modules.db_config.engine_config import (
-    EngineConfig,
     EngineLifecycleConfig,
 )
 from dynastore.modules.db_config.engine_instance_cache import (
     EngineInstanceCache,
     EngineInstanceProtocol,
 )
+from dynastore.modules.db_config.exceptions import EngineCacheBudgetExceededError
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +55,7 @@ class _FakeEngine:
         enabled: bool = True,
         policy: str = "global",
         ttl_seconds: Optional[int] = None,
+        budget_units: int = 0,
     ) -> None:
         self.enabled = enabled
         self.lifecycle = EngineLifecycleConfig(
@@ -63,10 +64,14 @@ class _FakeEngine:
         self.engine_init = AsyncMock(side_effect=self._make_instance)
         self.engine_release = AsyncMock()
         self._counter = 0
+        self._budget_units = budget_units
 
     def _make_instance(self) -> str:
         self._counter += 1
         return f"instance-{self._counter}"
+
+    def connection_budget_units(self) -> int:
+        return self._budget_units
 
 
 class _Clock:
@@ -311,6 +316,122 @@ async def test_get_after_close_raises():
     await cache.close()
     with pytest.raises(RuntimeError, match=r"closed"):
         await cache.get("pg")
+
+
+# ---------------------------------------------------------------------------
+# Fleet-wide connection budget (#2963)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_within_budget_succeeds():
+    """Two engines whose combined cost sits at exactly the budget both
+    instantiate cleanly — the ceiling is inclusive, not exclusive."""
+    eng_a = _FakeEngine(budget_units=60)
+    eng_b = _FakeEngine(budget_units=40)
+    cache = EngineInstanceCache(
+        engine_resolver=_make_resolver({"a": eng_a, "b": eng_b}),
+        pool_budget=100,
+    )
+    await cache.get("a")
+    await cache.get("b")
+    eng_a.engine_init.assert_awaited_once()
+    eng_b.engine_init.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_past_budget_raises_typed_budget_error():
+    """A NEW engine that would push the running total over ``pool_budget``
+    raises EngineCacheBudgetExceededError instead of silently instantiating
+    it — the whole point of the guard rail (#2963)."""
+    eng_a = _FakeEngine(budget_units=60)
+    eng_b = _FakeEngine(budget_units=50)
+    cache = EngineInstanceCache(
+        engine_resolver=_make_resolver({"a": eng_a, "b": eng_b}),
+        pool_budget=100,
+    )
+    await cache.get("a")
+    with pytest.raises(EngineCacheBudgetExceededError) as excinfo:
+        await cache.get("b")
+    eng_b.engine_init.assert_not_awaited()
+    err = excinfo.value
+    assert err.engine_ref == "b"
+    assert err.requested_units == 50
+    assert err.allocated_units == 60
+    assert err.pool_budget == 100
+
+
+@pytest.mark.asyncio
+async def test_evicting_an_engine_frees_budget_for_a_new_one():
+    """Evicting a cached engine hands its budget share back — the next
+    engine that would otherwise have been rejected now fits (#2963)."""
+    eng_a = _FakeEngine(budget_units=60)
+    eng_b = _FakeEngine(budget_units=50)
+    cache = EngineInstanceCache(
+        engine_resolver=_make_resolver({"a": eng_a, "b": eng_b}),
+        pool_budget=100,
+    )
+    await cache.get("a")
+    with pytest.raises(EngineCacheBudgetExceededError):
+        await cache.get("b")
+
+    assert await cache.evict("a") is True
+    await cache.get("b")  # no longer raises
+    eng_b.engine_init.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_default_pool_budget_is_unaffected_by_todays_single_engine_usage():
+    """Today's actual dormant-but-present callers instantiate at most a
+    handful of engines at their default ``pool_size`` (10) — well under the
+    default ``pool_budget`` — so the new cap is a no-op for them."""
+    eng_pg = _FakeEngine(budget_units=10)
+    eng_es = _FakeEngine(budget_units=0)
+    eng_duckdb = _FakeEngine(budget_units=0)
+    cache = EngineInstanceCache(
+        engine_resolver=_make_resolver(
+            {"pg": eng_pg, "es": eng_es, "duckdb": eng_duckdb}
+        ),
+    )  # default pool_budget
+    await cache.get("pg")
+    await cache.get("es")
+    await cache.get("duckdb")
+    eng_pg.engine_init.assert_awaited_once()
+    eng_es.engine_init.assert_awaited_once()
+    eng_duckdb.engine_init.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_zero_cost_engines_never_count_against_budget():
+    """An engine reporting 0 budget units (the base ``EngineConfig``
+    default) can be instantiated any number of times without ever
+    tripping the cap."""
+    engines = {f"ref-{i}": _FakeEngine(budget_units=0) for i in range(5)}
+    cache = EngineInstanceCache(
+        engine_resolver=_make_resolver(engines), pool_budget=1,
+    )
+    for ref in engines:
+        await cache.get(ref)
+    for eng in engines.values():
+        eng.engine_init.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_already_cached_engine_unaffected_by_later_budget_pressure():
+    """The fast path (already-warmed entry) never re-checks the budget —
+    only genuinely NEW instantiation is gated."""
+    eng_a = _FakeEngine(budget_units=100)
+    eng_b = _FakeEngine(budget_units=100)
+    cache = EngineInstanceCache(
+        engine_resolver=_make_resolver({"a": eng_a, "b": eng_b}),
+        pool_budget=100,
+    )
+    await cache.get("a")
+    with pytest.raises(EngineCacheBudgetExceededError):
+        await cache.get("b")
+    # "a" keeps serving from cache even though the budget is fully spent.
+    instance = await cache.get("a")
+    assert instance == "instance-1"
 
 
 # ---------------------------------------------------------------------------

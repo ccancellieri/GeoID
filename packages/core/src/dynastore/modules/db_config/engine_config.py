@@ -220,6 +220,18 @@ class EngineConfig(PluginConfig):
         ),
     )
 
+    def connection_budget_units(self) -> int:
+        """Connections this engine's runtime instance holds against
+        ``EngineInstanceCache``'s fleet-wide connection budget (#2963).
+
+        Base default is 0 — an engine kind that opens no real database
+        connections (e.g. an Elasticsearch client) never competes for the
+        budget. Override in engine kinds whose ``engine_init()`` actually
+        opens connections against the shared, connection-limited database
+        this budget protects (currently only PostgreSQL).
+        """
+        return 0
+
 
 class PostgresqlEngineConfig(EngineConfig):
     """PostgreSQL connection pool — backs every PG-driver class.
@@ -261,6 +273,13 @@ class PostgresqlEngineConfig(EngineConfig):
             "``asyncpg.exceptions.PoolTimeoutError``."
         ),
     )
+
+    def connection_budget_units(self) -> int:
+        """This engine's ``pool_size`` — the real connections
+        ``engine_init()`` opens against the shared database, and so the
+        cost this engine charges against ``EngineInstanceCache``'s
+        fleet-wide budget (#2963)."""
+        return self.pool_size
 
     async def engine_init(self) -> Any:
         """Build a dedicated ``asyncpg.Pool`` for this engine.

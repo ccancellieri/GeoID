@@ -135,6 +135,42 @@ class PoolSaturationError(DatabaseError):
         super().__init__(message, original_exception=original_exception)
         self.retry_after = retry_after
 
+
+class EngineCacheBudgetExceededError(DatabaseError):
+    """Raised when creating a new ``EngineInstanceCache`` entry would push the
+    fleet-wide connection budget past its configured ceiling (#2963).
+
+    ``PostgresqlEngineConfig.pool_size`` allows up to 200 connections per
+    engine, and the cache holds one live pool per DISTINCT ``engine_ref`` --
+    but until now nothing summed those pools against the shared database's
+    real connection ceiling. That was harmless while every deployment ran a
+    single default engine per kind; it stops being harmless once ref-keyed
+    driver-config storage (#2913) lets operators register many refs (e.g. one
+    per catalog), each pinning its own pool.
+
+    ``EngineInstanceCache`` tracks a running total of
+    ``EngineConfig.connection_budget_units()`` across every live entry and
+    raises this instead of silently instantiating past ``pool_budget``. The
+    caller can retry after evicting an idle engine (frees its share of the
+    budget) or after an operator raises the cache's configured budget.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        engine_ref: str,
+        requested_units: int,
+        allocated_units: int,
+        pool_budget: int,
+    ) -> None:
+        super().__init__(message)
+        self.engine_ref = engine_ref
+        self.requested_units = requested_units
+        self.allocated_units = allocated_units
+        self.pool_budget = pool_budget
+
+
 # --- Specific PostgreSQL Errors based on pgcode ---
 
 class TableNotFoundError(DatabaseError):
