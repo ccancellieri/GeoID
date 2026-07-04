@@ -675,10 +675,15 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
     ):
         """GET /catalogs/{catalog_id}/collections — list or search STAC collections.
 
-        When any STAC Collection Search extension parameters are present (bbox,
-        datetime, q, sortby) the request is routed through search_collections().
-        With no search parameters the plain listing path is used
-        (stac_generator.create_collections_catalog).
+        Every request — with or without STAC Collection Search extension
+        params (bbox, datetime, q, sortby, limit, offset) — is routed through
+        the single PG-backed search_collections() path below. There used to
+        be a separate unpaginated "plain listing" path that hydrated every
+        collection through the routed READ driver one at a time
+        (stac_generator.create_collections_catalog); on a catalog with ~2,000
+        collections that took 100s of seconds and blew the gateway timeout
+        (#2865-adjacent — same per-collection O(N) hydration shape as the
+        landing-page and /search fixes for that issue).
 
         Conforms to: https://api.stacspec.org/v1.0.0/collection-search and
         http://www.opengis.net/spec/ogcapi-common-2/1.0/conf/simple-query.
@@ -694,49 +699,6 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             raise HTTPException(
                 status_code=404, detail=f"Catalog '{catalog_id}' not found."
             )
-
-        # Detect whether any Collection Search params were supplied
-        has_search_params = any([bbox, datetime, q, sortby])
-        if not has_search_params and limit is None and offset == 0:
-            # Plain listing — no search parameters
-            try:
-                collections = await stac_generator.create_collections_catalog(
-                    request, catalog_id=catalog_id, lang=language, hints=request_hints,
-                )
-            except AttributeError as e:
-                raise HTTPException(
-                    status_code=501,
-                    detail="STAC Collection listing not yet implemented in generator.",
-                ) from e
-
-            if not collections.get("collections"):
-                # The plain-listing path hydrates each collection through the
-                # routed READ driver, which can be ES. Under job load (bulk
-                # collection creation) the ES secondary-index write may not
-                # have landed yet, so hydration returns nothing even though
-                # PG — the system of record — already has rows. Fall back to
-                # the PG-backed query the Collection Search branch below
-                # uses, with no filters, so listing never silently empties
-                # out while PG has data.
-                async with managed_transaction(engine) as conn:
-                    stac_config = await self._get_stac_config(catalog_id, db_resource=conn)
-                    fallback_req = CollectionSearchRequest(catalog_id=catalog_id)
-                    pg_collections, pg_total = await search_collections(
-                        conn, fallback_req,
-                        default_limit=stac_config.default_limit,
-                        max_limit=stac_config.max_limit,
-                    )
-                if pg_total:
-                    stac_collections = _pg_collections_to_stac_dicts(pg_collections, language)
-                    collections["collections"] = stac_collections
-                    collections["context"] = {
-                        "limit": fallback_req.limit,
-                        "offset": fallback_req.offset,
-                        "matched": pg_total,
-                        "returned": len(stac_collections),
-                    }
-
-            return JSONResponse(content=collections)
 
         # Collection Search path — parse params into CollectionSearchRequest
         parsed_bbox = None

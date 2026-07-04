@@ -554,41 +554,6 @@ async def create_catalog(
     return catalog.to_dict()
 
 
-async def create_collections_catalog(
-    request: Request, catalog_id: str, lang: str = "en", hints: FrozenSet = frozenset(),
-) -> Dict[str, Any]:
-    """Generates the collections list for a specific catalog."""
-    catalogs_svc = get_protocol(CatalogsProtocol)
-    if not catalogs_svc:
-        raise RuntimeError("CatalogsProtocol not available")
-    collections = await cast(CatalogsProtocol, catalogs_svc).list_collections(
-        catalog_id, lang=lang, limit=1000, hints=hints,
-    )
-
-    stac_collections = []
-    for coll in collections:
-        stac_coll = await create_collection(request, catalog_id, _public_id(coll), lang=lang, hints=hints)
-        if stac_coll:
-            stac_collections.append(stac_coll.to_dict())
-
-    root_url = get_root_url(request)
-    links = [
-        {
-            "rel": "self",
-            "type": "application/json",
-            "href": f"{root_url}/stac/catalogs/{catalog_id}/collections",
-        },
-        {
-            "rel": "parent",
-            "type": "application/json",
-            "href": f"{root_url}/stac/catalogs/{catalog_id}",
-        },
-        {"rel": "root", "type": "application/json", "href": f"{root_url}/stac"},
-    ]
-
-    return {"collections": stac_collections, "links": links}
-
-
 async def create_collection(
     request: Request,
     catalog_id: str,
