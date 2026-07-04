@@ -97,15 +97,38 @@ class SidecarRegistry:
             "stac_metadata" not in cls._registry
             and "stac_metadata" not in cls._unavailable_optional_sidecars
         ):
+            stac_module = "dynastore.extensions.stac.stac_items_sidecar"
             try:
                 from dynastore.extensions.stac.stac_items_sidecar import StacItemsSidecar
                 cls._registry["stac_metadata"] = StacItemsSidecar
                 logger.debug("SidecarRegistry: Successfully registered 'stac_metadata' sidecar")
+            except ModuleNotFoundError as e:
+                # `e.name` is the deepest package/module the import machinery
+                # failed to find, which is an ANCESTOR of `stac_module` (or
+                # `stac_module` itself) when the extension simply isn't
+                # installed on this image — e.g. a slim SCOPE reports
+                # `e.name == "dynastore.extensions.stac"`, not the leaf
+                # sidecar module. Only treat it as "genuinely missing" when
+                # it's on that ancestor chain; anything else means some
+                # OTHER module the (installed) extension imports internally
+                # is broken, which is a real defect and must keep warning
+                # loudly instead of being cached away.
+                is_extension_missing = e.name is not None and (
+                    stac_module == e.name or stac_module.startswith(e.name + ".")
+                )
+                if is_extension_missing:
+                    cls._unavailable_optional_sidecars.add("stac_metadata")
+                    logger.info(
+                        "SidecarRegistry: 'stac_metadata' sidecar not available in "
+                        f"this process, will not retry: {e}"
+                    )
+                else:
+                    logger.warning(
+                        f"SidecarRegistry: Failed to register 'stac_metadata' sidecar: {e}"
+                    )
             except ImportError as e:
-                cls._unavailable_optional_sidecars.add("stac_metadata")
-                logger.info(
-                    "SidecarRegistry: 'stac_metadata' sidecar not available in "
-                    f"this process, will not retry: {e}"
+                logger.warning(
+                    f"SidecarRegistry: Failed to register 'stac_metadata' sidecar: {e}"
                 )
 
     @classmethod
