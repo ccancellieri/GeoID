@@ -477,12 +477,17 @@ class Cache(Protocol):
         *,
         ttl: Optional[Union[timedelta, float]] = None,
         namespace: Optional[str] = None,
+        stale_grace: Optional[Union[timedelta, float]] = None,
     ) -> Any:
         """Stampede-safe get-or-create.
 
         If the key exists, return cached value.  Otherwise, acquire a lock,
         call ``factory()`` exactly once, cache the result, and return it.
         Other concurrent callers wait for the result.
+
+        The slow path (lock wait + ``factory()``) is bounded; on timeout or
+        a ``factory()`` exception, a value still within ``stale_grace`` of
+        its logical TTL is served instead of propagating (#2902).
 
         Inspired by dogpile ``get_or_create``, .NET ``GetOrCreate``,
         and cashews ``get_or_set``.

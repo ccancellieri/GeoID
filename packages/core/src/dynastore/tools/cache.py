@@ -461,6 +461,77 @@ def _ev_parse(data: Any) -> "tuple[int, Any, bool]":
 
 
 # ---------------------------------------------------------------------------
+#  Stale-serving envelope (#2902)
+# ---------------------------------------------------------------------------
+
+# A cache entry is kept physically alive past its logical TTL by a grace
+# window, so a slow or failing rebuild (DB pool starvation, downstream
+# outage) can serve the last-known-good value instead of every queued
+# waiter riding an unbounded factory() call to the caller's own gateway
+# timeout. This wrapper is independent of the L1/L2 version envelope above
+# (``_ev_wrap``/``_ev_parse`` — tiered-backend concurrency): it operates one
+# layer up, on the value ``LocalCache.get_or_set`` and the ``@cached``
+# decorator hand to whichever backend is resolved (local or tiered), so it
+# behaves the same regardless of backend type.
+
+DEFAULT_STALE_GRACE_SECONDS: float = 300.0
+_DEFAULT_SLOW_PATH_TIMEOUT_SECONDS: float = 30.0
+
+_STALE_AT = "__sat"    # wall-clock write time (time.time())
+_STALE_TTL = "__sttl"  # logical ttl (seconds) in effect at write time
+_STALE_VAL = "__sval"  # payload
+
+_NO_STALE: Any = object()  # sentinel: "no stale value available for fallback"
+
+
+def _stale_wrap(value: Any, ttl: float) -> Dict[str, Any]:
+    """Wrap ``value`` with its write time + logical ttl for stale-grace tracking."""
+    return {_STALE_AT: time.time(), _STALE_TTL: ttl, _STALE_VAL: value}
+
+
+def _stale_unwrap(raw: Any) -> "tuple[Any, bool]":
+    """Unwrap a stale-tracked entry -> ``(value, is_stale)``.
+
+    Entries not produced by ``_stale_wrap`` (grace disabled at write time)
+    are returned as-is and are never considered stale.
+    """
+    if not (
+        isinstance(raw, dict)
+        and _STALE_AT in raw
+        and _STALE_TTL in raw
+        and _STALE_VAL in raw
+    ):
+        return raw, False
+    age = time.time() - float(raw[_STALE_AT])
+    return raw[_STALE_VAL], age > float(raw[_STALE_TTL])
+
+
+async def _load_slow_path_timeout() -> float:
+    """Load ``slow_path_timeout_seconds`` from ``CachePluginConfig``.
+
+    Bounds lock-wait + factory time on the ``get_or_set``/``@cached`` slow
+    path. Falls back to 30s if ``ConfigsProtocol`` is unavailable or the
+    config load fails — mirrors
+    ``modules/tasks/dispatcher.py::_load_oracle_inner_timeout``.
+    """
+    try:
+        from dynastore.modules.cache.cache_config import CachePluginConfig
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.tools.discovery import get_protocol
+
+        configs_proto = get_protocol(ConfigsProtocol)
+        if configs_proto is not None:
+            cfg = await configs_proto.get_config(CachePluginConfig)
+            if cfg is not None:
+                return cfg.slow_path_timeout_seconds
+    except Exception as e:
+        logger.debug(
+            "cache: slow_path_timeout_seconds config load failed (%s), using default", e
+        )
+    return _DEFAULT_SLOW_PATH_TIMEOUT_SECONDS
+
+
+# ---------------------------------------------------------------------------
 #  TieredAsyncBackend
 # ---------------------------------------------------------------------------
 
@@ -1017,31 +1088,92 @@ class LocalCache:
         *,
         ttl: Optional[Union[timedelta, float]] = None,
         namespace: Optional[str] = None,
+        stale_grace: Optional[Union[timedelta, float]] = None,
     ) -> Any:
+        """Stampede-safe get-or-create with bounded slow path + stale fallback.
+
+        ``stale_grace`` (default ``DEFAULT_STALE_GRACE_SECONDS`` = 300s, ``0``
+        disables it) keeps the previous value physically alive past its
+        logical ``ttl`` so that, if the rebuild's lock-wait + ``factory()``
+        call exceeds ``CachePluginConfig.slow_path_timeout_seconds`` (default
+        30s) or ``factory()`` raises, the stale value is served instead of
+        propagating (see #2902). With no stale value available, the original
+        exception/timeout propagates promptly.
+        """
+        resolved_ttl = self._resolve_ttl(ttl)
+        grace = (
+            DEFAULT_STALE_GRACE_SECONDS
+            if stale_grace is None
+            else (
+                stale_grace.total_seconds()
+                if isinstance(stale_grace, timedelta)
+                else float(stale_grace)
+            )
+        )
+        stale_on = grace > 0 and resolved_ttl is not None
+        # Cross-revision key compatibility (#2902): an old-revision process
+        # reading a stale-wrapped entry has no unwrap logic and would return
+        # the wrapper dict as the value. Version-prefixing the key when
+        # stale-wrapping is active means old code simply misses (one cold
+        # rebuild, absorbed by the bounded slow path) instead of misreading;
+        # this also makes rollback safe since the old revision resumes
+        # reading its own unprefixed keys.
         full_key = self._full_key(key, namespace)
+        if stale_on:
+            full_key = "sv1|" + full_key
+        stale_candidate: Any = _NO_STALE
+
+        async def _read() -> "tuple[Any, bool]":
+            raw = await self._backend.get(full_key)
+            if raw is None:
+                return _NO_STALE, False
+            loaded = self._serializer.loads(raw)
+            return _stale_unwrap(loaded) if stale_on else (loaded, False)
 
         # Fast path: value in cache
-        raw = await self._backend.get(full_key)
-        if raw is not None:
-            self._stats.hits += 1
-            return self._serializer.loads(raw)
-
-        # Slow path: acquire per-key lock for stampede protection
-        lock = await self._backend.get_lock(full_key)
-        async with lock:
-            # Double-check after acquiring lock
-            raw = await self._backend.get(full_key)
-            if raw is not None:
+        value, is_stale = await _read()
+        if value is not _NO_STALE:
+            if not is_stale:
                 self._stats.hits += 1
-                return self._serializer.loads(raw)
+                return value
+            stale_candidate = value
 
-            self._stats.misses += 1
-            value = await factory()
-            resolved_ttl = self._resolve_ttl(ttl)
-            serialized = self._serializer.dumps(value)
-            await self._backend.set(full_key, serialized, ttl=resolved_ttl)
-            await self._emit(CacheEvent.SET, key=full_key, ttl=resolved_ttl)
-            return value
+        # Slow path: acquire per-key lock for stampede protection, bounded
+        # to slow_path_timeout_seconds (lock wait + factory combined).
+        lock = await self._backend.get_lock(full_key)
+        timeout = await _load_slow_path_timeout()
+        try:
+            async with asyncio.timeout(timeout):
+                async with lock:
+                    # Double-check after acquiring lock
+                    value, is_stale = await _read()
+                    if value is not _NO_STALE:
+                        if not is_stale:
+                            self._stats.hits += 1
+                            return value
+                        stale_candidate = value
+
+                    self._stats.misses += 1
+                    result = await factory()
+                    if stale_on and resolved_ttl is not None:
+                        to_store: Any = _stale_wrap(result, resolved_ttl)
+                        physical_ttl = resolved_ttl + grace
+                    else:
+                        to_store = result
+                        physical_ttl = resolved_ttl
+                    serialized = self._serializer.dumps(to_store)
+                    await self._backend.set(full_key, serialized, ttl=physical_ttl)
+                    await self._emit(CacheEvent.SET, key=full_key, ttl=physical_ttl)
+                    return result
+        except Exception as exc:
+            reason = "timeout" if isinstance(exc, TimeoutError) else "error"
+            if stale_candidate is not _NO_STALE:
+                logger.warning(
+                    "cache_stale_served key=%s reason=%s error=%s",
+                    full_key, reason, exc,
+                )
+                return stale_candidate
+            raise
 
     async def close(self) -> None:
         pass  # Backend lifecycle managed by CacheManager
@@ -1212,6 +1344,7 @@ def cached(
     distributed: bool = True,
     l1_ttl: Optional[Union[float, int]] = None,
     max_distributed_ttl: Optional[Union[float, int]] = None,
+    stale_grace: Optional[Union[float, int]] = None,
 ) -> Callable:
     """Centralized caching decorator for sync and async functions.
 
@@ -1243,6 +1376,13 @@ def cached(
             and invalidations are dropped (#2328). Defaults to 3600s (1 hour).
             Set higher for slowly-changing metadata (e.g., tiles config) or to
             ``float("inf")`` to disable the cap. Ignored for local-only caches.
+        stale_grace: Grace window (seconds) a value is kept physically alive
+            past its logical ``ttl`` so a rebuild that exceeds
+            ``CachePluginConfig.slow_path_timeout_seconds`` (default 30s) or
+            raises can serve the stale value instead of propagating (#2902).
+            Defaults to ``DEFAULT_STALE_GRACE_SECONDS`` (300s). ``0`` disables
+            stale serving. Ignored when ``ttl=None`` (no logical expiry, so
+            nothing can go stale).
 
     The decorated function gets these methods:
         - ``.cache_invalidate(*args, **kwargs)`` -- invalidate specific entry
@@ -1321,10 +1461,26 @@ def cached(
                 func_qualname, _effective_max_distributed_ttl,
             )
 
+        _grace = (
+            DEFAULT_STALE_GRACE_SECONDS if stale_grace is None else float(stale_grace)
+        )
+
+        # Cross-revision key compatibility (#2902): Valkey is shared across
+        # rolling-deploy revisions. An old-revision process has no unwrap
+        # logic for the stale-wrapped envelope, so its fast path would
+        # return the wrapper dict AS the cached value — silently corrupting
+        # every cached endpoint until the entry expires. Storing
+        # stale-wrapped entries under a version-prefixed key means old code
+        # simply misses (cold-rebuilds once, absorbed by the bounded slow
+        # path) instead of misreading. Grace-disabled functions keep
+        # today's unprefixed keys (those entries are never wrapped, so they
+        # stay cross-revision safe as-is).
+        _key_prefix = "sv1|" if _grace > 0 else ""
+
         def _build_key(args: tuple, kwargs: dict) -> str:
             if key_builder is not None:
-                return key_builder(func, *args, **kwargs)
-            return _make_cache_key(
+                return _key_prefix + key_builder(func, *args, **kwargs)
+            return _key_prefix + _make_cache_key(
                 ns, args, kwargs, sig, ignored_params, typed
             )
 
@@ -1354,43 +1510,75 @@ def cached(
                 assert _backend is not None
 
                 cache_key = _build_key(args, kwargs)
+                stale_candidate: Any = _NO_STALE
 
                 # Fast path
                 raw = await _backend.get(cache_key)
                 if raw is not None:
-                    # Re-validate against ``condition`` so stale entries written
-                    # before the condition was added (or by a code path that
-                    # bypassed it) cannot keep being served forever.  Drop the
-                    # entry across all tiers so the next read refetches.
-                    if condition is None or condition(raw):
-                        _backend._stats.hits += 1
-                        return raw  # NullSerializer for local; msgpack for Valkey
-                    await _backend.clear(key=cache_key)
+                    value, is_stale = _stale_unwrap(raw) if _grace > 0 else (raw, False)
+                    if not is_stale:
+                        # Re-validate against ``condition`` so stale entries written
+                        # before the condition was added (or by a code path that
+                        # bypassed it) cannot keep being served forever.  Drop the
+                        # entry across all tiers so the next read refetches.
+                        if condition is None or condition(value):
+                            _backend._stats.hits += 1
+                            return value  # NullSerializer for local; msgpack for Valkey
+                        await _backend.clear(key=cache_key)
+                    else:
+                        stale_candidate = value
 
-                # Stampede protection
+                # Stampede protection, bounded to slow_path_timeout_seconds
+                # (lock wait + factory combined) — on timeout or a factory()
+                # exception, fall back to a still-grace-window stale value
+                # rather than hanging every queued waiter (#2902).
                 if _backend_has_lock:
                     lock = await _backend.get_lock(cache_key)
                 else:
                     if cache_key not in _fallback_locks:
                         _fallback_locks[cache_key] = asyncio.Lock()
                     lock = _fallback_locks[cache_key]
-                async with lock:
-                    raw = await _backend.get(cache_key)
-                    if raw is not None:
-                        if condition is None or condition(raw):
-                            _backend._stats.hits += 1
-                            return raw
-                        await _backend.clear(key=cache_key)
+                timeout = await _load_slow_path_timeout()
+                try:
+                    async with asyncio.timeout(timeout):
+                        async with lock:
+                            raw = await _backend.get(cache_key)
+                            if raw is not None:
+                                value, is_stale = (
+                                    _stale_unwrap(raw) if _grace > 0 else (raw, False)
+                                )
+                                if not is_stale:
+                                    if condition is None or condition(value):
+                                        _backend._stats.hits += 1
+                                        return value
+                                    await _backend.clear(key=cache_key)
+                                else:
+                                    stale_candidate = value
 
-                    _backend._stats.misses += 1
-                    result = await func(*args, **kwargs)
+                            _backend._stats.misses += 1
+                            result = await func(*args, **kwargs)
 
-                    if condition is not None and not condition(result):
-                        return result
+                            if condition is not None and not condition(result):
+                                return result
 
-                    resolved = _resolve_ttl()
-                    await _backend.set(cache_key, result, ttl=resolved)
-                    return result
+                            resolved = _resolve_ttl()
+                            if _grace > 0 and resolved is not None:
+                                to_store = _stale_wrap(result, resolved)
+                                await _backend.set(
+                                    cache_key, to_store, ttl=resolved + _grace
+                                )
+                            else:
+                                await _backend.set(cache_key, result, ttl=resolved)
+                            return result
+                except Exception as exc:
+                    reason = "timeout" if isinstance(exc, TimeoutError) else "error"
+                    if stale_candidate is not _NO_STALE:
+                        logger.warning(
+                            "cache_stale_served key=%s reason=%s error=%s",
+                            cache_key, reason, exc,
+                        )
+                        return stale_candidate
+                    raise
 
             def sync_cache_invalidate_impl(*args: Any, **kwargs: Any) -> None:
                 """Sync invalidation -- works in both sync and async contexts."""
@@ -1428,7 +1616,7 @@ def cached(
                     # Distributed backend: schedule async namespace clear
                     try:
                         loop = asyncio.get_running_loop()
-                        _track(loop.create_task(_backend.clear(namespace=ns)))
+                        _track(loop.create_task(_backend.clear(namespace=_key_prefix + ns)))
                     except RuntimeError:
                         pass
 
@@ -1436,9 +1624,10 @@ def cached(
                 """Drop all entries whose key starts with ``sub_namespace + "|"``.
 
                 ``@cached`` functions build keys as ``"{ns}|{arg1}|{arg2}|..."``
-                where ``ns`` is the decorator's ``namespace`` parameter.  A
-                *sub-namespace* is a prefix of that key that identifies a
-                subset of entries — for example
+                (version-prefixed with ``sv1|`` when stale-grace is active,
+                see ``_key_prefix`` above) where ``ns`` is the decorator's
+                ``namespace`` parameter.  A *sub-namespace* is a prefix of
+                that key that identifies a subset of entries — for example
                 ``"collection_config|'mycat'|'mycoll'"`` matches every
                 class-key entry for that (catalog, collection) pair.
 
@@ -1455,7 +1644,8 @@ def cached(
                 """
                 if _backend is None:
                     return
-                key_prefix = f"{sub_namespace}|"
+                versioned_sub_ns = _key_prefix + sub_namespace
+                key_prefix = f"{versioned_sub_ns}|"
                 if isinstance(_backend, LocalAsyncCacheBackend):
                     # Direct in-process scan — no separator ambiguity.
                     to_delete = [k for k in list(_backend._store.keys()) if k.startswith(key_prefix)]
@@ -1469,7 +1659,7 @@ def cached(
                     # by this clear; residual L1 entries expire within l1_ttl.
                     try:
                         loop = asyncio.get_running_loop()
-                        _track(loop.create_task(_backend.clear(namespace=sub_namespace)))
+                        _track(loop.create_task(_backend.clear(namespace=versioned_sub_ns)))
                     except RuntimeError:
                         pass
 

@@ -913,7 +913,12 @@ class TestMaxDistributedTTL:
         try:
             calls = {"n": 0}
 
-            @cached(maxsize=8, namespace="max_ttl_test", distributed=True)
+            @cached(
+                maxsize=8,
+                namespace="max_ttl_test",
+                distributed=True,
+                stale_grace=0,  # isolate this test from the #2902 default grace window
+            )
             async def fetch(key: str):
                 calls["n"] += 1
                 return {"rev": calls["n"]}
@@ -960,6 +965,7 @@ class TestMaxDistributedTTL:
                 namespace="custom_cap",
                 distributed=True,
                 max_distributed_ttl=300,
+                stale_grace=0,  # isolate this test from the #2902 default grace window
             )
             async def fetch(key: str):
                 calls["n"] += 1
@@ -993,6 +999,7 @@ class TestMaxDistributedTTL:
                 namespace="explicit_ttl",
                 distributed=True,
                 max_distributed_ttl=300,
+                stale_grace=0,  # isolate this test from the #2902 default grace window
             )
             async def fetch(key: str):
                 calls["n"] += 1
@@ -1042,3 +1049,440 @@ class TestMaxDistributedTTL:
             assert ttl_passed is None
         finally:
             get_cache_manager().unregister_backend(l2)
+
+
+class TestLocalCacheGetOrSetStaleGraceFallback:
+    """LocalCache.get_or_set(stale_grace=...) — bounded slow path + degraded
+    serving on rebuild failure/timeout (#2902).
+
+    ``LocalCache.get_or_set`` is the exact root-cause API from #2902: an
+    unbounded per-key lock wait + factory() call with no stale fallback,
+    which under DB pool starvation rides every queued waiter to the
+    caller's own gateway timeout.
+    """
+
+    def _make_cache(self):
+        from dynastore.models.protocols.cache import CacheConfig
+        from dynastore.tools.cache import LocalAsyncCacheBackend, LocalCache
+
+        backend = LocalAsyncCacheBackend()
+        config = CacheConfig(namespace="lc_stale_test")
+        return LocalCache(backend=backend, config=config)
+
+    @pytest.mark.asyncio
+    async def test_fresh_value_preferred_when_not_expired(self):
+        """A hit within the logical TTL behaves exactly as before — no
+        staleness bookkeeping observable, factory called only once."""
+        cache = self._make_cache()
+        calls = {"n": 0}
+
+        async def factory():
+            calls["n"] += 1
+            return {"rev": calls["n"]}
+
+        first = await cache.get_or_set("k1", factory, ttl=60)
+        second = await cache.get_or_set("k1", factory, ttl=60)
+        assert first == second == {"rev": 1}
+        assert calls["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_stale_served_on_factory_error(self, caplog):
+        """factory() raising after the logical TTL expires serves the
+        still-in-grace stale value instead of propagating."""
+        import logging
+
+        cache = self._make_cache()
+        calls = {"n": 0}
+
+        async def factory():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"rev": 1}
+            raise RuntimeError("rebuild failed")
+
+        first = await cache.get_or_set("k1", factory, ttl=0.05, stale_grace=60)
+        assert first == {"rev": 1}
+        await asyncio.sleep(0.15)  # logical ttl expires; grace keeps it alive
+
+        with caplog.at_level(logging.WARNING, logger="dynastore.tools.cache"):
+            second = await cache.get_or_set("k1", factory, ttl=0.05, stale_grace=60)
+
+        assert second == {"rev": 1}
+        assert any(
+            "cache_stale_served" in r.getMessage() and "reason=error" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_stale_served_on_slow_path_timeout(self, caplog, monkeypatch):
+        """A factory() call that outlives slow_path_timeout_seconds is
+        abandoned and the stale value is served instead of hanging."""
+        import logging
+
+        from dynastore.tools import cache as cache_mod
+
+        monkeypatch.setattr(
+            cache_mod, "_load_slow_path_timeout", AsyncMock(return_value=0.05)
+        )
+
+        cache = self._make_cache()
+        calls = {"n": 0}
+
+        async def factory():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"rev": 1}
+            await asyncio.sleep(1.0)  # exceeds the 0.05s slow-path timeout
+            return {"rev": 2}
+
+        first = await cache.get_or_set("k1", factory, ttl=0.05, stale_grace=60)
+        assert first == {"rev": 1}
+        await asyncio.sleep(0.15)
+
+        with caplog.at_level(logging.WARNING, logger="dynastore.tools.cache"):
+            second = await cache.get_or_set("k1", factory, ttl=0.05, stale_grace=60)
+
+        assert second == {"rev": 1}
+        assert any(
+            "cache_stale_served" in r.getMessage() and "reason=timeout" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_stale_failing_factory_propagates_promptly(self):
+        """No prior value to fall back on — the factory's exception propagates."""
+        cache = self._make_cache()
+
+        async def factory():
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await cache.get_or_set("k1", factory, ttl=60, stale_grace=60)
+
+    @pytest.mark.asyncio
+    async def test_grace_zero_disables_stale_serving(self):
+        """stale_grace=0 keeps today's behavior: expired entries are gone,
+        a failing rebuild propagates."""
+        cache = self._make_cache()
+        calls = {"n": 0}
+
+        async def factory():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"rev": 1}
+            raise RuntimeError("rebuild failed")
+
+        first = await cache.get_or_set("k1", factory, ttl=0.05, stale_grace=0)
+        assert first == {"rev": 1}
+        await asyncio.sleep(0.15)
+
+        with pytest.raises(RuntimeError, match="rebuild failed"):
+            await cache.get_or_set("k1", factory, ttl=0.05, stale_grace=0)
+
+    @pytest.mark.asyncio
+    async def test_legacy_unprefixed_entry_is_not_returned_when_grace_active(self):
+        """Cross-revision safety (#2902 review): a pre-existing entry under
+        the plain (unprefixed) key -- as an old revision without stale-wrap
+        unwrap logic would have written it -- must not be misread as the
+        cached value once stale-wrapping (and its ``sv1|`` key prefix) is
+        active. The versioned key misses and the value is freshly rebuilt.
+        """
+        cache = self._make_cache()
+        calls = {"n": 0}
+
+        async def factory():
+            calls["n"] += 1
+            return {"rev": calls["n"]}
+
+        legacy_key = cache._full_key("k1")
+        await cache._backend.set(legacy_key, {"rev": "legacy-corrupt-if-read"}, ttl=60)
+
+        result = await cache.get_or_set("k1", factory, ttl=60, stale_grace=60)
+
+        assert result == {"rev": 1}
+        assert calls["n"] == 1
+
+
+class TestCachedStaleGraceFallback:
+    """@cached(stale_grace=...) — bounded slow path + degraded serving on
+    rebuild failure/timeout (#2902), the production call path used by
+    every ``@cached``-decorated function in the codebase.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fresh_value_preferred_when_not_expired(self):
+        from dynastore.tools.cache import cached
+
+        calls = {"n": 0}
+
+        @cached(maxsize=8, ttl=60, namespace="cached_stale_fresh_test", distributed=False)
+        async def fetch(key: str):
+            calls["n"] += 1
+            return {"rev": calls["n"]}
+
+        first = await fetch("k1")
+        second = await fetch("k1")
+        assert first == second == {"rev": 1}
+        assert calls["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_stale_served_on_factory_error(self, caplog):
+        import logging
+
+        from dynastore.tools.cache import cached
+
+        calls = {"n": 0}
+
+        @cached(
+            maxsize=8,
+            ttl=0.05,
+            stale_grace=60,
+            namespace="cached_stale_error_test",
+            distributed=False,
+        )
+        async def fetch(key: str):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"rev": 1}
+            raise RuntimeError("rebuild failed")
+
+        first = await fetch("k1")
+        assert first == {"rev": 1}
+        await asyncio.sleep(0.15)
+
+        with caplog.at_level(logging.WARNING, logger="dynastore.tools.cache"):
+            second = await fetch("k1")
+
+        assert second == {"rev": 1}
+        assert any(
+            "cache_stale_served" in r.getMessage() and "reason=error" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_stale_served_on_slow_path_timeout(self, caplog, monkeypatch):
+        import logging
+
+        from dynastore.tools import cache as cache_mod
+        from dynastore.tools.cache import cached
+
+        monkeypatch.setattr(
+            cache_mod, "_load_slow_path_timeout", AsyncMock(return_value=0.05)
+        )
+
+        calls = {"n": 0}
+
+        @cached(
+            maxsize=8,
+            ttl=0.05,
+            stale_grace=60,
+            namespace="cached_stale_timeout_test",
+            distributed=False,
+        )
+        async def fetch(key: str):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"rev": 1}
+            await asyncio.sleep(1.0)  # exceeds the 0.05s slow-path timeout
+            return {"rev": 2}
+
+        first = await fetch("k1")
+        assert first == {"rev": 1}
+        await asyncio.sleep(0.15)
+
+        with caplog.at_level(logging.WARNING, logger="dynastore.tools.cache"):
+            second = await fetch("k1")
+
+        assert second == {"rev": 1}
+        assert any(
+            "cache_stale_served" in r.getMessage() and "reason=timeout" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_stale_failing_factory_propagates_promptly(self):
+        from dynastore.tools.cache import cached
+
+        @cached(
+            maxsize=8,
+            ttl=60,
+            stale_grace=60,
+            namespace="cached_stale_no_prior_test",
+            distributed=False,
+        )
+        async def fetch(key: str):
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await fetch("k1")
+
+    @pytest.mark.asyncio
+    async def test_grace_zero_disables_stale_serving(self):
+        from dynastore.tools.cache import cached
+
+        calls = {"n": 0}
+
+        @cached(
+            maxsize=8,
+            ttl=0.05,
+            stale_grace=0,
+            namespace="cached_stale_disabled_test",
+            distributed=False,
+        )
+        async def fetch(key: str):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"rev": 1}
+            raise RuntimeError("rebuild failed")
+
+        first = await fetch("k1")
+        assert first == {"rev": 1}
+        await asyncio.sleep(0.15)
+
+        with pytest.raises(RuntimeError, match="rebuild failed"):
+            await fetch("k1")
+
+
+class TestCachedCrossRevisionKeyCompat:
+    """@cached key version-prefixing (#2902 review).
+
+    Valkey is shared across rolling-deploy revisions. An old-revision
+    process has no unwrap logic for the stale-wrapped envelope, so if it
+    read a wrapped entry its fast path would return the wrapper dict AS
+    the cached value -- silently corrupting every cached endpoint until
+    the entry expires. Storing stale-wrapped entries under a
+    version-prefixed key (``sv1|``) means old code simply misses (one
+    cold rebuild, absorbed by the bounded slow path) instead of
+    misreading, and makes rollback safe (the old revision resumes
+    reading its own unprefixed keys).
+    """
+
+    @pytest.mark.asyncio
+    async def test_legacy_unprefixed_entry_is_not_returned_when_grace_active(self):
+        import inspect
+
+        from dynastore.tools.cache import (
+            LocalAsyncCacheBackend,
+            _make_cache_key,
+            cached,
+            get_cache_manager,
+        )
+
+        class _NamedBackend(LocalAsyncCacheBackend):
+            @property
+            def name(self) -> str:  # type: ignore[override]
+                return "xrev-legacy-test-backend"
+
+        backend = _NamedBackend()
+        get_cache_manager().register_backend(backend)
+        try:
+            calls = {"n": 0}
+
+            @cached(
+                maxsize=8,
+                ttl=60,
+                namespace="xrev_legacy_test",
+                backend="xrev-legacy-test-backend",
+            )
+            async def fetch(key: str):
+                calls["n"] += 1
+                return {"rev": calls["n"]}
+
+            # Simulate an old-revision entry: a raw (unwrapped) value stored
+            # under the plain key -- the format @cached used before #2902.
+            sig = inspect.signature(fetch.__wrapped__)
+            legacy_key = _make_cache_key(
+                "xrev_legacy_test", ("k1",), {}, sig, set(), False
+            )
+            await backend.set(legacy_key, {"rev": "legacy-corrupt-if-read"}, ttl=60)
+
+            result = await fetch("k1")
+
+            # Must NOT return the legacy raw value -- a miss + fresh rebuild.
+            assert result == {"rev": 1}
+            assert calls["n"] == 1
+        finally:
+            get_cache_manager().unregister_backend(backend)
+
+    @pytest.mark.asyncio
+    async def test_cache_invalidate_clears_the_prefixed_entry(self):
+        from dynastore.tools.cache import (
+            LocalAsyncCacheBackend,
+            cached,
+            get_cache_manager,
+        )
+
+        class _NamedBackend(LocalAsyncCacheBackend):
+            @property
+            def name(self) -> str:  # type: ignore[override]
+                return "xrev-invalidate-test-backend"
+
+        backend = _NamedBackend()
+        get_cache_manager().register_backend(backend)
+        try:
+            calls = {"n": 0}
+
+            @cached(
+                maxsize=8,
+                ttl=60,
+                namespace="xrev_invalidate_test",
+                backend="xrev-invalidate-test-backend",
+            )
+            async def fetch(key: str):
+                calls["n"] += 1
+                return {"rev": calls["n"]}
+
+            first = await fetch("k1")
+            assert first == {"rev": 1}
+
+            stored_keys = list(backend._store.keys())
+            assert len(stored_keys) == 1
+            assert stored_keys[0].startswith("sv1|"), (
+                "a stale-wrapped entry must live under the versioned key"
+            )
+
+            fetch.cache_invalidate("k1")
+            assert list(backend._store.keys()) == []
+
+            second = await fetch("k1")
+            assert second == {"rev": 2}
+            assert calls["n"] == 2
+        finally:
+            get_cache_manager().unregister_backend(backend)
+
+    @pytest.mark.asyncio
+    async def test_grace_disabled_keeps_unprefixed_keys(self):
+        """stale_grace=0 stores under today's plain key -- unaffected by
+        the version-prefix mechanism."""
+        from dynastore.tools.cache import (
+            LocalAsyncCacheBackend,
+            cached,
+            get_cache_manager,
+        )
+
+        class _NamedBackend(LocalAsyncCacheBackend):
+            @property
+            def name(self) -> str:  # type: ignore[override]
+                return "xrev-disabled-test-backend"
+
+        backend = _NamedBackend()
+        get_cache_manager().register_backend(backend)
+        try:
+
+            @cached(
+                maxsize=8,
+                ttl=60,
+                stale_grace=0,
+                namespace="xrev_disabled_test",
+                backend="xrev-disabled-test-backend",
+            )
+            async def fetch(key: str):
+                return {"rev": 1}
+
+            await fetch("k1")
+
+            stored_keys = list(backend._store.keys())
+            assert len(stored_keys) == 1
+            assert not stored_keys[0].startswith("sv1|")
+        finally:
+            get_cache_manager().unregister_backend(backend)

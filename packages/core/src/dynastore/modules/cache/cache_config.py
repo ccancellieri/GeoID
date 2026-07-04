@@ -87,3 +87,18 @@ class CachePluginConfig(PluginConfig):
             "0.5 s matches the db_pool_acquire slow-log threshold."
         ),
     )
+
+    slow_path_timeout_seconds: Mutable[float] = Field(
+        default=30.0,
+        ge=1,
+        le=120,
+        description=(
+            "Upper bound on a cache-miss slow path: per-key stampede lock "
+            "wait plus the factory rebuild call, for both "
+            "LocalCache.get_or_set() and the @cached decorator. Without this "
+            "a rebuild stalled behind a starved DB pool rides every queued "
+            "waiter to the caller's own timeout. On expiry, a stale value "
+            "still within its grace window is served instead (see "
+            "@cached(stale_grace=...))."
+        ),
+    )
