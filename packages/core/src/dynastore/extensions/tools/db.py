@@ -21,7 +21,10 @@ from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncConnection
 from fastapi import Request
 
-from dynastore.modules.db_config.query_executor import managed_transaction
+from dynastore.modules.db_config.query_executor import (
+    _read_live_fg_acquire_timeout,
+    managed_transaction,
+)
 from dynastore.tools.discovery import get_protocol
 from dynastore.models.protocols import DatabaseProtocol
 
@@ -61,5 +64,28 @@ async def get_async_connection(
     async with managed_transaction(engine) as conn:
         # managed_transaction is dual-mode (sync/async engines, connections,
         # sessions); with an AsyncEngine input it always yields AsyncConnection.
+        assert isinstance(conn, AsyncConnection)
+        yield conn
+
+
+async def get_async_connection_bounded(
+    request: Request,
+) -> AsyncGenerator[AsyncConnection, None]:
+    """FastAPI dependency variant of :func:`get_async_connection` for read
+    surfaces that should fail fast under pool saturation (#2933/#2948).
+
+    Identical to :func:`get_async_connection` except the checkout is bounded
+    by ``ConnectionHealthConfig.foreground_pool_acquire_timeout_s`` instead of
+    only the engine's own ``pool_timeout`` — a saturated pool raises
+    ``PoolSaturationError`` (mapped to a 503 + Retry-After by the existing
+    ``PoolSaturationExceptionHandler``) well before the request rides the
+    full pool_timeout. Reserved for item-GET/search reads; write routes keep
+    the plain :func:`get_async_connection`.
+    """
+    engine = get_async_engine(request)
+
+    async with managed_transaction(
+        engine, acquire_timeout=await _read_live_fg_acquire_timeout()
+    ) as conn:
         assert isinstance(conn, AsyncConnection)
         yield conn

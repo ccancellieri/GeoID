@@ -70,7 +70,11 @@ from dynastore.extensions.tools.response_i18n import (  # noqa: E402
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.ogc_base import OGCServiceMixin, OGCTransactionMixin
 from dynastore.extensions.web.decorators import expose_web_page, expose_static
-from dynastore.extensions.tools.db import get_async_connection, get_async_engine
+from dynastore.extensions.tools.db import (
+    get_async_connection,
+    get_async_connection_bounded,
+    get_async_engine,
+)
 from dynastore.modules.db_config.query_executor import DbResource, managed_transaction
 import re
 from dynastore.extensions.tools.formatters import OutputFormatEnum
@@ -763,7 +767,8 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         request: Request,
         catalog_id: str,
         collection_id: str,
-        conn: AsyncConnection = Depends(get_async_connection),
+        # Bounded, fail-fast pool acquire (#2933/#2948) — see get_item.
+        conn: AsyncConnection = Depends(get_async_connection_bounded),
         limit: Optional[int] = Query(
             None,
             ge=1,
@@ -1144,7 +1149,12 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         collection_id: str,
         item_id: str,
         request: Request,
-        conn: AsyncConnection = Depends(get_async_connection),
+        # Bounded, fail-fast pool acquire (#2933/#2948): under pool
+        # saturation this returns 503 well before the request risks
+        # riding the Cloud Run ceiling, instead of queuing for the
+        # engine's full pool_timeout — same guard as STAC's item
+        # GET-by-id / item search (#2947).
+        conn: AsyncConnection = Depends(get_async_connection_bounded),
         language: str = Depends(get_language),
     ):
         catalogs_svc = await self._get_catalogs_service()

@@ -45,7 +45,11 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.ogc_base import OGCServiceMixin, OGCTransactionMixin
 from dynastore.extensions.web.decorators import expose_web_page, expose_static
-from dynastore.extensions.tools.db import get_async_connection, get_async_engine
+from dynastore.extensions.tools.db import (
+    get_async_connection,
+    get_async_connection_bounded,
+    get_async_engine,
+)
 from dynastore.extensions.tools.language_utils import get_language
 from dynastore.tools.language_utils import resolve_localized_field
 from dynastore.extensions.tools.url import get_root_url
@@ -424,7 +428,8 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         catalog_id: str,
         collection_id: str,
         language: str = Depends(get_language),
-        conn: AsyncConnection = Depends(get_async_connection),
+        # Bounded, fail-fast pool acquire (#2933/#2948) — see get_record.
+        conn: AsyncConnection = Depends(get_async_connection_bounded),
         limit: Optional[int] = Query(
             None,
             ge=1,
@@ -721,7 +726,12 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         record_id: str,
         request: Request,
         language: str = Depends(get_language),
-        conn: AsyncConnection = Depends(get_async_connection),
+        # Bounded, fail-fast pool acquire (#2933/#2948): under pool
+        # saturation this returns 503 well before the request risks
+        # riding the Cloud Run ceiling, instead of queuing for the
+        # engine's full pool_timeout — same guard as STAC's item
+        # GET-by-id / item search (#2947).
+        conn: AsyncConnection = Depends(get_async_connection_bounded),
     ) -> rm.Record:
         catalogs_svc = await self._get_catalogs_service()
         items_protocol = cast(ItemsProtocol, catalogs_svc)
