@@ -20,7 +20,10 @@ from pathlib import Path
 
 from dynastore.modules.notebooks.example_registry import register_platform_notebook
 from . import config  # noqa: F401  -- service-exposure plugin registration
-from . import presets as _dimensions_presets  # noqa: F401 -- preset registration side-effect
+
+# The ``common_dimensions`` preset now lives in core, alongside the
+# ``dimensions_materialize`` task it triggers, and registers via the
+# ``dynastore.presets`` entry-point group (#2601) — no import needed here.
 
 _examples_dir = Path(__file__).parent / "examples"
 

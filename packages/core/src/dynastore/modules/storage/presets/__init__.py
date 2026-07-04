@@ -50,7 +50,14 @@ from .preset import (  # noqa: F401
     PresetPlan,
     PresetPlanEntry,
 )
-from .registry import find_preset, get_preset, list_presets, register_preset, search_presets  # noqa: F401
+from .registry import (  # noqa: F401
+    find_preset,
+    get_preset,
+    list_presets,
+    load_preset_entry_points,
+    register_preset,
+    search_presets,
+)
 from .bundle_preset import BundlePreset  # noqa: F401
 
 # Built-in presets — auto-register on import.
@@ -106,6 +113,12 @@ except Exception:  # noqa: BLE001
         "presets.composites subpackage failed to import — no composites registered"
     )
 
+# Entry-point-discovered presets (#2601) — lightweight presets shipped
+# outside this package's direct imports (e.g. ``common_dimensions``, which
+# lives alongside its OGC Process task) register via the ``dynastore.presets``
+# entry-point group instead of an import here.
+load_preset_entry_points()
+
 __all__ = [
     "AppliedDescriptor",
     "AssetsGcsUploadsPreset",
@@ -133,6 +146,7 @@ __all__ = [
     "find_preset",
     "get_preset",
     "list_presets",
+    "load_preset_entry_points",
     "register_preset",
     "search_presets",
 ]

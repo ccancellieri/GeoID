@@ -128,6 +128,18 @@ webhook_delivery = "dynastore.tasks.webhook_delivery.task:WebhookDeliveryTask"
 catalog_provision = "dynastore.tasks.catalog_provision.task:CatalogProvisionTask"
 render_preseed = "dynastore.tasks.render_preseed.task:RenderPreseedTask"
 
+# ============================================================================
+# PRESETS — lightweight, entry-point-discovered preset registrations (#2601).
+# Each module registers itself via `register_preset()` as an import
+# side-effect (see `modules/storage/presets/registry.py:load_preset_entry_points`).
+# `common_dimensions` triggers the `dimensions_materialize` task above but
+# imports nothing from the `dimensions` extension or `ogc_dimensions` itself,
+# so any process serving `/configs/presets` can list/apply it without
+# installing the full dimensions extension.
+# ============================================================================
+[project.entry-points."dynastore.presets"]
+common_dimensions = "dynastore.tasks.dimensions_materialize.preset"
+
 [build-system]
 requires = ["setuptools>=80.9.0", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"

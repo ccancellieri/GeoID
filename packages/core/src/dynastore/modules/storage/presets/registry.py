@@ -29,15 +29,21 @@ are validated at registration time.
 """
 from __future__ import annotations
 
+import importlib.metadata
+import logging
 from typing import Any, Dict, List, Optional
 
 from .protocol import PresetTier
+
+logger = logging.getLogger(__name__)
 
 # Union type for the registry values; Preset / CompositePreset instances
 # (BundlePreset subclasses included) live here.
 _AnyPreset = Any  # Preset | CompositePreset
 
 _REGISTRY: Dict[str, _AnyPreset] = {}
+
+_PRESET_ENTRY_POINT_GROUP = "dynastore.presets"
 
 
 def register_preset(preset: Any) -> None:
@@ -69,6 +75,44 @@ def register_preset(preset: Any) -> None:
                 f"preset(s): {missing}. Register children first."
             )
     _REGISTRY[preset.name] = preset
+
+
+def load_preset_entry_points() -> None:
+    """Discover and import every ``dynastore.presets`` entry-point (#2601).
+
+    Each entry-point module registers itself via ``register_preset()`` as an
+    import side-effect, same as the built-in presets imported above — the
+    entry-point's return value is discarded, only the import matters. Mirrors
+    the fail-soft handling ``discover_and_load_plugins`` uses for the
+    ``dynastore.modules`` / ``dynastore.extensions`` / ``dynastore.tasks``
+    groups: a module whose optional dependencies aren't installed
+    (``ImportError``) is skipped with a WARN log rather than raising, so one
+    missing preset never blocks the others or the process boot that imports
+    this package.
+
+    Idempotent per process: Python caches imported modules, so re-running
+    this (e.g. a second call from a test) re-imports nothing and does not
+    retrigger ``register_preset``'s duplicate-name guard.
+    """
+    for entry_point in importlib.metadata.entry_points(group=_PRESET_ENTRY_POINT_GROUP):
+        try:
+            entry_point.load()
+            logger.info(
+                "Successfully discovered installed %s: %s",
+                _PRESET_ENTRY_POINT_GROUP, entry_point.name,
+            )
+        except ImportError as e:
+            logger.warning(
+                "Skipping %s plugin '%s': optional dependencies not installed "
+                "— %s (expected when SCOPE excludes the plugin's extras; "
+                "unexpected if the plugin should be active for this service)",
+                _PRESET_ENTRY_POINT_GROUP, entry_point.name, e,
+            )
+        except Exception:
+            logger.error(
+                "Failed to load installed plugin '%s' from group '%s'",
+                entry_point.name, _PRESET_ENTRY_POINT_GROUP, exc_info=True,
+            )
 
 
 def get_preset(name: str) -> _AnyPreset:
