@@ -27,6 +27,15 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+@pytest.fixture(autouse=True)
+def _clear_srid_cache():
+    """``_srid_exists`` is memoized at module scope (#2960) — clear it around
+    every test so mocked ``DQLQuery`` call counts stay isolated per test."""
+    tiles_db._srid_exists.cache_clear()
+    yield
+    tiles_db._srid_exists.cache_clear()
+
+
 @pytest.mark.asyncio
 async def test_get_features_as_mvt_filtered_query_structure():
     """
@@ -157,9 +166,17 @@ async def test_get_features_as_mvt_filtered_returns_empty_bytes_for_zero_feature
             mock_get_module.return_value = mock_catalog_module
 
             with patch("dynastore.tools.discovery.get_protocol") as mock_get_proto:
+                from dynastore.models.protocols import ItemsProtocol
+
                 mock_items = AsyncMock()
                 mock_items.get_features_query.return_value = ("SELECT 1", {})
-                mock_get_proto.return_value = mock_items
+                # Only resolve ItemsProtocol; other protocol lookups (e.g. the
+                # cache module's own ConfigsProtocol lookup for
+                # slow_path_timeout_seconds) must see "not registered" (None)
+                # rather than this unrelated AsyncMock.
+                mock_get_proto.side_effect = (
+                    lambda proto: mock_items if proto is ItemsProtocol else None
+                )
 
                 result = await tiles_db.get_features_as_mvt_filtered(
                     conn=conn,
@@ -227,6 +244,42 @@ async def test_build_collection_subquery_swallows_value_error(caplog):
         "Skipping collection cat/col in tile" in rec.message
         for rec in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_srid_exists_is_memoized():
+    """A second call with the same SRID must not re-query
+    ``spatial_ref_sys`` — the registered SRID set is static at runtime
+    (#2960)."""
+    conn = AsyncMock()
+    mock_execute = AsyncMock(return_value=True)
+
+    with patch("dynastore.modules.tiles.tiles_db.DQLQuery") as MockDQLQuery:
+        MockDQLQuery.return_value.execute = mock_execute
+
+        first = await tiles_db._srid_exists(conn, 4326)
+        second = await tiles_db._srid_exists(conn, 4326)
+
+    assert first is True
+    assert second is True
+    assert mock_execute.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_srid_exists_cache_key_is_per_srid():
+    """Different SRIDs must not share a cache entry."""
+    conn = AsyncMock()
+    mock_execute = AsyncMock(side_effect=[True, False])
+
+    with patch("dynastore.modules.tiles.tiles_db.DQLQuery") as MockDQLQuery:
+        MockDQLQuery.return_value.execute = mock_execute
+
+        result_4326 = await tiles_db._srid_exists(conn, 4326)
+        result_3857 = await tiles_db._srid_exists(conn, 3857)
+
+    assert result_4326 is True
+    assert result_3857 is False
+    assert mock_execute.call_count == 2
 
 
 if __name__ == "__main__":

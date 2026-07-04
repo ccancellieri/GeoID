@@ -30,6 +30,7 @@ from dynastore.modules.db_config.query_executor import (
     ResultHandler,
     DQLQuery,
 )
+from dynastore.tools.cache import cached
 from dynastore.tools.geospatial import SimplificationAlgorithm
 from .tiles_models import TileMatrixSet
 
@@ -39,6 +40,21 @@ logger = logging.getLogger(__name__)
 check_srid_query = text(
     "SELECT EXISTS (SELECT 1 FROM spatial_ref_sys WHERE srid = :srid)"
 )
+
+
+@cached(namespace="tiles_srid_exists", ttl=3600, ignore=["conn"])
+async def _srid_exists(conn, srid: int) -> bool:
+    """Check whether ``srid`` is registered in PostGIS ``spatial_ref_sys``.
+
+    The registered SRID set is static at runtime, so this is memoized
+    (keyed on ``srid`` only, ``conn`` excluded from the cache key) instead
+    of re-querying on every tile cache miss.
+    """
+    return bool(
+        await DQLQuery(
+            check_srid_query, result_handler=ResultHandler.SCALAR_ONE_OR_NONE
+        ).execute(conn, srid=srid)
+    )
 
 
 def _calculate_tile_envelope_wkb(
@@ -234,9 +250,7 @@ async def get_features_as_mvt_filtered(
     Extreme speed: focuses purely on parallel SQL construction and execution.
     """
     # 1. PostGIS check: Ensure target SRID exists
-    srid_exists = await DQLQuery(
-        check_srid_query, result_handler=ResultHandler.SCALAR_ONE_OR_NONE
-    ).execute(conn, srid=target_srid)
+    srid_exists = await _srid_exists(conn, target_srid)
     if not srid_exists:
         logger.error(f"SRID {target_srid} missing in PostGIS spatial_ref_sys.")
         return None
@@ -333,10 +347,10 @@ async def get_features_as_mvt_filtered(
         FROM mvtgeom{area_where};
     """
 
-    logger.info(
+    logger.debug(
         f"Executing MVT query. Bind params types: { {k: type(v) for k, v in all_bind_params.items()} }"
     )
-    logger.info(f"target_srid value: {all_bind_params.get('target_srid')}")
+    logger.debug(f"target_srid value: {all_bind_params.get('target_srid')}")
 
     mvt = await DQLQuery(
         full_query, result_handler=ResultHandler.SCALAR_ONE_OR_NONE

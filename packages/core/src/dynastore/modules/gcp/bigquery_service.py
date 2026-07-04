@@ -26,6 +26,7 @@ through ``modules/storage/drivers/bigquery._make_bq_client`` — the single
 Secret-reveal site for SA JSON / api_key resolution.
 """
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -87,13 +88,19 @@ class BigQueryService:
         if not project_id:
             raise ValueError("BigQuery project_id is required")
 
-        client = _build_client(project_id, credentials)
-        try:
-            logger.info("Executing BQ query (via BigQueryService): %s...", query[:200])
-            df = client.query(query).to_dataframe()
-            return df.to_dict("records")
-        finally:
-            client.close()
+        def _run_query() -> List[Dict[str, Any]]:
+            # Client build + query submission/polling + close all happen on
+            # a worker thread — google-cloud-bigquery's client is synchronous
+            # and ``to_dataframe()`` blocks until the job completes.
+            client = _build_client(project_id, credentials)
+            try:
+                logger.info("Executing BQ query (via BigQueryService): %s...", query[:200])
+                df = client.query(query).to_dataframe()
+                return df.to_dict("records")
+            finally:
+                client.close()
+
+        return await asyncio.to_thread(_run_query)
 
     async def insert_rows_json(
         self,
@@ -122,30 +129,35 @@ class BigQueryService:
 
         from google.cloud import bigquery
 
-        client = _build_client(project_id, credentials)
-        try:
-            table_ref = bigquery.TableReference.from_string(
-                table_fqn, default_project=project_id
-            )
-            errors = client.insert_rows_json(
-                table_ref,
-                rows,
-                row_ids=row_ids,
-            )
-            # google-cloud-bigquery returns a Sequence[dict] (no specific
-            # dict[str, Any] parameterisation in its stubs).  Materialise
-            # as a typed list so the protocol contract holds.
-            result: List[Dict[str, Any]] = list(errors)
-            if result:
-                logger.warning(
-                    "BQ streaming insert partial failure: %d/%d rows failed to "
-                    "insert into %s",
-                    len(result), len(rows), table_fqn,
+        def _run_insert() -> List[Dict[str, Any]]:
+            # Client build + the blocking insertAll HTTP call + close all
+            # happen on a worker thread.
+            client = _build_client(project_id, credentials)
+            try:
+                table_ref = bigquery.TableReference.from_string(
+                    table_fqn, default_project=project_id
                 )
-            else:
-                logger.debug(
-                    "BQ streaming insert OK: %d rows into %s", len(rows), table_fqn
+                errors = client.insert_rows_json(
+                    table_ref,
+                    rows,
+                    row_ids=row_ids,
                 )
-            return result
-        finally:
-            client.close()
+                # google-cloud-bigquery returns a Sequence[dict] (no specific
+                # dict[str, Any] parameterisation in its stubs).  Materialise
+                # as a typed list so the protocol contract holds.
+                result: List[Dict[str, Any]] = list(errors)
+                if result:
+                    logger.warning(
+                        "BQ streaming insert partial failure: %d/%d rows failed to "
+                        "insert into %s",
+                        len(result), len(rows), table_fqn,
+                    )
+                else:
+                    logger.debug(
+                        "BQ streaming insert OK: %d rows into %s", len(rows), table_fqn
+                    )
+                return result
+            finally:
+                client.close()
+
+        return await asyncio.to_thread(_run_insert)

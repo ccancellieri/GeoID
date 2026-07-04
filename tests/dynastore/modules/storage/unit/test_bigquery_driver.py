@@ -847,3 +847,73 @@ class TestBigQueryServiceCredentialResolution:
         )
         assert result == []
         assert called["n"] == 0
+
+
+class TestBigQueryServiceThreadOffload:
+    """execute_query / insert_rows_json must not block the event loop — the
+    synchronous google-cloud-bigquery client work (build + query/insert +
+    close) runs via ``asyncio.to_thread`` (#2960)."""
+
+    @pytest.mark.asyncio
+    async def test_execute_query_runs_via_to_thread(self, monkeypatch):
+        import asyncio
+        from unittest.mock import MagicMock
+
+        import dynastore.modules.gcp.bigquery_service as svc_mod
+        from dynastore.modules.gcp.bigquery_service import BigQueryService
+
+        fake_df = MagicMock()
+        fake_df.to_dict.return_value = [{"a": 1}]
+        fake_client = MagicMock()
+        fake_client.query.return_value.to_dataframe.return_value = fake_df
+        monkeypatch.setattr(
+            svc_mod, "_build_client",
+            lambda project_id, credentials: fake_client,
+        )
+
+        real_to_thread = asyncio.to_thread
+        calls = []
+
+        async def spy_to_thread(func, *args, **kwargs):
+            calls.append(func)
+            return await real_to_thread(func, *args, **kwargs)
+
+        monkeypatch.setattr(svc_mod.asyncio, "to_thread", spy_to_thread)
+
+        rows = await BigQueryService().execute_query("SELECT 1", "proj")
+
+        assert rows == [{"a": 1}]
+        assert len(calls) == 1
+        fake_client.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_insert_rows_json_runs_via_to_thread(self, monkeypatch):
+        import asyncio
+        from unittest.mock import MagicMock
+
+        import dynastore.modules.gcp.bigquery_service as svc_mod
+        from dynastore.modules.gcp.bigquery_service import BigQueryService
+
+        fake_client = MagicMock()
+        fake_client.insert_rows_json.return_value = []
+        monkeypatch.setattr(
+            svc_mod, "_build_client",
+            lambda project_id, credentials: fake_client,
+        )
+
+        real_to_thread = asyncio.to_thread
+        calls = []
+
+        async def spy_to_thread(func, *args, **kwargs):
+            calls.append(func)
+            return await real_to_thread(func, *args, **kwargs)
+
+        monkeypatch.setattr(svc_mod.asyncio, "to_thread", spy_to_thread)
+
+        result = await BigQueryService().insert_rows_json(
+            "p.d.t", [{"x": 1}], project_id="proj",
+        )
+
+        assert result == []
+        assert len(calls) == 1
+        fake_client.close.assert_called_once()

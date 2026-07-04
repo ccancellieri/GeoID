@@ -208,6 +208,10 @@ def _tms_def_stub(z_id="2"):
 
 async def _run_mvt_filtered(meta, z="2", extent=4096):
     """Run get_features_as_mvt_filtered with mocked DB / ItemsService and return the SQL."""
+    # _srid_exists is memoized (#2960); clear it so every test call re-hits
+    # the mocked DQLQuery instead of serving a cached SRID check from a
+    # previous test in this module.
+    tiles_db._srid_exists.cache_clear()
     conn = AsyncMock()
     captured_sql: list[str] = []
 
@@ -230,9 +234,17 @@ async def _run_mvt_filtered(meta, z="2", extent=4096):
 
     with patch("dynastore.modules.tiles.tiles_db.DQLQuery", side_effect=_CapturingDQLQuery):
         with patch("dynastore.tools.discovery.get_protocol") as mock_get_proto:
+            from dynastore.models.protocols import ItemsProtocol
+
             mock_items = AsyncMock()
             mock_items.get_features_query = AsyncMock(return_value=("SELECT 1", {}))
-            mock_get_proto.return_value = mock_items
+            # Only resolve ItemsProtocol; other protocol lookups (e.g. the
+            # cache module's own ConfigsProtocol lookup for
+            # slow_path_timeout_seconds) must see "not registered" (None)
+            # rather than this unrelated AsyncMock.
+            mock_get_proto.side_effect = (
+                lambda proto: mock_items if proto is ItemsProtocol else None
+            )
 
             await tiles_db.get_features_as_mvt_filtered(
                 conn=conn,
