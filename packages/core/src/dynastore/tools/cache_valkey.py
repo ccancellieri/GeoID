@@ -255,8 +255,18 @@ def _serialize(value: Any) -> bytes:
 
 
 def _deserialize(data: bytes) -> Any:
-    """Deserialize msgpack bytes to a value."""
-    return msgpack.unpackb(data, ext_hook=_msgpack_ext_hook, raw=False)
+    """Deserialize msgpack bytes to a value.
+
+    ``strict_map_key=False``: cached payloads legitimately contain
+    int-keyed dicts (e.g. per-zoom tile parameters), which ``_serialize``
+    packs without complaint but the default ``strict_map_key=True``
+    rejects on read — turning every get for such an entry into a failure
+    that also feeds the circuit breaker. The strict default guards
+    untrusted input; this cache only reads what ``_serialize`` wrote.
+    """
+    return msgpack.unpackb(
+        data, ext_hook=_msgpack_ext_hook, raw=False, strict_map_key=False
+    )
 
 
 def _build_keepalive_options(
