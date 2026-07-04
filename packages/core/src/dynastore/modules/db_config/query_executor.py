@@ -2140,6 +2140,74 @@ async def _acquire_async_engine_connection(engine: AsyncEngine) -> AsyncConnecti
         raise
 
 
+async def acquire_engine_connection_bounded(
+    engine: AsyncEngine, timeout_s: float
+) -> AsyncConnection:
+    """Pool-hygienized async connection, bounded by a fail-fast ``timeout_s``
+    shorter than the engine's own ``pool_timeout`` (#2933).
+
+    Delegates the actual checkout to :func:`_acquire_async_engine_connection`
+    so callers get the identical hygiene :func:`managed_transaction` gives
+    every other consumer (transient-connect retry, poisoned-slot eviction,
+    rollback-on-checkout). What this adds is a live-configurable deadline
+    shorter than the shared engine's ``pool_timeout`` -- useful for a
+    request path that wants to fail fast (and fall back, or return 503)
+    well before the global pool-acquire ceiling.
+
+    Deliberately a bare ``asyncio.wait_for`` -- NOT wrapped in
+    ``asyncio.shield``. An earlier version of this function shielded the
+    whole checkout to close a real but narrow leak: cancelling
+    ``engine.connect()`` while a *brand new* physical connection's asyncpg
+    handshake / dialect post-connect codec setup is in flight abandons an
+    already-open backend session rather than closing it (that window sits
+    outside SQLAlchemy's own connection-creation bookkeeping). That leak
+    is real, but only possible when the pool is BELOW its
+    ``pool_size + max_overflow`` ceiling, i.e. a new connection is actually
+    being created -- rare, and self-bounded by that ceiling.
+
+    Under genuine sustained saturation (every slot checked out, the actual
+    scenario this fail-fast guard exists for), a checkout never creates a
+    new connection at all -- it just waits on the pool's internal FIFO
+    queue (``AsyncAdaptedQueue.get()``, itself an
+    ``asyncio.wait_for(queue.get(), pool_timeout)``). A bare cancellation
+    there is clean: ``asyncio.Queue.get()`` removes its own waiter from the
+    FIFO on cancellation, so an abandoned attempt stops competing
+    immediately. Shielding the whole checkout traded the narrow handshake
+    leak for a worse failure mode here: every one of these (the common
+    case under real saturation) would instead leave a zombie checkout
+    registered in the FIFO for up to the full ``pool_timeout`` (tens of
+    seconds) -- far longer than this function's own ``timeout_s`` --
+    accumulating ahead of genuinely new requests and stealing connections
+    out from under them as they free up (priority inversion that
+    self-reinforces under sustained load, extending rather than relieving
+    an outage).
+
+    Net: a bare bounded wait accepts the rare, self-bounded handshake-
+    window leak in exchange for zero zombie accumulation in the case that
+    actually matters. See the accompanying integration tests for both
+    properties (single-timeout handshake-leak repro kept as a documented,
+    known tradeoff; sustained-saturation repeated-timeout test asserting no
+    pileup).
+    """
+    try:
+        return await asyncio.wait_for(
+            _acquire_async_engine_connection(engine), timeout=timeout_s
+        )
+    except TimeoutError:
+        logger.warning(
+            "db_pool_acquire failed service=%s wait_seconds=%.1f "
+            "fail_fast=true%s%s",
+            _SERVICE_NAME_FOR_METRICS, timeout_s, _acquire_scope_suffix(),
+            _format_pool_stats(engine),
+        )
+        retry_after = await _read_live_pool_saturation_retry_after()
+        raise PoolSaturationError(
+            f"Database connection pool saturated after waiting {timeout_s:.1f}s "
+            "for a free connection (fail-fast bound).",
+            retry_after=retry_after,
+        ) from None
+
+
 @contextmanager
 def sync_managed_transaction(db_resource: DbSyncResource) -> Iterator[Any]:
     """Sync re-entrant transaction manager."""
@@ -2165,7 +2233,9 @@ def sync_managed_transaction(db_resource: DbSyncResource) -> Iterator[Any]:
 
 
 @asynccontextmanager
-async def managed_transaction(db_resource: Optional[DbResource]):
+async def managed_transaction(
+    db_resource: Optional[DbResource], *, acquire_timeout: Optional[float] = None
+):
     """Async-native re-entrant transaction manager.
 
     Handles three connection scenarios:
@@ -2192,6 +2262,12 @@ async def managed_transaction(db_resource: Optional[DbResource]):
     Args:
         db_resource: AsyncEngine, Engine, AsyncConnection, Connection,
             AsyncSession, or Session.
+        acquire_timeout: Engine input only. When given, bounds the pool
+            checkout with :func:`acquire_engine_connection_bounded` instead
+            of the plain (engine-``pool_timeout``-bounded) acquire, raising
+            ``PoolSaturationError`` fast on a shorter, live-configurable
+            deadline (#2933). ``None`` (the default) preserves prior
+            behaviour for every existing caller.
 
     Yields:
         The connection/session ready for transactional work.
@@ -2206,11 +2282,19 @@ async def managed_transaction(db_resource: Optional[DbResource]):
     if isinstance(db_resource, (AsyncEngine, Engine)):
         if isinstance(db_resource, AsyncEngine):
             # Connection acquisition (with pool-hygiene + transient-connect
-            # retry) is delegated to :func:`_acquire_async_engine_connection`.
-            # Once we hold a healthy connection, the user body runs inside
-            # a regular ``conn.begin()`` block — body errors propagate without
-            # retry, since DML/DQL idempotency is the caller's responsibility.
-            conn = await _acquire_async_engine_connection(db_resource)
+            # retry) is delegated to :func:`_acquire_async_engine_connection`,
+            # or to :func:`acquire_engine_connection_bounded` for the same
+            # hygiene plus a fail-fast deadline when the caller passed
+            # ``acquire_timeout``. Once we hold a healthy connection, the
+            # user body runs inside a regular ``conn.begin()`` block — body
+            # errors propagate without retry, since DML/DQL idempotency is
+            # the caller's responsibility.
+            if acquire_timeout is not None:
+                conn = await acquire_engine_connection_bounded(
+                    db_resource, acquire_timeout
+                )
+            else:
+                conn = await _acquire_async_engine_connection(db_resource)
             try:
                 txn_cm = conn.begin()
                 await txn_cm.__aenter__()

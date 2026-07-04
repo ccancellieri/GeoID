@@ -37,6 +37,7 @@ from dynastore.extensions.tools.query import parse_hints_param
 from dynastore.extensions.tools.exception_handlers import handle_or_raise
 from dynastore.modules.db_config.query_executor import (
     managed_transaction,
+    _read_live_fg_acquire_timeout,
 )
 from dynastore.extensions.stac.search import (
     CollectionSearchRequest,
@@ -1234,7 +1235,12 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             if db_svc:
                 engine = db_svc.engine
 
-        async with managed_transaction(engine) as conn:
+        # Bounded, fail-fast pool acquire (#2933): under pool saturation this
+        # returns 503 well before the request risks riding the Cloud Run
+        # ceiling, instead of queuing for the engine's full pool_timeout.
+        async with managed_transaction(
+            engine, acquire_timeout=await _read_live_fg_acquire_timeout()
+        ) as conn:
             # Use direct connection with ItemService to ensure proper sidecar filtering
             from dynastore.models.protocols import ItemsProtocol
 
@@ -1665,7 +1671,10 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             sortby=parsed_sortby,
         )
 
-        async with managed_transaction(engine) as conn:
+        # Bounded, fail-fast pool acquire (#2933) — see get_stac_item.
+        async with managed_transaction(
+            engine, acquire_timeout=await _read_live_fg_acquire_timeout()
+        ) as conn:
             stac_config = await self._get_stac_config(catalog_id, db_resource=conn)
             try:
                 from dynastore.modules.storage.access_scope import (
@@ -1725,7 +1734,10 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             search_request = search_request.model_copy(update={"catalog_id": catalog_id})
         if not search_request.catalog_id:
             raise HTTPException(status_code=400, detail="catalog_id required")
-        async with managed_transaction(engine) as conn:
+        # Bounded, fail-fast pool acquire (#2933) — see get_stac_item.
+        async with managed_transaction(
+            engine, acquire_timeout=await _read_live_fg_acquire_timeout()
+        ) as conn:
             stac_config = await self._get_stac_config(
                 search_request.catalog_id, db_resource=conn
             )

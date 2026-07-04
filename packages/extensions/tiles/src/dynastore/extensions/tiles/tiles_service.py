@@ -52,10 +52,11 @@ from dynastore.extensions.web.decorators import expose_static
 from dynastore.extensions.tools.db import get_async_engine
 from dynastore.modules.db_config.query_executor import (
     _read_live_fg_acquire_timeout,
+    acquire_engine_connection_bounded,
     DQLQuery,
     ResultHandler,
 )
-from dynastore.modules.db_config.exceptions import QueryExecutionError
+from dynastore.modules.db_config.exceptions import PoolSaturationError, QueryExecutionError
 from dynastore.extensions.tools.query import parse_hints_param
 from dynastore.extensions.tools.resolvers import (
     resolve_internal_catalog_id_or_404,
@@ -924,12 +925,16 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
 
             # Acquire DB connection with pool-saturation guard.
             # On timeout: try serving a stale cached tile before failing fast.
+            # acquire_engine_connection_bounded gives this a live-configurable
+            # deadline shorter than the engine's own pool_timeout, with the
+            # same pool hygiene (poisoned-slot eviction, rollback-on-checkout)
+            # every other managed_transaction consumer gets (#2933).
             fg_timeout_s = await _read_live_fg_acquire_timeout()
             try:
-                _conn = await asyncio.wait_for(
-                    get_async_engine(request).connect(), timeout=fg_timeout_s
+                _conn = await acquire_engine_connection_bounded(
+                    get_async_engine(request), fg_timeout_s
                 )
-            except TimeoutError:
+            except PoolSaturationError as exc:
                 logger.warning(
                     "get_vector_tile: DB pool saturated (timeout=%.1fs) "
                     "catalog=%s z=%s x=%s y=%s — attempting stale tile fallback",
@@ -963,7 +968,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 raise HTTPException(
                     status_code=503,
                     detail="Database pool saturated, try again shortly.",
-                    headers={"Retry-After": "5"},
+                    headers={"Retry-After": str(exc.retry_after)},
                 ) from None
             conn = _conn
 
