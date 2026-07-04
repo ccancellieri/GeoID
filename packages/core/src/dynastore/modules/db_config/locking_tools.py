@@ -81,6 +81,20 @@ ON CONFLICT (lock_key) DO UPDATE
 RETURNING owner, epoch\
 """
 
+# Cheap non-locking pre-check run ahead of the CAS above. Postgres takes the
+# conflicting row's lock BEFORE evaluating _LEASE_CAS_SQL's WHERE clause, so a
+# follower whose CAS cannot possibly win still joins the row-lock queue —
+# pure lock-queue churn under N followers on one lease row. This plain SELECT
+# takes no row lock, so a follower can tell "a foreign owner is comfortably
+# ahead of expiry" and skip the CAS round trip entirely. ``live`` is computed
+# DB-side (same ``now()`` the CAS itself compares against) so no client clock
+# is involved.
+_LEASE_PRECHECK_SQL = """\
+SELECT owner, (expires_at > now()) AS live
+  FROM configs.leader_lease
+ WHERE lock_key = :lock_key\
+"""
+
 # Shared circuit breaker for the lease-election CAS. A SINGLE breaker (not
 # per-lock) is correct: a failing leadership CAS is a DB-wide signal, so once
 # tripped we stop hammering the database for every leader-elected service.
@@ -196,9 +210,11 @@ async def _lease_cas_round_trip(
 
     ``None`` covers every case where this process is not (or no longer) the
     leader: the circuit breaker is open, the transient-retry budget was
-    exhausted, or the CAS's ``WHERE`` clause simply did not match (a live
-    foreign owner holds the lease). A non-``None`` row always means this
-    process's ``_LEASE_OWNER`` now owns the row (see ``_LEASE_CAS_SQL``).
+    exhausted, the non-locking pre-check (see ``_LEASE_PRECHECK_SQL``) found a
+    foreign owner's lease still live and skipped the CAS entirely, or the
+    CAS's ``WHERE`` clause simply did not match. A non-``None`` row always
+    means this process's ``_LEASE_OWNER`` now owns the row (see
+    ``_LEASE_CAS_SQL``).
 
     Shared by :func:`lease_leadership` (per-tick acquire-or-renew) and
     :func:`renew_lease` (heartbeat renewal) so both regimes get identical
@@ -212,6 +228,22 @@ async def _lease_cas_round_trip(
     async def _run_cas() -> Any:
         async with managed_transaction(engine) as _conn:
             aconn = cast(AsyncConnection, _conn)
+            # Pre-check on the SAME connection/transaction as the CAS below —
+            # no extra connection checkout. A plain SELECT takes no row lock,
+            # so a foreign owner's still-live lease can be detected and the
+            # CAS skipped without ever joining the row-lock queue. Fall
+            # through to the CAS when the row is absent, already ours
+            # (renewal), or expired (takeover attempt).
+            precheck = await aconn.execute(
+                text(_LEASE_PRECHECK_SQL), {"lock_key": lock_id}
+            )
+            existing = precheck.fetchone()
+            # Indexed access (owner, live) rather than attribute access:
+            # works for both a real SQLAlchemy Row and the plain-tuple
+            # cursor stand-ins the unit tests use.
+            if existing is not None and existing[0] != _LEASE_OWNER and existing[1]:
+                return None
+
             # Scope the row-lock wait to this transaction (mirrors
             # safe_drop_relation) so a losing contender fails fast on 55P03
             # instead of inheriting the session-wide DB_LOCK_TIMEOUT. SET

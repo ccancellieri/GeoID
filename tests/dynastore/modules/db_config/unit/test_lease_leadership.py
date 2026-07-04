@@ -190,6 +190,82 @@ async def test_set_local_lock_timeout_precedes_cas_insert(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Tests: non-locking pre-check (#2959)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_precheck_skips_cas_while_foreign_owner_live(monkeypatch):
+    """A live foreign owner's lease is caught by the plain SELECT pre-check,
+    so the CAS (SET LOCAL + INSERT..ON CONFLICT) is never issued — the
+    follower never joins the row-lock queue for an update it cannot win."""
+    cursor = MagicMock()
+    cursor.fetchone.return_value = ("intruder:y", True)
+    execute_calls, call_idx = _patch_managed_transaction(monkeypatch, [cursor])
+
+    async with lease_leadership(_make_engine(), 42, name="test") as (is_leader, _):
+        assert is_leader is False
+
+    sqls = [sql for sql, _ in execute_calls]
+    assert any(sql.lstrip().upper().startswith("SELECT") for sql in sqls)
+    assert not any(sql.lstrip().upper().startswith("SET LOCAL") for sql in sqls)
+    assert not any(sql.lstrip().upper().startswith("INSERT") for sql in sqls)
+    # Lost the lease → no release UPDATE either (single managed_transaction call).
+    assert call_idx[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_precheck_falls_through_to_cas_after_expiry(monkeypatch):
+    """A foreign owner's row exists but is expired: the pre-check does NOT
+    skip the CAS — it falls through to the takeover attempt."""
+    responses = iter([("intruder:y", False), (_LEASE_OWNER, 2)])
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = lambda: next(responses)
+    execute_calls, _ = _patch_managed_transaction(monkeypatch, [cursor])
+
+    async with lease_leadership(_make_engine(), 42, name="test") as (is_leader, _):
+        assert is_leader is True
+
+    sqls = [sql for sql, _ in execute_calls]
+    assert any(sql.lstrip().upper().startswith("SELECT") for sql in sqls)
+    assert any(sql.lstrip().upper().startswith("INSERT") for sql in sqls)
+
+
+@pytest.mark.asyncio
+async def test_precheck_falls_through_to_cas_when_no_row(monkeypatch):
+    """No existing lease row: the pre-check finds nothing and falls through
+    to the CAS insert, which wins the (empty) lease."""
+    responses = iter([None, (_LEASE_OWNER, 1)])
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = lambda: next(responses)
+    execute_calls, _ = _patch_managed_transaction(monkeypatch, [cursor])
+
+    async with lease_leadership(_make_engine(), 42, name="test") as (is_leader, _):
+        assert is_leader is True
+
+    sqls = [sql for sql, _ in execute_calls]
+    assert any(sql.lstrip().upper().startswith("SELECT") for sql in sqls)
+    assert any(sql.lstrip().upper().startswith("INSERT") for sql in sqls)
+
+
+@pytest.mark.asyncio
+async def test_precheck_falls_through_to_cas_on_own_renewal(monkeypatch):
+    """An existing row already owned by this process is a renewal, not a
+    foreign lease — the pre-check falls through to the CAS regardless of
+    whether the row is still live."""
+    responses = iter([(_LEASE_OWNER, True), (_LEASE_OWNER, 1)])
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = lambda: next(responses)
+    execute_calls, _ = _patch_managed_transaction(monkeypatch, [cursor])
+
+    async with lease_leadership(_make_engine(), 42, name="test") as (is_leader, _):
+        assert is_leader is True
+
+    sqls = [sql for sql, _ in execute_calls]
+    assert any(sql.lstrip().upper().startswith("INSERT") for sql in sqls)
+
+
+# ---------------------------------------------------------------------------
 # Tests: acquire-lose
 # ---------------------------------------------------------------------------
 
@@ -1022,9 +1098,21 @@ async def test_failover_within_ttl_after_simulated_crash(monkeypatch):
 
         async def _ex(sql, params=None, **kw):
             sql_str = str(sql)
-            if sql_str.lstrip().upper().startswith("SET LOCAL"):
+            upper = sql_str.lstrip().upper()
+            if upper.startswith("SELECT"):
+                # Non-locking pre-check: mirrors the real
+                # owner/live query against the fake table's current row.
+                cur = MagicMock()
+                if table.row is None:
+                    cur.fetchone.return_value = None
+                else:
+                    cur.fetchone.return_value = (
+                        table.row["owner"], table.row["expires_at"] > time.monotonic()
+                    )
+                return cur
+            if upper.startswith("SET LOCAL"):
                 return MagicMock()
-            if sql_str.lstrip().upper().startswith("INSERT"):
+            if upper.startswith("INSERT"):
                 result = table.cas(params["owner"], params["ttl"])
                 cur = MagicMock()
                 cur.fetchone.return_value = result

@@ -651,6 +651,9 @@ async def test_heartbeat_mode_dispatches_to_heartbeat_loop() -> None:
     mock_per_tick_loop.assert_not_called()
     assert captured["kwargs"]["name"] == "heartbeat-periodic"
     assert captured["kwargs"]["cadence_seconds"] == 30.0
+    # #2959: followers must retry on the service's own cadence, not the 5s
+    # default baked into run_lease_leadership_heartbeat_loop.
+    assert captured["kwargs"]["reelect_cadence_seconds"] == 30.0
 
 
 @pytest.mark.asyncio

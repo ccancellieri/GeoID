@@ -604,6 +604,13 @@ class BackgroundSupervisor:
             cadence_seconds=periodic.cadence_seconds,
             is_shutdown=ctx.shutdown.is_set,
             shutdown_event=ctx.shutdown,
+            # Followers retry the CAS on the service's OWN cadence, not the
+            # 5s default — mirrors the per-tick regime's run_leader_loop,
+            # which uses a single cadence_seconds for both the leader tick
+            # interval and the follower re-election sleep (no separate
+            # TTL-based clamp there either), so both regimes carry the same
+            # re-election latency profile for a given service cadence.
+            reelect_cadence_seconds=periodic.cadence_seconds,
         )
 
     async def stop(self, *, timeout: float = 10.0) -> None:
