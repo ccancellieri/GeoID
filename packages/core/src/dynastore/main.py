@@ -39,7 +39,9 @@ from dynastore._version import VERSION, get_build_info
 from dynastore.extensions.tools.fast_api import ORJSONResponse
 from dynastore.extensions.bootstrap import bootstrap_app
 from dynastore.modules.concurrency import set_concurrency_backend
+from dynastore.tools.background_service import BackgroundSupervisor, ServiceContext
 from dynastore.tools.correlation import _correlation_id_var, set_correlation_id
+from dynastore.tools.memory_watchdog import build_memory_watchdog_service_from_env
 from fastapi.concurrency import run_in_threadpool
 
 # --- Initialize Concurrency Backend ---
@@ -137,56 +139,84 @@ async def lifespan(app: FastAPI):
     # /local-upload, /local-download endpoints) can reach it without
     # being promoted to extensions.
     app.state.app = app
-    async with modules_lifespan(app.state):
-        logger.info("--- [main.py] Modules are active. ---")
-        # Extensions can now reliably access services from modules and task instances.
-        async with extensions_lifespan(app):
-            # Flush any pending policy/role registrations from extensions
-            from dynastore.models.protocols.policies import PermissionProtocol
-            pm = get_protocol(PermissionProtocol)
-            # Announce the authorization posture exactly once at startup. The
-            # IAM extension is always_on whenever its wheel is installed, so a
-            # service meant to be open (e.g. a SCOPE that excludes the iam
-            # extension) can silently flip to deny-by-default if it runs a
-            # stale or wrong-SCOPE image that still carries the wheel. Surfacing
-            # the posture here turns that into an obvious log line instead of
-            # mysterious "Deny by Default" 403s on every non-public route.
-            _scope = os.environ.get("SCOPE", "<unset>")
-            if pm is None:
-                logger.warning(
-                    "Authorization DISABLED - no PermissionProtocol registered; "
-                    "all requests run unauthenticated (open access) [SCOPE=%s]. "
-                    "Expected for open scopes built without the iam extension.",
-                    _scope,
-                )
-            else:
-                logger.warning(
-                    "Authorization ENFORCED (deny-by-default) via %s "
-                    "[SCOPE=%s, IdP=%s]. For an open/no-auth deployment, build "
-                    "WITHOUT the iam extension (e.g. a catalog-only scope).",
-                    type(pm).__name__,
-                    _scope,
-                    os.environ.get("IDP_ISSUER_URL") or "<none>",
-                )
-            # Run all registered cold-boot contributors in descending priority
-            # order. Each contributor is fail-soft — a failure does not abort
-            # startup. Fully agnostic: no module-specific (iam/web/auth) names here.
-            try:
-                from dynastore.modules.presets.cold_boot import run_cold_boot
-                from dynastore.models.protocols import DatabaseProtocol
-                _db = get_protocol(DatabaseProtocol)
-                _engine = _db.engine if _db else None
-                await run_cold_boot(_engine)
-            except Exception:
-                logger.error(
-                    "Cold-boot orchestrator raised an unexpected error; "
-                    "some presets or IdP config may not be seeded.",
-                    exc_info=True,
-                )
-            logger.info("--- [main.py] Web Extensions are active. Application is running. ---")
-            yield
 
-    logger.info("--- [main.py] Application shutdown complete. ---")
+    # Memory watchdog (#2946): an OOM kill sends SIGKILL straight to the
+    # process, so nothing here can catch or drain it. This proactive
+    # RSS poll is the only way to turn the climb leading up to a kill into
+    # a monitored log-based error before it happens. Disabled unless an
+    # operator opts in via MEMORY_WATCHDOG_LIMIT_MB; started outside (and
+    # independent of) module/extension lifespans so it observes memory
+    # pressure from the very start of the process, not just once modules
+    # finish booting.
+    _mem_watchdog_service = build_memory_watchdog_service_from_env()
+    _mem_watchdog_shutdown = asyncio.Event()
+    _mem_watchdog_supervisor = BackgroundSupervisor()
+    if _mem_watchdog_service is not None:
+        _mem_watchdog_supervisor.register(_mem_watchdog_service)
+        _mem_watchdog_supervisor.start(
+            ServiceContext(
+                engine=None,
+                shutdown=_mem_watchdog_shutdown,
+                is_ephemeral=False,
+                name=os.environ.get("SERVICE_NAME", "dynastore"),
+            )
+        )
+
+    try:
+        async with modules_lifespan(app.state):
+            logger.info("--- [main.py] Modules are active. ---")
+            # Extensions can now reliably access services from modules and task instances.
+            async with extensions_lifespan(app):
+                # Flush any pending policy/role registrations from extensions
+                from dynastore.models.protocols.policies import PermissionProtocol
+                pm = get_protocol(PermissionProtocol)
+                # Announce the authorization posture exactly once at startup. The
+                # IAM extension is always_on whenever its wheel is installed, so a
+                # service meant to be open (e.g. a SCOPE that excludes the iam
+                # extension) can silently flip to deny-by-default if it runs a
+                # stale or wrong-SCOPE image that still carries the wheel. Surfacing
+                # the posture here turns that into an obvious log line instead of
+                # mysterious "Deny by Default" 403s on every non-public route.
+                _scope = os.environ.get("SCOPE", "<unset>")
+                if pm is None:
+                    logger.warning(
+                        "Authorization DISABLED - no PermissionProtocol registered; "
+                        "all requests run unauthenticated (open access) [SCOPE=%s]. "
+                        "Expected for open scopes built without the iam extension.",
+                        _scope,
+                    )
+                else:
+                    logger.warning(
+                        "Authorization ENFORCED (deny-by-default) via %s "
+                        "[SCOPE=%s, IdP=%s]. For an open/no-auth deployment, build "
+                        "WITHOUT the iam extension (e.g. a catalog-only scope).",
+                        type(pm).__name__,
+                        _scope,
+                        os.environ.get("IDP_ISSUER_URL") or "<none>",
+                    )
+                # Run all registered cold-boot contributors in descending priority
+                # order. Each contributor is fail-soft — a failure does not abort
+                # startup. Fully agnostic: no module-specific (iam/web/auth) names here.
+                try:
+                    from dynastore.modules.presets.cold_boot import run_cold_boot
+                    from dynastore.models.protocols import DatabaseProtocol
+                    _db = get_protocol(DatabaseProtocol)
+                    _engine = _db.engine if _db else None
+                    await run_cold_boot(_engine)
+                except Exception:
+                    logger.error(
+                        "Cold-boot orchestrator raised an unexpected error; "
+                        "some presets or IdP config may not be seeded.",
+                        exc_info=True,
+                    )
+                logger.info("--- [main.py] Web Extensions are active. Application is running. ---")
+                yield
+
+        logger.info("--- [main.py] Application shutdown complete. ---")
+    finally:
+        if _mem_watchdog_service is not None:
+            _mem_watchdog_shutdown.set()
+            await _mem_watchdog_supervisor.stop()
 
 # --- Main Application Creation ---
 
