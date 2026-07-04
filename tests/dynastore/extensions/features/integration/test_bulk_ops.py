@@ -21,6 +21,10 @@ import pytest
 from httpx import AsyncClient
 from tests.dynastore.test_utils import generate_test_id
 
+from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+from dynastore.tasks.ingestion.ingestion_config import IngestionPluginConfig
+from dynastore.tools.discovery import get_protocol
+
 # Increase timeout for the endpoint specifically if needed, 
 # or use a custom client with longer timeout.
 @pytest.mark.asyncio
@@ -193,6 +197,70 @@ async def test_feature_collection_post_returns_ids(sysadmin_in_process_client: A
         item = r.json()
         assert item["type"] == "Feature"
         assert item["id"] == fid
+
+
+@pytest.mark.asyncio
+@pytest.mark.enable_extensions("features", "assets", "stac")
+async def test_oversize_feature_collection_rejected_before_ingest(
+    sysadmin_in_process_client: AsyncClient, test_data_loader,
+):
+    """A FeatureCollection whose body exceeds ``sync_ingest_max_body_mb``
+    is rejected with 413 by ``SyncIngestBodyLimitMiddleware`` (#2657)
+    before the route ever parses it, and nothing is written."""
+    catalog_id = f"c_{generate_test_id()}"
+    collection_id = "test_oversize_collection"
+
+    catalog_data = test_data_loader("catalog.json")
+    catalog_data["id"] = catalog_id
+    r = await sysadmin_in_process_client.post("/features/catalogs", json=catalog_data, timeout=60.0)
+    assert r.status_code == 201
+
+    collection_data = test_data_loader("collection.json")
+    collection_data["id"] = collection_id
+    r = await sysadmin_in_process_client.post(
+        f"/features/catalogs/{catalog_id}/collections", json=collection_data, timeout=60.0
+    )
+    assert r.status_code == 201
+
+    config_mgr = get_protocol(PlatformConfigsProtocol)
+    assert config_mgr is not None
+    original_cfg = await config_mgr.get_config(IngestionPluginConfig)
+    await config_mgr.set_config(
+        IngestionPluginConfig,
+        IngestionPluginConfig(sync_ingest_max_body_mb=1),
+    )
+    try:
+        # A single oversize property pushes the encoded body past 1 MiB
+        # without needing a large feature count.
+        big_collection = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "geometry": {"type": "Point", "coordinates": [12.5, 41.9]},
+                    "properties": {"blob": "x" * (1024 * 1024 + 1024)},
+                }
+            ],
+        }
+
+        r = await sysadmin_in_process_client.post(
+            f"/features/catalogs/{catalog_id}/collections/{collection_id}/items",
+            json=big_collection,
+            timeout=60.0,
+        )
+        assert r.status_code == 413, r.text
+        detail = r.json()["detail"]
+        assert detail["max_body_mb"] == 1
+        assert "ingest-body-too-large" in detail["type"]
+    finally:
+        await config_mgr.set_config(IngestionPluginConfig, original_cfg)
+
+    # Nothing was written.
+    items_response = await sysadmin_in_process_client.get(
+        f"/features/catalogs/{catalog_id}/collections/{collection_id}/items"
+    )
+    assert items_response.status_code == 200
+    assert len(items_response.json().get("features", [])) == 0
 
 
 @pytest.mark.asyncio

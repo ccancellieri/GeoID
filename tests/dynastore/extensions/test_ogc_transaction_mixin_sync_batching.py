@@ -81,9 +81,10 @@ class _FakeConfigsSvc:
     """Returns a ``CollectionPluginConfig`` with a fixed row cap / byte
     budget, standing in for the platform configs service waterfall."""
 
-    def __init__(self, row_cap: int, mem_mb: int) -> None:
+    def __init__(self, row_cap: int, mem_mb: int, max_bulk_features: Optional[int] = None) -> None:
         self._row_cap = row_cap
         self._mem_mb = mem_mb
+        self._max_bulk_features = max_bulk_features
 
     async def get_config(
         self,
@@ -93,10 +94,13 @@ class _FakeConfigsSvc:
         ctx: Optional[DriverContext] = None,
         config_snapshot: Optional[Dict[str, Any]] = None,
     ):
-        return config_cls(
-            sync_ingest_batch_rows=self._row_cap,
-            sync_ingest_batch_memory_mb=self._mem_mb,
-        )
+        kwargs: Dict[str, Any] = {
+            "sync_ingest_batch_rows": self._row_cap,
+            "sync_ingest_batch_memory_mb": self._mem_mb,
+        }
+        if self._max_bulk_features is not None:
+            kwargs["max_bulk_features"] = self._max_bulk_features
+        return config_cls(**kwargs)
 
 
 def _make_items(n: int, geometry: Optional[dict] = None, reject_ids=frozenset()):
@@ -218,6 +222,45 @@ async def test_small_bulk_makes_one_upsert_call_and_returns_full_rows():
     assert len(catalogs.calls[0]) == 5
     assert all(not isinstance(r, str) for r in rows)
     assert sorted(r.id for r in rows) == sorted(f"f{i}" for i in range(5))
+
+
+@pytest.mark.asyncio
+async def test_max_bulk_features_rejects_full_list_even_when_sub_batched():
+    """Sub-batching (#2875) caps every ``upsert()`` call at
+    ``sync_ingest_batch_rows``, so the ``max_bulk_features`` guard that used
+    to live inside ``item_service.upsert()`` never sees the full payload
+    once a request is split — a request of arbitrary size would otherwise
+    sail through as a sequence of individually-compliant sub-batches.
+    ``_ingest_items`` must re-check the full list against
+    ``max_bulk_features`` before any splitting happens (#2657 commit 4).
+    """
+    svc = _Svc()
+    catalogs = _FakeCatalogsSvc()
+    svc._ogc_catalogs_protocol = catalogs
+    svc._ogc_configs_protocol = _FakeConfigsSvc(row_cap=2, mem_mb=32, max_bulk_features=5)
+    payload = _make_items(10)
+
+    with pytest.raises(ValueError, match="exceeding the maximum of 5"):
+        await svc._ingest_items("cat", "col", payload, DriverContext(), "/configs/...")
+
+    # Rejected before any sub-batch flush reached the catalogs service.
+    assert catalogs.calls == []
+
+
+@pytest.mark.asyncio
+async def test_max_bulk_features_within_limit_still_sub_batches_normally():
+    """A payload under ``max_bulk_features`` but over the row cap must
+    still take the normal sub-batching path, unaffected by the guard."""
+    svc, catalogs = _svc(row_cap=3, mem_mb=32)
+    payload = _make_items(10)
+
+    accepted_rows, rejections, was_single, batch_size = await svc._ingest_items(
+        "cat", "col", payload, DriverContext(), "/configs/...",
+    )
+
+    assert batch_size == 10
+    assert len(catalogs.calls) > 1
+    assert rejections == []
 
 
 @pytest.mark.asyncio

@@ -36,3 +36,14 @@ class IngestionPluginConfig(PluginConfig):
         default=WriteConflictPolicy.NEW_VERSION,
         description="Determines how new entities with an existing external_id are handled."
     )
+
+    sync_ingest_max_body_mb: Mutable[int] = Field(
+        default=64,
+        ge=1,
+        description=(
+            "Maximum inbound request body (MiB) accepted on the synchronous "
+            "bulk item-POST (POST .../collections/{id}/items) before the "
+            "body is parsed. Larger loads are rejected with 413 and steered "
+            "to the asynchronous ingestion task instead."
+        ),
+    )

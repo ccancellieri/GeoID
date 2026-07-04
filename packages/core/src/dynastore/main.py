@@ -367,6 +367,14 @@ bootstrap_app(app)
 from dynastore.extensions.tools.exception_handlers import setup_exception_handlers
 setup_exception_handlers(app)
 
+# Bounds the inbound body of the synchronous bulk item-POST before it is
+# parsed (#2657). Must sit inside (added before) CorrelationIdMiddleware so
+# a rejected request still gets stamped with X-Request-ID, and outside the
+# routing layer so it can reject a request before the route ever reads its
+# body.
+from dynastore.extensions.tools.body_size_limit import SyncIngestBodyLimitMiddleware
+app.add_middleware(SyncIngestBodyLimitMiddleware)
+
 # Correlation ID middleware must be the outermost middleware so it stamps
 # X-Request-ID on every response — including error responses produced by
 # GlobalExceptionHandlingMiddleware for exceptions raised inside any

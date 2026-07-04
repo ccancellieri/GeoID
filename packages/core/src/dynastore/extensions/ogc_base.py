@@ -1610,6 +1610,23 @@ class OGCTransactionMixin:
             col_config = await self._get_plugin_config(  # type: ignore[attr-defined]
                 CollectionPluginConfig, catalog_id, collection_id
             )
+
+            # Sub-batching (above) caps every upsert() call at row_cap
+            # items, which is normally well under max_bulk_features — so
+            # the equivalent check inside item_service.upsert() never sees
+            # the full FeatureCollection once a payload is split, and a
+            # request of arbitrary size would otherwise sail through as a
+            # sequence of individually-compliant sub-batches. Enforce the
+            # documented total-count contract here, against the full list,
+            # before any splitting happens.
+            max_bulk = col_config.max_bulk_features
+            if batch_size > max_bulk:
+                raise ValueError(
+                    f"FeatureCollection contains {batch_size} features, "
+                    f"exceeding the maximum of {max_bulk}. "
+                    f"Split into smaller batches."
+                )
+
             row_cap = col_config.sync_ingest_batch_rows
             byte_budget = max(1, col_config.sync_ingest_batch_memory_mb) * 1024 * 1024
 
