@@ -769,8 +769,9 @@ class CatalogModule(ModuleProtocol):
                 bg_supervisor.register(ZombieSessionReaper(zombie_reaper_cfg))
                 logger.info(
                     "CatalogModule: zombie-session reaper registered "
-                    "(enabled=%s, idle_threshold=%ds, interval=%ds).",
+                    "(enabled=%s, shadow_mode=%s, idle_threshold=%ds, interval=%ds).",
                     zombie_reaper_cfg.enabled,
+                    zombie_reaper_cfg.zombie_reaper_shadow_mode,
                     zombie_reaper_cfg.idle_threshold_seconds,
                     zombie_reaper_cfg.reaper_interval_seconds,
                 )

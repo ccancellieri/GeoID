@@ -58,6 +58,19 @@ Disabled by default (``ZombieSessionReaperConfig.enabled = False``); an
 operator opts in explicitly via the configs API after reviewing the
 instance-liveness table on their environment.
 
+Shadow mode
+-----------
+Flipping ``enabled`` to True does not, by itself, terminate anything:
+``zombie_reaper_shadow_mode`` defaults to True, so the reaper runs its full
+detection pipeline — candidate scan, per-service liveness resolution, and the
+TOCTOU recheck — exactly as it would to reap a session, but stops short of
+calling ``pg_terminate_backend`` and instead logs a ``lock_reaped_shadow``
+warning for every session it would have reaped (see ``_reap_session``). This
+lets an operator watch the reaper's targeting against real traffic on an
+environment before trusting it to actually evict a session. Only once that
+log has been reviewed and looks correct should ``zombie_reaper_shadow_mode``
+be flipped to False via the configs API.
+
 Known correlated-failure mode: CPU throttling
 -----------------------------------------------
 Idleness and liveness-staleness are meant to be *independent* evidence, but on
@@ -218,6 +231,22 @@ class ZombieSessionReaperConfig(PluginConfig):
             "amount of pg_terminate_backend() activity and logging in a single "
             "pass when many zombies have accumulated at once (e.g. after a "
             "deploy storm). Read live on every tick."
+        ),
+    )
+
+    zombie_reaper_shadow_mode: Mutable[bool] = Field(
+        default=True,
+        description=(
+            "When True (the default), the reaper runs its full detection "
+            "pipeline — candidate scan, per-service liveness resolution, TOCTOU "
+            "recheck — exactly as it would to reap a session, but never calls "
+            "pg_terminate_backend(): each session it would have reaped is "
+            "instead logged as a 'lock_reaped_shadow' warning. This lets an "
+            "operator turning enabled=True on for the first time on an "
+            "environment observe what the reaper would do before trusting it "
+            "to actually evict anything. Set to False once the shadow log has "
+            "been reviewed and its targeting looks correct. Read live on "
+            "every tick."
         ),
     )
 
@@ -392,7 +421,11 @@ class ZombieSessionReaper(PeriodicService):
                 if instance_id not in dead_ids:
                     continue
                 await self._reap_session(
-                    engine, row, instance_id, self._config.idle_threshold_seconds
+                    engine,
+                    row,
+                    instance_id,
+                    self._config.idle_threshold_seconds,
+                    self._config.zombie_reaper_shadow_mode,
                 )
 
     async def _find_candidates(self, engine: Any) -> List[dict]:
@@ -455,7 +488,12 @@ class ZombieSessionReaper(PeriodicService):
         return set(instance_ids) - fresh_ids
 
     async def _reap_session(
-        self, engine: Any, row: dict, instance_id: str, idle_threshold_seconds: int
+        self,
+        engine: Any,
+        row: dict,
+        instance_id: str,
+        idle_threshold_seconds: int,
+        shadow_mode: bool,
     ) -> None:
         pid = row.get("pid")
         try:
@@ -471,6 +509,39 @@ class ZombieSessionReaper(PeriodicService):
             )
             lock_rows = []
         lock_ids = [r["lock_id"] for r in (lock_rows or [])]
+
+        if shadow_mode:
+            # Shadow mode runs the identical TOCTOU recheck a real reap would,
+            # but never terminates anything — only a candidate that survives
+            # the recheck (i.e. one the real path would actually reap) gets
+            # the distinct lock_reaped_shadow warning below.
+            try:
+                async with background_managed_transaction(engine) as conn:
+                    still_idle = await DQLQuery(
+                        _RECHECK_STILL_IDLE_SQL, result_handler=ResultHandler.SCALAR
+                    ).execute(conn, pid=pid, idle_threshold_seconds=idle_threshold_seconds)
+            except Exception:
+                logger.warning(
+                    "zombie_session_reaper: TOCTOU recheck failed for pid=%s "
+                    "instance_id=%s (best-effort; shadow candidate not logged).",
+                    pid, instance_id, exc_info=True,
+                )
+                return
+            if not still_idle:
+                logger.info(
+                    "zombie_session_reaper: pid=%s instance_id=%s no longer "
+                    "idle past threshold at reap time (recheck failed) — "
+                    "skipping (shadow mode).",
+                    pid, instance_id,
+                )
+                return
+            logger.warning(
+                "lock_reaped_shadow pid=%s service=%s instance_id=%s "
+                "idle_secs=%s state=%r lock_ids=%s last_query=%r",
+                pid, row.get("application_name"), instance_id,
+                row.get("idle_secs"), row.get("state"), lock_ids, row.get("last_query"),
+            )
+            return
 
         # geoid#2924 leg 3: loud, structured record of what this reap
         # interrupted, BEFORE the terminate — so the signal survives even if

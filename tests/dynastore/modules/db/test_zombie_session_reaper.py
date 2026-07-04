@@ -24,6 +24,10 @@ threshold, (3) has no fresh configs.instance_liveness row scoped to its own
 service, and (4) is still idle past the threshold at the moment of the
 terminate itself (TOCTOU recheck). Any one of those failing must leave the
 session untouched.
+
+``zombie_reaper_shadow_mode`` defaults to True, so tests that exercise real
+termination pass ``zombie_reaper_shadow_mode=False`` explicitly; the shadow
+tests below pin the opposite contract — full detection, zero terminations.
 """
 
 from __future__ import annotations
@@ -179,14 +183,15 @@ async def test_live_instance_session_is_never_reaped(monkeypatch, caplog):
 
 
 async def test_dead_instance_session_is_reaped_with_lock_detail(monkeypatch, caplog):
+    config = ZombieSessionReaperConfig(enabled=True, zombie_reaper_shadow_mode=False)
     issued = _install_stub(
         monkeypatch,
-        config=ZombieSessionReaperConfig(enabled=True),
+        config=config,
         candidates=[_DEAD_ROW],
         fresh_instance_ids=[],  # dead instance carries no fresh row
         lock_rows=[{"lock_id": 123456789}],
     )
-    reaper = ZombieSessionReaper(ZombieSessionReaperConfig(enabled=True))
+    reaper = ZombieSessionReaper(config)
     with caplog.at_level(logging.WARNING, logger=mod.logger.name):
         await reaper.run_once()
 
@@ -232,14 +237,15 @@ async def test_safety_valve_is_scoped_per_service(monkeypatch, caplog):
     """A heartbeat outage affecting only one service must not let that
     service's candidates get reaped just because ANOTHER service still has
     fresh liveness rows — and must not block the healthy service either."""
+    config = ZombieSessionReaperConfig(enabled=True, zombie_reaper_shadow_mode=False)
     issued = _install_stub(
         monkeypatch,
-        config=ZombieSessionReaperConfig(enabled=True),
+        config=config,
         candidates=[_SERVICE_A_DEAD_ROW, _SERVICE_B_DEAD_ROW],
         any_fresh_by_service={"service-a": 0, "service-b": 1},
         fresh_instance_ids_by_service={"service-a": [], "service-b": []},
     )
-    reaper = ZombieSessionReaper(ZombieSessionReaperConfig(enabled=True))
+    reaper = ZombieSessionReaper(config)
     with caplog.at_level(logging.WARNING, logger=mod.logger.name):
         await reaper.run_once()
 
@@ -253,19 +259,94 @@ async def test_safety_valve_is_scoped_per_service(monkeypatch, caplog):
 async def test_toctou_recheck_skips_reap_when_session_no_longer_idle(monkeypatch, caplog):
     """A session that woke back up (or whose pid was recycled) between the
     scan and the reap must not be terminated."""
+    config = ZombieSessionReaperConfig(enabled=True, zombie_reaper_shadow_mode=False)
     issued = _install_stub(
         monkeypatch,
-        config=ZombieSessionReaperConfig(enabled=True),
+        config=config,
         candidates=[_DEAD_ROW],
         fresh_instance_ids=[],
         recheck_ok=False,
     )
-    reaper = ZombieSessionReaper(ZombieSessionReaperConfig(enabled=True))
+    reaper = ZombieSessionReaper(config)
     with caplog.at_level(logging.INFO, logger=mod.logger.name):
         await reaper.run_once()
 
     assert not any("pg_terminate_backend" in s for s in issued)
     assert any("recheck failed" in r.getMessage() for r in caplog.records)
+
+
+async def test_shadow_mode_logs_candidates_without_terminating(monkeypatch, caplog):
+    """Shadow mode (the default) must run the full detection + TOCTOU
+    recheck pipeline and log every candidate it would have reaped, but must
+    never call pg_terminate_backend()."""
+    config = ZombieSessionReaperConfig(enabled=True)  # shadow_mode defaults True
+    assert config.zombie_reaper_shadow_mode is True
+    issued = _install_stub(
+        monkeypatch,
+        config=config,
+        candidates=[_DEAD_ROW],
+        fresh_instance_ids=[],  # dead instance carries no fresh row
+        lock_rows=[{"lock_id": 123456789}],
+    )
+    reaper = ZombieSessionReaper(config)
+    with caplog.at_level(logging.WARNING, logger=mod.logger.name):
+        await reaper.run_once()
+
+    assert not any("pg_terminate_backend" in s for s in issued)
+    assert any("SELECT 1" in s and "pg_stat_activity" in s for s in issued), (
+        "shadow mode must still run the TOCTOU recheck"
+    )
+    msgs = [r.getMessage() for r in caplog.records]
+    shadow_line = [m for m in msgs if m.startswith("lock_reaped_shadow")]
+    assert shadow_line, "expected a lock_reaped_shadow warning for the candidate"
+    assert "pid=4242" in shadow_line[0]
+    assert "instance_id=" + _DEAD_INSTANCE in shadow_line[0]
+    assert "idle_secs=3600" in shadow_line[0]
+    assert not any(m.startswith("lock_reaped ") for m in msgs)
+    assert not any("terminated pid=" in m for m in msgs)
+
+
+async def test_shadow_mode_respects_toctou_recheck(monkeypatch, caplog):
+    """A session that woke back up between the scan and the shadow-reap must
+    not be logged as a shadow candidate either."""
+    config = ZombieSessionReaperConfig(enabled=True)
+    issued = _install_stub(
+        monkeypatch,
+        config=config,
+        candidates=[_DEAD_ROW],
+        fresh_instance_ids=[],
+        recheck_ok=False,
+    )
+    reaper = ZombieSessionReaper(config)
+    with caplog.at_level(logging.INFO, logger=mod.logger.name):
+        await reaper.run_once()
+
+    assert not any("pg_terminate_backend" in s for s in issued)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert not any(m.startswith("lock_reaped_shadow") for m in msgs)
+    assert any("recheck failed" in m and "shadow mode" in m for m in msgs)
+
+
+async def test_non_shadow_mode_evicts_as_before(monkeypatch, caplog):
+    """Explicitly disabling shadow mode must reap exactly as the reaper did
+    before shadow mode existed."""
+    config = ZombieSessionReaperConfig(enabled=True, zombie_reaper_shadow_mode=False)
+    issued = _install_stub(
+        monkeypatch,
+        config=config,
+        candidates=[_DEAD_ROW],
+        fresh_instance_ids=[],
+        lock_rows=[{"lock_id": 123456789}],
+    )
+    reaper = ZombieSessionReaper(config)
+    with caplog.at_level(logging.WARNING, logger=mod.logger.name):
+        await reaper.run_once()
+
+    assert any("pg_terminate_backend" in s for s in issued)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith("lock_reaped ") for m in msgs)
+    assert any("terminated pid=4242" in m for m in msgs)
+    assert not any(m.startswith("lock_reaped_shadow") for m in msgs)
 
 
 async def test_candidate_scan_failure_is_swallowed(monkeypatch):
@@ -294,6 +375,10 @@ def test_config_rejects_stale_after_shorter_than_idle_threshold():
 def test_config_defaults_satisfy_the_validator():
     cfg = ZombieSessionReaperConfig()
     assert cfg.liveness_stale_after_seconds >= cfg.idle_threshold_seconds
+
+
+def test_config_shadow_mode_defaults_to_true():
+    assert ZombieSessionReaperConfig().zombie_reaper_shadow_mode is True
 
 
 def test_config_accepts_stale_after_equal_to_idle_threshold():
