@@ -16,6 +16,8 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
+import datetime
+
 import pytest
 
 pytest.importorskip("pygeofilter", reason="pygeofilter required for CQL tests")
@@ -155,3 +157,154 @@ def test_parse_cql_filter_plain_value_unaffected_by_quote_handling():
     mapping = {"owner": column("owner")}
     _, params = parse_cql_filter(cql, field_mapping=mapping, parser_type="cql2")
     assert "PK001" in params.values()
+
+
+# ── PG/ES CQL2 operator-parity fixes (#2945) ────────────────────────────
+#
+# The STAC search PG fallback (#2943) and the OGC API Features ``/items``
+# ``filter=`` path both compile a CQL2 filter through this module's
+# ``parse_cql_filter``/``parse_cql2_json_filter``, which route through
+# ``_to_filter_with_parity_fixes`` / ``_ParityFilterEvaluator``. These tests
+# cover the two gaps found auditing that PG translator against the shared ES
+# CQL2->DSL translator (``cql_to_es.py``): LIKE pattern wildcard/singlechar
+# adaptation, and per-operator T_* temporal semantics (previously all folded
+# into an inclusive "between" by the bundled pygeofilter evaluator).
+
+def test_parse_cql_filter_like_singlechar_wildcard_converted_to_sql():
+    """CQL2's ``.`` single-char wildcard becomes SQL's ``_`` (not left inert).
+
+    Before #2945 the PG path passed the CQL2 pattern straight to SQL's LIKE,
+    so a CQL2 ``.`` wildcard (bundled grammar's default single-char token)
+    was left as a literal dot — narrower than the ES translator, which does
+    perform this adaptation.
+    """
+    cql = "name LIKE 'fo.o'"
+    mapping = {"name": column("name")}
+    sql, params = parse_cql_filter(cql, field_mapping=mapping, parser_type="cql2")
+    assert "ESCAPE" in sql
+    assert list(params.values()) == ["fo_o"]
+
+
+def test_parse_cql_filter_like_literal_underscore_escaped():
+    """A literal ``_`` in a LIKE pattern must not become SQL's own wildcard.
+
+    Before #2945 a literal underscore (not a CQL2 wildcard token) reached SQL
+    unescaped and was silently reinterpreted as SQL's single-char wildcard —
+    broader than intended.
+    """
+    cql = "name LIKE 'foo_bar'"
+    mapping = {"name": column("name")}
+    sql, params = parse_cql_filter(cql, field_mapping=mapping, parser_type="cql2")
+    assert list(params.values()) == ["foo\\_bar"]
+
+
+def test_parse_cql_filter_like_multi_wildcard_converted_to_percent():
+    """CQL2's ``%`` multi-char wildcard is unaffected (already SQL's own)."""
+    cql = "name LIKE 'fo%'"
+    mapping = {"name": column("name")}
+    _, params = parse_cql_filter(cql, field_mapping=mapping, parser_type="cql2")
+    assert list(params.values()) == ["fo%"]
+
+
+def _temporal_sql(cql, mapping=None):
+    mapping = mapping or {"dt": column("dt")}
+    return parse_cql_filter(cql, field_mapping=mapping, parser_type="cql2")
+
+
+def test_parse_cql_filter_temporal_before_is_exclusive():
+    """T_BEFORE must be a strict ``<`` (matches the ES translator's ``lt``).
+
+    Before #2945 the bundled evaluator's generic BEFORE handling produced an
+    inclusive ``<=``, so a document exactly at the boundary instant matched
+    on the PG fallback but not via ES — an inconsistency across paths.
+    """
+    sql, params = _temporal_sql("dt T_BEFORE TIMESTAMP('2020-01-01T00:00:00Z')")
+    assert " < " in sql
+    assert "<=" not in sql
+
+
+def test_parse_cql_filter_temporal_after_is_exclusive():
+    """T_AFTER must be a strict ``>`` (matches the ES translator's ``gt``)."""
+    sql, params = _temporal_sql("dt T_AFTER TIMESTAMP('2020-01-01T00:00:00Z')")
+    assert " > " in sql
+    assert ">=" not in sql
+
+
+def test_parse_cql_filter_temporal_begins_is_equality_on_low():
+    """T_BEGINS matches the ES translator: exact equality on the interval start.
+
+    Before #2945 BEGINS was folded into an inclusive between, matching every
+    value in the interval instead of just its start.
+    """
+    sql, params = _temporal_sql(
+        "dt T_BEGINS INTERVAL('2020-01-01T00:00:00Z','2021-01-01T00:00:00Z')"
+    )
+    assert " = " in sql
+    assert list(params.values()) == [
+        datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+    ]
+
+
+def test_parse_cql_filter_temporal_begunby_is_equality_on_high():
+    """T_BEGUNBY matches the ES translator: exact equality on the interval end."""
+    sql, params = _temporal_sql(
+        "dt T_BEGUNBY INTERVAL('2020-01-01T00:00:00Z','2021-01-01T00:00:00Z')"
+    )
+    assert " = " in sql
+    assert list(params.values()) == [
+        datetime.datetime(2021, 1, 1, tzinfo=datetime.timezone.utc)
+    ]
+
+
+def test_parse_cql_filter_temporal_during_is_strict_between():
+    """T_DURING is a strict (exclusive) between, matching the ES translator."""
+    sql, params = _temporal_sql(
+        "dt T_DURING INTERVAL('2020-01-01T00:00:00Z','2021-01-01T00:00:00Z')"
+    )
+    assert " > " in sql and " < " in sql
+    assert ">=" not in sql and "<=" not in sql
+
+
+def test_parse_cql_filter_temporal_tcontains_is_strict_between():
+    """T_CONTAINS matches T_DURING's bound (ES uses the same range, only its
+    inert ``relation`` hint differs — a no-op on a scalar column)."""
+    sql, params = _temporal_sql(
+        "dt T_CONTAINS INTERVAL('2020-01-01T00:00:00Z','2021-01-01T00:00:00Z')"
+    )
+    assert " > " in sql and " < " in sql
+
+
+def test_parse_cql_filter_temporal_toverlaps_is_inclusive_between():
+    """T_OVERLAPS is an inclusive between, matching the ES translator."""
+    sql, params = _temporal_sql(
+        "dt T_OVERLAPS INTERVAL('2020-01-01T00:00:00Z','2021-01-01T00:00:00Z')"
+    )
+    assert ">=" in sql and "<=" in sql
+
+
+def test_parse_cql_filter_temporal_overlappedby_is_inclusive_between():
+    """T_OVERLAPPEDBY matches T_OVERLAPS' bound, mirroring the ES translator."""
+    sql, params = _temporal_sql(
+        "dt T_OVERLAPPEDBY INTERVAL('2020-01-01T00:00:00Z','2021-01-01T00:00:00Z')"
+    )
+    assert ">=" in sql and "<=" in sql
+
+
+def test_parse_cql_filter_temporal_tequals_unchanged():
+    """T_EQUALS was already correct (pygeofilter's own explicit branch);
+    confirms the new evaluator preserves it."""
+    sql, params = _temporal_sql("dt T_EQUALS TIMESTAMP('2020-01-01T00:00:00Z')")
+    assert " = " in sql
+
+
+@pytest.mark.parametrize("op", ["T_MEETS", "T_METBY", "T_ENDS", "T_ENDEDBY"])
+def test_parse_cql_filter_temporal_ambiguous_ops_rejected(op):
+    """MEETS/METBY/ENDS/ENDEDBY have no ES-side reference translation to
+    mirror and no unambiguous meaning for a scalar (non-interval) property,
+    so the PG fallback now rejects them explicitly (400) instead of silently
+    folding them into a wrong "between" (the pre-#2945 behaviour)."""
+    with pytest.raises(ValueError) as excinfo:
+        _temporal_sql(
+            f"dt {op} INTERVAL('2020-01-01T00:00:00Z','2021-01-01T00:00:00Z')"
+        )
+    assert op.replace("T_", "") in str(excinfo.value) or op in str(excinfo.value)

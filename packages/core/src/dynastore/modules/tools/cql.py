@@ -16,6 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
+import datetime as _dt
 import logging
 import re
 from typing import Dict, Any, Tuple, Optional, Set, Union, TYPE_CHECKING
@@ -174,7 +175,6 @@ if TYPE_CHECKING:
     from pygeofilter.parsers.cql2_text import parse as parse_cql2_text
     from pygeofilter.parsers.cql2_json import parse as parse_cql2_json
     from pygeofilter.parsers.ecql import parse as parse_ecql
-    from pygeofilter.backends.sqlalchemy import to_filter
     from pygeofilter.ast import Attribute
     PYGEOFILTER_AVAILABLE = True
 else:
@@ -182,7 +182,6 @@ else:
         from pygeofilter.parsers.cql2_text import parse as parse_cql2_text
         from pygeofilter.parsers.cql2_json import parse as parse_cql2_json
         from pygeofilter.parsers.ecql import parse as parse_ecql
-        from pygeofilter.backends.sqlalchemy import to_filter
         from pygeofilter.ast import Attribute
         PYGEOFILTER_AVAILABLE = True
     except ImportError:
@@ -190,9 +189,135 @@ else:
         parse_cql2_text = None
         parse_cql2_json = None
         parse_ecql = None
-        to_filter = None
         Attribute = None
         logger.warning("`pygeofilter` not installed. CQL parsing will be disabled.")
+
+
+def _cql_like_pattern_to_sql(
+    pattern: str, wildcard: str, singlechar: str, escapechar: str = "\\"
+) -> str:
+    """Adapt a CQL2 ``LIKE`` pattern to SQL ``LIKE`` syntax.
+
+    pygeofilter's bundled ``SQLAlchemyFilterEvaluator`` passes a CQL2 ``LIKE``
+    pattern straight through to SQL's ``LIKE``, which only coincidentally
+    matches when the CQL2 wildcard tokens happen to equal SQL's own
+    (``%``/``_``). The bundled CQL2-Text/JSON grammar's single-char wildcard
+    is ``.`` (not SQL's ``_``): a raw pass-through treats a CQL2 ``.``
+    wildcard as an inert literal dot (missing the single-char match a CQL2
+    caller — and the ES CQL2->DSL translator, ``cql_to_es._like_to_wildcard``
+    — would honour) and treats a literal ``_`` in the pattern as SQL's own
+    wildcard (matching characters the caller never asked to match).
+
+    Walks the pattern once, converting the CQL2 wildcard/singlechar tokens to
+    SQL's, and escaping any literal ``%``/``_``/``escapechar`` so SQL's LIKE
+    never reinterprets them. The caller passes the same ``escapechar`` as the
+    SQL ``ESCAPE`` clause, so escaped literals round-trip.
+    """
+    out = []
+    i = 0
+    n = len(pattern)
+    while i < n:
+        ch = pattern[i]
+        if (
+            ch == escapechar
+            and i + 1 < n
+            and pattern[i + 1] in (wildcard, singlechar, escapechar)
+        ):
+            literal = pattern[i + 1]
+            out.append(escapechar + literal if literal in ("%", "_", escapechar) else literal)
+            i += 2
+            continue
+        if ch == wildcard:
+            out.append("%")
+        elif ch == singlechar:
+            out.append("_")
+        elif ch in ("%", "_", escapechar):
+            out.append(escapechar + ch)
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _to_filter_with_parity_fixes(ast_node: Any, field_mapping: Dict[str, Any]) -> Any:
+    """Evaluate a parsed CQL2 AST into a SQLAlchemy filter expression.
+
+    Drop-in replacement for pygeofilter's own ``to_filter`` (called only once
+    ``PYGEOFILTER_AVAILABLE`` is already known ``True`` by the caller). Routes
+    through a small evaluator that extends (never modifies) pygeofilter's
+    bundled ``SQLAlchemyFilterEvaluator`` — the PostgreSQL CQL2->SQL
+    translator the STAC search PG fallback (#2943) and the OGC API Features
+    ``/items`` ``filter=`` path both use — to close two gaps found auditing
+    it against the shared ES CQL2->DSL translator (``cql_to_es.py``, #2945):
+
+    * ``LIKE``/``ILIKE``: the bundled evaluator never adapts the CQL2
+      pattern's wildcard tokens to SQL's own (see
+      :func:`_cql_like_pattern_to_sql`).
+    * ``T_*`` temporal predicates: the bundled evaluator only special-cases
+      ``BEFORE``/``AFTER``/``TEQUALS`` and folds every other temporal
+      operator into an inclusive "between" — silently wrong for
+      ``BEGINS``/``BEGUNBY``/``TOVERLAPS``/``OVERLAPPEDBY``/``DURING``/
+      ``TCONTAINS``/``DISJOINT``, and even its own ``BEFORE``/``AFTER`` bound
+      is inclusive where the ES translator's is exclusive.
+      ``MEETS``/``METBY``/``ENDS``/``ENDEDBY`` have no ES-side reference
+      translation to mirror (the ES translator does not support them either —
+      it defers to this PG path for those), and collapsing an
+      interval-vs-interval Allen relation onto a single scalar timestamp
+      column has no single unambiguous meaning, so those four raise rather
+      than guess.
+    """
+    from sqlalchemy import and_ as sa_and, not_ as sa_not
+    from pygeofilter import ast as pg_ast
+    from pygeofilter.backends.evaluator import handle
+    from pygeofilter.backends.sqlalchemy.evaluate import SQLAlchemyFilterEvaluator
+
+    class _ParityFilterEvaluator(SQLAlchemyFilterEvaluator):
+        @handle(pg_ast.Like)
+        def like(self, node, lhs):
+            pattern = _cql_like_pattern_to_sql(
+                node.pattern, node.wildcard, node.singlechar, node.escapechar
+            )
+            bound = lhs.ilike if node.nocase else lhs.like
+            expr = bound(pattern, escape=node.escapechar)
+            return sa_not(expr) if node.not_ else expr
+
+        @handle(pg_ast.TemporalPredicate, subclasses=True)
+        def temporal(self, node, lhs, rhs):
+            op = node.op
+            Op = pg_ast.TemporalComparisonOp
+
+            if isinstance(rhs, (_dt.date, _dt.datetime)):
+                low = high = rhs
+            else:
+                try:
+                    low, high = rhs
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"Unsupported temporal RHS for operator {op.value}: {rhs!r}"
+                    ) from exc
+
+            if op == Op.BEFORE:
+                return lhs < low
+            if op == Op.AFTER:
+                return lhs > high
+            if op == Op.TEQUALS:
+                return lhs == low
+            if op == Op.DISJOINT:
+                return sa_not(sa_and(lhs >= low, lhs <= high))
+            if op in (Op.TOVERLAPS, Op.OVERLAPPEDBY):
+                return sa_and(lhs >= low, lhs <= high)
+            if op == Op.BEGINS:
+                return lhs == low
+            if op == Op.BEGUNBY:
+                return lhs == high
+            if op in (Op.DURING, Op.TCONTAINS):
+                return sa_and(lhs > low, lhs < high)
+            raise ValueError(
+                f"Unsupported temporal operator for the PostgreSQL CQL2 fallback: "
+                f"{op.value}"
+            )
+
+    return _ParityFilterEvaluator(field_mapping, None).evaluate(ast_node)
 
 
 def _extract_property_names(node) -> Set[str]:
@@ -356,7 +481,7 @@ def parse_cql_filter(
              raise ValueError("field_mapping is required for SQL conversion")
 
         try:
-            sql_expr = to_filter(ast, field_mapping=field_mapping)
+            sql_expr = _to_filter_with_parity_fixes(ast, field_mapping)
         except KeyError as ke:
              # Try to provide helpful context if possible
              prop_name = str(ke).strip(chr(39))
@@ -442,7 +567,7 @@ def parse_cql2_json_filter(
             raise ValueError("field_mapping is required for SQL conversion")
 
         try:
-            sql_expr = to_filter(ast, field_mapping=field_mapping)
+            sql_expr = _to_filter_with_parity_fixes(ast, field_mapping)
         except KeyError as ke:
             prop_name = str(ke).strip(chr(39))
             msg = f"Unknown property in filter: {prop_name}"
