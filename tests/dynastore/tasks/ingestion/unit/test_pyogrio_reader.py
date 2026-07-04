@@ -162,6 +162,60 @@ def test_open_chunk_size_forwarded_to_pyogrio(geojson_large_path):
     assert len(feats) == 10
 
 
+# ---------------------------------------------------------------------------
+# Offset resume (GeoID #2958): native skip_features seek, not a per-row
+# discard after the fact.
+# ---------------------------------------------------------------------------
+
+
+def test_supports_offset_seek_flag_is_true():
+    assert PyogrioReader.supports_offset_seek is True
+
+
+def test_open_offset_skips_correct_records(geojson_large_path):
+    """A real (unmocked) offset resume must yield only the rows from
+    ``offset`` onward, in order."""
+    reader = PyogrioReader()
+    with reader.open(geojson_large_path, offset=7) as records:
+        feats = list(records)
+    vals = [f["properties"]["val"] for f in feats]
+    assert vals == [7, 8, 9]
+
+
+def test_open_offset_zero_yields_all_records(geojson_large_path):
+    reader = PyogrioReader()
+    with reader.open(geojson_large_path, offset=0) as records:
+        feats = list(records)
+    assert len(feats) == 10
+
+
+def test_open_offset_seeds_first_pyogrio_call_via_skip_features(geojson_large_path):
+    """The resume ``offset`` must seed the FIRST pyogrio.read_dataframe call's
+    ``skip_features`` — not be re-discarded afterward by the caller — and
+    subsequent pages must continue counting from that seed, not from 0."""
+    import pyogrio
+    from unittest.mock import patch
+
+    import geopandas as gpd
+    gdf = gpd.GeoDataFrame.from_features(_GEOJSON_LARGE["features"])
+    page1 = gdf.iloc[7:10].copy()
+    empty = gdf.iloc[:0].copy()
+
+    with patch.object(
+        pyogrio, "read_dataframe", side_effect=[page1, empty],
+    ) as mock_rdf:
+        reader = PyogrioReader()
+        with reader.open(geojson_large_path, read_batch_size=5, offset=7) as records:
+            feats = list(records)
+
+    first_kwargs = mock_rdf.call_args_list[0].kwargs
+    assert first_kwargs.get("skip_features") == 7, (
+        "PyogrioReader.open(offset=7) did not seed the first "
+        "pyogrio.read_dataframe call's skip_features with the resume offset"
+    )
+    assert len(feats) == 3
+
+
 def test_open_does_not_use_gpd_read_file():
     """The reader must not call gpd.read_file — that materialises the entire
     dataset in memory. Chunked pyogrio.read_dataframe is the required path."""

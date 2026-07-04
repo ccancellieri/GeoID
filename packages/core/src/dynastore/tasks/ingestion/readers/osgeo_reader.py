@@ -68,6 +68,13 @@ ogr.UseExceptions()
 gdal.UseExceptions()
 
 
+# Rows discarded between heartbeat log lines while skipping to an ingestion
+# resume ``offset`` on a layer that has no fast native seek (GeoID #2958) —
+# frequent enough to prove the skip phase is progressing, rare enough not
+# to flood logs on a multi-million-row resume.
+_OFFSET_SKIP_HEARTBEAT_INTERVAL = 50_000
+
+
 def _resolve_temp_dir():
     """Return the registered ``TempDirProtocol`` implementation.
 
@@ -94,6 +101,12 @@ class GdalOsgeoReader(SourceReaderProtocol):
 
     reader_id: ClassVar[str] = "gdal_osgeo"
     priority: ClassVar[int] = 100
+
+    # Offset resume (GeoID #2958) is handled inside ``open()``/``_iter_features``
+    # via OGR's ``SetNextByIndex`` (native, O(1) for drivers advertising
+    # ``OLCFastSetNextByIndex`` — GeoPackage/SQLite among them) with a
+    # heartbeat-logged discard-iterate fallback for drivers that don't.
+    supports_offset_seek: ClassVar[bool] = True
 
     # Empty extension tuple means "match anything" — see can_read override.
     extensions: ClassVar[Tuple[str, ...]] = ()
@@ -207,6 +220,7 @@ class GdalOsgeoReader(SourceReaderProtocol):
         *,
         encoding: str = "utf-8",
         content_type: str | None = None,
+        offset: int = 0,
         **opts: Any,
     ) -> Generator[Iterable[dict], None, None]:
         from dynastore.tools.mime import ext_from_content_type
@@ -234,17 +248,17 @@ class GdalOsgeoReader(SourceReaderProtocol):
                     uri, task_id=task_id, task_schema=task_schema
                 ) as local_dir:
                     path = self._find_local_dataset(local_dir)
-                    yield from self._open_path_and_iter(path)
+                    yield from self._open_path_and_iter(path, offset=offset)
             else:
                 path = self._to_gdal_uri(uri, is_zip=False, use_vsicache=use_vsicache)
-                yield from self._open_path_and_iter(path)
+                yield from self._open_path_and_iter(path, offset=offset)
         finally:
             if prev_enc is None:
                 gdal.SetConfigOption("SHAPE_ENCODING", "")
             else:
                 gdal.SetConfigOption("SHAPE_ENCODING", prev_enc)
 
-    def _open_path_and_iter(self, path: str) -> Iterator[Iterable[dict]]:
+    def _open_path_and_iter(self, path: str, *, offset: int = 0) -> Iterator[Iterable[dict]]:
         ds = ogr.Open(path)
         if ds is None:
             raise RuntimeError(
@@ -257,7 +271,7 @@ class GdalOsgeoReader(SourceReaderProtocol):
                 "GdalOsgeoReader: opened %r via driver=%s, layers=%d",
                 path, ds.GetDriver().GetName(), ds.GetLayerCount(),
             )
-            yield self._iter_features(ds)
+            yield self._iter_features(ds, offset=offset)
         finally:
             ds = None  # noqa: F841 — release the dataset / file handle
 
@@ -370,19 +384,98 @@ class GdalOsgeoReader(SourceReaderProtocol):
         return extract_dir
 
     @staticmethod
-    def _iter_features(ds: Any) -> Iterator[dict]:
+    def _skip_layer_to_offset(layer: Any, remaining: int) -> int:
+        """Advance *layer* (already ``ResetReading()``-ed) past its first
+        *remaining* features, honoring an ingestion resume ``offset``
+        (GeoID #2958). Returns the rows still left to skip afterwards
+        (only >0 when *remaining* exceeds this layer's total feature
+        count, so the caller can carry the surplus into the next layer of
+        a multi-layer dataset).
+
+        Prefers a native ``SetNextByIndex`` seek — O(1) for drivers that
+        report ``OLCFastSetNextByIndex`` (GeoPackage/SQLite among them) —
+        used only once *remaining* is confirmed to land inside this layer
+        (a known, non-negative ``GetFeatureCount()``). Otherwise falls
+        back to a manual discard-iterate loop with a periodic heartbeat
+        log, so a slow skip is still visible instead of going completely
+        silent for the whole resume.
+        """
+        try:
+            feature_count = layer.GetFeatureCount()
+        except Exception:  # noqa: BLE001 — treat as unknown, use the safe path
+            feature_count = -1
+
+        if feature_count is not None and feature_count >= 0:
+            if remaining >= feature_count:
+                # The whole layer sits inside the already-ingested range —
+                # skip it without touching a single feature.
+                return remaining - feature_count
+            try:
+                if layer.TestCapability(ogr.OLCFastSetNextByIndex):
+                    layer.SetNextByIndex(remaining)
+                    logger.info(
+                        "GdalOsgeoReader: offset resume — native seek to row "
+                        "%d of %d (layer=%s, OLCFastSetNextByIndex)",
+                        remaining, feature_count, layer.GetName(),
+                    )
+                    return 0
+            except Exception:  # noqa: BLE001 — fall through to discard-iterate
+                logger.warning(
+                    "GdalOsgeoReader: native SetNextByIndex(%d) failed on "
+                    "layer=%s; falling back to discard-iterate",
+                    remaining, layer.GetName(),
+                )
+                layer.ResetReading()
+
+        # Deliberately NOT ``for _feat in layer:`` — OGR's ``Layer.__iter__``
+        # calls ``ResetReading()`` on every fresh ``for`` loop, which would
+        # silently rewind a subsequent read back to feature 0. Driving
+        # ``GetNextFeature()`` by hand here keeps the cursor exactly where
+        # this discard loop leaves it for the caller's own read loop.
+        skipped = 0
+        while skipped < remaining:
+            feat = layer.GetNextFeature()
+            if feat is None:
+                break
+            skipped += 1
+            if skipped % _OFFSET_SKIP_HEARTBEAT_INTERVAL == 0:
+                logger.info(
+                    "GdalOsgeoReader: offset resume — skipped %d/%d rows so "
+                    "far (layer=%s, no fast native seek)",
+                    skipped, remaining, layer.GetName(),
+                )
+        return max(0, remaining - skipped)
+
+    @staticmethod
+    def _iter_features(ds: Any, *, offset: int = 0) -> Iterator[dict]:
+        remaining_skip = offset
         for li in range(ds.GetLayerCount()):
             layer = ds.GetLayer(li)
             if layer is None:
                 continue
             layer.ResetReading()
+            if remaining_skip > 0:
+                remaining_skip = GdalOsgeoReader._skip_layer_to_offset(
+                    layer, remaining_skip,
+                )
+                if remaining_skip > 0:
+                    # Offset extends past this whole layer — nothing to
+                    # yield here, carry the remainder to the next layer.
+                    continue
             field_names = [
                 layer.GetLayerDefn().GetFieldDefn(i).GetName()
                 for i in range(layer.GetLayerDefn().GetFieldCount())
             ]
-            for feat in layer:
+            # Deliberately NOT ``for feat in layer:`` — OGR's
+            # ``Layer.__iter__`` calls ``ResetReading()`` on every fresh
+            # ``for`` loop, which would silently rewind an offset-seeked
+            # cursor back to feature 0 (GeoID #2958). ``GetNextFeature()``
+            # driven by hand continues from wherever ``_skip_layer_to_offset``
+            # (native seek or discard-iterate) left the cursor.
+            while True:
+                feat = layer.GetNextFeature()
                 if feat is None:
-                    continue
+                    break
                 props: dict = {}
                 for fname in field_names:
                     try:

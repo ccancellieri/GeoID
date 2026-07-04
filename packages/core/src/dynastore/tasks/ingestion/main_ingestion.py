@@ -24,7 +24,7 @@ import os
 import asyncio
 import itertools
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, Optional, Tuple
 
 from dateutil import parser as _dateutil_parser
 
@@ -406,6 +406,43 @@ def _estimate_feature_bytes(feature: Any) -> int:
         else:
             ordinates += _count_coordinate_ordinates(geom.get("coordinates"))
     return _FEATURE_BASE_BYTES + ordinates * _BYTES_PER_COORD_ORDINATE
+
+
+# Rows discarded between heartbeat log lines while skipping to ``offset``
+# for a reader that has no native seek (GeoID #2958) — frequent enough to
+# prove the skip phase is progressing, rare enough not to flood logs on a
+# multi-million-row resume.
+_OFFSET_SKIP_HEARTBEAT_INTERVAL = 50_000
+
+
+def _skip_to_offset_with_heartbeat(
+    records: Iterable[dict], offset: int,
+) -> Iterator[dict]:
+    """Discard the first *offset* records from *records*, logging progress
+    every ``_OFFSET_SKIP_HEARTBEAT_INTERVAL`` rows (GeoID #2958).
+
+    Fallback path for readers that don't advertise
+    ``SourceReaderProtocol.supports_offset_seek`` — i.e. can't position
+    themselves natively at ``offset``. Resuming a partial ingestion via
+    ``offset`` used to run this same discard loop via ``itertools.islice``
+    with zero log output until the first post-offset batch upserted; this
+    keeps the discard behaviour but makes a long skip phase observable.
+    """
+    if offset <= 0:
+        yield from records
+        return
+    skipped = 0
+    it = iter(records)
+    for _ in it:
+        skipped += 1
+        if skipped % _OFFSET_SKIP_HEARTBEAT_INTERVAL == 0:
+            logger.info(
+                "ingestion: resuming at offset=%d — skipped %d/%d rows so far",
+                offset, skipped, offset,
+            )
+        if skipped >= offset:
+            break
+    yield from it
 
 
 # Canonical items-schema data types that denote a temporal value. A property
@@ -1194,6 +1231,15 @@ async def run_ingestion_task(
             " (explicit override)" if task_request.reader else "",
         )
 
+        # #2958: readers that can position themselves at ``offset`` natively
+        # (PyogrioReader / GdalOsgeoReader, both via OGR's ``SetNextByIndex``
+        # under the hood) do so inside ``open()``; everything else falls
+        # back to the heartbeat-logged discard loop below so a large-offset
+        # resume is never silent.
+        reader_seeks_offset = bool(
+            getattr(reader_cls, "supports_offset_seek", False)
+        )
+
         # Built as a dict (not passed as literal kwargs) so reader_options can
         # cleanly override a default (e.g. read_batch_size) instead of colliding
         # as a duplicate keyword argument.
@@ -1204,14 +1250,16 @@ async def run_ingestion_task(
             "task_schema": phys_schema,
             "read_batch_size": task_request.read_batch_size,
         }
-        # task_id/task_schema/content_type are the reader's own identity/
-        # plumbing kwargs (e.g. used to name reaper-tracked scratch dirs) —
-        # a caller has no legitimate reason to override them via
-        # reader_options, so drop and warn on any collision instead of
-        # silently shadowing them.
+        if reader_seeks_offset:
+            open_kwargs["offset"] = task_request.offset
+        # task_id/task_schema/content_type/offset are the reader's own
+        # identity/plumbing/resume kwargs (e.g. used to name reaper-tracked
+        # scratch dirs, or to seek to the correct resume point) — a caller
+        # has no legitimate reason to override them via reader_options, so
+        # drop and warn on any collision instead of silently shadowing them.
         reader_options = dict(task_request.reader_options or {})
         shadowed_keys = [
-            key for key in ("task_id", "task_schema", "content_type")
+            key for key in ("task_id", "task_schema", "content_type", "offset")
             if key in reader_options
         ]
         if shadowed_keys:
@@ -1226,12 +1274,15 @@ async def run_ingestion_task(
         open_kwargs.update(reader_options)
 
         with reader_inst.open(source_file_path, **open_kwargs) as reader:
-            sliced_reader = itertools.islice(
-                reader,
-                task_request.offset,
-                task_request.limit + task_request.offset
+            pre_offset_reader: Iterable[dict] = (
+                reader
+                if reader_seeks_offset
+                else _skip_to_offset_with_heartbeat(reader, task_request.offset)
+            )
+            sliced_reader = (
+                itertools.islice(pre_offset_reader, task_request.limit)
                 if task_request.limit
-                else None,
+                else pre_offset_reader
             )
 
             for idx, raw_record in enumerate(sliced_reader, start=task_request.offset):

@@ -65,6 +65,13 @@ class PyogrioReader(SourceReaderProtocol):
         ".geojson", ".json", ".gpkg", ".shp", ".csv",
     )
 
+    # Offset resume (GeoID #2958) is threaded into the pagination cursor
+    # below via pyogrio's own ``skip_features`` — which itself delegates to
+    # OGR's ``SetNextByIndex`` (native, O(1) for drivers advertising
+    # ``OLCFastSetNextByIndex``) rather than the caller discarding rows one
+    # at a time in Python.
+    supports_offset_seek: ClassVar[bool] = True
+
     @contextlib.contextmanager
     def open(
         self,
@@ -72,6 +79,7 @@ class PyogrioReader(SourceReaderProtocol):
         *,
         encoding: str = "utf-8",
         content_type: str | None = None,  # noqa: ARG002 — forwarded by registry, unused here
+        offset: int = 0,
         **opts: Any,
     ) -> Iterator[Iterable[dict]]:
         path = _to_vsigs(uri, use_vsicache=bool(opts.get("use_vsicache", False)))
@@ -85,11 +93,16 @@ class PyogrioReader(SourceReaderProtocol):
             # keeps peak RSS proportional to chunk_size, not source-file
             # size.  (``read_dataframe`` has no ``chunksize`` kwarg — it's
             # not a chunked-generator API — so pagination is done here.)
-            offset = 0
+            #
+            # *offset* seeds the pagination cursor so resuming a partial
+            # ingestion (GeoID #2958) skips the already-ingested rows via
+            # pyogrio's native skip_features instead of the caller
+            # discarding them one at a time after the fact.
+            cursor = offset
             while True:
                 chunk = pyogrio.read_dataframe(
                     path, encoding=encoding,
-                    skip_features=offset, max_features=chunk_size,
+                    skip_features=cursor, max_features=chunk_size,
                 )
                 n = len(chunk)
                 if n == 0:
@@ -97,10 +110,11 @@ class PyogrioReader(SourceReaderProtocol):
                 yield from chunk.iterfeatures()
                 if n < chunk_size:
                     break
-                offset += chunk_size
+                cursor += chunk_size
 
         logger.info(
-            "PyogrioReader: opened %r (chunked, chunk_size=%d)", path, chunk_size,
+            "PyogrioReader: opened %r (chunked, chunk_size=%d%s)", path, chunk_size,
+            f", resuming at offset={offset} via native skip_features" if offset else "",
         )
         yield _iter_chunks()
 

@@ -61,6 +61,14 @@ class SourceReaderProtocol:
     extensions: ClassVar[Tuple[str, ...]] = ()
     # Stable identifier surfaced in logs / errors.
     reader_id: ClassVar[str] = ""
+    # True iff this reader honours ``open(..., offset=...)`` itself — via a
+    # native seek where the underlying format supports random access, or its
+    # own progress-logged discard loop otherwise (GeoID #2958). The caller
+    # (``main_ingestion``) must not additionally skip in that case. Readers
+    # that leave this False are skipped by the caller's own
+    # heartbeat-logged fallback, so every reader degrades gracefully without
+    # having to implement offset support itself.
+    supports_offset_seek: ClassVar[bool] = False
 
     @classmethod
     def can_read(cls, uri: str, *, content_type: Optional[str] = None) -> bool:
@@ -101,6 +109,7 @@ class SourceReaderProtocol:
         *,
         encoding: str = "utf-8",
         content_type: Optional[str] = None,
+        offset: int = 0,
         **opts: Any,
     ) -> ContextManager[Iterable[dict]]:
         """Open the source and return a ctx-mgr yielding dict-shaped records.
@@ -112,6 +121,12 @@ class SourceReaderProtocol:
 
         *content_type* is forwarded so subclasses can wrap zipped sources
         (``/vsizip/``) when the URI lacks a recognisable suffix.
+
+        *offset* is only meaningful when ``supports_offset_seek`` is True:
+        the returned iterable MUST then already be positioned past the
+        first *offset* records (GeoID #2958). Implementations that leave
+        ``supports_offset_seek`` False may ignore this parameter entirely
+        — the caller applies its own heartbeat-logged skip instead.
         """
         raise NotImplementedError
 
