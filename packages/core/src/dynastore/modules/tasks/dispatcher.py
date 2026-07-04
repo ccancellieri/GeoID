@@ -404,7 +404,7 @@ async def _maybe_dlq_unclaimable(
     """
     from dynastore.modules.tasks.capability_oracle import is_capability_live
     from dynastore.modules.db_config.query_executor import (
-        DQLQuery, ResultHandler, managed_transaction,
+        DQLQuery, ResultHandler, background_managed_transaction,
     )
     from dynastore.modules.tasks.tasks_module import get_task_schema
 
@@ -422,7 +422,14 @@ async def _maybe_dlq_unclaimable(
         )
         schema = get_task_schema()
         error_message = _dead_capability_error_message(capability_id)
-        async with managed_transaction(engine) as conn:
+        # Gated (#2900): this reactive check runs inline in the dispatcher's
+        # per-task claim path, not a separate maintenance tick — routing it
+        # through the background semaphore keeps it from piling onto the
+        # pool alongside true maintenance work under throttling. On
+        # saturation the semaphore raises asyncio.TimeoutError, caught by
+        # the except-and-fail-safe below, which already falls through to
+        # the standard reset-to-pending back-off — no new failure mode.
+        async with background_managed_transaction(engine) as conn:
             got_lock = await DQLQuery(
                 "SELECT pg_try_advisory_xact_lock(:k) AS got",
                 result_handler=ResultHandler.ONE_DICT,
@@ -658,29 +665,27 @@ async def sweep_unclaimable_rows(
     transient owner gap during a deploy does not dead-letter freshly-enqueued
     work (mirrors the capability sweep's age floor).
 
-    When ``conn`` is supplied, both the registry SELECT and the DLQ UPDATE run
-    on that connection (avoids two extra pool acquires); callers without one
-    still work via the ``conn=None`` default.
+    ``conn`` is used for the registry SELECT when supplied (avoids an extra
+    pool acquire), and is REQUIRED for the DLQ UPDATE step below: the sole
+    caller (the mandatory backstop pass in ``ProactiveSweepService``) always
+    supplies one, already checked out through ``background_managed_transaction``
+    — a second, ungated pool acquire here would defeat that gating (#2900).
     """
     unclaimable = await _find_unclaimable_task_types(
         engine, ttl_grace_seconds=ttl_grace_seconds, conn=conn,
     )
     if not unclaimable:
         return 0
+    assert conn is not None, (
+        "sweep_unclaimable_rows requires a pre-acquired, gated conn once "
+        "unclaimable rows are found"
+    )
     sql = _BACKSTOP_DLQ_SQL.format(schema=schema)
     err = _unclaimable_error(",".join(sorted(unclaimable)))
-    from dynastore.modules.db_config.query_executor import (
-        DQLQuery, ResultHandler, managed_transaction,
+    from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
+    rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
+        conn, err=err, task_types=unclaimable, min_age_s=min_age_s,
     )
-    if conn is not None:
-        rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
-            conn, err=err, task_types=unclaimable, min_age_s=min_age_s,
-        )
-    else:
-        async with managed_transaction(engine) as _conn:
-            rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
-                _conn, err=err, task_types=unclaimable, min_age_s=min_age_s,
-            )
     n = len(rows or [])
     if n:
         logger.error("backstop: dead-lettered %d unclaimable row(s) types=%s", n, unclaimable)

@@ -55,6 +55,7 @@ from dynastore.modules.tasks.reconciliation import VerdictAction, decide_verdict
 from dynastore.modules.db_config.connection_health_config import resolve_leadership_config
 from dynastore.tools.background_service import (
     Leadership,
+    LeaseRenewalMode,
     PeriodicService,
     PodPolicy,
     ServiceContext,
@@ -128,6 +129,10 @@ class GcpLivenessReconciler(PeriodicService):
     name = "gcp_liveness_reconciler"
     leadership = Leadership.LEADER_ONLY
     pod_policy = PodPolicy.SKIP_EPHEMERAL
+    # Default cadence (20s) sits close to the lease TTL (30s); per-tick
+    # acquire/release would re-elect almost every cycle. Heartbeat mode
+    # holds tenure across ticks and renews on its own cadence instead (#2900).
+    lease_renewal_mode = LeaseRenewalMode.HEARTBEAT
 
     def __init__(
         self,

@@ -192,3 +192,13 @@ def test_config_from_env(monkeypatch):
     assert cfg.interval_seconds == 15
     assert cfg.slow_query_seconds == 20
     assert cfg.lock_wait_seconds == 3
+
+
+def test_lease_renewal_mode_is_heartbeat():
+    """#2900: default cadence (30s) equals the lease TTL, so this monitor
+    holds tenure across ticks instead of re-electing per tick -- it should
+    stay stably leader-elected through the very contention episodes it
+    exists to observe."""
+    from dynastore.tools.background_service import LeaseRenewalMode
+
+    assert DbContentionMonitor.lease_renewal_mode is LeaseRenewalMode.HEARTBEAT

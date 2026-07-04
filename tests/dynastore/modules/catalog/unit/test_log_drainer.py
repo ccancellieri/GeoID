@@ -218,3 +218,11 @@ class TestConstruction:
         drainer = LogDrainer(LogServiceConfig())
         assert drainer.leadership is Leadership.LEADER_ONLY
         assert drainer.pod_policy is PodPolicy.SKIP_EPHEMERAL
+
+    def test_lease_renewal_mode_is_heartbeat(self):
+        """#2900: default cadence (2s) is far faster than the lease TTL, so
+        this service holds tenure across ticks instead of re-electing per tick."""
+        from dynastore.tools.background_service import LeaseRenewalMode
+
+        drainer = LogDrainer(LogServiceConfig())
+        assert drainer.lease_renewal_mode is LeaseRenewalMode.HEARTBEAT

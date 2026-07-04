@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -158,6 +159,11 @@ class ServiceContext:
     async def sleep(self, seconds: float) -> bool:
         """Sleep for up to *seconds*, interrupted early on shutdown.
 
+        Jittered by +/-15% (mirrors ``run_leader_loop``'s ``_sleep_cadence``
+        in ``tools/async_utils.py``) so a fleet of pods running the same
+        RUN_EVERYWHERE service on the same cadence doesn't tick in lockstep.
+        The zero-second case is left unjittered (test/fast-loop mode).
+
         Returns
         -------
         True
@@ -165,8 +171,9 @@ class ServiceContext:
         False
             Timeout elapsed normally — caller should continue.
         """
+        jittered = seconds * random.uniform(0.85, 1.15) if seconds > 0 else seconds
         try:
-            await asyncio.wait_for(self.shutdown.wait(), timeout=seconds)
+            await asyncio.wait_for(self.shutdown.wait(), timeout=jittered)
             return True  # shutdown signalled
         except asyncio.TimeoutError:
             return False  # normal timeout, keep running
@@ -530,7 +537,25 @@ class BackgroundSupervisor:
         :func:`~dynastore.modules.db_config.locking_tools.lease_leadership_with_heartbeat`'s
         background renewal task, so ``tick`` runs on ``cadence_seconds``
         without releasing leadership in between.
+
+        A tick must still never be allowed to outlive the lease TTL: the
+        heartbeat renewal keeps the lease row alive independently of the
+        tick, so without a bound here, a tick that resumes after a
+        throttling freeze longer than the TTL could keep running after a
+        successor has already taken over — split-brain with no forced
+        cutoff. ``on_tick`` therefore applies the SAME
+        ``lease_ttl_seconds - lease_skew_margin_seconds`` clamp
+        :meth:`_leader_elected_coro`'s ``on_leader_tick`` uses, so both
+        regimes give an in-flight tick the identical hard cutoff. Unlike the
+        per-tick regime, a clamp timeout here does NOT release leadership —
+        the lease is still validly held (renewed independently); it is
+        logged and the loop continues to the next tick, leaving the
+        renewal/loss machinery to detect and act on any real loss.
         """
+        # One-time visibility flag for the lease-TTL tick clamp below
+        # (mirrors _leader_elected_coro's on_leader_tick clamp).
+        _clamp_logged = {"done": False}
+
         async def on_tick() -> None:
             leader_ctx = ServiceContext(
                 engine=ctx.engine,
@@ -539,7 +564,37 @@ class BackgroundSupervisor:
                 name=ctx.name,
                 lock_connection=None,
             )
-            await periodic.tick(leader_ctx)
+            from dynastore.modules.db_config.connection_health_config import (
+                _leadership_config,
+            )
+            cfg = _leadership_config
+            configured = (
+                periodic.tick_timeout
+                if periodic.tick_timeout is not None
+                else periodic.cadence_seconds
+            )
+            cap = cfg.lease_ttl_seconds - cfg.lease_skew_margin_seconds
+            # configured may be 0 (service disabled its timeout); the lease
+            # backend still must bound the tick, so fall back to the cap.
+            effective = min(configured, cap) if configured and configured > 0 else cap
+            if configured and configured > cap and not _clamp_logged["done"]:
+                _clamp_logged["done"] = True
+                logger.info(
+                    "%s: tick clamped to %.1fs (lease_ttl %.1fs - skew %.1fs) "
+                    "below configured %.1fs to keep the tick within its lease.",
+                    periodic.name, effective, cfg.lease_ttl_seconds,
+                    cfg.lease_skew_margin_seconds, configured,
+                )
+            try:
+                await asyncio.wait_for(periodic.tick(leader_ctx), timeout=effective)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "%s: tick timed out after %.1fs (cancelled by the "
+                    "lease-TTL clamp; leadership NOT released — heartbeat "
+                    "renewal continues); consider reducing tick workload or "
+                    "increasing tick_timeout.",
+                    periodic.name, effective,
+                )
 
         return run_lease_leadership_heartbeat_loop(
             ctx.engine,

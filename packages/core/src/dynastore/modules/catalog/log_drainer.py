@@ -58,6 +58,7 @@ from dynastore.modules.catalog.log_service_config import (
 )
 from dynastore.tools.background_service import (
     Leadership,
+    LeaseRenewalMode,
     PeriodicService,
     PodPolicy,
     ServiceContext,
@@ -80,6 +81,11 @@ class LogDrainer(PeriodicService):
     name = "log_drainer"
     leadership = Leadership.LEADER_ONLY
     pod_policy = PodPolicy.SKIP_EPHEMERAL
+    # Default cadence is 2s, far faster than the lease TTL — per-tick
+    # acquire/release would hammer configs.leader_lease every couple of
+    # seconds. Heartbeat mode holds tenure across ticks and renews on its
+    # own ~10s cadence instead (#2900).
+    lease_renewal_mode = LeaseRenewalMode.HEARTBEAT
 
     def __init__(self, config: LogServiceConfig) -> None:
         self.cadence_seconds = config.valkey_drain_interval_seconds

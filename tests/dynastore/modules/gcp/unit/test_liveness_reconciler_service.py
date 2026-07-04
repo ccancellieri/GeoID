@@ -33,7 +33,12 @@ import asyncio
 
 import pytest
 
-from dynastore.tools.background_service import Leadership, PodPolicy, ServiceContext
+from dynastore.tools.background_service import (
+    Leadership,
+    LeaseRenewalMode,
+    PodPolicy,
+    ServiceContext,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +90,12 @@ class TestGcpLivenessReconcilerPolicyFields:
     def test_pod_policy_is_skip_ephemeral(self):
         svc = _make_service()
         assert svc.pod_policy is PodPolicy.SKIP_EPHEMERAL
+
+    def test_lease_renewal_mode_is_heartbeat(self):
+        """#2900: cadence (20s default) sits close to the lease TTL, so this
+        service holds tenure across ticks instead of re-electing per tick."""
+        svc = _make_service()
+        assert svc.lease_renewal_mode is LeaseRenewalMode.HEARTBEAT
 
     def test_cadence_seconds_matches_interval_seconds(self):
         svc = _make_service(interval_seconds=45.0)

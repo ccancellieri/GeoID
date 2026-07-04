@@ -19,6 +19,7 @@
 import logging
 import asyncio
 import functools
+import random
 import time
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
@@ -735,15 +736,20 @@ async def run_lease_leadership_heartbeat_loop(
     Leadership loss is checked immediately before and after every
     ``on_tick`` call, and interrupts the inter-tick sleep as soon as it
     happens (so a loss occurring mid-sleep does not wait out the full
-    cadence). Once observed, this loop stops calling ``on_tick`` and exits
-    the leadership context (stopping the heartbeat and releasing the lease)
-    before re-electing on ``reelect_cadence_seconds`` — bounding a lost
-    tenure's overlap with a successor to at most one in-flight tick, the same
-    bound the per-tick TTL clamp gives the default regime. ``on_tick`` bodies
-    are expected to be short, matching the existing LEADER_ONLY no-inner-retry
-    invariant (see ``run_leader_loop``'s docstring) — a tick that can hang
-    indefinitely is a pre-existing risk for both regimes, not something this
-    loop guards against by cancelling an in-flight tick.
+    cadence).
+
+    This generic loop has no visibility into what ``on_tick`` does and does
+    NOT itself cancel a slow tick — that bound is the caller's
+    responsibility, since only the caller knows the tick body and the
+    service's own ``tick_timeout``. The production caller for
+    :class:`~dynastore.tools.background_service.PeriodicService`
+    (``BackgroundSupervisor._heartbeat_leader_coro``) wraps ``on_tick`` in
+    the SAME ``lease_ttl_seconds - lease_skew_margin_seconds`` clamp the
+    per-tick regime applies in ``on_leader_tick``, so a tick can never
+    outlive its lease in either regime — bounding a lost tenure's overlap
+    with a successor to at most the skew margin. A caller that supplies its
+    own ``on_tick`` without an equivalent clamp reintroduces the overlap
+    risk this note describes.
 
     On any exception from ``on_tick`` (unrelated to lease loss) this loop
     logs, exits the leadership context, and resigns-and-retries after
@@ -752,15 +758,20 @@ async def run_lease_leadership_heartbeat_loop(
     is_shutdown = is_shutdown or (lambda: False)
 
     async def _interruptible_sleep(seconds: float, extra: Optional[asyncio.Event]) -> None:
+        # Jittered by +/-15% (mirrors run_leader_loop's _sleep_cadence in
+        # tools/async_utils.py) so a fleet of pods on the same cadence
+        # doesn't herd on the shared lease row every period. The
+        # zero-second test/fast-loop case is left unjittered.
+        jittered = seconds * random.uniform(0.85, 1.15) if seconds > 0 else seconds
         events = [shutdown_event] if shutdown_event is not None else []
         if extra is not None:
             events.append(extra)
         if not events:
-            await asyncio.sleep(seconds)
+            await asyncio.sleep(jittered)
             return
         waiters = [asyncio.ensure_future(e.wait()) for e in events]
         try:
-            await asyncio.wait(waiters, timeout=seconds, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait(waiters, timeout=jittered, return_when=asyncio.FIRST_COMPLETED)
         finally:
             for w in waiters:
                 if not w.done():

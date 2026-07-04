@@ -68,6 +68,7 @@ from dynastore.modules.db_config.query_executor import (
 )
 from dynastore.tools.background_service import (
     Leadership,
+    LeaseRenewalMode,
     PeriodicService,
     PodPolicy,
     ServiceContext,
@@ -206,6 +207,12 @@ class DbContentionMonitor(PeriodicService):
     name = "db_contention_monitor"
     leadership = Leadership.LEADER_ONLY
     pod_policy = PodPolicy.SKIP_EPHEMERAL
+    # Default cadence equals the lease TTL, so per-tick acquire/release
+    # would re-elect essentially every cycle. Heartbeat mode holds tenure
+    # across ticks and renews on its own cadence instead (#2900) -- useful
+    # here in particular, since this monitor should stay stably leader-elected
+    # through the very DB-contention episodes it exists to observe.
+    lease_renewal_mode = LeaseRenewalMode.HEARTBEAT
 
     def __init__(self, config: DbContentionMonitorConfig) -> None:
         self._config = config

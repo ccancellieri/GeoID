@@ -29,16 +29,6 @@ from dynastore.modules.tasks import dispatcher
 async def test_capabilityless_unclaimable_rows_are_dlqd(monkeypatch):
     captured = {}
 
-    class _FakeConn:
-        async def __aenter__(self): return self
-        async def __aexit__(self, *a): return False
-
-    import contextlib
-
-    @contextlib.asynccontextmanager
-    async def _fake_managed_transaction(_engine):
-        yield object()
-
     class _FakeQuery:
         def __init__(self, sql, result_handler=None):
             captured["sql"] = sql
@@ -47,14 +37,15 @@ async def test_capabilityless_unclaimable_rows_are_dlqd(monkeypatch):
             return [{"task_id": "a"}, {"task_id": "b"}, {"task_id": "c"}]  # 3 rows
 
     import dynastore.modules.db_config.query_executor as qe
-    monkeypatch.setattr(qe, "managed_transaction", _fake_managed_transaction)
     monkeypatch.setattr(qe, "DQLQuery", _FakeQuery)
 
     async def _unclaimable(_engine, *, ttl_grace_seconds, conn=None):
         return ["cascade_cleanup"]
     monkeypatch.setattr(dispatcher, "_find_unclaimable_task_types", _unclaimable)
 
-    n = await dispatcher.sweep_unclaimable_rows(object(), schema="system", ttl_grace_seconds=90, min_age_s=300)
+    n = await dispatcher.sweep_unclaimable_rows(
+        object(), schema="system", ttl_grace_seconds=90, min_age_s=300, conn=object(),
+    )
     assert n == 3
     assert "dead_letter" in captured["sql"].lower()
     assert "make_interval" in captured["sql"]
@@ -72,3 +63,19 @@ async def test_no_unclaimable_types_is_a_noop(monkeypatch):
         object(), schema="system", ttl_grace_seconds=90, min_age_s=300
     )
     assert n == 0
+
+
+@pytest.mark.asyncio
+async def test_sweep_requires_conn_when_rows_are_unclaimable(monkeypatch):
+    """The DLQ UPDATE step requires a pre-acquired, gated conn -- the sole
+    caller (the mandatory backstop pass) always supplies one already routed
+    through background_managed_transaction. Guards against reintroducing an
+    ungated pool acquire here (#2900)."""
+    async def _unclaimable(_engine, *, ttl_grace_seconds, conn=None):
+        return ["cascade_cleanup"]
+    monkeypatch.setattr(dispatcher, "_find_unclaimable_task_types", _unclaimable)
+
+    with pytest.raises(AssertionError):
+        await dispatcher.sweep_unclaimable_rows(
+            object(), schema="system", ttl_grace_seconds=90, min_age_s=300,
+        )

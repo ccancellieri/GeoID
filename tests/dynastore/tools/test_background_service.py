@@ -690,3 +690,114 @@ async def test_heartbeat_mode_ticks_repeatedly_without_reacquiring() -> None:
 
     assert acquire_count["n"] == 1, "lease must be acquired ONCE, not per tick"
     assert tick_count["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_mode_slow_tick_is_clamped_by_lease_ttl(monkeypatch) -> None:
+    """A HEARTBEAT-mode tick that runs longer than the lease TTL is cancelled
+    by the same TTL-skew clamp the per-tick regime applies (#2900).
+
+    Without this clamp, a tick that resumes after a throttling freeze longer
+    than the lease TTL could keep running after a successor has already
+    taken over — split-brain with no forced cutoff. cadence_seconds is set
+    much larger than the TTL-derived cap so the clamp firing is attributable
+    to the lease TTL, not to a short cadence.
+    """
+    import dynastore.modules.db_config.connection_health_config as chc
+
+    monkeypatch.setattr(chc._leadership_config, "lease_ttl_seconds", 0.2)
+    monkeypatch.setattr(chc._leadership_config, "lease_skew_margin_seconds", 0.1)
+    # effective cap = 0.2 - 0.1 = 0.1s
+
+    lost = asyncio.Event()
+
+    @asynccontextmanager
+    async def _fake_heartbeat_acquire(engine: Any, key: Any, *, name: str = "leader"):
+        yield (True, lost)
+
+    tick_started = asyncio.Event()
+    tick_finished = {"done": False}
+
+    class _SlowHeartbeatPeriodic(PeriodicService):
+        name = "slow-heartbeat"
+        leadership = Leadership.LEADER_ONLY
+        lease_renewal_mode = LeaseRenewalMode.HEARTBEAT
+        cadence_seconds = 10.0  # far above the 0.1s TTL-derived cap
+
+        async def tick(self, ctx: ServiceContext) -> None:
+            tick_started.set()
+            await asyncio.sleep(5.0)  # far longer than the cap
+            tick_finished["done"] = True  # must never be reached
+
+    ctx = _make_ctx(engine=MagicMock())
+    supervisor = BackgroundSupervisor()
+
+    with patch(
+        "dynastore.modules.db_config.locking_tools.lease_leadership_with_heartbeat",
+        _fake_heartbeat_acquire,
+    ):
+        coro = supervisor._leader_elected_coro(_SlowHeartbeatPeriodic(), ctx)
+        task = asyncio.create_task(coro)
+        await asyncio.wait_for(tick_started.wait(), timeout=1.0)
+        # Give the clamp (~0.1s) time to fire, well short of the tick's own
+        # 5s sleep and the 10s cadence.
+        await asyncio.sleep(0.4)
+        ctx.shutdown.set()
+        await asyncio.wait_for(task, timeout=2.0)
+
+    assert tick_finished["done"] is False, (
+        "the slow tick must have been cancelled by the lease-TTL clamp, "
+        "not run to completion"
+    )
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_mode_tick_timeout_is_honored(monkeypatch) -> None:
+    """A HEARTBEAT-mode service's own ``tick_timeout`` is honored, not
+    silently ignored (#2900) — it must cancel a slow tick even when the
+    lease-TTL cap alone would allow much more time."""
+    import dynastore.modules.db_config.connection_health_config as chc
+
+    monkeypatch.setattr(chc._leadership_config, "lease_ttl_seconds", 30.0)
+    monkeypatch.setattr(chc._leadership_config, "lease_skew_margin_seconds", 5.0)
+    # cap = 25s, far above tick_timeout below.
+
+    lost = asyncio.Event()
+
+    @asynccontextmanager
+    async def _fake_heartbeat_acquire(engine: Any, key: Any, *, name: str = "leader"):
+        yield (True, lost)
+
+    tick_started = asyncio.Event()
+    tick_finished = {"done": False}
+
+    class _TimeoutHeartbeatPeriodic(PeriodicService):
+        name = "timeout-heartbeat"
+        leadership = Leadership.LEADER_ONLY
+        lease_renewal_mode = LeaseRenewalMode.HEARTBEAT
+        cadence_seconds = 30.0
+        tick_timeout = 0.1  # far below the 25s cap
+
+        async def tick(self, ctx: ServiceContext) -> None:
+            tick_started.set()
+            await asyncio.sleep(5.0)  # far longer than tick_timeout
+            tick_finished["done"] = True  # must never be reached
+
+    ctx = _make_ctx(engine=MagicMock())
+    supervisor = BackgroundSupervisor()
+
+    with patch(
+        "dynastore.modules.db_config.locking_tools.lease_leadership_with_heartbeat",
+        _fake_heartbeat_acquire,
+    ):
+        coro = supervisor._leader_elected_coro(_TimeoutHeartbeatPeriodic(), ctx)
+        task = asyncio.create_task(coro)
+        await asyncio.wait_for(tick_started.wait(), timeout=1.0)
+        # Give tick_timeout (0.1s) time to fire.
+        await asyncio.sleep(0.4)
+        ctx.shutdown.set()
+        await asyncio.wait_for(task, timeout=2.0)
+
+    assert tick_finished["done"] is False, (
+        "tick_timeout must be honored in HEARTBEAT mode, not silently ignored"
+    )

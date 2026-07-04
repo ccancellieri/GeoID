@@ -327,7 +327,7 @@ def test_registry_heartbeat_service_declares_policy(monkeypatch):
     advisory key must still embed the service name so the lock identity matches
     the legacy run_registry_heartbeat key across a rolling deploy.
     """
-    from dynastore.tools.background_service import Leadership, PodPolicy
+    from dynastore.tools.background_service import Leadership, LeaseRenewalMode, PodPolicy
 
     monkeypatch.setattr(pub, "get_service_name", lambda: "my-service")
     svc = pub.RegistryHeartbeatService(refresh_seconds=15.0)
@@ -339,6 +339,9 @@ def test_registry_heartbeat_service_declares_policy(monkeypatch):
     assert svc.lock_key == "task-registry-heartbeat:my-service", (
         "advisory key must be preserved verbatim for rolling-deploy lock identity"
     )
+    # #2900: default cadence (30s) equals the lease TTL, so this service
+    # holds tenure across ticks instead of re-electing per tick.
+    assert svc.lease_renewal_mode is LeaseRenewalMode.HEARTBEAT
 
 
 @pytest.mark.asyncio

@@ -49,6 +49,7 @@ from dynastore.modules.tasks.registry.model import CapabilityRow, compute_publis
 from dynastore.tasks import task_kind
 from dynastore.tools.background_service import (
     Leadership,
+    LeaseRenewalMode,
     PeriodicService,
     PodPolicy,
     ServiceContext,
@@ -244,6 +245,10 @@ class RegistryHeartbeatService(PeriodicService):
     name = "task_registry_heartbeat"
     leadership = Leadership.LEADER_ONLY
     pod_policy = PodPolicy.SKIP_EPHEMERAL
+    # Default cadence equals the lease TTL, so per-tick acquire/release
+    # would re-elect essentially every cycle. Heartbeat mode holds tenure
+    # across ticks and renews on its own cadence instead (#2900).
+    lease_renewal_mode = LeaseRenewalMode.HEARTBEAT
 
     def __init__(self, *, refresh_seconds: float = 30.0) -> None:
         self.cadence_seconds = refresh_seconds

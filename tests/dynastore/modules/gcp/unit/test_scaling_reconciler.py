@@ -433,3 +433,11 @@ async def test_reads_signals_from_the_shared_cache_key():
         await reconciler._reconcile_once()
 
     backend.get.assert_awaited_once_with(SIGNALS_CACHE_KEY)
+
+
+def test_lease_renewal_mode_is_heartbeat():
+    """#2900: cadence (30s) equals the lease TTL, so this service holds
+    tenure across ticks instead of re-electing per tick."""
+    from dynastore.tools.background_service import LeaseRenewalMode
+
+    assert GcpScalingReconciler.lease_renewal_mode is LeaseRenewalMode.HEARTBEAT
