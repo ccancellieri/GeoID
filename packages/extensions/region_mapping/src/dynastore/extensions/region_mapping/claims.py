@@ -273,7 +273,7 @@ def _fid_index(value: Any) -> Optional[int]:
 @cached(maxsize=128, ttl=120, namespace="region_mapping_region_ids_by_unique_id")
 async def fetch_region_ids_by_unique_id(
     src_catalog: str, src_collection: str, region_prop: str, unique_id_prop: str,
-) -> List[Optional[str]]:
+) -> List[str]:
     """Per-feature ``region_prop`` values, positioned by ``unique_id_prop``.
 
     TerriaJS's MVT region matching (``RegionProvider.processRegionIds``)
@@ -283,10 +283,18 @@ async def fetch_region_ids_by_unique_id(
     ``fetch_distinct_region_ids`` (deduplicated, alphabetically sorted —
     for CSV templates): here every feature contributes one entry (region
     codes may repeat, e.g. many admin-1 features sharing one country
-    code), indexed by its numeric unique id. Assumes ``unique_id_prop`` is
-    dense and zero-based per TerriaJS's own contract; positions with no
-    matching feature (e.g. a gap from a soft-deleted row) are ``None``,
-    which TerriaJS treats as an unmatched region rather than erroring.
+    code), indexed by its numeric unique id.
+
+    ``unique_id_prop`` values are not guaranteed dense (e.g. a source
+    shapefile's FID column can have permanent gaps from features dropped
+    during ingestion, not just soft-deletes) — positions with no matching
+    feature are filled with ``""`` rather than left absent or ``None``.
+    TerriaJS's ``processRegionIds`` unconditionally calls ``.toLowerCase()``
+    on every array entry while loading this file, before any per-feature
+    MVT lookup happens, so a ``null`` entry crashes the load even though
+    that index would never actually be dereferenced at render time. An
+    empty string survives ``.toLowerCase()`` and can't collide with a real
+    region code.
     """
     catalogs = get_protocol(CatalogsProtocol)
     configs = get_protocol(ConfigsProtocol)
@@ -363,7 +371,7 @@ async def fetch_region_ids_by_unique_id(
     if not indexed:
         return []
 
-    ordered: List[Optional[str]] = [None] * (max(i for i, _ in indexed) + 1)
+    ordered: List[str] = [""] * (max(i for i, _ in indexed) + 1)
     for idx, region_value in indexed:
         ordered[idx] = region_value
     return ordered

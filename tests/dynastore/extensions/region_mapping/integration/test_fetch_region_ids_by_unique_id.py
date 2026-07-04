@@ -176,7 +176,7 @@ async def test_fetch_region_ids_by_unique_id_jsonb_float_fids_do_not_error(
 
     values = await fetch_region_ids_by_unique_id(catalog_id, collection_id, "region_code", "fid")
 
-    assert values == ["LKA", "IND", None, "NPL"]
+    assert values == ["LKA", "IND", "", "NPL"]
 
 
 @pytest.mark.asyncio
