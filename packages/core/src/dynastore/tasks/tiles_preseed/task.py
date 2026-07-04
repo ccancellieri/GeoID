@@ -160,15 +160,18 @@ class TilePreseedTask(
 
                 if explicit_bboxes:
                     effective_bboxes: List[BoundingBox] = explicit_bboxes
-                    effective_max_zoom = runtime_config.max_zoom
+                    default_max_zoom = runtime_config.max_zoom
                 else:
-                    effective_bboxes, effective_max_zoom = await _bounded_default_scope(
+                    effective_bboxes, default_max_zoom = await _bounded_default_scope(
                         catalogs, catalog_id, col_id, preseed_config, runtime_config.max_zoom,
                     )
+                effective_min_zoom, effective_max_zoom = _resolve_effective_zoom_range(
+                    request, runtime_config.min_zoom, default_max_zoom,
+                )
                 logger.info(
                     "tiles_preseed: bounded scope catalog=%s collection=%s bbox=%s "
                     "zoom=[%d,%d]",
-                    catalog_id, col_id, effective_bboxes, runtime_config.min_zoom, effective_max_zoom,
+                    catalog_id, col_id, effective_bboxes, effective_min_zoom, effective_max_zoom,
                 )
 
                 for tms_id in target_tms_ids:
@@ -190,7 +193,8 @@ class TilePreseedTask(
                             engine=engine, request=request, payload=payload,
                             catalog_id=catalog_id, col_id=col_id, tms_id=tms_id,
                             ctx=ctx, mc_tms=mc_tms, target_srid=target_srid,
-                            effective_bboxes=effective_bboxes, effective_max_zoom=effective_max_zoom,
+                            effective_bboxes=effective_bboxes,
+                            effective_min_zoom=effective_min_zoom, effective_max_zoom=effective_max_zoom,
                             runtime_config=runtime_config,
                             preseed_config=preseed_config, schema=schema, results=results,
                         )
@@ -200,7 +204,8 @@ class TilePreseedTask(
                             engine=engine, payload=payload, ctx=ctx, storage=storage,
                             catalog_id=catalog_id,
                             col_id=col_id, tms_id=tms_id, mc_tms=mc_tms,
-                            effective_bboxes=effective_bboxes, effective_max_zoom=effective_max_zoom,
+                            effective_bboxes=effective_bboxes,
+                            effective_min_zoom=effective_min_zoom, effective_max_zoom=effective_max_zoom,
                             runtime_config=runtime_config, preseed_config=preseed_config,
                             formats=formats, statement_timeout_ms=statement_timeout_ms,
                             schema=schema, results=results, total_processed_so_far=total_processed,
@@ -230,7 +235,7 @@ class TilePreseedTask(
     async def _preseed_mvt(
         self, *, engine: DbResource, payload: "TaskPayload[ExecuteRequest]",
         ctx: Any, storage: Any, catalog_id: str, col_id: str, tms_id: str, mc_tms: Any,
-        effective_bboxes: List[BoundingBox], effective_max_zoom: int,
+        effective_bboxes: List[BoundingBox], effective_min_zoom: int, effective_max_zoom: int,
         runtime_config: Any, preseed_config: Any, formats: List[str],
         statement_timeout_ms: int, schema: str, results: Dict[str, Any],
         total_processed_so_far: int,
@@ -249,10 +254,10 @@ class TilePreseedTask(
         recovery. Already-committed zooms are unaffected.
         """
         total_processed = total_processed_so_far
-        zoom_span = max(1, effective_max_zoom - runtime_config.min_zoom + 1)
+        zoom_span = max(1, effective_max_zoom - effective_min_zoom + 1)
 
-        for z in range(runtime_config.min_zoom, effective_max_zoom + 1):
-            progress = min(99, int(100 * (z - runtime_config.min_zoom) / zoom_span))
+        for z in range(effective_min_zoom, effective_max_zoom + 1):
+            progress = min(99, int(100 * (z - effective_min_zoom) / zoom_span))
             try:
                 async with managed_transaction(engine) as conn:
                     await DQLQuery(
@@ -324,7 +329,7 @@ class TilePreseedTask(
         self, *, engine: DbResource, request: "TilePreseedRequest",
         payload: "TaskPayload[ExecuteRequest]", catalog_id: str, col_id: str,
         tms_id: str, ctx: Any, mc_tms: Any, target_srid: int,
-        effective_bboxes: List[BoundingBox], effective_max_zoom: int,
+        effective_bboxes: List[BoundingBox], effective_min_zoom: int, effective_max_zoom: int,
         runtime_config: Any, preseed_config: Any, schema: str, results: Dict[str, Any],
     ) -> None:
         """Two-phase PMTiles archive generation (disk-backed, no in-memory tile accumulation)."""
@@ -353,7 +358,7 @@ class TilePreseedTask(
 
             with open(data_tmp_path, "wb") as data_out:
                 async with managed_transaction(engine) as conn:
-                    for z in range(runtime_config.min_zoom, effective_max_zoom + 1):
+                    for z in range(effective_min_zoom, effective_max_zoom + 1):
                         for bbox in effective_bboxes:
                             try:
                                 tiles_iter = mc_tms.tiles(*bbox, zooms=[z])
@@ -394,7 +399,7 @@ class TilePreseedTask(
                                     )
 
             sorted_entries = sorted(tile_entries, key=lambda e: e.tile_id)
-            min_zoom = runtime_config.min_zoom
+            min_zoom = effective_min_zoom
             max_zoom = effective_max_zoom
             metadata: Dict[str, Any] = {"name": tms_id, "type": "vector"}
             _data_path = data_tmp_path
@@ -460,3 +465,27 @@ async def _bounded_default_scope(
         )
     effective_max_zoom = min(runtime_max_zoom, preseed_config.preseed_max_zoom or PRESEED_DEFAULT_MAX_ZOOM)
     return bbox, effective_max_zoom
+
+
+def _resolve_effective_zoom_range(
+    request: TilePreseedRequest,
+    runtime_min_zoom: int,
+    default_max_zoom: int,
+) -> Tuple[int, int]:
+    """Resolve the zoom range a preseed run should iterate (#2953).
+
+    An explicit ``request.min_zoom``/``request.max_zoom`` always wins — it
+    lets a caller split a large collection's preseed into several bounded
+    jobs instead of always attempting the collection's full configured
+    range in one Cloud Run job invocation (the actual root cause of the job
+    always exhausting its 3600s timeout on a non-trivial bbox: tile count
+    grows combinatorially with the zoom span, independent of feature count).
+
+    When omitted, falls back to ``runtime_min_zoom`` (the collection's
+    ``TilesConfig.min_zoom``) and ``default_max_zoom`` — the caller already
+    resolved this to either ``TilesConfig.max_zoom`` (explicit bbox given)
+    or the ``_bounded_default_scope`` capped value (no bbox anywhere).
+    """
+    effective_min_zoom = request.min_zoom if request.min_zoom is not None else runtime_min_zoom
+    effective_max_zoom = request.max_zoom if request.max_zoom is not None else default_max_zoom
+    return effective_min_zoom, effective_max_zoom
