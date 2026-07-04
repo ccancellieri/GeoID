@@ -294,10 +294,12 @@ async def test_get_style_metadata_returns_200_with_serialized_links(monkeypatch)
     monkeypatch.setattr(_svc_mod, "get_root_url", lambda req: "http://example.com")
 
     svc = _build_service()
-    # Inject a stub catalogs protocol so _resolve_internal_catalog_id can resolve
-    # without a live registry.  "c_cat1" is an arbitrary internal id.
+    # Inject a stub catalogs protocol so _resolve_internal_catalog_id and
+    # _resolve_internal_collection_id can resolve without a live registry.
+    # "c_cat1"/"c_col1" are arbitrary internal ids.
     mock_catalogs = MagicMock()
     mock_catalogs.resolve_catalog_id = AsyncMock(return_value="c_cat1")
+    mock_catalogs.collections.resolve_collection_id = AsyncMock(return_value="c_col1")
     svc._ogc_catalogs_protocol = mock_catalogs
 
     req = _make_request("http://example.com/styles/catalogs/cat1/collections/col1/styles/dark/metadata")
@@ -348,6 +350,7 @@ async def test_get_style_metadata_includes_stylesheet_links(monkeypatch):
     svc = _build_service()
     mock_catalogs = MagicMock()
     mock_catalogs.resolve_catalog_id = AsyncMock(return_value="c_cat1")
+    mock_catalogs.collections.resolve_collection_id = AsyncMock(return_value="c_col1")
     svc._ogc_catalogs_protocol = mock_catalogs
 
     req = _make_request("http://example.com/styles/catalogs/cat1/collections/col1/styles/blue/metadata")
@@ -365,3 +368,116 @@ async def test_get_style_metadata_includes_stylesheet_links(monkeypatch):
     stylesheet_links = [lnk for lnk in body["links"] if lnk.get("rel") == "stylesheet"]
     assert stylesheet_links, "at least one stylesheet link must appear in metadata"
     assert all(isinstance(lnk, dict) for lnk in stylesheet_links)
+
+
+# ---------------------------------------------------------------------------
+# Regression: styles keyed by internal collection id (#2952)
+# ---------------------------------------------------------------------------
+
+
+def _make_style_create(style_id: str = "demo") -> "object":
+    from dynastore.modules.styles.models import StyleSheetCreate, StyleCreate
+
+    content = MapboxContent(
+        format=StyleFormatEnum.MAPBOX_GL,
+        version=8,
+        sources={"s": {"type": "geojson", "data": {}}},
+        layers=[],
+    )
+    return StyleCreate(style_id=style_id, stylesheets=[StyleSheetCreate(content=content)])
+
+
+def _stub_catalogs(internal_catalog_id: str, internal_collection_id: str):
+    from unittest.mock import AsyncMock
+
+    catalogs = MagicMock()
+    catalogs.resolve_catalog_id = AsyncMock(return_value=internal_catalog_id)
+    catalogs.collections.resolve_collection_id = AsyncMock(return_value=internal_collection_id)
+    return catalogs
+
+
+@pytest.mark.asyncio
+async def test_create_style_keys_storage_by_internal_collection_id(monkeypatch):
+    """Regression for #2952: create_style_for_collection must resolve the
+    external collection id to its internal id before calling styles_db —
+    the same internal id the styled-map render path resolves to. Before the
+    fix this call site passed the raw external collection_id straight
+    through, so a style created via the external id was never found by the
+    render route (which looks up by internal id).
+    """
+    from unittest.mock import AsyncMock
+    import dynastore.extensions.styles.styles_service as _svc_mod
+    import dynastore.modules.styles.db as _styles_db
+
+    svc = _build_service()
+    svc._ogc_catalogs_protocol = _stub_catalogs("c_cat1", "c_col1")
+
+    monkeypatch.setattr(
+        _svc_mod.catalog_module, "get_collection", AsyncMock(return_value={"id": "col1"})
+    )
+    monkeypatch.setattr(
+        "dynastore.modules.db_config.partition_tools.ensure_partitions_off_request_connection",
+        AsyncMock(return_value=None),
+    )
+
+    captured = {}
+
+    async def fake_create_style(
+        conn, catalog_id, collection_id, style, external_catalog_id=None, external_collection_id=None
+    ):
+        captured["catalog_id"] = catalog_id
+        captured["collection_id"] = collection_id
+        return _make_style_with_links(style.style_id)
+
+    monkeypatch.setattr(_styles_db, "create_style", fake_create_style)
+
+    conn = AsyncMock()
+    engine = MagicMock()
+
+    await svc.create_style_for_collection(
+        catalog_id="cat1",
+        collection_id="col1",
+        style=_make_style_create("demo"),
+        conn=conn,
+        engine=engine,
+    )
+
+    assert captured["catalog_id"] == "c_cat1"
+    assert captured["collection_id"] == "c_col1", (
+        "create_style must be called with the internal collection id, "
+        "not the raw external path parameter"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_style_looks_up_by_internal_collection_id(monkeypatch):
+    """The read side (get_style) must resolve to the same internal
+    collection id used at write time (see
+    test_create_style_keys_storage_by_internal_collection_id), matching the
+    styled-map render route's own resolution.
+    """
+    from unittest.mock import AsyncMock
+    import dynastore.modules.styles.db as _styles_db
+
+    svc = _build_service()
+    svc._ogc_catalogs_protocol = _stub_catalogs("c_cat1", "c_col1")
+
+    captured = {}
+
+    async def fake_get_style(
+        conn, catalog_id, collection_id, style_id, external_catalog_id=None, external_collection_id=None
+    ):
+        captured["catalog_id"] = catalog_id
+        captured["collection_id"] = collection_id
+        return _make_style_with_links(style_id)
+
+    monkeypatch.setattr(_styles_db, "get_style_by_id_and_collection", fake_get_style)
+
+    conn = AsyncMock()
+    style = await svc.get_style(
+        catalog_id="cat1", collection_id="col1", style_id="demo", conn=conn
+    )
+
+    assert style is not None
+    assert captured["catalog_id"] == "c_cat1"
+    assert captured["collection_id"] == "c_col1"

@@ -82,25 +82,30 @@ def _enrich_style_from_row(
     row: dict,
     root_url: str = "",
     external_catalog_id: Optional[str] = None,
+    external_collection_id: Optional[str] = None,
 ) -> Optional[Style]:
     """Constructs a Style from a DB row, injecting dynamic links.
 
-    ``external_catalog_id`` should be supplied whenever the caller has the
-    public (external) catalog id available.  It replaces the internal id
-    stored in ``row['catalog_id']`` so the response and link hrefs always
-    expose the user-visible external id, not the immutable internal one.
+    ``external_catalog_id``/``external_collection_id`` should be supplied
+    whenever the caller has the public (external) ids available.  They
+    replace the internal ids stored in ``row['catalog_id']``/
+    ``row['collection_id']`` so the response and link hrefs always expose
+    the user-visible external ids, not the immutable internal ones.
     """
     if not row:
         return None
 
-    # Use the caller-supplied external id for URLs and the response model.
-    # Fall back to row['catalog_id'] only when no context is available (e.g.
+    # Use the caller-supplied external ids for URLs and the response model.
+    # Fall back to the row only when no context is available (e.g.
     # cross-catalog listing that resolves the external id via a JOIN).
     display_catalog_id = external_catalog_id or row.get("catalog_external_id") or row["catalog_id"]
+    display_collection_id = (
+        external_collection_id or row.get("collection_external_id") or row["collection_id"]
+    )
 
     base_path = (
         f"{root_url}/styles/catalogs/{display_catalog_id}"
-        f"/collections/{row['collection_id']}/styles/{row['style_id']}"
+        f"/collections/{display_collection_id}/styles/{row['style_id']}"
     )
 
     enriched_stylesheets = []
@@ -115,9 +120,10 @@ def _enrich_style_from_row(
 
     row["stylesheets"] = enriched_stylesheets
     row["links"] = [Link(href=base_path, rel="self", type="application/json")]
-    # Ensure the response model carries the external (public) catalog id, not the
-    # internal partition key.
+    # Ensure the response model carries the external (public) ids, not the
+    # internal partition keys.
     row["catalog_id"] = display_catalog_id
+    row["collection_id"] = display_collection_id
     return Style.model_validate(row)
 
 # --- Public Functions ---
@@ -128,13 +134,15 @@ async def create_style(
     collection_id: str,
     style_data: StyleCreate,
     external_catalog_id: Optional[str] = None,
+    external_collection_id: Optional[str] = None,
 ) -> Style:
     """Creates a new style record.
 
-    ``catalog_id`` must be the immutable internal catalog id (resolved from
-    the public external id by the service layer before calling this function).
-    ``external_catalog_id`` is the public id used in link hrefs and the
-    response model; if omitted it falls back to ``catalog_id``.
+    ``catalog_id``/``collection_id`` must be the immutable internal ids
+    (resolved from the public external ids by the service layer before
+    calling this function). ``external_catalog_id``/``external_collection_id``
+    are the public ids used in link hrefs and the response model; if omitted
+    they fall back to the internal ids.
     """
     style_dict = style_data.model_dump(exclude={"links"})
     style_dict["stylesheets"] = json.dumps(
@@ -142,7 +150,11 @@ async def create_style(
     )
     params = {"catalog_id": catalog_id, "collection_id": collection_id, **style_dict}
     raw_row = await _create_style_query.execute(conn, **params)
-    enriched = _enrich_style_from_row(raw_row, external_catalog_id=external_catalog_id)
+    enriched = _enrich_style_from_row(
+        raw_row,
+        external_catalog_id=external_catalog_id,
+        external_collection_id=external_collection_id,
+    )
     if enriched is None:
         # The INSERT … RETURNING just succeeded — a None enrichment means the
         # row failed to validate against the Style model, which is a code bug,
@@ -160,16 +172,26 @@ async def get_style_by_id(
     catalog_id: str,
     style_id: str,
     external_catalog_id: Optional[str] = None,
+    external_collection_id: Optional[str] = None,
 ) -> Optional[Style]:
     """Retrieves a style by catalog + style_id (no collection filter).
 
     ``catalog_id`` must be the immutable internal catalog id.
-    ``external_catalog_id`` is used in the response and link hrefs.
+    ``external_catalog_id``/``external_collection_id`` are used in the
+    response and link hrefs.
     """
     raw_row = await _get_style_by_id_query.execute(
         conn, catalog_id=catalog_id, style_id=style_id
     )
-    return _enrich_style_from_row(raw_row, external_catalog_id=external_catalog_id) if raw_row else None
+    return (
+        _enrich_style_from_row(
+            raw_row,
+            external_catalog_id=external_catalog_id,
+            external_collection_id=external_collection_id,
+        )
+        if raw_row
+        else None
+    )
 
 
 async def get_style_by_id_and_collection(
@@ -178,11 +200,13 @@ async def get_style_by_id_and_collection(
     collection_id: str,
     style_id: str,
     external_catalog_id: Optional[str] = None,
+    external_collection_id: Optional[str] = None,
 ) -> Optional[Style]:
     """Retrieves a style by its unique (catalog, collection, style_id) triple.
 
     ``catalog_id`` must be the immutable internal catalog id.
-    ``external_catalog_id`` is used in the response and link hrefs.
+    ``external_catalog_id``/``external_collection_id`` are used in the
+    response and link hrefs.
     """
     raw_row = await _get_style_by_id_and_collection_query.execute(
         conn,
@@ -191,7 +215,11 @@ async def get_style_by_id_and_collection(
         style_id=style_id,
     )
     return (
-        _enrich_style_from_row(raw_row, external_catalog_id=external_catalog_id)
+        _enrich_style_from_row(
+            raw_row,
+            external_catalog_id=external_catalog_id,
+            external_collection_id=external_collection_id,
+        )
         if raw_row
         else None
     )
@@ -204,11 +232,13 @@ async def list_styles_for_collection(
     limit: int = 100,
     offset: int = 0,
     external_catalog_id: Optional[str] = None,
+    external_collection_id: Optional[str] = None,
 ) -> Tuple[List[Style], int]:
     """Lists styles for a specific collection (paginated).
 
     ``catalog_id`` must be the immutable internal catalog id.
-    ``external_catalog_id`` is used in the response and link hrefs.
+    ``external_catalog_id``/``external_collection_id`` are used in the
+    response and link hrefs.
     Returns ``(styles, total)``.
     """
     raw_rows, total = await list_page_with_count(
@@ -221,7 +251,11 @@ async def list_styles_for_collection(
     styles = [
         s
         for s in (
-            _enrich_style_from_row(row, external_catalog_id=external_catalog_id)
+            _enrich_style_from_row(
+                row,
+                external_catalog_id=external_catalog_id,
+                external_collection_id=external_collection_id,
+            )
             for row in raw_rows
         )
         if s is not None
@@ -253,17 +287,27 @@ async def update_style(
     style_id: str,
     style_data: StyleUpdate,
     external_catalog_id: Optional[str] = None,
+    external_collection_id: Optional[str] = None,
 ) -> Optional[Style]:
     """Updates an existing style record identified by (catalog_id, style_id).
 
-    ``catalog_id`` must be the immutable internal catalog id.
-    ``external_catalog_id`` is used in the response and link hrefs.
+    ``catalog_id`` must be the immutable internal catalog id. The update
+    itself is not scoped by collection (see ``get_style_by_id``'s docstring),
+    but ``external_collection_id`` is still needed here — the returned row
+    carries whatever ``collection_id`` is stored on it, and the response must
+    not leak that internal id.
+    ``external_catalog_id``/``external_collection_id`` are used in the
+    response and link hrefs.
     """
     update_values = style_data.model_dump(exclude_unset=True)
     if not update_values:
         logger.warning("update_style called with no values to update.")
         return await get_style_by_id(
-            conn, catalog_id, style_id, external_catalog_id=external_catalog_id
+            conn,
+            catalog_id,
+            style_id,
+            external_catalog_id=external_catalog_id,
+            external_collection_id=external_collection_id,
         )
 
     if "stylesheets" in update_values:
@@ -287,7 +331,11 @@ async def update_style(
         conn, catalog_id=catalog_id, style_id=style_id, **update_values
     )
     return (
-        _enrich_style_from_row(raw_row, external_catalog_id=external_catalog_id)
+        _enrich_style_from_row(
+            raw_row,
+            external_catalog_id=external_catalog_id,
+            external_collection_id=external_collection_id,
+        )
         if raw_row
         else None
     )
