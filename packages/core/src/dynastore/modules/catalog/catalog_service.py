@@ -1464,6 +1464,10 @@ class CatalogService(CatalogsProtocol):
                 )
                 await self._purge_catalog_storage(conn, _reclaim_id)
                 _invalidate_catalog_external_id_cache(external_id)
+                from dynastore.modules.catalog.config_service import (
+                    invalidate_catalog_config_caches,
+                )
+                invalidate_catalog_config_caches(_reclaim_id)
 
             committed_internal_id = await _insert_catalog_row_with_pk_retry(
                 conn,
@@ -1518,6 +1522,10 @@ class CatalogService(CatalogsProtocol):
 
             _invalidate_catalog_model_cache(catalog_model.id)
             _invalidate_catalog_external_id_cache(external_id)
+            from dynastore.modules.catalog.config_service import (
+                invalidate_catalog_config_caches,
+            )
+            invalidate_catalog_config_caches(catalog_model.id)
 
         logger.info(
             "catalog '%s' (external='%s'): async create committed; "
@@ -2427,6 +2435,10 @@ class CatalogService(CatalogsProtocol):
                 # external_id they can match against the tombstoned row.
                 _invalidate_catalog_external_id_cache(external_id)
                 _invalidate_catalog_model_cache(catalog_id)
+                from dynastore.modules.catalog.config_service import (
+                    invalidate_catalog_config_caches,
+                )
+                invalidate_catalog_config_caches(catalog_id)
                 return True
 
         # Hard delete path (force=True) - uses same checklist mechanism as provision.
@@ -2543,6 +2555,10 @@ class CatalogService(CatalogsProtocol):
 
         # Post-transaction cleanup
         _invalidate_catalog_model_cache(catalog_id)
+        from dynastore.modules.catalog.config_service import (
+            invalidate_catalog_config_caches,
+        )
+        invalidate_catalog_config_caches(catalog_id)
         return True
 
     async def get_hard_delete_task(self, catalog_id: str) -> Optional[Any]:

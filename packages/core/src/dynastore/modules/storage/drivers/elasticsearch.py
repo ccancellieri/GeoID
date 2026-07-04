@@ -692,6 +692,12 @@ class _ItemsElasticsearchBase(_ElasticsearchBase):
         if es is None:
             return False
         try:
+            # Resolve external catalog_id to internal before computing the
+            # index name — mirrors count_entities/read_entities. Without this,
+            # this pre-check probed a different (non-existent) index than the
+            # one the read actually hits, so a real index was reported
+            # unavailable (or vice versa) and the PG fallback never engaged.
+            catalog_id, _ = await self._resolve_internal_ids(catalog_id)
             return bool(
                 await es.indices.exists(index=self._items_index_name(catalog_id))
             )

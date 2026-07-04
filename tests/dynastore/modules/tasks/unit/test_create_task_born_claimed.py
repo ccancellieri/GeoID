@@ -101,22 +101,30 @@ def test_create_task_default_path_emits_pending_insert_only():
     # Conditional include, not unconditional.
     assert 'cols.append("owner_id")' in src
     assert 'cols.append("locked_until")' in src
-    # The ACTIVE-only timing fields must also be conditional so default
-    # PENDING inserts do not stamp started_at / last_heartbeat_at out of band.
+    # The ACTIVE-only timing field must also be conditional so default
+    # PENDING inserts do not stamp last_heartbeat_at out of band.
     assert 'if initial_status == "ACTIVE":' in src
-    assert "started_at, last_heartbeat_at" in src
+    assert ", last_heartbeat_at" in src
 
 
-def test_create_task_active_branch_stamps_timing_fields():
-    """When ``initial_status='ACTIVE'`` the row MUST also be stamped with
-    ``started_at = NOW()`` and ``last_heartbeat_at = NOW()`` so the row
-    looks identical to one ``claim_batch`` would have produced. Otherwise
-    the reaper would consider the row instantly stale (NULL
-    last_heartbeat_at vs locked_until comparison).
+def test_create_task_active_branch_stamps_heartbeat_not_started_at():
+    """When ``initial_status='ACTIVE'`` the row MUST be stamped with
+    ``last_heartbeat_at = NOW()`` so the row looks live (otherwise the
+    reaper would consider it instantly stale: NULL last_heartbeat_at vs
+    locked_until comparison) — but must NOT stamp ``started_at`` (#2893).
+
+    This branch is the REMOTE born-claimed INSERT (GcpJobRunner's REST
+    dispatch): the row is ACTIVE/owned/leased before the Cloud Run
+    container has actually started, so started_at must stay NULL until
+    ``claim_for_execution``'s ``COALESCE(started_at, NOW())`` stamps the
+    real container-start moment.
     """
     src = inspect.getsource(_get_create_task())
-    assert "started_at, last_heartbeat_at" in src
-    assert ", NOW(), NOW()" in src
+    assert 'sql_extra = ", last_heartbeat_at"' in src
+    assert 'values_extra = ", NOW()"' in src
+    assert "started_at, last_heartbeat_at" not in src, (
+        "started_at must not be stamped by the ACTIVE born-claimed INSERT branch"
+    )
 
 
 # ---------------------------------------------------------------------------

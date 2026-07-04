@@ -431,6 +431,50 @@ class TestDataSideOpsResolveExternalIds:
         assert "c_internal123" in args[1]
         assert kwargs["collection"] == "col_internal456"
 
+    @pytest.mark.asyncio
+    async def test_index_available_resolves_external_catalog_id(self):
+        """index_available must probe the SAME (internal-keyed) index name
+        read_entities/count_entities target — otherwise a pre-check on an
+        external catalog_id disagrees with the read it is gating, and a
+        genuinely-present index is reported unavailable (or vice versa),
+        defeating the PG fallback / ES-selection decision (#2894).
+        """
+        fake_catalogs = _FakeCatalogsProtocol(
+            catalog_map={"gaulb": "c_internal123"},
+            collection_map={},
+        )
+        driver = ItemsElasticsearchDriver()
+        es = MagicMock()
+        es.indices.exists = AsyncMock(return_value=True)
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.tools.discovery.get_protocol", return_value=fake_catalogs,
+        ):
+            result = await driver.index_available("gaulb")
+
+        assert result is True
+        probed_index = es.indices.exists.call_args.kwargs["index"]
+        assert "c_internal123" in probed_index
+        assert "gaulb" not in probed_index
+
+    @pytest.mark.asyncio
+    async def test_index_available_passthrough_when_already_internal_or_unmapped(self):
+        """No CatalogsProtocol registered (or id unmapped) — probes the raw
+        id verbatim, matching prior behaviour."""
+        driver = ItemsElasticsearchDriver()
+        es = MagicMock()
+        es.indices.exists = AsyncMock(return_value=False)
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.tools.discovery.get_protocol", return_value=None,
+        ):
+            result = await driver.index_available("cat1")
+
+        assert result is False
+        assert es.indices.exists.call_args.kwargs["index"] == driver._items_index_name("cat1")
+
 
 class TestQueryRequestToEs:
     def test_empty_request(self):

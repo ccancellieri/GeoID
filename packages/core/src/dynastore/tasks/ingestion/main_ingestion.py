@@ -61,6 +61,16 @@ class _IndexMissFailed(RuntimeError):
     """
 
 
+class _RejectionFailed(_IndexMissFailed):
+    """Sentinel raised after every row in the run was rejected by the upsert.
+
+    A subclass of ``_IndexMissFailed`` so it is caught by the same
+    ``except _IndexMissFailed`` guard below (task_finished("FAILED") was
+    already called before this is raised — the guard prevents a second,
+    conflicting FAILED notification from the generic exception handler).
+    """
+
+
 # ---------------------------------------------------------------------------
 # Secondary-index health check (FIX 2)
 # ---------------------------------------------------------------------------
@@ -899,6 +909,12 @@ async def run_ingestion_task(
         current_batch = []
         current_batch_bytes = 0
         rows_ingested = 0
+        # Rows actually persisted vs. rejected by the upsert (#2891) — distinct
+        # from rows_ingested, which counts every row PROCESSED (batch size) and
+        # gates progress/extent regardless of whether the upsert accepted it.
+        rows_persisted = 0
+        rows_rejected = 0
+        first_rejection_message: Optional[str] = None
         # Accumulate per-indexer BulkResult totals across all batches so we can
         # classify secondary-index health at the end of the loop.
         accumulated_index_results: Dict[str, Any] = {}
@@ -1117,6 +1133,20 @@ async def run_ingestion_task(
                         processing_context=upsert_context,
                     )
                     rows_ingested += len(current_batch)
+                    _batch_rejections = upsert_ctx.extensions.get("_rejections") or []
+                    _batch_persisted = (
+                        upsert_result
+                        if isinstance(upsert_result, list)
+                        else ([upsert_result] if upsert_result else [])
+                    )
+                    rows_persisted += len(_batch_persisted)
+                    rows_rejected += len(_batch_rejections)
+                    if first_rejection_message is None and _batch_rejections:
+                        first_rejection_message = (
+                            _batch_rejections[0].get("message")
+                            or _batch_rejections[0].get("reason")
+                            or "rejected"
+                        )
                     _merge_index_results(
                         accumulated_index_results,
                         upsert_ctx.extensions.get("_index_results") or {},
@@ -1124,7 +1154,7 @@ async def run_ingestion_task(
                     await _broadcast_batch_outcome(
                         reporters, current_batch, upsert_result,
                         upsert_ctx.extensions.get("_generated_stats"),
-                        rejections=upsert_ctx.extensions.get("_rejections"),
+                        rejections=_batch_rejections,
                     )
                     await asyncio.gather(
                         *(
@@ -1146,6 +1176,20 @@ async def run_ingestion_task(
                     processing_context=upsert_context,
                 )
                 rows_ingested += len(current_batch)
+                _batch_rejections = upsert_ctx.extensions.get("_rejections") or []
+                _batch_persisted = (
+                    upsert_result
+                    if isinstance(upsert_result, list)
+                    else ([upsert_result] if upsert_result else [])
+                )
+                rows_persisted += len(_batch_persisted)
+                rows_rejected += len(_batch_rejections)
+                if first_rejection_message is None and _batch_rejections:
+                    first_rejection_message = (
+                        _batch_rejections[0].get("message")
+                        or _batch_rejections[0].get("reason")
+                        or "rejected"
+                    )
                 _merge_index_results(
                     accumulated_index_results,
                     upsert_ctx.extensions.get("_index_results") or {},
@@ -1153,7 +1197,7 @@ async def run_ingestion_task(
                 await _broadcast_batch_outcome(
                     reporters, current_batch, upsert_result,
                     upsert_ctx.extensions.get("_generated_stats"),
-                    rejections=upsert_ctx.extensions.get("_rejections"),
+                    rejections=_batch_rejections,
                 )
                 await asyncio.gather(
                     *(
@@ -1211,13 +1255,54 @@ async def run_ingestion_task(
                 f"({asset.asset_id} → {collection_id}): {ref_err}"
             )
 
+        # --- Full-rejection gate (#2891) ---
+        # Every row the upsert saw was rejected (0 persisted, >0 rejected):
+        # the run wrote nothing, so report FAILED rather than falling into
+        # the index-health check below, which treats rows_written==0 as the
+        # trivial "nothing to index" COMPLETED case. Not an index miss (the
+        # rows never made it to the source store), so no restore task is
+        # enqueued here.
+        if rows_persisted == 0 and rows_rejected > 0:
+            rej_msg = (
+                f"All {rows_rejected} row(s) rejected; 0 persisted. "
+                f"First rejection: {first_rejection_message}"
+            )
+            logger.error(
+                "ingestion task %s: %s/%s — %s",
+                task_id, catalog_id, collection_id, rej_msg,
+            )
+            await asyncio.gather(
+                *(
+                    reporter.task_finished("FAILED", error_message=rej_msg)
+                    for reporter in reporters
+                )
+            )
+            if post_ops:
+                try:
+                    _cat = await catalog_module.get_catalog(
+                        catalog_id, ctx=DriverContext(db_resource=engine),
+                    )
+                    _coll = await catalog_module.get_collection(
+                        catalog_id, collection_id, ctx=DriverContext(db_resource=engine),
+                    )
+                    await run_post_operations(
+                        post_ops, _cat, _coll, asset, "FAILED",
+                        error_message=rej_msg,
+                    )
+                except Exception as _post_err:
+                    logger.warning(
+                        "Post-operations for FAILED (full rejection) errored: %s",
+                        _post_err,
+                    )
+            raise _RejectionFailed(rej_msg)
+
         # --- Secondary-index health check (FIX 2 + FIX 3) ---
         # Inspect the per-indexer BulkResult totals accumulated across all
         # batches.  A total miss (succeeded==0 on all indexers for a non-zero
         # write) marks the task FAILED and enqueues an automatic restore so a
         # retry self-heals.  A partial miss keeps COMPLETED but surfaces counts.
         final_status, index_msg = _check_index_health(
-            rows_written=rows_ingested,
+            rows_written=rows_persisted,
             index_results=accumulated_index_results,
         )
 
@@ -1286,6 +1371,18 @@ async def run_ingestion_task(
             if summary is None:
                 summary = {}
             summary["index_warning"] = index_msg
+
+        if rows_rejected > 0:
+            # Partial rejection: some rows persisted, some didn't (#2891).
+            # rows_persisted > 0 here — a full rejection already raised
+            # _RejectionFailed above — so this stays COMPLETED with counts.
+            if summary is None:
+                summary = {}
+            summary["rejection_summary"] = {
+                "persisted": rows_persisted,
+                "rejected": rows_rejected,
+                "first_message": first_rejection_message,
+            }
 
         await asyncio.gather(
             *(

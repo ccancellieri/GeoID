@@ -477,3 +477,27 @@ def test_reaper_ddl_notifies_dispatchers_on_reap():
     assert "pg_notify('new_task_queued'" in GLOBAL_TASKS_REAPER_DDL
 
 
+# ---------------------------------------------------------------------------
+# claim_for_dispatch — clears started_at on every (re-)dispatch (#2893)
+# ---------------------------------------------------------------------------
+
+
+def test_claim_for_dispatch_clears_started_at():
+    """``claim_for_dispatch`` is the REMOTE offload handoff (GcpJobRunner's
+    ``run``) — the row is still cold-starting, so its SET clause must reset
+    ``started_at`` to NULL alongside taking ownership/renewing the lease.
+    A retried dispatch of the same task must re-null it too, so the
+    eventual ``claim_for_execution`` COALESCE stamps THIS attempt's real
+    container-start time rather than a stale one from a prior attempt.
+    """
+    import inspect
+    from dynastore.modules.tasks.tasks_module import claim_for_dispatch
+
+    src = inspect.getsource(claim_for_dispatch)
+    assert "started_at = NULL" in src
+    # Ownership/lease/liveness fields must still be set alongside it.
+    assert "owner_id = :owner_id" in src
+    assert "locked_until = :locked_until" in src
+    assert "last_heartbeat_at = NOW()" in src
+
+

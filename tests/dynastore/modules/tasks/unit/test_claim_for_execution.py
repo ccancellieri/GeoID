@@ -79,3 +79,18 @@ def test_claim_for_execution_returns_task_id():
     src = inspect.getsource(_get_claim_for_execution())
     assert "RETURNING" in src.upper()
     assert "task_id" in src
+
+
+def test_claim_for_execution_stamps_started_at_via_coalesce():
+    """#2893: this is the ONLY hook that should ever stamp ``started_at`` for
+    a REMOTE task — the producing side (``create_task`` ACTIVE branch,
+    ``claim_for_dispatch``) leaves it NULL through dispatch so this claim,
+    made by the container once it is actually up, records the real
+    container-start moment.
+
+    ``COALESCE(started_at, NOW())`` — not a bare ``NOW()`` — so a retried
+    claim of an already-started row (this execution re-taking its own lease
+    on a later heartbeat cycle) does not overwrite the original start time.
+    """
+    src = inspect.getsource(_get_claim_for_execution())
+    assert "started_at = COALESCE(started_at, NOW())" in src

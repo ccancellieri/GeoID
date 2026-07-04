@@ -684,9 +684,14 @@ class GcpLivenessReconciler(PeriodicService):
             return ReconcileOutcome(verdict, race_lost=not acted)
         else:  # VerdictAction.NOOP (LivenessVerdict.UNKNOWN)
             started_at = row.get("started_at")
-            young = (
-                started_at is not None
-                and started_at > now - timedelta(seconds=self._unknown_grace_seconds)
+            # #2893: started_at is NULL while a REMOTE task's container is
+            # still cold-starting (no longer stamped at dispatch). NULL here
+            # means "not started yet", not "unknown" — treat it as maximally
+            # young rather than falling through to the else branch below,
+            # which would deny this grace extension to every not-yet-booted
+            # container.
+            young = started_at is None or (
+                started_at > now - timedelta(seconds=self._unknown_grace_seconds)
             )
             if not runner_ref and young:
                 # The spawn→runner_ref-capture gap: give the row one short

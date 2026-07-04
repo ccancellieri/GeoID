@@ -132,6 +132,9 @@ async def test_get_job_internal_leaves_fresh_lease_running(monkeypatch):
         catalog_id="s_cat",
         owner_id="gcp_cloud_run_abc123",
         locked_until=datetime.now(timezone.utc) + timedelta(seconds=300),
+        # Container already up and executing (#2893: ACTIVE with a NULL
+        # started_at means still cold-starting -> "accepted", not "running").
+        started_at=datetime.now(timezone.utc) - timedelta(seconds=60),
     )
 
     async def fake_schema(catalog_id, conn):

@@ -251,6 +251,25 @@ async def test_unknown_old_is_noop(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_unknown_null_started_at_extends_grace(monkeypatch):
+    """#2893: started_at is no longer stamped at REMOTE dispatch — a
+    just-dispatched, not-yet-booted container's row has ``started_at IS
+    NULL``, not a recent timestamp. That must still read as "young" (grace
+    extended), not fall through to the old-row no-op branch."""
+    from dynastore.modules.tasks.liveness import LivenessVerdict
+
+    actions = _patch_actions(monkeypatch)
+    _patch_probe(monkeypatch, LivenessVerdict.UNKNOWN)
+    rec = _make_reconciler(unknown_grace_seconds=180)
+    row = _row(runner_ref=None)
+    row["started_at"] = None
+
+    await rec._reconcile_row(row)
+
+    actions.heartbeat.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_unmapped_owner_is_noop(monkeypatch):
     """No probe owns the row (in-process / ephemeral runner) — reconciler
     no-ops, the pg_cron reaper handles it exactly as today."""

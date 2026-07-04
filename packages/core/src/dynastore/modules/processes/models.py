@@ -397,6 +397,13 @@ def task_to_status_info(task: "Task", links: Optional[List[Link]] = None) -> Sta
         TaskStatusEnum.DEAD_LETTER: "failed",
     }
     api_status = mapping.get(task.status, "accepted")
+    # #2893: a REMOTE task is born ACTIVE (owned/leased) at dispatch time, but
+    # its container may still be cold-starting — started_at stays NULL until
+    # claim_for_execution stamps the real container-start moment. Report
+    # "accepted" (not "running") for that window; the RUNNING legacy alias
+    # always means a genuinely running task, so it is left mapped to "running".
+    if task.status == TaskStatusEnum.ACTIVE and task.started_at is None:
+        api_status = "accepted"
 
     # ``message`` carries the failure reason for failed jobs; for successful
     # jobs a task may return a human-facing message (e.g. a signed result URL)

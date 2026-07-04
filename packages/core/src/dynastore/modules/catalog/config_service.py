@@ -141,6 +141,7 @@ def _resolve(config_cls: "Union[str, Type[PluginConfig]]") -> "tuple[Type[Plugin
     namespace="catalog_config",
     ignore=["engine", "catalog_manager"],
     l1_ttl=2,
+    condition=lambda v: v is not None,
 )
 async def _catalog_config_cache(
     engine: DbResource,
@@ -169,6 +170,7 @@ async def _catalog_config_cache(
     namespace="collection_config",
     ignore=["engine", "catalog_manager"],
     l1_ttl=2,
+    condition=lambda v: v is not None,
 )
 async def _collection_config_cache(
     engine: DbResource,
@@ -229,6 +231,37 @@ def invalidate_collection_config_cache(catalog_id: str, collection_id: str) -> N
     clear_prefix = getattr(_collection_config_cache, "cache_clear_prefix", None)
     if clear_prefix is not None:
         clear_prefix(sub_ns)
+
+
+def invalidate_catalog_config_caches(internal_catalog_id: str) -> None:
+    """Drop every catalog- and collection-config cache entry for a catalog.
+
+    Catalog delete/reclaim and re-creation have no lifecycle-invalidation hook
+    into ``_catalog_config_cache`` / ``_collection_config_cache`` today (#2895):
+    a config resolved just before a delete stays cached for up to the L2 TTL
+    (300s) and would be served to a reclaimed catalog id that reuses the same
+    internal id. Same ``cache_clear_prefix`` mechanism as
+    ``invalidate_collection_config_cache`` — the catalog-config key format is
+    ``catalog_config|repr(catalog_id)|repr(class_key)`` and the
+    collection-config key format is
+    ``collection_config|repr(catalog_id)|repr(collection_id)|repr(class_key)``,
+    so a prefix of just ``repr(catalog_id)`` on each covers every class_key
+    (and, for collections, every collection) under this catalog.
+
+    ``internal_catalog_id`` must already be the immutable internal id — every
+    read (``get_catalog_config_internal_cached`` /
+    ``get_collection_config_internal_cached``) and write invalidation in this
+    module key on that form (see ``ConfigService._internal_catalog_id``).
+    """
+    cat_sub_ns = f"catalog_config|{repr(internal_catalog_id)}"
+    cat_clear_prefix = getattr(_catalog_config_cache, "cache_clear_prefix", None)
+    if cat_clear_prefix is not None:
+        cat_clear_prefix(cat_sub_ns)
+
+    col_sub_ns = f"collection_config|{repr(internal_catalog_id)}"
+    col_clear_prefix = getattr(_collection_config_cache, "cache_clear_prefix", None)
+    if col_clear_prefix is not None:
+        col_clear_prefix(col_sub_ns)
 
 
 # ==============================================================================
@@ -419,12 +452,29 @@ class ConfigService(ConfigsProtocol):
             merged.update(delta)
         return _validate_stored_config(cls, merged)
 
+    async def _internal_catalog_id(self, catalog_id: str) -> str:
+        """Normalize ``catalog_id`` to its immutable internal id for cache keys.
+
+        ``resolve_catalog_id`` is external-only (returns ``None`` for an
+        already-internal id, by design — see its docstring), so the
+        None-guard leaves an already-internal id unchanged. Every
+        ``_catalog_config_cache`` / ``_collection_config_cache`` read and
+        invalidation call site goes through this so the two agree on the same
+        key regardless of which id form the caller holds (#2895).
+        """
+        resolved = await self._get_catalog_manager().resolve_catalog_id(
+            catalog_id, allow_missing=True
+        )
+        return resolved if resolved is not None else catalog_id
+
     async def get_catalog_config_internal_cached(
         self, catalog_id: str, class_key: str
     ) -> Optional[dict]:
         assert self.engine is not None, "ConfigService.engine not initialised"
+        catalogs = self._get_catalog_manager()
+        catalog_id = await self._internal_catalog_id(catalog_id)
         return await _catalog_config_cache(
-            self.engine, self._get_catalog_manager(), catalog_id, class_key
+            self.engine, catalogs, catalog_id, class_key
         )
 
     async def get_catalog_defaults_snapshot(
@@ -558,6 +608,9 @@ class ConfigService(ConfigsProtocol):
             # Fall back to original ID if resolution fails
             internal_collection_id = collection_id
 
+        # #2895: also normalize catalog_id (see _internal_catalog_id).
+        catalog_id = await self._internal_catalog_id(catalog_id)
+
         return await _collection_config_cache(
             self.engine, catalogs, catalog_id, internal_collection_id, class_key
         )
@@ -666,7 +719,10 @@ class ConfigService(ConfigsProtocol):
             )
 
         _catalog_config_cache.cache_invalidate(
-            self.engine, self._get_catalog_manager(), catalog_id, SNAPSHOT_REF_KEY
+            self.engine,
+            self._get_catalog_manager(),
+            await self._internal_catalog_id(catalog_id),
+            SNAPSHOT_REF_KEY,
         )
 
     async def _enforce_first_write_against_inherited(
@@ -847,7 +903,10 @@ class ConfigService(ConfigsProtocol):
             await run_apply_handlers(cls, config, catalog_id, None, conn)
 
         _catalog_config_cache.cache_invalidate(
-            self.engine, self._get_catalog_manager(), catalog_id, class_key
+            self.engine,
+            self._get_catalog_manager(),
+            await self._internal_catalog_id(catalog_id),
+            class_key,
         )
         _maybe_bust_router(cls, catalog_id, None)
 
@@ -950,7 +1009,8 @@ class ConfigService(ConfigsProtocol):
             await run_apply_handlers(cls, config, catalog_id, internal_collection_id, conn)
 
         _collection_config_cache.cache_invalidate(
-            self.engine, catalogs, catalog_id, internal_collection_id, class_key
+            self.engine, catalogs, await self._internal_catalog_id(catalog_id),
+            internal_collection_id, class_key
         )
         _maybe_bust_router(cls, catalog_id, original_collection_id)
 
@@ -1323,7 +1383,10 @@ class ConfigService(ConfigsProtocol):
             await run_apply_handlers(cls, config, catalog_id, None, conn)
 
         _catalog_config_cache.cache_invalidate(
-            self.engine, self._get_catalog_manager(), catalog_id, class_key
+            self.engine,
+            self._get_catalog_manager(),
+            await self._internal_catalog_id(catalog_id),
+            class_key,
         )
         _maybe_bust_router(cls, catalog_id, None)
 
@@ -1403,7 +1466,7 @@ class ConfigService(ConfigsProtocol):
         _collection_config_cache.cache_invalidate(
             self.engine,
             catalogs,
-            catalog_id,
+            await self._internal_catalog_id(catalog_id),
             internal_collection_id,
             class_key,
         )
@@ -1453,7 +1516,8 @@ class ConfigService(ConfigsProtocol):
                 )
             _collection_config_cache.cache_invalidate(
                 self.engine, self._get_catalog_manager(),
-                catalog_id, internal_collection_id, stored_class_key,
+                await self._internal_catalog_id(catalog_id),
+                internal_collection_id, stored_class_key,
             )
             cls = resolve_config_class(stored_class_key)
             if cls is not None:
@@ -1480,7 +1544,8 @@ class ConfigService(ConfigsProtocol):
                     conn, ref_key=ref_key,
                 )
             _catalog_config_cache.cache_invalidate(
-                self.engine, self._get_catalog_manager(), catalog_id, stored_class_key,
+                self.engine, self._get_catalog_manager(),
+                await self._internal_catalog_id(catalog_id), stored_class_key,
             )
             cls = resolve_config_class(stored_class_key)
             if cls is not None:
@@ -1652,7 +1717,8 @@ class ConfigService(ConfigsProtocol):
 
             if rows_affected > 0:
                 _catalog_config_cache.cache_invalidate(
-                    self.engine, self.catalog_manager, catalog_id, class_key
+                    self.engine, self.catalog_manager,
+                    await self._internal_catalog_id(catalog_id), class_key,
                 )
                 _maybe_bust_router(cls, catalog_id, None)
                 return True
@@ -1698,7 +1764,7 @@ class ConfigService(ConfigsProtocol):
                 _collection_config_cache.cache_invalidate(
                     self.engine,
                     self.catalog_manager,
-                    catalog_id,
+                    await self._internal_catalog_id(catalog_id),
                     internal_collection_id,
                     class_key,
                 )

@@ -1952,11 +1952,16 @@ async def create_task(
         if locked_until is not None:
             cols.append("locked_until")
             insert_kwargs["locked_until"] = locked_until
-        # Stamp ACTIVE timing fields so the row looks identical to one
-        # claim_batch / claim_by_id would have produced.
+        # Stamp the ACTIVE ownership/liveness fields so the row looks
+        # identical to one claim_batch / claim_by_id would have produced.
+        # started_at is deliberately NOT stamped here (#2893): this branch is
+        # the REMOTE born-claimed path (GcpJobRunner's REST dispatch) — the
+        # container has not started yet at insert time, so started_at stays
+        # NULL until claim_for_execution's COALESCE(started_at, NOW()) stamps
+        # the real container-start moment.
         if initial_status == "ACTIVE":
-            sql_extra = ", started_at, last_heartbeat_at"
-            values_extra = ", NOW(), NOW()"
+            sql_extra = ", last_heartbeat_at"
+            values_extra = ", NOW()"
         else:
             sql_extra = ""
             values_extra = ""
@@ -3234,7 +3239,8 @@ async def claim_for_dispatch(
         UPDATE {task_schema}.tasks
         SET owner_id = :owner_id,
             locked_until = :locked_until,
-            last_heartbeat_at = NOW()
+            last_heartbeat_at = NOW(),
+            started_at = NULL
         WHERE task_id = :task_id
           AND status = 'ACTIVE'
           AND (
