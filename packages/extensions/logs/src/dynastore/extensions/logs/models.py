@@ -25,7 +25,12 @@ from pydantic import BaseModel, Field, ConfigDict
 # --- Pydantic Models ---
 
 class LogEntry(BaseModel):
-    id: Optional[int] = None
+    # Backend-assigned id — an Elasticsearch document id string like
+    # "_system_:exception:<iso timestamp>" (#2749 removed PG persistence,
+    # so there is no integer-id source left). Typing this as int made
+    # every ES row fail validation, which search_logs' catch-all turned
+    # into a silent empty list on all /logs read endpoints.
+    id: Optional[str] = None
     catalog_id: str
     collection_id: Optional[str] = None
     event_type: str

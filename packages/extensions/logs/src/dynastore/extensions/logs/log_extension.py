@@ -656,14 +656,36 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
             return []
 
 
+    async def _get_log_entry(self, log_id: str, catalog_id: str) -> List[LogEntry]:
+        """Zero-or-one entry for the ``?log_id=`` filter — the target of the
+        ``log_reference.url`` emitted on 5xx responses. Catalog scoping is
+        ``LogService.get_log_by_id``'s: the system stream can address any
+        entry; a per-catalog read only entries of that catalog."""
+        service = get_protocol(LogsProtocol)
+        getter = getattr(service, "get_log_by_id", None) if service else None
+        if getter is None:
+            return []
+        entry = await getter(log_id, catalog_id)
+        if entry is None:
+            return []
+        return [LogEntry.model_validate(entry)]
+
     async def get_system_logs(
         self,
         event_type: Optional[str] = Query(None),
         level: Optional[str] = Query(None),
+        log_id: Optional[str] = Query(
+            None, description="Return only the entry with this backend id."
+        ),
         limit: int = 100,
         offset: int = 0,
     ) -> LogsListResponse:
         """Retrieve global system-level logs."""
+        if log_id:
+            return LogsListResponse(
+                logs=await self._get_log_entry(log_id, SYSTEM_CATALOG_ID),
+                kibana_dashboard_url=_kibana_url(),
+            )
         logs = await self.search_logs(
             catalog_id="_system_",
             event_type=event_type,
@@ -681,6 +703,9 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
         catalog_id: str,
         event_type: Optional[str] = Query(None),
         level: Optional[str] = Query(None),
+        log_id: Optional[str] = Query(
+            None, description="Return only the entry with this backend id."
+        ),
         limit: int = 100,
         offset: int = 0,
     ) -> LogsListResponse:
@@ -688,6 +713,11 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
         Retrieve logs for a specific catalog.
         If the catalog has been hard-deleted, this may return final lifecycle events from the system log.
         """
+        if log_id:
+            return LogsListResponse(
+                logs=await self._get_log_entry(log_id, catalog_id),
+                kibana_dashboard_url=_kibana_url(),
+            )
         logs = await self.search_logs(
             catalog_id=catalog_id,
             event_type=event_type,

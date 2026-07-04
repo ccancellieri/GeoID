@@ -1373,8 +1373,22 @@ async def generic_exception_handler(request: Request, exc: Exception) -> Respons
         status_code = getattr(result, "status_code", 500)
 
         if log_id and status_code >= 500:
+            from urllib.parse import quote
+
+            from dynastore.models.shared_models import SYSTEM_CATALOG_ID
+
+            # Point at the logs API's ?log_id= filter. Log ids embed an
+            # ISO timestamp whose "+00:00" suffix breaks unencoded query
+            # strings ("+" decodes to a space), so percent-encode strictly.
             _root = request.scope.get("root_path", "").rstrip("/")
-            log_url = f"{_root}/web/#/logs?catalog={context['log_catalog']}&log_id={log_id}"
+            _log_catalog = context["log_catalog"]
+            if _log_catalog == SYSTEM_CATALOG_ID:
+                log_url = f"{_root}/logs/system?log_id={quote(log_id, safe='')}"
+            else:
+                log_url = (
+                    f"{_root}/logs/catalogs/{quote(_log_catalog, safe='')}"
+                    f"?log_id={quote(log_id, safe='')}"
+                )
             response_content["log_reference"] = {  # type: ignore[assignment]
                 "log_id": log_id,
                 "catalog_id": context["log_catalog"],
