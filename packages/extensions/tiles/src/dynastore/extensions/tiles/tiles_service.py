@@ -88,8 +88,10 @@ logger = logging.getLogger(__name__)
 
 # PostgreSQL pgcode for "query_canceled" — raised when a statement exceeds
 # ``statement_timeout``. Used by ``get_vector_tile`` (#2813) to distinguish a
-# bounded-timeout cancellation (graceful empty tile) from a genuine query
-# failure (500).
+# bounded-timeout cancellation from a genuine query failure (500). A
+# cancellation means the tile's content is simply unknown — not "no data" —
+# so it is never reported as 204; it falls back to a stale cached tile or a
+# 503 instead (#2965).
 _QUERY_CANCELED_PGCODE = "57014"
 
 # Raster render imports — guarded so the tiles extension can load in
@@ -940,31 +942,13 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                     "catalog=%s z=%s x=%s y=%s — attempting stale tile fallback",
                     fg_timeout_s, dataset, z, x, y,
                 )
-                if effective_cache_enabled:
-                    _stale_provider = get_protocol(TileStorageProtocol)
-                    if _stale_provider:
-                        _cache_id = (
-                            collections
-                            if len(requested_cols_list) > 1
-                            else requested_cols_list[0]
-                        )
-                        _effective_cache_id = (
-                            f"{_cache_id}@{params_hash}" if params_hash else _cache_id
-                        )
-                        stale = await self._try_cached_tile(
-                            _stale_provider,
-                            dataset,
-                            _effective_cache_id,
-                            tileMatrixSetId,
-                            z,
-                            x,
-                            y,
-                            format,
-                            start_time,
-                            serve_mode="proxy",
-                        )
-                        if stale:
-                            return stale
+                stale = await self._try_stale_tile_fallback(
+                    effective_cache_enabled, dataset, requested_cols_list,
+                    collections, params_hash, tileMatrixSetId, z, x, y,
+                    format, start_time,
+                )
+                if stale:
+                    return stale
                 raise HTTPException(
                     status_code=503,
                     detail="Database pool saturated, try again shortly.",
@@ -1052,9 +1036,10 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             # Bound the render query with a per-request SET LOCAL
             # statement_timeout (#2813) — mirrors the preseed task's
             # per-zoom-transaction timeout. On PostGIS canceling the
-            # statement (pgcode 57014), treat it as an empty tile (below)
-            # instead of surfacing a 500; any other query failure still
-            # propagates to the generic error handler.
+            # statement (pgcode 57014), fall back to a stale cached tile or
+            # a 503 (below) instead of surfacing a 500 or a false 204 (#2965);
+            # any other query failure still propagates to the generic error
+            # handler.
             statement_timeout_ms = int(tiles_config.live_tile_timeout_seconds * 1000)
             render_task: Optional["asyncio.Task[Optional[bytes]]"] = None
             try:
@@ -1089,14 +1074,31 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 pgcode = getattr(exc.original_exception, "pgcode", None)
                 if pgcode != _QUERY_CANCELED_PGCODE:
                     raise
+                # A cancelled statement means this render never learned
+                # whether the tile has data or not — reporting 204 here would
+                # claim "confirmed empty" (/req/core/tc-error part B) for a
+                # tile that may well be full. Fall back to a stale cached
+                # tile (200, honest even if outdated), else tell the client
+                # to retry (503) rather than render a false hole (#2965).
                 logger.warning(
                     "get_vector_tile: statement timeout (pgcode %s, "
                     "live_tile_timeout_seconds=%s) catalog=%s collection=%s "
-                    "z=%s x=%s y=%s — serving empty tile instead of 500",
+                    "z=%s x=%s y=%s — attempting stale tile fallback",
                     pgcode, tiles_config.live_tile_timeout_seconds,
                     dataset, collections, z, x, y,
                 )
-                mvt_content = None
+                stale = await self._try_stale_tile_fallback(
+                    effective_cache_enabled, dataset, requested_cols_list,
+                    collections, params_hash, tileMatrixSetId, z, x, y,
+                    format, start_time,
+                )
+                if stale:
+                    return stale
+                raise HTTPException(
+                    status_code=503,
+                    detail="Tile render timed out, try again shortly.",
+                    headers={"Retry-After": "5"},
+                ) from None
             except asyncio.CancelledError:
                 if render_task is not None and not render_task.done():
                     # The client already gave up, so there is no response
@@ -1344,6 +1346,44 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             return None
         params_str = "|".join(str(a) for a in args)
         return hashlib.sha256(params_str.encode()).hexdigest()[:16]
+
+    async def _try_stale_tile_fallback(
+        self,
+        effective_cache_enabled: bool,
+        dataset: str,
+        requested_cols_list: List[str],
+        collections: str,
+        params_hash: Optional[str],
+        tileMatrixSetId: str,
+        z: int,
+        x: int,
+        y: int,
+        format: str,
+        start_time: float,
+    ) -> Optional[Response]:
+        """Look up a cached/stale tile for a request that could not complete
+        a fresh render — the shared ladder for DB-pool saturation (#2845) and
+        a render cancelled by ``statement_timeout`` (pgcode 57014, #2965).
+
+        Returns the cached response (redirect, proxied bytes, or a
+        confirmed-empty 204 from a *previous, completed* render) if one
+        exists, or ``None`` when there is nothing cached — the caller must
+        then fail with an honest 503 + Retry-After rather than fabricate a
+        204 for a render that never actually confirmed the tile was empty.
+        """
+        if not effective_cache_enabled:
+            return None
+        provider = get_protocol(TileStorageProtocol)
+        if not provider:
+            return None
+        cache_id = (
+            collections if len(requested_cols_list) > 1 else requested_cols_list[0]
+        )
+        effective_cache_id = f"{cache_id}@{params_hash}" if params_hash else cache_id
+        return await self._try_cached_tile(
+            provider, dataset, effective_cache_id, tileMatrixSetId,
+            z, x, y, format, start_time, serve_mode="proxy",
+        )
 
     @staticmethod
     async def _try_cached_tile(
