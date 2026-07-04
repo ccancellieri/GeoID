@@ -1700,3 +1700,169 @@ class TestSharedRebuildNotCancelledByCallers:
         )
         assert results == ["fresh"] * 5
         assert calls == 1
+
+
+class TestRebuildExceptionHygiene:
+    """A failing detached rebuild retrieves its own exception and logs one
+    structured WARN line instead of surfacing asyncio's raw "exception was
+    never retrieved" traceback (#2900/#2902); single-flight bookkeeping still
+    cleans up so the next miss on the same key retries."""
+
+    def _make_cache(self, ns):
+        from dynastore.models.protocols.cache import CacheConfig
+        from dynastore.tools.cache import LocalAsyncCacheBackend, LocalCache
+
+        return LocalCache(
+            backend=LocalAsyncCacheBackend(), config=CacheConfig(namespace=ns)
+        )
+
+    @pytest.mark.asyncio
+    async def test_abandoned_rebuild_failure_logs_structured_warning(
+        self, caplog, monkeypatch
+    ):
+        import logging
+
+        import dynastore.tools.cache as cache_mod
+
+        monkeypatch.setattr(
+            cache_mod, "_load_slow_path_timeout", AsyncMock(return_value=0.05)
+        )
+        cache = self._make_cache("t_rebuild_fail")
+        release = asyncio.Event()
+
+        async def factory():
+            await release.wait()
+            raise RuntimeError("boom")
+
+        with caplog.at_level(logging.WARNING, logger="dynastore.tools.cache"):
+            # No stale value available -- the caller's timeout propagates
+            # while the rebuild keeps running detached.
+            with pytest.raises(TimeoutError):
+                await cache.get_or_set("k", factory, ttl=60)
+
+            release.set()
+            await asyncio.sleep(0.05)  # let the detached rebuild fail + log
+
+        assert any(
+            "cache_rebuild_failed" in r.getMessage()
+            and "key=" in r.getMessage()
+            and "error_type=RuntimeError" in r.getMessage()
+            and "boom" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_next_miss_retries_after_abandoned_failure(self, monkeypatch):
+        import dynastore.tools.cache as cache_mod
+
+        monkeypatch.setattr(
+            cache_mod, "_load_slow_path_timeout", AsyncMock(return_value=0.05)
+        )
+        cache = self._make_cache("t_rebuild_retry")
+        calls = 0
+
+        async def failing_factory():
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError):
+            await cache.get_or_set("k", failing_factory, ttl=60)
+        assert calls == 1
+
+        async def ok_factory():
+            nonlocal calls
+            calls += 1
+            return "fresh"
+
+        assert await cache.get_or_set("k", ok_factory, ttl=60) == "fresh"
+        assert calls == 2
+
+
+class TestRebuildConcurrencySemaphore:
+    """At most ``max_concurrent_detached_rebuilds`` detached rebuild tasks run
+    at once across the process (#2902): under a CPU-throttling storm, one
+    detached rebuild per cache-miss key can otherwise stampede the small DB
+    pool. Excess candidates queue for a semaphore slot inside their own
+    detached task, not on the caller's side."""
+
+    def _make_cache(self, ns):
+        from dynastore.models.protocols.cache import CacheConfig
+        from dynastore.tools.cache import LocalAsyncCacheBackend, LocalCache
+
+        return LocalCache(
+            backend=LocalAsyncCacheBackend(), config=CacheConfig(namespace=ns)
+        )
+
+    def _reset_semaphore(self, monkeypatch):
+        import dynastore.tools.cache as cache_mod
+
+        monkeypatch.setattr(cache_mod, "_rebuild_semaphore", None)
+        monkeypatch.setattr(cache_mod, "_rebuild_semaphore_limit", 0)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_rebuilds_are_bounded(self, monkeypatch):
+        import dynastore.tools.cache as cache_mod
+
+        self._reset_semaphore(monkeypatch)
+        monkeypatch.setattr(
+            cache_mod, "_load_slow_path_timeout", AsyncMock(return_value=30.0)
+        )
+        monkeypatch.setattr(
+            cache_mod, "_load_max_concurrent_rebuilds", AsyncMock(return_value=2)
+        )
+
+        cache = self._make_cache("t_rebuild_sem")
+        in_flight = 0
+        max_in_flight = 0
+        release = asyncio.Event()
+
+        async def factory():
+            nonlocal in_flight, max_in_flight
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            await release.wait()
+            in_flight -= 1
+            return "fresh"
+
+        # 5 distinct keys -> 5 distinct detached tasks, no single-flight sharing.
+        tasks = [
+            asyncio.create_task(cache.get_or_set(f"k{i}", factory, ttl=60))
+            for i in range(5)
+        ]
+        await asyncio.sleep(0.05)  # let everything queue/start
+        assert max_in_flight == 2  # bounded by the semaphore, not all 5 at once
+
+        release.set()
+        results = await asyncio.gather(*tasks)
+        assert results == ["fresh"] * 5
+
+    @pytest.mark.asyncio
+    async def test_semaphore_rebuilds_on_config_change(self, monkeypatch):
+        """A changed limit (hot-reload) replaces the semaphore; holders of
+        the superseded semaphore still release normally."""
+        import dynastore.tools.cache as cache_mod
+
+        self._reset_semaphore(monkeypatch)
+        monkeypatch.setattr(
+            cache_mod, "_load_max_concurrent_rebuilds", AsyncMock(return_value=2)
+        )
+        sem1 = await cache_mod._get_rebuild_semaphore()
+        assert sem1._value == 2  # type: ignore[attr-defined]
+
+        monkeypatch.setattr(
+            cache_mod, "_load_max_concurrent_rebuilds", AsyncMock(return_value=5)
+        )
+        sem2 = await cache_mod._get_rebuild_semaphore()
+        assert sem2 is not sem1
+        assert sem2._value == 5  # type: ignore[attr-defined]
+
+    def test_default_limit_is_conservative(self):
+        import dynastore.tools.cache as cache_mod
+
+        assert cache_mod._DEFAULT_MAX_CONCURRENT_REBUILDS == 4
+
+    def test_cache_plugin_config_field_default_matches(self):
+        from dynastore.modules.cache.cache_config import CachePluginConfig
+
+        assert CachePluginConfig().max_concurrent_detached_rebuilds == 4

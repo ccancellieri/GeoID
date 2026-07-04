@@ -516,35 +516,38 @@ def _stale_unwrap(raw: Any) -> "tuple[Any, bool]":
 # the per-miss hot path (and off the config service entirely between
 # refreshes).
 _SLOW_PATH_TIMEOUT_REFRESH_SECONDS: float = 60.0
+_DEFAULT_MAX_CONCURRENT_REBUILDS: int = 4
 _slow_path_timeout_value: float = _DEFAULT_SLOW_PATH_TIMEOUT_SECONDS
+_max_concurrent_rebuilds_value: int = _DEFAULT_MAX_CONCURRENT_REBUILDS
 _slow_path_timeout_checked_at: float = 0.0  # time.monotonic(); 0 = never
 _slow_path_timeout_loading: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
     "cache_slow_path_timeout_loading", default=False
 )
 
 
-async def _load_slow_path_timeout() -> float:
-    """Load ``slow_path_timeout_seconds`` from ``CachePluginConfig``.
+async def _load_cache_plugin_config_values() -> None:
+    """Refresh the memoized ``CachePluginConfig`` values used on the cache
+    slow path: ``slow_path_timeout_seconds`` and
+    ``max_concurrent_detached_rebuilds``.
 
-    Bounds lock-wait + factory time on the ``get_or_set``/``@cached`` slow
-    path. Falls back to the last-known value (default 30s) when called
-    re-entrantly from its own config load, when the memoized value is still
-    fresh, or when ``ConfigsProtocol`` is unavailable / the config load
-    fails — mirrors ``modules/tasks/dispatcher.py::_load_oracle_inner_timeout``.
+    Both fields live on the same config row, so they share one fetch, one
+    re-entrancy guard, and one refresh interval — see
+    :func:`_load_slow_path_timeout` for why the guard exists.
     """
-    global _slow_path_timeout_value, _slow_path_timeout_checked_at
+    global _slow_path_timeout_value, _max_concurrent_rebuilds_value
+    global _slow_path_timeout_checked_at
 
     if _slow_path_timeout_loading.get():
         # Re-entered from the @cached config load this function triggered:
         # answering with the memo/default is what terminates the recursion.
-        return _slow_path_timeout_value
+        return
 
     now = time.monotonic()
     if (
         _slow_path_timeout_checked_at
         and now - _slow_path_timeout_checked_at < _SLOW_PATH_TIMEOUT_REFRESH_SECONDS
     ):
-        return _slow_path_timeout_value
+        return
 
     token = _slow_path_timeout_loading.set(True)
     try:
@@ -557,16 +560,41 @@ async def _load_slow_path_timeout() -> float:
             cfg = await configs_proto.get_config(CachePluginConfig)
             if cfg is not None:
                 _slow_path_timeout_value = cfg.slow_path_timeout_seconds
+                _max_concurrent_rebuilds_value = cfg.max_concurrent_detached_rebuilds
     except Exception as e:
         logger.debug(
-            "cache: slow_path_timeout_seconds config load failed (%s), using default", e
+            "cache: CachePluginConfig load failed (%s), using cached/default values", e
         )
     finally:
         _slow_path_timeout_loading.reset(token)
         # Stamp even on failure so a broken config path is retried once per
         # refresh window, not hammered on every cache miss.
         _slow_path_timeout_checked_at = now
+
+
+async def _load_slow_path_timeout() -> float:
+    """Load ``slow_path_timeout_seconds`` from ``CachePluginConfig``.
+
+    Bounds lock-wait + factory time on the ``get_or_set``/``@cached`` slow
+    path. Falls back to the last-known value (default 30s) when the memoized
+    value is still fresh or ``ConfigsProtocol`` is unavailable / the config
+    load fails — mirrors
+    ``modules/tasks/dispatcher.py::_load_oracle_inner_timeout``.
+    """
+    await _load_cache_plugin_config_values()
     return _slow_path_timeout_value
+
+
+async def _load_max_concurrent_rebuilds() -> int:
+    """Load ``max_concurrent_detached_rebuilds`` from ``CachePluginConfig``.
+
+    Bounds how many detached cache-rebuild tasks (see
+    :func:`_await_shared_rebuild`) may run concurrently across the process.
+    Falls back to the last-known value (default 4) on the same terms as
+    :func:`_load_slow_path_timeout`.
+    """
+    await _load_cache_plugin_config_values()
+    return _max_concurrent_rebuilds_value
 
 
 # In-flight rebuild tasks, one per cache key. A rebuild runs as its OWN task,
@@ -583,6 +611,33 @@ async def _load_slow_path_timeout() -> float:
 # and writes the cache for whoever comes next.
 _inflight_rebuilds: Dict[str, "asyncio.Task[Any]"] = {}
 
+# Process-wide cap on concurrent detached rebuild tasks (#2902): a CPU-
+# throttling storm can turn dozens of simultaneous cache misses (each its own
+# key) into dozens of detached tasks all racing for the same small DB pool,
+# each holding/queuing a slot for up to ``slow_path_timeout_seconds``. The
+# semaphore is acquired INSIDE the detached task (see ``_gated_rebuild``
+# below), not by the caller of ``_await_shared_rebuild`` — callers already
+# fall back to a stale value or their own timeout while they wait, so having
+# an excess rebuild candidate queue for a slot costs nothing but time.
+_rebuild_semaphore: Optional[asyncio.Semaphore] = None
+_rebuild_semaphore_limit: int = 0
+
+
+async def _get_rebuild_semaphore() -> asyncio.Semaphore:
+    """Return the process-wide detached-rebuild concurrency semaphore.
+
+    Reads ``max_concurrent_detached_rebuilds`` live (mirrors the
+    background-DB-concurrency semaphore in ``query_executor.py``) and rebuilds
+    the semaphore when the configured limit changes; in-flight holders of a
+    superseded semaphore are unaffected and release normally.
+    """
+    global _rebuild_semaphore, _rebuild_semaphore_limit
+    limit = await _load_max_concurrent_rebuilds()
+    if _rebuild_semaphore is None or _rebuild_semaphore_limit != limit:
+        _rebuild_semaphore = asyncio.Semaphore(limit)
+        _rebuild_semaphore_limit = limit
+    return _rebuild_semaphore
+
 
 async def _await_shared_rebuild(
     key: str,
@@ -597,19 +652,29 @@ async def _await_shared_rebuild(
     """
     task = _inflight_rebuilds.get(key)
     if task is None or task.done():
-        task = asyncio.get_running_loop().create_task(rebuild())
+
+        async def _gated_rebuild(_rebuild: "Callable[[], Coroutine[Any, Any, Any]]" = rebuild) -> Any:
+            sem = await _get_rebuild_semaphore()
+            async with sem:
+                return await _rebuild()
+
+        task = asyncio.get_running_loop().create_task(_gated_rebuild())
         _inflight_rebuilds[key] = task
 
         def _cleanup(t: "asyncio.Task[Any]", _key: str = key) -> None:
             if _inflight_rebuilds.get(_key) is t:
                 _inflight_rebuilds.pop(_key, None)
-            # Retrieve the exception so an abandoned failure (every waiter
-            # already timed out) doesn't log "exception was never retrieved".
-            if not t.cancelled() and t.exception() is not None:
-                logger.debug(
-                    "cache: detached rebuild for key=%s failed: %s",
-                    _key, t.exception(),
-                )
+            # Retrieve the exception so an abandoned detached rebuild (every
+            # waiter already timed out) surfaces as one structured WARN line
+            # instead of asyncio's raw "exception was never retrieved" ERROR
+            # traceback.
+            if not t.cancelled():
+                exc = t.exception()
+                if exc is not None:
+                    logger.warning(
+                        "cache_rebuild_failed key=%s error_type=%s error=%s",
+                        _key, type(exc).__name__, exc,
+                    )
 
         task.add_done_callback(_cleanup)
     return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)

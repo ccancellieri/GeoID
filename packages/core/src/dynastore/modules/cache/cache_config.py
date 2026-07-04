@@ -102,3 +102,24 @@ class CachePluginConfig(PluginConfig):
             "@cached(stale_grace=...))."
         ),
     )
+
+    max_concurrent_detached_rebuilds: Mutable[int] = Field(
+        default=4,
+        ge=1,
+        le=16,
+        description=(
+            "Maximum number of detached cache-rebuild tasks (one per cache "
+            "key, see LocalCache.get_or_set()/@cached slow path) allowed to "
+            "run concurrently across the process. Each rebuild holds/queues "
+            "a DB connection for up to slow_path_timeout_seconds; under a "
+            "CPU-throttling storm dozens of simultaneous cache misses can "
+            "each spawn one, saturating the DB pool (#2900/#2902). Excess "
+            "rebuild candidates queue for a semaphore slot inside their own "
+            "detached task -- callers are unaffected since they already fall "
+            "back to a stale value or their own timeout while waiting. "
+            "Conservative default of 4 leaves headroom in the default pool "
+            "for foreground requests and the background-maintenance "
+            "semaphore. Hot-reloadable -- changes take effect immediately "
+            "without a pod restart. Must be in [1, 16]."
+        ),
+    )
