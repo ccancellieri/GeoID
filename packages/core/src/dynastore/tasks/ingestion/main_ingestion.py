@@ -30,8 +30,10 @@ from dateutil import parser as _dateutil_parser
 
 from dynastore.modules.catalog.asset_service import Asset, VirtualAssetCreate
 from dynastore.modules.catalog.models import CoreAssetReferenceType
+from dynastore.models.query_builder import AssetFilter, FilterOperator
 
 from dynastore.modules.catalog.tools import recalculate_and_update_extents
+from dynastore.modules.db_config.exceptions import UniqueViolationError
 from dynastore.modules.db_config.query_executor import DbEngine
 from dynastore.modules.storage.computed_fields import SYSTEM_FIELD_KEYS
 from dynastore.models.driver_context import DriverContext
@@ -938,9 +940,45 @@ async def run_ingestion_task(
                 href=req_asset.uri,
                 metadata=req_asset.metadata or {},
             )
-            asset = await asset_manager.create_asset(
-                catalog_id, asset_payload, collection_id, ctx=DriverContext(db_resource=engine)
-            )
+            try:
+                asset = await asset_manager.create_asset(
+                    catalog_id, asset_payload, collection_id, ctx=DriverContext(db_resource=engine)
+                )
+            except UniqueViolationError as exc:
+                # #3015: create_asset collided on the asset's (catalog_id,
+                # collection_id, href) uniqueness constraint even though the
+                # get_asset probe above (keyed on asset_id_for_lookup) found
+                # nothing. The probe wasn't wrong to miss — it was looking
+                # for the wrong identity: the href is already registered
+                # under a *different* asset_id than the one this resume
+                # derived (e.g. the asset was originally created with an
+                # explicit, operator-chosen asset_id — via direct upload or
+                # a request that supplied one — and this resume request
+                # omitted asset_id, so main_ingestion derived one from the
+                # URI basename that doesn't match). Re-probing by the same
+                # asset_id would just repeat the miss, so look the row up by
+                # href instead and reuse whatever asset_id it actually has.
+                if "_catalog_id_collection_id_href_idx" not in exc.details:
+                    raise
+                logger.warning(
+                    "Task '%s': create_asset hit a duplicate-key conflict on "
+                    "href %r for catalog=%s collection=%s — an asset with "
+                    "this href already exists under a different asset_id "
+                    "than %r; looking it up by href instead of failing the "
+                    "resume.",
+                    task_id, req_asset.uri, catalog_id, collection_id,
+                    asset_id_for_lookup,
+                )
+                existing = await asset_manager.search_assets(
+                    catalog_id,
+                    filters=[AssetFilter(field="href", op=FilterOperator.EQ, value=req_asset.uri)],
+                    collection_id=collection_id,
+                    limit=1,
+                    db_resource=engine,
+                )
+                if not existing:
+                    raise
+                asset = existing[0]
 
         if not asset:
             raise ValueError("Could not find or create an asset.")

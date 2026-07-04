@@ -73,7 +73,7 @@ Quick reference
         print(r.ref_type, r.ref_id, "blocking:", not r.cascade_delete)
 """
 
-from typing import Protocol, Optional, List, runtime_checkable, TYPE_CHECKING
+from typing import Any, Protocol, Optional, List, runtime_checkable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from dynastore.modules.catalog.asset_service import (
@@ -315,6 +315,7 @@ class AssetsProtocol(Protocol):
         offset: int = 0,
         collection_id: Optional[str] = None,
         all_collections: bool = False,
+        db_resource: Optional[Any] = None,
     ) -> List["Asset"]:
         """
         Searches for assets using a list of filters.
@@ -331,6 +332,9 @@ class AssetsProtocol(Protocol):
                 across all collections and the catalog tier; ``collection_id``
                 is ignored. When False (default), ``collection_id=None`` scopes
                 to catalog-tier assets only.
+            db_resource: Optional transactional resource (engine/connection)
+                for callers that already hold one open (mirrors the intra-module
+                ``db_resource`` kwarg on ``get_asset``/``create_asset``).
 
         Returns:
             List of matching Asset model instances.
