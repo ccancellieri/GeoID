@@ -2583,6 +2583,48 @@ async def complete_task(
     return bool(rowcount and rowcount > 0)
 
 
+async def update_task_ingestion_offset(
+    engine: DbResource,
+    task_id: uuid.UUID,
+    offset: int,
+) -> bool:
+    """Stamp a committed-row cursor onto ``inputs.ingestion_request.offset`` (#2820).
+
+    Called by the ingestion loop after every batch commit so a subsequent
+    claim of this task row — a dispatcher retry after a timeout/kill, which
+    resets status/owner via ``fail_task(retry=True)`` but never touches
+    ``inputs`` — rebuilds ``TaskIngestionRequest`` (see ``IngestionTask.run``,
+    which reads ``inputs`` fresh from the claimed row on every dispatch)
+    starting at the last durably committed offset instead of the original
+    request's (almost always 0).
+
+    Scoped by ``task_id`` only, matching ``complete_task`` / ``fail_task`` —
+    the ingestion loop already holds ``task_id`` from its own dispatch and
+    has no cheap access to the ``catalog_id`` column value here.
+
+    Returns ``True`` when a row was updated, ``False`` when none matched.
+    Callers should treat this as best-effort — a missed write degrades to
+    the pre-#2820 behaviour (a retry restarts from the original offset)
+    rather than aborting an otherwise-successful batch.
+    """
+    task_schema = get_task_schema()
+    sql = f"""
+        UPDATE {task_schema}.tasks
+        SET inputs = jsonb_set(
+            COALESCE(inputs, '{{}}'::jsonb),
+            '{{ingestion_request,offset}}',
+            to_jsonb(:offset_value::bigint),
+            true
+        )
+        WHERE task_id = :task_id;
+    """
+    async with managed_transaction(engine) as conn:
+        rowcount = await DQLQuery(
+            sql, result_handler=ResultHandler.ROWCOUNT
+        ).execute(conn, task_id=task_id, offset_value=offset)
+    return bool(rowcount and rowcount > 0)
+
+
 async def _emit_task_failed_event(
     task_id: uuid.UUID,
     row: Dict[str, Any],

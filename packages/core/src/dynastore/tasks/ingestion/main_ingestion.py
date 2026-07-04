@@ -273,6 +273,42 @@ async def _maybe_apply_ingest_backpressure() -> None:
         )
 
 
+async def _persist_ingestion_cursor(
+    engine: DbEngine, task_id: str, next_offset: int,
+) -> None:
+    """Persist a committed-row cursor onto the task row after a batch commits (#2820).
+
+    Stamps ``inputs.ingestion_request.offset`` on the task's own DB row so a
+    retry picks up where the last successful batch left off instead of
+    replaying the whole source from scratch. ``fail_task(retry=True)`` (the
+    Cloud Run task-timeout / dispatcher retry path) resets ``status``/
+    ``owner_id`` but never touches ``inputs`` — and the next claim rebuilds
+    ``TaskIngestionRequest`` from that same ``inputs`` column (see
+    ``IngestionTask.run``), so stamping the offset here is sufficient to seed
+    the resumed run; no separate "seed on start" step is needed.
+
+    Called immediately after each batch's upsert returns successfully (both
+    the row-cap/memory-budget flush inside the read loop and the trailing
+    partial-batch flush). Best-effort: a write failure here only degrades to
+    the pre-#2820 behaviour (a retry restarts from the original offset) and
+    must never fail an otherwise-successful ingestion batch.
+    """
+    if not task_id:
+        return
+    try:
+        from dynastore.modules.tasks import tasks_module
+        import uuid as _uuid
+
+        task_uuid = _uuid.UUID(task_id) if isinstance(task_id, str) else task_id
+        await tasks_module.update_task_ingestion_offset(engine, task_uuid, next_offset)
+    except Exception:  # noqa: BLE001 — cursor persistence is best-effort
+        logger.warning(
+            "ingestion: failed to persist resume cursor (offset=%d) for task "
+            "%s — a retry will restart from the original offset.",
+            next_offset, task_id, exc_info=True,
+        )
+
+
 async def _resolve_items_secondary_via_storage_plane() -> bool:
     """Best-effort read of ``TasksPluginConfig.items_secondary_via_storage_plane``.
 
@@ -940,8 +976,15 @@ async def run_ingestion_task(
             )
             if total_features is not None:
                 logger.info(f"Source file contains {total_features} features.")
+                # A resumed run (task_request.offset > 0, seeded from the
+                # cursor a prior attempt persisted — see
+                # ``_persist_ingestion_cursor``) starts progress reporting at
+                # its resume point rather than back at 0% (#2820).
                 await asyncio.gather(
-                    *(reporter.update_progress(0, total_features) for reporter in reporters)
+                    *(
+                        reporter.update_progress(task_request.offset, total_features)
+                        for reporter in reporters
+                    )
                 )
         except Exception as e:
             logger.warning(f"Could not determine total feature count: {e}")
@@ -1210,6 +1253,13 @@ async def run_ingestion_task(
                         processing_context=upsert_context,
                     )
                     rows_ingested += len(current_batch)
+                    # Batch durably committed — persist the resume cursor before
+                    # any other bookkeeping so a crash between here and the next
+                    # batch still leaves a retry able to skip everything this
+                    # batch just wrote (#2820).
+                    await _persist_ingestion_cursor(
+                        engine, task_id, task_request.offset + rows_ingested,
+                    )
                     _batch_rejections = upsert_ctx.extensions.get("_rejections") or []
                     _batch_persisted = (
                         upsert_result
@@ -1235,7 +1285,9 @@ async def run_ingestion_task(
                     )
                     await asyncio.gather(
                         *(
-                            reporter.update_progress(rows_ingested, total_features)
+                            reporter.update_progress(
+                                task_request.offset + rows_ingested, total_features,
+                            )
                             for reporter in reporters
                         )
                     )
@@ -1253,6 +1305,10 @@ async def run_ingestion_task(
                     processing_context=upsert_context,
                 )
                 rows_ingested += len(current_batch)
+                # Batch durably committed — persist the resume cursor (#2820).
+                await _persist_ingestion_cursor(
+                    engine, task_id, task_request.offset + rows_ingested,
+                )
                 _batch_rejections = upsert_ctx.extensions.get("_rejections") or []
                 _batch_persisted = (
                     upsert_result
@@ -1278,7 +1334,9 @@ async def run_ingestion_task(
                 )
                 await asyncio.gather(
                     *(
-                        reporter.update_progress(rows_ingested, total_features)
+                        reporter.update_progress(
+                            task_request.offset + rows_ingested, total_features,
+                        )
                         for reporter in reporters
                     )
                 )
