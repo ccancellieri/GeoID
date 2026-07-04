@@ -75,11 +75,15 @@ async def _storage_backlog_exists(engine: Any) -> bool:
 
     Fails open to ``False`` (no backlog opinion -> no spawn attempt this
     tick) on any error — a missing/unavailable ``tasks.storage`` table must
-    never crash the leader tick.
+    never crash the leader tick. The table's existence is checked first via
+    ``to_regclass()`` (never raises, transaction-visible), so a not-yet-
+    provisioned table is a clean skip rather than a statement error the probe's
+    own transaction has to absorb.
     """
     try:
+        from dynastore.modules.db_config.locking_tools import check_table_exists
         from dynastore.modules.db_config.query_executor import (
-            DQLQuery, ResultHandler, managed_transaction,
+            DQLQuery, ResultHandler, background_managed_transaction,
         )
         from dynastore.modules.tasks.tasks_module import get_task_schema
         from dynastore.tools.db import validate_sql_identifier
@@ -95,7 +99,9 @@ async def _storage_backlog_exists(engine: Any) -> bool:
             f"    LIMIT 1"
             f")"
         )
-        async with managed_transaction(engine) as conn:
+        async with background_managed_transaction(engine) as conn:
+            if not await check_table_exists(conn, "storage", task_schema):
+                return False
             return bool(
                 await DQLQuery(sql, result_handler=ResultHandler.SCALAR).execute(
                     conn, stale_lease=_STALE_LEASE_SECONDS,
@@ -117,8 +123,9 @@ async def _events_backlog_exists(engine: Any) -> bool:
     :func:`_storage_backlog_exists`.
     """
     try:
+        from dynastore.modules.db_config.locking_tools import check_table_exists
         from dynastore.modules.db_config.query_executor import (
-            DQLQuery, ResultHandler, managed_transaction,
+            DQLQuery, ResultHandler, background_managed_transaction,
         )
         from dynastore.modules.tasks.tasks_module import get_task_schema
         from dynastore.tools.db import validate_sql_identifier
@@ -133,7 +140,9 @@ async def _events_backlog_exists(engine: Any) -> bool:
             f"    LIMIT 1"
             f")"
         )
-        async with managed_transaction(engine) as conn:
+        async with background_managed_transaction(engine) as conn:
+            if not await check_table_exists(conn, "events", task_schema):
+                return False
             return bool(
                 await DQLQuery(sql, result_handler=ResultHandler.SCALAR).execute(conn)
             )
@@ -148,12 +157,29 @@ async def _events_backlog_exists(engine: Any) -> bool:
 async def _spawn_storage_drain(ctx: ServiceContext, *, wedge_grace_seconds: float) -> None:
     if not await _storage_backlog_exists(ctx.engine):
         return
-    from dynastore.modules.db_config.query_executor import managed_transaction
+    from dynastore.modules.db_config.locking_tools import check_table_exists
+    from dynastore.modules.db_config.query_executor import background_managed_transaction
     from dynastore.modules.storage.storage_emit import (
         _enqueue_drain_trigger as _enqueue_storage_drain_trigger,
     )
+    from dynastore.modules.tasks.tasks_module import get_task_schema
 
-    async with managed_transaction(ctx.engine) as conn:
+    task_schema = get_task_schema()
+    async with background_managed_transaction(ctx.engine) as conn:
+        # Checked on THIS connection, ahead of the enqueue attempt, rather
+        # than relying on the enqueue helper's own best-effort SAVEPOINT to
+        # classify a missing table: the spawner's transaction carries no
+        # other work, so there is nothing for that SAVEPOINT to protect, and
+        # a swallowed statement failure right before this transaction's
+        # implicit commit is exactly the surfaced-as-"invalid transaction"
+        # failure mode the recovery tick must never produce (#2715).
+        if not await check_table_exists(conn, "tasks", task_schema):
+            logger.debug(
+                "drain_spawner: storage_drain recovery skipped — tasks "
+                "table not available in schema %r (normal during staged "
+                "rollout).", task_schema,
+            )
+            return
         await _enqueue_storage_drain_trigger(
             conn, wedge_grace_seconds=wedge_grace_seconds,
         )
@@ -162,12 +188,26 @@ async def _spawn_storage_drain(ctx: ServiceContext, *, wedge_grace_seconds: floa
 async def _spawn_event_drain(ctx: ServiceContext, *, wedge_grace_seconds: float) -> None:
     if not await _events_backlog_exists(ctx.engine):
         return
-    from dynastore.modules.db_config.query_executor import managed_transaction
+    from dynastore.modules.db_config.locking_tools import check_table_exists
+    from dynastore.modules.db_config.query_executor import background_managed_transaction
     from dynastore.modules.tasks.events.events_emit import (
         _enqueue_event_drain_trigger,
     )
+    from dynastore.modules.tasks.tasks_module import get_task_schema
 
-    async with managed_transaction(ctx.engine) as conn:
+    task_schema = get_task_schema()
+    async with background_managed_transaction(ctx.engine) as conn:
+        # See the matching comment in _spawn_storage_drain: check existence
+        # on this connection up front instead of leaning on the enqueue
+        # helper's SAVEPOINT tolerance for a transaction that has no other
+        # work to protect.
+        if not await check_table_exists(conn, "tasks", task_schema):
+            logger.debug(
+                "drain_spawner: event_drain recovery skipped — tasks "
+                "table not available in schema %r (normal during staged "
+                "rollout).", task_schema,
+            )
+            return
         await _enqueue_event_drain_trigger(
             conn, wedge_grace_seconds=wedge_grace_seconds,
         )

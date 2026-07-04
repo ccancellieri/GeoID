@@ -430,6 +430,55 @@ async def test_terminal_row_does_not_block_fresh_spawn(drain_env):
 
 
 @pytest.mark.asyncio
+async def test_missing_tasks_table_does_not_wedge_next_tick(drain_env, caplog):
+    """#2715: a tick that finds ``tasks.tasks`` momentarily unavailable
+    (staged rollout, or any table-existence hiccup) must degrade gracefully
+    on its OWN connection and must not leave the following tick unable to
+    run. Every dev report showed the OPPOSITE: once one tick misdiagnosed a
+    failure as "table not available", every subsequent tick failed with a
+    SQLAlchemy "Can't reconnect until invalid transaction is rolled back"
+    error, forever."""
+    from dynastore.modules.db_config.query_executor import (
+        DQLQuery, ResultHandler, managed_transaction,
+    )
+
+    task_schema, engine = drain_env
+    await _seed_storage_backlog(engine, task_schema)
+
+    async with managed_transaction(engine) as conn:
+        await DQLQuery(
+            f'DROP TABLE "{task_schema}".tasks', result_handler=ResultHandler.NONE,
+        ).execute(conn)
+
+    service = _make_service()
+    ctx = _make_ctx(engine)
+
+    caplog.set_level("WARNING", logger="dynastore.modules.tasks.drain_spawner")
+
+    # Tick 1: tasks.tasks is gone — must be a silent no-op, not a crash.
+    await service.tick(ctx)
+    assert "recovery tick failed" not in caplog.text
+
+    # Recreate the table (the schema becoming available again, or the
+    # staged-rollout window closing).
+    async with managed_transaction(engine) as conn:
+        await DQLQuery(
+            _TASKS_DDL.format(schema=task_schema), result_handler=ResultHandler.NONE,
+        ).execute(conn)
+
+    caplog.clear()
+
+    # Tick 2 must succeed cleanly — a wedged connection/transaction left
+    # behind by tick 1 would make this fail with the exact error reported
+    # live: "Can't reconnect until invalid transaction is rolled back".
+    await service.tick(ctx)
+    assert "recovery tick failed" not in caplog.text
+
+    rows = await _fetch_tasks(engine, task_schema)
+    assert {r["task_type"] for r in rows} == {"storage_drain"}
+
+
+@pytest.mark.asyncio
 async def test_repeated_ticks_are_idempotent(drain_env):
     """Overlapping/repeated ticks must not pile up duplicate PENDING rows —
     the dedup guard already enforced by the underlying trigger helpers makes
