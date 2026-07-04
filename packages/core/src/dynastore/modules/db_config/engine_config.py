@@ -236,21 +236,47 @@ class PostgresqlEngineConfig(EngineConfig):
         accepts libpq-flavoured DSNs only, so the SQLAlchemy
         ``postgresql+asyncpg://`` prefix is normalised to ``postgresql://``
         — matches the strip already done in the outbox-pool helper.
+
+        Every connection carries the same lock-safety + clamped
+        statement_timeout ``server_settings`` as the shared serving engine
+        (``modules/db/db_service.py``, #2906) — without them a per-catalog
+        engine has zero server-side timeouts, so a stuck query or a leaked
+        transaction can hold a connection (and its locks) indefinitely
+        (#2898).
         """
         import asyncpg  # local import: keeps F.1 import light
 
         from dynastore.modules.db_config.db_config import DBConfig
+        from dynastore.modules.db_config.db_timeout_config import (
+            clamp_serving_statement_timeout,
+            lock_safety_server_settings,
+            resolve_timeout_settings,
+        )
 
         if self.connection_url is not None:
             dsn = self.connection_url.reveal()
         else:
             dsn = DBConfig.database_url
         dsn = dsn.replace("postgresql+asyncpg://", "postgresql://")
+
+        lock_timeout, statement_timeout, idle_in_transaction_session_timeout = (
+            resolve_timeout_settings(DBConfig)
+        )
+        statement_timeout = clamp_serving_statement_timeout(
+            statement_timeout, DBConfig.serving_statement_timeout_ceiling_seconds
+        )
+        server_settings = {
+            **lock_safety_server_settings(
+                lock_timeout, idle_in_transaction_session_timeout
+            ),
+            "statement_timeout": statement_timeout,
+        }
         return await asyncpg.create_pool(
             dsn=dsn,
             min_size=1,
             max_size=self.pool_size,
             timeout=self.pool_timeout_sec,
+            server_settings=server_settings,
         )
 
     async def engine_release(self, instance: Any) -> None:
@@ -759,6 +785,35 @@ class ValkeyEngineConfig(EngineConfig):
         ),
     )
 
+    health_check_interval_seconds: Mutable[int] = Field(
+        default=30,
+        ge=0,
+        le=300,
+        description=(
+            "Seconds between proactive PINGs of an otherwise-idle Valkey "
+            "connection. Catches a socket dead-on-arrival (stale pooled "
+            "connection) before the next real command hits it, rather than "
+            "that command failing outright and feeding the cache's "
+            "consecutive-failure circuit breaker. ``0`` disables the check "
+            "(valkey-py default)."
+        ),
+    )
+
+    retry_attempts: Mutable[int] = Field(
+        default=3,
+        ge=0,
+        le=10,
+        description=(
+            "Bounded retry count (exponential backoff) for connection-class "
+            "errors only — a stale pooled socket surfaces as an immediate "
+            "``ConnectionError``/``TimeoutError``, and without a retry a "
+            "single bad connection trips the circuit breaker instead of "
+            "self-healing on the next attempt. Application-level errors "
+            "(bad command, cluster ``MOVED``, etc.) are never retried. "
+            "``0`` disables retries (valkey-py default)."
+        ),
+    )
+
     async def engine_init(self) -> Any:
         """Build a Valkey async client from the current config snapshot.
 
@@ -798,6 +853,8 @@ class ValkeyEngineConfig(EngineConfig):
             tcp_keepalive_idle=self.tcp_keepalive_idle_seconds,
             tcp_keepalive_interval=self.tcp_keepalive_interval_seconds,
             tcp_keepalive_count=self.tcp_keepalive_count,
+            health_check_interval=self.health_check_interval_seconds,
+            retry_attempts=self.retry_attempts,
         )
         # Stash the pool on the client so engine_release can close both.
         # ValkeyCluster owns its pools internally so _pool is None there.

@@ -28,6 +28,7 @@ connection pool kwargs.
 from __future__ import annotations
 
 import socket
+from unittest.mock import patch
 
 import pytest
 
@@ -96,3 +97,99 @@ def test_build_valkey_client_omits_keepalives_when_no_tunables_supplied() -> Non
     assert "socket_connect_timeout" not in pool_kwargs
     assert "socket_keepalive" not in pool_kwargs
     assert "socket_keepalive_options" not in pool_kwargs
+
+
+# --------------------------------------------------------------------------
+# ValkeyEngineConfig — health checks + bounded retry (#2902)
+# --------------------------------------------------------------------------
+
+
+def test_valkey_engine_config_exposes_health_check_and_retry_defaults() -> None:
+    cfg = ValkeyEngineConfig()
+    assert cfg.health_check_interval_seconds == 30
+    assert cfg.retry_attempts == 3
+
+
+def test_build_valkey_client_wires_health_check_interval() -> None:
+    client, pool = build_valkey_client(
+        url="valkey://localhost:6379",
+        health_check_interval=30,
+    )
+    pool_kwargs = pool.connection_kwargs  # type: ignore[union-attr]
+    assert pool_kwargs["health_check_interval"] == 30
+
+
+def test_build_valkey_client_wires_bounded_retry_when_configured() -> None:
+    """A configured ``retry_attempts`` produces a ``Retry`` object bounded to
+    connection-class errors, plus ``retry_on_timeout=True`` for the
+    standalone client's asyncio timeout coverage."""
+    from valkey.exceptions import ConnectionError as ValkeyConnectionError
+    from valkey.retry import Retry
+
+    client, pool = build_valkey_client(
+        url="valkey://localhost:6379",
+        retry_attempts=3,
+    )
+    pool_kwargs = pool.connection_kwargs  # type: ignore[union-attr]
+    assert pool_kwargs["retry_on_timeout"] is True
+    retry = pool_kwargs["retry"]
+    assert isinstance(retry, Retry)
+    assert retry._retries == 3
+    # Only connection-class errors are retried, never application errors.
+    assert ValkeyConnectionError in retry._supported_errors
+    assert TimeoutError in retry._supported_errors
+
+
+def test_build_valkey_client_omits_retry_when_retry_attempts_not_supplied() -> None:
+    client, pool = build_valkey_client(url="valkey://localhost:6379")
+    pool_kwargs = pool.connection_kwargs  # type: ignore[union-attr]
+    assert "retry" not in pool_kwargs
+    assert "retry_on_timeout" not in pool_kwargs
+
+
+def test_build_valkey_client_omits_retry_when_retry_attempts_zero() -> None:
+    """``retry_attempts=0`` means "no retry" — must not build a Retry(0)."""
+    client, pool = build_valkey_client(url="valkey://localhost:6379", retry_attempts=0)
+    pool_kwargs = pool.connection_kwargs  # type: ignore[union-attr]
+    assert "retry" not in pool_kwargs
+    assert "retry_on_timeout" not in pool_kwargs
+
+
+def test_build_valkey_client_cluster_mode_strips_retry_on_timeout() -> None:
+    """``ValkeyCluster.__init__`` has no ``retry_on_timeout`` parameter — passing
+    it would raise ``TypeError``. Cluster mode must still receive ``retry`` +
+    ``health_check_interval`` (both supported there)."""
+    with patch("valkey.asyncio.cluster.ValkeyCluster") as MockCluster:
+        build_valkey_client(
+            cluster_mode=True,
+            discovery_host="10.132.0.9",
+            discovery_port=6379,
+            health_check_interval=30,
+            retry_attempts=3,
+        )
+
+    MockCluster.assert_called_once()
+    _args, kwargs = MockCluster.call_args
+    assert "retry_on_timeout" not in kwargs
+    assert kwargs["health_check_interval"] == 30
+    assert kwargs["retry"]._retries == 3
+
+
+async def test_engine_init_plumbs_health_check_and_retry_to_builder() -> None:
+    """``ValkeyEngineConfig.engine_init`` forwards the new tunables to
+    ``build_valkey_client`` so a config change actually reaches the client."""
+    cfg = ValkeyEngineConfig(
+        connection_url="valkey://localhost:6379",  # type: ignore[arg-type]
+        health_check_interval_seconds=45,
+        retry_attempts=5,
+    )
+    with patch(
+        "dynastore.tools.cache_valkey.build_valkey_client",
+        return_value=(object(), None),
+    ) as mock_build:
+        await cfg.engine_init()
+
+    mock_build.assert_called_once()
+    _args, kwargs = mock_build.call_args
+    assert kwargs["health_check_interval"] == 45
+    assert kwargs["retry_attempts"] == 5

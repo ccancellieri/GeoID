@@ -362,6 +362,8 @@ def build_valkey_client(
     tcp_keepalive_idle: Optional[int] = None,
     tcp_keepalive_interval: Optional[int] = None,
     tcp_keepalive_count: Optional[int] = None,
+    health_check_interval: Optional[float] = None,
+    retry_attempts: Optional[int] = None,
 ) -> "tuple[Any, Any]":
     """Build a Valkey async client (standalone or cluster) from connection params.
 
@@ -378,6 +380,18 @@ def build_valkey_client(
     ``discovery_port`` via an ``address_remap`` callable. This is the fix for
     Memorystore Valkey 9 CLUSTER, which advertises unreachable internal shard
     addresses at the cluster-bus port range (see ``build_discovery_port_remap``).
+
+    ``health_check_interval`` (#2902): proactively PINGs an idle connection
+    every N seconds so a socket silently dropped by an intermediary (Cloud
+    NAT, LB) is detected and replaced before the next real command hits it,
+    instead of surfacing as a hard failure on that command.
+
+    ``retry_attempts`` (#2902): bounded retry (exponential backoff) for the
+    connection-class errors — ``ConnectionError``/``TimeoutError`` and their
+    asyncio counterparts — that a single stale pooled socket raises. Valkey's
+    ``Retry`` only ever matches those error classes (never application-level
+    errors such as a bad command or a cluster ``MOVED`` response), so a
+    genuine backend fault still surfaces immediately.
     """
     import logging
     _logger = logging.getLogger(__name__)
@@ -437,6 +451,24 @@ def build_valkey_client(
         if keepalive_options:
             pool_kwargs["socket_keepalive_options"] = keepalive_options
 
+    # Proactive health checks — PING idle connections every N seconds so a
+    # socket dead-on-arrival (stale pooled connection) is caught and replaced
+    # ahead of the next real command rather than failing that command outright.
+    if health_check_interval is not None:
+        pool_kwargs["health_check_interval"] = health_check_interval
+
+    # Bounded retry for connection-class errors (#2902). Passing a ``Retry``
+    # object is enough on its own — its default ``supported_errors``
+    # (``ConnectionError``/``TimeoutError``/``socket.timeout``) already
+    # excludes application-level errors; ``retry_on_timeout`` additionally
+    # folds in asyncio's ``TimeoutError`` for the standalone client.
+    if retry_attempts is not None and retry_attempts > 0:
+        from valkey.backoff import ExponentialBackoff
+        from valkey.retry import Retry
+
+        pool_kwargs["retry_on_timeout"] = True
+        pool_kwargs["retry"] = Retry(ExponentialBackoff(), retry_attempts)
+
     # TLS
     if tls:
         pool_kwargs["connection_class"] = avalkey.SSLConnection
@@ -455,9 +487,14 @@ def build_valkey_client(
         from valkey.asyncio.cluster import ValkeyCluster
 
         # cluster handles per-node pools internally; drop connection_class
-        # (cluster picks SSLConnection itself when ssl=True).
+        # (cluster picks SSLConnection itself when ssl=True) and
+        # retry_on_timeout (ValkeyCluster.__init__ has no such parameter —
+        # it merges the equivalent error classes itself once a ``retry``
+        # object is supplied, see valkey.asyncio.cluster.ValkeyCluster).
         cluster_kwargs = {
-            k: v for k, v in pool_kwargs.items() if k != "connection_class"
+            k: v
+            for k, v in pool_kwargs.items()
+            if k not in ("connection_class", "retry_on_timeout")
         }
         cluster_kwargs["ssl"] = tls
         cluster_kwargs["require_full_coverage"] = require_full_coverage
