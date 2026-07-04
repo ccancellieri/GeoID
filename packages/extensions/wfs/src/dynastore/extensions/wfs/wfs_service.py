@@ -339,9 +339,12 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
 
     def _register_routes(self):
         """
-        Registers two distinct entry points to handle WFS requests:
+        Registers the WFS entry points:
         1. A root endpoint (`/wfs`) for service-wide discovery (GetCapabilities).
-        2. A scoped endpoint (`/wfs/{catalog_id}`) for operations within a specific catalog.
+        2. A scoped endpoint (`/wfs/catalogs/{catalog_id}`) for operations within a
+           specific catalog (OGC aligned path).
+        3. The legacy scoped endpoint (`/wfs/{catalog_id}`), kept for existing WFS
+           2.0 clients (QGIS/ArcGIS connections are typically saved by URL).
 
         This dual structure provides flexibility for different client behaviors.
         """
@@ -350,7 +353,20 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
         # The root endpoint is disabled to enforce catalog-scoped requests.
         self.router.add_api_route("", self.handle_root_wfs_request, methods=["GET"])
         self.router.add_api_route(
-            "/{catalog_id}", self.handle_scoped_wfs_request, methods=["GET"]
+            "/catalogs/{catalog_id}",
+            self.handle_scoped_wfs_request,
+            methods=["GET"],
+            summary="WFS 2.0 catalog-scoped operations (OGC aligned path)",
+        )
+        self.router.add_api_route(
+            "/{catalog_id}",
+            self.handle_scoped_wfs_request,
+            methods=["GET"],
+            deprecated=True,
+            summary=(
+                "WFS 2.0 catalog-scoped operations (deprecated). "
+                "Use /wfs/catalogs/{catalog_id} instead."
+            ),
         )
 
     async def _dispatch_request(
@@ -419,7 +435,8 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
         conn: AsyncConnection = Depends(get_async_connection),
         language: str = Depends(get_language),
     ):
-        """Handles requests scoped to a specific catalog, e.g., `/wfs/my_catalog`."""
+        """Handles requests scoped to a specific catalog, e.g., `/wfs/catalogs/my_catalog`
+        (or the deprecated `/wfs/my_catalog`)."""
         safe_catalog_id = catalog_id.replace(":", "_").replace("-", "_")
         await self._resolve_catalog_or_404(
             safe_catalog_id, ctx=DriverContext(db_resource=conn),

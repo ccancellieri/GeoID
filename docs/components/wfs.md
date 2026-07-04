@@ -7,7 +7,7 @@ The WFS 2.0 standard requires Key-Value Pair (KVP) queries spanning `Capabilitie
 
 We implement dual routing to bridge this RESTfully:
 - `GET /wfs`: Root global query (Discovers everything)
-- `GET /wfs/{catalog_id}`: Scoped isolating a tenant into a specific virtual endpoint.
+- `GET /wfs/catalogs/{catalog_id}`: Scoped isolating a tenant into a specific virtual endpoint (`/wfs/{catalog_id}` is kept as a deprecated alias for existing WFS clients).
 
 ## Dynamic XML via `wfs_generator`
 We utilize `xml.etree.ElementTree` to synthesize XSD architectures directly dynamically at request time strictly bypassing physical static schema maps.

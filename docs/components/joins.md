@@ -405,9 +405,9 @@ automatically when `dynastore[dwh]` is used (which also installs `dynastore[join
 
 | Route | Description |
 |---|---|
-| `POST /dwh/join` | Legacy join — catalog id in request body |
-| `POST /dwh/catalogs/{catalog_id}/join` | Per-catalog variant |
-| `POST /dwh/catalogs/{catalog_id}/tiles/{z}/{x}/{y}/join.{format}` | MVT tile join |
+| `POST /dwh/join` | Deprecated — catalog id in request body, no catalog scope in the URL |
+| `POST /dwh/catalogs/{catalog_id}/join` | Per-catalog join (OGC aligned path) |
+| `POST /dwh/catalogs/{catalog_id}/tiles/{z}/{x}/{y}/join.{format}` | Per-catalog MVT tile join (OGC aligned path) |
 
 Key differences from `/join`:
 
