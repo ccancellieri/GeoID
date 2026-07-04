@@ -564,11 +564,16 @@ class _StubEs:
         self.delete_by_query_calls: list = []
         self.get_calls: list = []
         self.search_calls: list = []
+        self.index_calls: list = []
         self.count_result = {"count": 0}
 
     async def bulk(self, *, body, params=None, **kwargs):
         self.bulk_calls.append({"body": body, "params": params, "kwargs": kwargs})
         return {"items": []}
+
+    async def index(self, *, index, id, body, params=None, **kwargs):
+        self.index_calls.append({"index": index, "id": id, "body": body, "params": params})
+        return {"result": "created"}
 
     async def delete(self, *, index, id, params=None, **kwargs):
         self.delete_calls.append({"index": index, "id": id, "params": params})
@@ -1683,8 +1688,13 @@ def _fake_canonical_inputs(catalog_id, collection_id, geoids, db_resource=None):
     return {g: CanonicalIndexInput(row={"geoid": g}) for g in geoids}
 
 
-def _patch_bulk_dependencies(es):
-    """Wire the module-level helpers used inside ``index_bulk``."""
+def _patch_bulk_dependencies(es, *, has_pg_write_canonical=True):
+    """Wire the module-level helpers used inside ``index_bulk``/``index``.
+
+    ``has_pg_write_canonical`` defaults to True so the existing response-shape
+    tests keep exercising the PG-hydration path unchanged; pass False to
+    exercise the ES-only skip-the-canonical-read branch (#2884 follow-up).
+    """
     return [
         patch(
             "dynastore.modules.elasticsearch.client.get_client", return_value=es,
@@ -1704,6 +1714,10 @@ def _patch_bulk_dependencies(es):
         patch(
             "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
             new=AsyncMock(side_effect=_fake_canonical_inputs),
+        ),
+        patch.object(
+            ItemsElasticsearchDriver, "_collection_has_pg_write_canonical",
+            new=AsyncMock(return_value=has_pg_write_canonical),
         ),
     ]
 
@@ -1928,6 +1942,112 @@ class TestIndexBulkResponseShapes:
             "indexed doc must carry top-level catalog_id so "
             "SearchService's term filter matches (#914 fix)"
         )
+
+
+class TestIndexAndIndexBulkPgCanonicalDetection:
+    """Follow-up to #2864/#2884: ``write_entities`` was fixed to skip the PG
+    canonical read for ES-only routing, but ``index`` and ``index_bulk`` —
+    reached via the secondary-indexer dispatch fan-out for collections whose
+    single WRITE entry is both primary and ``secondary_index=True`` — called
+    ``read_canonical_index_inputs`` unconditionally. On a real ES-only
+    collection this deterministically raised ``_fetch_raw_rows``'s "cannot
+    resolve physical table" RuntimeError as an ``IndexerFatal``, which
+    propagated out of ``ItemService.upsert`` even though the primary write
+    had already committed — surfacing as a stuck/looping harvest job that
+    never progressed."""
+
+    @pytest.mark.asyncio
+    async def test_index_bulk_skips_pg_read_and_builds_feature_derived_doc(self):
+        es = _StubEsBulk({
+            "errors": False,
+            "items": [{"index": {"_id": "f1", "result": "created", "status": 201}}],
+        })
+        ops = [_make_op("f1", payload={
+            "id": "f1", "type": "Feature", "collection": "col1",
+            "geometry": {"type": "Point", "coordinates": [12.0, 41.9]},
+            "properties": {"name": "Rome"},
+        })]
+        ctx = _make_ctx()
+        canonical_read_mock = AsyncMock(
+            side_effect=RuntimeError(
+                "canonical_index_read._fetch_raw_rows: cannot resolve "
+                "physical table for cat1/col1"
+            )
+        )
+
+        patches = _patch_bulk_dependencies(es, has_pg_write_canonical=False)
+        with patch(
+            "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+            new=canonical_read_mock,
+        ):
+            for p in patches:
+                if p.attribute != "read_canonical_index_inputs":
+                    p.start()
+            try:
+                driver = ItemsElasticsearchDriver()
+                result = await driver.index_bulk(ctx, ops)
+            finally:
+                for p in patches:
+                    if p.attribute != "read_canonical_index_inputs":
+                        p.stop()
+
+        canonical_read_mock.assert_not_awaited()
+        assert result.total == 1
+        assert result.succeeded == 1
+        doc = es.bulk_calls[0]["body"][1]
+        assert doc["id"] == "f1"
+        assert doc["properties"]["extras"]["name"] == "Rome"
+
+    @pytest.mark.asyncio
+    async def test_index_single_op_skips_pg_read_and_builds_feature_derived_doc(self):
+        es = _StubEs(exists=True)
+        ctx = _make_ctx()
+        op = _make_op("f1", payload={
+            "id": "f1", "type": "Feature", "collection": "col1",
+            "geometry": {"type": "Point", "coordinates": [12.0, 41.9]},
+            "properties": {"name": "Rome"},
+        })
+        canonical_read_mock = AsyncMock(
+            side_effect=RuntimeError(
+                "canonical_index_read._fetch_raw_rows: cannot resolve "
+                "physical table for cat1/col1"
+            )
+        )
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.modules.elasticsearch.client.get_index_prefix",
+            return_value="dynastore",
+        ), patch(
+            "dynastore.modules.storage.drivers.elasticsearch._ensure_in_public_alias_once",
+            new=AsyncMock(return_value=None),
+        ), patch(
+            "dynastore.modules.elasticsearch.items_projection.resolve_catalog_known_fields",
+            new=AsyncMock(return_value={}),
+        ), patch(
+            "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+            new=canonical_read_mock,
+        ), patch.object(
+            ItemsElasticsearchDriver, "_collection_has_pg_write_canonical",
+            new=AsyncMock(return_value=False),
+        ), patch.object(
+            ItemsElasticsearchDriver, "_resolve_simplify_geometry",
+            new=AsyncMock(return_value=False),
+        ), patch.object(
+            ItemsElasticsearchDriver, "_resolve_simplify_max_bytes",
+            new=AsyncMock(return_value=10_000_000),
+        ), patch.object(
+            ItemsElasticsearchDriver, "_resolve_snap_to_grid_config",
+            new=AsyncMock(return_value=(False, 0.00001)),
+        ):
+            driver = ItemsElasticsearchDriver()
+            await driver.index(ctx, op)
+
+        canonical_read_mock.assert_not_awaited()
+        assert len(es.index_calls) == 1
+        doc = es.index_calls[0]["body"]
+        assert doc["id"] == "f1"
+        assert doc["properties"]["extras"]["name"] == "Rome"
 
 
 # ---------------------------------------------------------------------------

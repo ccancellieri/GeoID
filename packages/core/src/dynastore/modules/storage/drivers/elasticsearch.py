@@ -2440,9 +2440,19 @@ class ItemsElasticsearchDriver(
         # directly from the raw row + resolved sidecars — no read-policy
         # filtering, no external_id_as_feature_id id-flip (#1800).
         known_fields = await resolve_catalog_known_fields(ctx.catalog)
-        inputs = await read_canonical_index_inputs(
-            ctx.catalog, ctx.collection, [op.entity_id],
-            db_resource=ctx.pg_conn,
+        # Only attempt the PG canonical read when this collection's WRITE
+        # routing actually resolves a PG-capable driver — same guard
+        # write_entities() uses (#2864/#2884). Pure ES-only routing has no
+        # PG WRITE entry, so this read would deterministically raise
+        # "cannot resolve physical table"; skip straight to the
+        # feature-derived fallback below instead.
+        inputs = (
+            await read_canonical_index_inputs(
+                ctx.catalog, ctx.collection, [op.entity_id],
+                db_resource=ctx.pg_conn,
+            )
+            if await self._collection_has_pg_write_canonical(ctx.catalog, ctx.collection)
+            else {}
         )
         ci = inputs.get(op.entity_id)
         if ci is None:
@@ -2527,7 +2537,12 @@ class ItemsElasticsearchDriver(
             ctx.catalog, ctx.collection,
         )
 
-        # Batch-fetch canonical inputs for all upsert ops in one PG round-trip.
+        # Batch-fetch canonical inputs for all upsert ops in one PG round-trip
+        # — but only when this collection's WRITE routing actually resolves a
+        # PG-capable driver, same guard write_entities() uses (#2864/#2884).
+        # Pure ES-only routing has no PG WRITE entry, so this read would
+        # deterministically raise "cannot resolve physical table"; skip
+        # straight to the per-op feature-derived fallback below instead.
         upsert_geoids = [
             op.entity_id
             for op in ops
@@ -2537,10 +2552,16 @@ class ItemsElasticsearchDriver(
         # connection from the caller's transaction when available (covers the
         # Cloud Run JOB/worker context where the dispatcher's IndexContext
         # carries the wrapping TX opened by _dispatch_index_upsert Phase 2f).
-        canonical_inputs = await read_canonical_index_inputs(
-            ctx.catalog, ctx.collection, upsert_geoids,
-            db_resource=ctx.pg_conn,
-        ) if upsert_geoids else {}
+        canonical_inputs = (
+            await read_canonical_index_inputs(
+                ctx.catalog, ctx.collection, upsert_geoids,
+                db_resource=ctx.pg_conn,
+            )
+            if upsert_geoids and await self._collection_has_pg_write_canonical(
+                ctx.catalog, ctx.collection,
+            )
+            else {}
+        )
 
         body: List[dict] = []
         for op in ops:
