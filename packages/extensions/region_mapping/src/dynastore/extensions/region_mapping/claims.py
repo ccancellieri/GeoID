@@ -248,6 +248,28 @@ async def fetch_distinct_region_ids(
     return sorted(str(v) for v in (values or []))
 
 
+def _fid_index(value: Any) -> Optional[int]:
+    """Coerce a raw unique-id attribute value to a non-negative list index.
+
+    Values arrive as int, float, or text depending on the storage lane and
+    how the source dataset typed the field (JSONB ``->>`` always yields
+    text; a float-typed source field yields "984.0"). Non-numeric,
+    fractional, and negative values cannot be positional indexes — skip
+    them (return ``None``) rather than erroring or corrupting the array
+    (a negative index would silently overwrite entries from the end).
+    """
+    try:
+        as_float = float(value)
+        as_int = int(as_float)
+    except (TypeError, ValueError, OverflowError):
+        # int() raises on the floats float() happily parses: ValueError
+        # for "nan", OverflowError for "inf"/"Infinity".
+        return None
+    if as_int != as_float or as_int < 0:
+        return None
+    return as_int
+
+
 @cached(maxsize=128, ttl=120, namespace="region_mapping_region_ids_by_unique_id")
 async def fetch_region_ids_by_unique_id(
     src_catalog: str, src_collection: str, region_prop: str, unique_id_prop: str,
@@ -308,7 +330,12 @@ async def fetch_region_ids_by_unique_id(
     else:
         jsonb_col = validate_column_identifier(attrs_config.jsonb_column_name)
         region_expr = f's."{jsonb_col}" ->> :region_prop'
-        fid_expr = f'(s."{jsonb_col}" ->> :unique_id_prop)::int'
+        # No ::int cast here: attribute values ingested as JSON floats
+        # come back as "984.0", which the cast rejects with 22P02.
+        # Coercion/validation happens in Python via _fid_index below;
+        # DB-side ordering is irrelevant because rows are placed into the
+        # result array positionally by fid.
+        fid_expr = f's."{jsonb_col}" ->> :unique_id_prop'
         params["region_prop"] = region_prop
         params["unique_id_prop"] = unique_id_prop
 
@@ -317,8 +344,7 @@ async def fetch_region_ids_by_unique_id(
         f'FROM "{schema}"."{hub_table}" h '
         f'JOIN "{schema}"."{attrs_table}" s ON s.geoid = h.geoid '
         f'WHERE h.deleted_at IS NULL AND {region_expr} IS NOT NULL '
-        f'AND {fid_expr} IS NOT NULL '
-        f'ORDER BY fid ASC'
+        f'AND {fid_expr} IS NOT NULL'
     )
 
     engine = get_engine()
@@ -328,11 +354,16 @@ async def fetch_region_ids_by_unique_id(
         rows = await DQLQuery(
             sql, result_handler=ResultHandler.ALL_DICTS,
         ).execute(conn, **params)
-    if not rows:
+
+    indexed = []
+    for row in rows or []:
+        idx = _fid_index(row["fid"])
+        if idx is not None:
+            indexed.append((idx, str(row["region_value"])))
+    if not indexed:
         return []
 
-    max_fid = max(int(row["fid"]) for row in rows)
-    ordered: List[Optional[str]] = [None] * (max_fid + 1)
-    for row in rows:
-        ordered[int(row["fid"])] = str(row["region_value"])
+    ordered: List[Optional[str]] = [None] * (max(i for i, _ in indexed) + 1)
+    for idx, region_value in indexed:
+        ordered[idx] = region_value
     return ordered

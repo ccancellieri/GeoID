@@ -44,7 +44,7 @@ pytestmark = pytest.mark.enable_modules(
 )
 
 
-def _feature(item_id: str, region_code: str, fid: int) -> dict:
+def _feature(item_id: str, region_code: str, fid: "int | float | str") -> dict:
     """A VECTOR feature carrying ``region_code`` and a sequential ``fid`` --
     mirrors a country/admin-boundary layer where several features can share
     one region code (e.g. several admin-1 features under the same country)."""
@@ -142,6 +142,41 @@ async def test_fetch_region_ids_by_unique_id_jsonb_collection_ordered_by_fid(
     values = await fetch_region_ids_by_unique_id(catalog_id, collection_id, "region_code", "fid")
 
     assert values == ["FRA", "ITA", "DEU"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_region_ids_by_unique_id_jsonb_float_fids_do_not_error(
+    app_lifespan,
+) -> None:
+    """Float-typed unique ids ("984.0" after JSONB ``->>``) must position
+    correctly instead of failing the whole read with 22P02 (the dev
+    regression on the srilanka mapping, whose GDAL-ingested FID column was
+    real-typed). A non-numeric unique id on one feature is skipped rather
+    than sinking every other feature in the collection."""
+    from dynastore.extensions.region_mapping.claims import fetch_region_ids_by_unique_id
+    from dynastore.tools.cache import cache_clear
+
+    cache_clear(fetch_region_ids_by_unique_id)
+
+    catalog_id = f"cat_{generate_id_hex()}"
+    collection_id = f"coll_{generate_id_hex()}"
+    await _provision_catalog(catalog_id)
+    await _create_collection(catalog_id, collection_id, columnar=False)
+
+    catalogs = get_protocol(CatalogsProtocol)
+    assert catalogs is not None
+    for i, (code, fid) in enumerate([("LKA", 0.0), ("IND", 1.0), ("NPL", 3.0)]):
+        await catalogs.upsert(catalog_id, collection_id, _feature(f"row-{i}", code, fid))
+    # Values float() parses but int() rejects ("NaN", "Infinity") must be
+    # skipped like any other junk, not crash the Python coercion.
+    for suffix, bad in [("nan", "NaN"), ("inf", "Infinity"), ("text", "not-a-number")]:
+        await catalogs.upsert(
+            catalog_id, collection_id, _feature(f"row-bad-{suffix}", "BAD", bad),
+        )
+
+    values = await fetch_region_ids_by_unique_id(catalog_id, collection_id, "region_code", "fid")
+
+    assert values == ["LKA", "IND", None, "NPL"]
 
 
 @pytest.mark.asyncio
