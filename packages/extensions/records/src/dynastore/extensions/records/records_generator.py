@@ -31,6 +31,7 @@ from typing import Any, Dict, Optional, Union, cast
 
 from geojson_pydantic import Feature as _GeoJSONFeature
 
+from dynastore.models.dimensions import DIMENSIONS_CATALOG_ID
 from dynastore.models.localization import LocalizedText
 from dynastore.models.shared_models import Link
 from dynastore.models.driver_context import DriverContext
@@ -44,6 +45,21 @@ from dynastore.extensions.tools.ogc_row_mapping import (
 from . import records_models as rm
 
 logger = logging.getLogger(__name__)
+
+
+def _records_collection_url(catalog_id: str, collection_id: str, root_url: str) -> str:
+    """Build the canonical URL of a Records collection.
+
+    Dimension-backed collections are materialized under the internal
+    ``DIMENSIONS_CATALOG_ID`` sentinel catalog (not a real per-tenant
+    catalog), so their links must not reuse the catalog-scoped
+    ``/records/catalogs/{catalog_id}/collections/{id}`` shape — that would
+    leak the ``_dimensions_`` sentinel into a public URL (#2957). They get
+    the genuine platform-tier ``/records/dimensions/{id}`` path instead.
+    """
+    if catalog_id == DIMENSIONS_CATALOG_ID:
+        return f"{root_url}/records/dimensions/{collection_id}"
+    return f"{root_url}/records/catalogs/{catalog_id}/collections/{collection_id}"
 
 
 async def collection_has_geometry(
@@ -170,11 +186,12 @@ def db_row_to_record(
     feature_id = str(item.id) if item.id is not None else None
 
     # Links
-    self_url = f"{root_url}/records/catalogs/{catalog_id}/collections/{collection_id}/items/{feature_id}"
+    collection_url = _records_collection_url(catalog_id, collection_id, root_url)
+    self_url = f"{collection_url}/items/{feature_id}"
     links = [
         Link(href=self_url, rel="self", type="application/geo+json"),
         Link(
-            href=f"{root_url}/records/catalogs/{catalog_id}/collections/{collection_id}",
+            href=collection_url,
             rel="collection",
             type="application/json",
         ),
@@ -209,7 +226,7 @@ def collection_to_records_collection(
     coll_dict = collection if isinstance(collection, dict) else collection.model_dump(exclude_none=True)
 
     coll_id = coll_dict.get("id", "")
-    self_url = f"{root_url}/records/catalogs/{catalog_id}/collections/{coll_id}"
+    self_url = _records_collection_url(catalog_id, coll_id, root_url)
 
     links = [
         Link(href=self_url, rel="self", type="application/json"),

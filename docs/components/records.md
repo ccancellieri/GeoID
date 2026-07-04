@@ -16,7 +16,21 @@ to `"RECORDS"`.
 /records/catalogs/{catalog_id}/collections/{collection_id}                      collection metadata
 /records/catalogs/{catalog_id}/collections/{collection_id}/items                list / create records
 /records/catalogs/{catalog_id}/collections/{collection_id}/items/{record_id}    get single record
+/records/dimensions                                                             list dimension-backed collections (platform tier)
+/records/dimensions/{dim_id}                                                    dimension collection metadata (platform tier)
+/records/dimensions/{dim_id}/items                                             list dimension members as records (platform tier)
+/records/dimensions/{dim_id}/items/{record_id}                                 get single dimension member as a record (platform tier)
 ```
+
+Dimension-backed RECORDS collections are materialized under the internal
+`_dimensions_` sentinel catalog (see `dynastore.models.dimensions.DIMENSIONS_CATALOG_ID`),
+which is platform-tier data, not a real per-tenant catalog. The `/records/dimensions/...`
+routes above are the canonical, genuine platform-tier shape for reaching them — the
+sentinel catalog id never appears in a link or a documented URL (#2957). The generic
+`/records/catalogs/{catalog_id}/...` routes still technically resolve requests made
+with `catalog_id=_dimensions_` for existing consumers, but every self/collection link
+returned by the API always uses the `/records/dimensions/...` shape regardless of
+which path was used to reach it.
 
 OGC conformance declared:
 ```

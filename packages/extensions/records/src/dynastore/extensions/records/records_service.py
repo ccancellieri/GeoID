@@ -59,6 +59,7 @@ from dynastore.extensions.tools.query import (  # noqa: E402
     resolve_items_read_policy,
 )
 from dynastore.modules.storage.hints import Hint  # noqa: E402
+from dynastore.models.dimensions import DIMENSIONS_CATALOG_ID
 from dynastore.models.protocols import ItemsProtocol
 from dynastore.models.shared_models import Link
 from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
@@ -276,6 +277,45 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             status_code=status.HTTP_204_NO_CONTENT,
         )
 
+        # Platform-tier dimension-backed collections (#2957). Dimension
+        # members are materialized into RECORDS collections under the
+        # internal ``_dimensions_`` sentinel catalog, but that is platform
+        # data, not a real per-tenant catalog — it must not appear as a
+        # catalog id in a public URL. These routes give it a genuine
+        # platform-tier shape; the legacy sentinel path
+        # (``/catalogs/_dimensions_/collections/{dim_id}/...``) keeps working
+        # unchanged for existing consumers, but every self/collection link
+        # now resolves to this canonical shape regardless of which route was
+        # used to reach it (see ``records_generator._records_collection_url``).
+        self.router.add_api_route(
+            "/dimensions",
+            self.list_dimension_collections,
+            methods=["GET"],
+            response_model=rm.RecordsCatalogCollections,
+            summary="List dimension-backed records collections (platform tier)",
+        )
+        self.router.add_api_route(
+            "/dimensions/{dim_id}",
+            self.get_dimension_collection,
+            methods=["GET"],
+            response_model=rm.RecordsCatalogCollection,
+            summary="Dimension-backed records collection metadata (platform tier)",
+        )
+        self.router.add_api_route(
+            "/dimensions/{dim_id}/items",
+            self.get_dimension_records,
+            methods=["GET"],
+            response_model=rm.RecordCollection,
+            summary="List dimension members as records (platform tier)",
+        )
+        self.router.add_api_route(
+            "/dimensions/{dim_id}/items/{record_id}",
+            self.get_dimension_record,
+            methods=["GET"],
+            response_model=rm.Record,
+            summary="Get a single dimension member as a record (platform tier)",
+        )
+
     # ------------------------------------------------------------------
     # Landing page & conformance (delegated to OGCServiceMixin)
     # ------------------------------------------------------------------
@@ -417,6 +457,56 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         root_url = get_root_url(request)
         localized, _ = coll.localize(language) if hasattr(coll, "localize") else (coll, language)
         return gen.collection_to_records_collection(localized, catalog_id, root_url)
+
+    # ------------------------------------------------------------------
+    # Platform-tier dimension routes (#2957)
+    # ------------------------------------------------------------------
+    # Thin wrappers over the catalog-scoped handlers above, fixing
+    # catalog_id to the internal DIMENSIONS_CATALOG_ID sentinel so it never
+    # appears as a path parameter — see the route registration comment in
+    # ``_register_routes`` for the rationale.
+
+    async def list_dimension_collections(
+        self,
+        request: Request,
+        language: str = Depends(get_language),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of collections to return. Omitted falls back "
+                "to the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
+        offset: int = Query(0, ge=0),
+        request_hints: FrozenSet = Depends(parse_hints_param),
+    ) -> rm.RecordsCatalogCollections:
+        """List dimension-backed records collections at the platform tier."""
+        return await self.list_collections(
+            catalog_id=DIMENSIONS_CATALOG_ID,
+            request=request,
+            language=language,
+            limit=limit,
+            offset=offset,
+            request_hints=request_hints,
+        )
+
+    async def get_dimension_collection(
+        self,
+        dim_id: str,
+        request: Request,
+        language: str = Depends(get_language),
+        request_hints: FrozenSet = Depends(parse_hints_param),
+    ) -> rm.RecordsCatalogCollection:
+        """Dimension-backed records collection metadata at the platform tier."""
+        return await self.get_collection(
+            catalog_id=DIMENSIONS_CATALOG_ID,
+            collection_id=dim_id,
+            request=request,
+            language=language,
+            request_hints=request_hints,
+        )
 
     # ------------------------------------------------------------------
     # Record items
@@ -719,6 +809,97 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             max_response_bytes=max_response_bytes,
         )
 
+    async def get_dimension_records(
+        self,
+        request: Request,
+        dim_id: str,
+        language: str = Depends(get_language),
+        conn: AsyncConnection = Depends(get_async_connection_bounded),
+        limit: Optional[int] = Query(
+            None,
+            ge=1,
+            description=(
+                "Maximum number of records to return. Omitted falls back to "
+                "the configured default; a value above the configured "
+                "maximum is clamped, not rejected (fc-limit-response-1)."
+            ),
+        ),
+        offset: int = Query(0, ge=0, description="Offset of the first record to return."),
+        filter: Optional[str] = Query(
+            None,
+            description=(
+                "CQL2 filter expression; encoding controlled by ``filter-lang``."
+            ),
+        ),
+        filter_lang: str = Query(
+            "cql2-text",
+            alias="filter-lang",
+            description="Filter encoding: 'cql2-text' (default) or 'cql2-json'.",
+        ),
+        filter_crs: Optional[str] = Query(
+            None,
+            alias="filter-crs",
+            description=(
+                "URI of the CRS the geometric values in ``filter=`` are "
+                "expressed in. Default = CRS84."
+            ),
+        ),
+        properties: Optional[str] = Query(
+            None,
+            description=(
+                "Comma-separated property names; unknown name → 400, empty "
+                "value strips all attribute properties. Orthogonal to "
+                "``skipGeometry``."
+            ),
+        ),
+        skip_geometry: Optional[bool] = Query(
+            None,
+            alias="skipGeometry",
+            description=(
+                "When true, returned records carry ``geometry: null`` and "
+                "the resolved driver omits the geometry from its projection. "
+                "De-facto pygeoapi convention. Mutually exclusive with "
+                "``returnGeometry`` unless both are consistent. Default: false."
+            ),
+        ),
+        return_geometry: Optional[bool] = Query(
+            None,
+            alias="returnGeometry",
+            description=(
+                "ESRI de-facto alias for ``skipGeometry``. "
+                "``returnGeometry=false`` is equivalent to ``skipGeometry=true``. "
+                "Passing both with conflicting values returns HTTP 400."
+            ),
+        ),
+        sortby: Optional[str] = Query(None, description="Sort order (e.g., '-title,+created')."),
+        bbox: Optional[str] = Query(
+            None,
+            description="Spatial filter as comma-separated bbox (minx,miny,maxx,maxy). Records are geometry-less by default; use only on collections with spatial extent.",
+        ),
+        q: Optional[str] = Query(None, description="Free-text search query."),
+        request_hints: FrozenSet = Depends(parse_hints_param),
+    ) -> Response:
+        """List dimension members as records at the platform tier."""
+        return await self.get_records(
+            request=request,
+            catalog_id=DIMENSIONS_CATALOG_ID,
+            collection_id=dim_id,
+            language=language,
+            conn=conn,
+            limit=limit,
+            offset=offset,
+            filter=filter,
+            filter_lang=filter_lang,
+            filter_crs=filter_crs,
+            properties=properties,
+            skip_geometry=skip_geometry,
+            return_geometry=return_geometry,
+            sortby=sortby,
+            bbox=bbox,
+            q=q,
+            request_hints=request_hints,
+        )
+
     async def get_record(
         self,
         catalog_id: str,
@@ -778,6 +959,24 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         _resolve_links_titles(content.get("links"), language)
         return JSONResponse(
             content=content,
+        )
+
+    async def get_dimension_record(
+        self,
+        dim_id: str,
+        record_id: str,
+        request: Request,
+        language: str = Depends(get_language),
+        conn: AsyncConnection = Depends(get_async_connection_bounded),
+    ) -> rm.Record:
+        """Get a single dimension member as a record at the platform tier."""
+        return await self.get_record(
+            catalog_id=DIMENSIONS_CATALOG_ID,
+            collection_id=dim_id,
+            record_id=record_id,
+            request=request,
+            language=language,
+            conn=conn,
         )
 
     async def add_records(
