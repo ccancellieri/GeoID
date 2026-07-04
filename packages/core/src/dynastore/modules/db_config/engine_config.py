@@ -286,6 +286,7 @@ class PostgresqlEngineConfig(EngineConfig):
             lock_safety_server_settings,
             resolve_timeout_settings,
         )
+        from dynastore.modules.db_config.instance import get_stamped_application_name
 
         if self.connection_url is not None:
             dsn = self.connection_url.reveal()
@@ -300,6 +301,12 @@ class PostgresqlEngineConfig(EngineConfig):
             statement_timeout, DBConfig.serving_statement_timeout_ceiling_seconds
         )
         server_settings = {
+            # geoid#2924: stamp service + per-process instance id so a
+            # monitoring/reaper query can recognize this pool's connections
+            # and tell dead-instance sessions from live ones. Every other
+            # engine in this codebase already carries this stamp; this
+            # per-catalog pool previously carried none at all.
+            "application_name": get_stamped_application_name(),
             **lock_safety_server_settings(
                 lock_timeout, idle_in_transaction_session_timeout
             ),

@@ -258,12 +258,17 @@ class DBService(ModuleProtocol, DatabaseProtocol):
                     # populated. Without this every connection shows as the empty
                     # string and per-service contention cannot be diagnosed from
                     # the DB side. See #699 / #655.
+                    #
+                    # ``application_name`` additionally carries this process's
+                    # stable instance id (geoid#2924) so a monitoring/reaper
+                    # query can tell individual replicas of the same service
+                    # apart — needed to recognize a session left behind by a
+                    # specific dead Cloud Run instance rather than the whole
+                    # service.
                     from dynastore.modules.db_config.instance import (
-                        get_service_name,
+                        get_stamped_application_name,
                     )
-                    app_name = get_service_name() or os.getenv(
-                        "SERVICE_NAME"
-                    ) or "dynastore"
+                    app_name = get_stamped_application_name()
 
                     # Resolve timeout settings from PluginConfig, env, or DBConfig
                     (

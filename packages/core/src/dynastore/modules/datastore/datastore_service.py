@@ -17,7 +17,6 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-import os
 from psycopg2.extras import register_default_jsonb, register_default_json
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
@@ -114,12 +113,16 @@ class DatastoreModule(ModuleProtocol, DatabaseProtocol):
                 # per-service contention is visible from the DB side. See
                 # #699 / #655. psycopg2 honours libpq ``application_name``
                 # in connect_args.
+                #
+                # Also carries this process's stable instance id (geoid#2924)
+                # so a monitoring/reaper query can recognize a session left
+                # behind by a specific dead Cloud Run instance, not just the
+                # service as a whole — see
+                # dynastore.modules.db_config.instance.get_stamped_application_name.
                 from dynastore.modules.db_config.instance import (
-                    get_service_name,
+                    get_stamped_application_name,
                 )
-                app_name = get_service_name() or os.getenv(
-                    "SERVICE_NAME"
-                ) or "dynastore"
+                app_name = get_stamped_application_name()
 
                 app_state.sync_engine = create_engine(
                     normalize_db_url(db_config.database_url, is_async=False),

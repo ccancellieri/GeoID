@@ -122,6 +122,26 @@ CREATE TABLE IF NOT EXISTS configs.leader_lease (
 """
 
 
+# Per-instance liveness heartbeat (geoid#2924). One row per running process
+# (keyed by the per-process instance id minted at import time — see
+# dynastore.modules.db_config.instance.get_instance_id), renewed on a cheap
+# cadence by every pod. configs.leader_lease only carries a row for whichever
+# pod currently holds a given lease, so it cannot answer "is this specific
+# instance alive" for a pod that never won an election; this table can. The
+# zombie-session reaper (modules/db/zombie_session_reaper.py) uses "no row, or
+# a row stale past a generous grace window" as proof an instance is gone.
+# Created idempotently alongside the other configs-schema tables; never
+# ALTER-ed in place.
+INSTANCE_LIVENESS_DDL = """
+CREATE SCHEMA IF NOT EXISTS configs;
+CREATE TABLE IF NOT EXISTS configs.instance_liveness (
+    instance_id TEXT        PRIMARY KEY,
+    service     TEXT        NOT NULL,
+    renewed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+
 def tenant_configs_ddl(tenant_schema: str) -> str:
     """Return idempotent DDL for the two per-tenant typed-config tables.
 

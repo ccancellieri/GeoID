@@ -75,3 +75,46 @@ def test_resolve_root_default_uses_app_dir(monkeypatch, tmp_path):
     monkeypatch.delenv("DYNASTORE_CONFIG_ROOT", raising=False)
     monkeypatch.setenv("APP_DIR", str(tmp_path))
     assert inst._resolve_root() == pathlib.Path(str(tmp_path)) / "config"
+
+
+def test_instance_id_is_stable_within_process():
+    assert inst.get_instance_id() == inst.get_instance_id()
+
+
+def test_stamped_application_name_uses_service_name(monkeypatch, tmp_path):
+    f = tmp_path / "instance.json"
+    f.write_text(json.dumps({"service_name": "catalog-api"}))
+    monkeypatch.setattr(inst, "INSTANCE_FILE", f)
+    stamped = inst.get_stamped_application_name()
+    service, _, instance_id = stamped.rpartition(":")
+    assert service == "catalog-api"
+    assert instance_id == inst.get_instance_id()
+
+
+def test_stamped_application_name_falls_back_to_service_name_env(monkeypatch, tmp_path):
+    monkeypatch.setattr(inst, "INSTANCE_FILE", tmp_path / "absent.json")
+    monkeypatch.setenv("SERVICE_NAME", "env-service")
+    stamped = inst.get_stamped_application_name()
+    assert stamped.startswith("env-service:")
+
+
+def test_stamped_application_name_falls_back_to_dynastore(monkeypatch, tmp_path):
+    monkeypatch.setattr(inst, "INSTANCE_FILE", tmp_path / "absent.json")
+    monkeypatch.delenv("SERVICE_NAME", raising=False)
+    stamped = inst.get_stamped_application_name()
+    assert stamped.startswith("dynastore:")
+
+
+def test_stamped_application_name_truncates_long_service_name(monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr(inst, "_warned_application_name_truncated", False)
+    long_service = "a" * 100
+    f = tmp_path / "instance.json"
+    f.write_text(json.dumps({"service_name": long_service}))
+    monkeypatch.setattr(inst, "INSTANCE_FILE", f)
+
+    caplog.set_level("WARNING")
+    stamped = inst.get_stamped_application_name()
+
+    assert len(stamped.encode("utf-8")) <= 63
+    assert stamped.endswith(f":{inst.get_instance_id()}")
+    assert any("exceeding" in r.message for r in caplog.records)

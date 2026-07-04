@@ -45,9 +45,75 @@ import json
 import logging
 import os
 import pathlib
+import uuid
 from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
+
+# Stable per-process identity, minted once at import time — every connection
+# this process opens carries the same token, and a fresh process (redeploy,
+# restart, new Cloud Run instance) always mints a different one. Distinct from
+# service_name (shared by every replica of the same service): this is what
+# lets geoid#2924's zombie-session reaper tell "a dead REPLICA of a healthy
+# service" apart from "the service itself is unhealthy". Independent of
+# locking_tools._LEASE_OWNER (same "mint once at import" idea, different
+# call site — this one is stamped on every connection's application_name,
+# not just the lease-table CAS).
+_INSTANCE_ID: str = uuid.uuid4().hex
+
+
+def get_instance_id() -> str:
+    """Return this process's stable identity token (minted once at import)."""
+    return _INSTANCE_ID
+
+
+# PostgreSQL truncates the ``application_name`` GUC to NAMEDATALEN-1 = 63
+# bytes server-side. "{service}:{32-hex instance id}" is 33 bytes just for the
+# ":" + instance id, so a long service name can push the total over the limit
+# and silently truncate away part (or all) of the instance id — breaking the
+# zombie-session reaper's identity match with no error anywhere. Truncate the
+# SERVICE part ourselves instead so the instance id always survives intact.
+_MAX_APPLICATION_NAME_BYTES = 63
+_warned_application_name_truncated = False
+
+
+def get_stamped_application_name() -> str:
+    """Return ``"{service}:{instance_id}"`` for ``pg_stat_activity.application_name``.
+
+    ``service`` resolves the same way every existing call site already does
+    (``instance.json`` → ``SERVICE_NAME`` env → literal ``"dynastore"``);
+    appending the per-process ``instance_id`` lets a monitoring/reaper query
+    distinguish individual replicas of the same service from each other, not
+    just from other services.
+
+    If the combined string would exceed PostgreSQL's 63-byte
+    ``application_name`` limit, the service part is truncated (once, with a
+    logged warning) so the instance id — the part identity matching actually
+    depends on — always survives intact.
+    """
+    service = get_service_name() or os.getenv("SERVICE_NAME") or "dynastore"
+    stamped = f"{service}:{_INSTANCE_ID}"
+    if len(stamped.encode("utf-8")) <= _MAX_APPLICATION_NAME_BYTES:
+        return stamped
+
+    global _warned_application_name_truncated
+    if not _warned_application_name_truncated:
+        logger.warning(
+            "get_stamped_application_name: %r is %d bytes, exceeding "
+            "PostgreSQL's 63-byte application_name limit — truncating the "
+            "service name (keeping the instance id intact) so identity "
+            "matching still works. Consider a shorter service_name in "
+            "instance.json.",
+            stamped, len(stamped.encode("utf-8")),
+        )
+        _warned_application_name_truncated = True
+
+    suffix = f":{_INSTANCE_ID}"
+    max_service_bytes = _MAX_APPLICATION_NAME_BYTES - len(suffix.encode("utf-8"))
+    truncated_service = service.encode("utf-8")[:max_service_bytes].decode(
+        "utf-8", errors="ignore"
+    )
+    return f"{truncated_service}{suffix}"
 
 
 def _resolve_root() -> pathlib.Path:

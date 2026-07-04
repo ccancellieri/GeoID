@@ -178,6 +178,23 @@ CREATE TABLE IF NOT EXISTS configs.leader_lease (
 """
 
 
+# Keep in sync with dynastore.modules.db_config.typed_store.ddl.INSTANCE_LIVENESS_DDL
+def _get_instance_liveness_ddl() -> str:
+    try:
+        from dynastore.modules.db_config.typed_store.ddl import INSTANCE_LIVENESS_DDL
+        return INSTANCE_LIVENESS_DDL
+    except ImportError:
+        pass
+    return """
+CREATE SCHEMA IF NOT EXISTS configs;
+CREATE TABLE IF NOT EXISTS configs.instance_liveness (
+    instance_id TEXT        PRIMARY KEY,
+    service     TEXT        NOT NULL,
+    renewed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _parse_url(url: str) -> dict:
@@ -208,9 +225,10 @@ def _log(msg: str) -> None:
 async def _reset_configs(conn, dry_run: bool) -> None:
     platform_ddl = _get_platform_ddl()
     lease_ddl = _get_lease_ddl()
+    instance_liveness_ddl = _get_instance_liveness_ddl()
     all_ddl_stmts = [
         s.strip() + ";"
-        for ddl in (platform_ddl, lease_ddl)
+        for ddl in (platform_ddl, lease_ddl, instance_liveness_ddl)
         for s in ddl.strip().split(";")
         if s.strip()
     ]

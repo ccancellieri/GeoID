@@ -150,12 +150,22 @@ def task_engine_connect_args(db_config) -> Dict[str, Dict[str, str]]:
     Wraps the result via :func:`lock_safety_server_settings`. Intended for
     the short-lived, single-use engines built outside the shared engine —
     pass the result straight as the engine's ``connect_args`` keyword.
+
+    Also stamps ``application_name`` with this process's service + instance
+    id (geoid#2924) — these ad-hoc task engines previously carried no
+    ``application_name`` at all, making their connections invisible to any
+    per-instance monitoring/reaper query.
     """
+    from dynastore.modules.db_config.instance import get_stamped_application_name
+
     lock_timeout, _statement_timeout, _idle_in_transaction_session_timeout = (
         resolve_timeout_settings(db_config)
     )
     return {
-        "server_settings": lock_safety_server_settings(
-            lock_timeout, db_config.task_idle_in_transaction_session_timeout
-        ),
+        "server_settings": {
+            "application_name": get_stamped_application_name(),
+            **lock_safety_server_settings(
+                lock_timeout, db_config.task_idle_in_transaction_session_timeout
+            ),
+        },
     }

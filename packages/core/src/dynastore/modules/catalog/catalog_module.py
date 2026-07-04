@@ -634,6 +634,13 @@ class CatalogModule(ModuleProtocol):
                 DbContentionMonitor,
                 load_db_contention_monitor_config,
             )
+            from dynastore.modules.db.instance_liveness import (
+                InstanceLivenessHeartbeat,
+            )
+            from dynastore.modules.db.zombie_session_reaper import (
+                ZombieSessionReaper,
+                load_zombie_session_reaper_config,
+            )
             from dynastore.modules.scaling.publisher import ScalingSignalPublisher
             # Import-time side effect: registers the lowest-priority fallback
             # PlatformScalingProtocol so the control loop has somewhere safe
@@ -738,6 +745,40 @@ class CatalogModule(ModuleProtocol):
                 logger.warning(
                     "CatalogModule: DB contention monitor failed to configure: %s — "
                     "lock/slow-query contention will not be logged automatically.",
+                    exc,
+                )
+
+            try:
+                # Always registered — its tick() live-reads
+                # ZombieSessionReaperConfig.enabled and does zero DB work
+                # while the reaper is off (the default), so this never adds
+                # background load on its own and a live configs-API PATCH
+                # enabling the reaper takes effect without a pod restart.
+                bg_supervisor.register(InstanceLivenessHeartbeat())
+                logger.info("CatalogModule: instance liveness heartbeat registered.")
+            except Exception as exc:  # noqa: BLE001 — never block startup
+                logger.warning(
+                    "CatalogModule: instance liveness heartbeat failed to "
+                    "configure: %s — the zombie-session reaper will see no "
+                    "live instances and will not reap anyone (fail-safe).",
+                    exc,
+                )
+
+            try:
+                zombie_reaper_cfg = await load_zombie_session_reaper_config()
+                bg_supervisor.register(ZombieSessionReaper(zombie_reaper_cfg))
+                logger.info(
+                    "CatalogModule: zombie-session reaper registered "
+                    "(enabled=%s, idle_threshold=%ds, interval=%ds).",
+                    zombie_reaper_cfg.enabled,
+                    zombie_reaper_cfg.idle_threshold_seconds,
+                    zombie_reaper_cfg.reaper_interval_seconds,
+                )
+            except Exception as exc:  # noqa: BLE001 — never block startup
+                logger.warning(
+                    "CatalogModule: zombie-session reaper failed to configure: "
+                    "%s — dead-instance sessions will not be automatically "
+                    "reaped.",
                     exc,
                 )
 
