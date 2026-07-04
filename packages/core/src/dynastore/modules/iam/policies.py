@@ -374,15 +374,32 @@ class PolicyService:
         if not policy.partition_key:
             policy.partition_key = "global"
 
-        async with managed_transaction(self._engine) as conn:
-            # 1. Ensure partition exists before inserting
-            from .postgres_policy_storage import PostgresPolicyStorage
+        # 1. Ensure the partition exists before inserting, provisioned on its
+        # own dedicated, short-lived transaction — NOT the write transaction
+        # below. ``CREATE TABLE ... PARTITION OF`` takes an ACCESS EXCLUSIVE
+        # lock on the shared parent ``policies`` table for the life of the
+        # enclosing transaction, not just the DDL statement; running it
+        # inline inside the same transaction as the duplicate-check + INSERT
+        # held that lock open for the whole request. This mirrors
+        # ``ensure_partitions_off_request_connection`` (ConSys/Styles/Moving
+        # Features, #2831) and the ingestion write path's pre-create-then-write
+        # phasing: the DDL commits (or is tolerated as a benign 42P07
+        # concurrent-create race) before the write transaction even opens, so
+        # a retry after any failure below is always safe — the partition is
+        # idempotently already there. IAM policy partitions are keyed
+        # directly by ``partition_key`` (not the generic hashed name
+        # ``ensure_partition_exists`` builds for data partitions), so
+        # ``ensure_policy_partition`` is called directly here rather than
+        # through that generic helper.
+        from .postgres_policy_storage import PostgresPolicyStorage
 
-            if isinstance(self.storage, PostgresPolicyStorage):
+        if isinstance(self.storage, PostgresPolicyStorage):
+            async with managed_transaction(self._engine) as ddl_conn:
                 await self.storage.ensure_policy_partition(
-                    conn, policy.partition_key, schema=schema
+                    ddl_conn, policy.partition_key, schema=schema
                 )
 
+        async with managed_transaction(self._engine) as conn:
             # 2. Check for duplicate IDs in the target partition. Filtering
             # by partition is required: the same id can exist across
             # partitions (e.g., default policies seeded into both
