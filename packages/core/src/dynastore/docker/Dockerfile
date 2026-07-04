@@ -337,6 +337,14 @@ ARG APP_GID=1001
 ARG APP_DIR=/dynastore
 ENV VENV_PATH=/opt/venv
 
+# Re-declared here (also set in the builder stage): this stage is a fresh
+# `FROM`, not `FROM builder`, so ENV values from the builder stage do not
+# carry over — only COPY --from brings filesystem content across stages.
+ARG BUILD_COMMIT=unknown
+ENV BUILD_COMMIT=${BUILD_COMMIT}
+ARG BUILD_TIME=
+ENV BUILD_TIME=${BUILD_TIME}
+
 # Install runtime dependencies (curl for healthchecks)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends sudo curl && \
