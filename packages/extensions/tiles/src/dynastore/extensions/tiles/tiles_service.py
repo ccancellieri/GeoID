@@ -925,52 +925,37 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 dataset, collections, z, x, y, effective_cache_enabled,
             )
 
-            # Acquire DB connection with pool-saturation guard.
-            # On timeout: try serving a stale cached tile before failing fast.
-            # acquire_engine_connection_bounded gives this a live-configurable
-            # deadline shorter than the engine's own pool_timeout, with the
-            # same pool hygiene (poisoned-slot eviction, rollback-on-checkout)
-            # every other managed_transaction consumer gets (#2933).
-            fg_timeout_s = await _read_live_fg_acquire_timeout()
-            try:
-                _conn = await acquire_engine_connection_bounded(
-                    get_async_engine(request), fg_timeout_s
-                )
-            except PoolSaturationError as exc:
-                logger.warning(
-                    "get_vector_tile: DB pool saturated (timeout=%.1fs) "
-                    "catalog=%s z=%s x=%s y=%s — attempting stale tile fallback",
-                    fg_timeout_s, dataset, z, x, y,
-                )
-                stale = await self._try_stale_tile_fallback(
-                    effective_cache_enabled, dataset, requested_cols_list,
-                    collections, params_hash, tileMatrixSetId, z, x, y,
-                    format, start_time,
-                )
-                if stale:
-                    return stale
-                raise HTTPException(
-                    status_code=503,
-                    detail="Database pool saturated, try again shortly.",
-                    headers={"Retry-After": str(exc.retry_after)},
-                ) from None
-            conn = _conn
-
             # 4. TMS & Coordinate Validation (HTTP-specific z/x/y bounds check;
             # stays here — tiles_engine.build_render_context re-resolves the
             # same TMS internally for the SRID/source-selection it owns).
+            # Runs before any DB connection is acquired — it's a cheap,
+            # cached lookup, not something worth holding pool capacity for.
             await self._validate_tms_and_matrix(dataset, tileMatrixSetId, z, x, y)
 
             # 5. Resolve the render context: collection metadata, TMS, target
             # SRID, and TileSource — consolidated with the preseed task's
             # identical resolution in tiles_engine.build_render_context.
+            #
+            # Resolved BEFORE the main render connection is acquired (#3014):
+            # the collection-metadata lookup this triggers
+            # (tiles_module.get_tile_resolution_params) always opens its own
+            # separate pooled connection regardless of what's passed as
+            # ``engine`` here, so running it while a render connection was
+            # already checked out meant every in-flight request could need
+            # two connections from the pool at once. Under a burst wide
+            # enough to approach the pool size, every request ends up
+            # holding its first connection while blocked on the second,
+            # deadlocking the pool. Passing the bare engine (not a checked-
+            # out connection) for the optional custom-CRS SRID resolution
+            # below is the same pattern already used by the preseed and
+            # export tasks, which never hold a render connection at all.
             from dynastore.modules.tiles import tiles_engine
             from dynastore.modules.tiles.tiles_source import TileSourceNotSupported
 
             try:
                 ctx = await tiles_engine.build_render_context(
-                    dataset, requested_cols_list, tileMatrixSetId, engine=conn,
-                    should_abort=_should_abort,
+                    dataset, requested_cols_list, tileMatrixSetId,
+                    engine=get_async_engine(request), should_abort=_should_abort,
                 )
             except TileSourceNotSupported as exc:
                 logger.error("get_vector_tile: %s", exc)
@@ -1028,6 +1013,42 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 return self._handle_render_aborted(
                     _abort_reason, dataset, collections, z, x, y, start_time,
                 )
+
+            # Acquire DB connection with pool-saturation guard.
+            # On timeout: try serving a stale cached tile before failing fast.
+            # acquire_engine_connection_bounded gives this a live-configurable
+            # deadline shorter than the engine's own pool_timeout, with the
+            # same pool hygiene (poisoned-slot eviction, rollback-on-checkout)
+            # every other managed_transaction consumer gets (#2933).
+            #
+            # Acquired last, once metadata resolution above is done (#3014) —
+            # this is the only connection a render ever needs to hold now, so
+            # a burst of concurrent requests can never deadlock the pool by
+            # each holding one connection while blocked on a second.
+            fg_timeout_s = await _read_live_fg_acquire_timeout()
+            try:
+                _conn = await acquire_engine_connection_bounded(
+                    get_async_engine(request), fg_timeout_s
+                )
+            except PoolSaturationError as exc:
+                logger.warning(
+                    "get_vector_tile: DB pool saturated (timeout=%.1fs) "
+                    "catalog=%s z=%s x=%s y=%s — attempting stale tile fallback",
+                    fg_timeout_s, dataset, z, x, y,
+                )
+                stale = await self._try_stale_tile_fallback(
+                    effective_cache_enabled, dataset, requested_cols_list,
+                    collections, params_hash, tileMatrixSetId, z, x, y,
+                    format, start_time,
+                )
+                if stale:
+                    return stale
+                raise HTTPException(
+                    status_code=503,
+                    detail="Database pool saturated, try again shortly.",
+                    headers={"Retry-After": str(exc.retry_after)},
+                ) from None
+            conn = _conn
 
             # Retrieve MVT content via the unified render engine — L1 cache
             # enabled (the live request-serving path); the preseed task

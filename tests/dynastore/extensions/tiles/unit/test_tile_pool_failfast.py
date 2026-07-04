@@ -103,6 +103,13 @@ async def test_get_vector_tile_returns_503_on_pool_timeout():
     """When engine.connect() times out, the handler raises HTTP 503."""
     svc = _make_service()
     svc._require_collection_visible = AsyncMock()
+    # Metadata/TMS resolution now runs before the connection is acquired
+    # (#3014) — mock it out so this test still exercises the pool-timeout
+    # path in isolation, not the real (DB-backed) TMS lookup. A real
+    # TilesConfig (not a bare MagicMock) is required too, since the render
+    # budget check now runs unconditionally ahead of the acquire attempt.
+    svc._validate_tms_and_matrix = AsyncMock(return_value=MagicMock(crs="EPSG:3857"))
+    svc._resolve_request_config = AsyncMock(return_value=TilesConfig())
 
     # Patch timeout to 0.01 s so test runs instantly
     async def _slow_timeout() -> float:
@@ -117,6 +124,8 @@ async def test_get_vector_tile_returns_503_on_pool_timeout():
     config_mock = MagicMock()
     config_mock.get_config = AsyncMock(return_value=MagicMock())
 
+    fake_ctx = MagicMock(target_srid=3857)
+
     with patch(
         "dynastore.extensions.tiles.tiles_service._read_live_fg_acquire_timeout",
         _slow_timeout,
@@ -126,6 +135,9 @@ async def test_get_vector_tile_returns_503_on_pool_timeout():
     ), patch(
         "dynastore.extensions.tiles.tiles_service.get_protocol",
         return_value=config_mock,
+    ), patch(
+        "dynastore.modules.tiles.tiles_engine.build_render_context",
+        AsyncMock(return_value=fake_ctx),
     ):
         with pytest.raises(HTTPException) as exc_info:
             await svc.get_vector_tile(
@@ -153,6 +165,10 @@ async def test_get_vector_tile_serves_stale_on_pool_timeout_with_cache():
     svc._require_collection_visible = AsyncMock()
     svc._resolve_request_config = AsyncMock(return_value=TilesConfig())
     svc._is_cache_enabled = AsyncMock(return_value=True)
+    # Metadata/TMS resolution now runs before the connection is acquired
+    # (#3014) — mock it out so this test still exercises the pool-timeout
+    # path in isolation, not the real (DB-backed) TMS lookup.
+    svc._validate_tms_and_matrix = AsyncMock(return_value=MagicMock(crs="EPSG:3857"))
 
     stale_response = FResponse(
         content=b"stale-mvt",
@@ -172,6 +188,14 @@ async def test_get_vector_tile_serves_stale_on_pool_timeout_with_cache():
 
     config_mock = MagicMock()
     config_mock.get_config = AsyncMock(return_value=MagicMock())
+    # get_protocol is patched to return this mock for every protocol
+    # requested, including TileArchiveStorageProtocol — the PMTiles archive
+    # fallback (now resolved ahead of the connection acquire) needs an
+    # awaitable here so it reports "no archive" and continues instead of
+    # crashing on a bare MagicMock.
+    config_mock.archive_exists = AsyncMock(return_value=False)
+
+    fake_ctx = MagicMock(target_srid=3857)
 
     # Simulate cache miss from the primary check (to reach the connect step)
     # but stale available on the fallback path
@@ -184,6 +208,9 @@ async def test_get_vector_tile_serves_stale_on_pool_timeout_with_cache():
     ), patch(
         "dynastore.extensions.tiles.tiles_service.get_protocol",
         return_value=config_mock,
+    ), patch(
+        "dynastore.modules.tiles.tiles_engine.build_render_context",
+        AsyncMock(return_value=fake_ctx),
     ):
         # Enable cache but not the primary try (disable_cache=False triggers cache
         # check; _try_cached_tile returns None first, then stale on second call)
