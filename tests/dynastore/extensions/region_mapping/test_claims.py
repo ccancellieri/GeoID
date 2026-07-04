@@ -22,7 +22,7 @@ claim-computation kernel + source-collection read helpers (dynastore#2821).
 from __future__ import annotations
 
 from typing import Any, List, Optional
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -269,6 +269,29 @@ async def test_fetch_collection_bbox_falls_back_to_world_bounds(monkeypatch: pyt
 
     bbox = await claims.fetch_collection_bbox("fao", "countries")
     assert bbox == list(claims.WORLD_BBOX)
+
+
+@pytest.mark.asyncio
+async def test_fetch_collection_bbox_second_call_is_served_from_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second call for the same (catalog_id, collection_id) within the TTL
+    must not re-invoke ``catalogs.get_collection`` -- that's the whole point
+    of caching this lookup: region.json calls it once per registered mapping
+    on every request, and ``get_collection`` is a heavyweight, multi-round-trip
+    hydration."""
+    from dynastore.extensions.region_mapping import claims
+
+    catalogs = _StubCatalogs(collection_extent_bbox=[10.0, 20.0, 30.0, 40.0])
+    get_collection = AsyncMock(wraps=catalogs.get_collection)
+    monkeypatch.setattr(catalogs, "get_collection", get_collection)
+    monkeypatch.setattr(claims, "get_protocol", lambda _t: catalogs)
+
+    first = await claims.fetch_collection_bbox("fao", "countries")
+    second = await claims.fetch_collection_bbox("fao", "countries")
+
+    assert first == second == [10.0, 20.0, 30.0, 40.0]
+    get_collection.assert_awaited_once()
 
 
 @pytest.mark.asyncio
