@@ -54,6 +54,7 @@ class ReaderRegistry:
     @classmethod
     def resolve(
         cls, uri: str, *, content_type: str | None = None,
+        reader_id: str | None = None,
     ) -> Type[SourceReaderProtocol]:
         """Highest-priority reader (= lowest priority value) whose
         ``can_read(uri, content_type=...)`` is True.  Raises
@@ -62,7 +63,22 @@ class ReaderRegistry:
 
         *content_type* is forwarded to each reader's ``can_read`` so
         readers can honour a MIME hint when the URI suffix is unknown.
+
+        *reader_id*, when given, bypasses ``can_read``/priority scanning
+        entirely and returns the reader registered under that exact id —
+        this is the explicit per-request override (e.g. forcing
+        ``gdal_osgeo`` instead of ``pyogrio`` to A/B test a reader without
+        a redeploy).  Raises :class:`LookupError` naming the registered
+        ids if no reader matches.
         """
+        if reader_id is not None:
+            for reader_cls in cls._registered:
+                if reader_cls.reader_id == reader_id:
+                    return reader_cls
+            raise LookupError(
+                f"No registered reader with reader_id={reader_id!r}. "
+                f"Registered: {[c.reader_id for c in cls._registered]}"
+            )
         for reader_cls in cls._registered:
             try:
                 if reader_cls.can_read(uri, content_type=content_type):

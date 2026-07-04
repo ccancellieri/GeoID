@@ -147,9 +147,15 @@ def test_row_cap_default_is_50() -> None:
 def test_read_batch_size_forwarded_to_reader() -> None:
     """read_batch_size must be threaded from the task request into the reader's
     open() call so pyogrio (the fallback reader) can chunk rather than
-    materialise the whole GeoDataFrame at once."""
+    materialise the whole GeoDataFrame at once.
+
+    Built via an ``open_kwargs`` dict (GeoID #2981) rather than a literal
+    keyword argument, so ``task_request.reader_options`` can override it
+    without colliding as a duplicate kwarg — assert on the dict entry, not
+    the old literal-kwarg spelling.
+    """
     src = inspect.getsource(run_ingestion_task)
-    assert "read_batch_size=task_request.read_batch_size" in src, (
+    assert '"read_batch_size": task_request.read_batch_size' in src, (
         "run_ingestion_task no longer forwards read_batch_size to the reader. "
         "Without it, PyogrioReader falls back to its internal default and the "
         "task-level override has no effect on the reader's chunk size."

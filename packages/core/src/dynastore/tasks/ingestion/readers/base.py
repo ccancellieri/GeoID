@@ -142,6 +142,7 @@ def register_reader(cls: Type[SourceReaderProtocol]) -> Type[SourceReaderProtoco
 
 def resolve_reader(
     uri: str, *, content_type: Optional[str] = None,
+    reader_id: Optional[str] = None,
 ) -> Type[SourceReaderProtocol]:
     """Return the highest-priority registered reader whose ``can_read(uri)``
     matches.  Raises :class:`LookupError` if no reader matches.
@@ -149,20 +150,40 @@ def resolve_reader(
     *content_type* is an optional MIME hint used to recover when the
     URI itself carries no recognisable suffix (e.g. an asset uploaded
     with a bare filename).
+
+    *reader_id*, when given, forces the reader with that exact
+    ``reader_id`` and skips the ``can_read``/priority scan — see
+    :meth:`ReaderRegistry.resolve`.
     """
     from .registry import ReaderRegistry
-    return ReaderRegistry.resolve(uri, content_type=content_type)
+    return ReaderRegistry.resolve(uri, content_type=content_type, reader_id=reader_id)
 
 
-def _to_vsigs(uri: str) -> str:
+def _to_vsigs(uri: str, *, use_vsicache: bool = False) -> str:
     """Translate ``gs://bucket/key`` → ``/vsigs/bucket/key`` for GDAL.
 
     Many of GDAL's drivers know ``/vsigs/``; fewer know ``gs://``
     natively.  Round-tripping here keeps every GDAL-backed reader
     consistent and lets a future S3 / Azure migration adjust ONE place.
+
+    *use_vsicache*, when True, wraps the translated ``/vsigs/`` path with
+    GDAL's ``/vsicached/`` local block-cache VSI (GeoID #2981): SQLite's
+    B-tree does random-access reads over ``/vsigs/``'s HTTP-range shim,
+    and without a local read cache each seek re-issues a fresh ranged GET
+    against a view of the file that can have moved on since the previous
+    read — a suspected contributor to the ``database disk image is
+    malformed`` crash on an 8.4M-feature GeoPackage ingest.  Note GDAL's
+    actual syntax for this VSI is the query-string form
+    ``/vsicached?file=<url-encoded-inner-path>``, not a path prefix —
+    see https://gdal.org/en/latest/user/virtual_file_systems.html#vsicached-caching-a-vsi-file
     """
     if uri.startswith("gs://"):
-        return "/vsigs/" + uri[len("gs://"):]
+        vsigs = "/vsigs/" + uri[len("gs://"):]
+        if use_vsicache:
+            from urllib.parse import quote
+
+            return f"/vsicached?file={quote(vsigs, safe='/:')}"
+        return vsigs
     if uri.startswith("file://"):
         # Local / on-prem asset: strip the ``file://`` scheme to a plain path;
         # GDAL/OGR readers cannot open a ``file://`` URI directly.

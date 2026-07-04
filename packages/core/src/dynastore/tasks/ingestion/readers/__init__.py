@@ -48,7 +48,7 @@ from .registry import ReaderRegistry
 import logging as _logging  # noqa: E402
 _logger = _logging.getLogger(__name__)
 
-for _mod in ("osgeo_reader", "pyogrio_reader"):
+for _mod in ("osgeo_reader", "pyogrio_reader", "duckdb_reader"):
     try:
         __import__(f"{__name__}.{_mod}")
     except ImportError as _exc:  # noqa: PERF203

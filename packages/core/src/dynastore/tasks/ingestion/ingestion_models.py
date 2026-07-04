@@ -110,6 +110,9 @@ class TaskIngestionRequest(BaseModel):
     limit: Optional[int] = Field(default=None, description="Maximum number of records to process from the source file.")
     read_batch_size:  int = Field(default=1000, description="Number of records to read from the source file if supported by the source file format.")
 
+    reader: Optional[str] = Field(default=None, description="Explicit reader_id override (e.g. 'gdal_osgeo', 'pyogrio', 'duckdb'). When unset, the registry auto-selects by priority/extension match.")
+    reader_options: Optional[Dict[str, Any]] = Field(default=None, description="Extra reader-specific options forwarded to the chosen reader's open() call (e.g. {'read_batch_size': 500, 'use_vsicache': True}). Overrides the corresponding top-level field (e.g. read_batch_size) when both are set.")
+
     @model_validator(mode='after')
     def validate_asset_present(self) -> 'TaskIngestionRequest':
         """

@@ -883,6 +883,7 @@ async def run_ingestion_task(
 
             _count_reader = resolve_reader(
                 source_file_path, content_type=source_content_type,
+                reader_id=task_request.reader,
             )()
             total_features = _count_reader.feature_count(
                 source_file_path, content_type=source_content_type,
@@ -1090,22 +1091,29 @@ async def run_ingestion_task(
 
         reader_cls = resolve_reader(
             source_file_path, content_type=source_content_type,
+            reader_id=task_request.reader,
         )
         reader_inst = reader_cls()
         logger.info(
-            "ingestion: source %r (content_type=%r) → reader '%s'",
+            "ingestion: source %r (content_type=%r) → reader '%s'%s",
             source_file_path, source_content_type,
             reader_cls.reader_id or reader_cls.__name__,
+            " (explicit override)" if task_request.reader else "",
         )
 
-        with reader_inst.open(
-            source_file_path,
-            encoding=task_request.encoding,
-            content_type=source_content_type,
-            task_id=task_id,
-            task_schema=phys_schema,
-            read_batch_size=task_request.read_batch_size,
-        ) as reader:
+        # Built as a dict (not passed as literal kwargs) so reader_options can
+        # cleanly override a default (e.g. read_batch_size) instead of colliding
+        # as a duplicate keyword argument.
+        open_kwargs: Dict[str, Any] = {
+            "encoding": task_request.encoding,
+            "content_type": source_content_type,
+            "task_id": task_id,
+            "task_schema": phys_schema,
+            "read_batch_size": task_request.read_batch_size,
+        }
+        open_kwargs.update(task_request.reader_options or {})
+
+        with reader_inst.open(source_file_path, **open_kwargs) as reader:
             sliced_reader = itertools.islice(
                 reader,
                 task_request.offset,

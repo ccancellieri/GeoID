@@ -74,7 +74,7 @@ class PyogrioReader(SourceReaderProtocol):
         content_type: str | None = None,  # noqa: ARG002 — forwarded by registry, unused here
         **opts: Any,
     ) -> Iterator[Iterable[dict]]:
-        path = _to_vsigs(uri)
+        path = _to_vsigs(uri, use_vsicache=bool(opts.get("use_vsicache", False)))
         chunk_size: int = opts.get("read_batch_size", 1000)  # type: ignore[assignment]
 
         def _iter_chunks() -> Iterator[dict]:

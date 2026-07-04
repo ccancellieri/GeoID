@@ -143,7 +143,9 @@ class GdalOsgeoReader(SourceReaderProtocol):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _to_gdal_uri(uri: str, *, is_zip: bool | None = None) -> str:
+    def _to_gdal_uri(
+        uri: str, *, is_zip: bool | None = None, use_vsicache: bool = False,
+    ) -> str:
         """Normalize the URI for GDAL.  Translates ``gs://`` and wraps
         zipped shapefiles with ``/vsizip/`` when needed.
 
@@ -151,6 +153,11 @@ class GdalOsgeoReader(SourceReaderProtocol):
         URI itself lacks the ``.zip`` suffix (e.g. an asset uploaded
         with a bare filename, where the caller knows the content_type
         is ``application/zip``).
+
+        *use_vsicache* wraps the non-zip path with GDAL's ``/vsicached/``
+        local block-cache VSI (see ``_to_vsigs``) — not applied to the zip
+        branch since archives are already staged to local disk before
+        feature iteration (see ``_extract_archive_to_local``).
 
         When the underlying object's path lacks a recognised archive
         extension we use GDAL's curly-brace notation
@@ -162,7 +169,7 @@ class GdalOsgeoReader(SourceReaderProtocol):
         if is_zip is None:
             is_zip = out.lower().endswith(".zip")
         if not is_zip:
-            return out
+            return _to_vsigs(uri, use_vsicache=use_vsicache) if use_vsicache else out
         # GDAL autodetects the archive boundary on these extensions.
         if out.lower().endswith((".zip", ".kmz", ".ods", ".xlsx")):
             return "/vsizip/" + out
@@ -203,6 +210,7 @@ class GdalOsgeoReader(SourceReaderProtocol):
         **opts: Any,
     ) -> Generator[Iterable[dict], None, None]:
         from dynastore.tools.mime import ext_from_content_type
+        use_vsicache = bool(opts.get("use_vsicache", False))
         is_zip = (ext_from_content_type(content_type) or "").lower() == ".zip"
         if is_zip is None or not is_zip:
             is_zip = _to_vsigs(uri).lower().endswith(".zip")
@@ -228,7 +236,7 @@ class GdalOsgeoReader(SourceReaderProtocol):
                     path = self._find_local_dataset(local_dir)
                     yield from self._open_path_and_iter(path)
             else:
-                path = self._to_gdal_uri(uri, is_zip=False)
+                path = self._to_gdal_uri(uri, is_zip=False, use_vsicache=use_vsicache)
                 yield from self._open_path_and_iter(path)
         finally:
             if prev_enc is None:
