@@ -1,18 +1,19 @@
-# Admin Boundaries — Fixed-Schema Fixtures
+# Admin Boundaries — Fixed-Schema Fixture
 
 Sample data for the fixed-schema columnar recipe described in
-[issue #447](https://github.com/un-fao/GeoID/issues/447).
-
-The interactive walkthrough notebook that used to live here was retired with
-the teaching-notebook consolidation: catalog/collection lifecycle is covered
-by the `catalog_lifecycle_with_presets` platform notebook and ingestion by
-`ingestion_virtual_asset` (both seeded into JupyterLite at startup).
+[issue #447](https://github.com/un-fao/GeoID/issues/447). Previously lived
+under `notebooks/admin_boundaries_fixed_schema/` alongside an interactive
+walkthrough notebook; that notebook was retired with the teaching-notebook
+consolidation (catalog/collection lifecycle is now covered by the
+`catalog_lifecycle_with_presets` platform notebook and ingestion by
+`ingestion_virtual_asset`, both seeded into JupyterLite at startup), so the
+fixture moved here to sit with the test that actually uses it.
 
 ## Files
 
 | Path | Role |
 |---|---|
-| `fixtures/admin_boundaries.geojson` | 3-feature country sample with `code` external-id field (used by `test_bootstrap_schema_composition.py`) |
+| `admin_boundaries.geojson` | 3-feature country sample with `code` external-id field (used by `test_bootstrap_schema_composition.py`) |
 
 ## Platform gaps (tracked)
 
