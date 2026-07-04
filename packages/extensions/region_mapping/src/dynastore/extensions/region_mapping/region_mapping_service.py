@@ -226,6 +226,24 @@ def _parse_cql(filter_text: Optional[str]) -> tuple[str, Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# CSV formula-injection guard
+# ---------------------------------------------------------------------------
+
+
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _escape_csv_cell(value: str) -> str:
+    """Neutralize CSV/formula injection (OWASP): a cell whose first
+    character would be interpreted as a formula trigger by Excel/Sheets
+    gets a leading single quote so it opens as literal text instead.
+    """
+    if value.startswith(_CSV_FORMULA_PREFIXES):
+        return f"'{value}"
+    return value
+
+
+# ---------------------------------------------------------------------------
 # /definitions rendering
 # ---------------------------------------------------------------------------
 
@@ -548,8 +566,8 @@ class RegionMappingService(ExtensionProtocol):
 
         buffer = io.StringIO()
         writer = csv.writer(buffer)
-        writer.writerow([header])
-        writer.writerows([value] for value in values)
+        writer.writerow([_escape_csv_cell(header)])
+        writer.writerows([_escape_csv_cell(value)] for value in values)
 
         return Response(
             content=buffer.getvalue(),

@@ -576,6 +576,78 @@ async def test_region_ids_csv_unknown_mapping_returns_404(monkeypatch: pytest.Mo
     assert resp.status_code == 404
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dangerous_value", ["=SUM(A1:A9)", "+1+1", "-123", "@cmd"])
+async def test_region_ids_csv_escapes_formula_injection_in_values(
+    monkeypatch: pytest.MonkeyPatch, dangerous_value: str,
+) -> None:
+    """Values starting with =, +, -, @ come back quoted so Excel/Sheets
+    won't interpret them as a formula (OWASP CSV injection)."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    app = _app(monkeypatch, _StubCatalogs({}))
+    monkeypatch.setattr(
+        svc._store, "fetch_mapping_primary",
+        AsyncMock(return_value={
+            "src_catalog": "fao", "src_collection": "countries",
+            "region_prop": "adm0_code", "alias": "iso3",
+        }),
+    )
+    monkeypatch.setattr(svc, "fetch_distinct_region_ids", AsyncMock(return_value=[dangerous_value, "DEU"]))
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/region-mappings/fao_countries/regionIds.csv")
+
+    assert resp.text.splitlines() == ["iso3", f"'{dangerous_value}", "DEU"]
+
+
+@pytest.mark.asyncio
+async def test_region_ids_csv_escapes_formula_injection_in_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The header cell (mapping alias) is just as attacker-influenceable
+    as the values and gets the same escaping."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    app = _app(monkeypatch, _StubCatalogs({}))
+    monkeypatch.setattr(
+        svc._store, "fetch_mapping_primary",
+        AsyncMock(return_value={
+            "src_catalog": "fao", "src_collection": "countries",
+            "region_prop": "adm0_code", "alias": "=HYPERLINK(evil)",
+        }),
+    )
+    monkeypatch.setattr(svc, "fetch_distinct_region_ids", AsyncMock(return_value=["DEU"]))
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/region-mappings/fao_countries/regionIds.csv")
+
+    assert resp.text.splitlines() == ["'=HYPERLINK(evil)", "DEU"]
+
+
+@pytest.mark.asyncio
+async def test_region_ids_csv_leaves_benign_values_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    app = _app(monkeypatch, _StubCatalogs({}))
+    monkeypatch.setattr(
+        svc._store, "fetch_mapping_primary",
+        AsyncMock(return_value={
+            "src_catalog": "fao", "src_collection": "countries",
+            "region_prop": "adm0_code", "alias": "iso3",
+        }),
+    )
+    monkeypatch.setattr(svc, "fetch_distinct_region_ids", AsyncMock(return_value=["DEU", "FRA", "ITA"]))
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/region-mappings/fao_countries/regionIds.csv")
+
+    assert resp.text.splitlines() == ["iso3", "DEU", "FRA", "ITA"]
+
+
 # ---------------------------------------------------------------------------
 # TerriaJS parameters + multilanguage description (dynastore#443 follow-up)
 # ---------------------------------------------------------------------------
