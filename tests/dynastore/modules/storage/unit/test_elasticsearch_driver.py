@@ -27,7 +27,6 @@ from dynastore.modules.storage.drivers.elasticsearch_private import (
     ItemsElasticsearchPrivateDriver,
 )
 from dynastore.models.ogc import Feature, FeatureCollection
-from dynastore.models.protocols.storage_driver import Capability
 from dynastore.modules.storage.errors import SoftDeleteNotSupportedError
 
 
@@ -86,28 +85,8 @@ class TestElasticsearchBase:
 
 
 class TestItemsElasticsearchDriverMeta:
-    def test_driver_class_name(self):
-        driver = ItemsElasticsearchDriver()
-        assert type(driver).__name__ == "ItemsElasticsearchDriver"
-
-    def test_priority(self):
-        driver = ItemsElasticsearchDriver()
-        assert driver.priority == 50
-
-    def test_capabilities(self):
-        driver = ItemsElasticsearchDriver()
-        assert Capability.STREAMING in driver.capabilities
-        assert Capability.SOFT_DELETE in driver.capabilities
-
-    def test_read_flavour_hints(self):
-        """Read-flavour capabilities moved from ``Capability`` to
-        ``Hint`` in PR #3b — the driver self-declares them via
-        ``supported_hints``."""
-        from dynastore.modules.storage.hints import Hint
-        driver = ItemsElasticsearchDriver()
-        assert Hint.FULLTEXT in driver.supported_hints
-        assert Hint.SPATIAL_FILTER in driver.supported_hints
-        assert Hint.AGGREGATION in driver.supported_hints
+    """Driver class name / priority / capabilities / read-flavour hints
+    are pinned once for all drivers in ``test_driver_meta_contract.py``."""
 
     @pytest.mark.asyncio
     async def test_export_entities_not_implemented(self):
@@ -117,18 +96,10 @@ class TestItemsElasticsearchDriverMeta:
 
 
 class TestItemsElasticsearchPrivateDriverMeta:
-    def test_driver_class_name(self):
-        driver = ItemsElasticsearchPrivateDriver()
-        assert type(driver).__name__ == "ItemsElasticsearchPrivateDriver"
-
-    def test_priority(self):
-        driver = ItemsElasticsearchPrivateDriver()
-        assert driver.priority == 51
-
-    def test_capabilities(self):
-        driver = ItemsElasticsearchPrivateDriver()
-        assert Capability.STREAMING in driver.capabilities
-        assert Capability.SOFT_DELETE not in driver.capabilities
+    """Driver class name / priority / capabilities are pinned once for
+    all drivers in ``test_driver_meta_contract.py``; ``test_has_search_hints``
+    below additionally pins opt-in-only routing behaviour, which is
+    driver-specific and stays here."""
 
     @pytest.mark.asyncio
     async def test_export_entities_not_implemented(self):

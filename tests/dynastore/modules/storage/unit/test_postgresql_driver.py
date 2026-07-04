@@ -24,35 +24,14 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from dynastore.modules.storage.drivers.postgresql import ItemsPostgresqlDriver
 from dynastore.models.ogc import Feature
-from dynastore.models.protocols.storage_driver import Capability
 from dynastore.models.query_builder import QueryRequest
 from dynastore.modules.storage.errors import SoftDeleteNotSupportedError
 from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
 
 
 class TestItemsPostgresqlDriverMeta:
-    def test_driver_class_name(self):
-        driver = ItemsPostgresqlDriver()
-        assert type(driver).__name__ == "ItemsPostgresqlDriver"
-
-    def test_priority(self):
-        driver = ItemsPostgresqlDriver()
-        assert driver.priority == 10
-
-    def test_capabilities(self):
-        driver = ItemsPostgresqlDriver()
-        assert Capability.STREAMING in driver.capabilities
-        assert Capability.SOFT_DELETE in driver.capabilities
-        assert Capability.EXPORT in driver.capabilities
-        assert Capability.READ_ONLY not in driver.capabilities
-
-    def test_read_flavour_hints(self):
-        """Read-flavour capabilities moved to ``Hint`` in PR #3b."""
-        from dynastore.modules.storage.hints import Hint
-        driver = ItemsPostgresqlDriver()
-        assert Hint.SPATIAL_FILTER in driver.supported_hints
-        assert Hint.AGGREGATION in driver.supported_hints
-        assert Hint.GEOMETRY_EXACT in driver.supported_hints
+    """Driver class name / priority / capabilities / read-flavour hints
+    are pinned once for all drivers in ``test_driver_meta_contract.py``."""
 
     def test_is_available_with_items_protocol(self):
         with patch("dynastore.tools.discovery.get_protocol") as mock_gp:

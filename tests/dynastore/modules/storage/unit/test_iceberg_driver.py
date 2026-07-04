@@ -31,7 +31,6 @@ import pytest
 from unittest.mock import AsyncMock, patch
 from datetime import datetime, timezone
 
-from dynastore.models.protocols.storage_driver import Capability
 from dynastore.modules.storage.driver_config import ItemsIcebergDriverConfig, IcebergConfig
 from dynastore.modules.storage.drivers.iceberg import (
     ItemsIcebergDriver,
@@ -191,30 +190,8 @@ def _write_rows(table, rows):
 
 
 class TestIcebergDriverMeta:
-    def test_driver_class_name(self):
-        assert type(ItemsIcebergDriver()).__name__ == "ItemsIcebergDriver"
-
-    def test_priority(self):
-        assert ItemsIcebergDriver().priority == 20
-
-    def test_capabilities(self):
-        caps = ItemsIcebergDriver().capabilities
-        assert Capability.STREAMING in caps
-        assert Capability.EXPORT in caps
-        assert Capability.TIME_TRAVEL in caps
-        assert Capability.VERSIONING in caps
-        assert Capability.SNAPSHOTS in caps
-        assert Capability.SCHEMA_EVOLUTION in caps
-        assert Capability.SOFT_DELETE in caps
-        assert Capability.READ_ONLY not in caps
-
-    def test_read_flavour_hints(self):
-        """Read-flavour capabilities moved to ``Hint`` in PR #3b."""
-        from dynastore.modules.storage.hints import Hint
-        hints = ItemsIcebergDriver().supported_hints
-        assert Hint.SPATIAL_FILTER in hints
-        assert Hint.STATISTICS in hints
-        assert Hint.SORT in hints
+    """Driver class name / priority / capabilities / read-flavour hints
+    are pinned once for all drivers in ``test_driver_meta_contract.py``."""
 
     def test_is_available_true(self):
         assert ItemsIcebergDriver().is_available() is True

@@ -20,28 +20,10 @@ import pytest
 
 
 class TestDriverMeta:
-    def test_class_name_matches_routing_contract(self):
-        from dynastore.modules.storage.drivers.bigquery import ItemsBigQueryDriver
-        assert ItemsBigQueryDriver.__name__ == "ItemsBigQueryDriver"
-
-    def test_capabilities_set(self):
-        """Phase 3 adds WRITE (reporter-mode, opt-in via reporter_mode config)."""
-        from dynastore.modules.storage.drivers.bigquery import ItemsBigQueryDriver
-        from dynastore.modules.storage.hints import Hint
-        d = ItemsBigQueryDriver()
-        caps = d.capabilities
-        assert "READ" in caps
-        assert "STREAMING" in caps
-        assert "INTROSPECTION" in caps
-        # PR #3b: COUNT and AGGREGATION moved from ``Capability`` to
-        # ``Hint`` — drivers self-declare them via ``supported_hints``.
-        assert Hint.COUNT in d.supported_hints
-        assert Hint.AGGREGATION in d.supported_hints
-        # Phase 3: WRITE capability is declared at the class level so the
-        # driver can participate in routing-config WRITE fan-outs.  Actual
-        # write behaviour is gated by reporter_mode on the per-collection
-        # config — default "off" means WRITE is a no-op.
-        assert "WRITE" in caps
+    """Driver class name / priority / capabilities / read-flavour hints
+    are pinned once for all drivers in ``test_driver_meta_contract.py``
+    (see that table's ``ItemsBigQueryDriver`` row for the WRITE/reporter_mode
+    note)."""
 
     def test_preferred_for_features(self):
         from dynastore.modules.storage.drivers.bigquery import ItemsBigQueryDriver

@@ -23,7 +23,6 @@ import time
 import pytest
 from unittest.mock import AsyncMock, patch
 
-from dynastore.models.protocols.storage_driver import Capability
 from dynastore.modules.storage.errors import (
     ReadOnlyDriverError,
     SoftDeleteNotSupportedError,
@@ -32,31 +31,8 @@ from dynastore.modules.storage.driver_config import ItemsDuckdbDriverConfig
 
 
 class TestDuckDBDriverMeta:
-    def test_driver_class_name(self):
-        from dynastore.modules.storage.drivers.duckdb import ItemsDuckdbDriver
-        driver = ItemsDuckdbDriver()
-        assert type(driver).__name__ == "ItemsDuckdbDriver"
-
-    def test_priority(self):
-        from dynastore.modules.storage.drivers.duckdb import ItemsDuckdbDriver
-        driver = ItemsDuckdbDriver()
-        assert driver.priority == 30
-
-    def test_capabilities(self):
-        from dynastore.modules.storage.drivers.duckdb import ItemsDuckdbDriver
-        driver = ItemsDuckdbDriver()
-        assert Capability.READ in driver.capabilities
-        assert Capability.STREAMING in driver.capabilities
-        assert Capability.EXPORT in driver.capabilities
-
-    def test_read_flavour_hints(self):
-        """Read-flavour capabilities moved to ``Hint`` in PR #3b."""
-        from dynastore.modules.storage.drivers.duckdb import ItemsDuckdbDriver
-        from dynastore.modules.storage.hints import Hint
-        driver = ItemsDuckdbDriver()
-        assert Hint.SPATIAL_FILTER in driver.supported_hints
-        assert Hint.SORT in driver.supported_hints
-        assert Hint.GROUP_BY in driver.supported_hints
+    """Driver class name / priority / capabilities / read-flavour hints
+    are pinned once for all drivers in ``test_driver_meta_contract.py``."""
 
     def test_is_available_without_duckdb(self):
         from dynastore.modules.storage.drivers.duckdb import ItemsDuckdbDriver
