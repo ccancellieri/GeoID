@@ -143,45 +143,54 @@ def _resolve_payload_model(target_task: object, task_name: str) -> type:
 async def report_failure(task_id: str, schema: str, error_message: str):
     """
     Attempts to report a fatal failure to the database.
-    This helper initializes just enough of the module system to update the task status.
+
+    Last-resort fallback (#2887): reached from a bare ``asyncio.run()`` in the
+    ``__main__`` handler, after ``main()`` itself has already unwound and the
+    in-lifecycle attempt (inside ``main()``) either failed or never got a
+    chance to run. Standing up the FULL module graph here — Tiles,
+    MovingFeatures, Stats, ConnectedSystems, a fresh DB engine/pool, a fresh ES
+    client, and a second ``BackgroundSupervisor`` — purely to flip one row to
+    FAILED is itself expensive enough to tip an already memory-pressured
+    process into OOM. Writing the FAILED status only needs a DB connection and
+    the ``tasks`` table UPDATE, so this opens its own bare, ``NullPool``-backed
+    async engine and calls ``update_task`` directly — the same minimal-footprint
+    pattern ``StorageDrainTask.run()`` / ``EventDrainTask.run()`` already use to
+    build their own engines without any module bootstrap.
     """
     if not task_id or not schema:
         logger.error("Cannot report failure to DB: task_id or schema missing.")
         return
 
+    engine = None
     try:
-        from dynastore import modules
-        from dynastore.modules.tasks.models import TaskUpdate, TaskStatusEnum
+        from sqlalchemy.ext.asyncio import create_async_engine
+        from sqlalchemy.pool import NullPool
 
-        app_state = SimpleNamespace()
-        # Initialize foundational modules for reporting (failsafe)
-        from dynastore.tasks.bootstrap import bootstrap_task_env
-        bootstrap_task_env(app_state)
+        from dynastore.modules.db_config.db_config import DBConfig
+        from dynastore.modules.db_config.db_timeout_config import (
+            task_engine_connect_args,
+        )
+        from dynastore.modules.db_config.tools import normalize_db_url
+        from dynastore.modules.tasks.models import TaskStatusEnum, TaskUpdate
+        from dynastore.modules.tasks.tasks_module import update_task
 
-        async with modules.lifespan(app_state):
-            logger.info(f"Reporting failure for task '{task_id}' in schema '{schema}'...")
-            from dynastore.modules import get_protocol
-            from dynastore.models.protocols import DatabaseProtocol, TasksProtocol
+        db_url = normalize_db_url(DBConfig.database_url, is_async=True)
+        engine = create_async_engine(
+            db_url, poolclass=NullPool, connect_args=task_engine_connect_args(DBConfig)
+        )
 
-            db = get_protocol(DatabaseProtocol)
-            if not db:
-                logger.warning("DatabaseProtocol implementation not found. Cannot report failure to DB.")
-                return
-            engine = db.engine
-
-            tasks_mgr = get_protocol(TasksProtocol)
-            if not tasks_mgr:
-                logger.warning("TasksProtocol implementation not found. Cannot report failure to DB.")
-                return
-
-            update_data = TaskUpdate(
-                status=TaskStatusEnum.FAILED,
-                error_message=f"Fatal Runner Error: {error_message}"
-            )
-            await tasks_mgr.update_task(engine, uuid.UUID(task_id), update_data, schema=schema)
-            logger.info(f"Successfully reported failure for task '{task_id}'.")
+        logger.info(f"Reporting failure for task '{task_id}' in schema '{schema}'...")
+        update_data = TaskUpdate(
+            status=TaskStatusEnum.FAILED,
+            error_message=f"Fatal Runner Error: {error_message}"
+        )
+        await update_task(engine, uuid.UUID(task_id), update_data, schema=schema)
+        logger.info(f"Successfully reported failure for task '{task_id}'.")
     except Exception as e:
         logger.critical(f"Failed to report failure to database: {e}", exc_info=True)
+    finally:
+        if engine is not None:
+            await engine.dispose()
 
 async def main(task_name: str, payload: dict, schema: str):
     """

@@ -720,3 +720,268 @@ def test_coerce_payload_malformed_degrades_with_warning(caplog):
     assert len(warnings) == 3, (
         f"each malformed payload must warn; got {[r.getMessage() for r in warnings]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 11. In-process wall-clock/row drain budget handoff (#2887) — serving tier only
+#
+# EventDrainTask's ``while True`` loop used to have no escape hatch — a large
+# tasks.events backlog could pin a single execution open for hours. If
+# cumulative elapsed wall-clock or cumulative claimed rows crosses
+# TasksPluginConfig.event_drain_inprocess_max_seconds /
+# event_drain_inprocess_max_rows while backlog rows still remain, an
+# in-process (serving-tier) run() stops early and hands the remainder off to
+# a fresh event_drain execution. The budget is SKIPPED ENTIRELY when this
+# execution IS the async-writer Cloud Run Job (app_state.ephemeral_job) — the
+# Job always drains to empty, unbounded, exactly like StorageDrainOffloadTask
+# (a long single Job execution is no longer a hazard once #2887's Gap-A
+# report_failure fix removed the actual OOM mechanism).
+# Mirrors StorageDrainTask's byte/wall-clock self-escape test shape.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_hands_off_when_row_budget_exceeded_with_backlog_remaining():
+    """A single over-budget batch stops the loop immediately (not drain to
+    empty) and calls _handoff_to_offload_job exactly once."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from dynastore.tasks.workclass_drain.event_drain_task import EventDrainTask
+
+    task = EventDrainTask(inprocess_max_rows=3, inprocess_max_seconds=999.0)
+    fake_engine = MagicMock()
+    fake_engine.dispose = AsyncMock()
+
+    calls = {"n": 0}
+
+    async def _fake_drain_once(*, engine, owner_id):
+        calls["n"] += 1
+        return 5  # exceeds the 3-row budget in a single batch; backlog likely remains
+
+    handoff = AsyncMock()
+
+    with (
+        patch("sqlalchemy.ext.asyncio.create_async_engine", return_value=fake_engine),
+        patch.object(task, "drain_once", new=_fake_drain_once),
+        patch.object(task, "_handoff_to_offload_job", new=handoff),
+    ):
+        report = await task.run(MagicMock())
+
+    handoff.assert_awaited_once_with(fake_engine)
+    assert calls["n"] == 1, "must stop after the first over-budget batch, not loop to empty"
+    assert report.metrics["drained"] == 5
+
+
+@pytest.mark.asyncio
+async def test_run_hands_off_when_time_budget_exceeded_with_backlog_remaining():
+    """Slow delivery that blows the wall-clock budget triggers the same
+    handoff, independent of row count (kept well under the row budget)."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from dynastore.tasks.workclass_drain.event_drain_task import EventDrainTask
+
+    task = EventDrainTask(inprocess_max_rows=0, inprocess_max_seconds=0.02)
+    fake_engine = MagicMock()
+    fake_engine.dispose = AsyncMock()
+
+    calls = {"n": 0}
+
+    async def _fake_drain_once(*, engine, owner_id):
+        calls["n"] += 1
+        await asyncio.sleep(0.05)  # simulated slow delivery — well over the 0.02s budget
+        return 3
+
+    handoff = AsyncMock()
+
+    with (
+        patch("sqlalchemy.ext.asyncio.create_async_engine", return_value=fake_engine),
+        patch.object(task, "drain_once", new=_fake_drain_once),
+        patch.object(task, "_handoff_to_offload_job", new=handoff),
+    ):
+        await task.run(MagicMock())
+
+    handoff.assert_awaited_once_with(fake_engine)
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_generous_budget_drains_to_empty_without_handoff():
+    """A budget nothing in the run ever crosses drains to empty exactly like
+    the pre-#2887 loop — no handoff is ever attempted."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from dynastore.tasks.workclass_drain.event_drain_task import EventDrainTask
+
+    task = EventDrainTask(inprocess_max_rows=10**6, inprocess_max_seconds=999.0)
+    fake_engine = MagicMock()
+    fake_engine.dispose = AsyncMock()
+
+    calls = {"n": 0}
+
+    async def _fake_drain_once(*, engine, owner_id):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return 5
+        return 0
+
+    handoff = AsyncMock()
+
+    with (
+        patch("sqlalchemy.ext.asyncio.create_async_engine", return_value=fake_engine),
+        patch.object(task, "drain_once", new=_fake_drain_once),
+        patch.object(task, "_handoff_to_offload_job", new=handoff),
+    ):
+        report = await task.run(MagicMock())
+
+    handoff.assert_not_awaited()
+    assert calls["n"] == 3, "must loop until drain_once reports 0 (drain to empty)"
+    assert report.metrics["drained"] == 10
+
+
+@pytest.mark.asyncio
+async def test_handoff_to_offload_job_uses_distinct_dedup_key():
+    """_handoff_to_offload_job must enqueue its trigger under a dedup_key
+    distinct from the live co-transactional trigger's ("event_drain") — the
+    currently-running execution's own row is still non-terminal (ACTIVE), so
+    reusing that key would make the handoff a permanent no-op against itself.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from dynastore.tasks.workclass_drain.event_drain_task import EventDrainTask
+
+    task = EventDrainTask()
+    fake_engine = MagicMock()
+    trigger_mock = AsyncMock()
+
+    with (
+        patch(
+            "dynastore.modules.db_config.query_executor.managed_transaction",
+        ) as managed_tx_mock,
+        patch(
+            "dynastore.modules.tasks.events.events_emit._enqueue_event_drain_trigger",
+            new=trigger_mock,
+        ),
+    ):
+        fake_conn = MagicMock()
+        managed_tx_mock.return_value.__aenter__ = AsyncMock(return_value=fake_conn)
+        managed_tx_mock.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        await task._handoff_to_offload_job(fake_engine)
+
+    trigger_mock.assert_awaited_once_with(fake_conn, dedup_key="event_drain_handoff")
+
+
+@pytest.mark.asyncio
+async def test_run_drains_to_empty_ignoring_budget_when_running_as_async_writer_job():
+    """When app_state.ephemeral_job is True (the async-writer Cloud Run Job
+    entrypoint, stamped by main_task.py), the in-process budget must be
+    skipped entirely — the Job always drains to empty, unbounded, exactly
+    like StorageDrainOffloadTask. A budget tiny enough to trip on the very
+    first batch must NOT trigger a handoff here."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from dynastore.tasks.workclass_drain.event_drain_task import EventDrainTask
+
+    job_app_state = SimpleNamespace(ephemeral_job=True)
+    task = EventDrainTask(
+        app_state=job_app_state, inprocess_max_rows=1, inprocess_max_seconds=0.001,
+    )
+    fake_engine = MagicMock()
+    fake_engine.dispose = AsyncMock()
+
+    calls = {"n": 0}
+
+    async def _fake_drain_once(*, engine, owner_id):
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            return 5  # would blow the 1-row / 0.001s budget many times over
+        return 0
+
+    handoff = AsyncMock()
+    resolve_budget = AsyncMock()
+
+    with (
+        patch("sqlalchemy.ext.asyncio.create_async_engine", return_value=fake_engine),
+        patch.object(task, "drain_once", new=_fake_drain_once),
+        patch.object(task, "_handoff_to_offload_job", new=handoff),
+        patch.object(task, "_resolve_inprocess_budget", new=resolve_budget),
+    ):
+        report = await task.run(MagicMock())
+
+    handoff.assert_not_awaited()
+    resolve_budget.assert_not_awaited(), "the Job path must not even resolve the budget config"
+    assert calls["n"] == 4, "must loop until drain_once reports 0 (drain to empty)"
+    assert report.metrics["drained"] == 15
+
+
+@pytest.mark.asyncio
+async def test_handoff_to_offload_job_logs_when_insert_is_a_noop(caplog):
+    """A self-blocked handoff (0 rows inserted — a prior 'event_drain_handoff'
+    row is still non-terminal, the no-async-writer-job residual case) must be
+    observable via a log line, not swallowed silently."""
+    import logging
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from dynastore.tasks.workclass_drain.event_drain_task import EventDrainTask
+
+    task = EventDrainTask()
+    fake_engine = MagicMock()
+    trigger_mock = AsyncMock(return_value=0)  # dedup guard blocked the insert
+
+    with (
+        patch(
+            "dynastore.modules.db_config.query_executor.managed_transaction",
+        ) as managed_tx_mock,
+        patch(
+            "dynastore.modules.tasks.events.events_emit._enqueue_event_drain_trigger",
+            new=trigger_mock,
+        ),
+        caplog.at_level(logging.INFO),
+    ):
+        fake_conn = MagicMock()
+        managed_tx_mock.return_value.__aenter__ = AsyncMock(return_value=fake_conn)
+        managed_tx_mock.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        await task._handoff_to_offload_job(fake_engine)
+
+    trigger_mock.assert_awaited_once_with(fake_conn, dedup_key="event_drain_handoff")
+    assert any(
+        "no-op" in r.getMessage() for r in caplog.records
+    ), "a self-blocked handoff must be logged, not silently swallowed"
+
+
+@pytest.mark.asyncio
+async def test_handoff_to_offload_job_logs_success_when_insert_lands(caplog):
+    """The success path (1 row inserted) logs the handoff too, distinctly
+    from the no-op path above."""
+    import logging
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from dynastore.tasks.workclass_drain.event_drain_task import EventDrainTask
+
+    task = EventDrainTask()
+    fake_engine = MagicMock()
+    trigger_mock = AsyncMock(return_value=1)
+
+    with (
+        patch(
+            "dynastore.modules.db_config.query_executor.managed_transaction",
+        ) as managed_tx_mock,
+        patch(
+            "dynastore.modules.tasks.events.events_emit._enqueue_event_drain_trigger",
+            new=trigger_mock,
+        ),
+        caplog.at_level(logging.INFO),
+    ):
+        fake_conn = MagicMock()
+        managed_tx_mock.return_value.__aenter__ = AsyncMock(return_value=fake_conn)
+        managed_tx_mock.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        await task._handoff_to_offload_job(fake_engine)
+
+    assert any(
+        "handed off remainder" in r.getMessage() for r in caplog.records
+    )
+    assert not any("no-op" in r.getMessage() for r in caplog.records)

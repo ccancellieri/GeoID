@@ -102,8 +102,14 @@ def _events_insert_query(task_schema: str) -> "DQLQuery":
 
 async def _enqueue_event_drain_trigger(
     conn: Any, *, wedge_grace_seconds: Optional[float] = None,
-) -> None:
+    dedup_key: str = "event_drain",
+) -> int:
     """Insert one global dedup'd ``event_drain`` PENDING task on ``conn``.
+    Returns the number of rows inserted (1 on success, 0 when the dedup
+    guard blocked the insert or the tasks table was unavailable) so a
+    caller relying on this trigger for forward progress (#2887,
+    ``EventDrainTask._handoff_to_offload_job``) can observe a self-blocked
+    no-op instead of it passing silently.
 
     Co-transactional: the drain row commits if and only if the caller's event
     row commits.  A single global dedup key coalesces high event volume to one
@@ -130,6 +136,18 @@ async def _enqueue_event_drain_trigger(
       older than ``wedge_grace_seconds`` or an ACTIVE row whose lease
       (``locked_until``) has already expired. A live row still blocks,
       exactly as before.
+
+    ``dedup_key`` (#2887): defaults to ``"event_drain"`` — unchanged behaviour
+    for the hot co-transactional path and the recovery tick above.
+    ``EventDrainTask._handoff_to_offload_job`` passes a distinct value (e.g.
+    ``"event_drain_handoff"``) instead, so it can enqueue a fresh execution
+    while the currently-running row is still non-terminal (ACTIVE) without
+    being blocked by that very row's own dedup guard. The ``task_type`` stays
+    ``"event_drain"`` in every case — unlike storage's offload variant, there
+    is no separate offload task type: ``EventDrainTask`` already carries the
+    async-write workclass marker and always prefers an offload-capable runner
+    when one is deployed, so a handoff is simply a fresh execution of the
+    same task.
     """
     from dynastore.modules.db_config.query_executor import (  # noqa: PLC0415
         DQLQuery,
@@ -170,10 +188,15 @@ async def _enqueue_event_drain_trigger(
         f"  execution_mode, inputs, timestamp, status, dedup_key)"
         f" SELECT :task_id, 'platform', 'platform', :caller_id, 'event_drain',"
         f"        'task', 'ASYNCHRONOUS', '{{}}'::jsonb, now(), 'PENDING',"
-        f"        'event_drain'"
+        f"        :dedup_key"
         f" WHERE NOT EXISTS ("
         f"     SELECT 1 FROM {task_schema}.tasks"
-        f"     WHERE dedup_key = 'event_drain'"
+        # A distinct bind name from the SELECT target-list :dedup_key above —
+        # asyncpg raises AmbiguousParameterError when the SAME named
+        # parameter is reused across an untyped SELECT target position and a
+        # column-comparison position, even though both bind the same Python
+        # value here (mirrors storage_emit._enqueue_drain_trigger).
+        f"     WHERE dedup_key = :dedup_key_filter"
         f"       AND catalog_id = 'platform'"
         # Terminal set matches the dispatcher's claim query: a terminal-state
         # drain task (incl. DISMISSED) must NOT block a fresh enqueue, or the
@@ -182,14 +205,20 @@ async def _enqueue_event_drain_trigger(
         f"{wedge_tolerant_clause}"
         f" )"
     )
-    params: Dict[str, Any] = {"task_id": generate_uuidv7(), "caller_id": caller_id}
+    params: Dict[str, Any] = {
+        "task_id": generate_uuidv7(),
+        "caller_id": caller_id,
+        "dedup_key": dedup_key,
+        "dedup_key_filter": dedup_key,
+    }
     if wedge_grace_seconds is not None:
         params["wedge_grace_seconds"] = wedge_grace_seconds
 
+    inserted = 0
     async with best_effort_savepoint(conn) as outcome:
-        await DQLQuery(insert_sql, result_handler=ResultHandler.NONE).execute(
-            conn, **params
-        )
+        inserted = await DQLQuery(
+            insert_sql, result_handler=ResultHandler.ROWCOUNT
+        ).execute(conn, **params)
     if outcome.error is not None:
         logger.debug(
             "event_drain: drain trigger skipped — tasks table not "
@@ -197,6 +226,8 @@ async def _enqueue_event_drain_trigger(
             task_schema,
             exc_info=outcome.error,
         )
+        return 0
+    return inserted or 0
 
 
 async def emit_event_row(

@@ -64,13 +64,42 @@ Drain loop
 ``run(payload)`` loops ``drain_once()`` until it returns 0, then exits
 (one-shot drain-to-empty, matching ``StorageDrainTask``).
 The dispatcher re-enters via NOTIFY / periodic catch-up.
+
+In-process wall-clock/row budget (#2887) — SERVING TIER ONLY
+--------------------------------------------------------------
+A ``dev-dynastore-async-writer`` execution OOM'd after a single
+``EventDrainTask`` run stayed open for roughly four hours draining a large
+``tasks.events`` backlog to empty. The actual tip-over was a *separate* bug
+in ``main_task.py``'s ``report_failure()`` fallback, since fixed: it used to
+re-bootstrap the entire module graph (every module plus a second
+``BackgroundSupervisor``) purely to record one FAILED row, and that second
+boot was the allocation that OOM'd an already memory-pressured process. With
+that fixed, a long single Job execution is no longer the hazard it was, so
+the async-writer Cloud Run Job still drains straight to empty, unbounded —
+exactly like ``StorageDrainOffloadTask``.
+
+The wall-clock/row budget below applies only when this task runs in-process
+on the serving tier (no async-writer Job deployed, or the Job is busy and
+the serving tier absorbed the work). If cumulative wall-clock elapsed or
+cumulative claimed rows crosses
+``TasksPluginConfig.event_drain_inprocess_max_seconds`` /
+``event_drain_inprocess_max_rows`` with backlog rows still remaining,
+``run()`` stops early and hands the remainder off to a fresh ``event_drain``
+execution (see :meth:`EventDrainTask._handoff_to_offload_job`) instead of
+holding the serving tier's request-handling capacity hostage indefinitely.
+Mirrors ``StorageDrainTask``'s byte/wall-clock self-escape (#2732 step 4);
+events carry no comparable per-row byte signal, so the companion budget
+here is a row count rather than hydrated bytes. The signal distinguishing
+"running as the Job" from "running in-process" is
+``app_state.ephemeral_job`` (stamped exclusively by ``main_task.py``'s
+Cloud Run Job entrypoint) — see :meth:`EventDrainTask.run` for the gate.
 """
 from __future__ import annotations
 
 import json
 import logging
 import time
-from typing import Any, ClassVar, Dict, List, Optional, Set
+from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
 from uuid import uuid4
 
 from dynastore.models.tasks import TaskPayload
@@ -96,6 +125,17 @@ _DEFAULT_BATCH_SIZE: int = 100
 # Default max delivery attempts when the row carries no per-row ``max_retries``
 # override. Mirrors the legacy events consumer's ``_MAX_RETRIES``.
 _DEFAULT_MAX_RETRIES: int = 3
+
+# Default in-process drain wall-clock budget (#2887), seconds. Matches
+# TasksPluginConfig.event_drain_inprocess_max_seconds — see the module
+# docstring's "In-process wall-clock/row budget" section.
+_DEFAULT_INPROCESS_MAX_SECONDS: float = 5.0
+
+# Default in-process drain row budget (#2887). Matches
+# TasksPluginConfig.event_drain_inprocess_max_rows — the companion to
+# _DEFAULT_INPROCESS_MAX_SECONDS for runs with many small events that never
+# cross the wall-clock budget on their own.
+_DEFAULT_INPROCESS_MAX_ROWS: int = 5_000
 
 
 def _backoff(retry_count: int) -> int:
@@ -182,16 +222,43 @@ class EventDrainTask(AsyncWriteDrainTaskProtocol):
         *,
         batch_size: int = _DEFAULT_BATCH_SIZE,
         lease_seconds: int = _DEFAULT_LEASE_SECONDS,
+        inprocess_max_seconds: float = _DEFAULT_INPROCESS_MAX_SECONDS,
+        inprocess_max_rows: int = _DEFAULT_INPROCESS_MAX_ROWS,
     ) -> None:
         self.app_state = app_state
         self.batch_size = batch_size
         self.lease_seconds = lease_seconds
+        self.inprocess_max_seconds = inprocess_max_seconds
+        self.inprocess_max_rows = inprocess_max_rows
 
     async def run(self, payload: TaskPayload) -> TaskReport:
-        """Drain ``tasks.events`` to empty, then return.
+        """Drain ``tasks.events``, then return.
 
-        Loops ``drain_once()`` until it reports zero claimed rows.  The
-        dispatcher re-enters via NOTIFY when new rows appear.
+        Loops ``drain_once()`` until it reports zero claimed rows (drain to
+        empty) — the dispatcher re-enters via NOTIFY when new rows appear.
+
+        In-process wall-clock/row budget (#2887) — SERVING TIER ONLY: when
+        this execution is running in-process (no async-writer Cloud Run Job
+        picked it up), the loop tracks cumulative claimed rows and elapsed
+        wall-clock time. If either configured budget
+        (``event_drain_inprocess_max_seconds`` / ``event_drain_inprocess_max_rows``)
+        is crossed while rows still remain, the loop stops early and hands the
+        remainder off to a fresh ``event_drain`` execution via
+        :meth:`_handoff_to_offload_job`, rather than holding this in-process
+        execution open indefinitely.
+
+        The budget is SKIPPED ENTIRELY when this execution is the async-writer
+        Cloud Run Job itself (``self.app_state.ephemeral_job`` — stamped by
+        ``main_task.py`` for every Cloud Run Job entrypoint, never by the
+        serving-tier app_state): the Job drains straight to empty, exactly
+        like ``StorageDrainOffloadTask``. Applying the same short budget
+        inside the Job would force it to self-escape into a fresh execution
+        every few seconds, paying the ~40s app-bootstrap cost again on each
+        hop (the exact tax the #2887 Gap-A ``report_failure`` fix removed)
+        and could chain into a handoff that dead-ends against its own
+        still-ACTIVE row (see :meth:`_handoff_to_offload_job`). Since Gap-A
+        already removes the OOM mechanism a long single Job execution used to
+        risk, letting the Job run unbounded is no longer the hazard it was.
 
         Returns a :class:`~dynastore.tasks.report.TaskReport` so the runner
         persists structured metrics alongside the human-facing message
@@ -227,12 +294,38 @@ class EventDrainTask(AsyncWriteDrainTaskProtocol):
         # Stable owner_id for the lifetime of this run — the claim stamp and the
         # CAS guard on terminal writes.
         owner_id = f"event_drain:{uuid4()}"
+        # The in-process budget never applies inside the async-writer Cloud
+        # Run Job (#2887) — see the docstring above. ``app_state`` is ``None``
+        # for ad-hoc/test instantiation, which correctly defaults to the
+        # budget being active (matches the serving-tier default).
+        budget_enabled = not bool(getattr(self.app_state, "ephemeral_job", False))
+        # Hot-reloaded in-process drain budget (#2887), resolved once per run
+        # — skipped entirely inside the Job, mirroring
+        # StorageDrainOffloadTask never resolving/checking its budget either.
+        inprocess_max_seconds, inprocess_max_rows = (
+            await self._resolve_inprocess_budget() if budget_enabled else (0.0, 0)
+        )
         total = 0
+        start_time = time.monotonic()
         try:
             while True:
                 n = await self.drain_once(engine=engine, owner_id=owner_id)
                 total += n
                 if n == 0:
+                    break
+
+                if not budget_enabled:
+                    continue
+
+                elapsed = time.monotonic() - start_time
+                over_seconds = (
+                    inprocess_max_seconds > 0 and elapsed >= inprocess_max_seconds
+                )
+                over_rows = (
+                    inprocess_max_rows > 0 and total >= inprocess_max_rows
+                )
+                if over_seconds or over_rows:
+                    await self._handoff_to_offload_job(engine)
                     break
         finally:
             await engine.dispose()
@@ -251,6 +344,93 @@ class EventDrainTask(AsyncWriteDrainTaskProtocol):
         )
 
         return report
+
+    async def _resolve_inprocess_budget(self) -> Tuple[float, int]:
+        """Resolve the ``TasksPluginConfig.event_drain_inprocess_max_seconds``
+        / ``event_drain_inprocess_max_rows`` pair, hot-reloaded (#2887).
+
+        Only ever called from the serving-tier (in-process) path of
+        :meth:`run` — never inside the async-writer Cloud Run Job, which
+        always drains to empty. Mirrors
+        ``StorageDrainTask._resolve_inprocess_budget``'s fallback pattern:
+        falls back to the instance defaults (constructor values, themselves
+        matching the field defaults) when the platform configs protocol is
+        unavailable — early startup, lightweight worker contexts, tests.
+        """
+        try:
+            from dynastore.models.protocols.platform_configs import (
+                PlatformConfigsProtocol,
+            )
+            from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+            from dynastore.tools.discovery import get_protocol
+
+            config_mgr = get_protocol(PlatformConfigsProtocol)
+            if config_mgr is not None:
+                cfg = await config_mgr.get_config(TasksPluginConfig)
+                if isinstance(cfg, TasksPluginConfig):
+                    return (
+                        float(cfg.event_drain_inprocess_max_seconds),
+                        int(cfg.event_drain_inprocess_max_rows),
+                    )
+        except Exception:  # noqa: BLE001 — config read is best-effort
+            logger.debug(
+                "EventDrainTask: event_drain_inprocess_max_seconds/"
+                "event_drain_inprocess_max_rows unavailable — falling back "
+                "to the instance defaults (%.1f, %d).",
+                self.inprocess_max_seconds,
+                self.inprocess_max_rows,
+                exc_info=True,
+            )
+        return self.inprocess_max_seconds, self.inprocess_max_rows
+
+    async def _handoff_to_offload_job(self, engine: Any) -> None:
+        """Enqueue a fresh ``event_drain`` execution for the remaining backlog
+        (#2887).
+
+        Called by ``run()`` once the in-process wall-clock/row drain budget is
+        exhausted with backlog rows still remaining — serving tier only, the
+        Job never calls this (see ``run()``'s docstring). Uses a dedup key
+        distinct from the live co-transactional trigger's (``"event_drain"``)
+        so the handoff is never blocked by the currently-running execution's
+        own still-non-terminal row — unlike ``StorageDrainTask``, there is no
+        separate ``event_drain_offload`` task type: ``EventDrainTask`` already
+        carries the async-write workclass marker, so a fresh execution of the
+        same task type is offloaded exactly like the one it replaces.
+
+        Residual self-block (no async-writer Job deployed): when no
+        offload-capable runner exists, this handoff's own row also runs
+        in-process and can itself exceed the budget, calling this method
+        again — that second INSERT uses the SAME static
+        ``"event_drain_handoff"`` dedup key and is blocked by the first
+        handoff's still-ACTIVE row (a deliberately static key: a per-hop
+        key would let concurrent successors pile up instead). The insert is
+        then a safe no-op logged below rather than silently swallowed;
+        forward progress resumes once that row completes, or at worst on the
+        next ``DrainSpawnerService`` recovery tick
+        (``drain_spawn_interval_seconds``, default 120s).
+        """
+        from dynastore.modules.db_config.query_executor import managed_transaction
+        from dynastore.modules.tasks.events.events_emit import (
+            _enqueue_event_drain_trigger,
+        )
+
+        async with managed_transaction(engine) as conn:
+            inserted = await _enqueue_event_drain_trigger(
+                conn, dedup_key="event_drain_handoff",
+            )
+        if inserted:
+            logger.info(
+                "EventDrainTask: in-process drain budget exhausted with "
+                "backlog remaining — handed off remainder to a fresh "
+                "event_drain execution.",
+            )
+        else:
+            logger.info(
+                "EventDrainTask: handoff trigger was a no-op — a prior "
+                "'event_drain_handoff' row is still non-terminal. Backlog "
+                "remains; it resumes once that row completes or on the next "
+                "DrainSpawnerService recovery tick.",
+            )
 
     async def drain_once(self, *, engine: Any, owner_id: str) -> int:
         """Claim one batch, deliver, apply fenced outcomes; return rows handled.

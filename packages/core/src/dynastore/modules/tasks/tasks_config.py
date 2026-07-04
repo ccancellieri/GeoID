@@ -340,6 +340,50 @@ class TasksPluginConfig(ExposableConfigMixin, PluginConfig):
         ),
     )
 
+    event_drain_inprocess_max_seconds: Mutable[float] = Field(
+        default=5.0,
+        ge=0.0,
+        description=(
+            "Wall-clock budget (seconds, #2887) bounding one EventDrainTask."
+            "run() execution — SERVING TIER ONLY (in-process, no "
+            "async-writer Cloud Run Job available). It does NOT apply when "
+            "this task runs AS the async-writer Job itself (detected via "
+            "app_state.ephemeral_job): the Job always drains to empty, "
+            "unbounded, exactly like storage_drain_offload. Applying this "
+            "same short budget inside the Job would force it to self-escape "
+            "into a fresh execution every few seconds, paying the ~40s "
+            "app-bootstrap cost on every hop — the exact tax the #2887 "
+            "report_failure fix removed. In-process, a large tasks.events "
+            "backlog could otherwise pin the serving tier's request-serving "
+            "capacity for a long time draining to empty; once a run has "
+            "spent this long draining with rows still remaining, it stops "
+            "and hands the remainder off to a fresh event_drain execution "
+            "(see event_drain_inprocess_max_rows for the companion "
+            "row-count budget) instead of looping indefinitely. ``0`` "
+            "disables the time budget for the in-process path. Read once "
+            "per in-process drain run via the platform configs hot-reload "
+            "path; no restart required."
+        ),
+    )
+
+    event_drain_inprocess_max_rows: Mutable[int] = Field(
+        default=5_000,
+        ge=0,
+        description=(
+            "Cumulative claimed-row budget (#2887) bounding one "
+            "EventDrainTask.run() execution — SERVING TIER ONLY, "
+            "complementing event_drain_inprocess_max_seconds. Like its "
+            "companion, this does NOT apply when the task runs as the "
+            "async-writer Cloud Run Job itself (app_state.ephemeral_job) — "
+            "the Job always drains to empty. tasks.events rows carry no "
+            "comparable byte-size signal to storage_drain's hydrated-"
+            "document budget, so row count is the bounding signal here "
+            "instead for the in-process path. ``0`` disables the row "
+            "budget. Read once per in-process drain run via the platform "
+            "configs hot-reload path; no restart required."
+        ),
+    )
+
     items_secondary_via_storage_plane: Mutable[bool] = Field(
         default=False,
         description=(
