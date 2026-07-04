@@ -304,6 +304,7 @@ def pushdown_read_select(
     is_stac: bool,
     geometry_field: Optional[str],
     skip_geometry: bool,
+    write_bbox: bool = False,
 ) -> Optional[List[Any]]:
     """Narrow a wildcard read ``SELECT`` to exactly what ``feature_type`` exposes.
 
@@ -344,6 +345,14 @@ def pushdown_read_select(
     so it is re-prepended here for the row-projected read path (the tile path
     injects geometry separately) unless the caller asked to skip it
     (``returnGeometry=false`` / ``skipGeometry=true``).
+
+    When geometry is skipped but the collection's geometry sidecar keeps a
+    ``bbox_geom`` envelope column (``write_bbox=True``, the default), the four
+    scalar ``ST_XMin``/``ST_YMin``/``ST_XMax``/``ST_YMax`` fields are projected
+    in its place — the same envelope columns the STAC search hydration query
+    already uses — so ``GeometriesSidecar._map_row_to_feature`` can still
+    populate ``feature.bbox`` cheaply, without ever touching the full geometry
+    column (#2899).
     """
     from dynastore.models.query_builder import FieldSelection
 
@@ -368,6 +377,14 @@ def pushdown_read_select(
     result: List[Any] = []
     if geometry_field and not skip_geometry:
         result.append(FieldSelection(field=geometry_field))
+    elif geometry_field and skip_geometry and write_bbox:
+        # #2899: geometry is skipped, but the sidecar's bbox_geom envelope
+        # column can still supply feature.bbox — project the cheap scalar
+        # bounds instead of leaving bbox unset.
+        result.extend(
+            FieldSelection(field=name)
+            for name in ("bbox_xmin", "bbox_ymin", "bbox_xmax", "bbox_ymax")
+        )
     result.extend(projected)
 
     if not result:

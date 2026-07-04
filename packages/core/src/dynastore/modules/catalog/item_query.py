@@ -1669,6 +1669,15 @@ class ItemQueryMixin:
                     ),
                     None,
                 )
+                # #2899: whether the geometries sidecar keeps a bbox_geom
+                # envelope column — when it does, a skip-geometry read can
+                # still get feature.bbox from the cheap scalar bounds instead
+                # of dropping it alongside geometry.
+                _write_bbox = any(
+                    getattr(cfg, "write_bbox", False)
+                    for cfg in driver_sidecars(col_config)
+                    if getattr(cfg, "sidecar_type", None) == "geometries"
+                )
                 _narrowed = pushdown_read_select(
                     request.select,
                     _feature_type,
@@ -1676,6 +1685,7 @@ class ItemQueryMixin:
                     is_stac=(consumer == ConsumerType.STAC),
                     geometry_field=_geom_field,
                     skip_geometry=bool(getattr(request, "skip_geometry", False)),
+                    write_bbox=_write_bbox,
                 )
                 if _narrowed is not None:
                     request.select = _narrowed

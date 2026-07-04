@@ -154,3 +154,54 @@ def test_expose_empty_with_geometry_is_geometry_only():
     )
     assert out is not None
     assert _names(out) == ["geom"]
+
+
+# --- skip_geometry + bbox_geom sidecar (#2899) -------------------------------
+
+_BBOX_FIELDS = {"bbox_xmin", "bbox_ymin", "bbox_xmax", "bbox_ymax"}
+
+
+def test_skip_geometry_with_write_bbox_projects_scalar_bbox_fields():
+    # skipGeometry=true + a geometries sidecar with write_bbox=True -> geometry
+    # is still omitted, but the cheap ST_XMin/YMin/XMax/YMax(bbox_geom) fields
+    # are projected instead so feature.bbox can still be populated.
+    out = pushdown_read_select(
+        _wildcard(), FeatureType(), _schema("CODE", "NAME"),
+        is_stac=False, geometry_field="geom", skip_geometry=True,
+        write_bbox=True,
+    )
+    assert out is not None
+    names = _names(out)
+    assert "geom" not in names
+    assert _BBOX_FIELDS.issubset(names)
+    assert set(names) == _BBOX_FIELDS | {"CODE", "NAME"}
+
+
+def test_skip_geometry_without_write_bbox_unchanged():
+    # Regression: no bbox_geom sidecar column configured -> behaviour is
+    # identical to the pre-fix path (no bbox fields substituted).
+    out = pushdown_read_select(
+        _wildcard(), FeatureType(), _schema("CODE", "NAME"),
+        is_stac=False, geometry_field="geom", skip_geometry=True,
+        write_bbox=False,
+    )
+    assert out is not None
+    names = _names(out)
+    assert "geom" not in names
+    assert not _BBOX_FIELDS.intersection(names)
+    assert set(names) == {"CODE", "NAME"}
+
+
+def test_geometry_returned_ignores_write_bbox():
+    # Regression: when geometry IS returned, write_bbox must not add the
+    # scalar bbox fields alongside it — geometry already carries the bbox
+    # via the Priority C derive-from-geometry fallback in the row mapper.
+    out = pushdown_read_select(
+        _wildcard(), FeatureType(), _schema("CODE"),
+        is_stac=False, geometry_field="geom", skip_geometry=False,
+        write_bbox=True,
+    )
+    assert out is not None
+    names = _names(out)
+    assert names[0] == "geom"
+    assert not _BBOX_FIELDS.intersection(names)
