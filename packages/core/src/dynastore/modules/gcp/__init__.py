@@ -34,6 +34,14 @@ except ImportError as e:
     logger.debug(f"GCP Module: bucket_reporter skipped due to missing dependencies: {e}")
 
 try:
+    # By importing bq_feature_reporter here, we ensure that whenever the
+    # GCPModule is active, the BqFeatureReporter is automatically registered
+    # with the ingestion task system. This makes it discoverable.
+    from dynastore.modules.gcp import bq_feature_reporter  # noqa: F401  -- side-effect: registers BqFeatureReporter
+except ImportError as e:
+    logger.debug(f"GCP Module: bq_feature_reporter skipped due to missing dependencies: {e}")
+
+try:
     # By importing the gcp_config here, we ensure that the PluginConfig models
     # auto-register via PluginConfig.__init_subclass__ when the GCP module loads.
     from dynastore.modules.gcp import gcp_config  # noqa: F401  -- side-effect: auto-registers PluginConfig models
