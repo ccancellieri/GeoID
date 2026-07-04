@@ -502,10 +502,35 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
             getattr(MapsService.process_pool, "_max_workers", "unknown"),
         )
         app.state.maps_config = MapsConfig()
+
+        # Register the default-style vector PNG map-tile source into core's
+        # TileSourceProtocol registry (format-gated on "png"), so
+        # tiles_engine.build_render_context(..., format="png") picks this
+        # source instead of PostgisTileSource. Guarded: the maps extension
+        # must still start when the tiles module isn't installed in this
+        # deployment — in that case the vector /map/tiles/....png route falls
+        # back to its existing 404.
+        png_tile_source = None
+        try:
+            from dynastore.tools.discovery import register_plugin
+            from .maps_png_tilesource import MapsPngTileSource
+
+            png_tile_source = MapsPngTileSource()
+            register_plugin(png_tile_source)
+            logger.info("Maps Service: registered MapsPngTileSource (format=png).")
+        except Exception as exc:
+            logger.debug(
+                "Maps Service: MapsPngTileSource registration skipped (tiles "
+                "module unavailable?): %s", exc,
+            )
+
         yield
         logger.info("Maps Service shutdown: closing process pool.")
         if MapsService.process_pool:
             MapsService.process_pool.shutdown(wait=True)
+        if png_tile_source is not None:
+            from dynastore.tools.discovery import unregister_plugin
+            unregister_plugin(png_tile_source)
 
     def contribute(self, ref):
         """AssetContributor: emit a map-preview link when the resource has a bbox."""

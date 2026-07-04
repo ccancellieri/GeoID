@@ -34,7 +34,7 @@ class _FakeSource:
         self._supports_result = supports_result
         self.render_calls = []
 
-    def supports(self, driver):
+    def supports(self, driver, format: str = "mvt"):
         return self._supports_result
 
     async def render_tile(self, conn, **kwargs):

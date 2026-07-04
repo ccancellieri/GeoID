@@ -85,8 +85,11 @@ logger = logging.getLogger(__name__)
 # under each of these (format is part of the tile primary key / object key), so
 # invalidation MUST drop every one — dropping only ``mvt`` would leave a stale
 # ``pbf`` of the same coordinate cached. Keep in sync with the format whitelist
-# in ``extensions/tiles/tiles_service.py`` (``["mvt", "pbf"]``).
-SERVED_TILE_FORMATS: Tuple[str, ...] = ("mvt", "pbf")
+# in ``extensions/tiles/tiles_service.py`` (``["mvt", "pbf"]``) plus ``png`` —
+# the default-style vector map-tile PNG, cached under the same plain
+# collection-based cache-id as the MVT lane so this same invalidation path
+# drops it on a feature write.
+SERVED_TILE_FORMATS: Tuple[str, ...] = ("mvt", "pbf", "png")
 
 # Hard ceiling on tiles enqueued per coalesced batch. A continent-scale or
 # scattered-multipolygon bbox at high zoom can cover tens of thousands of

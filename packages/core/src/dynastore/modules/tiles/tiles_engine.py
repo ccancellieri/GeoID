@@ -118,14 +118,20 @@ async def build_render_context(
     *,
     engine: Any = None,
     morecantile_compatible: bool = False,
+    format: str = "mvt",
     should_abort: Optional[ShouldAbort] = None,
 ) -> Optional[TileRenderContext]:
     """Resolve metadata, TMS, target SRID, and TileSource for a tile render.
 
     ``driver``/``source`` are resolved from the FIRST collection id — v1 has
-    exactly one registered ``TileSourceProtocol`` (PostGIS) so this is
-    sufficient; a future multi-driver render would need a per-collection
-    source lookup instead.
+    exactly one registered ``TileSourceProtocol`` per format (PostGIS for
+    mvt/pbf) so this is sufficient; a future multi-driver render would need a
+    per-collection source lookup instead.
+
+    ``format`` (default ``"mvt"``) narrows source selection to the registered
+    ``TileSourceProtocol`` whose ``supports(driver, format)`` returns True —
+    e.g. the maps extension's PNG renderer registers for ``format="png"``
+    alongside the core PostGIS MVT source.
 
     ``should_abort``, when given, is checked once per collection before its
     metadata is resolved — the natural loop boundary here (#2898). Raises
@@ -196,7 +202,7 @@ async def build_render_context(
 
     source: Optional[TileSourceProtocol] = None
     for candidate in get_protocols(TileSourceProtocol):
-        if candidate.supports(driver):
+        if candidate.supports(driver, format):
             source = candidate
             break
     if source is None:

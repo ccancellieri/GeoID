@@ -60,8 +60,14 @@ class TileSourceNotSupported(RuntimeError):
 class TileSourceProtocol(Protocol):
     """Protocol for rendering tile bytes from a resolved storage driver."""
 
-    def supports(self, driver: Any) -> bool:
-        """True if this source can render tiles for the given resolved driver."""
+    def supports(self, driver: Any, format: str = "mvt") -> bool:
+        """True if this source can render ``format`` tiles for the given resolved driver.
+
+        ``format`` defaults to ``"mvt"`` so existing single-source deployments
+        (v1 shipped only ``PostgisTileSource``) keep working unmodified; a
+        second source registered for a different output format (e.g. the maps
+        extension's PNG renderer) narrows on the format it accepts.
+        """
         ...
 
     async def render_tile(
@@ -95,8 +101,11 @@ class PostgisTileSource(TileSourceProtocol):
     method is accepted.
     """
 
-    def supports(self, driver: Any) -> bool:
-        return getattr(driver, "_get_effective_driver_config", None) is not None
+    def supports(self, driver: Any, format: str = "mvt") -> bool:
+        return (
+            format in ("mvt", "pbf")
+            and getattr(driver, "_get_effective_driver_config", None) is not None
+        )
 
     async def render_tile(
         self,

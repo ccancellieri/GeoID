@@ -1567,9 +1567,14 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             description="Per-band rescale ranges as semicolon-separated 'min,max' pairs.",
         ),
     ) -> Response:
-        """Render a COG map tile using the collection's default style (resolved via binding).
+        """Render a map tile using the collection's default style.
 
-        Flow:
+        RASTER collections render from a COG asset via rio-tiler (flow below).
+        VECTOR (and RECORDS) collections dispatch to ``_get_vector_map_tile``,
+        which renders default-style PNG from PostGIS via the maps extension's
+        ``MapsPngTileSource`` (registered into core's ``TileSourceProtocol``).
+
+        Raster flow:
         1. Validate format; ensure rio-tiler is available.
         2. Resolve external catalog/collection IDs to internal IDs.
         3. Check bucket cache.
@@ -1579,20 +1584,9 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         7. Render via run_in_thread(render_cog_tile); write to cache in background.
         """
         from dynastore.modules.concurrency import run_in_thread
-
-        self._require_raster_engine()
+        from dynastore.modules.catalog.catalog_config import CollectionKind
 
         fmt_lower = format.lower()
-        if fmt_lower not in _FORMAT_MEDIA_TYPE:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported format '{format}'. Use 'png' or 'webp'.",
-            )
-        output_format: Literal["PNG", "WEBP"] = "PNG" if fmt_lower == "png" else "WEBP"
-
-        bands_parsed, expression_parsed, rescale_parsed = self._parse_multiband_params(
-            bands, expression, rescale
-        )
 
         start = time.perf_counter()
 
@@ -1603,6 +1597,34 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
 
         # Validate TMS before cache check (avoids a spurious cache lookup on bad TMS)
         await self._validate_tms_and_matrix(internal_catalog_id, tms_id, z, x, y)
+
+        kind = await self._collection_kind(internal_catalog_id, internal_collection_id)
+        if kind != CollectionKind.RASTER:
+            return await self._get_vector_map_tile(
+                request,
+                background_tasks,
+                internal_catalog_id,
+                internal_collection_id,
+                tms_id,
+                z,
+                x,
+                y,
+                fmt_lower,
+                start,
+            )
+
+        self._require_raster_engine()
+
+        if fmt_lower not in _FORMAT_MEDIA_TYPE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported format '{format}'. Use 'png' or 'webp'.",
+            )
+        output_format: Literal["PNG", "WEBP"] = "PNG" if fmt_lower == "png" else "WEBP"
+
+        bands_parsed, expression_parsed, rescale_parsed = self._parse_multiband_params(
+            bands, expression, rescale
+        )
 
         cfg = await self._load_render_caching_config()
         params_hash = _BUILD_RENDER_PARAMS_HASH(  # type: ignore[misc]
@@ -1742,6 +1764,131 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 "X-Render-Source": "rio-tiler",
                 "Cache-Control": f"public, max-age={cfg.ttl_seconds if cfg else 3600}",
             },
+        )
+
+    async def _get_vector_map_tile(
+        self,
+        request: Request,
+        background_tasks: BackgroundTasks,
+        internal_catalog_id: str,
+        internal_collection_id: str,
+        tms_id: str,
+        z: int,
+        x: int,
+        y: int,
+        fmt_lower: str,
+        start: float,
+    ) -> Response:
+        """Default-style vector map tile (PNG), dispatched from ``get_map_tile``.
+
+        Rendered by ``MapsPngTileSource`` (packages/extensions/maps), which
+        registers into core's ``TileSourceProtocol`` registry for
+        ``format="png"`` — this extension never imports the maps extension;
+        the maps extension imports core and registers itself (DI).
+
+        Cached under the plain ``internal_collection_id`` (no
+        ``build_render_cache_key``, no style/params suffix) — the SAME
+        cache-id the vector MVT lane uses — so the existing feature-write
+        invalidation (which iterates ``SERVED_TILE_FORMATS`` per z/x/y) drops
+        it automatically. Only the default style is supported here; a named
+        style still 404s via ``get_map_tile_styled``.
+        """
+        if fmt_lower != "png":
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Format '{fmt_lower}' is not available for vector map tiles; "
+                    "only 'png' (default style) is supported."
+                ),
+            )
+
+        cache_id = internal_collection_id
+        provider = get_protocol(TileStorageProtocol)
+        cache_enabled = await cache_on_demand_enabled(internal_catalog_id, internal_collection_id)
+
+        if provider and cache_enabled:
+            cached = await provider.get_tile(
+                internal_catalog_id, cache_id, tms_id, z, x, y, "png"
+            )
+            if cached:
+                duration_ms = (time.perf_counter() - start) * 1000
+                logger.info(
+                    "map_tile: cache=hit source=tile_storage catalog=%s cache_id=%s "
+                    "z=%s x=%s y=%s duration_ms=%.2f bytes=%d",
+                    internal_catalog_id, cache_id, z, x, y, duration_ms, len(cached),
+                )
+                return Response(
+                    content=cached,
+                    media_type="image/png",
+                    headers={"X-Render-Cache": "hit", "X-Render-Source": "tile_storage"},
+                )
+
+        try:
+            conn = await get_async_engine(request).connect()
+        except Exception as exc:
+            logger.error(
+                "map_tile: failed to acquire DB connection for vector PNG render "
+                "catalog=%s collection=%s: %s",
+                internal_catalog_id, internal_collection_id, exc,
+            )
+            raise HTTPException(status_code=503, detail="Database unavailable.") from exc
+
+        try:
+            from dynastore.modules.tiles import tiles_engine
+            from dynastore.modules.tiles.tiles_source import TileSourceNotSupported
+
+            try:
+                ctx = await tiles_engine.build_render_context(
+                    internal_catalog_id,
+                    [internal_collection_id],
+                    tms_id,
+                    engine=conn,
+                    format="png",
+                )
+            except TileSourceNotSupported as exc:
+                logger.error("map_tile: %s", exc)
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+            if ctx is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"Collection '{internal_collection_id}' could not be resolved "
+                        "for map-tile rendering."
+                    ),
+                )
+
+            tile_bytes = await tiles_engine.render_tile(
+                conn, ctx, str(z), x, y, format="png", use_l1_cache=True,
+            )
+        finally:
+            await conn.close()
+
+        if not tile_bytes:
+            duration_ms = (time.perf_counter() - start) * 1000
+            logger.info(
+                "map_tile: cache=miss source=vector_png catalog=%s collection=%s "
+                "z=%s x=%s y=%s duration_ms=%.2f bytes=0 (no features)",
+                internal_catalog_id, internal_collection_id, z, x, y, duration_ms,
+            )
+            return Response(status_code=204)
+
+        if provider and cache_enabled:
+            background_tasks.add_task(
+                provider.save_tile,
+                internal_catalog_id, cache_id, tms_id, z, x, y, tile_bytes, "png",
+            )
+
+        duration_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "map_tile: cache=miss source=vector_png catalog=%s collection=%s "
+            "z=%s x=%s y=%s duration_ms=%.2f bytes=%d",
+            internal_catalog_id, internal_collection_id, z, x, y, duration_ms, len(tile_bytes),
+        )
+        return Response(
+            content=tile_bytes,
+            media_type="image/png",
+            headers={"X-Render-Cache": "miss", "X-Render-Source": "vector_png"},
         )
 
     async def get_map_tile_styled(
