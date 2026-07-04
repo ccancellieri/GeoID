@@ -193,3 +193,52 @@ async def test_engine_init_plumbs_health_check_and_retry_to_builder() -> None:
     _args, kwargs = mock_build.call_args
     assert kwargs["health_check_interval"] == 45
     assert kwargs["retry_attempts"] == 5
+
+
+# --------------------------------------------------------------------------
+# ValkeyEngineConfig — max_connections cap (#2961)
+# --------------------------------------------------------------------------
+
+
+def test_valkey_engine_config_exposes_max_connections_default() -> None:
+    """Default caps concurrent connections instead of valkey-py's 2**31."""
+    cfg = ValkeyEngineConfig()
+    assert cfg.max_connections == 100
+
+
+def test_build_valkey_client_wires_max_connections() -> None:
+    """build_valkey_client forwards max_connections to the pool.
+
+    ``ConnectionPool`` stores ``max_connections`` as a pool-level attribute
+    (not inside ``connection_kwargs``, which holds only per-connection
+    kwargs) — assert against ``pool.max_connections`` directly.
+    """
+    client, pool = build_valkey_client(
+        url="valkey://localhost:6379",
+        max_connections=100,
+    )
+    assert pool.max_connections == 100  # type: ignore[union-attr]
+
+
+def test_build_valkey_client_omits_max_connections_when_not_supplied() -> None:
+    """Without an explicit cap, valkey-py's own unbounded default applies."""
+    client, pool = build_valkey_client(url="valkey://localhost:6379")
+    assert pool.max_connections == 2**31  # type: ignore[union-attr]
+
+
+async def test_engine_init_plumbs_max_connections_to_builder() -> None:
+    """``ValkeyEngineConfig.engine_init`` forwards ``max_connections`` to
+    ``build_valkey_client`` so a config change actually reaches the client."""
+    cfg = ValkeyEngineConfig(
+        connection_url="valkey://localhost:6379",  # type: ignore[arg-type]
+        max_connections=250,
+    )
+    with patch(
+        "dynastore.tools.cache_valkey.build_valkey_client",
+        return_value=(object(), None),
+    ) as mock_build:
+        await cfg.engine_init()
+
+    mock_build.assert_called_once()
+    _args, kwargs = mock_build.call_args
+    assert kwargs["max_connections"] == 250

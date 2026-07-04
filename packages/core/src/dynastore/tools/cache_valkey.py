@@ -374,6 +374,7 @@ def build_valkey_client(
     tcp_keepalive_count: Optional[int] = None,
     health_check_interval: Optional[float] = None,
     retry_attempts: Optional[int] = None,
+    max_connections: Optional[int] = None,
 ) -> "tuple[Any, Any]":
     """Build a Valkey async client (standalone or cluster) from connection params.
 
@@ -402,6 +403,12 @@ def build_valkey_client(
     ``Retry`` only ever matches those error classes (never application-level
     errors such as a bad command or a cluster ``MOVED`` response), so a
     genuine backend fault still surfaces immediately.
+
+    ``max_connections`` (#2961): caps concurrent connections in the
+    standalone ``ConnectionPool`` and (via ``cluster_kwargs``) each of the
+    cluster client's per-node pools. Set before the cluster-mode kwargs
+    filter below so both paths inherit it without separate plumbing.
+    valkey-py otherwise defaults this to ``2**31`` (effectively unbounded).
     """
     import logging
     _logger = logging.getLogger(__name__)
@@ -441,6 +448,9 @@ def build_valkey_client(
     )
 
     pool_kwargs: Dict[str, Any] = {"decode_responses": False}
+
+    if max_connections is not None:
+        pool_kwargs["max_connections"] = max_connections
 
     if socket_connect_timeout is not None:
         pool_kwargs["socket_connect_timeout"] = socket_connect_timeout

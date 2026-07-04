@@ -128,6 +128,26 @@ def test_build_valkey_client_cluster_no_remap_by_default() -> None:
     assert "address_remap" not in kwargs
 
 
+def test_build_valkey_client_cluster_wires_max_connections() -> None:
+    """``max_connections`` (#2961) reaches each per-node pool in cluster mode.
+
+    ``pool_kwargs`` is built once and shared into ``cluster_kwargs`` — this
+    pins that the cap survives the cluster-mode filter step alongside the
+    other pool tunables.
+    """
+    with patch("valkey.asyncio.cluster.ValkeyCluster") as MockCluster:
+        build_valkey_client(
+            cluster_mode=True,
+            discovery_host="10.132.0.9",
+            discovery_port=6379,
+            max_connections=100,
+        )
+
+    MockCluster.assert_called_once()
+    _args, kwargs = MockCluster.call_args
+    assert kwargs["max_connections"] == 100
+
+
 # --------------------------------------------------------------------------
 # build_valkey_client — cluster discovery routes through ValkeyCluster(host=..)
 # --------------------------------------------------------------------------

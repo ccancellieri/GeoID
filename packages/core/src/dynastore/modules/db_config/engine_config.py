@@ -879,6 +879,20 @@ class ValkeyEngineConfig(EngineConfig):
         ),
     )
 
+    max_connections: Mutable[int] = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        description=(
+            "Cap on concurrent Valkey connections for this engine's client — "
+            "applied to both the standalone ``ConnectionPool`` and the "
+            "cluster client's per-node pools. valkey-py otherwise defaults "
+            "``max_connections`` to ``2**31`` (effectively unbounded), so a "
+            "request burst can open one connection per in-flight command "
+            "per instance."
+        ),
+    )
+
     async def engine_init(self) -> Any:
         """Build a Valkey async client from the current config snapshot.
 
@@ -920,6 +934,7 @@ class ValkeyEngineConfig(EngineConfig):
             tcp_keepalive_count=self.tcp_keepalive_count,
             health_check_interval=self.health_check_interval_seconds,
             retry_attempts=self.retry_attempts,
+            max_connections=self.max_connections,
         )
         # Stash the pool on the client so engine_release can close both.
         # ValkeyCluster owns its pools internally so _pool is None there.
