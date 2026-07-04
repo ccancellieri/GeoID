@@ -31,6 +31,7 @@ from typing import Any, ClassVar, Dict, Iterable, Iterator, Tuple
 
 import pytest
 
+from dynastore.tasks.ingestion.main_ingestion import logger as _main_ingestion_logger
 from dynastore.tasks.ingestion.readers.base import (
     SourceReaderProtocol,
     resolve_reader,
@@ -143,7 +144,21 @@ def _build_open_kwargs(task_id: str, phys_schema: str, read_batch_size: int,
         "task_schema": phys_schema,
         "read_batch_size": read_batch_size,
     }
-    open_kwargs.update(reader_options or {})
+    options = dict(reader_options or {})
+    shadowed_keys = [
+        key for key in ("task_id", "task_schema", "content_type")
+        if key in options
+    ]
+    if shadowed_keys:
+        _main_ingestion_logger.warning(
+            "ingestion: reader_options attempted to override structural "
+            "kwarg(s) %s — ignoring, these are fixed by the ingestion "
+            "task itself and are not user-tunable",
+            shadowed_keys,
+        )
+        for key in shadowed_keys:
+            del options[key]
+    open_kwargs.update(options)
     return open_kwargs
 
 
@@ -171,17 +186,62 @@ def test_no_reader_options_keeps_defaults():
 
 def test_main_ingestion_builds_open_kwargs_as_dict_and_merges_reader_options():
     """Source-inspection guard: main_ingestion.py must build the reader
-    ``open()`` kwargs as a dict and ``.update()`` it with
-    ``task_request.reader_options`` — passing both as literal keyword
-    arguments would collide with a duplicate ``read_batch_size`` the
-    instant an operator sets ``reader_options={'read_batch_size': ...}``."""
+    ``open()`` kwargs as a dict and merge in ``task_request.reader_options``
+    — passing both as literal keyword arguments would collide with a
+    duplicate ``read_batch_size`` the instant an operator sets
+    ``reader_options={'read_batch_size': ...}``."""
     import inspect
 
     from dynastore.tasks.ingestion import main_ingestion
 
     src = inspect.getsource(main_ingestion)
     assert "open_kwargs" in src
-    assert "open_kwargs.update(task_request.reader_options or {})" in src
+    assert "open_kwargs.update(reader_options)" in src
     assert "reader_inst.open(source_file_path, **open_kwargs)" in src
     # The reader_id override must reach both resolve_reader() call sites.
     assert src.count("reader_id=task_request.reader") == 2
+
+
+# ---------------------------------------------------------------------------
+# GeoID #2986: reader_options must not shadow the reader's structural
+# task_id/task_schema/content_type kwargs.
+# ---------------------------------------------------------------------------
+
+
+def test_reader_options_task_id_is_stripped_and_warned(caplog):
+    """A reader_options dict carrying 'task_id' must not overwrite the
+    ingestion task's own task_id — the structural value wins and a warning
+    names the ignored key."""
+    with caplog.at_level("WARNING"):
+        kwargs = _build_open_kwargs(
+            task_id="real-task-id", phys_schema="s1", read_batch_size=1000,
+            encoding="utf-8", content_type=None,
+            reader_options={"task_id": "other-task-id"},
+        )
+    assert kwargs["task_id"] == "real-task-id"
+    assert len(caplog.records) == 1
+    assert "task_id" in caplog.records[0].getMessage()
+
+
+def test_reader_options_read_batch_size_still_overrides():
+    """Regression check: read_batch_size is a legitimate tuning knob and
+    must still be overridable via reader_options after the #2986 fix."""
+    kwargs = _build_open_kwargs(
+        task_id="t1", phys_schema="s1", read_batch_size=1000,
+        encoding="utf-8", content_type=None,
+        reader_options={"read_batch_size": 250},
+    )
+    assert kwargs["read_batch_size"] == 250
+
+
+def test_reader_options_without_protected_keys_passes_through_unchanged():
+    """A reader_options dict with no protected keys is forwarded as-is."""
+    kwargs = _build_open_kwargs(
+        task_id="t1", phys_schema="s1", read_batch_size=1000,
+        encoding="utf-8", content_type=None,
+        reader_options={"use_vsicache": True, "some_tuning_knob": 42},
+    )
+    assert kwargs["use_vsicache"] is True
+    assert kwargs["some_tuning_knob"] == 42
+    assert kwargs["task_id"] == "t1"
+    assert kwargs["task_schema"] == "s1"

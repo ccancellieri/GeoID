@@ -1111,7 +1111,26 @@ async def run_ingestion_task(
             "task_schema": phys_schema,
             "read_batch_size": task_request.read_batch_size,
         }
-        open_kwargs.update(task_request.reader_options or {})
+        # task_id/task_schema/content_type are the reader's own identity/
+        # plumbing kwargs (e.g. used to name reaper-tracked scratch dirs) —
+        # a caller has no legitimate reason to override them via
+        # reader_options, so drop and warn on any collision instead of
+        # silently shadowing them.
+        reader_options = dict(task_request.reader_options or {})
+        shadowed_keys = [
+            key for key in ("task_id", "task_schema", "content_type")
+            if key in reader_options
+        ]
+        if shadowed_keys:
+            logger.warning(
+                "ingestion: reader_options attempted to override structural "
+                "kwarg(s) %s — ignoring, these are fixed by the ingestion "
+                "task itself and are not user-tunable",
+                shadowed_keys,
+            )
+            for key in shadowed_keys:
+                del reader_options[key]
+        open_kwargs.update(reader_options)
 
         with reader_inst.open(source_file_path, **open_kwargs) as reader:
             sliced_reader = itertools.islice(
