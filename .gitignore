@@ -187,6 +187,7 @@ plans/
 skills/
 .aider*
 .cursorrules
+.opencode/
 
 # mcp-skill-hub tooling belongs in that project, not here
 scripts/export_ai_context.py
