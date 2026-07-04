@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextvars
 import functools
 import hashlib
 import inspect
@@ -506,14 +507,45 @@ def _stale_unwrap(raw: Any) -> "tuple[Any, bool]":
     return raw[_STALE_VAL], age > float(raw[_STALE_TTL])
 
 
+# The config read below goes through the config service, whose loads are
+# themselves ``@cached`` — so a cache miss on the config entry would re-enter
+# the slow path and call back into this loader, recursing until Python's
+# stack limit ("maximum recursion depth exceeded" storms on boot). The
+# ContextVar breaks that same-task re-entrancy; the memo keeps the value off
+# the per-miss hot path (and off the config service entirely between
+# refreshes).
+_SLOW_PATH_TIMEOUT_REFRESH_SECONDS: float = 60.0
+_slow_path_timeout_value: float = _DEFAULT_SLOW_PATH_TIMEOUT_SECONDS
+_slow_path_timeout_checked_at: float = 0.0  # time.monotonic(); 0 = never
+_slow_path_timeout_loading: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "cache_slow_path_timeout_loading", default=False
+)
+
+
 async def _load_slow_path_timeout() -> float:
     """Load ``slow_path_timeout_seconds`` from ``CachePluginConfig``.
 
     Bounds lock-wait + factory time on the ``get_or_set``/``@cached`` slow
-    path. Falls back to 30s if ``ConfigsProtocol`` is unavailable or the
-    config load fails — mirrors
-    ``modules/tasks/dispatcher.py::_load_oracle_inner_timeout``.
+    path. Falls back to the last-known value (default 30s) when called
+    re-entrantly from its own config load, when the memoized value is still
+    fresh, or when ``ConfigsProtocol`` is unavailable / the config load
+    fails — mirrors ``modules/tasks/dispatcher.py::_load_oracle_inner_timeout``.
     """
+    global _slow_path_timeout_value, _slow_path_timeout_checked_at
+
+    if _slow_path_timeout_loading.get():
+        # Re-entered from the @cached config load this function triggered:
+        # answering with the memo/default is what terminates the recursion.
+        return _slow_path_timeout_value
+
+    now = time.monotonic()
+    if (
+        _slow_path_timeout_checked_at
+        and now - _slow_path_timeout_checked_at < _SLOW_PATH_TIMEOUT_REFRESH_SECONDS
+    ):
+        return _slow_path_timeout_value
+
+    token = _slow_path_timeout_loading.set(True)
     try:
         from dynastore.modules.cache.cache_config import CachePluginConfig
         from dynastore.models.protocols.configs import ConfigsProtocol
@@ -523,12 +555,17 @@ async def _load_slow_path_timeout() -> float:
         if configs_proto is not None:
             cfg = await configs_proto.get_config(CachePluginConfig)
             if cfg is not None:
-                return cfg.slow_path_timeout_seconds
+                _slow_path_timeout_value = cfg.slow_path_timeout_seconds
     except Exception as e:
         logger.debug(
             "cache: slow_path_timeout_seconds config load failed (%s), using default", e
         )
-    return _DEFAULT_SLOW_PATH_TIMEOUT_SECONDS
+    finally:
+        _slow_path_timeout_loading.reset(token)
+        # Stamp even on failure so a broken config path is retried once per
+        # refresh window, not hammered on every cache miss.
+        _slow_path_timeout_checked_at = now
+    return _slow_path_timeout_value
 
 
 # ---------------------------------------------------------------------------

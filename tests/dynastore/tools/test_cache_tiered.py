@@ -1486,3 +1486,100 @@ class TestCachedCrossRevisionKeyCompat:
             assert not stored_keys[0].startswith("sv1|")
         finally:
             get_cache_manager().unregister_backend(backend)
+
+
+class TestSlowPathTimeoutRecursionGuard:
+    """The slow-path-timeout loader reads CachePluginConfig through the
+    config service, whose loads are themselves ``@cached`` — without a
+    re-entrancy guard a miss on the config entry recursed back into the
+    loader until the Python stack limit (post-#2921 boot storms)."""
+
+    def _reset_memo(self, monkeypatch):
+        import dynastore.tools.cache as cache_mod
+
+        monkeypatch.setattr(cache_mod, "_slow_path_timeout_checked_at", 0.0)
+        monkeypatch.setattr(
+            cache_mod,
+            "_slow_path_timeout_value",
+            cache_mod._DEFAULT_SLOW_PATH_TIMEOUT_SECONDS,
+        )
+
+    @pytest.mark.asyncio
+    async def test_reentrant_config_load_terminates_and_returns_value(
+        self, monkeypatch
+    ):
+        import dynastore.tools.cache as cache_mod
+        import dynastore.tools.discovery as discovery
+
+        self._reset_memo(monkeypatch)
+        calls = 0
+
+        class _FakeConfigs:
+            async def get_config(self, _cls):
+                nonlocal calls
+                calls += 1
+                # What the @cached config path does on a miss: it re-enters
+                # the loader. The guard must answer with the memo/default
+                # instead of recursing.
+                inner = await cache_mod._load_slow_path_timeout()
+                assert inner == cache_mod._DEFAULT_SLOW_PATH_TIMEOUT_SECONDS
+
+                class _Cfg:
+                    slow_path_timeout_seconds = 42.0
+
+                return _Cfg()
+
+        monkeypatch.setattr(discovery, "get_protocol", lambda _p: _FakeConfigs())
+
+        out = await cache_mod._load_slow_path_timeout()
+        assert out == 42.0
+        assert calls == 1  # the guard prevented a second config load
+
+    @pytest.mark.asyncio
+    async def test_memo_skips_config_reload_within_refresh_window(
+        self, monkeypatch
+    ):
+        import dynastore.tools.cache as cache_mod
+        import dynastore.tools.discovery as discovery
+
+        self._reset_memo(monkeypatch)
+
+        class _Cfg:
+            slow_path_timeout_seconds = 42.0
+
+        class _FakeConfigs:
+            async def get_config(self, _cls):
+                return _Cfg()
+
+        monkeypatch.setattr(discovery, "get_protocol", lambda _p: _FakeConfigs())
+        assert await cache_mod._load_slow_path_timeout() == 42.0
+
+        def _boom(_p):
+            raise AssertionError("config service must not be hit within the window")
+
+        monkeypatch.setattr(discovery, "get_protocol", _boom)
+        assert await cache_mod._load_slow_path_timeout() == 42.0
+
+    @pytest.mark.asyncio
+    async def test_failure_is_stamped_and_not_hammered(self, monkeypatch):
+        import dynastore.tools.cache as cache_mod
+        import dynastore.tools.discovery as discovery
+
+        self._reset_memo(monkeypatch)
+        attempts = 0
+
+        def _failing(_p):
+            nonlocal attempts
+            attempts += 1
+            raise RuntimeError("config service down")
+
+        monkeypatch.setattr(discovery, "get_protocol", _failing)
+        assert (
+            await cache_mod._load_slow_path_timeout()
+            == cache_mod._DEFAULT_SLOW_PATH_TIMEOUT_SECONDS
+        )
+        assert (
+            await cache_mod._load_slow_path_timeout()
+            == cache_mod._DEFAULT_SLOW_PATH_TIMEOUT_SECONDS
+        )
+        assert attempts == 1  # second call served by the failure-stamped memo
