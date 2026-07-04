@@ -89,6 +89,12 @@ RUN ${VENV_PATH}/bin/pip install uv
 ARG BUILD_COMMIT=unknown
 ENV BUILD_COMMIT=${BUILD_COMMIT}
 
+# Build-time timestamp for version info (no .git in runtime image; without
+# this the /health endpoint would fall back to reporting request time as if
+# it were the build time)
+ARG BUILD_TIME=
+ENV BUILD_TIME=${BUILD_TIME}
+
 # Build-time version (resolved by CI from `git describe --tags` or by the
 # downstream wrapper from a pinned tag). setuptools-scm has no .git/ here,
 # so we hand it the version explicitly via SETUPTOOLS_SCM_PRETEND_VERSION.

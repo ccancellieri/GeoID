@@ -22,7 +22,6 @@ import importlib.metadata
 import logging
 import os
 import subprocess
-from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -65,12 +64,33 @@ def get_git_commit() -> str:
         return "unknown"
 
 
+def get_build_time() -> str:
+    """Return the image build timestamp, or the last commit's timestamp as a fallback.
+
+    Tier 1: BUILD_TIME env var, set by the Docker build (no .git in runtime image).
+    Tier 2: local git environments — last commit timestamp, close enough for dev.
+    Never falls back to "now": that would silently mislabel the current time as
+    the build time.
+    """
+    build_time = os.environ.get("BUILD_TIME", "").strip()
+    if build_time:
+        return build_time
+    try:
+        return subprocess.check_output(
+            ["git", "log", "-1", "--format=%cI"],
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).decode().strip()
+    except Exception:
+        return "unknown"
+
+
 def get_build_info() -> dict:
     """Return version info safe for public exposure."""
     return {
         "version": get_version(),
         "commit": get_git_commit(),
-        "build_time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "build_time": get_build_time(),
     }
 
 
