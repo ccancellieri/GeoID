@@ -304,6 +304,143 @@ async def test_empty_file_completed():
 
 
 @pytest.mark.asyncio
+async def test_secondary_indexing_flag_on_pending_backlog():
+    """#2897: flag on + a non-empty tasks.storage backlog for this collection
+    -> summary carries a "pending" secondary_indexing block with the count,
+    and run_ingestion_task returns that same block to its caller."""
+    from dynastore.tasks.ingestion.main_ingestion import run_ingestion_task
+
+    records = [_feature(1), _feature(2)]
+    upsert_results = [[{"id": "f1"}, {"id": "f2"}]]
+    upsert_fx = _upsert_batches(results=upsert_results, rejections=[[]])
+
+    with (
+        _run_ingestion_harness(records, upsert_fx) as (reporters, _reindex_mock),
+        patch(
+            "dynastore.tasks.ingestion.main_ingestion._resolve_items_secondary_via_storage_plane",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "dynastore.tasks.ingestion.main_ingestion._count_pending_secondary_index_ops",
+            new=AsyncMock(return_value=7),
+        ),
+    ):
+        result = await run_ingestion_task(
+            None, "task-6", "cat1", "col1", _make_task_request(),
+        )
+
+    reporter = reporters[0]
+    status, kwargs = reporter.finished_calls[0]
+    assert status == "COMPLETED"
+    summary = kwargs.get("summary") or {}
+    assert summary["secondary_indexing"] == {
+        "state": "pending",
+        "queued": 7,
+        "message": "primary write complete; 7 entries pending asynchronous indexing",
+    }
+    assert result == summary["secondary_indexing"]
+
+
+@pytest.mark.asyncio
+async def test_secondary_indexing_flag_on_zero_backlog_converged():
+    """#2897: flag on but the backlog for this collection is already 0
+    -> summary carries a "converged" secondary_indexing block."""
+    from dynastore.tasks.ingestion.main_ingestion import run_ingestion_task
+
+    records = [_feature(1)]
+    upsert_results = [[{"id": "f1"}]]
+    upsert_fx = _upsert_batches(results=upsert_results, rejections=[[]])
+
+    with (
+        _run_ingestion_harness(records, upsert_fx) as (reporters, _reindex_mock),
+        patch(
+            "dynastore.tasks.ingestion.main_ingestion._resolve_items_secondary_via_storage_plane",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "dynastore.tasks.ingestion.main_ingestion._count_pending_secondary_index_ops",
+            new=AsyncMock(return_value=0),
+        ),
+    ):
+        result = await run_ingestion_task(
+            None, "task-7", "cat1", "col1", _make_task_request(),
+        )
+
+    reporter = reporters[0]
+    status, kwargs = reporter.finished_calls[0]
+    assert status == "COMPLETED"
+    summary = kwargs.get("summary") or {}
+    assert summary["secondary_indexing"] == {"state": "converged", "queued": 0}
+    assert result == {"state": "converged", "queued": 0}
+
+
+@pytest.mark.asyncio
+async def test_secondary_indexing_flag_off_omits_field():
+    """#2897: flag off -> no secondary_indexing field at all, and the count
+    helper is never even called (existing payloads must stay unchanged)."""
+    from dynastore.tasks.ingestion.main_ingestion import run_ingestion_task
+
+    records = [_feature(1)]
+    upsert_results = [[{"id": "f1"}]]
+    upsert_fx = _upsert_batches(results=upsert_results, rejections=[[]])
+
+    with (
+        _run_ingestion_harness(records, upsert_fx) as (reporters, _reindex_mock),
+        patch(
+            "dynastore.tasks.ingestion.main_ingestion._resolve_items_secondary_via_storage_plane",
+            new=AsyncMock(return_value=False),
+        ),
+        patch(
+            "dynastore.tasks.ingestion.main_ingestion._count_pending_secondary_index_ops",
+            new=AsyncMock(side_effect=AssertionError("must not be called when the flag is off")),
+        ),
+    ):
+        result = await run_ingestion_task(
+            None, "task-8", "cat1", "col1", _make_task_request(),
+        )
+
+    reporter = reporters[0]
+    status, kwargs = reporter.finished_calls[0]
+    assert status == "COMPLETED"
+    summary = kwargs.get("summary")
+    assert not summary or "secondary_indexing" not in summary
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_secondary_indexing_count_failure_omits_field():
+    """#2897: flag on but the COUNT itself raises -> best-effort, the field
+    is omitted entirely and the (already-successful) task still COMPLETEs."""
+    from dynastore.tasks.ingestion.main_ingestion import run_ingestion_task
+
+    records = [_feature(1)]
+    upsert_results = [[{"id": "f1"}]]
+    upsert_fx = _upsert_batches(results=upsert_results, rejections=[[]])
+
+    with (
+        _run_ingestion_harness(records, upsert_fx) as (reporters, _reindex_mock),
+        patch(
+            "dynastore.tasks.ingestion.main_ingestion._resolve_items_secondary_via_storage_plane",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "dynastore.tasks.ingestion.main_ingestion._count_pending_secondary_index_ops",
+            new=AsyncMock(side_effect=RuntimeError("pool exhausted")),
+        ),
+    ):
+        result = await run_ingestion_task(
+            None, "task-9", "cat1", "col1", _make_task_request(),
+        )
+
+    reporter = reporters[0]
+    status, kwargs = reporter.finished_calls[0]
+    assert status == "COMPLETED"
+    summary = kwargs.get("summary")
+    assert not summary or "secondary_indexing" not in summary
+    assert result is None
+
+
+@pytest.mark.asyncio
 async def test_check_index_health_receives_persisted_count_not_processed_count():
     """A batch with rejections must pass rows_persisted (not rows_ingested,
     which also counts rejected rows) to _check_index_health."""

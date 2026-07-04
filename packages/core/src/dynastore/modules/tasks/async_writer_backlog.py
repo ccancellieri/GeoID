@@ -99,6 +99,52 @@ async def _capped_ready_count(conn, *, task_schema: str, cap: int) -> int:
     return int(storage_count or 0) + int(events_count or 0)
 
 
+async def count_pending_item_ops(
+    conn, *, task_schema: str, catalog_id: str, collection_id: str,
+) -> int:
+    """Count outstanding item-tier ``tasks.storage`` ops for one collection.
+
+    Scoped by ``(catalog_id, collection_id, entity_kind='item')`` with
+    ``status IN ('ready', 'in_flight')`` — the two non-terminal states an
+    id-only obligation (#2494) can be in before ``storage_drain`` converges
+    it. Unlike :func:`_capped_ready_count` (an uncapped, cross-tenant probe),
+    this is a genuine per-collection COUNT — but honestly: neither existing
+    index covers this predicate. ``idx_storage_fairness`` is
+    ``(catalog_id, ready_at) WHERE status = 'ready'`` (no ``collection_id`` /
+    ``entity_kind``, and it excludes ``in_flight`` rows entirely);
+    ``idx_storage_driver`` leads with ``driver_id``, which isn't part of this
+    query at all. There is also no ``day`` filter, so every partition is
+    visited. This is a genuine partition-wide sequential-ish scan, kept safe
+    only by the caller bounding it with a server-side ``statement_timeout``
+    (see ``reconciliation.reconcile_secondary_indexing``) rather than by any
+    index. A covering index on ``(catalog_id, collection_id, entity_kind,
+    status)`` would fix this properly; deliberately not added here (no
+    runtime DDL) — left as a DBA follow-up.
+
+    Note this counts obligations for the COLLECTION, not the calling task
+    specifically: concurrent ingestions into the same collection inflate each
+    other's ``queued`` count. Harmless for the read-side convergence check —
+    it only ever delays a flip to "converged", never flips early.
+
+    Shared by the ingestion completion path (#2897, "is the write I just
+    finished still pending secondary indexing") and the task-status read path
+    (convergence flip on GET), so both sides can never drift on the query.
+    """
+    from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
+
+    sql = (
+        f"SELECT count(*) FROM {task_schema}.storage"
+        f" WHERE catalog_id = :catalog_id"
+        f"   AND collection_id = :collection_id"
+        f"   AND entity_kind = 'item'"
+        f"   AND status IN ('ready', 'in_flight')"
+    )
+    result = await DQLQuery(sql, result_handler=ResultHandler.SCALAR).execute(
+        conn, catalog_id=catalog_id, collection_id=collection_id,
+    )
+    return int(result or 0)
+
+
 @cached(maxsize=1, ttl=_BACKLOG_PROBE_TTL_SECONDS, distributed=False)
 async def _cached_backlog_depth() -> int:
     """Process-local, short-TTL snapshot of the aggregate outbox backlog depth.

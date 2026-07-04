@@ -393,3 +393,209 @@ async def test_lost_race_on_fail_task_returns_task_unchanged(monkeypatch):
 
     assert result is task
     writers["get_task"].assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# reconcile_secondary_indexing (#2897) — read-side convergence flip
+# ---------------------------------------------------------------------------
+
+
+def _pending_task(*, queued=3, catalog_id="s_cat", collection_id="col1"):
+    return _task(
+        status="COMPLETED",
+        catalog_id=catalog_id,
+        outputs={
+            "message": "https://example.org/items",
+            "secondary_indexing": {
+                "state": "pending",
+                "queued": queued,
+                "message": f"primary write complete; {queued} entries pending asynchronous indexing",
+            },
+        },
+    ).model_copy(update={"collection_id": collection_id})
+
+
+def _patch_count(monkeypatch, *, return_value=None, side_effect=None):
+    from dynastore.modules.tasks import async_writer_backlog
+
+    mock = AsyncMock(return_value=return_value, side_effect=side_effect)
+    monkeypatch.setattr(async_writer_backlog, "count_pending_item_ops", mock)
+    return mock
+
+
+def _patch_persist_outputs(monkeypatch, **kwargs):
+    from dynastore.modules.tasks import tasks_module
+
+    mock = AsyncMock(**kwargs)
+    monkeypatch.setattr(tasks_module, "persist_outputs", mock)
+    return mock
+
+
+def _patch_managed_transaction(monkeypatch, *, raises=None):
+    """Stand in for the real ``managed_transaction`` so tests never open an
+    actual pool/transaction. ``raises`` simulates a bounded-acquire failure
+    (e.g. ``PoolSaturationError``) before any connection is yielded; the
+    success path yields a fake connection (specced as ``AsyncConnection`` so
+    the function's own ``isinstance`` narrowing check passes) whose
+    ``.execute`` (the ``SET LOCAL statement_timeout`` calls) is a no-op.
+    """
+    from contextlib import asynccontextmanager
+
+    from sqlalchemy.ext.asyncio import AsyncConnection
+
+    from dynastore.modules.db_config import query_executor
+
+    fake_conn = AsyncMock(spec=AsyncConnection)
+
+    @asynccontextmanager
+    async def _fake(db_resource, *, acquire_timeout=None):
+        if raises is not None:
+            raise raises
+        yield fake_conn
+
+    monkeypatch.setattr(query_executor, "managed_transaction", _fake)
+    return fake_conn
+
+
+@pytest.mark.asyncio
+async def test_secondary_indexing_noop_when_not_completed(monkeypatch):
+    reconciliation = _reconciliation()
+    count_mock = _patch_count(monkeypatch, return_value=0)
+    task = _pending_task()
+    task = task.model_copy(update={"status": "ACTIVE"})
+
+    result = await reconciliation.reconcile_secondary_indexing(object(), task)
+
+    assert result is task
+    count_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_secondary_indexing_noop_when_no_outputs(monkeypatch):
+    reconciliation = _reconciliation()
+    count_mock = _patch_count(monkeypatch, return_value=0)
+    task = _task(status="COMPLETED", outputs=None)
+
+    result = await reconciliation.reconcile_secondary_indexing(object(), task)
+
+    assert result is task
+    count_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_secondary_indexing_noop_when_state_not_pending(monkeypatch):
+    reconciliation = _reconciliation()
+    count_mock = _patch_count(monkeypatch, return_value=0)
+    task = _task(
+        status="COMPLETED",
+        outputs={"secondary_indexing": {"state": "converged", "queued": 0}},
+    )
+
+    result = await reconciliation.reconcile_secondary_indexing(object(), task)
+
+    assert result is task
+    count_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_secondary_indexing_zero_backlog_flips_to_converged_and_persists(monkeypatch):
+    reconciliation = _reconciliation()
+    _patch_managed_transaction(monkeypatch)
+    count_mock = _patch_count(monkeypatch, return_value=0)
+    persist_mock = _patch_persist_outputs(monkeypatch)
+    task = _pending_task(queued=3)
+
+    result = await reconciliation.reconcile_secondary_indexing(object(), task)
+
+    assert result is not task
+    assert result.outputs["secondary_indexing"] == {"state": "converged", "queued": 0}
+    assert result.outputs["message"] == "https://example.org/items", (
+        "other outputs keys must survive the merge"
+    )
+    count_mock.assert_awaited_once()
+    persist_mock.assert_awaited_once()
+    persisted_outputs = persist_mock.await_args.args[2]
+    assert persisted_outputs["secondary_indexing"] == {"state": "converged", "queued": 0}
+
+
+@pytest.mark.asyncio
+async def test_secondary_indexing_nonzero_backlog_refreshes_count_without_persist(monkeypatch):
+    reconciliation = _reconciliation()
+    _patch_managed_transaction(monkeypatch)
+    count_mock = _patch_count(monkeypatch, return_value=5)
+    persist_mock = _patch_persist_outputs(monkeypatch)
+    task = _pending_task(queued=3)
+
+    result = await reconciliation.reconcile_secondary_indexing(object(), task)
+
+    assert result.outputs["secondary_indexing"]["state"] == "pending"
+    assert result.outputs["secondary_indexing"]["queued"] == 5
+    count_mock.assert_awaited_once()
+    persist_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_secondary_indexing_count_failure_serves_unchanged(monkeypatch):
+    """A generic count failure (e.g. a 57014 statement-timeout cancel raised
+    by the server-side ``SET LOCAL statement_timeout`` bound) must serve the
+    task unchanged rather than raise or persist anything. The connection
+    itself is never wrapped in ``asyncio.wait_for`` -- see
+    ``test_secondary_indexing_pool_saturation_serves_unchanged`` for the
+    acquire-side bound instead."""
+    reconciliation = _reconciliation()
+    _patch_managed_transaction(monkeypatch)
+    count_mock = _patch_count(
+        monkeypatch,
+        side_effect=RuntimeError(
+            "canceling statement due to statement timeout (57014)"
+        ),
+    )
+    persist_mock = _patch_persist_outputs(monkeypatch)
+    task = _pending_task(queued=3)
+
+    result = await reconciliation.reconcile_secondary_indexing(object(), task)
+
+    assert result is task
+    count_mock.assert_awaited_once()
+    persist_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_secondary_indexing_pool_saturation_serves_unchanged(monkeypatch):
+    """A saturated pool must fail fast at ACQUIRE time (``PoolSaturationError``
+    from ``managed_transaction(engine, acquire_timeout=...)``) and never reach
+    the query -- the whole point of bounding the acquire instead of wrapping
+    the in-flight query in ``asyncio.wait_for`` (which would leak the
+    checked-out connection on cancellation)."""
+    from dynastore.modules.db_config.exceptions import PoolSaturationError
+
+    reconciliation = _reconciliation()
+    _patch_managed_transaction(
+        monkeypatch, raises=PoolSaturationError("pool saturated"),
+    )
+    count_mock = _patch_count(monkeypatch, return_value=0)
+    persist_mock = _patch_persist_outputs(monkeypatch)
+    task = _pending_task(queued=3)
+
+    result = await reconciliation.reconcile_secondary_indexing(
+        object(), task, budget_seconds=0.05,
+    )
+
+    assert result is task
+    count_mock.assert_not_awaited()
+    persist_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_secondary_indexing_persist_failure_still_serves_converged(monkeypatch):
+    """The flip is served for THIS response even when persisting it fails."""
+    reconciliation = _reconciliation()
+    _patch_managed_transaction(monkeypatch)
+    _patch_count(monkeypatch, return_value=0)
+    persist_mock = _patch_persist_outputs(monkeypatch, side_effect=RuntimeError("db down"))
+    task = _pending_task(queued=3)
+
+    result = await reconciliation.reconcile_secondary_indexing(object(), task)
+
+    assert result.outputs["secondary_indexing"] == {"state": "converged", "queued": 0}
+    persist_mock.assert_awaited_once()

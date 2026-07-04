@@ -87,7 +87,10 @@ from dynastore.modules.tasks.maintenance import (
     list_dead_letter_tasks as _dlq_list,
     requeue_dead_letter_task as _dlq_requeue,
 )
-from dynastore.modules.tasks.reconciliation import reconcile_task_liveness
+from dynastore.modules.tasks.reconciliation import (
+    reconcile_secondary_indexing,
+    reconcile_task_liveness,
+)
 from dynastore.modules.tasks.tasks_module import encode_cursor
 from dynastore.tools.discovery import get_protocol
 
@@ -225,6 +228,13 @@ async def _get_task_scoped_uncached(
     except Exception as e:  # noqa: BLE001 — best-effort; never turn a 200 into a 500
         logger.warning(
             "reconcile_task_liveness failed for task %s: %s — serving unreconciled status.",
+            task_id, e,
+        )
+    try:
+        task = await reconcile_secondary_indexing(conn, task)
+    except Exception as e:  # noqa: BLE001 — best-effort; never turn a 200 into a 500
+        logger.warning(
+            "reconcile_secondary_indexing failed for task %s: %s — serving stored status.",
             task_id, e,
         )
     await _project_collection_external_ids([task])

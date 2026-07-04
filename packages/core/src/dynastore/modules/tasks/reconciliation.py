@@ -201,3 +201,133 @@ async def reconcile_task_liveness(
 
     refreshed = await tasks_module.get_task(engine, task.task_id, schema)
     return refreshed if refreshed is not None else task
+
+
+# ---------------------------------------------------------------------------
+# #2897 — secondary-indexing convergence flip on read
+# ---------------------------------------------------------------------------
+
+_SECONDARY_INDEXING_KEY = "secondary_indexing"
+
+
+async def reconcile_secondary_indexing(
+    engine: Any,
+    task: "Task",
+    *,
+    budget_seconds: float = 0.8,
+) -> "Task":
+    """Best-effort read-side convergence check for a pending secondary index.
+
+    An ingestion COMPLETED with ``items_secondary_via_storage_plane`` on and a
+    non-empty ``tasks.storage`` backlog persists
+    ``outputs["secondary_indexing"] = {"state": "pending", ...}``. This
+    re-counts that backlog on read (mirroring :func:`reconcile_task_liveness`'s
+    on-demand pattern) so a client polling after ``storage_drain`` has caught
+    up sees ``"converged"`` without waiting for a fresh ingestion.
+
+    No-op unless the task is COMPLETED with a ``pending`` secondary-indexing
+    state on its outputs — anything else (including a task type that never set
+    the field) is returned unchanged with no query.
+
+    Bounding the read never wraps ``asyncio.wait_for`` around an in-flight
+    query: cancelling a live ``await conn.execute(...)`` mid-flight is a
+    ``BaseException`` that escapes the executor's cleanup, leaking the
+    checked-out connection out of the pool for good (every timeout would
+    permanently shrink it by one). Instead, ``budget_seconds`` bounds two
+    things that ARE safely cancellable: the pool-FIFO wait via
+    ``managed_transaction(engine, acquire_timeout=budget_seconds)`` (mirrors
+    the ``acquire_engine_connection_bounded`` plumbing behind #2933 — raises
+    ``PoolSaturationError`` on a saturated pool without ever starting a
+    query), and the query itself via a server-side ``SET LOCAL
+    statement_timeout`` (Postgres cancels the COUNT itself past the budget,
+    raising ``query_canceled``/57014, rather than the client abandoning a
+    connection it can't get back). A saturated pool, a statement-timeout
+    cancel, or any other exception all serve ``task`` unchanged rather than
+    stalling or failing the GET.
+
+    A drained-to-zero backlog is best-effort persisted back onto the row
+    (via ``persist_outputs``, which does not touch ``status``) so later reads
+    skip this check entirely; the persist failing still serves the converged
+    view for this one response.
+    """
+    if task.status != "COMPLETED":
+        return task
+    outputs = task.outputs
+    if not isinstance(outputs, dict):
+        return task
+    secondary = outputs.get(_SECONDARY_INDEXING_KEY)
+    if not isinstance(secondary, dict) or secondary.get("state") != "pending":
+        return task
+    if not task.catalog_id or not task.collection_id:
+        return task
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
+
+    from dynastore.modules.db_config.exceptions import PoolSaturationError
+    from dynastore.modules.db_config.query_executor import managed_transaction
+    from dynastore.modules.tasks import tasks_module
+    from dynastore.modules.tasks.async_writer_backlog import count_pending_item_ops
+
+    try:
+        async with managed_transaction(
+            engine, acquire_timeout=budget_seconds,
+        ) as conn:
+            # Async-only assertion (mirrors query_executor.py's DDL executor):
+            # ``engine`` is always an async resource on this read path (the
+            # request-scoped AsyncConnection or the shared async engine),
+            # narrows the type for pyright's benefit too.
+            assert isinstance(conn, (AsyncConnection, AsyncSession))
+            # Bound the query server-side rather than the client awaiting it:
+            # a Postgres-side cancel raises a normal (safely-handled) DB
+            # exception instead of orphaning the connection. Reset back to
+            # DEFAULT on the way out so a nested SAVEPOINT (the real caller
+            # here reuses the request's own open connection) never leaves this
+            # budget in effect for whatever that connection runs afterwards —
+            # a failure path skips the reset, but then the whole block's
+            # ROLLBACK reverts the GUC anyway.
+            timeout_ms = max(1, int(budget_seconds * 1000))
+            await conn.execute(
+                text(f"SET LOCAL statement_timeout = '{timeout_ms}ms'")
+            )
+            queued = await count_pending_item_ops(
+                conn,
+                task_schema=tasks_module.get_task_schema(),
+                catalog_id=task.catalog_id,
+                collection_id=task.collection_id,
+            )
+            await conn.execute(text("SET LOCAL statement_timeout = DEFAULT"))
+    except PoolSaturationError as exc:
+        logger.info(
+            "reconcile_secondary_indexing: pool saturated acquiring a "
+            "connection for task %s: %s — serving stored pending state.",
+            task.task_id, exc,
+        )
+        return task
+    except Exception as exc:  # noqa: BLE001 — best-effort; must not raise into the caller
+        logger.warning(
+            "reconcile_secondary_indexing: count failed for task %s: %s — "
+            "serving stored pending state.",
+            task.task_id, exc,
+        )
+        return task
+
+    if queued > 0:
+        # Still outstanding: refresh the served count without a write — a
+        # DB write on every poll while the backlog works itself down would
+        # just add load for a value that's about to change again.
+        merged_outputs = dict(outputs)
+        merged_outputs[_SECONDARY_INDEXING_KEY] = {**secondary, "queued": queued}
+        return task.model_copy(update={"outputs": merged_outputs})
+
+    merged_outputs = dict(outputs)
+    merged_outputs[_SECONDARY_INDEXING_KEY] = {"state": "converged", "queued": 0}
+    try:
+        await tasks_module.persist_outputs(engine, task.task_id, merged_outputs)
+    except Exception as exc:  # noqa: BLE001 — persisting the flip is best-effort
+        logger.warning(
+            "reconcile_secondary_indexing: failed to persist converged flip "
+            "for task %s: %s — serving converged view this request only.",
+            task.task_id, exc,
+        )
+    return task.model_copy(update={"outputs": merged_outputs})

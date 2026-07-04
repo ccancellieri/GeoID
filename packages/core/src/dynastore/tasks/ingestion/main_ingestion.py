@@ -273,6 +273,56 @@ async def _maybe_apply_ingest_backpressure() -> None:
         )
 
 
+async def _resolve_items_secondary_via_storage_plane() -> bool:
+    """Best-effort read of ``TasksPluginConfig.items_secondary_via_storage_plane``.
+
+    Mirrors :func:`_maybe_apply_ingest_backpressure`'s config-read pattern.
+    Any failure (missing protocol, config error) resolves to ``False`` so a
+    completion never reports a secondary-indexing state it can't back with
+    data (#2897).
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+        from dynastore.tools.discovery import get_protocol
+
+        config_mgr = get_protocol(PlatformConfigsProtocol)
+        cfg = await config_mgr.get_config(TasksPluginConfig) if config_mgr else None
+        return isinstance(cfg, TasksPluginConfig) and cfg.items_secondary_via_storage_plane
+    except Exception:  # noqa: BLE001 — config read is best-effort
+        logger.debug(
+            "ingestion: items_secondary_via_storage_plane read failed — "
+            "treating as off.",
+            exc_info=True,
+        )
+        return False
+
+
+async def _count_pending_secondary_index_ops(
+    engine, catalog_id: str, collection_id: str,
+) -> int:
+    """COUNT outstanding ``tasks.storage`` item ops for this collection.
+
+    Delegates to the shared counter in ``async_writer_backlog`` so the
+    write-side (this function) and the read-side convergence check
+    (``reconciliation.py``) can never drift on the query. Raises on failure —
+    callers treat this as best-effort and catch around the call.
+
+    ``engine`` is passed straight through to ``DQLQuery.execute`` (via
+    ``count_pending_item_ops``), which accepts either a bare engine or an
+    already-open connection — no explicit ``managed_transaction`` needed here.
+    """
+    from dynastore.modules.tasks.async_writer_backlog import count_pending_item_ops
+    from dynastore.modules.tasks.tasks_module import get_task_schema
+
+    return await count_pending_item_ops(
+        engine,
+        task_schema=get_task_schema(),
+        catalog_id=catalog_id,
+        collection_id=collection_id,
+    )
+
+
 # Per-batch memory budgeting -------------------------------------------------
 #
 # A batch is flushed when EITHER an explicit row cap (database_batch_size) OR an
@@ -628,7 +678,7 @@ async def run_ingestion_task(
     collection_id: str,
     task_request: TaskIngestionRequest,
     caller_id: Optional[str] = None,
-):
+) -> Optional[Dict[str, Any]]:
     from dynastore.tools.discovery import get_protocol
     from dynastore.models.protocols import CatalogsProtocol
 
@@ -1411,6 +1461,42 @@ async def run_ingestion_task(
                 "first_message": first_rejection_message,
             }
 
+        # --- Secondary-indexing honesty (#2897) ---
+        # With items_secondary_via_storage_plane on, the primary PG write above
+        # is synchronous but ES/secondary indexing is only an id-only
+        # obligation on tasks.storage until storage_drain converges it — a bare
+        # COMPLETED here would overstate what's actually searchable. Best-
+        # effort: a count failure omits the field entirely rather than
+        # guessing, and never fails the (already-successful) task.
+        secondary_indexing: Optional[Dict[str, Any]] = None
+        if await _resolve_items_secondary_via_storage_plane():
+            try:
+                queued = await _count_pending_secondary_index_ops(
+                    engine, catalog_id, collection_id,
+                )
+                secondary_indexing = (
+                    {
+                        "state": "pending",
+                        "queued": queued,
+                        "message": (
+                            f"primary write complete; {queued} entries "
+                            "pending asynchronous indexing"
+                        ),
+                    }
+                    if queued > 0
+                    else {"state": "converged", "queued": 0}
+                )
+            except Exception:  # noqa: BLE001 — count is best-effort, never fail the task
+                logger.warning(
+                    "ingestion task %s: secondary-index backlog count failed "
+                    "for %s/%s — omitting secondary_indexing from summary.",
+                    task_id, catalog_id, collection_id, exc_info=True,
+                )
+        if secondary_indexing is not None:
+            if summary is None:
+                summary = {}
+            summary["secondary_indexing"] = secondary_indexing
+
         await asyncio.gather(
             *(
                 reporter.task_finished("COMPLETED", summary=summary)
@@ -1425,6 +1511,8 @@ async def run_ingestion_task(
                 catalog_id, collection_id, ctx=DriverContext(db_resource=engine)
             )
             await run_post_operations(post_ops, catalog, collection, asset, "COMPLETED")
+
+        return secondary_indexing
 
     except _IndexMissFailed:
         # task_finished("FAILED") was already called in the FAILED branch above;

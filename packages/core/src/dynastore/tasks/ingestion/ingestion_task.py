@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-from typing import Optional
+from typing import Any, Dict, Optional
 
 # Hard runtime dep — see modules/elasticsearch/module.py for rationale.
 # Forces entry-point load to fail on services without ``geopandas``
@@ -36,7 +36,7 @@ from dynastore.tasks.ingestion.main_ingestion import run_ingestion_task
 from dynastore.tasks.ingestion.ingestion_models import TaskIngestionRequest
 from dynastore.tools.protocol_helpers import get_engine
 from .definition import INGESTION_PROCESS_DEFINITION
-from dynastore.modules.processes.models import Process, ExecuteRequest, StatusInfo
+from dynastore.modules.processes.models import Process, ExecuteRequest
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +109,7 @@ async def _maybe_enqueue_tile_preseed(
         await engine.dispose()
 
 
-class IngestionTask(ProcessTaskProtocol[Process, TaskPayload[ExecuteRequest], Optional[StatusInfo]]):
+class IngestionTask(ProcessTaskProtocol[Process, TaskPayload[ExecuteRequest], Optional[Dict[str, Any]]]):
     priority: int = 100
     """
     A formal, stateful task responsible for running the data ingestion process.
@@ -128,7 +128,7 @@ class IngestionTask(ProcessTaskProtocol[Process, TaskPayload[ExecuteRequest], Op
         self.app_state = app_state
         logger.info("IngestionTask initialized.")
 
-    async def run(self, payload: TaskPayload[ExecuteRequest]) -> Optional[StatusInfo]:
+    async def run(self, payload: TaskPayload[ExecuteRequest]) -> Optional[Dict[str, Any]]:
         """The core execution logic. It parses the payload and calls the main ingestion function."""
         task_id: str = str(payload.task_id)
         # A background task MUST use a synchronous engine to avoid event loop conflicts.
@@ -158,7 +158,7 @@ class IngestionTask(ProcessTaskProtocol[Process, TaskPayload[ExecuteRequest], Op
             logger.info(f"Running ingestion task '{task_id}' for {catalog_id}:{collection_id}")
 
             # This is now a direct, blocking call. The runner is responsible for thread management.
-            await run_ingestion_task(
+            secondary_indexing = await run_ingestion_task(
                 engine=sync_engine,
                 task_id=task_id,
                 catalog_id=catalog_id,
@@ -194,7 +194,15 @@ class IngestionTask(ProcessTaskProtocol[Process, TaskPayload[ExecuteRequest], Op
             verify_url = await result_message.items_verify_url(
                 catalog_id, collection_id, asset_id=asset_id
             )
-            return result_message.completed(payload.task_id, message=verify_url)
+            status_info = result_message.completed(payload.task_id, message=verify_url)
+            if secondary_indexing is None:
+                return status_info.model_dump()
+            # #2897: carry the secondary-indexing convergence state into
+            # task.outputs (persisted verbatim by the runner) so it is
+            # visible on the Tasks API without waiting on storage_drain.
+            outputs = status_info.model_dump()
+            outputs["secondary_indexing"] = secondary_indexing
+            return outputs
         except Exception as e:
             logger.error(f"Ingestion task '{task_id}' failed catastrophically: {e}", exc_info=True)
             # The DatabaseStatusReporter will catch this exception and mark the task as FAILED.
