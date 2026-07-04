@@ -224,27 +224,19 @@ class TestAdminPoliciesRegistered:
         created, _ = _register("cat-admin-test")
         return created
 
-    def test_admin_features_emitted(self) -> None:
-        assert "geoid_admin_features" in self._get(), (
-            "register_geoid_policies_for_catalog must create geoid_admin_features"
+    @pytest.mark.parametrize("policy_key", ["geoid_admin_features", "geoid_admin_data"])
+    def test_emitted(self, policy_key: str) -> None:
+        assert policy_key in self._get(), (
+            f"register_geoid_policies_for_catalog must create {policy_key}"
         )
 
-    def test_admin_data_emitted(self) -> None:
-        assert "geoid_admin_data" in self._get(), (
-            "register_geoid_policies_for_catalog must create geoid_admin_data"
-        )
+    @pytest.mark.parametrize("policy_key", ["geoid_admin_features", "geoid_admin_data"])
+    def test_effect_allow(self, policy_key: str) -> None:
+        assert self._get()[policy_key].effect == "ALLOW"
 
-    def test_admin_features_effect_allow(self) -> None:
-        assert self._get()["geoid_admin_features"].effect == "ALLOW"
-
-    def test_admin_data_effect_allow(self) -> None:
-        assert self._get()["geoid_admin_data"].effect == "ALLOW"
-
-    def test_admin_features_priority(self) -> None:
-        assert self._get()["geoid_admin_features"].priority == _PRIORITY_ADMIN
-
-    def test_admin_data_priority(self) -> None:
-        assert self._get()["geoid_admin_data"].priority == _PRIORITY_ADMIN
+    @pytest.mark.parametrize("policy_key", ["geoid_admin_features", "geoid_admin_data"])
+    def test_priority(self, policy_key: str) -> None:
+        assert self._get()[policy_key].priority == _PRIORITY_ADMIN
 
     def test_admin_features_resources_contain_features_path(self) -> None:
         resources = self._get()["geoid_admin_features"].resources or []
@@ -260,21 +252,15 @@ class TestAdminPoliciesRegistered:
             "geoid_admin_data resources must include both /stac/... and /search/... patterns"
         )
 
-    def test_admin_features_actions(self) -> None:
-        actions = set(self._get()["geoid_admin_features"].actions or [])
+    @pytest.mark.parametrize("policy_key", ["geoid_admin_features", "geoid_admin_data"])
+    def test_actions(self, policy_key: str) -> None:
+        actions = set(self._get()[policy_key].actions or [])
         assert {"GET", "POST", "PUT", "PATCH", "DELETE"} == actions
 
-    def test_admin_data_actions(self) -> None:
-        actions = set(self._get()["geoid_admin_data"].actions or [])
-        assert {"GET", "POST", "PUT", "PATCH", "DELETE"} == actions
-
-    def test_admin_features_no_conditions(self) -> None:
-        conds = self._get()["geoid_admin_features"].conditions or []
-        assert conds == [], "geoid_admin_features must have no conditions (unconditional ALLOW)"
-
-    def test_admin_data_no_conditions(self) -> None:
-        conds = self._get()["geoid_admin_data"].conditions or []
-        assert conds == [], "geoid_admin_data must have no conditions (unconditional ALLOW)"
+    @pytest.mark.parametrize("policy_key", ["geoid_admin_features", "geoid_admin_data"])
+    def test_no_conditions(self, policy_key: str) -> None:
+        conds = self._get()[policy_key].conditions or []
+        assert conds == [], f"{policy_key} must have no conditions (unconditional ALLOW)"
 
 
 # ---------------------------------------------------------------------------

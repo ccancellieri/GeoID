@@ -707,40 +707,50 @@ class TestIcebergSchemaEvolution:
 
 
 class TestIcebergBboxFilter:
-    def test_point_inside_bbox(self):
-        geom = {"type": "Point", "coordinates": [10, 20]}
-        assert ItemsIcebergDriver._bbox_matches(geom, [0, 0, 50, 50]) is True
-
-    def test_point_outside_bbox(self):
-        geom = {"type": "Point", "coordinates": [100, 100]}
-        assert ItemsIcebergDriver._bbox_matches(geom, [0, 0, 50, 50]) is False
-
-    def test_polygon_partially_inside(self):
-        geom = {"type": "Polygon", "coordinates": [[[10, 10], [60, 10], [60, 60], [10, 60], [10, 10]]]}
-        assert ItemsIcebergDriver._bbox_matches(geom, [0, 0, 50, 50]) is True
-
-    def test_none_geometry(self):
-        assert ItemsIcebergDriver._bbox_matches(None, [0, 0, 50, 50]) is False
-
-    def test_empty_bbox(self):
-        geom = {"type": "Point", "coordinates": [10, 20]}
-        assert ItemsIcebergDriver._bbox_matches(geom, []) is False
-
-    def test_json_string_geometry(self):
-        geom = json.dumps({"type": "Point", "coordinates": [10, 20]})
-        assert ItemsIcebergDriver._bbox_matches(geom, [0, 0, 50, 50]) is True
-
-    def test_linestring(self):
-        geom = {"type": "LineString", "coordinates": [[5, 5], [15, 15]]}
-        assert ItemsIcebergDriver._bbox_matches(geom, [0, 0, 10, 10]) is True
-
-    def test_multipoint_none_inside(self):
-        geom = {"type": "MultiPoint", "coordinates": [[100, 100], [200, 200]]}
-        assert ItemsIcebergDriver._bbox_matches(geom, [0, 0, 50, 50]) is False
-
-    def test_point_on_bbox_edge(self):
-        geom = {"type": "Point", "coordinates": [50, 50]}
-        assert ItemsIcebergDriver._bbox_matches(geom, [0, 0, 50, 50]) is True
+    @pytest.mark.parametrize(
+        "geom, bbox, expected",
+        [
+            pytest.param(
+                {"type": "Point", "coordinates": [10, 20]}, [0, 0, 50, 50], True, id="point_inside_bbox"
+            ),
+            pytest.param(
+                {"type": "Point", "coordinates": [100, 100]}, [0, 0, 50, 50], False, id="point_outside_bbox"
+            ),
+            pytest.param(
+                {"type": "Polygon", "coordinates": [[[10, 10], [60, 10], [60, 60], [10, 60], [10, 10]]]},
+                [0, 0, 50, 50],
+                True,
+                id="polygon_partially_inside",
+            ),
+            pytest.param(None, [0, 0, 50, 50], False, id="none_geometry"),
+            pytest.param(
+                {"type": "Point", "coordinates": [10, 20]}, [], False, id="empty_bbox"
+            ),
+            pytest.param(
+                json.dumps({"type": "Point", "coordinates": [10, 20]}),
+                [0, 0, 50, 50],
+                True,
+                id="json_string_geometry",
+            ),
+            pytest.param(
+                {"type": "LineString", "coordinates": [[5, 5], [15, 15]]},
+                [0, 0, 10, 10],
+                True,
+                id="linestring",
+            ),
+            pytest.param(
+                {"type": "MultiPoint", "coordinates": [[100, 100], [200, 200]]},
+                [0, 0, 50, 50],
+                False,
+                id="multipoint_none_inside",
+            ),
+            pytest.param(
+                {"type": "Point", "coordinates": [50, 50]}, [0, 0, 50, 50], True, id="point_on_bbox_edge"
+            ),
+        ],
+    )
+    def test_bbox_matches(self, geom, bbox, expected):
+        assert ItemsIcebergDriver._bbox_matches(geom, bbox) is expected
 
 
 # ---------------------------------------------------------------------------
@@ -749,29 +759,21 @@ class TestIcebergBboxFilter:
 
 
 class TestIcebergTypeResolution:
-    def test_string(self):
-        assert isinstance(_resolve_iceberg_type("string"), StringType)
-
-    def test_int32(self):
-        assert isinstance(_resolve_iceberg_type("int32"), IntegerType)
-
-    def test_int64(self):
-        assert isinstance(_resolve_iceberg_type("int64"), LongType)
-
-    def test_float32(self):
-        assert isinstance(_resolve_iceberg_type("float32"), FloatType)
-
-    def test_float64(self):
-        assert isinstance(_resolve_iceberg_type("float64"), DoubleType)
-
-    def test_boolean(self):
-        assert isinstance(_resolve_iceberg_type("boolean"), BooleanType)
-
-    def test_date(self):
-        assert isinstance(_resolve_iceberg_type("date"), DateType)
-
-    def test_unknown_defaults_to_string(self):
-        assert isinstance(_resolve_iceberg_type("unknown_type"), StringType)
+    @pytest.mark.parametrize(
+        "type_name, expected_type",
+        [
+            pytest.param("string", StringType, id="string"),
+            pytest.param("int32", IntegerType, id="int32"),
+            pytest.param("int64", LongType, id="int64"),
+            pytest.param("float32", FloatType, id="float32"),
+            pytest.param("float64", DoubleType, id="float64"),
+            pytest.param("boolean", BooleanType, id="boolean"),
+            pytest.param("date", DateType, id="date"),
+            pytest.param("unknown_type", StringType, id="unknown_defaults_to_string"),
+        ],
+    )
+    def test_resolve_iceberg_type(self, type_name, expected_type):
+        assert isinstance(_resolve_iceberg_type(type_name), expected_type)
 
 
 # ---------------------------------------------------------------------------

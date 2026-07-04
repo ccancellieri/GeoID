@@ -33,32 +33,30 @@ from dynastore.modules.renders.colormap import (
 
 
 class TestParseHexColor:
-    def test_black(self):
-        assert _parse_hex_color("#000000") == (0, 0, 0)
+    @pytest.mark.parametrize(
+        "value, expected",
+        [
+            pytest.param("#000000", (0, 0, 0), id="black"),
+            pytest.param("#ffffff", (255, 255, 255), id="white"),
+            pytest.param("#1a2b3c", (0x1A, 0x2B, 0x3C), id="mixed"),
+            pytest.param("#AABBCC", (0xAA, 0xBB, 0xCC), id="uppercase"),
+            pytest.param("  #0A0B0C  ", (0x0A, 0x0B, 0x0C), id="leading_whitespace"),
+        ],
+    )
+    def test_parse_hex_color(self, value, expected):
+        assert _parse_hex_color(value) == expected
 
-    def test_white(self):
-        assert _parse_hex_color("#ffffff") == (255, 255, 255)
-
-    def test_mixed(self):
-        assert _parse_hex_color("#1a2b3c") == (0x1A, 0x2B, 0x3C)
-
-    def test_uppercase(self):
-        assert _parse_hex_color("#AABBCC") == (0xAA, 0xBB, 0xCC)
-
-    def test_leading_whitespace(self):
-        assert _parse_hex_color("  #0A0B0C  ") == (0x0A, 0x0B, 0x0C)
-
-    def test_invalid_no_hash(self):
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("0A0B0C", id="no_hash"),
+            pytest.param("#ABC", id="short"),
+            pytest.param("#ZZZZZZ", id="non_hex"),
+        ],
+    )
+    def test_parse_hex_color_invalid(self, value):
         with pytest.raises(ValueError):
-            _parse_hex_color("0A0B0C")
-
-    def test_invalid_short(self):
-        with pytest.raises(ValueError):
-            _parse_hex_color("#ABC")
-
-    def test_invalid_non_hex(self):
-        with pytest.raises(ValueError):
-            _parse_hex_color("#ZZZZZZ")
+            _parse_hex_color(value)
 
 
 # ---------------------------------------------------------------------------
@@ -67,26 +65,20 @@ class TestParseHexColor:
 
 
 class TestOpacityToAlpha:
-    def test_none_defaults_to_255(self):
-        assert _opacity_to_alpha(None) == 255
-
-    def test_one_is_255(self):
-        assert _opacity_to_alpha("1.0") == 255
-
-    def test_zero_is_0(self):
-        assert _opacity_to_alpha("0.0") == 0
-
-    def test_half(self):
-        assert _opacity_to_alpha("0.5") == 128
-
-    def test_clamp_over_1(self):
-        assert _opacity_to_alpha("1.5") == 255
-
-    def test_clamp_negative(self):
-        assert _opacity_to_alpha("-0.1") == 0
-
-    def test_invalid_string_defaults_255(self):
-        assert _opacity_to_alpha("not-a-float") == 255
+    @pytest.mark.parametrize(
+        "value, expected",
+        [
+            pytest.param(None, 255, id="none_defaults_to_255"),
+            pytest.param("1.0", 255, id="one_is_255"),
+            pytest.param("0.0", 0, id="zero_is_0"),
+            pytest.param("0.5", 128, id="half"),
+            pytest.param("1.5", 255, id="clamp_over_1"),
+            pytest.param("-0.1", 0, id="clamp_negative"),
+            pytest.param("not-a-float", 255, id="invalid_string_defaults_255"),
+        ],
+    )
+    def test_opacity_to_alpha(self, value, expected):
+        assert _opacity_to_alpha(value) == expected
 
 
 # ---------------------------------------------------------------------------

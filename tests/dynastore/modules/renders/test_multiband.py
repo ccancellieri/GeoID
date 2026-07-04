@@ -42,38 +42,29 @@ from dynastore.modules.renders.engine import _resolve_indexes
 
 
 class TestResolveIndexes:
-    def test_single_band_default(self):
-        indexes, expr = _resolve_indexes(band=1, bands=None, expression=None)
-        assert indexes == (1,)
-        assert expr is None
-
-    def test_bands_overrides_band(self):
-        indexes, expr = _resolve_indexes(band=1, bands=(3, 2, 1), expression=None)
-        assert indexes == (3, 2, 1)
-        assert expr is None
-
-    def test_expression_overrides_bands_and_band(self):
-        indexes, expr = _resolve_indexes(
-            band=1, bands=(3, 2, 1), expression="(B1-B2)/(B1+B2)"
-        )
-        assert indexes is None
-        assert expr == "(B1-B2)/(B1+B2)"
-
-    def test_expression_without_bands(self):
-        indexes, expr = _resolve_indexes(band=2, bands=None, expression="B1/B2")
-        assert indexes is None
-        assert expr == "B1/B2"
-
-    def test_empty_bands_falls_back_to_band(self):
-        # Empty tuple is falsy — falls through to single-band path.
-        indexes, expr = _resolve_indexes(band=3, bands=(), expression=None)
-        assert indexes == (3,)
-        assert expr is None
-
-    def test_band_4_single(self):
-        indexes, expr = _resolve_indexes(band=4, bands=None, expression=None)
-        assert indexes == (4,)
-        assert expr is None
+    @pytest.mark.parametrize(
+        "band, bands, expression, expected_indexes, expected_expr",
+        [
+            pytest.param(1, None, None, (1,), None, id="single_band_default"),
+            pytest.param(1, (3, 2, 1), None, (3, 2, 1), None, id="bands_overrides_band"),
+            pytest.param(
+                1,
+                (3, 2, 1),
+                "(B1-B2)/(B1+B2)",
+                None,
+                "(B1-B2)/(B1+B2)",
+                id="expression_overrides_bands_and_band",
+            ),
+            pytest.param(2, None, "B1/B2", None, "B1/B2", id="expression_without_bands"),
+            # Empty tuple is falsy — falls through to single-band path.
+            pytest.param(3, (), None, (3,), None, id="empty_bands_falls_back_to_band"),
+            pytest.param(4, None, None, (4,), None, id="band_4_single"),
+        ],
+    )
+    def test_resolve_indexes(self, band, bands, expression, expected_indexes, expected_expr):
+        indexes, expr = _resolve_indexes(band=band, bands=bands, expression=expression)
+        assert indexes == expected_indexes
+        assert expr == expected_expr
 
 
 # ---------------------------------------------------------------------------

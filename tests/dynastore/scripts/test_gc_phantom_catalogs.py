@@ -66,50 +66,35 @@ async def _noop_lifespan(*a, **kw):
 # ---------------------------------------------------------------------------
 
 class TestIsPhantomExternalId:
-    def test_internal_shaped_catalog_id_matches(self):
-        # c_ prefix + exactly 13 chars from [2-9a-x]
-        assert gc.is_phantom_external_id("c_2abc3defg4hij") is True
-
-    def test_all_digits_suffix_matches(self):
-        assert gc.is_phantom_external_id("c_2345678923456") is True
-
-    def test_all_letters_from_alphabet_matches(self):
-        assert gc.is_phantom_external_id("c_abcdefghijklm") is True
-
-    def test_normal_external_id_does_not_match(self):
-        assert gc.is_phantom_external_id("my-real-catalog") is False
-
-    def test_uuid_external_id_does_not_match(self):
-        assert gc.is_phantom_external_id("550e8400-e29b-41d4-a716-446655440000") is False
-
-    def test_wrong_prefix_does_not_match(self):
-        # col_ prefix used for collections, not catalogs
-        assert gc.is_phantom_external_id("col_2abc3defg4hi") is False
-
-    def test_too_short_suffix_does_not_match(self):
-        assert gc.is_phantom_external_id("c_2abc3def") is False
-
-    def test_too_long_suffix_does_not_match(self):
-        assert gc.is_phantom_external_id("c_2abc3defg4hijk") is False
-
-    def test_forbidden_char_y_does_not_match(self):
-        # 'y' is NOT in [2-9a-x]
-        assert gc.is_phantom_external_id("c_2yyyyyyyyyyyyyyy") is False
-
-    def test_forbidden_char_0_does_not_match(self):
-        # '0' is not in the base32 alphabet used
-        assert gc.is_phantom_external_id("c_0yyyyyyyyyyy0") is False
-
-    def test_forbidden_char_1_does_not_match(self):
-        assert gc.is_phantom_external_id("c_1abc3defg4hi") is False
-
-    def test_empty_string_does_not_match(self):
-        assert gc.is_phantom_external_id("") is False
-
-    def test_real_internal_id_from_generate_physical_name(self):
-        # A representative id produced by generate_physical_name("c").
-        # Alphabet is 2-9 + a-x (32 symbols), so all chars in [2-9a-x].
-        assert gc.is_phantom_external_id("c_3kp7rmn4bcdef") is True
+    @pytest.mark.parametrize(
+        "external_id, expected",
+        [
+            pytest.param("c_2abc3defg4hij", True, id="internal_shaped_catalog_id_matches"),
+            pytest.param("c_2345678923456", True, id="all_digits_suffix_matches"),
+            pytest.param("c_abcdefghijklm", True, id="all_letters_from_alphabet_matches"),
+            pytest.param("my-real-catalog", False, id="normal_external_id_does_not_match"),
+            pytest.param(
+                "550e8400-e29b-41d4-a716-446655440000", False, id="uuid_external_id_does_not_match"
+            ),
+            # col_ prefix used for collections, not catalogs
+            pytest.param("col_2abc3defg4hi", False, id="wrong_prefix_does_not_match"),
+            pytest.param("c_2abc3def", False, id="too_short_suffix_does_not_match"),
+            pytest.param("c_2abc3defg4hijk", False, id="too_long_suffix_does_not_match"),
+            # 'y' is NOT in [2-9a-x]
+            pytest.param("c_2yyyyyyyyyyyyyyy", False, id="forbidden_char_y_does_not_match"),
+            # '0' is not in the base32 alphabet used
+            pytest.param("c_0yyyyyyyyyyy0", False, id="forbidden_char_0_does_not_match"),
+            pytest.param("c_1abc3defg4hi", False, id="forbidden_char_1_does_not_match"),
+            pytest.param("", False, id="empty_string_does_not_match"),
+            # A representative id produced by generate_physical_name("c").
+            # Alphabet is 2-9 + a-x (32 symbols), so all chars in [2-9a-x].
+            pytest.param(
+                "c_3kp7rmn4bcdef", True, id="real_internal_id_from_generate_physical_name"
+            ),
+        ],
+    )
+    def test_is_phantom_external_id(self, external_id, expected):
+        assert gc.is_phantom_external_id(external_id) is expected
 
 
 # ---------------------------------------------------------------------------
@@ -747,58 +732,32 @@ class TestRequireDevEnv:
         else:
             monkeypatch.delenv("ENVIRONMENT", raising=False)
 
-    def test_refuses_when_env_is_prod(self, monkeypatch):
-        self._call(monkeypatch, dynastore_env="prod")
-        with pytest.raises(SystemExit) as exc:
-            gc._require_dev_env()
-        assert exc.value.code == 2
-
-    def test_refuses_when_env_is_production(self, monkeypatch):
-        self._call(monkeypatch, dynastore_env="production")
-        with pytest.raises(SystemExit) as exc:
-            gc._require_dev_env()
-        assert exc.value.code == 2
-
-    def test_refuses_when_env_is_empty(self, monkeypatch):
-        """Empty label is refused — --all must not run when env is unknown."""
-        self._call(monkeypatch, dynastore_env=None, environment=None)
-        with pytest.raises(SystemExit) as exc:
-            gc._require_dev_env()
-        assert exc.value.code == 2
-
-    def test_refuses_when_env_is_unknown_label(self, monkeypatch):
-        self._call(monkeypatch, dynastore_env="staging")
-        with pytest.raises(SystemExit) as exc:
-            gc._require_dev_env()
-        assert exc.value.code == 2
-
-    def test_allows_dev(self, monkeypatch):
-        self._call(monkeypatch, dynastore_env="dev")
-        gc._require_dev_env()  # must not raise
-
-    def test_allows_development(self, monkeypatch):
-        self._call(monkeypatch, dynastore_env="development")
-        gc._require_dev_env()
-
-    def test_allows_review(self, monkeypatch):
-        self._call(monkeypatch, dynastore_env="review")
-        gc._require_dev_env()
-
-    def test_allows_dev_case_insensitive(self, monkeypatch):
-        self._call(monkeypatch, dynastore_env="DEV")
-        gc._require_dev_env()
-
-    def test_falls_back_to_environment_var(self, monkeypatch):
-        """When DYNASTORE_ENV is absent, ENVIRONMENT is used as fallback."""
-        self._call(monkeypatch, dynastore_env=None, environment="dev")
-        gc._require_dev_env()
-
-    def test_dynastore_env_takes_priority_over_environment(self, monkeypatch):
-        """DYNASTORE_ENV=prod wins even when ENVIRONMENT=dev."""
-        self._call(monkeypatch, dynastore_env="prod", environment="dev")
-        with pytest.raises(SystemExit) as exc:
-            gc._require_dev_env()
-        assert exc.value.code == 2
+    @pytest.mark.parametrize(
+        "dynastore_env, environment, should_raise",
+        [
+            pytest.param("prod", None, True, id="refuses_when_env_is_prod"),
+            pytest.param("production", None, True, id="refuses_when_env_is_production"),
+            # Empty label is refused — --all must not run when env is unknown.
+            pytest.param(None, None, True, id="refuses_when_env_is_empty"),
+            pytest.param("staging", None, True, id="refuses_when_env_is_unknown_label"),
+            pytest.param("dev", None, False, id="allows_dev"),
+            pytest.param("development", None, False, id="allows_development"),
+            pytest.param("review", None, False, id="allows_review"),
+            pytest.param("DEV", None, False, id="allows_dev_case_insensitive"),
+            # When DYNASTORE_ENV is absent, ENVIRONMENT is used as fallback.
+            pytest.param(None, "dev", False, id="falls_back_to_environment_var"),
+            # DYNASTORE_ENV=prod wins even when ENVIRONMENT=dev.
+            pytest.param("prod", "dev", True, id="dynastore_env_takes_priority_over_environment"),
+        ],
+    )
+    def test_require_dev_env(self, monkeypatch, dynastore_env, environment, should_raise):
+        self._call(monkeypatch, dynastore_env=dynastore_env, environment=environment)
+        if should_raise:
+            with pytest.raises(SystemExit) as exc:
+                gc._require_dev_env()
+            assert exc.value.code == 2
+        else:
+            gc._require_dev_env()  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -806,31 +765,37 @@ class TestRequireDevEnv:
 # ---------------------------------------------------------------------------
 
 class TestCleanDsn:
-    def test_strips_surrounding_whitespace(self):
-        assert gc._clean_dsn("  postgresql://x/db  ") == "postgresql://x/db"
-
-    def test_strips_single_quotes(self):
-        assert gc._clean_dsn("'postgresql://x/db'") == "postgresql://x/db"
-
-    def test_strips_double_quotes(self):
-        assert gc._clean_dsn('"postgresql://x/db"') == "postgresql://x/db"
-
-    def test_returns_none_for_empty_string(self):
-        assert gc._clean_dsn("") is None
-
-    def test_returns_none_for_none(self):
-        assert gc._clean_dsn(None) is None
+    @pytest.mark.parametrize(
+        "value, expected",
+        [
+            pytest.param("  postgresql://x/db  ", "postgresql://x/db", id="strips_surrounding_whitespace"),
+            pytest.param("'postgresql://x/db'", "postgresql://x/db", id="strips_single_quotes"),
+            pytest.param('"postgresql://x/db"', "postgresql://x/db", id="strips_double_quotes"),
+            pytest.param("", None, id="returns_none_for_empty_string"),
+            pytest.param(None, None, id="returns_none_for_none"),
+        ],
+    )
+    def test_clean_dsn(self, value, expected):
+        assert gc._clean_dsn(value) == expected
 
 
 class TestNormalizeDsn:
-    def test_strips_postgresql_asyncpg(self):
-        assert gc._normalize_dsn("postgresql+asyncpg://u:p@h/db") == "postgresql://u:p@h/db"
-
-    def test_strips_postgres_asyncpg(self):
-        assert gc._normalize_dsn("postgres+asyncpg://u:p@h/db") == "postgresql://u:p@h/db"
-
-    def test_plain_postgresql_unchanged(self):
-        assert gc._normalize_dsn("postgresql://u:p@h/db") == "postgresql://u:p@h/db"
+    @pytest.mark.parametrize(
+        "value, expected",
+        [
+            pytest.param(
+                "postgresql+asyncpg://u:p@h/db", "postgresql://u:p@h/db", id="strips_postgresql_asyncpg"
+            ),
+            pytest.param(
+                "postgres+asyncpg://u:p@h/db", "postgresql://u:p@h/db", id="strips_postgres_asyncpg"
+            ),
+            pytest.param(
+                "postgresql://u:p@h/db", "postgresql://u:p@h/db", id="plain_postgresql_unchanged"
+            ),
+        ],
+    )
+    def test_normalize_dsn(self, value, expected):
+        assert gc._normalize_dsn(value) == expected
 
 
 class TestResolveDsn:
