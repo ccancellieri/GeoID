@@ -53,6 +53,40 @@ def _logger() -> logging.Logger:
     return logging.getLogger(__name__)
 
 
+def _make_pool_reset_hook(pool_label: str) -> Any:
+    """Build an ``asyncpg.create_pool(reset=...)`` callback for ``pool_label``.
+
+    A raw asyncpg connection whose protocol state was left corrupted by a
+    cancelled operation (asyncio task cancellation, CPU-throttling storm)
+    fails its release-time reset query with the same shape SQLAlchemy sees
+    on its pooled connections (``InternalClientError: cannot switch to
+    state N``). ``PoolConnectionHolder.release()`` already terminates the
+    connection instead of returning it whenever the reset call raises — see
+    asyncpg's ``pool.py`` — but does so silently. Supplying a custom
+    ``reset`` callback replaces asyncpg's default reset entirely, so this
+    still issues the same reset query asyncpg would run by default
+    (``Connection.get_reset_query()``); the only addition is the structured
+    WARN logged before the exception propagates and the connection is
+    discarded.
+    """
+
+    async def _reset(conn: Any) -> None:
+        reset_query = conn.get_reset_query()
+        try:
+            if reset_query:
+                await conn.execute(reset_query)
+        except Exception as exc:
+            _logger().warning(
+                "raw_pool_connection_discarded pool=%s reason=%s: %s",
+                pool_label,
+                type(exc).__name__,
+                str(exc)[:120],
+            )
+            raise
+
+    return _reset
+
+
 class EngineLifecycleConfig(BaseModel):
     """Lifecycle policy attached to a platform engine.
 
@@ -277,6 +311,11 @@ class PostgresqlEngineConfig(EngineConfig):
             max_size=self.pool_size,
             timeout=self.pool_timeout_sec,
             server_settings=server_settings,
+            # Discard (rather than recycle) a connection whose protocol
+            # state was corrupted by a cancelled operation — this pool has
+            # no SQLAlchemy layer, so it needs its own release-time guard
+            # (#2900).
+            reset=_make_pool_reset_hook(self.__class__.class_key()),
         )
 
     async def engine_release(self, instance: Any) -> None:

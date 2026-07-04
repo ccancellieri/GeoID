@@ -44,9 +44,6 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 from sqlalchemy.engine import Engine
 from dynastore.modules import ModuleProtocol
-from dynastore.modules.db_config.connection_poison_guard import (
-    register_connection_poison_guard,
-)
 from dynastore.modules.db_config.db_config import DBConfig
 from dynastore.modules.db_config.db_timeout_config import (
     clamp_serving_statement_timeout,
@@ -375,12 +372,6 @@ class DBService(ModuleProtocol, DatabaseProtocol):
                     # silently-dropped idle connection is detected fast instead of
                     # hanging the next pool_pre_ping for connect_timeout (#710).
                     _arm_client_socket_keepalive(app_state.engine, db_config)
-                    # Evict (rather than recycle) connections whose asyncpg
-                    # protocol state machine was left mid-operation by a
-                    # cancelled request — see connection_poison_guard (#2900).
-                    register_connection_poison_guard(
-                        app_state.engine, service=app_name
-                    )
                     engine_created_by_service = True
                     logger.info(
                         "DBService: ASYNC Database connection pool established successfully."

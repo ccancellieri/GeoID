@@ -268,9 +268,6 @@ class EventDrainTask(AsyncWriteDrainTaskProtocol):
         from sqlalchemy.ext.asyncio import create_async_engine
         from sqlalchemy.pool import NullPool
 
-        from dynastore.modules.db_config.connection_poison_guard import (
-            register_connection_poison_guard,
-        )
         from dynastore.modules.db_config.db_config import DBConfig
         from dynastore.modules.db_config.db_timeout_config import (
             task_engine_connect_args,
@@ -294,7 +291,6 @@ class EventDrainTask(AsyncWriteDrainTaskProtocol):
         engine = create_async_engine(
             db_url, poolclass=NullPool, connect_args=task_engine_connect_args(DBConfig)
         )
-        register_connection_poison_guard(engine, service="event_drain_task")
         # Stable owner_id for the lifetime of this run — the claim stamp and the
         # CAS guard on terminal writes.
         owner_id = f"event_drain:{uuid4()}"

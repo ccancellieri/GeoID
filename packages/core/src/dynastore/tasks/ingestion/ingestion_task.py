@@ -77,9 +77,6 @@ async def _maybe_enqueue_tile_preseed(
     from sqlalchemy.ext.asyncio import create_async_engine
     from sqlalchemy.pool import NullPool
 
-    from dynastore.modules.db_config.connection_poison_guard import (
-        register_connection_poison_guard,
-    )
     from dynastore.modules.db_config.db_config import DBConfig
     from dynastore.modules.db_config.db_timeout_config import task_engine_connect_args
     from dynastore.modules.db_config.tools import normalize_db_url
@@ -93,7 +90,6 @@ async def _maybe_enqueue_tile_preseed(
     engine = create_async_engine(
         db_url, poolclass=NullPool, connect_args=task_engine_connect_args(DBConfig)
     )
-    register_connection_poison_guard(engine, service="ingestion_task.preseed")
     try:
         await execute_process(
             "tiles_preseed",
