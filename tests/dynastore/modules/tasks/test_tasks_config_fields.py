@@ -22,6 +22,32 @@ from unittest.mock import MagicMock
 from dynastore.modules.tasks.tasks_config import TasksPluginConfig
 
 
+# ---------------------------------------------------------------------------
+# queue_poll_interval env-derived default (geoid#2830 C6)
+# ---------------------------------------------------------------------------
+#
+# ``default_factory`` (re-read on every bare construction) rather than a
+# frozen-at-import ``default=os.getenv(...)`` — see the field's docstring
+# comment in tasks_config.py for why this stays env-backed instead of
+# migrating to a cold-boot DB-seed preset.
+
+
+def test_queue_poll_interval_default_when_env_unset(monkeypatch):
+    monkeypatch.delenv("DYNASTORE_QUEUE_POLL_INTERVAL", raising=False)
+    cfg = TasksPluginConfig()
+    assert cfg.queue_poll_interval == 30.0
+
+
+def test_queue_poll_interval_default_reads_env_per_instantiation(monkeypatch):
+    monkeypatch.setenv("DYNASTORE_QUEUE_POLL_INTERVAL", "0.5")
+    cfg = TasksPluginConfig()
+    assert cfg.queue_poll_interval == 0.5
+
+    monkeypatch.setenv("DYNASTORE_QUEUE_POLL_INTERVAL", "12.0")
+    cfg2 = TasksPluginConfig()
+    assert cfg2.queue_poll_interval == 12.0
+
+
 def test_runner_and_dispatcher_fields_present_with_defaults():
     cfg = TasksPluginConfig()
     assert cfg.background_runner_concurrency == 4

@@ -35,6 +35,15 @@ class TasksPluginConfig(ExposableConfigMixin, PluginConfig):
     _address: ClassVar[Tuple[str, ...]] = ("platform", "tasks")
 
 
+    # ``default_factory`` (re-read on every bare construction, not frozen at
+    # class-definition/import time) is a deliberate, reviewed exception to
+    # routing env-sourcing through a cold-boot seed preset (geoid#2830 C6):
+    # ``tests/dynastore/conftest.py`` sets DYNASTORE_QUEUE_POLL_INTERVAL
+    # before constructing any config so the whole test suite polls at a fast
+    # fixed interval instead of the 30s production default. A DB-seeded
+    # value would not be visible to the many unit tests that construct
+    # ``TasksPluginConfig()`` directly without a full app cold boot, so this
+    # field stays env-backed at the model layer.
     queue_poll_interval: Mutable[float] = Field(
         default_factory=lambda: float(os.environ.get("DYNASTORE_QUEUE_POLL_INTERVAL", "30.0")),
         description="Fallback polling interval (in seconds) for the task queue listener when real-time push notifications are unavailable.",

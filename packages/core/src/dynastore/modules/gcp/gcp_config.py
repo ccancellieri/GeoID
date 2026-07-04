@@ -147,7 +147,22 @@ class GcpCatalogBucketConfig(PluginConfig):
     # (see ``GcpCatalogBucketConfig.register_apply_handler(...)`` below).
 
     # Immutable fields: Once the bucket is created, these cannot be changed.
-    location: Immutable[Optional[GcpLocation]] = Field(default=os.getenv("REGION", GcpLocation.EUROPE_WEST1), description="The GCP region where the bucket will be created (e.g., 'europe-west1'). If not set, defaults to the application's region.")  # type: ignore[assignment]
+    #
+    # ``default_factory`` (not a bare ``default=os.getenv(...)``) is a
+    # deliberate, reviewed exception to routing env-sourcing through a
+    # cold-boot seed preset (geoid#2830 C6): a plain ``Field(default=...)``
+    # expression is evaluated once at class-definition/import time, so it
+    # silently freezes whatever REGION was at that instant; the lambda below
+    # re-reads the environment on every bare construction instead. In
+    # practice this bare default is rarely reached anyway — the two
+    # fallback-construction call sites in ``bucket_service.py`` already pass
+    # ``location=GcpLocation(self.region)`` explicitly, and ``self.region``
+    # comes from ``GCPModule.get_region()``, which prefers GCP
+    # metadata-server/ADC identity auto-detection ahead of any config value
+    # (see ``modules/gcp/tools/service_account.py``). This field only
+    # backstops that when identity auto-detection is unavailable (e.g. local
+    # dev without a metadata server).
+    location: Immutable[Optional[GcpLocation]] = Field(default_factory=lambda: os.getenv("REGION", GcpLocation.EUROPE_WEST1), description="The GCP region where the bucket will be created (e.g., 'europe-west1'). If not set, defaults to the application's region.")  # type: ignore[assignment]
     storage_class: Immutable[GcsStorageClass] = Field(default=GcsStorageClass.STANDARD, description="The default storage class for objects in the bucket.")
 
     # Mutable fields
@@ -192,8 +207,18 @@ class GcpModuleConfig(ExposableConfigMixin, PluginConfig):
     """
     _address: ClassVar[Tuple[str, ...]] = ("platform", "modules", "gcp")
 
-    project_id: Mutable[str] = Field(default=os.getenv("PROJECT_ID", "local-project"), description="The GCP Project ID.")
-    region: Mutable[str] = Field(default=os.getenv("REGION", "europe-west1"), description="The default GCP region.")
+    # ``default_factory`` (not a bare ``default=os.getenv(...)``) is a
+    # deliberate, reviewed exception to routing env-sourcing through a
+    # cold-boot seed preset (geoid#2830 C6) — see the longer rationale on
+    # ``GcpCatalogBucketConfig.location`` above. Production project_id/region
+    # resolution is dominated by ``GCPModule.get_project_id()``/
+    # ``get_region()``, which prefer GCP metadata-server/ADC identity
+    # auto-detection ahead of this field entirely; these fields only
+    # backstop that when identity auto-detection is unavailable. An operator
+    # can always override the persisted value via the Configs API regardless
+    # of this default.
+    project_id: Mutable[str] = Field(default_factory=lambda: os.getenv("PROJECT_ID", "local-project"), description="The GCP Project ID.")
+    region: Mutable[str] = Field(default_factory=lambda: os.getenv("REGION", "europe-west1"), description="The default GCP region.")
 
     # Visibility and Propagation Tuning (Critical for tests)
     catalog_visibility_max_retries: Mutable[int] = Field(
