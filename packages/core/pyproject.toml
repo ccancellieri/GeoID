@@ -38,6 +38,10 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "python-dateutil",
     "orjson>=3.9.0",
+    # tools/secrets.py Fernet-encrypts `{"__secret__": ...}` config fields;
+    # engine configs carrying encrypted credentials (e.g. valkey_engine_config)
+    # fail to load in build_engine_snapshot without it. See #2976.
+    "cryptography>=42.0.0",
 ]
 
 # ============================================================================

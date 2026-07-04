@@ -135,3 +135,18 @@ def test_flag_value_must_be_exactly_one(monkeypatch):
     secrets = _reload_secrets_module()
     with pytest.raises(RuntimeError, match="DYNASTORE_SECRET_KEY"):
         secrets._derive_key()
+
+
+def test_encrypt_decrypt_round_trip(monkeypatch):
+    """Secret.encrypt/decrypt must round-trip — exercises the real
+    cryptography.fernet import, which is a declared core dependency
+    (engine configs with `{"__secret__": ...}` fields fail to load
+    from build_engine_snapshot without it, #2976)."""
+    monkeypatch.setenv("DYNASTORE_SECRET_KEY", "round-trip-key")
+    monkeypatch.delenv("JWT_SECRET", raising=False)
+    monkeypatch.delenv("SESSION_SECRET_KEY", raising=False)
+
+    secrets = _reload_secrets_module()
+    token = secrets.Secret.encrypt("s3cr3t-value")
+    assert token != "s3cr3t-value"
+    assert secrets.Secret.decrypt(token) == "s3cr3t-value"
