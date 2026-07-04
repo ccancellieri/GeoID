@@ -2619,7 +2619,7 @@ async def update_task_ingestion_offset(
         SET inputs = jsonb_set(
             COALESCE(inputs, '{{}}'::jsonb),
             '{{ingestion_request,offset}}',
-            to_jsonb(:offset_value::bigint),
+            to_jsonb(CAST(:offset_value AS bigint)),
             true
         )
         WHERE task_id = :task_id;

@@ -434,7 +434,7 @@ class ItemQueryMixin:
             try:
                 reltuples: int = await DQLQuery(
                     'SELECT reltuples::bigint FROM pg_class '
-                    'WHERE oid = :table_oid::regclass',
+                    'WHERE oid = CAST(:table_oid AS regclass)',
                     result_handler=ResultHandler.SCALAR,
                 ).execute(conn, table_oid=f'"{phys_schema}"."{phys_table}"')
                 if reltuples is None:
