@@ -85,9 +85,9 @@ def test_can_read_matches_extensions():
     assert not PyogrioReader.can_read("gs://b/x/file.parquet")
 
 
-def test_priority_is_tail_fallback():
-    # Strictly behind GdalOsgeoReader (priority=10); higher number = later.
-    assert PyogrioReader.priority == 100
+def test_priority_is_ahead_of_gdal_osgeo():
+    # Strictly ahead of GdalOsgeoReader (priority=100); lower number = earlier.
+    assert PyogrioReader.priority == 10
     assert PyogrioReader.reader_id == "pyogrio"
 
 

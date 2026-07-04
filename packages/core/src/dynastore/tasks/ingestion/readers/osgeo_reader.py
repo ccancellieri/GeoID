@@ -16,7 +16,8 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""GdalOsgeoReader — primary reader, uses system libgdal via ``osgeo.ogr``.
+"""GdalOsgeoReader — broad-coverage fallback reader, uses system libgdal
+via ``osgeo.ogr``.
 
 Why this exists: PyPI GDAL wheels (``pyogrio``, like ``fiona`` before
 it) ship a bundled libgdal that omits the Arrow/Parquet driver.
@@ -25,6 +26,13 @@ comes with the
 ``ghcr.io/osgeo/gdal:ubuntu-full-3.13.0`` base image), which DOES
 include Parquet, FlatGeobuf, OpenFileGDB, …  Same osgeo binding the
 maps service uses successfully.
+
+Registered at ``priority=100`` — behind :class:`PyogrioReader`
+(``priority=10``) — because this reader iterates one OGR feature at a
+time via the Python API, which is far slower than pyogrio's vectorized
+chunked reads on the formats pyogrio also supports (GeoID #2964). It
+remains the reader of record for every format pyogrio's PyPI wheel
+doesn't declare (Parquet, FlatGeobuf, OpenFileGDB, KML, GML, MapInfo, …).
 
 Hard-imports ``osgeo`` at module load — when SCOPE excludes
 ``module_gdal`` the import fails and :class:`ReaderRegistry` skips
@@ -85,14 +93,16 @@ class GdalOsgeoReader(SourceReaderProtocol):
     """
 
     reader_id: ClassVar[str] = "gdal_osgeo"
-    priority: ClassVar[int] = 10
+    priority: ClassVar[int] = 100
 
     # Empty extension tuple means "match anything" — see can_read override.
     extensions: ClassVar[Tuple[str, ...]] = ()
 
-    # Drivers we explicitly know GDAL can open from /vsigs/ + a small
-    # extension hint set so the registry's *priority* ordering still
-    # picks us over the pyogrio fallback reader for common formats.
+    # Drivers we explicitly know GDAL can open from /vsigs/. For any
+    # extension PyogrioReader also declares (priority=10), pyogrio wins
+    # and this reader is only reached as its fallback; for everything
+    # else in this list (Parquet, FlatGeobuf, KML, GML, MapInfo, …) this
+    # is the sole/first match.
     KNOWN_EXT: ClassVar[Tuple[str, ...]] = (
         ".parquet", ".geoparquet",
         ".fgb",

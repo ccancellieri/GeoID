@@ -16,14 +16,18 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Pyogrio-backed reader, registered as a fallback.
+"""Pyogrio-backed reader — preferred for the formats it declares.
 
-Sits strictly behind :class:`GdalOsgeoReader` (``priority=10``), which
-binds the **system** libgdal via ``osgeo.ogr``.  This reader hard-imports
-``pyogrio`` instead — pyogrio ships its own GDAL build in the PyPI wheel,
-so it provides a vector-read path in scopes that pull in ``geospatial_io``
-but not the ``module_gdal`` osgeo bindings.  ``priority=100`` keeps it a
-tail candidate.
+Sits strictly ahead of :class:`GdalOsgeoReader` (``priority=100``) for
+the extensions listed below.  ``pyogrio.read_dataframe(..., chunksize=...)``
+reads in vectorized/Arrow-backed chunks, whereas ``GdalOsgeoReader``
+iterates one OGR feature at a time via the Python API — on an 8.4M-row
+GeoPackage that row-by-row path ran at ~27 rows/sec (GeoID #2964).
+``priority=10`` gives this reader first crack at its declared extensions;
+for any format outside that list ``can_read()`` returns False and the
+registry falls through to ``GdalOsgeoReader``, which still covers the
+~78 GDAL driver formats (Parquet, FlatGeobuf, OpenFileGDB, …) pyogrio's
+PyPI wheel doesn't support.
 """
 
 from __future__ import annotations
@@ -44,14 +48,16 @@ logger = logging.getLogger(__name__)
 
 
 class PyogrioReader(SourceReaderProtocol):
-    """Fallback reader backed by pyogrio's bundled GDAL."""
+    """Preferred reader (chunked/vectorized) for the formats it declares;
+    backed by pyogrio's bundled GDAL."""
 
     reader_id: ClassVar[str] = "pyogrio"
-    priority: ClassVar[int] = 100
+    priority: ClassVar[int] = 10
     extensions: ClassVar[Tuple[str, ...]] = (
-        # Keep the set small and overlapping with osgeo intentionally so an
-        # explicit ``hint=pyogrio`` (future) can pin it; osgeo's lower
-        # priority still wins for these by default.
+        # Formats pyogrio reads in vectorized/Arrow-backed chunks —
+        # dramatically faster than GdalOsgeoReader's row-by-row OGR
+        # iteration (GeoID #2964).  Anything outside this list falls
+        # through to GdalOsgeoReader's broader driver coverage.
         ".geojson", ".json", ".gpkg", ".shp", ".csv",
     )
 
