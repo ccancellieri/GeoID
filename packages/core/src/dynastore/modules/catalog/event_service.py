@@ -201,6 +201,12 @@ class CatalogEventType(EventType):
     # Task Lifecycle Events (platform-scoped, fired by runners - no module coupling)
     TASK_FAILED = define_event("task.failed", EventScope.PLATFORM)
 
+    # Health/Watchdog Alerts (platform-scoped, from the #2368 watchdog work)
+    MAINTENANCE_HEALTH_ALERT = define_event(
+        "maintenance.health_alert", EventScope.PLATFORM
+    )
+    TASKS_HEALTH_ALERT = define_event("tasks.health_alert", EventScope.PLATFORM)
+
 Listener = Callable[..., Coroutine[Any, Any, None]]
 
 

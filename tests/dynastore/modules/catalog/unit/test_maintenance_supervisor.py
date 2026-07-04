@@ -1015,3 +1015,21 @@ def test_es_logs_retention_job_registered_in_dispatch_table():
     assert _CADENCE_ES_LOGS_RETENTION == 86400
 
 
+# ---------------------------------------------------------------------------
+# maintenance.health_alert must be a declared event (#2918)
+# ---------------------------------------------------------------------------
+
+
+def test_maintenance_health_alert_event_is_registered():
+    """`_run_health_alert` emits ``maintenance.health_alert``, which must be
+    declared via ``define_event`` (like every other event type) so
+    ``EventRegistry.is_valid`` reflects reality instead of relying on
+    ``EventService.emit``'s PLATFORM fallback for unregistered names."""
+    from dynastore.modules.catalog.event_service import CatalogEventType, EventScope
+    from dynastore.modules.tasks.events.primitives import EventRegistry
+
+    assert EventRegistry.is_valid("maintenance.health_alert")
+    assert EventRegistry._events["maintenance.health_alert"] == EventScope.PLATFORM
+    assert CatalogEventType.MAINTENANCE_HEALTH_ALERT == "maintenance.health_alert"
+
+
