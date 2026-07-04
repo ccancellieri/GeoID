@@ -40,6 +40,8 @@ from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import Geom
 from dynastore.modules.stac.stac_config import (
     StacPluginConfig,
     HierarchyStrategy,
+    DatacubeDimension,
+    OGC_DIMENSIONS_PAGINATION_URI,
 )
 from dynastore.tools.language_utils import resolve_localized_field
 from dynastore.extensions.tools.conformance import get_active_conformance
@@ -58,6 +60,26 @@ SUPPORTED_STAC_EXTENSIONS = [
     "https://stac-extensions.github.io/datacube/v2.3.0/schema.json",
     "https://stac-extensions.github.io/projection/v1.1.0/schema.json",
 ]
+
+
+def _cube_dimensions_extension_uris(
+    cube_dimensions: Dict[str, DatacubeDimension],
+) -> List[str]:
+    """STAC extension URIs to declare for a set of ``cube:dimensions`` (#2985).
+
+    Always the ratified datacube v2.3.0 URI. If any dimension carries
+    DynaStore's pagination fields (``size``/``href``/``generator`` — not part
+    of the ratified v2.3.0 schema), also declare the OGC Dimensions
+    pagination URI so those extras aren't presented as if they were part of
+    the standard datacube conformance claim.
+    """
+    uris = [SUPPORTED_STAC_EXTENSIONS[0]]
+    if any(
+        dim.size is not None or dim.href is not None or dim.generator is not None
+        for dim in cube_dimensions.values()
+    ):
+        uris.append(OGC_DIMENSIONS_PAGINATION_URI)
+    return uris
 
 
 def _public_id(model: Any) -> str:
@@ -653,8 +675,9 @@ async def create_collection(
             stac_extensions_to_add.append(ext_uri)
     # Add extensions based on config
     if stac_config.cube_dimensions or stac_config.cube_variables:
-        if SUPPORTED_STAC_EXTENSIONS[0] not in stac_extensions_to_add:
-            stac_extensions_to_add.append(SUPPORTED_STAC_EXTENSIONS[0])
+        for cube_uri in _cube_dimensions_extension_uris(stac_config.cube_dimensions):
+            if cube_uri not in stac_extensions_to_add:
+                stac_extensions_to_add.append(cube_uri)
 
     # Cast layer_config components to expected types to handle Immutable wrappers.
     # Sidecars are PG-driver-internal — driver_sidecars() returns [] for any
