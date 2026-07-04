@@ -2029,8 +2029,44 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                     headers={"X-Render-Cache": "hit", "X-Render-Source": "tile_storage"},
                 )
 
+        from dynastore.modules.tiles import tiles_engine
+        from dynastore.modules.tiles.tiles_source import TileSourceNotSupported
+
+        # Resolved BEFORE the render connection is acquired below (#3014,
+        # same reorder applied to get_vector_tile in #3022): the collection-
+        # metadata lookup this triggers (tiles_module.get_tile_resolution_params)
+        # always opens its own separate pooled connection regardless of what's
+        # passed as ``engine`` here, so running it while a render connection
+        # was already checked out meant this handler could need two pool
+        # connections at once. Passing the bare engine for the optional
+        # custom-CRS SRID resolution matches the pattern already used by
+        # get_vector_tile and the preseed/export tasks.
+        engine = get_async_engine(request)
         try:
-            conn = await get_async_engine(request).connect()
+            ctx = await tiles_engine.build_render_context(
+                internal_catalog_id,
+                [internal_collection_id],
+                tms_id,
+                engine=engine,
+                format="png",
+            )
+        except TileSourceNotSupported as exc:
+            logger.error("map_tile: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        if ctx is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Collection '{internal_collection_id}' could not be resolved "
+                    "for map-tile rendering."
+                ),
+            )
+
+        # Acquired last, once metadata resolution above is done — this is the
+        # only connection this handler ever needs to hold now.
+        try:
+            conn = await engine.connect()
         except Exception as exc:
             logger.error(
                 "map_tile: failed to acquire DB connection for vector PNG render "
@@ -2040,30 +2076,6 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             raise HTTPException(status_code=503, detail="Database unavailable.") from exc
 
         try:
-            from dynastore.modules.tiles import tiles_engine
-            from dynastore.modules.tiles.tiles_source import TileSourceNotSupported
-
-            try:
-                ctx = await tiles_engine.build_render_context(
-                    internal_catalog_id,
-                    [internal_collection_id],
-                    tms_id,
-                    engine=conn,
-                    format="png",
-                )
-            except TileSourceNotSupported as exc:
-                logger.error("map_tile: %s", exc)
-                raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-            if ctx is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail=(
-                        f"Collection '{internal_collection_id}' could not be resolved "
-                        "for map-tile rendering."
-                    ),
-                )
-
             tile_bytes = await tiles_engine.render_tile(
                 conn, ctx, str(z), x, y, format="png", use_l1_cache=True,
             )

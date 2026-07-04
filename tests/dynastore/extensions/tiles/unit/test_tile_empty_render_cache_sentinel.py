@@ -222,3 +222,48 @@ async def test_read_gate_still_misses_on_genuine_absence():
     )
 
     assert resp is None
+
+
+@pytest.mark.asyncio
+async def test_disable_cache_bypasses_empty_tile_write():
+    """``disable_cache=True`` must skip the write gate entirely, even for a
+    confirmed-empty render — the request explicitly opted out of caching."""
+    bg_tasks = _make_bg_tasks()
+    svc = _make_service()
+    svc._require_collection_visible = AsyncMock()
+    svc._resolve_request_config = AsyncMock(return_value=TilesConfig())
+    svc._is_cache_enabled = AsyncMock(return_value=True)
+    svc._validate_tms_and_matrix = AsyncMock(return_value=MagicMock(crs="EPSG:3857"))
+
+    async def _fast_timeout() -> float:
+        return 5.0
+
+    fake_ctx = MagicMock(target_srid=3857)
+    protocol_mock = _do_everything_protocol_mock()
+
+    with patch(
+        "dynastore.extensions.tiles.tiles_service._read_live_fg_acquire_timeout",
+        _fast_timeout,
+    ), patch(
+        "dynastore.extensions.tiles.tiles_service.get_async_engine",
+        return_value=_instant_connect_engine(),
+    ), patch(
+        "dynastore.extensions.tiles.tiles_service.get_protocol",
+        return_value=protocol_mock,
+    ), patch(
+        "dynastore.modules.tiles.tiles_engine.build_render_context",
+        AsyncMock(return_value=fake_ctx),
+    ), patch(
+        "dynastore.modules.tiles.tiles_engine.render_tile",
+        AsyncMock(return_value=b""),
+    ):
+        result = await svc.get_vector_tile(
+            request=_make_request(),
+            background_tasks=bg_tasks,
+            **_minimal_tile_kwargs(disable_cache=True),
+        )
+
+    assert result.status_code == 204
+    protocol_mock.get_tile.assert_not_called()
+    protocol_mock.get_tile_url.assert_not_called()
+    bg_tasks.add_task.assert_not_called()
