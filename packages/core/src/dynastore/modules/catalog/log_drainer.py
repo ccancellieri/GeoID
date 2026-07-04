@@ -56,6 +56,9 @@ from dynastore.modules.catalog.log_service_config import (
     LogServiceConfig,
     load as load_log_config,
 )
+from dynastore.modules.tasks.durable.lock_registry import (
+    LOG_DRAINER_ADVISORY_LOCK_KEY as _LOG_DRAINER_ADVISORY_LOCK_KEY,
+)
 from dynastore.tools.background_service import (
     Leadership,
     LeaseRenewalMode,
@@ -66,9 +69,9 @@ from dynastore.tools.background_service import (
 
 logger = logging.getLogger(__name__)
 
-# Advisory lock key for leader election — must not collide with any other
-# leader-elected loop (maintenance_supervisor / soft_delete_reaper / ...).
-_LOG_DRAINER_ADVISORY_LOCK_KEY = 0x4C4F4744_52414E31  # "LOGDRAN1" in ASCII hex
+# Advisory lock key for leader election — see
+# modules/tasks/durable/lock_registry.py, the central registry of every
+# leader-elected loop's key.
 
 # Bounds one tick's total work regardless of backlog depth — a burst that
 # filled the queue drains over several ticks rather than one very long tick.

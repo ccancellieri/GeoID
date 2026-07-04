@@ -56,6 +56,9 @@ from dynastore.modules.db_config.query_executor import (
     ResultHandler,
     managed_transaction,
 )
+from dynastore.modules.tasks.durable.lock_registry import (
+    SOFT_DELETE_REAPER_ADVISORY_LOCK_KEY as _REAPER_ADVISORY_LOCK_KEY,
+)
 from dynastore.tools.background_service import (
     Leadership,
     PeriodicService,
@@ -70,8 +73,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Advisory lock key for leader election — must not collide with other loops.
-_REAPER_ADVISORY_LOCK_KEY = 0x5D3A7E1F_C2B84961  # deterministic constant
+# Advisory lock key for leader election — see
+# modules/tasks/durable/lock_registry.py, the central registry of every
+# leader-elected loop's key.
 
 
 class SoftDeleteReaperConfig(PluginConfig):

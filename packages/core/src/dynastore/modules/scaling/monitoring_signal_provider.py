@@ -69,10 +69,10 @@ from dynastore.tools.discovery import get_protocol
 
 logger = logging.getLogger(__name__)
 
-# Advisory lock key for leader election — must not collide with other loops
-# (gcp-scaling-reconciler, gcp-liveness-reconciler, the contention monitor's
-# 0x4C4F434B_4D4F4E49). A distinct string key, same convention as the GCP
-# reconcilers which key by plain string rather than a bigint constant.
+# Advisory lock key for leader election. A distinct string key, same
+# convention as the GCP reconcilers which key by plain string rather than a
+# bigint constant. Listed alongside every other static lock/lease key in
+# modules/tasks/durable/lock_registry.py.
 _MONITORING_SIGNAL_LOCK_KEY = "monitoring-signal-provider"
 
 

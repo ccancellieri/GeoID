@@ -74,6 +74,8 @@ from dynastore.modules.db_config.query_executor import DbResource, is_lock_not_a
 logger = logging.getLogger(__name__)
 
 
+# Listed alongside every other static lock/lease key in
+# modules/tasks/durable/lock_registry.py.
 _SEED_LOCK_KEY = "config_seeder.defaults"
 _PRODUCTION_ENV_NAMES = frozenset({"prod", "production"})
 

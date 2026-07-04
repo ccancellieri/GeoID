@@ -66,6 +66,9 @@ from dynastore.modules.db_config.query_executor import (
     ResultHandler,
     managed_transaction,
 )
+from dynastore.modules.tasks.durable.lock_registry import (
+    CONTENTION_MONITOR_LOCK_KEY as _CONTENTION_MONITOR_LOCK_KEY,
+)
 from dynastore.tools.background_service import (
     Leadership,
     LeaseRenewalMode,
@@ -77,10 +80,9 @@ from dynastore.tools.protocol_helpers import get_engine
 
 logger = logging.getLogger(__name__)
 
-# Advisory lock key for leader election — must not collide with other loops
-# (supervisor 0x4D41494E_54454E41, reaper 0x5D3A7E1F_C2B84961, lifecycle reaper).
-# ASCII "LOCKMONI"; a deterministic constant inside the signed bigint range.
-_CONTENTION_MONITOR_LOCK_KEY = 0x4C4F434B_4D4F4E49
+# Advisory lock key for leader election — see
+# modules/tasks/durable/lock_registry.py, the central registry of every
+# leader-elected loop's key.
 
 
 def _env_bool(name: str, default: bool) -> bool:

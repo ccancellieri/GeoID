@@ -66,6 +66,9 @@ from dynastore.modules.db_config.query_executor import (
     background_managed_transaction,
     managed_transaction,
 )
+from dynastore.modules.tasks.durable.lock_registry import (
+    SUPERVISOR_ADVISORY_LOCK_KEY as _SUPERVISOR_ADVISORY_LOCK_KEY,
+)
 from dynastore.tools.background_service import (
     Leadership,
     PeriodicService,
@@ -130,11 +133,10 @@ async def load_health_alert_config() -> HealthAlertConfig:
 
 
 # ---------------------------------------------------------------------------
-# Advisory lock key — must not collide with SoftDeleteReaper (0x5D3A7E1F_C2B84961)
-# or any other leader-elected loop.
+# Advisory lock key — see modules/tasks/durable/lock_registry.py, the
+# central registry of every leader-elected loop's key (collision avoidance
+# happens there, not via cross-file comments).
 # ---------------------------------------------------------------------------
-
-_SUPERVISOR_ADVISORY_LOCK_KEY = 0x4D41494E_54454E41  # "MAINTENA" in ASCII hex
 
 # ---------------------------------------------------------------------------
 # Job names — must match the strings passed to repo.upsert_job at startup.

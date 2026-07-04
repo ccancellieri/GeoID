@@ -136,6 +136,9 @@ from dynastore.modules.db_config.query_executor import (
     ResultHandler,
     background_managed_transaction,
 )
+from dynastore.modules.tasks.durable.lock_registry import (
+    ZOMBIE_REAPER_ADVISORY_LOCK_KEY as _ZOMBIE_REAPER_ADVISORY_LOCK_KEY,
+)
 from dynastore.tools.background_service import (
     Leadership,
     PeriodicService,
@@ -146,11 +149,9 @@ from dynastore.tools.protocol_helpers import get_engine
 
 logger = logging.getLogger(__name__)
 
-# Advisory lock key for leader election — must not collide with other loops
-# (SoftDeleteReaper 0x5D3A7E1F_C2B84961, MaintenanceSupervisor
-# 0x4D41494E_54454E41, LifecycleReaper 0x4C494643_52454150, DbContentionMonitor
-# 0x4C4F434B_4D4F4E49). ASCII "ZOMBIEP1".
-_ZOMBIE_REAPER_ADVISORY_LOCK_KEY = 0x5A4F4D42_49455031
+# Advisory lock key for leader election — see
+# modules/tasks/durable/lock_registry.py, the central registry of every
+# leader-elected loop's key.
 
 # Matches exactly the shape get_stamped_application_name() produces:
 # "{service}:{32-char lowercase hex instance id}". Anything else (empty,

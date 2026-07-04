@@ -63,6 +63,9 @@ from dynastore.modules.db_config.query_executor import (
 from dynastore.modules.catalog.collection_service import (
     _invalidate_collection_lifecycle_caches,
 )
+from dynastore.modules.tasks.durable.lock_registry import (
+    LIFECYCLE_REAPER_ADVISORY_LOCK_KEY as _LIFECYCLE_REAPER_ADVISORY_LOCK_KEY,
+)
 from dynastore.tools.background_service import (
     Leadership,
     PeriodicService,
@@ -74,9 +77,8 @@ from dynastore.tools.protocol_helpers import get_engine
 
 logger = logging.getLogger(__name__)
 
-# Advisory lock key — must not collide with SoftDeleteReaper (0x5D3A7E1F_C2B84961)
-# or MaintenanceSupervisor (0x4D41494E_54454E41).
-_LIFECYCLE_REAPER_ADVISORY_LOCK_KEY = 0x4C494643_52454150  # "LIFECREAP"
+# Advisory lock key — see modules/tasks/durable/lock_registry.py, the
+# central registry of every leader-elected loop's key.
 
 
 class LifecycleReaperConfig(PluginConfig):

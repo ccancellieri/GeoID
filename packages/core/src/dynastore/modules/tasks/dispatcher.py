@@ -289,6 +289,8 @@ def _log_task_terminal(
 
 # Cross-pod-stable lock namespace shared by reactive + proactive paths so
 # both serialize on the same ``pg_try_advisory_xact_lock`` key per capability.
+# Listed alongside every other static lock/lease key in
+# modules/tasks/durable/lock_registry.py.
 _REAPER_LOCK_NAMESPACE = "dynastore.idx_reaper"
 
 

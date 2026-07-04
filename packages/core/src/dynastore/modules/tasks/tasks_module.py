@@ -1139,6 +1139,12 @@ async def sweep_wedged_provisioning_catalogs(
     return drained
 
 
+# Lock namespace for the backstop pass below — see
+# modules/tasks/durable/lock_registry.py, the central registry of every
+# static lock/lease key.
+_MANDATORY_BACKSTOP_LOCK_NAME = "dynastore.mandatory.backstop"
+
+
 async def _run_mandatory_backstop_pass(
     engine: DbResource, schema: str, *, ttl_grace_seconds: float, min_age_s: float
 ) -> None:
@@ -1156,7 +1162,7 @@ async def _run_mandatory_backstop_pass(
     )
     from dynastore.modules.tasks.mandatory import check_mandatory_ownership
 
-    lock_key = _stable_advisory_lock_key("dynastore.mandatory.backstop")
+    lock_key = _stable_advisory_lock_key(_MANDATORY_BACKSTOP_LOCK_NAME)
 
     # The whole locked pass is idempotent (a backstop sweep), so on a
     # transaction-mode pooler tearing down the backend mid-pass (08003) we
