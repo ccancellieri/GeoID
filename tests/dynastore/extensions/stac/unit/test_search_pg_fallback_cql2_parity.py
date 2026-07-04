@@ -33,10 +33,12 @@ fewer rows than a real CQL2 caller — or the ES path — would expect).
 """
 
 import pytest
+from pygeofilter.parsers.cql2_json import parse as parse_cql2_json
 from sqlalchemy.sql import column
 
 from dynastore.extensions.stac.search import AttributeFilter, _filter_to_cql2_json
 from dynastore.models.query_builder import FilterOperator
+from dynastore.modules.storage.drivers.es_common.cql_to_es import cql_ast_to_es_query
 from dynastore.modules.tools.cql import parse_cql2_json_filter
 
 
@@ -68,6 +70,78 @@ def test_pg_fallback_like_literal_underscore_no_longer_broadened():
     _, params = parse_cql2_json_filter(cql2_json, field_mapping=field_mapping)
 
     assert list(params.values()) == ["foo\\_bar"]
+
+
+def test_pg_and_es_agree_on_escaped_percent_literal():
+    """#3006: an escaped literal ``%`` in a LIKE pattern (``\\%``) must stay a
+    literal percent on both backends, not be reinterpreted as the CQL2
+    wildcard. The ES translator (``cql_to_es._like_to_wildcard``) had a bug
+    that built its "already escaped" check from a hardcoded double-backslash,
+    so it only recognised a double-backslash escape while pygeofilter's
+    grammars deliver a single one — the PG fallback already got this right.
+    """
+    filt = AttributeFilter(field="name", operator=FilterOperator.LIKE, value="100\\%off")
+    cql2_json = _filter_to_cql2_json(filt)
+
+    field_mapping = {"name": column("name")}
+    sql, params = parse_cql2_json_filter(cql2_json, field_mapping=field_mapping)
+    assert "ESCAPE" in sql
+    # PG keeps the pattern escaped (``\%``) so SQL's own LIKE treats it as a
+    # literal percent under the ``ESCAPE '\'`` clause it declares.
+    assert list(params.values()) == ["100\\%off"]
+
+    es_query = cql_ast_to_es_query(
+        parse_cql2_json(cql2_json), {"name": "properties.name"}
+    )
+    # ES has no escape clause; the literal survives unescaped since ``%`` is
+    # not a reserved character to the ES ``wildcard`` query.
+    assert es_query == {
+        "wildcard": {
+            "properties.name": {"value": "100%off", "case_insensitive": False}
+        }
+    }
+
+
+def test_pg_and_es_agree_on_escaped_singlechar_literal():
+    """Same escape parity for the CQL2 single-char wildcard (``.``, #3006)."""
+    filt = AttributeFilter(field="name", operator=FilterOperator.LIKE, value="fo\\.o")
+    cql2_json = _filter_to_cql2_json(filt)
+
+    field_mapping = {"name": column("name")}
+    _, params = parse_cql2_json_filter(cql2_json, field_mapping=field_mapping)
+    assert list(params.values()) == ["fo.o"]
+
+    es_query = cql_ast_to_es_query(
+        parse_cql2_json(cql2_json), {"name": "properties.name"}
+    )
+    assert es_query == {
+        "wildcard": {
+            "properties.name": {"value": "fo.o", "case_insensitive": False}
+        }
+    }
+
+
+def test_pg_and_es_agree_on_escaped_escapechar_literal():
+    """Escaping the escape character itself (``\\\\``) must yield a single
+    literal backslash on both backends (#3006).
+    """
+    filt = AttributeFilter(field="name", operator=FilterOperator.LIKE, value="a\\\\b")
+    cql2_json = _filter_to_cql2_json(filt)
+
+    field_mapping = {"name": column("name")}
+    _, params = parse_cql2_json_filter(cql2_json, field_mapping=field_mapping)
+    # PG double-escapes the backslash so SQL's ``ESCAPE '\'`` decodes it back
+    # to a single literal backslash.
+    assert list(params.values()) == ["a\\\\b"]
+
+    es_query = cql_ast_to_es_query(
+        parse_cql2_json(cql2_json), {"name": "properties.name"}
+    )
+    assert es_query == {
+        "wildcard": {
+            "properties.name": {"value": "a\\b", "case_insensitive": False}
+        }
+    }
 
 
 def test_pg_fallback_has_no_wire_path_for_temporal_operators():

@@ -148,6 +148,66 @@ def test_like_to_wildcard():
     }
 
 
+# --------------------------------------------------------------------------- #
+# LIKE escape handling (#3006): an escaped wildcard/single-char/escape-char
+# token in a CQL2 LIKE pattern must survive as its literal character, not be
+# misread as a live ES wildcard.
+# --------------------------------------------------------------------------- #
+
+def test_like_to_wildcard_escaped_percent_stays_literal():
+    """``\\%`` is an escaped literal percent, not the CQL2 wildcard."""
+    node = {"op": "like", "args": [{"property": "name"}, "100\\%off"]}
+    q = _es(node)
+    assert q == {
+        "wildcard": {
+            "properties.name": {"value": "100%off", "case_insensitive": False}
+        }
+    }
+
+
+def test_like_to_wildcard_escaped_singlechar_stays_literal():
+    """``\\.`` is an escaped literal dot, not the CQL2 single-char wildcard."""
+    node = {"op": "like", "args": [{"property": "name"}, "fo\\.o"]}
+    q = _es(node)
+    assert q == {
+        "wildcard": {
+            "properties.name": {"value": "fo.o", "case_insensitive": False}
+        }
+    }
+
+
+def test_like_to_wildcard_escaped_escapechar_stays_literal():
+    """``\\\\`` (escaped escape char) survives as a single literal backslash."""
+    node = {"op": "like", "args": [{"property": "name"}, "a\\\\b"]}
+    q = _es(node)
+    assert q == {
+        "wildcard": {
+            "properties.name": {"value": "a\\b", "case_insensitive": False}
+        }
+    }
+
+
+def test_like_to_wildcard_unescaped_wildcard_still_translates():
+    """Unescaped wildcard/single-char tokens still translate normally
+    alongside an escaped literal in the same pattern."""
+    node = {"op": "like", "args": [{"property": "name"}, "100\\%%off"]}
+    q = _es(node)
+    assert q == {
+        "wildcard": {
+            "properties.name": {"value": "100%*off", "case_insensitive": False}
+        }
+    }
+
+
+def test_like_on_fulltext_field_escaped_percent_stays_literal():
+    """Same escape parity for the FULLTEXT ``match`` path (#1291 + #3006)."""
+    field_map = {"title": "properties.title.keyword"}
+    fulltext_map = {"title": "properties.title.text"}
+    node = {"op": "like", "args": [{"property": "title"}, "100\\%off"]}
+    q = cql_ast_to_es_query(parse_cql2_json(node), field_map, fulltext_map)
+    assert q == {"match": {"properties.title.text": "100%off"}}
+
+
 def test_isnull_to_must_not_exists():
     node = {"op": "isNull", "args": [{"property": "name"}]}
     assert _es(node) == {

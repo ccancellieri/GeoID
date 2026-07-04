@@ -54,7 +54,6 @@ falls back to the PostgreSQL path, preserving today's behaviour.
 from __future__ import annotations
 
 import datetime as _dt
-import re
 from typing import Any, Dict, Optional
 
 from pygeofilter import ast, values
@@ -79,6 +78,45 @@ _COMPARISON_OP_MAP: Dict[Any, str] = {
 }
 
 
+def _iter_like_tokens(
+    pattern: str, wildcard: str, single_char: str, escape_char: str
+):
+    """Walk a CQL ``LIKE`` pattern once, classifying each character.
+
+    Yields ``("wildcard" | "single" | "literal", char)`` pairs. An
+    ``escape_char`` immediately followed by ``wildcard``/``single_char``/
+    itself is consumed and yields a ``"literal"`` for the *escaped* character
+    (the escape marker itself never appears in the output) — this is the
+    piece the former regex-based implementation got wrong (#3006): it built
+    its "already escaped" lookbehind from a hardcoded 4-backslash literal,
+    which only matched a *double*-backslash escape, while pygeofilter's
+    CQL2/ECQL grammars deliver a single backslash as the escape character.
+
+    Mirrors ``dynastore.modules.tools.cql._cql_like_pattern_to_sql``'s walk
+    (the PG-side fix for the same class of bug, #2945/#3005) so both backends
+    treat an escaped wildcard token identically.
+    """
+    i = 0
+    n = len(pattern)
+    while i < n:
+        ch = pattern[i]
+        if (
+            ch == escape_char
+            and i + 1 < n
+            and pattern[i + 1] in (wildcard, single_char, escape_char)
+        ):
+            yield "literal", pattern[i + 1]
+            i += 2
+            continue
+        if ch == wildcard:
+            yield "wildcard", ch
+        elif ch == single_char:
+            yield "single", ch
+        else:
+            yield "literal", ch
+        i += 1
+
+
 def _like_to_wildcard(
     value: str, wildcard: str, single_char: str, escape_char: str = "\\"
 ) -> str:
@@ -86,21 +124,18 @@ def _like_to_wildcard(
 
     Mirrors ``pygeofilter.backends.elasticsearch.util.like_to_wildcard`` (which
     cannot be imported without ``elasticsearch_dsl``): a non-escaped ``wildcard``
-    char becomes ``*`` and a non-escaped ``single_char`` becomes ``?``.
+    char becomes ``*`` and a non-escaped ``single_char`` becomes ``?``; an
+    escaped wildcard/single-char/escape-char is unescaped to its literal form.
     """
-    x_wildcard = re.escape(wildcard)
-    x_single_char = re.escape(single_char)
-
-    if escape_char == "\\":
-        x_escape_char = "\\\\\\\\"
-    else:
-        x_escape_char = re.escape(escape_char)
-
-    if wildcard != "*":
-        value = re.sub(f"(?<!{x_escape_char}){x_wildcard}", "*", value)
-    if single_char != "?":
-        value = re.sub(f"(?<!{x_escape_char}){x_single_char}", "?", value)
-    return value
+    out = []
+    for kind, ch in _iter_like_tokens(value, wildcard, single_char, escape_char):
+        if kind == "wildcard":
+            out.append("*")
+        elif kind == "single":
+            out.append("?")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def _like_to_match_text(
@@ -114,19 +149,13 @@ def _like_to_match_text(
     to ``match``, so they are removed; an escaped wildcard becomes its literal
     character. The analyzer handles tokenisation and case-folding from there.
     """
-    x_wildcard = re.escape(wildcard)
-    x_single_char = re.escape(single_char)
-    if escape_char == "\\":
-        x_escape_char = "\\\\\\\\"
-    else:
-        x_escape_char = re.escape(escape_char)
-    # Drop non-escaped wildcard / single-char markers.
-    value = re.sub(f"(?<!{x_escape_char}){x_wildcard}", " ", value)
-    value = re.sub(f"(?<!{x_escape_char}){x_single_char}", " ", value)
-    # Unescape escaped wildcard / single-char back to their literal form.
-    value = value.replace(f"{escape_char}{wildcard}", wildcard)
-    value = value.replace(f"{escape_char}{single_char}", single_char)
-    return value.strip()
+    out = []
+    for kind, ch in _iter_like_tokens(value, wildcard, single_char, escape_char):
+        if kind in ("wildcard", "single"):
+            out.append(" ")
+        else:
+            out.append(ch)
+    return "".join(out).strip()
 
 
 class _CqlToEsEvaluator(Evaluator):
