@@ -458,6 +458,8 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             ("/virtual/hierarchy/{hierarchy_id}/catalogs/{catalog_id}/collections/{collection_id}", "get_virtual_hierarchy_collection", ["GET"], {"response_class": _J}),
             ("/virtual/hierarchy/{hierarchy_id}/catalogs/{catalog_id}/collections/{collection_id}/items", "get_virtual_hierarchy_items", ["GET"], {"response_class": _J}),
             ("/virtual/hierarchy/{hierarchy_id}/catalogs/{catalog_id}/collections/{collection_id}/search", "search_virtual_hierarchy_items", ["GET", "POST"], {"response_class": _J}),
+            # STAC Aggregation Extension
+            ("/catalogs/{catalog_id}/collections/{collection_id}/aggregate", "aggregate_collection_items", ["POST"], {"response_class": _J}),
         ]
 
         for path, handler_name, methods, kwargs in route_table:
@@ -1945,12 +1947,9 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             language=language,
         )
 
-    @router.post(
-        "/catalogs/{catalog_id}/collections/{collection_id}/aggregate",
-        response_class=JSONResponse,
-    )
     async def aggregate_collection_items(
-        catalog_id: str,  # type: ignore[reportGeneralTypeIssues]
+        self,
+        catalog_id: str,
         collection_id: str,
         request: Request,
         aggregation_request: AggregationRequest,

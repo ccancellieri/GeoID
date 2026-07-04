@@ -39,6 +39,14 @@ Registration:
 Ordering: contributors are sorted by DESCENDING ``priority`` (highest
 first).  Ties are broken by insertion order (stable sort).  IAM uses
 priority 100; web uses 50; auth uses 40; file-preset seeder uses 10.
+
+Direction note: this ``priority`` is DESCENDING — higher runs first. This
+is the OPPOSITE direction from the ``priority`` field used to order
+module/extension instantiation (``modules/__init__.py``'s
+``_get_ordered_modules`` and ``extensions/registry.py``'s instantiation
+sort), both of which are ASCENDING (lower runs first). Same field name,
+opposite meaning across the two systems — do not assume one from the
+other.
 """
 from __future__ import annotations
 
@@ -57,11 +65,14 @@ class ColdBootContributor(Protocol):
     """Structural protocol for a cold-boot contributor.
 
     Implementors must expose ``name`` (unique string key), ``priority``
-    (integer; higher = runs first), and an async ``run`` coroutine that
-    receives the database engine.  ``run`` must be fail-soft: it should
-    catch its own expected errors internally and either return normally or
-    raise only for truly unexpected conditions — :func:`run_cold_boot`
-    wraps every contributor in a separate ``try/except`` regardless.
+    (integer; higher = runs first — DESCENDING, the opposite direction
+    from the ascending module/extension instantiation ``priority`` in
+    ``modules/__init__.py`` / ``extensions/registry.py``), and an async
+    ``run`` coroutine that receives the database engine.  ``run`` must be
+    fail-soft: it should catch its own expected errors internally and
+    either return normally or raise only for truly unexpected conditions —
+    :func:`run_cold_boot` wraps every contributor in a separate
+    ``try/except`` regardless.
     """
 
     name: str

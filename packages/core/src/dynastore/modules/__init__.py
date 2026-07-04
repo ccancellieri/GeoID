@@ -130,6 +130,13 @@ def _get_ordered_modules() -> List[str]:
     priority value means the module is started earlier; alphabetical name
     is the tiebreak so the order is deterministic across discovery passes.
     Modules without a ``priority`` attribute default to 100.
+
+    Direction note: this ``priority`` is ASCENDING — lower runs first, same
+    convention as ``extensions/registry.py``'s instantiation sort. This is
+    the opposite direction from ``modules/presets/cold_boot.py``'s
+    ``ColdBootContributor.priority``, which is DESCENDING (higher runs
+    first). Same field name, opposite meaning — don't assume one from the
+    other.
     """
     def _sort_key(name: str) -> Tuple[int, str]:
         config = _DYNASTORE_MODULES.get(name)

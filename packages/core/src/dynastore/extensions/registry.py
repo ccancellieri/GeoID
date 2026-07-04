@@ -130,6 +130,12 @@ def instantiate_extensions(app: Any, include_only: Optional[List[str]] = None):
     # priority 100) resolve deterministically instead of falling back to
     # entry-point discovery order, which varies with installed-distribution
     # order. Mirrors the tiebreak in modules/__init__.py's instantiation sort.
+    #
+    # Direction note: ASCENDING — lower priority instantiates first, same
+    # convention as modules/__init__.py's _get_ordered_modules. This is the
+    # opposite direction from modules/presets/cold_boot.py's
+    # ColdBootContributor.priority, which is DESCENDING (higher runs first).
+    # Same field name, opposite meaning — don't assume one from the other.
     def _sort_key(name: str) -> tuple[int, str]:
         config = _DYNASTORE_EXTENSIONS.get(name)
         priority = getattr(config.cls, "priority", 0) if config else 0
