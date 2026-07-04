@@ -895,21 +895,38 @@ async def run_ingestion_task(
         asset_manager = catalog_module.assets
 
         # --- Resolve or Create the Asset ---
-        asset: Optional[Asset] = None
-        if req_asset.asset_id:
-            asset = await asset_manager.get_asset(
-                catalog_id, req_asset.asset_id, collection_id
+        # The lookup key is the caller-supplied asset_id, or — when omitted —
+        # the same deterministic derivation used at creation time. Computing
+        # it up front lets a resume always probe for a pre-existing asset
+        # before creating one, whether or not the request spelled out
+        # asset_id explicitly (a resume request that omits it previously
+        # skipped this check entirely and went straight to create_asset).
+        asset_id_for_lookup = req_asset.asset_id
+        if not asset_id_for_lookup and req_asset.uri:
+            asset_id_for_lookup = re.sub(
+                r"[^a-zA-Z0-9_\-]", "_", os.path.basename(req_asset.uri)
             )
-            if not asset and not req_asset.uri:
+
+        asset: Optional[Asset] = None
+        if asset_id_for_lookup:
+            # ctx=DriverContext(db_resource=engine) reads through the same
+            # connection the rest of this task uses instead of AssetService's
+            # own cached read path (get_asset_cached, 60s TTL) — a prior
+            # failed attempt on the same asset_id would otherwise leave a
+            # cached "not found" negative that a fast resume rides straight
+            # into another doomed create_asset call. Mirrors the ctx= usage
+            # on the create_asset call below.
+            asset = await asset_manager.get_asset(
+                catalog_id, asset_id_for_lookup, collection_id,
+                ctx=DriverContext(db_resource=engine),
+            )
+            if not asset and req_asset.asset_id and not req_asset.uri:
                 raise ValueError(
                     f"Asset with asset_id '{req_asset.asset_id}' not found and no URI provided."
                 )
 
         if not asset and req_asset.uri:
             logger.info(f"Creating asset from URI: {req_asset.uri}")
-            asset_id_for_creation = req_asset.asset_id or re.sub(
-                r"[^a-zA-Z0-9_\-]", "_", os.path.basename(req_asset.uri)
-            )
 
             # External-source ingestion: register as a virtual asset since we
             # don't manage the source bytes (the file lives in the caller's
@@ -917,7 +934,7 @@ async def run_ingestion_task(
             # variant; today we keep the `Asset.uri` field populated by
             # storing the raw URI as the virtual `href`.
             asset_payload = VirtualAssetCreate(
-                asset_id=asset_id_for_creation,
+                asset_id=asset_id_for_lookup,
                 href=req_asset.uri,
                 metadata=req_asset.metadata or {},
             )

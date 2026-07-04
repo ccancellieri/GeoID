@@ -105,6 +105,7 @@ class AssetsProtocol(Protocol):
         asset_id: str,
         catalog_id: str,
         collection_id: Optional[str] = None,
+        ctx: Optional["DriverContext"] = None,
     ) -> Optional["Asset"]:
         """
         Retrieves an asset by ID.
@@ -113,6 +114,12 @@ class AssetsProtocol(Protocol):
             asset_id: The asset ID to retrieve.
             catalog_id: The catalog ID containing the asset.
             collection_id: Optional collection ID for scoping.
+            ctx: Optional driver context — pass a caller-owned transactional
+                resource (e.g. ``DriverContext(db_resource=engine)``) so the
+                read rides the same connection as surrounding writes instead
+                of the service's own cached read path. Mirrors ``create_asset``'s
+                ``ctx`` parameter; intra-module callers may still use the
+                ``db_resource`` kwarg directly on the SQL-backed implementation.
 
         Returns:
             Asset model instance, or ``None`` if not found.

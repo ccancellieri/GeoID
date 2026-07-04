@@ -799,8 +799,17 @@ class AssetService(AssetsProtocol):
         asset_id: str,
         collection_id: Optional[str] = None,
         db_resource: Optional[DbResource] = None,
+        ctx: Optional[DriverContext] = None,
     ) -> Optional[Asset]:
-        """Get asset by ID, routing through the configured read driver."""
+        """Get asset by ID, routing through the configured read driver.
+
+        ``ctx`` is the ``AssetsProtocol``-sanctioned way for a caller outside
+        this module to pass a transactional resource (mirrors
+        ``create_asset``'s ``ctx`` parameter) — it takes precedence over the
+        intra-module-only ``db_resource`` kwarg when both are given.
+        """
+        if ctx is not None and ctx.db_resource is not None:
+            db_resource = ctx.db_resource
         catalog_id, collection_id = await self._resolve_external_ids(catalog_id, collection_id)
         from dynastore.modules.storage.router import get_asset_driver
 
