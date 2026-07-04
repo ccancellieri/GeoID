@@ -57,6 +57,7 @@ from typing import (
     Any,
     Awaitable,
     Callable,
+    Coroutine,
     Dict,
     List,
     Optional,
@@ -566,6 +567,52 @@ async def _load_slow_path_timeout() -> float:
         # refresh window, not hammered on every cache miss.
         _slow_path_timeout_checked_at = now
     return _slow_path_timeout_value
+
+
+# In-flight rebuild tasks, one per cache key. A rebuild runs as its OWN task,
+# shared by every concurrent miss on that key, and always runs to completion:
+# cancelling in-flight DB work mid-query leaves the asyncpg connection's
+# protocol state machine stuck ("cannot switch to state N; another operation
+# is in progress") and poisons the pool (#2900). The original slow-path
+# ``asyncio.timeout`` did exactly that — it cancelled ``factory()`` at the
+# budget, and every client disconnect did the same to the request's factory —
+# so under post-deploy cold-cache load each 30s rebuild cancellation seeded a
+# fresh poisoned connection (the 06:29Z state-11 storm). Callers now wait on
+# the shared task via ``wait_for(shield(task))``: a caller that gives up
+# (budget below, client disconnect) stops WAITING, while the rebuild finishes
+# and writes the cache for whoever comes next.
+_inflight_rebuilds: Dict[str, "asyncio.Task[Any]"] = {}
+
+
+async def _await_shared_rebuild(
+    key: str,
+    rebuild: "Callable[[], Coroutine[Any, Any, Any]]",
+    timeout: float,
+) -> Any:
+    """Await the single in-flight rebuild task for ``key``, bounded by ``timeout``.
+
+    Creates the task if none is running. Raises ``TimeoutError`` when the wait
+    budget elapses (the task keeps running detached) and re-raises whatever the
+    rebuild itself raised; the caller decides whether a stale value absorbs it.
+    """
+    task = _inflight_rebuilds.get(key)
+    if task is None or task.done():
+        task = asyncio.get_running_loop().create_task(rebuild())
+        _inflight_rebuilds[key] = task
+
+        def _cleanup(t: "asyncio.Task[Any]", _key: str = key) -> None:
+            if _inflight_rebuilds.get(_key) is t:
+                _inflight_rebuilds.pop(_key, None)
+            # Retrieve the exception so an abandoned failure (every waiter
+            # already timed out) doesn't log "exception was never retrieved".
+            if not t.cancelled() and t.exception() is not None:
+                logger.debug(
+                    "cache: detached rebuild for key=%s failed: %s",
+                    _key, t.exception(),
+                )
+
+        task.add_done_callback(_cleanup)
+    return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -1175,33 +1222,37 @@ class LocalCache:
                 return value
             stale_candidate = value
 
-        # Slow path: acquire per-key lock for stampede protection, bounded
-        # to slow_path_timeout_seconds (lock wait + factory combined).
-        lock = await self._backend.get_lock(full_key)
+        # Slow path: one shared rebuild task per key (see
+        # _await_shared_rebuild) so a caller abandoning the wait — the budget
+        # below, or a client disconnect cancelling the request — never
+        # cancels the factory's in-flight DB work (#2900 poisoning). The
+        # per-key lock is kept for cross-checking with waiters outside this
+        # process-local single-flight.
+        async def _rebuild() -> Any:
+            lock = await self._backend.get_lock(full_key)
+            async with lock:
+                # Double-check after acquiring lock
+                value, is_stale = await _read()
+                if value is not _NO_STALE and not is_stale:
+                    self._stats.hits += 1
+                    return value
+
+                self._stats.misses += 1
+                result = await factory()
+                if stale_on and resolved_ttl is not None:
+                    to_store: Any = _stale_wrap(result, resolved_ttl)
+                    physical_ttl = resolved_ttl + grace
+                else:
+                    to_store = result
+                    physical_ttl = resolved_ttl
+                serialized = self._serializer.dumps(to_store)
+                await self._backend.set(full_key, serialized, ttl=physical_ttl)
+                await self._emit(CacheEvent.SET, key=full_key, ttl=physical_ttl)
+                return result
+
         timeout = await _load_slow_path_timeout()
         try:
-            async with asyncio.timeout(timeout):
-                async with lock:
-                    # Double-check after acquiring lock
-                    value, is_stale = await _read()
-                    if value is not _NO_STALE:
-                        if not is_stale:
-                            self._stats.hits += 1
-                            return value
-                        stale_candidate = value
-
-                    self._stats.misses += 1
-                    result = await factory()
-                    if stale_on and resolved_ttl is not None:
-                        to_store: Any = _stale_wrap(result, resolved_ttl)
-                        physical_ttl = resolved_ttl + grace
-                    else:
-                        to_store = result
-                        physical_ttl = resolved_ttl
-                    serialized = self._serializer.dumps(to_store)
-                    await self._backend.set(full_key, serialized, ttl=physical_ttl)
-                    await self._emit(CacheEvent.SET, key=full_key, ttl=physical_ttl)
-                    return result
+            return await _await_shared_rebuild("gos|" + full_key, _rebuild, timeout)
         except Exception as exc:
             reason = "timeout" if isinstance(exc, TimeoutError) else "error"
             if stale_candidate is not _NO_STALE:
@@ -1565,48 +1616,54 @@ def cached(
                     else:
                         stale_candidate = value
 
-                # Stampede protection, bounded to slow_path_timeout_seconds
-                # (lock wait + factory combined) — on timeout or a factory()
-                # exception, fall back to a still-grace-window stale value
-                # rather than hanging every queued waiter (#2902).
-                if _backend_has_lock:
-                    lock = await _backend.get_lock(cache_key)
-                else:
-                    if cache_key not in _fallback_locks:
-                        _fallback_locks[cache_key] = asyncio.Lock()
-                    lock = _fallback_locks[cache_key]
+                # Stampede protection: one shared rebuild task per key (see
+                # _await_shared_rebuild), waited on for at most
+                # slow_path_timeout_seconds. A caller abandoning the wait (the
+                # budget, or a client disconnect cancelling the request) never
+                # cancels the in-flight rebuild — cancelled mid-query DB work
+                # poisons asyncpg connections (#2900). On timeout or a rebuild
+                # exception, fall back to a still-grace-window stale value.
+                async def _rebuild() -> Any:
+                    assert _backend is not None
+                    if _backend_has_lock:
+                        lock = await _backend.get_lock(cache_key)
+                    else:
+                        if cache_key not in _fallback_locks:
+                            _fallback_locks[cache_key] = asyncio.Lock()
+                        lock = _fallback_locks[cache_key]
+                    async with lock:
+                        raw = await _backend.get(cache_key)
+                        if raw is not None:
+                            value, is_stale = (
+                                _stale_unwrap(raw) if _grace > 0 else (raw, False)
+                            )
+                            if not is_stale:
+                                if condition is None or condition(value):
+                                    _backend._stats.hits += 1
+                                    return value
+                                await _backend.clear(key=cache_key)
+
+                        _backend._stats.misses += 1
+                        result = await func(*args, **kwargs)
+
+                        if condition is not None and not condition(result):
+                            return result
+
+                        resolved = _resolve_ttl()
+                        if _grace > 0 and resolved is not None:
+                            to_store = _stale_wrap(result, resolved)
+                            await _backend.set(
+                                cache_key, to_store, ttl=resolved + _grace
+                            )
+                        else:
+                            await _backend.set(cache_key, result, ttl=resolved)
+                        return result
+
                 timeout = await _load_slow_path_timeout()
                 try:
-                    async with asyncio.timeout(timeout):
-                        async with lock:
-                            raw = await _backend.get(cache_key)
-                            if raw is not None:
-                                value, is_stale = (
-                                    _stale_unwrap(raw) if _grace > 0 else (raw, False)
-                                )
-                                if not is_stale:
-                                    if condition is None or condition(value):
-                                        _backend._stats.hits += 1
-                                        return value
-                                    await _backend.clear(key=cache_key)
-                                else:
-                                    stale_candidate = value
-
-                            _backend._stats.misses += 1
-                            result = await func(*args, **kwargs)
-
-                            if condition is not None and not condition(result):
-                                return result
-
-                            resolved = _resolve_ttl()
-                            if _grace > 0 and resolved is not None:
-                                to_store = _stale_wrap(result, resolved)
-                                await _backend.set(
-                                    cache_key, to_store, ttl=resolved + _grace
-                                )
-                            else:
-                                await _backend.set(cache_key, result, ttl=resolved)
-                            return result
+                    return await _await_shared_rebuild(
+                        "dec|" + cache_key, _rebuild, timeout
+                    )
                 except Exception as exc:
                     reason = "timeout" if isinstance(exc, TimeoutError) else "error"
                     if stale_candidate is not _NO_STALE:

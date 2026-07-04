@@ -1583,3 +1583,120 @@ class TestSlowPathTimeoutRecursionGuard:
             == cache_mod._DEFAULT_SLOW_PATH_TIMEOUT_SECONDS
         )
         assert attempts == 1  # second call served by the failure-stamped memo
+
+
+class TestSharedRebuildNotCancelledByCallers:
+    """The slow-path rebuild must never be cancelled by a caller giving up:
+    cancelling in-flight DB work mid-query poisons asyncpg connections
+    (#2900) — the post-#2921 state-11 storm was seeded exactly this way by
+    the old ``asyncio.timeout`` around ``factory()``."""
+
+    def _make_cache(self, ns):
+        from dynastore.models.protocols.cache import CacheConfig
+        from dynastore.tools.cache import LocalAsyncCacheBackend, LocalCache
+
+        return LocalCache(
+            backend=LocalAsyncCacheBackend(), config=CacheConfig(namespace=ns)
+        )
+
+    @pytest.mark.asyncio
+    async def test_timeout_leaves_rebuild_running_and_cache_written(
+        self, monkeypatch
+    ):
+        import dynastore.tools.cache as cache_mod
+
+        monkeypatch.setattr(
+            cache_mod, "_load_slow_path_timeout", AsyncMock(return_value=0.05)
+        )
+        cache = self._make_cache("t_detach")
+
+        release = asyncio.Event()
+        cancelled = False
+        calls = 0
+
+        async def factory():
+            nonlocal cancelled, calls
+            calls += 1
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            return "fresh"
+
+        # No stale value exists -> the caller's timeout must propagate...
+        with pytest.raises(TimeoutError):
+            await cache.get_or_set("k", factory, ttl=60)
+
+        # ...but the rebuild keeps running: releasing it completes the write.
+        release.set()
+        await asyncio.sleep(0.05)
+        assert cancelled is False
+        assert calls == 1
+
+        # The detached rebuild's write landed: a new get_or_set is a fast-path
+        # hit and never invokes its (poisoned-pill) factory.
+        async def must_not_run():
+            raise AssertionError("factory must not run — value was written")
+
+        assert await cache.get_or_set("k", must_not_run, ttl=60) == "fresh"
+
+    @pytest.mark.asyncio
+    async def test_caller_cancellation_does_not_cancel_rebuild(
+        self, monkeypatch
+    ):
+        import dynastore.tools.cache as cache_mod
+
+        monkeypatch.setattr(
+            cache_mod, "_load_slow_path_timeout", AsyncMock(return_value=30.0)
+        )
+        cache = self._make_cache("t_detach_cancel")
+
+        release = asyncio.Event()
+        cancelled = False
+
+        async def factory():
+            nonlocal cancelled
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            return "fresh"
+
+        caller = asyncio.create_task(cache.get_or_set("k", factory, ttl=60))
+        await asyncio.sleep(0.02)  # let the rebuild start
+        caller.cancel()  # simulates a client disconnect killing the request
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+
+        release.set()
+        await asyncio.sleep(0.05)
+        assert cancelled is False
+
+        async def must_not_run():
+            raise AssertionError("factory must not run — value was written")
+
+        assert await cache.get_or_set("k", must_not_run, ttl=60) == "fresh"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_misses_share_one_rebuild(self, monkeypatch):
+        import dynastore.tools.cache as cache_mod
+
+        monkeypatch.setattr(
+            cache_mod, "_load_slow_path_timeout", AsyncMock(return_value=30.0)
+        )
+        cache = self._make_cache("t_detach_share")
+        calls = 0
+
+        async def factory():
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0.05)
+            return "fresh"
+
+        results = await asyncio.gather(
+            *(cache.get_or_set("k", factory, ttl=60) for _ in range(5))
+        )
+        assert results == ["fresh"] * 5
+        assert calls == 1
