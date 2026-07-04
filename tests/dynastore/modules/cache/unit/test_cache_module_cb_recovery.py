@@ -177,6 +177,42 @@ async def test_recovery_loop_guard_tracks_observed_backend_not_the_original_trip
 
 
 @pytest.mark.asyncio
+async def test_cancel_recovery_task_logs_real_error_not_swallowed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A genuine error raised while the task unwinds from cancellation must
+    be logged, not silently eaten alongside the expected CancelledError."""
+    tripped_backend = object()
+
+    async def _buggy_recover(*_a: Any, **_kw: Any) -> None:
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            raise RuntimeError("recovery cleanup blew up") from None
+
+    with (
+        caplog.at_level("ERROR"),
+        patch.object(cm, "_recover_after_circuit_trip", _buggy_recover),
+    ):
+        cm._on_backend_trip(tripped_backend)
+        task = cm._recovery_task
+        assert task is not None and not task.done()
+        # Let the task actually start (reach its ``await asyncio.sleep``)
+        # before cancelling — cancelling before the coroutine ever runs
+        # short-circuits straight to CancelledError without executing any
+        # of its body, which would trivially (and misleadingly) pass here.
+        await asyncio.sleep(0)
+
+        await cm._cancel_recovery_task()
+
+    assert cm._recovery_task is None
+    assert any(
+        "circuit-breaker recovery task errored during cancellation" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
 async def test_cancel_recovery_task_stops_the_loop() -> None:
     tripped_backend = object()
 

@@ -467,3 +467,54 @@ async def test_deps_missing_stays_local_no_upgrade_task(monkeypatch):
         entered = True
         assert cm._current_backend is None
     assert entered
+
+
+async def test_lifespan_logs_real_error_from_cancelled_boot_upgrade_task(
+    monkeypatch, caplog,
+):
+    """Cancelling the boot-upgrade task on shutdown must not silently eat a
+    genuine error the task raised while unwinding from cancellation — only
+    ``asyncio.CancelledError`` itself is the expected, swallowed outcome."""
+    import dynastore.modules.cache.cache_module as cm
+    import dynastore.tools.cache_valkey as cv
+    from dynastore.modules.cache.cache_module import CacheModule
+
+    _reset_module_state()
+
+    monkeypatch.setattr(cv, "_CACHE_DEPS_OK", True)
+    monkeypatch.setattr(cv, "ValkeyCacheBackend", _FakeBackend)
+
+    async def _no_cfg(*_a: Any, **_kw: Any) -> Any:
+        from dynastore.modules.cache.cache_config import CachePluginConfig
+
+        return CachePluginConfig()
+
+    monkeypatch.setattr(cm, "_load_cache_config", _no_cfg)
+
+    async def _buggy_upgrade(*_a: Any, **_kw: Any) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise RuntimeError("boot-upgrade cleanup blew up") from None
+
+    monkeypatch.setattr(cm, "_boot_upgrade_to_valkey", _buggy_upgrade)
+
+    class _NeverReadyEngineCache:
+        async def get(self, ref: str) -> object:
+            raise KeyError(ref)
+
+    app_state = types.SimpleNamespace(engine_cache=_NeverReadyEngineCache())
+    module = CacheModule(app_state=app_state)
+
+    with caplog.at_level("ERROR"):
+        async with module.lifespan(app_state):
+            # Let the upgrade task actually start (reach its ``await``)
+            # before the context manager cancels it on exit — cancelling
+            # before the coroutine ever runs short-circuits straight to
+            # CancelledError without executing any of its body.
+            await asyncio.sleep(0)
+
+    assert any(
+        "boot-upgrade-to-Valkey task errored during cancellation" in r.getMessage()
+        for r in caplog.records
+    )

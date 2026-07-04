@@ -628,8 +628,12 @@ async def _cancel_recovery_task() -> None:
         task.cancel()
         try:
             await task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            pass
+        except asyncio.CancelledError:
+            pass  # expected — we just cancelled it
+        except Exception:
+            logger.exception(
+                "CacheModule: circuit-breaker recovery task errored during cancellation"
+            )
     _recovery_task = None
 
 
@@ -864,8 +868,12 @@ async def _degraded_local_lifespan(
             upgrade_task.cancel()
             try:
                 await upgrade_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
+            except asyncio.CancelledError:
+                pass  # expected — we just cancelled it
+            except Exception:
+                logger.exception(
+                    "CacheModule: boot-upgrade-to-Valkey task errored during cancellation"
+                )
         await _cancel_recovery_task()
         if handlers_registered:
             _unregister_engine_apply_handlers()
