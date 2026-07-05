@@ -89,6 +89,11 @@ create the sub-mountpoint inside an already-mounted `:ro` parent
    `tests/dynastore/test_dev_compose_config_in_sync.py`.
 2. **Shared dir without `:ro`** — drop the read-only flag from the parent
    mount; Docker can then create the sub-mountpoint. Loses the read-only
-   guard.
+   guard. Used by `docker-compose.dev.yml` to layer `config/local/defaults/
+   idp-config.json` (the compose-local Keycloak values) on top of each
+   auth-fronting service's self-contained `defaults/` dir — geoid's tracked
+   `catalog`/`maps`/`tools` defaults ship no `idp-config.json` at all (the
+   onprem baseline is the neutral `IdpConfig` pydantic default,
+   unconfigured), so local dev needs this second mount to get a working IdP.
 3. **Bake into the image** — `COPY` everything into the image at build time
    so the runtime is fully self-contained. No bind mount, no overlap.

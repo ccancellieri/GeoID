@@ -45,8 +45,16 @@ services:
       - ../../../..:/dynastore/packages
       # Service identity (instance.json) + shared config defaults.
       # Drives the task-routing gate so this service only claims task
-      # types whose routing consumers list it.
-      - ./config/catalog:/dynastore/config:ro
+      # types whose routing consumers list it. Not `:ro` — the local IdP
+      # override below bind-mounts a single file inside this directory,
+      # which Docker cannot do against a read-only parent mount (see
+      # config/example/README.md "Pitfall" section).
+      - ./config/catalog:/dynastore/config
+      # geoid ships no idp-config.json in its tracked defaults (onprem
+      # baseline = the neutral IdpConfig pydantic defaults, unconfigured).
+      # Local docker-compose auth needs a real IdP, so this local-only
+      # override supplies the compose-local Keycloak values.
+      - ./config/local/defaults/idp-config.json:/dynastore/config/defaults/idp-config.json:ro
     env_file:
       - .env
       - path: .env.local
@@ -106,7 +114,9 @@ services:
         BUILD_JUPYTERLITE: "true"
     volumes:
       - ../../../..:/dynastore/packages # Hot reload mount (editable-install root; see catalog service)
-      - ./config/tools:/dynastore/config:ro
+      # Not `:ro` — see the local IdP override comment on the catalog service.
+      - ./config/tools:/dynastore/config
+      - ./config/local/defaults/idp-config.json:/dynastore/config/defaults/idp-config.json:ro
     env_file:
       - .env
       - path: .env.local
@@ -140,7 +150,9 @@ services:
         BUILD_JUPYTERLITE: "true"
     volumes:
       - ../../../..:/dynastore/packages # Hot reload mount (editable-install root; see catalog service)
-      - ./config/maps:/dynastore/config:ro
+      # Not `:ro` — see the local IdP override comment on the catalog service.
+      - ./config/maps:/dynastore/config
+      - ./config/local/defaults/idp-config.json:/dynastore/config/defaults/idp-config.json:ro
     env_file:
       - .env
       - path: .env.local

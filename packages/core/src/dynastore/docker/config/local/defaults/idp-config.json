@@ -1,5 +1,6 @@
 {
   "class_key": "idp_config",
+  "override": false,
   "value": {
     "type": "oidc",
     "issuer_url": "http://keycloak:8080/realms/geoid",

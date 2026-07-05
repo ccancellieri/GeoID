@@ -86,13 +86,18 @@ def test_defaults_content_identical_across_services():
     """Every ``defaults/<name>.json`` shared by two or more config dirs must
     be byte-identical across all the dirs that carry it.
 
-    Not every filename is expected in every dir — e.g. ``idp-config.json``
-    only ships to the auth-fronting services and ``task-routing-config.json``
-    only to ``worker`` — so this compares content per-filename across
-    whichever dirs happen to hold it, rather than requiring the full set of
-    filenames to match everywhere. ``example`` is included: it is docs-only
-    (never copied into an image) but the README explicitly claims its
-    ``defaults/`` is covered by this drift check.
+    Not every filename is expected in every dir — e.g.
+    ``task-routing-config.json`` only ships to ``worker`` — so this compares
+    content per-filename across whichever dirs happen to hold it, rather than
+    requiring the full set of filenames to match everywhere. ``example`` is
+    included: it is docs-only (never copied into an image) but the README
+    explicitly claims its ``defaults/`` is covered by this drift check.
+
+    ``idp-config.json`` is intentionally absent from every dir here: geoid's
+    tracked onprem baseline ships no IdP override (the neutral ``IdpConfig``
+    pydantic default is unconfigured). The compose-local Keycloak values live
+    in ``config/local/defaults/idp-config.json`` instead, covered by
+    ``tests/dynastore/modules/iam/unit/test_idp_config_dev_seed.py``.
     """
     dirs = _SERVICES + ("example",)
     trees = {d: _read_defaults_tree(d) for d in dirs}
