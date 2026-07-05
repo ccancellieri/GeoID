@@ -32,17 +32,16 @@ import rasterio as _rasterio_scope_gate  # noqa: F401  # SCOPE gate: extension_c
 _ = _rasterio_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import Response, StreamingResponse
-from dynastore.extensions.web.decorators import expose_static, expose_web_page
+from fastapi.responses import StreamingResponse
+from dynastore.extensions.web.decorators import expose_web_page
 
 from dynastore.extensions.coverages.config import CoveragesConfig
 from dynastore.extensions.coverages.links import build_coverage_links
 from dynastore.extensions.ogc_base import OGCServiceMixin, ogc_asset_href
 from dynastore.extensions.protocols import ExtensionProtocol
-from dynastore.extensions.tools.fast_api import AppJSONResponse as JSONResponse
 from dynastore.extensions.tools.language_utils import get_language
 from dynastore.extensions.tools.query import parse_hints_param  # noqa: E402
-from dynastore.extensions.tools.response_i18n import localize_response_dict, resolve_localized  # noqa: E402
+from dynastore.extensions.tools.response_i18n import localize_response_dict  # noqa: E402
 from dynastore.extensions.tools.url import get_root_url
 from dynastore.modules.coverages.domainset import build_domainset
 from dynastore.modules.coverages.rangetype import build_rangetype
@@ -458,6 +457,11 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
     prefix = "/coverages"
     protocol_title = "DynaStore OGC API - Coverages"
     protocol_description = "Access to coverage data via OGC API - Coverages"
+    landing_response_model = cm.CoveragesLandingPage
+
+    # StaticPageMixin (folded into OGCServiceMixin) class attributes
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    static_prefix = "coverages"
 
     def __init__(self, app: Optional[FastAPI] = None):
         super().__init__()
@@ -474,30 +478,9 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
         logger.info("CoveragesService: policies registered.")
         yield
 
-    def get_notebooks(self):
-        try:
-            from .notebooks import build_contributions
-        except Exception:
-            return []
-        return build_contributions()
-
-    def get_web_pages(self):
-        from dynastore.extensions.tools.web_collect import collect_web_pages
-        return collect_web_pages(self)
-
-    def get_static_assets(self):
-        from dynastore.extensions.tools.web_collect import collect_static_assets
-        return collect_static_assets(self)
-
-    @expose_static("coverages")
-    def provide_static_files(self) -> list[str]:
-        """Exposes the internal static directory for the Coverages browser."""
-        static_dir = os.path.join(os.path.dirname(__file__), "static")
-        files = []
-        for root, _, filenames in os.walk(static_dir):
-            for filename in filenames:
-                files.append(os.path.join(root, filename))
-        return files
+    # get_web_pages / get_static_assets / get_notebooks / provide_static_files /
+    # _serve_page_template are provided by OGCServiceMixin (static_dir /
+    # static_prefix below opt this service into the default wiring).
 
     @expose_web_page(
         page_id="coverages_browser",
@@ -508,22 +491,13 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
     async def provide_coverages_browser(self, request: Request):
         return await self._serve_page_template("coverages_browser.html")
 
-    async def _serve_page_template(self, filename: str):
-        from dynastore._version import VERSION
-        file_path = os.path.join(os.path.dirname(__file__), "static", filename)
-        if not os.path.exists(file_path):
-            return Response(content=f"Template {filename} not found", status_code=404)
-        with open(file_path, "r", encoding="utf-8") as f:
-            return Response(content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html")
-
     # ------------------------------------------------------------------
     # Route registration
     # ------------------------------------------------------------------
 
     def _register_routes(self) -> None:
+        self.register_ogc_standard_routes()
         route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
-            ("/", "get_landing_page", ["GET"], {"response_model": cm.CoveragesLandingPage}),
-            ("/conformance", "get_conformance", ["GET"], {"response_model": cm.Conformance}),
             # Catalog / collection listing (drives the web browser's navigation)
             (
                 "/catalogs",
@@ -593,17 +567,7 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
             max_limit=coverages_config.max_limit,
         )
 
-        catalogs_svc = await self._get_catalogs_service()
-        catalogs = await catalogs_svc.list_catalogs(limit=limit, offset=offset)
-        return {
-            "catalogs": [
-                {
-                    "id": getattr(c, "external_id", None) or c.id,
-                    "title": resolve_localized(getattr(c, "title", None), language),
-                }
-                for c in (catalogs or [])
-            ]
-        }
+        return await self._ogc_list_catalogs(limit=limit, offset=offset, language=language)
 
     async def list_collections(
         self,
@@ -630,33 +594,9 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
             max_limit=coverages_config.max_limit,
         )
 
-        catalogs_svc = await self._get_catalogs_service()
-        collections = await catalogs_svc.list_collections(
-            catalog_id, limit=limit, offset=offset
+        return await self._ogc_list_collections(
+            catalog_id, limit=limit, offset=offset, language=language
         )
-        items = []
-        for c in (collections or []):
-            entry: dict = {"id": getattr(c, "external_id", None) or c.id}
-            title = resolve_localized(getattr(c, "title", None), language)
-            if title is not None:
-                entry["title"] = title
-            description = resolve_localized(getattr(c, "description", None), language)
-            if description is not None:
-                entry["description"] = description
-            items.append(entry)
-        return {"collections": items}
-
-    # ------------------------------------------------------------------
-    # Landing page & conformance (delegated to OGCServiceMixin)
-    # ------------------------------------------------------------------
-
-    async def get_landing_page(
-        self, request: Request, language: str = Depends(get_language)
-    ) -> JSONResponse:
-        return await self.ogc_landing_page_handler(request, language=language)
-
-    async def get_conformance(self, request: Request) -> cm.Conformance:
-        return await self.ogc_conformance_handler(request)
 
     # ------------------------------------------------------------------
     # Coverage endpoints (stubs — to be implemented per data model)

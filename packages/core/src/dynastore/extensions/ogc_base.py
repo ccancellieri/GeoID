@@ -34,9 +34,10 @@ Usage::
 """
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Dict, FrozenSet, Iterable, List, Literal, Optional, Tuple, Type, TypeVar, cast
 
-from fastapi import Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from dynastore.extensions.ogc_models_shared import (
     BulkCreationResponse,
@@ -99,6 +100,15 @@ class OGCServiceMixin:
     * ``prefix: str`` — router path prefix (e.g. ``"/features"``)
     * ``protocol_title: str`` — human-readable protocol name
     * ``protocol_description: str`` — one-line description
+
+    Two opt-in feature groups, both off by default:
+
+    * Static-page / web-UI serving — set ``static_dir`` (and ``static_prefix``)
+      to get a default ``provide_static_files``/``get_static_assets`` wiring;
+      see the "Static-page / web-UI serving" section below.
+    * Standard route wiring — call :meth:`register_ogc_standard_routes` from
+      ``_register_routes()`` to register ``/`` and ``/conformance`` off the
+      existing ``ogc_landing_page_handler``/``ogc_conformance_handler``.
     """
 
     # --- Class attributes to be set by subclasses ---
@@ -106,6 +116,22 @@ class OGCServiceMixin:
     prefix: str = ""
     protocol_title: str = ""
     protocol_description: str = ""
+
+    # --- Static-page / web-UI serving (opt-in) ---
+    # ``static_dir`` must be computed in the *subclass's own module* (e.g.
+    # ``os.path.join(os.path.dirname(__file__), "static")``) — this module's
+    # ``__file__`` would point at the wrong directory. Leaving it unset opts
+    # the subclass out of the default ``provide_static_files``/
+    # ``get_static_assets`` wiring below (it can still define its own).
+    static_dir: ClassVar[Optional[str]] = None
+    static_prefix: str = ""
+    static_owner: str = ""
+    static_description: str = ""
+    static_public: bool = True
+
+    # --- Standard route response models (see register_ogc_standard_routes) ---
+    landing_response_model: ClassVar[Optional[Type[Any]]] = None
+    conformance_response_model: ClassVar[Optional[Type[Any]]] = Conformance
 
     # --- Cached protocol references (per-instance) ---
     _ogc_catalogs_protocol: Optional[CatalogsProtocol] = None
@@ -177,6 +203,91 @@ class OGCServiceMixin:
             keywords=keywords,
             contributor_factory=_Contributor,
         ))
+
+    # ------------------------------------------------------------------
+    # Static-page / web-UI serving (opt-in via static_dir/static_prefix)
+    # ------------------------------------------------------------------
+    # Byte-identical extraction of the static-page shell that used to be
+    # copy-pasted per extension: a static-files directory walk, an HTML
+    # template server that substitutes ``{{VERSION}}``, and the
+    # WebPageContributor/StaticAssetProvider delegators. A subclass that
+    # sets ``static_dir`` (and ``static_prefix``) gets all of this for free
+    # and keeps only its ``@expose_web_page``-decorated browser-page method.
+
+    def get_web_pages(self) -> List[Any]:
+        """Default ``WebPageContributor`` hook: collect ``@expose_web_page`` methods."""
+        from dynastore.extensions.tools.web_collect import collect_web_pages
+
+        return collect_web_pages(self)
+
+    def get_static_assets(self) -> List[Any]:
+        """Default ``StaticAssetProvider`` hook.
+
+        Collects any ``@expose_static``-decorated methods (unchanged
+        mechanism) plus, when ``static_dir``/``static_prefix`` are set, a
+        ``StaticAsset`` wired to :meth:`provide_static_files` — equivalent
+        to what ``@expose_static(static_prefix)`` on that method would have
+        produced, without needing the decorator's compile-time-fixed prefix.
+        """
+        from dynastore.extensions.tools.web_collect import collect_static_assets
+
+        assets = list(collect_static_assets(self))
+        if self.static_dir and self.static_prefix:
+            from dynastore.models.protocols.web_ui import StaticAsset
+
+            assets.append(
+                StaticAsset(
+                    prefix=self.static_prefix.strip("/"),
+                    files_provider=self.provide_static_files,
+                    owner=self.static_owner,
+                    description=self.static_description,
+                    public=self.static_public,
+                )
+            )
+        return assets
+
+    def get_notebooks(self) -> List[Any]:
+        """Default hook: delegate to the subclass's own ``.notebooks`` submodule.
+
+        Resolves ``build_contributions`` from the ``notebooks`` module living
+        alongside the concrete service class (e.g. ``dynastore.extensions.
+        coverages.notebooks`` for ``CoveragesService``), matching the
+        ``from .notebooks import build_contributions`` pattern every service
+        used to repeat inline. Returns ``[]`` when no such module exists.
+        """
+        import importlib
+
+        package_name = type(self).__module__.rsplit(".", 1)[0]
+        try:
+            notebooks_mod = importlib.import_module(f"{package_name}.notebooks")
+            build_contributions = notebooks_mod.build_contributions
+        except Exception:
+            return []
+        return build_contributions()
+
+    def provide_static_files(self) -> List[str]:
+        """Default static-files provider: walk ``self.static_dir``.
+
+        Returns the absolute path of every file under ``static_dir`` —
+        the same ``os.walk`` collector every extension used to inline.
+        """
+        files: List[str] = []
+        for root, _, filenames in os.walk(self.static_dir or ""):
+            for filename in filenames:
+                files.append(os.path.join(root, filename))
+        return files
+
+    async def _serve_page_template(self, filename: str) -> Response:
+        """Serve an HTML file from ``static_dir`` with ``{{VERSION}}`` substituted."""
+        from dynastore._version import VERSION
+
+        file_path = os.path.join(self.static_dir or "", filename)
+        if not os.path.exists(file_path):
+            return Response(content=f"Template {filename} not found", status_code=404)
+        with open(file_path, "r", encoding="utf-8") as f:
+            return Response(
+                content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html"
+            )
 
     # ------------------------------------------------------------------
     # Protocol getters (cached, with standard error handling)
@@ -450,6 +561,98 @@ class OGCServiceMixin:
             ],
         )
         return JSONResponse(content=localize_model(landing_page, language))
+
+    def register_ogc_standard_routes(self, router: Optional[APIRouter] = None) -> None:
+        """Register the standard ``/`` and ``/conformance`` GET routes.
+
+        Wires ``self.ogc_landing_page_handler``/``self.ogc_conformance_handler``
+        onto *router* (or ``self.router`` when omitted) — both bound methods,
+        so a subclass override of either handler is picked up automatically
+        by normal method resolution (STAC, which returns a root catalog
+        instead of a plain landing page, does not call this method at all
+        and is unaffected).
+
+        ``response_model`` for each route comes from the ``landing_response_model``/
+        ``conformance_response_model`` class attributes, so the OpenAPI schema
+        stays protocol-specific even though the handlers are shared.
+        """
+        target_router = router if router is not None else self.router  # type: ignore[attr-defined]
+        target_router.add_api_route(
+            "/",
+            self.ogc_landing_page_handler,
+            methods=["GET"],
+            response_model=self.landing_response_model,
+        )
+        target_router.add_api_route(
+            "/conformance",
+            self.ogc_conformance_handler,
+            methods=["GET"],
+            response_model=self.conformance_response_model,
+        )
+
+    # ------------------------------------------------------------------
+    # Web-nav listing helpers (catalog/collection {id, title, description})
+    # ------------------------------------------------------------------
+
+    async def _ogc_list_catalogs(
+        self,
+        *,
+        limit: int,
+        offset: int = 0,
+        language: Optional[str] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Shared ``{id, title}`` catalog nav-listing projection.
+
+        Used by the web-browser "list catalogs" endpoints (Coverages, EDR).
+        *limit* must already be resolved (e.g. via ``resolve_page_limit``) —
+        this helper does not apply a default. When *language* is given,
+        ``title`` is resolved via :func:`resolve_localized` to a single
+        string; when ``None`` the raw title value is passed through
+        unchanged.
+        """
+        catalogs_svc = await self._get_catalogs_service()
+        catalogs = await catalogs_svc.list_catalogs(limit=limit, offset=offset)
+        result: List[Dict[str, Any]] = []
+        for c in (catalogs or []):
+            title = getattr(c, "title", None)
+            if language is not None:
+                from dynastore.extensions.tools.response_i18n import resolve_localized
+
+                title = resolve_localized(title, language)
+            result.append({"id": getattr(c, "external_id", None) or c.id, "title": title})
+        return {"catalogs": result}
+
+    async def _ogc_list_collections(
+        self,
+        catalog_id: str,
+        *,
+        limit: int,
+        offset: int = 0,
+        language: str,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Shared ``{id, title, description}`` collection nav-listing projection.
+
+        *limit* must already be resolved (e.g. via ``resolve_page_limit``).
+        ``title``/``description`` are resolved via :func:`resolve_localized`
+        and omitted from an entry when the resolved value is ``None``.
+        """
+        from dynastore.extensions.tools.response_i18n import resolve_localized
+
+        catalogs_svc = await self._get_catalogs_service()
+        collections = await catalogs_svc.list_collections(
+            catalog_id, limit=limit, offset=offset
+        )
+        items: List[Dict[str, Any]] = []
+        for c in (collections or []):
+            entry: Dict[str, Any] = {"id": getattr(c, "external_id", None) or c.id}
+            title = resolve_localized(getattr(c, "title", None), language)
+            if title is not None:
+                entry["title"] = title
+            description = resolve_localized(getattr(c, "description", None), language)
+            if description is not None:
+                entry["description"] = description
+            items.append(entry)
+        return {"collections": items}
 
     # ------------------------------------------------------------------
     # Shared CRUD helpers

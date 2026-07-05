@@ -29,7 +29,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, FrozenSet, List, Optional, cast
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import StreamingResponse
 
 from dynastore.extensions.ogc_base import OGCServiceMixin, ogc_asset_href
 from dynastore.extensions.protocols import ExtensionProtocol
@@ -38,7 +38,7 @@ from dynastore.extensions.tools.language_utils import get_language
 from dynastore.extensions.tools.query import parse_hints_param
 from dynastore.extensions.tools.response_i18n import localize_model
 from dynastore.extensions.tools.url import get_root_url
-from dynastore.extensions.web.decorators import expose_static, expose_web_page
+from dynastore.extensions.web.decorators import expose_web_page
 from dynastore.models.protocols import CatalogsProtocol
 
 from . import edr_models as em
@@ -143,6 +143,12 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
     prefix = "/edr"
     protocol_title = "DynaStore OGC API - EDR"
     protocol_description = "Environmental Data Retrieval via OGC API - EDR"
+    landing_response_model = em.EDRLandingPage
+    conformance_response_model = em.Conformance
+
+    # StaticPageMixin (folded into OGCServiceMixin) class attributes
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    static_prefix = "edr"
 
     def __init__(self, app: Optional[FastAPI] = None):
         super().__init__()
@@ -163,9 +169,8 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
     # ------------------------------------------------------------------
 
     def _register_routes(self) -> None:
+        self.register_ogc_standard_routes()
         route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
-            ("/", "get_landing_page", ["GET"], {"response_model": em.EDRLandingPage}),
-            ("/conformance", "get_conformance", ["GET"], {"response_model": em.Conformance}),
             (
                 "/catalogs",
                 "list_catalogs",
@@ -209,45 +214,6 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
             self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     # ------------------------------------------------------------------
-    # Landing page & conformance (delegated to OGCServiceMixin)
-    # ------------------------------------------------------------------
-
-    async def get_landing_page(
-        self, request: Request, language: str = Depends(get_language)
-    ) -> JSONResponse:
-        # Build an EDRLandingPage (which applies EDR-specific title/description
-        # defaults) and return it localized to the requested language.
-        from dynastore.models.shared_models import Link as _Link
-
-        root_url = get_root_url(request)
-        landing = em.EDRLandingPage(
-            links=[
-                _Link(
-                    href=f"{root_url}{self.prefix}/",
-                    rel="self",
-                    type="application/json",
-                    title="This document",  # type: ignore[arg-type]
-                ),
-                _Link(
-                    href=f"{root_url}{self.prefix}/conformance",
-                    rel="conformance",
-                    type="application/json",
-                    title="Conformance classes",  # type: ignore[arg-type]
-                ),
-                _Link(
-                    href=f"{root_url}/api",
-                    rel="service-doc",
-                    type="application/json",
-                    title="API documentation",  # type: ignore[arg-type]
-                ),
-            ],
-        )
-        return JSONResponse(content=localize_model(landing, language))
-
-    async def get_conformance(self, request: Request) -> em.Conformance:
-        return await self.ogc_conformance_handler(request)
-
-    # ------------------------------------------------------------------
     # Collections
     # ------------------------------------------------------------------
 
@@ -275,14 +241,7 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
             max_limit=edr_config.max_limit,
         )
 
-        catalogs_svc = await self._get_catalogs_service()
-        catalogs = await catalogs_svc.list_catalogs(limit=limit, offset=offset)
-        return {
-            "catalogs": [
-                {"id": getattr(c, "external_id", None) or c.id, "title": getattr(c, "title", None)}
-                for c in (catalogs or [])
-            ]
-        }
+        return await self._ogc_list_catalogs(limit=limit, offset=offset)
 
     async def list_collections(
         self,
@@ -726,31 +685,9 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
     # ------------------------------------------------------------------
     # Web page contribution (WebPageContributor / StaticAssetProvider)
     # ------------------------------------------------------------------
-
-    def get_web_pages(self):
-        from dynastore.extensions.tools.web_collect import collect_web_pages
-        return collect_web_pages(self)
-
-    def get_static_assets(self):
-        from dynastore.extensions.tools.web_collect import collect_static_assets
-        return collect_static_assets(self)
-
-    def get_notebooks(self):
-        try:
-            from .notebooks import build_contributions
-        except Exception:
-            return []
-        return build_contributions()
-
-    @expose_static("edr")
-    def provide_static_files(self) -> list:
-        """Exposes the internal static directory for the EDR browser."""
-        static_dir = os.path.join(os.path.dirname(__file__), "static")
-        files = []
-        for root, _, filenames in os.walk(static_dir):
-            for filename in filenames:
-                files.append(os.path.join(root, filename))
-        return files
+    # get_web_pages / get_static_assets / get_notebooks / provide_static_files /
+    # _serve_page_template are provided by OGCServiceMixin (static_dir /
+    # static_prefix above opt this service into the default wiring).
 
     @expose_web_page(
         page_id="edr_browser",
@@ -760,14 +697,6 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
     )
     async def provide_edr_browser(self, request: Request):
         return await self._serve_page_template("edr_browser.html")
-
-    async def _serve_page_template(self, filename: str):
-        from dynastore._version import VERSION
-        file_path = os.path.join(os.path.dirname(__file__), "static", filename)
-        if not os.path.exists(file_path):
-            return Response(content=f"Template {filename} not found", status_code=404)
-        with open(file_path, "r", encoding="utf-8") as f:
-            return Response(content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html")
 
     # ------------------------------------------------------------------
     # Internal item access helpers
