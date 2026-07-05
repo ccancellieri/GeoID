@@ -418,36 +418,44 @@ class JoinsService(ExtensionProtocol, OGCServiceMixin):
         return build_contributions()
 
     def _register_routes(self) -> None:
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/join",
-            self.describe_join, methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/join",
-            self.execute_join, methods=["POST"],
-            response_class=GeoJSONResponse,
-            # Doc-only response schema: the join FeatureCollection carries
-            # arbitrary per-request properties/geometry that a real
-            # `response_model=FeatureCollection` would re-validate on every
-            # request (and reject legitimate `geometry: null` features, since
-            # geojson_pydantic's `Feature.geometry` isn't itself nullable-
-            # optional) — that's the join *semantics* this issue must not
-            # touch. `responses=` documents the schema for the OpenAPI spec
-            # without imposing runtime (re-)validation.
-            responses={
-                200: {
-                    "description": (
-                        "Joined FeatureCollection page, served as "
-                        f"`{GEOJSON_MEDIA_TYPE}` by default or `{JSON_MEDIA_TYPE}` "
-                        "when explicitly requested via `Accept`."
-                    ),
-                    "content": {
-                        GEOJSON_MEDIA_TYPE: {"schema": FeatureCollection.model_json_schema()},
-                        JSON_MEDIA_TYPE: {"schema": FeatureCollection.model_json_schema()},
+        # (path, handler_name, methods, kwargs)
+        route_table = [
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/join",
+                "describe_join", ["GET"], {},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/join",
+                "execute_join", ["POST"],
+                {
+                    "response_class": GeoJSONResponse,
+                    # Doc-only response schema: the join FeatureCollection carries
+                    # arbitrary per-request properties/geometry that a real
+                    # `response_model=FeatureCollection` would re-validate on every
+                    # request (and reject legitimate `geometry: null` features, since
+                    # geojson_pydantic's `Feature.geometry` isn't itself nullable-
+                    # optional) — that's the join *semantics* this issue must not
+                    # touch. `responses=` documents the schema for the OpenAPI spec
+                    # without imposing runtime (re-)validation.
+                    "responses": {
+                        200: {
+                            "description": (
+                                "Joined FeatureCollection page, served as "
+                                f"`{GEOJSON_MEDIA_TYPE}` by default or `{JSON_MEDIA_TYPE}` "
+                                "when explicitly requested via `Accept`."
+                            ),
+                            "content": {
+                                GEOJSON_MEDIA_TYPE: {"schema": FeatureCollection.model_json_schema()},
+                                JSON_MEDIA_TYPE: {"schema": FeatureCollection.model_json_schema()},
+                            },
+                        },
                     },
                 },
-            },
-        )
+            ),
+        ]
+
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     async def describe_join(
         self, catalog_id: str, collection_id: str, request: Request,

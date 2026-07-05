@@ -88,70 +88,49 @@ class NotebooksExtension(ExtensionProtocol):
         yield
 
     def _register_routes(self):
-        # Platform notebooks (global, cross-tenant)
-        self.router.add_api_route(
-            "/platform",
-            self.list_platform_notebooks,
-            methods=["GET"],
-            response_model=Dict[str, Any],
-            summary="List platform notebooks",
-        )
-        self.router.add_api_route(
-            "/platform/{notebook_id}",
-            self.get_platform_notebook,
-            methods=["GET"],
-            summary="Get a platform notebook",
-        )
-        self.router.add_api_route(
-            "/platform/{notebook_id}",
-            self.save_platform_notebook,
-            methods=["PUT"],
-            response_model=PlatformNotebook,
-            summary="Create or update a platform notebook (sysadmin)",
-        )
-        self.router.add_api_route(
-            "/platform/{notebook_id}",
-            self.delete_platform_notebook,
-            methods=["DELETE"],
-            summary="Soft-delete a platform notebook (sysadmin)",
-        )
-        # Copy platform -> tenant
-        self.router.add_api_route(
-            "/{catalog_id}/copy/{platform_notebook_id}",
-            self.copy_platform_notebook,
-            methods=["POST"],
-            response_model=Notebook,
-            status_code=201,
-            summary="Copy a platform notebook into a tenant catalog",
-        )
-        # Tenant CRUD
-        self.router.add_api_route(
-            "/{catalog_id}",
-            self.list_notebooks,
-            methods=["GET"],
-            response_model=Dict[str, Any],
-            summary="List notebooks in a catalog",
-        )
-        self.router.add_api_route(
-            "/{catalog_id}/{notebook_code}",
-            self.get_notebook,
-            methods=["GET"],
-            response_model=Notebook,
-            summary="Get full notebook content",
-        )
-        self.router.add_api_route(
-            "/{catalog_id}/{notebook_code}",
-            self.save_notebook,
-            methods=["PUT"],
-            response_model=Notebook,
-            summary="Save a notebook",
-        )
-        self.router.add_api_route(
-            "/{catalog_id}/{notebook_code}",
-            self.delete_notebook,
-            methods=["DELETE"],
-            summary="Soft-delete a notebook",
-        )
+        # (path, handler_name, methods, kwargs)
+        route_table = [
+            # Platform notebooks (global, cross-tenant)
+            ("/platform", "list_platform_notebooks", ["GET"], {
+                "response_model": Dict[str, Any],
+                "summary": "List platform notebooks",
+            }),
+            ("/platform/{notebook_id}", "get_platform_notebook", ["GET"], {
+                "summary": "Get a platform notebook",
+            }),
+            ("/platform/{notebook_id}", "save_platform_notebook", ["PUT"], {
+                "response_model": PlatformNotebook,
+                "summary": "Create or update a platform notebook (sysadmin)",
+            }),
+            ("/platform/{notebook_id}", "delete_platform_notebook", ["DELETE"], {
+                "summary": "Soft-delete a platform notebook (sysadmin)",
+            }),
+            # Copy platform -> tenant
+            ("/{catalog_id}/copy/{platform_notebook_id}", "copy_platform_notebook", ["POST"], {
+                "response_model": Notebook,
+                "status_code": 201,
+                "summary": "Copy a platform notebook into a tenant catalog",
+            }),
+            # Tenant CRUD
+            ("/{catalog_id}", "list_notebooks", ["GET"], {
+                "response_model": Dict[str, Any],
+                "summary": "List notebooks in a catalog",
+            }),
+            ("/{catalog_id}/{notebook_code}", "get_notebook", ["GET"], {
+                "response_model": Notebook,
+                "summary": "Get full notebook content",
+            }),
+            ("/{catalog_id}/{notebook_code}", "save_notebook", ["PUT"], {
+                "response_model": Notebook,
+                "summary": "Save a notebook",
+            }),
+            ("/{catalog_id}/{notebook_code}", "delete_notebook", ["DELETE"], {
+                "summary": "Soft-delete a notebook",
+            }),
+        ]
+
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     # ------------------------------------------------------------------
     # Web page: Notebook browser
