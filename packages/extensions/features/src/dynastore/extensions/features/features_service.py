@@ -196,140 +196,79 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
 
     def _register_routes(self):
         """Registers all OGC API Features routes."""
-        self.router.add_api_route(
-            "/",
-            self.get_landing_page,
-            methods=["GET"],
-            response_model=ogc_models.LandingPage,
-        )
-        self.router.add_api_route(
-            "/conformance",
-            self.get_conformance,
-            methods=["GET"],
-            response_model=ogc_models.Conformance,
-        )
-        self.router.add_api_route(
-            "/functions",
-            self.get_supported_functions,
-            methods=["GET"],
-            response_model=FunctionsResponse,
-        )
-
-        # --- Catalog Endpoints ---
-        self.router.add_api_route(
-            "/catalogs",
-            self.list_catalogs,
-            methods=["GET"],
-            response_model=ogc_models.Catalogs,
-        )
-        self.router.add_api_route(
-            "/catalogs",
-            self.create_catalog,
-            methods=["POST"],
-            response_model=Catalog,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}",
-            self.get_catalog,
-            methods=["GET"],
-            response_model=Catalog,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}",
-            self.replace_catalog,
-            methods=["PUT"],
-            response_model=Catalog,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}",
-            self.update_catalog,
-            methods=["PATCH"],
-            response_model=Catalog,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}",
-            self.delete_catalog,
-            methods=["DELETE"],
-            status_code=status.HTTP_204_NO_CONTENT,
-        )
-
-        # --- Collection Endpoints ---
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections",
-            self.list_collections_in_catalog,
-            methods=["GET"],
-            response_model=ogc_models.Collections,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections",
-            self.create_collection,
-            methods=["POST"],
-            response_model=ogc_models.OGCCollection,
-            status_code=status.HTTP_201_CREATED,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}",
-            self.get_collection,
-            methods=["GET"],
-            response_model=ogc_models.OGCCollection,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}",
-            self.replace_collection,
-            methods=["PUT"],
-            response_model=ogc_models.OGCCollection,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}",
-            self.update_collection,
-            methods=["PATCH"],
-            response_model=ogc_models.OGCCollection,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}",
-            self.delete_collection,
-            methods=["DELETE"],
-            status_code=status.HTTP_204_NO_CONTENT,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/queryables",
-            self.get_queryables,
-            methods=["GET"],
-            response_model=ogc_models.Queryables,
-        )
-
-        # --- Item Endpoints ---
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/items",
-            self.get_items,
-            methods=["GET"],
-            response_model=ogc_models.FeatureCollection,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/items",
-            self.add_item,
-            methods=["POST"],
-            response_model=Union[ogc_models.Feature, ogc_models.BulkCreationResponse],
-            status_code=status.HTTP_201_CREATED,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}",
-            self.get_item,
-            methods=["GET"],
-            response_model=ogc_models.Feature,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}",
-            self.replace_item,
-            methods=["PUT"],
-            response_model=ogc_models.Feature,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}",
-            self.delete_item,
-            methods=["DELETE"],
-            status_code=status.HTTP_204_NO_CONTENT,
-        )
+        route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
+            ("/", "get_landing_page", ["GET"], {"response_model": ogc_models.LandingPage}),
+            ("/conformance", "get_conformance", ["GET"], {"response_model": ogc_models.Conformance}),
+            ("/functions", "get_supported_functions", ["GET"], {"response_model": FunctionsResponse}),
+            # --- Catalog Endpoints ---
+            ("/catalogs", "list_catalogs", ["GET"], {"response_model": ogc_models.Catalogs}),
+            ("/catalogs", "create_catalog", ["POST"], {"response_model": Catalog}),
+            ("/catalogs/{catalog_id}", "get_catalog", ["GET"], {"response_model": Catalog}),
+            ("/catalogs/{catalog_id}", "replace_catalog", ["PUT"], {"response_model": Catalog}),
+            ("/catalogs/{catalog_id}", "update_catalog", ["PATCH"], {"response_model": Catalog}),
+            (
+                "/catalogs/{catalog_id}", "delete_catalog", ["DELETE"],
+                {"status_code": status.HTTP_204_NO_CONTENT},
+            ),
+            # --- Collection Endpoints ---
+            (
+                "/catalogs/{catalog_id}/collections", "list_collections_in_catalog", ["GET"],
+                {"response_model": ogc_models.Collections},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections", "create_collection", ["POST"],
+                {
+                    "response_model": ogc_models.OGCCollection,
+                    "status_code": status.HTTP_201_CREATED,
+                },
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}", "get_collection", ["GET"],
+                {"response_model": ogc_models.OGCCollection},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}", "replace_collection", ["PUT"],
+                {"response_model": ogc_models.OGCCollection},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}", "update_collection", ["PATCH"],
+                {"response_model": ogc_models.OGCCollection},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}", "delete_collection", ["DELETE"],
+                {"status_code": status.HTTP_204_NO_CONTENT},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/queryables", "get_queryables", ["GET"],
+                {"response_model": ogc_models.Queryables},
+            ),
+            # --- Item Endpoints ---
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items", "get_items", ["GET"],
+                {"response_model": ogc_models.FeatureCollection},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items", "add_item", ["POST"],
+                {
+                    "response_model": Union[ogc_models.Feature, ogc_models.BulkCreationResponse],
+                    "status_code": status.HTTP_201_CREATED,
+                },
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}", "get_item", ["GET"],
+                {"response_model": ogc_models.Feature},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}", "replace_item", ["PUT"],
+                {"response_model": ogc_models.Feature},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items/{item_id}", "delete_item", ["DELETE"],
+                {"status_code": status.HTTP_204_NO_CONTENT},
+            ),
+        ]
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):

@@ -166,194 +166,155 @@ class ConfigsService(ExtensionProtocol):
         yield
 
     def _setup_routes(self):
-        # ---- Discovery: registry (plugin classes) + driver instances ----
-        # ``/registry`` is the catalog of plugin classes (each entry carries
-        # JSON Schema + description + scope).  ``/storage/drivers`` is a
-        # different concept — runtime driver INSTANCES grouped by Protocol
-        # qualname (capabilities, availability) for the operator's driver
-        # picker.  The legacy ``/schemas``, ``/plugins`` (discovery list),
-        # ``/graph`` and ``/search`` endpoints have been retired.
-        self.router.add_api_route(
-            "/registry",
-            self.get_config_schemas,
-            methods=["GET"],
-            summary="Plugin registry — list all registered config plugin classes",
-        )
-        self.router.add_api_route(
-            "/registry/{plugin_id}",
-            self.get_config_schema,
-            methods=["GET"],
-            summary="Plugin registry entry — JSON Schema + description for one plugin class",
-        )
-        self.router.add_api_route(
-            "/storage/drivers",
-            self.list_storage_drivers,
-            methods=["GET"],
-            summary="List all registered storage drivers grouped by Protocol qualname",
-        )
-        self.router.add_api_route(
-            "/engines",
-            self.list_engines,
-            methods=["GET"],
-            summary=(
-                "List registered platform engines + their driver-class "
-                "compatibility (Cycle F.4c.0)"
+        col = "/catalogs/{catalog_id}/collections/{collection_id}"
+        route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
+            # ---- Discovery: registry (plugin classes) + driver instances ----
+            # ``/registry`` is the catalog of plugin classes (each entry carries
+            # JSON Schema + description + scope).  ``/storage/drivers`` is a
+            # different concept — runtime driver INSTANCES grouped by Protocol
+            # qualname (capabilities, availability) for the operator's driver
+            # picker.  The legacy ``/schemas``, ``/plugins`` (discovery list),
+            # ``/graph`` and ``/search`` endpoints have been retired.
+            (
+                "/registry", "get_config_schemas", ["GET"],
+                {"summary": "Plugin registry — list all registered config plugin classes"},
             ),
-        )
-        # ---- Task routing discovery (read-only; the #1647/#1675 surfaces) ----
-        # ``catalogue`` = the in-process task/process registry, kind-split.
-        # ``runners``   = registered runners + what each declares it can run
-        #                 (incl. discovered Cloud Run Jobs).
-        # ``capabilities`` = the live claim map for THIS service + a fail-open
-        #                 reconcile of catalogued items that would starve here.
-        self.router.add_api_route(
-            "/tasks/catalogue",
-            self.get_tasks_catalogue,
-            methods=["GET"],
-            summary="Task/process registry (kind-split) — the routable inventory",
-        )
-        self.router.add_api_route(
-            "/tasks/runners",
-            self.get_tasks_runners,
-            methods=["GET"],
-            summary="Registered task runners + their declared task manifests",
-        )
-        self.router.add_api_route(
-            "/tasks/capabilities",
-            self.get_tasks_capabilities,
-            methods=["GET"],
-            summary="Live claim map for this service + starvation reconcile (#1647/#1675)",
-        )
-        # ---- Composed (waterfall-resolved) tree views ----
-        self.router.add_api_route(
-            "/",
-            self.get_platform_config_composed,
-            methods=["GET"],
-            summary="Platform config — all effective platform configs composed",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}",
-            self.get_catalog_config_composed,
-            methods=["GET"],
-            summary="Catalog config — all effective catalog configs composed",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}",
-            self.get_collection_config_composed,
-            methods=["GET"],
-            summary="Collection config — all effective collection configs composed",
-        )
-        # ---- Multi-instance ref discovery (read-only; #1940 / Refs #948) ----
-        # The ``{ref_key: class_key}`` map of rows stored at the scope. Lets
-        # the Configuration Hub surface instance rows authored under a
-        # non-canonical ``ref_key`` (``set_config_by_ref``), which the
-        # class-keyed registry list does not show. Tier-local (no waterfall).
-        self.router.add_api_route(
-            "/refs",
-            self.list_config_refs_platform,
-            methods=["GET"],
-            summary="Multi-instance refs — {ref_key: class_key} stored at platform scope",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/refs",
-            self.list_config_refs_catalog,
-            methods=["GET"],
-            summary="Multi-instance refs — {ref_key: class_key} stored at catalog scope",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/refs",
-            self.list_config_refs_collection,
-            methods=["GET"],
-            summary="Multi-instance refs — {ref_key: class_key} stored at collection scope",
-        )
-        # ---- Multi-plugin partial write (RFC 7396 merge-patch) ----
-        # Body: ``{plugin_id: payload | null}``.  ``null`` deletes the override.
-        # Atomic at the scope level.  Replaces the legacy ``/bulk`` endpoint.
-        self.router.add_api_route(
-            "/",
-            self._patch_platform_config,
-            methods=["PATCH"],
-            summary="Partially update platform-level configs (RFC 7396 merge-patch); null value deletes the override",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}",
-            self._patch_catalog_config,
-            methods=["PATCH"],
-            summary="Partially update catalog-level configs (RFC 7396 merge-patch); null value deletes the override",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}",
-            self._patch_collection_config,
-            methods=["PATCH"],
-            summary="Partially update collection-level configs (RFC 7396 merge-patch); null value deletes the override",
-        )
-        # ---- Per-plugin CRUD (platform tier) ----
-        self.router.add_api_route(
-            "/plugins/{plugin_id}",
-            self.get_platform_config,
-            methods=["GET"],
-            summary="Get platform-level plugin configuration",
-        )
-        self.router.add_api_route(
-            "/plugins/{plugin_id}",
-            self.update_platform_config,
-            methods=["PUT"],
-            summary="Set platform-level plugin configuration",
-        )
-        self.router.add_api_route(
-            "/plugins/{plugin_id}",
-            self.delete_platform_config,
-            methods=["DELETE"],
-            summary="Delete platform-level plugin configuration",
-            status_code=status.HTTP_204_NO_CONTENT,
-        )
-        # ---- Per-plugin CRUD (catalog tier) ----
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/plugins/{plugin_id}",
-            self.get_catalog_config,
-            methods=["GET"],
-            summary="Get effective plugin configuration for a catalog",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/plugins/{plugin_id}",
-            self.update_catalog_config,
-            methods=["PUT"],
-            summary="Set or update a catalog-level plugin configuration",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/plugins/{plugin_id}",
-            self.delete_catalog_config,
-            methods=["DELETE"],
-            summary="Delete a catalog-level plugin configuration",
-            status_code=status.HTTP_204_NO_CONTENT,
-        )
-        # ---- Per-plugin CRUD (collection tier) ----
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/plugins/{plugin_id}",
-            self.get_collection_config,
-            methods=["GET"],
-            summary="Get effective plugin configuration for a collection",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/plugins/{plugin_id}",
-            self.update_collection_config,
-            methods=["PUT"],
-            summary="Set or update a collection-level plugin configuration",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/plugins/{plugin_id}",
-            self.delete_collection_config,
-            methods=["DELETE"],
-            summary="Delete a collection-level plugin configuration",
-            status_code=status.HTTP_204_NO_CONTENT,
-        )
-        # ---- items_schema derivation (propose; apply is the existing PUT) ----
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/items-schema/derive",
-            self.derive_items_schema_proposal,
-            methods=["POST"],
-            summary="Derive a proposed items_schema for a collection from a vector asset's gdalinfo",
-        )
+            (
+                "/registry/{plugin_id}", "get_config_schema", ["GET"],
+                {"summary": "Plugin registry entry — JSON Schema + description for one plugin class"},
+            ),
+            (
+                "/storage/drivers", "list_storage_drivers", ["GET"],
+                {"summary": "List all registered storage drivers grouped by Protocol qualname"},
+            ),
+            (
+                "/engines", "list_engines", ["GET"],
+                {
+                    "summary": (
+                        "List registered platform engines + their driver-class "
+                        "compatibility (Cycle F.4c.0)"
+                    ),
+                },
+            ),
+            # ---- Task routing discovery (read-only; the #1647/#1675 surfaces) ----
+            # ``catalogue`` = the in-process task/process registry, kind-split.
+            # ``runners``   = registered runners + what each declares it can run
+            #                 (incl. discovered Cloud Run Jobs).
+            # ``capabilities`` = the live claim map for THIS service + a fail-open
+            #                 reconcile of catalogued items that would starve here.
+            (
+                "/tasks/catalogue", "get_tasks_catalogue", ["GET"],
+                {"summary": "Task/process registry (kind-split) — the routable inventory"},
+            ),
+            (
+                "/tasks/runners", "get_tasks_runners", ["GET"],
+                {"summary": "Registered task runners + their declared task manifests"},
+            ),
+            (
+                "/tasks/capabilities", "get_tasks_capabilities", ["GET"],
+                {"summary": "Live claim map for this service + starvation reconcile (#1647/#1675)"},
+            ),
+            # ---- Composed (waterfall-resolved) tree views ----
+            (
+                "/", "get_platform_config_composed", ["GET"],
+                {"summary": "Platform config — all effective platform configs composed"},
+            ),
+            (
+                "/catalogs/{catalog_id}", "get_catalog_config_composed", ["GET"],
+                {"summary": "Catalog config — all effective catalog configs composed"},
+            ),
+            (
+                col, "get_collection_config_composed", ["GET"],
+                {"summary": "Collection config — all effective collection configs composed"},
+            ),
+            # ---- Multi-instance ref discovery (read-only; #1940 / Refs #948) ----
+            # The ``{ref_key: class_key}`` map of rows stored at the scope. Lets
+            # the Configuration Hub surface instance rows authored under a
+            # non-canonical ``ref_key`` (``set_config_by_ref``), which the
+            # class-keyed registry list does not show. Tier-local (no waterfall).
+            (
+                "/refs", "list_config_refs_platform", ["GET"],
+                {"summary": "Multi-instance refs — {ref_key: class_key} stored at platform scope"},
+            ),
+            (
+                "/catalogs/{catalog_id}/refs", "list_config_refs_catalog", ["GET"],
+                {"summary": "Multi-instance refs — {ref_key: class_key} stored at catalog scope"},
+            ),
+            (
+                f"{col}/refs", "list_config_refs_collection", ["GET"],
+                {"summary": "Multi-instance refs — {ref_key: class_key} stored at collection scope"},
+            ),
+            # ---- Multi-plugin partial write (RFC 7396 merge-patch) ----
+            # Body: ``{plugin_id: payload | null}``.  ``null`` deletes the override.
+            # Atomic at the scope level.  Replaces the legacy ``/bulk`` endpoint.
+            (
+                "/", "_patch_platform_config", ["PATCH"],
+                {"summary": "Partially update platform-level configs (RFC 7396 merge-patch); null value deletes the override"},
+            ),
+            (
+                "/catalogs/{catalog_id}", "_patch_catalog_config", ["PATCH"],
+                {"summary": "Partially update catalog-level configs (RFC 7396 merge-patch); null value deletes the override"},
+            ),
+            (
+                col, "_patch_collection_config", ["PATCH"],
+                {"summary": "Partially update collection-level configs (RFC 7396 merge-patch); null value deletes the override"},
+            ),
+            # ---- Per-plugin CRUD (platform tier) ----
+            (
+                "/plugins/{plugin_id}", "get_platform_config", ["GET"],
+                {"summary": "Get platform-level plugin configuration"},
+            ),
+            (
+                "/plugins/{plugin_id}", "update_platform_config", ["PUT"],
+                {"summary": "Set platform-level plugin configuration"},
+            ),
+            (
+                "/plugins/{plugin_id}", "delete_platform_config", ["DELETE"],
+                {
+                    "summary": "Delete platform-level plugin configuration",
+                    "status_code": status.HTTP_204_NO_CONTENT,
+                },
+            ),
+            # ---- Per-plugin CRUD (catalog tier) ----
+            (
+                "/catalogs/{catalog_id}/plugins/{plugin_id}", "get_catalog_config", ["GET"],
+                {"summary": "Get effective plugin configuration for a catalog"},
+            ),
+            (
+                "/catalogs/{catalog_id}/plugins/{plugin_id}", "update_catalog_config", ["PUT"],
+                {"summary": "Set or update a catalog-level plugin configuration"},
+            ),
+            (
+                "/catalogs/{catalog_id}/plugins/{plugin_id}", "delete_catalog_config", ["DELETE"],
+                {
+                    "summary": "Delete a catalog-level plugin configuration",
+                    "status_code": status.HTTP_204_NO_CONTENT,
+                },
+            ),
+            # ---- Per-plugin CRUD (collection tier) ----
+            (
+                f"{col}/plugins/{{plugin_id}}", "get_collection_config", ["GET"],
+                {"summary": "Get effective plugin configuration for a collection"},
+            ),
+            (
+                f"{col}/plugins/{{plugin_id}}", "update_collection_config", ["PUT"],
+                {"summary": "Set or update a collection-level plugin configuration"},
+            ),
+            (
+                f"{col}/plugins/{{plugin_id}}", "delete_collection_config", ["DELETE"],
+                {
+                    "summary": "Delete a collection-level plugin configuration",
+                    "status_code": status.HTTP_204_NO_CONTENT,
+                },
+            ),
+            # ---- items_schema derivation (propose; apply is the existing PUT) ----
+            (
+                f"{col}/items-schema/derive", "derive_items_schema_proposal", ["POST"],
+                {"summary": "Derive a proposed items_schema for a collection from a vector asset's gdalinfo"},
+            ),
+        ]
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
         # ---- Preset lifecycle (#847/#972) — platform/catalog/collection ----
         # Presets are a configuration concern: applying one walks a bundle of
         # validated configs through the standard ``set_config`` lifecycle. The
