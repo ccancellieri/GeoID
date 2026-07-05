@@ -1742,6 +1742,86 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             logger.warning("map_tile: cache lookup failed: %s", exc)
         return None
 
+    @staticmethod
+    async def _render_raster_tile(
+        background_tasks: BackgroundTasks,
+        renderer,
+        renderer_args: tuple,
+        renderer_kwargs: dict,
+        *,
+        catalog_id: str,
+        collection_id: str,
+        cache_key: str,
+        tms_id: str,
+        z: int,
+        x: int,
+        y: int,
+        fmt_lower: str,
+        render_source: str,
+        log_tag: str,
+        error_prefix: str,
+        check_invalid_expression: bool,
+        provider: Optional[TileStorageProtocol],
+        cfg,
+    ) -> Response:
+        """Run a rio-tiler renderer off-thread and build its HTTP response.
+
+        Shared by ``get_map_tile``'s default-style raster branch and all
+        three ``get_map_tile_styled`` branches (styled, terrain-rgb,
+        hillshade): each calls a different renderer with different args, but
+        the exception translation (``InvalidExpression`` -> 422,
+        ``TileOutsideBounds`` -> 204, anything else -> 500), the background
+        cache write-back, and the response construction are identical.
+        ``check_invalid_expression`` is False for terrain-rgb, whose renderer
+        never raises that exception type.
+        """
+        from dynastore.modules.concurrency import run_in_thread
+
+        try:
+            tile_bytes = await run_in_thread(renderer, *renderer_args, **renderer_kwargs)
+        except Exception as exc:
+            exc_type = type(exc).__name__
+            if check_invalid_expression and exc_type == "InvalidExpression":
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Invalid band expression: {exc}",
+                ) from exc
+            if exc_type == "TileOutsideBounds":
+                return Response(status_code=204)
+            logger.error(
+                "map_tile: %s failed for %s/%s z=%s x=%s y=%s: %s",
+                log_tag, catalog_id, collection_id, z, x, y, exc,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"{error_prefix} failed: {exc}",
+            ) from exc
+
+        if provider and cfg and cfg.cache_enabled and tile_bytes:
+            background_tasks.add_task(
+                provider.save_tile,
+                catalog_id,
+                cache_key,
+                tms_id,
+                z,
+                x,
+                y,
+                tile_bytes,
+                fmt_lower,
+            )
+
+        media_type = _FORMAT_MEDIA_TYPE[fmt_lower]
+        return Response(
+            content=tile_bytes,
+            media_type=media_type,
+            headers={
+                "X-Render-Cache": "miss",
+                "X-Render-Source": render_source,
+                "Cache-Control": f"public, max-age={cfg.ttl_seconds if cfg else 3600}",
+            },
+        )
+
     async def _resolve_catalog_and_collection(
         self,
         catalog_id: str,
@@ -1806,7 +1886,6 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         6. Validate TMS/matrix (upgrades renders' WebMercatorQuad-only frozenset).
         7. Render via run_in_thread(render_cog_tile); write to cache in background.
         """
-        from dynastore.modules.concurrency import run_in_thread
         from dynastore.modules.catalog.catalog_config import CollectionKind
 
         fmt_lower = format.lower()
@@ -1932,61 +2011,31 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             internal_catalog_id, internal_collection_id, style_id, tms_id, z, x, y, fmt_lower,
         )
         assert _RENDER_COG_TILE is not None  # guaranteed by _require_raster_engine()
-        try:
-            tile_bytes = await run_in_thread(
-                _RENDER_COG_TILE,
-                cog_href,
-                z,
-                x,
-                y,
+        return await self._render_raster_tile(
+            background_tasks,
+            _RENDER_COG_TILE,
+            (cog_href, z, x, y),
+            dict(
                 colormap=colormap,
                 output_format=output_format,
                 bands=bands_parsed,
                 expression=expression_parsed,
                 rescale=rescale_parsed,
-            )
-        except Exception as exc:
-            # Import errors or missing rio_tiler — check specific types
-            exc_type = type(exc).__name__
-            if exc_type == "InvalidExpression":
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Invalid band expression: {exc}",
-                ) from exc
-            if exc_type == "TileOutsideBounds":
-                return Response(status_code=204)
-            logger.error(
-                "map_tile: rio-tiler failed for %s/%s z=%s x=%s y=%s: %s",
-                internal_catalog_id, internal_collection_id, z, x, y, exc,
-                exc_info=True,
-            )
-            raise HTTPException(
-                status_code=500,
-                detail=f"Raster render failed: {exc}",
-            ) from exc
-
-        if provider and cfg and cfg.cache_enabled and tile_bytes:
-            background_tasks.add_task(
-                provider.save_tile,
-                internal_catalog_id,
-                cache_key,
-                tms_id,
-                z,
-                x,
-                y,
-                tile_bytes,
-                fmt_lower,
-            )
-
-        media_type = _FORMAT_MEDIA_TYPE[fmt_lower]
-        return Response(
-            content=tile_bytes,
-            media_type=media_type,
-            headers={
-                "X-Render-Cache": "miss",
-                "X-Render-Source": "rio-tiler",
-                "Cache-Control": f"public, max-age={cfg.ttl_seconds if cfg else 3600}",
-            },
+            ),
+            catalog_id=internal_catalog_id,
+            collection_id=internal_collection_id,
+            cache_key=cache_key,
+            tms_id=tms_id,
+            z=z,
+            x=x,
+            y=y,
+            fmt_lower=fmt_lower,
+            render_source="rio-tiler",
+            log_tag="rio-tiler",
+            error_prefix="Raster render",
+            check_invalid_expression=True,
+            provider=provider,
+            cfg=cfg,
         )
 
     async def _get_vector_map_tile(
@@ -2186,8 +2235,6 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         5. Branch on terrain-rgb / hillshade / styled.
         6. Render via run_in_thread; write to cache in background.
         """
-        from dynastore.modules.concurrency import run_in_thread
-
         # Security: reject style_id values that could contaminate the cache key.
         self._validate_style_id(style_id)
         self._require_raster_engine()
@@ -2286,48 +2333,25 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 internal_catalog_id, internal_collection_id, tms_id, z, x, y,
             )
             assert _RENDER_COG_TERRAIN_RGB is not None  # guaranteed by _require_raster_engine()
-            try:
-                tile_bytes = await run_in_thread(
-                    _RENDER_COG_TERRAIN_RGB,
-                    cog_href,
-                    z,
-                    x,
-                    y,
-                    band=band,
-                )
-            except Exception as exc:
-                exc_type = type(exc).__name__
-                if exc_type == "TileOutsideBounds":
-                    return Response(status_code=204)
-                logger.error(
-                    "map_tile: terrain-rgb failed for %s/%s z=%s x=%s y=%s: %s",
-                    internal_catalog_id, internal_collection_id, z, x, y, exc,
-                    exc_info=True,
-                )
-                raise HTTPException(
-                    status_code=500, detail=f"Terrain-RGB render failed: {exc}"
-                ) from exc
-
-            if provider and cfg and cfg.cache_enabled and tile_bytes:
-                background_tasks.add_task(
-                    provider.save_tile,
-                    internal_catalog_id,
-                    cache_key,
-                    tms_id,
-                    z,
-                    x,
-                    y,
-                    tile_bytes,
-                    "png",
-                )
-            return Response(
-                content=tile_bytes,
-                media_type="image/png",
-                headers={
-                    "X-Render-Cache": "miss",
-                    "X-Render-Source": "rio-tiler-terrain-rgb",
-                    "Cache-Control": f"public, max-age={cfg.ttl_seconds if cfg else 3600}",
-                },
+            return await self._render_raster_tile(
+                background_tasks,
+                _RENDER_COG_TERRAIN_RGB,
+                (cog_href, z, x, y),
+                dict(band=band),
+                catalog_id=internal_catalog_id,
+                collection_id=internal_collection_id,
+                cache_key=cache_key,
+                tms_id=tms_id,
+                z=z,
+                x=x,
+                y=y,
+                fmt_lower=fmt_lower,
+                render_source="rio-tiler-terrain-rgb",
+                log_tag="terrain-rgb",
+                error_prefix="Terrain-RGB render",
+                check_invalid_expression=False,
+                provider=provider,
+                cfg=cfg,
             )
 
         # ------------------------------------------------------------------
@@ -2377,56 +2401,25 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 azimuth, altitude, tms_id, z, x, y,
             )
             assert _RENDER_COG_HILLSHADE is not None  # guaranteed by _require_raster_engine()
-            try:
-                tile_bytes = await run_in_thread(
-                    _RENDER_COG_HILLSHADE,
-                    cog_href,
-                    z,
-                    x,
-                    y,
-                    band=band,
-                    azimuth=azimuth,
-                    altitude=altitude,
-                    colormap=colormap,
-                )
-            except Exception as exc:
-                exc_type = type(exc).__name__
-                if exc_type == "InvalidExpression":
-                    raise HTTPException(
-                        status_code=422,
-                        detail=f"Invalid band expression: {exc}",
-                    ) from exc
-                if exc_type == "TileOutsideBounds":
-                    return Response(status_code=204)
-                logger.error(
-                    "map_tile: hillshade failed for %s/%s z=%s x=%s y=%s: %s",
-                    internal_catalog_id, internal_collection_id, z, x, y, exc,
-                    exc_info=True,
-                )
-                raise HTTPException(
-                    status_code=500, detail=f"Hillshade render failed: {exc}"
-                ) from exc
-
-            if provider and cfg and cfg.cache_enabled and tile_bytes:
-                background_tasks.add_task(
-                    provider.save_tile,
-                    internal_catalog_id,
-                    cache_key,
-                    tms_id,
-                    z,
-                    x,
-                    y,
-                    tile_bytes,
-                    "png",
-                )
-            return Response(
-                content=tile_bytes,
-                media_type="image/png",
-                headers={
-                    "X-Render-Cache": "miss",
-                    "X-Render-Source": "rio-tiler-hillshade",
-                    "Cache-Control": f"public, max-age={cfg.ttl_seconds if cfg else 3600}",
-                },
+            return await self._render_raster_tile(
+                background_tasks,
+                _RENDER_COG_HILLSHADE,
+                (cog_href, z, x, y),
+                dict(band=band, azimuth=azimuth, altitude=altitude, colormap=colormap),
+                catalog_id=internal_catalog_id,
+                collection_id=internal_collection_id,
+                cache_key=cache_key,
+                tms_id=tms_id,
+                z=z,
+                x=x,
+                y=y,
+                fmt_lower=fmt_lower,
+                render_source="rio-tiler-hillshade",
+                log_tag="hillshade",
+                error_prefix="Hillshade render",
+                check_invalid_expression=True,
+                provider=provider,
+                cfg=cfg,
             )
 
         # ------------------------------------------------------------------
@@ -2437,60 +2430,31 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             internal_catalog_id, internal_collection_id, style_id, tms_id, z, x, y, fmt_lower,
         )
         assert _RENDER_COG_TILE is not None  # guaranteed by _require_raster_engine()
-        try:
-            tile_bytes = await run_in_thread(
-                _RENDER_COG_TILE,
-                cog_href,
-                z,
-                x,
-                y,
+        return await self._render_raster_tile(
+            background_tasks,
+            _RENDER_COG_TILE,
+            (cog_href, z, x, y),
+            dict(
                 colormap=colormap,
                 output_format=output_format,
                 bands=bands_parsed,
                 expression=expression_parsed,
                 rescale=rescale_parsed,
-            )
-        except Exception as exc:
-            exc_type = type(exc).__name__
-            if exc_type == "InvalidExpression":
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Invalid band expression: {exc}",
-                ) from exc
-            if exc_type == "TileOutsideBounds":
-                return Response(status_code=204)
-            logger.error(
-                "map_tile: rio-tiler failed for %s/%s z=%s x=%s y=%s: %s",
-                internal_catalog_id, internal_collection_id, z, x, y, exc,
-                exc_info=True,
-            )
-            raise HTTPException(
-                status_code=500,
-                detail=f"Raster render failed: {exc}",
-            ) from exc
-
-        if provider and cfg and cfg.cache_enabled and tile_bytes:
-            background_tasks.add_task(
-                provider.save_tile,
-                internal_catalog_id,
-                cache_key,
-                tms_id,
-                z,
-                x,
-                y,
-                tile_bytes,
-                fmt_lower,
-            )
-
-        media_type = _FORMAT_MEDIA_TYPE[fmt_lower]
-        return Response(
-            content=tile_bytes,
-            media_type=media_type,
-            headers={
-                "X-Render-Cache": "miss",
-                "X-Render-Source": "rio-tiler",
-                "Cache-Control": f"public, max-age={cfg.ttl_seconds if cfg else 3600}",
-            },
+            ),
+            catalog_id=internal_catalog_id,
+            collection_id=internal_collection_id,
+            cache_key=cache_key,
+            tms_id=tms_id,
+            z=z,
+            x=x,
+            y=y,
+            fmt_lower=fmt_lower,
+            render_source="rio-tiler",
+            log_tag="rio-tiler",
+            error_prefix="Raster render",
+            check_invalid_expression=True,
+            provider=provider,
+            cfg=cfg,
         )
 
     async def _invalidate_tile_cache_impl(self, catalog_id: str, collection_id: Optional[str]) -> dict:
