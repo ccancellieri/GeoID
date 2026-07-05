@@ -460,3 +460,115 @@ async def test_fetch_region_ids_by_unique_id_columnar_rejects_undeclared_unique_
 
     values = await claims.fetch_region_ids_by_unique_id("fao", "countries", "adm0_code", "FID")
     assert values == []
+
+
+# ---------------------------------------------------------------------------
+# Bounded pool acquire (dynastore#2902) -- a saturated pool on either query's
+# connection acquire must raise PoolSaturationError fast rather than holding
+# a checked-out connection for the full 300s request ceiling, mirroring the
+# tiles-metadata hardening in dynastore#3023.
+# ---------------------------------------------------------------------------
+
+
+def _columnar_col_config(declared: List[str]):
+    from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
+    from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
+        AttributeSchemaEntry,
+        AttributeStorageMode,
+        FeatureAttributeSidecarConfig,
+    )
+
+    attrs = FeatureAttributeSidecarConfig(
+        storage_mode=AttributeStorageMode.COLUMNAR,
+        attribute_schema=[AttributeSchemaEntry(name=name) for name in declared],
+    )
+    return ItemsPostgresqlDriverConfig(physical_table="t_abc123", sidecars=[attrs])
+
+
+@pytest.mark.asyncio
+async def test_fetch_distinct_region_ids_acquire_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A saturated pool on this query's connection acquire raises
+    ``PoolSaturationError``, bounded by the live fail-fast timeout instead of
+    holding the connection for the full request timeout."""
+    import asyncio
+    from unittest.mock import AsyncMock as _AsyncMock
+    from unittest.mock import patch
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from dynastore.extensions.region_mapping import claims
+    from dynastore.modules.db_config.exceptions import PoolSaturationError
+
+    catalogs = _StubCatalogs()
+    configs = _StubConfigs(_columnar_col_config(["adm0_code"]))
+    monkeypatch.setattr(
+        claims, "get_protocol", _protocol_router(catalogs=catalogs, configs=configs),
+    )
+
+    engine = create_async_engine("postgresql+asyncpg://u:p@localhost/db")
+    monkeypatch.setattr(claims, "get_engine", lambda: engine)
+
+    async def _fast_fail_fast_timeout() -> float:
+        return 0.01
+
+    async def _never_connects(*_args: Any, **_kwargs: Any) -> None:
+        await asyncio.sleep(10)
+
+    monkeypatch.setattr(claims, "_read_live_fg_acquire_timeout", _fast_fail_fast_timeout)
+
+    try:
+        with patch(
+            "dynastore.modules.db_config.query_executor._acquire_async_engine_connection",
+            new=_AsyncMock(side_effect=_never_connects),
+        ):
+            with pytest.raises(PoolSaturationError):
+                await claims.fetch_distinct_region_ids("fao", "countries", "adm0_code")
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_fetch_region_ids_by_unique_id_acquire_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same bounded-acquire hardening for ``fetch_region_ids_by_unique_id``,
+    the other direct-acquire query on this read path."""
+    import asyncio
+    from unittest.mock import AsyncMock as _AsyncMock
+    from unittest.mock import patch
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from dynastore.extensions.region_mapping import claims
+    from dynastore.modules.db_config.exceptions import PoolSaturationError
+
+    catalogs = _StubCatalogs()
+    configs = _StubConfigs(_columnar_col_config(["adm0_code", "FID"]))
+    monkeypatch.setattr(
+        claims, "get_protocol", _protocol_router(catalogs=catalogs, configs=configs),
+    )
+
+    engine = create_async_engine("postgresql+asyncpg://u:p@localhost/db")
+    monkeypatch.setattr(claims, "get_engine", lambda: engine)
+
+    async def _fast_fail_fast_timeout() -> float:
+        return 0.01
+
+    async def _never_connects(*_args: Any, **_kwargs: Any) -> None:
+        await asyncio.sleep(10)
+
+    monkeypatch.setattr(claims, "_read_live_fg_acquire_timeout", _fast_fail_fast_timeout)
+
+    try:
+        with patch(
+            "dynastore.modules.db_config.query_executor._acquire_async_engine_connection",
+            new=_AsyncMock(side_effect=_never_connects),
+        ):
+            with pytest.raises(PoolSaturationError):
+                await claims.fetch_region_ids_by_unique_id(
+                    "fao", "countries", "adm0_code", "FID",
+                )
+    finally:
+        await engine.dispose()

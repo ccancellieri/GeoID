@@ -45,6 +45,7 @@ from dynastore.models.protocols.configs import ConfigsProtocol
 from dynastore.modules.db_config.query_executor import (
     DQLQuery,
     ResultHandler,
+    _read_live_fg_acquire_timeout,
     managed_transaction,
 )
 from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
@@ -241,7 +242,12 @@ async def fetch_distinct_region_ids(
     engine = get_engine()
     if engine is None:
         return []
-    async with managed_transaction(engine) as conn:
+    # Bounded so a rebuild triggered under pool pressure times out into
+    # PoolSaturationError -> 503 + Retry-After instead of holding the
+    # connection for the full request timeout (dynastore#2902).
+    async with managed_transaction(
+        engine, acquire_timeout=await _read_live_fg_acquire_timeout()
+    ) as conn:
         values = await DQLQuery(
             sql, result_handler=ResultHandler.ALL_SCALARS,
         ).execute(conn, **params)
@@ -358,7 +364,11 @@ async def fetch_region_ids_by_unique_id(
     engine = get_engine()
     if engine is None:
         return []
-    async with managed_transaction(engine) as conn:
+    # Bounded for the same reason as fetch_distinct_region_ids above
+    # (dynastore#2902).
+    async with managed_transaction(
+        engine, acquire_timeout=await _read_live_fg_acquire_timeout()
+    ) as conn:
         rows = await DQLQuery(
             sql, result_handler=ResultHandler.ALL_DICTS,
         ).execute(conn, **params)
