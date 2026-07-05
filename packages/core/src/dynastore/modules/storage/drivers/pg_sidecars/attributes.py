@@ -33,6 +33,7 @@ from sqlalchemy import text
 from dynastore.modules.db_config.query_executor import DbResource, DQLQuery, ResultHandler
 from dynastore.models.protocols import AssetsProtocol
 from dynastore.tools.discovery import get_protocol
+from dynastore.tools.db import qualify_table
 from dynastore.modules.db_config.tools import map_pg_to_json_type
 from dynastore.models.field_types import CANONICAL_TO_PG_DDL
 from dynastore.modules.storage.field_constraints import pg_native_to_canonical
@@ -1842,7 +1843,7 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         if asset_id and self.config.asset_id_field is not None:
             asset_col = self.config.asset_id_field
             query = text(f"""
-                SELECT 1 FROM "{physical_schema}"."{table}"
+                SELECT 1 FROM {qualify_table(physical_schema, table)}
                 WHERE {asset_col} = :asset_id
                 {f"AND geoid != :exclude_geoid" if exclude_geoid else ""}
                 LIMIT 1
@@ -1889,7 +1890,7 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
 
         # Check standard identity fields
         if field_name in ["external_id", "asset_id"]:
-            sql = f'SELECT 1 FROM "{physical_schema}"."{sc_table}" WHERE {field_name} = :val'
+            sql = f'SELECT 1 FROM {qualify_table(physical_schema, sc_table)} WHERE {field_name} = :val'
             params: Dict[str, Any] = {"val": str(value)}
             if exclude_geoid:
                 sql += " AND geoid <> :exclude"
@@ -1908,7 +1909,7 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         ):
             attr_names = {a.name for a in self.config.attribute_schema}
             if field_name in attr_names:
-                sql = f'SELECT 1 FROM "{physical_schema}"."{sc_table}" WHERE "{field_name}" = :val'
+                sql = f'SELECT 1 FROM {qualify_table(physical_schema, sc_table)} WHERE "{field_name}" = :val'
                 params = {"val": value}
                 if exclude_geoid:
                     sql += " AND geoid <> :exclude"
@@ -1984,9 +1985,9 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
 
         sql = f"""
             SELECT {", ".join(select_fields)}
-            FROM "{physical_schema}"."{physical_table}" h,
-                 "{physical_schema}"."{sc_table}" s,
-                 "{physical_schema}"."{geom_sc_table}" g
+            FROM {qualify_table(physical_schema, physical_table)} h,
+                 {qualify_table(physical_schema, sc_table)} s,
+                 {qualify_table(physical_schema, geom_sc_table)} g
             WHERE {" AND ".join(where_conditions)}
             ORDER BY h.transaction_time DESC
             LIMIT 1;
@@ -2025,8 +2026,8 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         geom_sidecar_table = f"{physical_table}_geometries"
         sql = f"""
             SELECT h.geoid, s.geometry_hash
-            FROM "{physical_schema}"."{physical_table}" h
-            JOIN "{physical_schema}"."{geom_sidecar_table}" s
+            FROM {qualify_table(physical_schema, physical_table)} h
+            JOIN {qualify_table(physical_schema, geom_sidecar_table)} s
               ON s.geoid = h.geoid
             WHERE s.geometry_hash = :ch
               AND h.deleted_at IS NULL
@@ -2081,9 +2082,9 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         geom_sc_table = f"{physical_table}_geometries"
         sql = f"""
             SELECT h.geoid, g.geometry_hash, s.attributes_hash
-            FROM "{physical_schema}"."{physical_table}" h,
-                 "{physical_schema}"."{sc_table}" s,
-                 "{physical_schema}"."{geom_sc_table}" g
+            FROM {qualify_table(physical_schema, physical_table)} h,
+                 {qualify_table(physical_schema, sc_table)} s,
+                 {qualify_table(physical_schema, geom_sc_table)} g
             WHERE h.geoid = s.geoid
               AND g.geoid = h.geoid
               AND h.deleted_at IS NULL
@@ -2141,7 +2142,7 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
 
         sc_table = f"{physical_table}_{self.sidecar_id}"
         # Standard Postgres temporal range update: set upper bound to expire_at
-        sql = f'UPDATE "{physical_schema}"."{sc_table}" SET validity = tstzrange(lower(validity), :expire_at, \'[)\') WHERE geoid = :geoid'
+        sql = f'UPDATE {qualify_table(physical_schema, sc_table)} SET validity = tstzrange(lower(validity), :expire_at, \'[)\') WHERE geoid = :geoid'
 
         from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
 

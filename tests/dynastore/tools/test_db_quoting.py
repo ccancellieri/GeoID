@@ -60,6 +60,23 @@ def test_quote_ident_rejects_non_string():
         quote_ident(123)  # type: ignore[arg-type]
 
 
+def test_quote_ident_is_idempotent_on_already_quoted_input():
+    assert quote_ident('"my_schema"') == '"my_schema"'
+
+
+def test_quote_ident_wraps_star_by_default():
+    # Without allow_star, "*" is just another identifier and gets quoted.
+    assert quote_ident("*") == '"*"'
+
+
+def test_quote_ident_passes_through_star_when_allowed():
+    assert quote_ident("*", allow_star=True) == "*"
+
+
+def test_quote_ident_escapes_non_star_even_when_allow_star_set():
+    assert quote_ident('a"b', allow_star=True) == '"a""b"'
+
+
 # ---------------------------------------------------------------------------
 # qualify_table
 # ---------------------------------------------------------------------------

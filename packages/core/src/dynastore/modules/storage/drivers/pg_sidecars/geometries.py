@@ -56,6 +56,7 @@ from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
     SimplificationAlgorithm,
 )
 from dynastore.modules.db_config.query_executor import DbResource, DQLQuery, ResultHandler
+from dynastore.tools.db import quote_ident as _canonical_quote_ident
 from dynastore.tools.geospatial_exceptions import SridMismatchError
 
 logger = logging.getLogger(__name__)
@@ -95,11 +96,11 @@ def _quote_ident(name: str) -> str:
     Unquoted identifiers are folded to lowercase by Postgres, which breaks
     consumers that reference the column by its original mixed/upper-case name.
     Idempotent: an already-quoted name is returned unchanged. See #719.
+
+    Thin wrapper around the canonical ``dynastore.tools.db.quote_ident``
+    (#2700) — kept as a local alias so call sites in this module don't churn.
     """
-    n = name.strip()
-    if n.startswith('"') and n.endswith('"'):
-        return n
-    return '"' + n.replace('"', '""') + '"'
+    return _canonical_quote_ident(name.strip())
 
 
 def _derive_bbox_from_shapely(geom: Any) -> Optional[Tuple[float, float, float, float]]:

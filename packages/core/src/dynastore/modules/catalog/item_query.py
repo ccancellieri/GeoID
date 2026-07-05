@@ -53,7 +53,11 @@ from dynastore.modules.storage.drivers.pg_sidecars.base import (
     ConsumerType,
 )
 from dynastore.tools.discovery import get_protocol
-from dynastore.tools.db import validate_sql_identifier, validate_column_identifier
+from dynastore.tools.db import (
+    validate_sql_identifier,
+    validate_column_identifier,
+    qualify_table,
+)
 from dynastore.models.query_builder import QueryRequest, QueryResponse
 from dynastore.modules.catalog.query_optimizer import QueryOptimizer
 
@@ -436,7 +440,7 @@ class ItemQueryMixin:
                     'SELECT reltuples::bigint FROM pg_class '
                     'WHERE oid = CAST(:table_oid AS regclass)',
                     result_handler=ResultHandler.SCALAR,
-                ).execute(conn, table_oid=f'"{phys_schema}"."{phys_table}"')
+                ).execute(conn, table_oid=qualify_table(phys_schema, phys_table))
                 if reltuples is None:
                     reltuples = 0
             except Exception as exc:  # noqa: BLE001 - fall back to exact count
@@ -985,8 +989,8 @@ class ItemQueryMixin:
                 sc_table = f"{phys_table}_{sc_id}"
                 ext_id = await DQLQuery(
                     f'SELECT s.{fid_col} '
-                    f'FROM "{phys_schema}"."{phys_table}" h '
-                    f'JOIN "{phys_schema}"."{sc_table}" s '
+                    f'FROM {qualify_table(phys_schema, phys_table)} h '
+                    f'JOIN {qualify_table(phys_schema, sc_table)} s '
                     f"ON s.geoid = h.geoid "
                     f"WHERE h.geoid = :geoid "
                     f"AND h.deleted_at IS NULL "
@@ -1045,7 +1049,7 @@ class ItemQueryMixin:
             validity_clause = f" AND s.{vcol} @> NOW()"
         geoids = await DQLQuery(
             f'SELECT DISTINCT s.geoid '
-            f'FROM "{phys_schema}"."{sc_table}" s '
+            f'FROM {qualify_table(phys_schema, sc_table)} s '
             f"WHERE s.{field} = ANY(:_ext_ids){validity_clause}",
             result_handler=ResultHandler.ALL_SCALARS,
         ).execute(conn, _ext_ids=[str(i) for i in ext_ids])
@@ -1350,9 +1354,9 @@ class ItemQueryMixin:
                         # DQLQuery handles both async/sync conns uniformly.
                         deleted_geoids = [
                             str(g) for g in await DQLQuery(
-                                f'UPDATE "{phys_schema}"."{phys_table}" h '
+                                f'UPDATE {qualify_table(phys_schema, phys_table)} h '
                                 f"SET deleted_at = NOW() "
-                                f'FROM "{phys_schema}"."{sc_table}" s '
+                                f'FROM {qualify_table(phys_schema, sc_table)} s '
                                 f"WHERE s.{fid_col} = :ext_id "
                                 f"AND h.deleted_at IS NULL "
                                 f"AND h.geoid = s.geoid "

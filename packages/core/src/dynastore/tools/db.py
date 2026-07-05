@@ -133,10 +133,15 @@ def validate_column_identifier(identifier: str) -> str:
     return identifier
 
 
-def quote_ident(identifier: str) -> str:
+def quote_ident(identifier: str, allow_star: bool = False) -> str:
     """
     Double-quote a single PostgreSQL identifier for safe interpolation into
     SQL text, escaping embedded ``"`` per the SQL standard (``"`` -> ``""``).
+
+    Idempotent: an already-quoted identifier is returned unchanged. When
+    ``allow_star`` is set, the bare wildcard ``*`` (e.g. a ``SELECT *``
+    projection) is returned unquoted rather than wrapped — ``"*"`` is not a
+    valid SQL wildcard. See #719.
 
     This only handles quoting/escaping — it does not validate character
     content. Callers that build identifiers from user input should run them
@@ -146,6 +151,10 @@ def quote_ident(identifier: str) -> str:
     """
     if not isinstance(identifier, str):
         raise TypeError("Identifier must be a string.")
+    if allow_star and identifier == "*":
+        return identifier
+    if identifier.startswith('"') and identifier.endswith('"'):
+        return identifier
     return '"' + identifier.replace('"', '""') + '"'
 
 

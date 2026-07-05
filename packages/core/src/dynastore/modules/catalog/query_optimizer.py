@@ -37,6 +37,7 @@ from dynastore.models.query_builder import (
 )
 from dynastore.models.ogc import Feature
 from dynastore.tools.discovery import get_protocol
+from dynastore.tools.db import quote_ident as _canonical_quote_ident
 from dynastore.models.protocols.items import ItemsProtocol
 
 logger = logging.getLogger(__name__)
@@ -66,13 +67,11 @@ def _quote_alias(alias: str) -> str:
     e.g. the MVT outer wrapper that selects ``"CODE"`` from the inner subquery.
     Idempotent: an already-quoted alias is returned unchanged. ``*`` is never
     quoted. See #719.
+
+    Thin wrapper around the canonical ``dynastore.tools.db.quote_ident``
+    (#2700) — kept as a local alias so call sites in this module don't churn.
     """
-    a = alias.strip()
-    if a == "*":
-        return a
-    if a.startswith('"') and a.endswith('"'):
-        return a
-    return '"' + a.replace('"', '""') + '"'
+    return _canonical_quote_ident(alias.strip(), allow_star=True)
 
 
 class QueryOptimizer:

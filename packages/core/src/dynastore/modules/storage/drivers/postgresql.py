@@ -1038,6 +1038,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         from dynastore.modules.db_config.query_executor import (
             DQLQuery, ResultHandler, managed_transaction,
         )
+        from dynastore.tools.db import qualify_table
 
         schema = await self._resolve_schema(catalog_id, db_resource=db_resource)
         table = await self.resolve_physical_table(
@@ -1046,7 +1047,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         if not table:
             return 0
 
-        query_sql = f'SELECT COUNT(*) FROM "{schema}"."{table}" WHERE deleted_at IS NULL;'
+        query_sql = f'SELECT COUNT(*) FROM {qualify_table(schema, table)} WHERE deleted_at IS NULL;'
 
         async def _query(conn):
             return await DQLQuery(
@@ -1079,6 +1080,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         # information_schema spellings (``character varying``, ``USER-DEFINED``,
         # ``ARRAY`` …). No separate per-driver map (see #1216).
         from dynastore.modules.storage.field_constraints import pg_native_to_canonical
+        from dynastore.tools.db import qualify_table
 
         schema = await self._resolve_schema(catalog_id, db_resource=db_resource)
         table = await self.resolve_physical_table(
@@ -1144,7 +1146,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
                     try:
                         sample_sql = f"""
                             SELECT DISTINCT jsonb_object_keys(attributes) AS key
-                            FROM "{schema}"."{attr_table}"
+                            FROM {qualify_table(schema, attr_table)}
                             WHERE attributes IS NOT NULL
                             LIMIT 1000;
                         """
@@ -1322,6 +1324,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         from dynastore.modules.db_config.query_executor import (
             DQLQuery, ResultHandler, managed_transaction,
         )
+        from dynastore.tools.db import qualify_table
 
         schema = await self._resolve_schema(catalog_id, db_resource=db_resource)
         table = await self.resolve_physical_table(
@@ -1363,7 +1366,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
                     geom_alias = "g"
                     storage_srid = geom_sc.target_srid
                     joins.append(
-                        f'JOIN "{schema}"."{geom_source}" {geom_alias} ON h.geoid = {geom_alias}.geoid'
+                        f'JOIN {qualify_table(schema, geom_source)} {geom_alias} ON h.geoid = {geom_alias}.geoid'
                     )
 
                 attr_sc = next(
@@ -1382,7 +1385,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
                     temporal_alias = "a"
                     if temporal_source != (f"{table}_{geom_sc.sidecar_id}" if geom_sc else ""):
                         joins.append(
-                            f'JOIN "{schema}"."{temporal_source}" {temporal_alias} ON h.geoid = {temporal_alias}.geoid'
+                            f'JOIN {qualify_table(schema, temporal_source)} {temporal_alias} ON h.geoid = {temporal_alias}.geoid'
                         )
                     else:
                         temporal_alias = geom_alias
@@ -1410,7 +1413,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
                         {spatial_expr} AS combined_geom,
                         {min_validity_expr} AS min_validity,
                         {max_validity_expr} AS max_validity
-                    FROM "{schema}"."{table}" h
+                    FROM {qualify_table(schema, table)} h
                     {join_clause}
                     WHERE h.deleted_at IS NULL AND {geom_alias}.{geom_col} IS NOT NULL
                 )
@@ -1467,6 +1470,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         from dynastore.modules.db_config.query_executor import (
             DQLQuery, ResultHandler, managed_transaction,
         )
+        from dynastore.tools.db import qualify_table
 
         schema = await self._resolve_schema(catalog_id, db_resource=db_resource)
         table = await self.resolve_physical_table(
@@ -1486,19 +1490,19 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
             # Resolve attribute sidecar table
             attr_table = f"{table}_attributes"
             attr_alias = "s"
-            attr_join = f'JOIN "{schema}"."{attr_table}" {attr_alias} ON h.geoid = {attr_alias}.geoid'
+            attr_join = f'JOIN {qualify_table(schema, attr_table)} {attr_alias} ON h.geoid = {attr_alias}.geoid'
 
             # Resolve geometry sidecar table
             geom_table = f"{table}_geometries"
             geom_alias = "g"
-            geom_join = f'JOIN "{schema}"."{geom_table}" {geom_alias} ON h.geoid = {geom_alias}.geoid'
+            geom_join = f'JOIN {qualify_table(schema, geom_table)} {geom_alias} ON h.geoid = {geom_alias}.geoid'
 
             base_where = "h.deleted_at IS NULL"
 
             if aggregation_type == "terms" and field:
                 sql = f"""
                     SELECT {attr_alias}.attributes->>'{field}' AS val, COUNT(*) AS cnt
-                    FROM "{schema}"."{table}" h
+                    FROM {qualify_table(schema, table)} h
                     {attr_join}
                     WHERE {base_where} AND {attr_alias}.attributes ? '{field}'
                     GROUP BY val
@@ -1516,7 +1520,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
                         AVG(CAST({attr_alias}.attributes->>'{field}' AS NUMERIC)) AS avg_val,
                         SUM(CAST({attr_alias}.attributes->>'{field}' AS NUMERIC)) AS sum_val,
                         COUNT(*) AS cnt
-                    FROM "{schema}"."{table}" h
+                    FROM {qualify_table(schema, table)} h
                     {attr_join}
                     WHERE {base_where}
                       AND {attr_alias}.attributes ? '{field}'
@@ -1530,7 +1534,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
                     SELECT
                         MIN(lower({attr_alias}.validity)) AS min_dt,
                         MAX(upper({attr_alias}.validity)) AS max_dt
-                    FROM "{schema}"."{table}" h
+                    FROM {qualify_table(schema, table)} h
                     {attr_join}
                     WHERE {base_where};
                 """
@@ -1562,7 +1566,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
                         ST_XMin(ext), ST_YMin(ext), ST_XMax(ext), ST_YMax(ext)
                     FROM (
                         SELECT {expr} AS ext
-                        FROM "{schema}"."{table}" h
+                        FROM {qualify_table(schema, table)} h
                         {join_sql}
                         WHERE {base_where} AND {geom_source}.geom IS NOT NULL
                     ) sub;
@@ -1573,7 +1577,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
                 return None
 
             elif aggregation_type == "count":
-                sql = f'SELECT COUNT(*) FROM "{schema}"."{table}" WHERE {base_where};'
+                sql = f'SELECT COUNT(*) FROM {qualify_table(schema, table)} WHERE {base_where};'
                 return await DQLQuery(sql, result_handler=ResultHandler.SCALAR_ONE).execute(conn)
 
             else:

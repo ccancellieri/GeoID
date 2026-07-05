@@ -25,6 +25,7 @@ from pydantic import BaseModel
 from .query_executor import (
     DDLQuery, DbConnection, DbResource, managed_transaction
 )
+from dynastore.tools.db import qualify_table
 
 logger = logging.getLogger(__name__)
 class PartitionDefinition(BaseModel):
@@ -159,7 +160,7 @@ def _get_partition_ddl(
     parent_name = parent_table_name or table_name
     
     # Always build the fully qualified name explicitly.
-    partition_of_clause = f'PARTITION OF "{parent_schema}"."{parent_name}"'
+    partition_of_clause = f'PARTITION OF {qualify_table(parent_schema, parent_name)}'
     
     sub_partition_clause = ""
     if sub_partition_def:
@@ -174,7 +175,7 @@ def _get_partition_ddl(
         value_for_clause = str(partition_value)
         partition_value_hash = hashlib.sha256(value_for_clause.encode('utf-8')).hexdigest()[:16]
         partition_name = f"{table_name}_p_{partition_value_hash}"
-        create_sql = f'CREATE TABLE IF NOT EXISTS "{schema}"."{partition_name}" {partition_of_clause} FOR VALUES IN (\'{value_for_clause}\'){sub_partition_clause};'
+        create_sql = f'CREATE TABLE IF NOT EXISTS {qualify_table(schema, partition_name)} {partition_of_clause} FOR VALUES IN (\'{value_for_clause}\'){sub_partition_clause};'
         return partition_name, create_sql
 
     elif strategy.upper() == 'RANGE':
@@ -194,7 +195,7 @@ def _get_partition_ddl(
         else:
             raise ValueError(f"Unsupported RANGE interval: {interval}")
 
-        create_sql = f'CREATE TABLE IF NOT EXISTS "{schema}"."{partition_name}" {partition_of_clause} FOR VALUES FROM (\'{start_date.isoformat()}\') TO (\'{end_date.isoformat()}\'){sub_partition_clause};'
+        create_sql = f'CREATE TABLE IF NOT EXISTS {qualify_table(schema, partition_name)} {partition_of_clause} FOR VALUES FROM (\'{start_date.isoformat()}\') TO (\'{end_date.isoformat()}\'){sub_partition_clause};'
         return partition_name, create_sql
 
     else:
@@ -227,7 +228,7 @@ async def ensure_list_hash_partitions(
     
     # The intermediate table has the same name as the parent, but in the partition_schema
     _, base_table_name = parent_table_fqn.split('.')
-    intermediate_partition_fqn = f'"{partition_schema}"."{base_table_name}"'
+    intermediate_partition_fqn = qualify_table(partition_schema, base_table_name)
 
     # Define existence check for the intermediate partition
     async def check_intermediate():
@@ -246,7 +247,7 @@ async def ensure_list_hash_partitions(
     for i in range(num_hash_partitions):
         hash_partition_name = f"{base_table_name}_p{i}"
         statements.append(f"""
-        CREATE TABLE IF NOT EXISTS "{partition_schema}"."{hash_partition_name}"
+        CREATE TABLE IF NOT EXISTS {qualify_table(partition_schema, hash_partition_name)}
         PARTITION OF {intermediate_partition_fqn}
         FOR VALUES WITH (MODULUS {num_hash_partitions}, REMAINDER {i})
         """)
