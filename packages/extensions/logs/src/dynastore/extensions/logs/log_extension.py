@@ -276,49 +276,60 @@ class LogExtension(ExtensionProtocol, LogsProtocol):
         self._setup_routes()
 
     def _setup_routes(self):
-        self.router.add_api_route(
-            "/system",
-            self.get_system_logs,
-            methods=["GET"],
-            response_model=LogsListResponse,
-            summary="Retrieve global system-level logs",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}",
-            self.get_catalog_logs,
-            methods=["GET"],
-            response_model=LogsListResponse,
-            summary="Retrieve logs for a specific catalog",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/logs",
-            self.get_catalog_logs,
-            methods=["GET"],
-            response_model=LogsListResponse,
-            summary="Retrieve logs for a specific catalog",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/logs",
-            self.get_collection_logs,
-            methods=["GET"],
-            response_model=LogsListResponse,
-            summary="Retrieve logs for a specific collection",
-        )
-        # Status endpoints feeding the embedded logs dashboard page.
-        self.router.add_api_route(
-            "/_dashboards_health",
-            self._get_dashboards_health,
-            methods=["GET"],
-            response_class=JSONResponse,
-            include_in_schema=False,
-        )
-        self.router.add_api_route(
-            "/_dashboards_config",
-            self._get_dashboards_config,
-            methods=["GET"],
-            response_class=JSONResponse,
-            include_in_schema=False,
-        )
+        # (path, handler_name, methods, kwargs)
+        route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
+            (
+                "/system",
+                "get_system_logs",
+                ["GET"],
+                {
+                    "response_model": LogsListResponse,
+                    "summary": "Retrieve global system-level logs",
+                },
+            ),
+            (
+                "/catalogs/{catalog_id}",
+                "get_catalog_logs",
+                ["GET"],
+                {
+                    "response_model": LogsListResponse,
+                    "summary": "Retrieve logs for a specific catalog",
+                },
+            ),
+            (
+                "/catalogs/{catalog_id}/logs",
+                "get_catalog_logs",
+                ["GET"],
+                {
+                    "response_model": LogsListResponse,
+                    "summary": "Retrieve logs for a specific catalog",
+                },
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/logs",
+                "get_collection_logs",
+                ["GET"],
+                {
+                    "response_model": LogsListResponse,
+                    "summary": "Retrieve logs for a specific collection",
+                },
+            ),
+            # Status endpoints feeding the embedded logs dashboard page.
+            (
+                "/_dashboards_health",
+                "_get_dashboards_health",
+                ["GET"],
+                {"response_class": JSONResponse, "include_in_schema": False},
+            ),
+            (
+                "/_dashboards_config",
+                "_get_dashboards_config",
+                ["GET"],
+                {"response_class": JSONResponse, "include_in_schema": False},
+            ),
+        ]
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     def configure_app(self, app: FastAPI) -> None:
         """Mount the cross-origin-dashboard reverse proxy on the app.

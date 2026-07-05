@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 import pyproj as _pyproj_scope_gate  # noqa: F401  # SCOPE gate: extension_crs requires module_crs (pyproj)
 _ = _pyproj_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status, Request, FastAPI
@@ -114,74 +114,94 @@ class CRSExtension(ExtensionProtocol):
 
     def _setup_routes(self):
         # Routes follow the platform convention: /crs/catalogs/{catalog_id}/...
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}",
-            self.create_crs_endpoint,
-            methods=["POST"],
-            response_model=CRS,
-            status_code=status.HTTP_201_CREATED,
-            summary="Register a New CRS (OGC aligned path)",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/{crs_uri:path}",
-            self.update_crs_endpoint,
-            methods=["PUT"],
-            response_model=CRS,
-            summary="Update a CRS Definition (OGC aligned path)",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}",
-            self.list_crs_endpoint,
-            methods=["GET"],
-            response_model=CustomCRSList,
-            summary="List All CRS Definitions (OGC aligned path)",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/search",
-            self.search_crs_endpoint,
-            methods=["GET"],
-            response_model=CustomCRSList,
-            summary="Search CRS Definitions (OGC aligned path)",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/by-name/{crs_name}",
-            self.get_crs_by_name_endpoint,
-            methods=["GET"],
-            response_model=CRS,
-            summary="Get CRS by Name (OGC aligned path)",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/{crs_uri:path}",
-            self.get_crs_by_uri_endpoint,
-            methods=["GET"],
-            summary="Get CRS by URI (OGC aligned path)",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/{crs_uri:path}",
-            self.delete_crs_endpoint,
-            methods=["DELETE"],
-            status_code=status.HTTP_204_NO_CONTENT,
-            summary="Delete a CRS (OGC aligned path)",
-        )
-        # Platform scope: paginated catalogue of resolvable global authority CRS.
-        self.router.add_api_route(
-            "/",
-            self.list_global_crs_endpoint,
-            methods=["GET"],
-            response_model=GlobalCRSList,
-            summary="List global authority CRS (EPSG/OGC) — platform scope, paginated",
-        )
-        # Platform scope: read-only resolution of global authority CRS (EPSG/OGC).
-        # Registered LAST — the greedy {crs_uri:path} converter must not shadow the
-        # catalog-scoped routes above (or the list route), which are matched first
-        # by registration order.
-        self.router.add_api_route(
-            "/{crs_uri:path}",
-            self.resolve_global_crs_endpoint,
-            methods=["GET"],
-            response_model=CRSDefinition,
-            summary="Resolve a global authority CRS (EPSG/OGC) — platform scope, read-only",
-        )
+        # (path, handler_name, methods, kwargs)
+        #
+        # Platform-scope routes ("/", "/{crs_uri:path}") are registered LAST — the
+        # greedy {crs_uri:path} converter must not shadow the catalog-scoped routes
+        # above it, which are matched first by registration order.
+        route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
+            (
+                "/catalogs/{catalog_id}",
+                "create_crs_endpoint",
+                ["POST"],
+                {
+                    "response_model": CRS,
+                    "status_code": status.HTTP_201_CREATED,
+                    "summary": "Register a New CRS (OGC aligned path)",
+                },
+            ),
+            (
+                "/catalogs/{catalog_id}/{crs_uri:path}",
+                "update_crs_endpoint",
+                ["PUT"],
+                {
+                    "response_model": CRS,
+                    "summary": "Update a CRS Definition (OGC aligned path)",
+                },
+            ),
+            (
+                "/catalogs/{catalog_id}",
+                "list_crs_endpoint",
+                ["GET"],
+                {
+                    "response_model": CustomCRSList,
+                    "summary": "List All CRS Definitions (OGC aligned path)",
+                },
+            ),
+            (
+                "/catalogs/{catalog_id}/search",
+                "search_crs_endpoint",
+                ["GET"],
+                {
+                    "response_model": CustomCRSList,
+                    "summary": "Search CRS Definitions (OGC aligned path)",
+                },
+            ),
+            (
+                "/catalogs/{catalog_id}/by-name/{crs_name}",
+                "get_crs_by_name_endpoint",
+                ["GET"],
+                {
+                    "response_model": CRS,
+                    "summary": "Get CRS by Name (OGC aligned path)",
+                },
+            ),
+            (
+                "/catalogs/{catalog_id}/{crs_uri:path}",
+                "get_crs_by_uri_endpoint",
+                ["GET"],
+                {"summary": "Get CRS by URI (OGC aligned path)"},
+            ),
+            (
+                "/catalogs/{catalog_id}/{crs_uri:path}",
+                "delete_crs_endpoint",
+                ["DELETE"],
+                {
+                    "status_code": status.HTTP_204_NO_CONTENT,
+                    "summary": "Delete a CRS (OGC aligned path)",
+                },
+            ),
+            (
+                "/",
+                "list_global_crs_endpoint",
+                ["GET"],
+                {
+                    "response_model": GlobalCRSList,
+                    "summary": "List global authority CRS (EPSG/OGC) — platform scope, paginated",
+                },
+            ),
+            (
+                "/{crs_uri:path}",
+                "resolve_global_crs_endpoint",
+                ["GET"],
+                {
+                    "response_model": CRSDefinition,
+                    "summary": "Resolve a global authority CRS (EPSG/OGC) — platform scope, read-only",
+                },
+            ),
+        ]
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     @property
     def catalogs(self) -> CatalogsProtocol:

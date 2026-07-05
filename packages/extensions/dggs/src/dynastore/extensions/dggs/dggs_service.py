@@ -167,41 +167,28 @@ class DGGSService(ExtensionProtocol, OGCServiceMixin):
     # ------------------------------------------------------------------
 
     def _register_routes(self) -> None:
-        self.router.add_api_route(
-            "/",
-            self.get_landing_page,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/conformance",
-            self.get_conformance,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/dggs-list",
-            self.get_dggrs_list,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/dggs-list/{dggsId}",
-            self.get_dggrs,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/collections",
-            self.get_collections,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/dggs",
-            self.get_dggs_data,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/dggs/{zoneId}",
-            self.get_dggs_zone,
-            methods=["GET"],
-        )
+        # (path, handler_name, methods, kwargs)
+        route_table: list[tuple[str, str, list[str], dict]] = [
+            ("/", "get_landing_page", ["GET"], {}),
+            ("/conformance", "get_conformance", ["GET"], {}),
+            ("/dggs-list", "get_dggrs_list", ["GET"], {}),
+            ("/dggs-list/{dggsId}", "get_dggrs", ["GET"], {}),
+            ("/collections", "get_collections", ["GET"], {}),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/dggs",
+                "get_dggs_data",
+                ["GET"],
+                {},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/dggs/{zoneId}",
+                "get_dggs_zone",
+                ["GET"],
+                {},
+            ),
+        ]
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     # ------------------------------------------------------------------
     # Landing page & conformance
