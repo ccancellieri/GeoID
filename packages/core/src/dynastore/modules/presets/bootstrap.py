@@ -57,9 +57,21 @@ import json
 import logging
 from typing import Any, Dict, Optional
 
+from dynastore.modules.db_config.exceptions import ConfigResolutionError
 from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
 
 logger = logging.getLogger(__name__)
+
+# Process-lifetime cache of preset names confirmed structurally impossible to
+# apply in this SCOPE — e.g. a preset that writes an item whose sidecar
+# requires an extension not installed on a slim image. ``bootstrap_presets``
+# runs on essentially every service boot/rebuild tick, so without this cache
+# a slim SCOPE re-raises and re-logs the exact same "cannot run here" fact
+# forever, drowning real regressions in noise (#3033). Populated only from a
+# ``ConfigResolutionError`` whose ``missing_key`` starts with ``"extension:"``
+# — that prefix is the structured signal that the failure is about a whole
+# extension package being absent, not an ordinary misconfiguration.
+_structurally_unavailable_presets: set[str] = set()
 
 # ---------------------------------------------------------------------------
 # Sentinel queries — read from the existing iam.applied_presets table.
@@ -282,6 +294,19 @@ async def bootstrap_presets(
     because boot resilience matters more than atomicity here.  Callers that
     need atomicity should use ``CompositePreset`` instead.
 
+    A preset that raises ``ConfigResolutionError`` with a ``missing_key``
+    starting with ``"extension:"`` is treated differently: that prefix means
+    the failure is structural — this SCOPE will never be able to run this
+    preset, in this process, no matter how many times it retries (e.g. a
+    slim image missing the extension a preset's write path depends on). The
+    preset name is cached in ``_structurally_unavailable_presets`` after one
+    INFO-level log, and subsequent calls to ``bootstrap_presets`` in the same
+    process skip it outright instead of re-invoking
+    ``bootstrap_preset_if_absent`` and re-logging the same fact on every
+    tick. Any other exception — including a ``ConfigResolutionError`` with an
+    unrelated ``missing_key`` — keeps the loud ERROR log and retries on
+    every call, since that may be a genuine, fixable misconfiguration.
+
     ``payload.scope_key`` overrides ``default_scope_key`` per entry.
 
     Returns a dict mapping ``preset_name`` to the applied bool from
@@ -294,6 +319,11 @@ async def bootstrap_presets(
 
     for entry in preset_list:
         scope = entry.scope_key if entry.scope_key != "platform" else default_scope_key
+
+        if entry.preset_name in _structurally_unavailable_presets:
+            results[entry.preset_name] = False
+            continue
+
         try:
             applied = await bootstrap_preset_if_absent(
                 engine,
@@ -302,6 +332,21 @@ async def bootstrap_presets(
                 force=entry.force,
                 params=entry.params or None,
             )
+        except ConfigResolutionError as exc:
+            if exc.missing_key.startswith("extension:"):
+                _structurally_unavailable_presets.add(entry.preset_name)
+                logger.info(
+                    "bootstrap_presets: preset %r skipped: requires %s, not in this SCOPE",
+                    entry.preset_name,
+                    exc.missing_key,
+                )
+            else:
+                logger.error(
+                    "bootstrap_presets: preset %r raised unexpectedly — continuing chain: %s",
+                    entry.preset_name,
+                    exc,
+                )
+            applied = False
         except Exception as exc:
             logger.error(
                 "bootstrap_presets: preset %r raised unexpectedly — continuing chain: %s",
