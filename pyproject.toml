@@ -110,7 +110,7 @@ module_datastore = ["dynastore[db_sync]", "psycopg2-binary>=2.9.7", "dynastore-m
 module_db_config = ["sqlalchemy", "geoalchemy2", "h3>=4.4.2", "s2sphere>=0.2.5", "python-dateutil"]
 module_web = ["dynastore-module-web"]
 module_iam = ["pydantic[email]", "PyJWT>=2.13.0", "tenacity>=8.0", "dynastore-module-iam"]
-module_local = ["python-multipart>=0.0.30", "dynastore-module-local"]
+module_local = ["python-multipart>=0.0.31", "dynastore-module-local"]
 module_db = ["dynastore[db_async]", "sqlalchemy[asyncio]", "asyncpg"]
 module_crs = ["dynastore[geospatial_core]", "pyproj>=3.0.0", "dynastore-module-crs"]
 module_events = ["psycopg[binary,pool]"]
@@ -134,8 +134,8 @@ extension_web = ["dynastore[extension_base]", "markdown>=3.3.7", "dynastore-ext-
 extension_httpx = ["dynastore[extension_base]", "httpx", "dynastore-ext-httpx"]
 extension_catalog = ["dynastore[extension_base,module_catalog]"]
 extension_stac = ["dynastore[extension_base,geospatial_io]", "pystac[validation]>=1.13.0", "stac-pydantic[validation]>=3.1.0", "dynastore-ext-stac"]
-extension_auth = ["dynastore[extension_base,extension_web]", "python-multipart>=0.0.30", "itsdangerous>=2.0", "dynastore-ext-auth"]
-extension_template = ["dynastore[extension_base]", "attrs>=25.3.0", "aiohttp>=3.14", "jinja2>=3.1.6", "xmltodict>=0.13.0", "httpx>=0.24.1", "dynastore-ext-template"]
+extension_auth = ["dynastore[extension_base,extension_web]", "python-multipart>=0.0.31", "itsdangerous>=2.0", "dynastore-ext-auth"]
+extension_template = ["dynastore[extension_base]", "attrs>=25.3.0", "aiohttp>=3.14.1", "jinja2>=3.1.6", "xmltodict>=0.13.0", "httpx>=0.24.1", "dynastore-ext-template"]
 extension_processes = ["dynastore[extension_base]", "jsonschema", "dynastore-ext-processes"]
 extension_features = ["dynastore[extension_base,geospatial_core,geospatial_io]", "pygeofilter[backend-sqlalchemy]", "dynastore-ext-features"]
 extension_tiles = ["dynastore[extension_base,module_tiles]", "dynastore-ext-tiles"]
@@ -649,7 +649,7 @@ everything = ["dynastore[all,extension_admin,extension_assets,extension_auth,ext
 # images on `scope_*` to stay slim.
 typecheck = ["dynastore[everything,drivers_grp,task_tiles_preseed_deps]"]
 test = ["pytest>=8.0.0", "pytest-asyncio>=0.23.5", "pytest-cov>=4.1.0", "pytest-xdist>=3.5.0", "pytest-timeout>=2.3.0", "requests>=2.31.0", "orjson>=3.9.15"]
-notebooks_test = ["dynastore[test]", "nbval>=0.11", "ipykernel>=6.29", "jupyter-client>=8.6", "httpx>=0.27", "python-dotenv>=1.0"]
+notebooks_test = ["dynastore[test]", "nbval>=0.11", "ipykernel>=6.29", "jupyter-client>=8.6", "tornado>=6.5.7", "httpx>=0.27", "python-dotenv>=1.0"]
 lite_build = ["jupyterlite-core>=0.4", "jupyterlite-pyodide-kernel>=0.4"]
 dev = ["ruff", "black", "mypy", "pyright>=1.1.390", "debugpy", "dynastore[test]"]
 
