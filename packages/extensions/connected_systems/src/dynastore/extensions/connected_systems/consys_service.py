@@ -25,7 +25,7 @@ Scoped per catalog; all write endpoints respect the catalog-readiness guard.
 
 import logging
 from contextlib import asynccontextmanager
-from typing import FrozenSet, List, Optional, Tuple
+from typing import Any, FrozenSet, List, Optional, Tuple
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request
 from sqlalchemy.exc import IntegrityError
@@ -112,99 +112,116 @@ class ConnectedSystemsService(
     # ------------------------------------------------------------------
 
     def _register_routes(self) -> None:
-        self.router.add_api_route("/", self.get_landing_page, methods=["GET"])
-        self.router.add_api_route("/conformance", self.get_conformance, methods=["GET"])
-
-        # Systems
-        self.router.add_api_route(
-            "/systems",
-            self.list_systems,
-            methods=["GET"],
-            response_model=SystemList,
-            summary="List connected systems (sensors, stations) for a catalog",
-        )
-        self.router.add_api_route(
-            "/systems",
-            self.create_system,
-            methods=["POST"],
-            response_model=System,
-            status_code=status.HTTP_201_CREATED,
-            summary="Register a new connected system",
-        )
-        self.router.add_api_route(
-            "/systems/{system_id}",
-            self.get_system,
-            methods=["GET"],
-            response_model=System,
-            summary="Get a connected system by ID",
-        )
-        self.router.add_api_route(
-            "/systems/{system_id}",
-            self.update_system,
-            methods=["PUT"],
-            response_model=System,
-            summary="Update a connected system",
-        )
-        self.router.add_api_route(
-            "/systems/{system_id}",
-            self.delete_system,
-            methods=["DELETE"],
-            status_code=status.HTTP_204_NO_CONTENT,
-            summary="Delete a connected system",
-        )
-        self.router.add_api_route(
-            "/systems/{system_id}/deployments",
-            self.list_system_deployments,
-            methods=["GET"],
-            response_model=List[Deployment],
-            summary="List deployments for a system",
-        )
-        self.router.add_api_route(
-            "/systems/{system_id}/datastreams",
-            self.list_system_datastreams,
-            methods=["GET"],
-            response_model=List[DataStream],
-            summary="List datastreams for a system",
-        )
-
-        # DataStreams
-        self.router.add_api_route(
-            "/datastreams",
-            self.list_datastreams,
-            methods=["GET"],
-            response_model=List[DataStream],
-            summary="List all datastreams for a catalog",
-        )
-        self.router.add_api_route(
-            "/datastreams",
-            self.create_datastream,
-            methods=["POST"],
-            response_model=DataStream,
-            status_code=status.HTTP_201_CREATED,
-            summary="Create a datastream",
-        )
-        self.router.add_api_route(
-            "/datastreams/{datastream_id}",
-            self.get_datastream,
-            methods=["GET"],
-            response_model=DataStream,
-            summary="Get a datastream by ID",
-        )
-        self.router.add_api_route(
-            "/datastreams/{datastream_id}/observations",
-            self.list_observations,
-            methods=["GET"],
-            response_model=List[Observation],
-            summary="List observations for a datastream",
-        )
-        self.router.add_api_route(
-            "/datastreams/{datastream_id}/observations",
-            self.create_observation,
-            methods=["POST"],
-            response_model=Observation,
-            status_code=status.HTTP_201_CREATED,
-            summary="Insert an observation into a datastream",
-        )
+        route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
+            ("/", "get_landing_page", ["GET"], {}),
+            ("/conformance", "get_conformance", ["GET"], {}),
+            # Systems
+            (
+                "/systems",
+                "list_systems",
+                ["GET"],
+                {
+                    "response_model": SystemList,
+                    "summary": "List connected systems (sensors, stations) for a catalog",
+                },
+            ),
+            (
+                "/systems",
+                "create_system",
+                ["POST"],
+                {
+                    "response_model": System,
+                    "status_code": status.HTTP_201_CREATED,
+                    "summary": "Register a new connected system",
+                },
+            ),
+            (
+                "/systems/{system_id}",
+                "get_system",
+                ["GET"],
+                {"response_model": System, "summary": "Get a connected system by ID"},
+            ),
+            (
+                "/systems/{system_id}",
+                "update_system",
+                ["PUT"],
+                {"response_model": System, "summary": "Update a connected system"},
+            ),
+            (
+                "/systems/{system_id}",
+                "delete_system",
+                ["DELETE"],
+                {
+                    "status_code": status.HTTP_204_NO_CONTENT,
+                    "summary": "Delete a connected system",
+                },
+            ),
+            (
+                "/systems/{system_id}/deployments",
+                "list_system_deployments",
+                ["GET"],
+                {
+                    "response_model": List[Deployment],
+                    "summary": "List deployments for a system",
+                },
+            ),
+            (
+                "/systems/{system_id}/datastreams",
+                "list_system_datastreams",
+                ["GET"],
+                {
+                    "response_model": List[DataStream],
+                    "summary": "List datastreams for a system",
+                },
+            ),
+            # DataStreams
+            (
+                "/datastreams",
+                "list_datastreams",
+                ["GET"],
+                {
+                    "response_model": List[DataStream],
+                    "summary": "List all datastreams for a catalog",
+                },
+            ),
+            (
+                "/datastreams",
+                "create_datastream",
+                ["POST"],
+                {
+                    "response_model": DataStream,
+                    "status_code": status.HTTP_201_CREATED,
+                    "summary": "Create a datastream",
+                },
+            ),
+            (
+                "/datastreams/{datastream_id}",
+                "get_datastream",
+                ["GET"],
+                {"response_model": DataStream, "summary": "Get a datastream by ID"},
+            ),
+            (
+                "/datastreams/{datastream_id}/observations",
+                "list_observations",
+                ["GET"],
+                {
+                    "response_model": List[Observation],
+                    "summary": "List observations for a datastream",
+                },
+            ),
+            (
+                "/datastreams/{datastream_id}/observations",
+                "create_observation",
+                ["POST"],
+                {
+                    "response_model": Observation,
+                    "status_code": status.HTTP_201_CREATED,
+                    "summary": "Insert an observation into a datastream",
+                },
+            ),
+        ]
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     # ------------------------------------------------------------------
     # Standard OGC endpoints

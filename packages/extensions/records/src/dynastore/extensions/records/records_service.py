@@ -203,80 +203,6 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
     # ------------------------------------------------------------------
 
     def _register_routes(self) -> None:
-        # Landing page & conformance
-        self.router.add_api_route(
-            "/",
-            self.get_landing_page,
-            methods=["GET"],
-            response_model=rm.LandingPage,
-        )
-        self.router.add_api_route(
-            "/conformance",
-            self.get_conformance,
-            methods=["GET"],
-            response_model=rm.Conformance,
-        )
-
-        # Catalog listing (drives the web browser's top-level navigation)
-        self.router.add_api_route(
-            "/catalogs",
-            self.list_catalogs,
-            methods=["GET"],
-            summary="List catalogs available to the Records service",
-        )
-
-        # Collections (RECORDS-type only)
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections",
-            self.list_collections,
-            methods=["GET"],
-            response_model=rm.RecordsCatalogCollections,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}",
-            self.get_collection,
-            methods=["GET"],
-            response_model=rm.RecordsCatalogCollection,
-        )
-
-        # Record items
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/items",
-            self.get_records,
-            methods=["GET"],
-            response_model=rm.RecordCollection,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/items",
-            self.add_records,
-            methods=["POST"],
-            status_code=status.HTTP_201_CREATED,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/items/{record_id}",
-            self.get_record,
-            methods=["GET"],
-            response_model=rm.Record,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/items/{record_id}",
-            self.replace_record,
-            methods=["PUT"],
-            response_model=rm.Record,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/items/{record_id}",
-            self.update_record,
-            methods=["PATCH"],
-            response_model=rm.Record,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/items/{record_id}",
-            self.delete_record,
-            methods=["DELETE"],
-            status_code=status.HTTP_204_NO_CONTENT,
-        )
-
         # Platform-tier dimension-backed collections (#2957). Dimension
         # members are materialized into RECORDS collections under the
         # internal ``_dimensions_`` sentinel catalog, but that is platform
@@ -287,34 +213,106 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         # unchanged for existing consumers, but every self/collection link
         # now resolves to this canonical shape regardless of which route was
         # used to reach it (see ``records_generator._records_collection_url``).
-        self.router.add_api_route(
-            "/dimensions",
-            self.list_dimension_collections,
-            methods=["GET"],
-            response_model=rm.RecordsCatalogCollections,
-            summary="List dimension-backed records collections (platform tier)",
-        )
-        self.router.add_api_route(
-            "/dimensions/{dim_id}",
-            self.get_dimension_collection,
-            methods=["GET"],
-            response_model=rm.RecordsCatalogCollection,
-            summary="Dimension-backed records collection metadata (platform tier)",
-        )
-        self.router.add_api_route(
-            "/dimensions/{dim_id}/items",
-            self.get_dimension_records,
-            methods=["GET"],
-            response_model=rm.RecordCollection,
-            summary="List dimension members as records (platform tier)",
-        )
-        self.router.add_api_route(
-            "/dimensions/{dim_id}/items/{record_id}",
-            self.get_dimension_record,
-            methods=["GET"],
-            response_model=rm.Record,
-            summary="Get a single dimension member as a record (platform tier)",
-        )
+        route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
+            # Landing page & conformance
+            ("/", "get_landing_page", ["GET"], {"response_model": rm.LandingPage}),
+            ("/conformance", "get_conformance", ["GET"], {"response_model": rm.Conformance}),
+            # Catalog listing (drives the web browser's top-level navigation)
+            (
+                "/catalogs",
+                "list_catalogs",
+                ["GET"],
+                {"summary": "List catalogs available to the Records service"},
+            ),
+            # Collections (RECORDS-type only)
+            (
+                "/catalogs/{catalog_id}/collections",
+                "list_collections",
+                ["GET"],
+                {"response_model": rm.RecordsCatalogCollections},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}",
+                "get_collection",
+                ["GET"],
+                {"response_model": rm.RecordsCatalogCollection},
+            ),
+            # Record items
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items",
+                "get_records",
+                ["GET"],
+                {"response_model": rm.RecordCollection},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items",
+                "add_records",
+                ["POST"],
+                {"status_code": status.HTTP_201_CREATED},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items/{record_id}",
+                "get_record",
+                ["GET"],
+                {"response_model": rm.Record},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items/{record_id}",
+                "replace_record",
+                ["PUT"],
+                {"response_model": rm.Record},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items/{record_id}",
+                "update_record",
+                ["PATCH"],
+                {"response_model": rm.Record},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/items/{record_id}",
+                "delete_record",
+                ["DELETE"],
+                {"status_code": status.HTTP_204_NO_CONTENT},
+            ),
+            (
+                "/dimensions",
+                "list_dimension_collections",
+                ["GET"],
+                {
+                    "response_model": rm.RecordsCatalogCollections,
+                    "summary": "List dimension-backed records collections (platform tier)",
+                },
+            ),
+            (
+                "/dimensions/{dim_id}",
+                "get_dimension_collection",
+                ["GET"],
+                {
+                    "response_model": rm.RecordsCatalogCollection,
+                    "summary": "Dimension-backed records collection metadata (platform tier)",
+                },
+            ),
+            (
+                "/dimensions/{dim_id}/items",
+                "get_dimension_records",
+                ["GET"],
+                {
+                    "response_model": rm.RecordCollection,
+                    "summary": "List dimension members as records (platform tier)",
+                },
+            ),
+            (
+                "/dimensions/{dim_id}/items/{record_id}",
+                "get_dimension_record",
+                ["GET"],
+                {
+                    "response_model": rm.Record,
+                    "summary": "Get a single dimension member as a record (platform tier)",
+                },
+            ),
+        ]
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     # ------------------------------------------------------------------
     # Landing page & conformance (delegated to OGCServiceMixin)

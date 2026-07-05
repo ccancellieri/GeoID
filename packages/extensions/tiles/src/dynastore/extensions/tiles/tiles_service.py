@@ -24,7 +24,7 @@ import asyncio
 import hashlib
 import re
 import time
-from typing import ClassVar, FrozenSet, Literal, Optional, Dict, List, Tuple
+from typing import Any, ClassVar, FrozenSet, Literal, Optional, Dict, List, Tuple
 from contextlib import asynccontextmanager
 from fastapi import (
     FastAPI,
@@ -218,170 +218,192 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         )
 
     def _register_routes(self):
-        # OGC API Common: landing + conformance (delegated to OGCServiceMixin)
-        self.router.add_api_route(
-            "/", self.get_landing_page, methods=["GET"],
-            response_model=LandingPage, summary="OGC API - Tiles landing page", name="get_tiles_landing_page",
-        )
-        self.router.add_api_route(
-            "/conformance", self.get_conformance, methods=["GET"],
-            response_model=Conformance, summary="OGC API - Tiles conformance", name="get_tiles_conformance",
-        )
-        # Tile Matrix Sets (server-level, untouched)
-        self.router.add_api_route(
-            "/tileMatrixSets", self.get_tile_matrix_sets, methods=["GET"],
-            response_model=TileMatrixSetList, summary="Retrieve available Tile Matrix Sets"
-        )
-        self.router.add_api_route(
-            "/tileMatrixSets/{tileMatrixSetId}", self.get_tile_matrix_set, methods=["GET"],
-            response_model=TileMatrixSet, summary="Retrieve a Tile Matrix Set definition"
-        )
-
-        # Tile Content — deprecated flat/catalog-dataset paths
-        self.router.add_api_route(
-            "/catalogs/{dataset}/tiles/{z}/{x}/{y}.mvt", self.get_vector_tile_catalog_default, methods=["GET"],
-            deprecated=True,
-            summary=(
-                "Catalog-centric MVT endpoint (deprecated). "
-                "Use /tiles/catalogs/{catalog_id}/collections/{collection_id}/tiles/{z}/{x}/{y}.mvt instead."
+        col = "/catalogs/{catalog_id}/collections/{collection_id}"
+        route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
+            # OGC API Common: landing + conformance (delegated to OGCServiceMixin)
+            (
+                "/", "get_landing_page", ["GET"],
+                {
+                    "response_model": LandingPage,
+                    "summary": "OGC API - Tiles landing page",
+                    "name": "get_tiles_landing_page",
+                },
             ),
-        )
-        self.router.add_api_route(
-            "/catalogs/{dataset}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}", self.get_vector_tile_catalog, methods=["GET"],
-            deprecated=True,
-            summary=(
-                "Catalog-centric MVT with TMS (deprecated). "
-                "Use /tiles/catalogs/{catalog_id}/collections/{collection_id}/tiles/{tms}/{z}/{x}/{y}.{format} instead."
+            (
+                "/conformance", "get_conformance", ["GET"],
+                {
+                    "response_model": Conformance,
+                    "summary": "OGC API - Tiles conformance",
+                    "name": "get_tiles_conformance",
+                },
             ),
-        )
-        self.router.add_api_route(
-            "/{dataset}/tiles/{z}/{x}/{y}.mvt", self.get_vector_tile_default, methods=["GET"],
-            deprecated=True,
-            summary=(
-                "Legacy MVT endpoint (deprecated). "
-                "Use /tiles/catalogs/{catalog_id}/collections/{collection_id}/tiles/{z}/{x}/{y}.mvt instead."
+            # Tile Matrix Sets (server-level, untouched)
+            (
+                "/tileMatrixSets", "get_tile_matrix_sets", ["GET"],
+                {
+                    "response_model": TileMatrixSetList,
+                    "summary": "Retrieve available Tile Matrix Sets",
+                },
             ),
-        )
-        self.router.add_api_route(
-            "/{dataset}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}", self.get_vector_tile, methods=["GET"],
-            deprecated=True,
-            summary=(
-                "Get filtered MVT (deprecated). "
-                "Use /tiles/catalogs/{catalog_id}/collections/{collection_id}/tiles/{tms}/{z}/{x}/{y}.{format} instead."
+            (
+                "/tileMatrixSets/{tileMatrixSetId}", "get_tile_matrix_set", ["GET"],
+                {
+                    "response_model": TileMatrixSet,
+                    "summary": "Retrieve a Tile Matrix Set definition",
+                },
             ),
-        )
-
-        # Cache Management — deprecated flat path
-        self.router.add_api_route(
-            "/{dataset}/tiles/cache", self.invalidate_tile_cache, methods=["DELETE"],
-            status_code=200,
-            deprecated=True,
-            summary=(
-                "Invalidate tile cache (deprecated). "
-                "Use DELETE /tiles/catalogs/{catalog_id}/collections/{collection_id}/tiles/cache instead."
+            # Tile Content — deprecated flat/catalog-dataset paths
+            (
+                "/catalogs/{dataset}/tiles/{z}/{x}/{y}.mvt", "get_vector_tile_catalog_default", ["GET"],
+                {
+                    "deprecated": True,
+                    "summary": (
+                        "Catalog-centric MVT endpoint (deprecated). "
+                        "Use /tiles/catalogs/{catalog_id}/collections/{collection_id}/tiles/{z}/{x}/{y}.mvt instead."
+                    ),
+                },
             ),
-        )
-
-        # Tile Matrix Sets (per-collection deprecated path)
-        self.router.add_api_route(
-            "/{dataset}/tileMatrixSets", self.create_tile_matrix_set, methods=["POST"],
-            deprecated=True,
-            response_model=TileMatrixSet, status_code=201,
-            summary=(
-                "Create a custom Tile Matrix Set (deprecated). "
-                "Use POST /tiles/catalogs/{catalog_id}/collections/{collection_id}/tileMatrixSets instead."
+            (
+                "/catalogs/{dataset}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}", "get_vector_tile_catalog", ["GET"],
+                {
+                    "deprecated": True,
+                    "summary": (
+                        "Catalog-centric MVT with TMS (deprecated). "
+                        "Use /tiles/catalogs/{catalog_id}/collections/{collection_id}/tiles/{tms}/{z}/{x}/{y}.{format} instead."
+                    ),
+                },
             ),
-        )
-
-        # --- Aligned endpoints: /tiles/catalogs/{catalog_id}/collections/{collection_id}/... ---
-
-        # Aligned vector tile endpoints
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/tiles/{z}/{x}/{y}.mvt",
-            self.get_vector_tile_aligned_default,
-            methods=["GET"],
-            summary="Get vector tile (MVT) for a collection (OGC aligned path, default WebMercatorQuad TMS)",
-            name="get_vector_tile_aligned_default",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}",
-            self.get_vector_tile_aligned,
-            methods=["GET"],
-            summary="Get vector tile for a collection with explicit TMS (OGC aligned path)",
-            name="get_vector_tile_aligned",
-        )
-
-        # Aligned tileset list
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/tiles",
-            self.get_collection_tilesets,
-            methods=["GET"],
-            response_model=TileSetList,
-            summary="List available tilesets for a collection (OGC API Tiles §7.1)",
-            name="get_collection_tilesets",
-        )
-        # Tileset-metadata: full TileSet document for a specific TMS (vector tiles)
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/tiles/{tileMatrixSetId}",
-            self.get_collection_tileset,
-            methods=["GET"],
-            response_model=TileSetItem,
-            summary=(
-                "Tileset metadata for vector tiles of a collection with a given TMS "
-                "(OGC API Tiles §7.2, dataType='vector')"
+            (
+                "/{dataset}/tiles/{z}/{x}/{y}.mvt", "get_vector_tile_default", ["GET"],
+                {
+                    "deprecated": True,
+                    "summary": (
+                        "Legacy MVT endpoint (deprecated). "
+                        "Use /tiles/catalogs/{catalog_id}/collections/{collection_id}/tiles/{z}/{x}/{y}.mvt instead."
+                    ),
+                },
             ),
-            name="get_collection_tileset",
-        )
-        # Tileset-metadata: full TileSet document for map tiles (dataType=map)
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/map/tiles/{tms_id}",
-            self.get_collection_map_tileset,
-            methods=["GET"],
-            response_model=TileSetItem,
-            summary=(
-                "Tileset metadata for raster map tiles of a collection with a given TMS "
-                "(OGC API Maps §7.2, dataType='map')"
+            (
+                "/{dataset}/tiles/{tileMatrixSetId}/{z}/{x}/{y}.{format}", "get_vector_tile", ["GET"],
+                {
+                    "deprecated": True,
+                    "summary": (
+                        "Get filtered MVT (deprecated). "
+                        "Use /tiles/catalogs/{catalog_id}/collections/{collection_id}/tiles/{tms}/{z}/{x}/{y}.{format} instead."
+                    ),
+                },
             ),
-            name="get_collection_map_tileset",
-        )
-
-        # Aligned cache invalidation
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/tiles/cache",
-            self.invalidate_collection_tile_cache,
-            methods=["DELETE"],
-            status_code=200,
-            summary="Invalidate tile cache for a specific collection (OGC aligned path)",
-            name="invalidate_collection_tile_cache",
-        )
-
-        # Map tiles (dataType=map) — default style resolved via binding
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}"
-            "/map/tiles/{tms_id}/{z}/{x}/{y}.{format}",
-            self.get_map_tile,
-            methods=["GET"],
-            summary=(
-                "Render a styled raster map tile (dataType=map) from a COG asset using "
-                "the collection's default style. catalog_id and collection_id are public "
-                "(external) IDs."
+            # Cache Management — deprecated flat path
+            (
+                "/{dataset}/tiles/cache", "invalidate_tile_cache", ["DELETE"],
+                {
+                    "status_code": 200,
+                    "deprecated": True,
+                    "summary": (
+                        "Invalidate tile cache (deprecated). "
+                        "Use DELETE /tiles/catalogs/{catalog_id}/collections/{collection_id}/tiles/cache instead."
+                    ),
+                },
             ),
-            name="get_map_tile",
-        )
-        # Map tiles with explicit style
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}"
-            "/styles/{style_id}/map/tiles/{tms_id}/{z}/{x}/{y}.{format}",
-            self.get_map_tile_styled,
-            methods=["GET"],
-            summary=(
-                "Render a styled raster map tile (dataType=map) with an explicit style. "
-                "Use style_id='terrain-rgb' for Terrain-RGB encoding. "
-                "Add ?relief=hillshade for hillshade rendering. "
-                "catalog_id and collection_id are public (external) IDs."
+            # Tile Matrix Sets (per-collection deprecated path)
+            (
+                "/{dataset}/tileMatrixSets", "create_tile_matrix_set", ["POST"],
+                {
+                    "deprecated": True,
+                    "response_model": TileMatrixSet,
+                    "status_code": 201,
+                    "summary": (
+                        "Create a custom Tile Matrix Set (deprecated). "
+                        "Use POST /tiles/catalogs/{catalog_id}/collections/{collection_id}/tileMatrixSets instead."
+                    ),
+                },
             ),
-            name="get_map_tile_styled",
-        )
+            # --- Aligned endpoints: /tiles/catalogs/{catalog_id}/collections/{collection_id}/... ---
+            # Aligned vector tile endpoints
+            (
+                f"{col}/tiles/{{z}}/{{x}}/{{y}}.mvt", "get_vector_tile_aligned_default", ["GET"],
+                {
+                    "summary": "Get vector tile (MVT) for a collection (OGC aligned path, default WebMercatorQuad TMS)",
+                    "name": "get_vector_tile_aligned_default",
+                },
+            ),
+            (
+                f"{col}/tiles/{{tileMatrixSetId}}/{{z}}/{{x}}/{{y}}.{{format}}", "get_vector_tile_aligned", ["GET"],
+                {
+                    "summary": "Get vector tile for a collection with explicit TMS (OGC aligned path)",
+                    "name": "get_vector_tile_aligned",
+                },
+            ),
+            # Aligned tileset list
+            (
+                f"{col}/tiles", "get_collection_tilesets", ["GET"],
+                {
+                    "response_model": TileSetList,
+                    "summary": "List available tilesets for a collection (OGC API Tiles §7.1)",
+                    "name": "get_collection_tilesets",
+                },
+            ),
+            # Tileset-metadata: full TileSet document for a specific TMS (vector tiles)
+            (
+                f"{col}/tiles/{{tileMatrixSetId}}", "get_collection_tileset", ["GET"],
+                {
+                    "response_model": TileSetItem,
+                    "summary": (
+                        "Tileset metadata for vector tiles of a collection with a given TMS "
+                        "(OGC API Tiles §7.2, dataType='vector')"
+                    ),
+                    "name": "get_collection_tileset",
+                },
+            ),
+            # Tileset-metadata: full TileSet document for map tiles (dataType=map)
+            (
+                f"{col}/map/tiles/{{tms_id}}", "get_collection_map_tileset", ["GET"],
+                {
+                    "response_model": TileSetItem,
+                    "summary": (
+                        "Tileset metadata for raster map tiles of a collection with a given TMS "
+                        "(OGC API Maps §7.2, dataType='map')"
+                    ),
+                    "name": "get_collection_map_tileset",
+                },
+            ),
+            # Aligned cache invalidation
+            (
+                f"{col}/tiles/cache", "invalidate_collection_tile_cache", ["DELETE"],
+                {
+                    "status_code": 200,
+                    "summary": "Invalidate tile cache for a specific collection (OGC aligned path)",
+                    "name": "invalidate_collection_tile_cache",
+                },
+            ),
+            # Map tiles (dataType=map) — default style resolved via binding
+            (
+                f"{col}/map/tiles/{{tms_id}}/{{z}}/{{x}}/{{y}}.{{format}}", "get_map_tile", ["GET"],
+                {
+                    "summary": (
+                        "Render a styled raster map tile (dataType=map) from a COG asset using "
+                        "the collection's default style. catalog_id and collection_id are public "
+                        "(external) IDs."
+                    ),
+                    "name": "get_map_tile",
+                },
+            ),
+            # Map tiles with explicit style
+            (
+                f"{col}/styles/{{style_id}}/map/tiles/{{tms_id}}/{{z}}/{{x}}/{{y}}.{{format}}", "get_map_tile_styled", ["GET"],
+                {
+                    "summary": (
+                        "Render a styled raster map tile (dataType=map) with an explicit style. "
+                        "Use style_id='terrain-rgb' for Terrain-RGB encoding. "
+                        "Add ?relief=hillshade for hillshade rendering. "
+                        "catalog_id and collection_id are public (external) IDs."
+                    ),
+                    "name": "get_map_tile_styled",
+                },
+            ),
+        ]
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     @expose_static("tiles")
     def provide_static_files(self) -> list[str]:
