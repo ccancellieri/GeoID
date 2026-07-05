@@ -1428,8 +1428,10 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
 
     def get_internal_columns(self) -> set:
         """Columns owned by this sidecar that are never part of Feature properties."""
-        cols = {"geoid", "external_id", "validity", "transaction_time", "deleted_at",
+        cols = {"geoid", "validity", "transaction_time", "deleted_at",
                 "transaction_period", "catalog_id", "collection_id"}
+        if self.config.external_id_field is not None:
+            cols.add(self.config.external_id_field)
         if self.config.asset_id_field is not None:
             cols.add(self.config.asset_id_field)
         # attributes_hash is write-policy plumbing for ComputedKind.ATTRIBUTES_HASH;

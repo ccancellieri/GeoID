@@ -1740,8 +1740,26 @@ class GeometriesSidecar(SidecarProtocol):
         queryable at the SQL layer for write policies but is hidden from
         API consumers by default to avoid leaking storage plumbing into
         Feature.properties.
+
+        ``bbox_xmin``/``bbox_ymin``/``bbox_xmax``/``bbox_ymax`` are the
+        scalar ``ST_XMin``/``ST_YMin``/``ST_XMax``/``ST_YMax`` columns
+        projected in place of the full geometry when ``skipGeometry=true``
+        (#2899), consumed by ``map_row_to_feature`` above to populate
+        ``feature.bbox``. Excluding them here keeps them out of the
+        attributes sidecar's whole-row context publish, so they don't
+        flatten onto the Feature root as foreign members duplicating
+        ``bbox``.
         """
-        cols = {"geom", "bbox_geom", "geohash"}
+        cols = {
+            "geom",
+            "geom_type",
+            "bbox_geom",
+            "geohash",
+            "bbox_xmin",
+            "bbox_ymin",
+            "bbox_xmax",
+            "bbox_ymax",
+        }
         if self._has_jsonb_stats():
             cols.add("geom_stats")
         for f in self._columnar_fields():

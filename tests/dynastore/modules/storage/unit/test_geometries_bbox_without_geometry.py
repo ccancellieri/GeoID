@@ -69,3 +69,16 @@ def test_no_bbox_source_leaves_bbox_unset() -> None:
 
     assert feature.geometry is None
     assert feature.bbox is None
+
+
+def test_scalar_bbox_columns_are_internal() -> None:
+    # Regression: the attributes sidecar publishes the whole raw row into the
+    # shared pipeline context for inter-sidecar use; anything not declared
+    # internal here flattens onto the Feature root as a foreign member,
+    # duplicating the standard ``bbox`` array. These four scalar columns
+    # exist purely to populate ``feature.bbox`` (see the tests above) and
+    # must never surface on the wire under their own names.
+    sidecar = GeometriesSidecar(GeometriesSidecarConfig())
+    internal = sidecar.get_internal_columns()
+
+    assert {"bbox_xmin", "bbox_ymin", "bbox_xmax", "bbox_ymax"} <= internal
