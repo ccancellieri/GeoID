@@ -138,49 +138,59 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
         return await self.ogc_landing_page_handler(request)
 
     def _register_routes(self) -> None:
-        self.router.add_api_route(
-            "/",
-            self.get_landing_page,
-            methods=["GET"],
-            summary="OGC API - 3D GeoVolumes landing page",
-        )
-        self.router.add_api_route(
-            "/conformance",
-            self.get_conformance,
-            methods=["GET"],
-            summary="OGC API - 3D GeoVolumes conformance",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/3dtiles/tileset.json",
-            self.get_tileset_json, methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/3dtiles/tiles/{tile_id}.b3dm",
-            self.get_tile_b3dm, methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/3dtiles/tiles/{tile_id}.glb",
-            self.get_tile_glb, methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/3dtiles/metadata",
-            self.get_volumes_metadata, methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections",
-            self.list_3d_collections, methods=["GET"],
-            summary="List 3D container collections",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}",
-            self.get_3d_collection, methods=["GET"],
-            summary="Get a single 3D container",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/cityjsonseq",
-            self.stream_cityjsonseq, methods=["GET"],
-            summary="Stream CityJSONSeq for a 3D container collection",
-        )
+        route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
+            ("/", "get_landing_page", ["GET"], {"summary": "OGC API - 3D GeoVolumes landing page"}),
+            (
+                "/conformance",
+                "get_conformance",
+                ["GET"],
+                {"summary": "OGC API - 3D GeoVolumes conformance"},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/3dtiles/tileset.json",
+                "get_tileset_json",
+                ["GET"],
+                {},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/3dtiles/tiles/{tile_id}.b3dm",
+                "get_tile_b3dm",
+                ["GET"],
+                {},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/3dtiles/tiles/{tile_id}.glb",
+                "get_tile_glb",
+                ["GET"],
+                {},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/3dtiles/metadata",
+                "get_volumes_metadata",
+                ["GET"],
+                {},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections",
+                "list_3d_collections",
+                ["GET"],
+                {"summary": "List 3D container collections"},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}",
+                "get_3d_collection",
+                ["GET"],
+                {"summary": "Get a single 3D container"},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/cityjsonseq",
+                "stream_cityjsonseq",
+                ["GET"],
+                {"summary": "Stream CityJSONSeq for a 3D container collection"},
+            ),
+        ]
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     # ------------------------------------------------------------------
     # Tileset index

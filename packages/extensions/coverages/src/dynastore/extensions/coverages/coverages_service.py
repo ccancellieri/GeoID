@@ -26,7 +26,7 @@ and protocol-specific response models. Zero core changes needed.
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import FrozenSet, Optional, Tuple
+from typing import Any, FrozenSet, Optional, Tuple
 
 import rasterio as _rasterio_scope_gate  # noqa: F401  # SCOPE gate: extension_coverages requires rasterio
 _ = _rasterio_scope_gate  # silence pyright "unused" — load-bearing for SCOPE filtering
@@ -521,51 +521,49 @@ class CoveragesService(ExtensionProtocol, OGCServiceMixin):
     # ------------------------------------------------------------------
 
     def _register_routes(self) -> None:
-        self.router.add_api_route(
-            "/",
-            self.get_landing_page,
-            methods=["GET"],
-            response_model=cm.CoveragesLandingPage,
-        )
-        self.router.add_api_route(
-            "/conformance",
-            self.get_conformance,
-            methods=["GET"],
-            response_model=cm.Conformance,
-        )
-        # Catalog / collection listing (drives the web browser's navigation)
-        self.router.add_api_route(
-            "/catalogs",
-            self.list_catalogs,
-            methods=["GET"],
-            summary="List catalogs available to the Coverages service",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections",
-            self.list_collections,
-            methods=["GET"],
-            summary="List collections in a catalog",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/coverage",
-            self.get_coverage,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/coverage/metadata",
-            self.get_coverage_metadata,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/coverage/domainset",
-            self.get_coverage_domainset,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/coverage/rangetype",
-            self.get_coverage_rangetype,
-            methods=["GET"],
-        )
+        route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
+            ("/", "get_landing_page", ["GET"], {"response_model": cm.CoveragesLandingPage}),
+            ("/conformance", "get_conformance", ["GET"], {"response_model": cm.Conformance}),
+            # Catalog / collection listing (drives the web browser's navigation)
+            (
+                "/catalogs",
+                "list_catalogs",
+                ["GET"],
+                {"summary": "List catalogs available to the Coverages service"},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections",
+                "list_collections",
+                ["GET"],
+                {"summary": "List collections in a catalog"},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/coverage",
+                "get_coverage",
+                ["GET"],
+                {},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/coverage/metadata",
+                "get_coverage_metadata",
+                ["GET"],
+                {},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/coverage/domainset",
+                "get_coverage_domainset",
+                ["GET"],
+                {},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/coverage/rangetype",
+                "get_coverage_rangetype",
+                ["GET"],
+                {},
+            ),
+        ]
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     # ------------------------------------------------------------------
     # Catalog / collection listing (web-browser navigation)

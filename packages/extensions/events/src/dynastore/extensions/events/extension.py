@@ -48,68 +48,67 @@ class EventsExtension(ExtensionProtocol, EventsProtocol):
         self._register_routes()
 
     def _register_routes(self):
-        # --- Event search routes ---
-        self.router.add_api_route("/system", self.get_system_events, methods=["GET"])
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/events", self.get_catalog_events, methods=["GET"]
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/events",
-            self.get_collection_events,
-            methods=["GET"],
-        )
-
-        # --- Subscription routes: platform scope ---
-        self.router.add_api_route(
-            "/subscriptions",
-            self.create_subscription,
-            methods=["POST"],
-        )
-        self.router.add_api_route(
-            "/subscriptions",
-            self.list_subscriptions,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/subscriptions/{subscriber_name}/{event_type}",
-            self.delete_subscription,
-            methods=["DELETE"],
-        )
-
-        # --- Subscription routes: catalog scope ---
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/subscriptions",
-            self.create_catalog_subscription,
-            methods=["POST"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/subscriptions",
-            self.list_catalog_subscriptions,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/subscriptions/{subscriber_name}/{event_type}",
-            self.delete_catalog_subscription,
-            methods=["DELETE"],
-        )
-
-        # --- Subscription routes: collection scope ---
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/subscriptions",
-            self.create_collection_subscription,
-            methods=["POST"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/subscriptions",
-            self.list_collection_subscriptions,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}"
-            "/subscriptions/{subscriber_name}/{event_type}",
-            self.delete_collection_subscription,
-            methods=["DELETE"],
-        )
+        route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
+            # --- Event search routes ---
+            ("/system", "get_system_events", ["GET"], {}),
+            ("/catalogs/{catalog_id}/events", "get_catalog_events", ["GET"], {}),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/events",
+                "get_collection_events",
+                ["GET"],
+                {},
+            ),
+            # --- Subscription routes: platform scope ---
+            ("/subscriptions", "create_subscription", ["POST"], {}),
+            ("/subscriptions", "list_subscriptions", ["GET"], {}),
+            (
+                "/subscriptions/{subscriber_name}/{event_type}",
+                "delete_subscription",
+                ["DELETE"],
+                {},
+            ),
+            # --- Subscription routes: catalog scope ---
+            (
+                "/catalogs/{catalog_id}/subscriptions",
+                "create_catalog_subscription",
+                ["POST"],
+                {},
+            ),
+            (
+                "/catalogs/{catalog_id}/subscriptions",
+                "list_catalog_subscriptions",
+                ["GET"],
+                {},
+            ),
+            (
+                "/catalogs/{catalog_id}/subscriptions/{subscriber_name}/{event_type}",
+                "delete_catalog_subscription",
+                ["DELETE"],
+                {},
+            ),
+            # --- Subscription routes: collection scope ---
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/subscriptions",
+                "create_collection_subscription",
+                ["POST"],
+                {},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/subscriptions",
+                "list_collection_subscriptions",
+                ["GET"],
+                {},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}"
+                "/subscriptions/{subscriber_name}/{event_type}",
+                "delete_collection_subscription",
+                ["DELETE"],
+                {},
+            ),
+        ]
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     # ------------------------------------------------------------------
     # Event search handlers
