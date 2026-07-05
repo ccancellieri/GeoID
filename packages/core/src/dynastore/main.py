@@ -19,7 +19,7 @@
 import logging
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Optional
+from typing import Any, Optional, Union
 import asyncio
 import json
 import uuid
@@ -39,7 +39,13 @@ from dynastore._version import VERSION, get_build_info
 from dynastore.extensions.tools.fast_api import ORJSONResponse
 from dynastore.extensions.bootstrap import bootstrap_app
 from dynastore.modules.concurrency import set_concurrency_backend
-from dynastore.tools.background_service import BackgroundSupervisor, ServiceContext
+from dynastore.tools.background_service import (
+    BackgroundSupervisor,
+    Leadership,
+    LeaseRenewalMode,
+    PodPolicy,
+    ServiceContext,
+)
 from dynastore.tools.correlation import _correlation_id_var, set_correlation_id
 from dynastore.tools.memory_watchdog import build_memory_watchdog_service_from_env
 from fastapi.concurrency import run_in_threadpool
@@ -120,6 +126,53 @@ for _lib in ("opensearch", "elasticsearch", "elastic_transport"):
 
 logger = logging.getLogger(__name__)
 
+
+class _ColdBootReconciliationService:
+    """Runs the cold-boot contributor pipeline off the startup-probe path (#3002).
+
+    ``run_cold_boot`` iterates every registered ``ColdBootContributor`` —
+    force=True IAM/preset self-heal, the file-backed preset seeder (which can
+    provision demo catalogs/collections), and similar idempotent reconciliation
+    work. None of it gates ``/health`` or ``/ready`` (neither route checks IAM
+    or preset state), so running it synchronously before ``yield`` only made
+    boot time scale with catalog count for no correctness benefit — a
+    full-fleet deploy against a DB with many catalogs could grind past the
+    Cloud Run startup-probe window entirely.
+
+    Submitted as a RUN_EVERYWHERE background task instead: every pod attempts
+    it independently, and single-flight safety comes from the advisory lock
+    each contributor already takes via ``acquire_startup_lock`` in
+    ``bootstrap_preset_if_absent`` — a pod that loses a given lock skips that
+    contributor, exactly as it did when this ran inline.
+    """
+
+    name = "cold_boot_reconciliation"
+    leadership = Leadership.RUN_EVERYWHERE
+    pod_policy = PodPolicy.ALL
+    lock_key: Optional[Union[int, str]] = None
+    lease_renewal_mode = LeaseRenewalMode.PER_TICK  # unused under RUN_EVERYWHERE
+
+    def __init__(self, engine: Any) -> None:
+        self._engine = engine
+
+    async def run(self, ctx: ServiceContext) -> None:
+        from dynastore.modules.presets.cold_boot import run_cold_boot
+        try:
+            await run_cold_boot(self._engine)
+        except Exception:
+            # run_cold_boot is documented to never raise; this is a last-resort
+            # guard so a future contributor's bug can't kill the task silently.
+            logger.error(
+                "Cold-boot reconciliation raised an unexpected error; some "
+                "presets or IdP config may not be seeded.",
+                exc_info=True,
+            )
+        else:
+            logger.info(
+                "--- [main.py] Cold-boot reconciliation complete (background). ---"
+            )
+
+
 # --- Combined Application Lifecycle ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -162,6 +215,11 @@ async def lifespan(app: FastAPI):
             )
         )
 
+    # Cold-boot reconciliation supervisor (#3002): started once the DB engine
+    # is available below, stopped alongside the memory watchdog in `finally`.
+    _cold_boot_shutdown = asyncio.Event()
+    _cold_boot_supervisor = BackgroundSupervisor()
+
     try:
         async with modules_lifespan(app.state):
             logger.info("--- [main.py] Modules are active. ---")
@@ -195,25 +253,31 @@ async def lifespan(app: FastAPI):
                         os.environ.get("IDP_ISSUER_URL") or "<none>",
                     )
                 # Run all registered cold-boot contributors in descending priority
-                # order. Each contributor is fail-soft — a failure does not abort
-                # startup. Fully agnostic: no module-specific (iam/web/auth) names here.
-                try:
-                    from dynastore.modules.presets.cold_boot import run_cold_boot
-                    from dynastore.models.protocols import DatabaseProtocol
-                    _db = get_protocol(DatabaseProtocol)
-                    _engine = _db.engine if _db else None
-                    await run_cold_boot(_engine)
-                except Exception:
-                    logger.error(
-                        "Cold-boot orchestrator raised an unexpected error; "
-                        "some presets or IdP config may not be seeded.",
-                        exc_info=True,
+                # order, off the critical path (#3002). This work is idempotent
+                # self-heal/reconciliation — it does not gate /health or /ready —
+                # so it is submitted as a background task rather than awaited
+                # here. Each contributor is fail-soft — a failure does not abort
+                # the pipeline. Fully agnostic: no module-specific (iam/web/auth)
+                # names here.
+                from dynastore.models.protocols import DatabaseProtocol
+                _db = get_protocol(DatabaseProtocol)
+                _engine = _db.engine if _db else None
+                _cold_boot_supervisor.register(_ColdBootReconciliationService(_engine))
+                _cold_boot_supervisor.start(
+                    ServiceContext(
+                        engine=_engine,
+                        shutdown=_cold_boot_shutdown,
+                        is_ephemeral=False,
+                        name=os.environ.get("SERVICE_NAME", "dynastore"),
                     )
+                )
                 logger.info("--- [main.py] Web Extensions are active. Application is running. ---")
                 yield
 
         logger.info("--- [main.py] Application shutdown complete. ---")
     finally:
+        _cold_boot_shutdown.set()
+        await _cold_boot_supervisor.stop()
         if _mem_watchdog_service is not None:
             _mem_watchdog_shutdown.set()
             await _mem_watchdog_supervisor.stop()
