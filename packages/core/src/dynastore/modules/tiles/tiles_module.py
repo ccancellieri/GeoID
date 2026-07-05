@@ -45,6 +45,7 @@ from dynastore.modules.db_config.query_executor import (
     ResultHandler,
     DbResource,
     managed_transaction,
+    _read_live_fg_acquire_timeout,
 )
 from dynastore.modules.db_config.partition_tools import ensure_partition_exists
 from dynastore.modules.db_config.locking_tools import check_table_exists
@@ -1059,7 +1060,13 @@ async def get_collection_source_srid(
     2. Falls back to PostGIS Find_SRID lookup.
     """
     engine = _get_engine()
-    async with managed_transaction(engine) as conn:
+    # Bounded so a rebuild triggered under pool pressure (e.g. by the render
+    # path's cache miss) times out into PoolSaturationError -> 503 +
+    # Retry-After instead of riding the engine's own pool_timeout into a raw
+    # 500 (#3023).
+    async with managed_transaction(
+        engine, acquire_timeout=await _read_live_fg_acquire_timeout()
+    ) as conn:
         # Check logical configuration first for CRS hints
         # We can look for 'source_crs' in TilesConfig at collection level
         catalogs = get_protocol(CatalogsProtocol)
@@ -1137,7 +1144,15 @@ async def get_tile_resolution_params(
     Returns: physical names, source_srid, and simplification rules.
     """
     engine = _get_engine()
-    async with managed_transaction(engine) as conn:
+    # Bounded for the same reason as get_collection_source_srid above: this
+    # cached rebuild is the nested acquire #3014/#3022 identified as the
+    # thing a render request could deadlock behind — a plain
+    # managed_transaction(engine) rides the engine's full pool_timeout on
+    # saturation and surfaces as a raw 500 instead of the fail-fast
+    # PoolSaturationError -> 503 + Retry-After path (#3023).
+    async with managed_transaction(
+        engine, acquire_timeout=await _read_live_fg_acquire_timeout()
+    ) as conn:
         # 1. Resolve Physical Names (Cached inside catalogs protocol)
         catalogs = get_protocol(CatalogsProtocol)
         if not catalogs:

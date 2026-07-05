@@ -639,6 +639,25 @@ async def _get_rebuild_semaphore() -> asyncio.Semaphore:
     return _rebuild_semaphore
 
 
+def _is_orphaned_teardown_error(exc: BaseException) -> bool:
+    """True for a torn-down-connection error from an orphaned rebuild (#3023).
+
+    A detached ``@cached`` rebuild (:func:`_await_shared_rebuild`) always runs
+    to completion even after every waiter has stopped waiting on it (#2900 --
+    cancelling in-flight DB work mid-query poisons the connection pool). If
+    the rebuild's own connection then gets torn down before it finishes, the
+    resulting ``InterfaceError``/``DatabaseConnectionError`` ("connection is
+    closed") is expected teardown noise rather than an actionable failure --
+    no live caller depends on the outcome.
+    """
+    from sqlalchemy.exc import InterfaceError
+    from dynastore.modules.db_config.exceptions import DatabaseConnectionError
+
+    if isinstance(exc, (InterfaceError, DatabaseConnectionError)):
+        return "closed" in str(exc).lower()
+    return False
+
+
 async def _await_shared_rebuild(
     key: str,
     rebuild: "Callable[[], Coroutine[Any, Any, Any]]",
@@ -665,16 +684,31 @@ async def _await_shared_rebuild(
             if _inflight_rebuilds.get(_key) is t:
                 _inflight_rebuilds.pop(_key, None)
             # Retrieve the exception so an abandoned detached rebuild (every
-            # waiter already timed out) surfaces as one structured WARN line
+            # waiter already timed out) surfaces as one structured log line
             # instead of asyncio's raw "exception was never retrieved" ERROR
             # traceback.
             if not t.cancelled():
                 exc = t.exception()
                 if exc is not None:
-                    logger.warning(
-                        "cache_rebuild_failed key=%s error_type=%s error=%s",
-                        _key, type(exc).__name__, exc,
-                    )
+                    if _is_orphaned_teardown_error(exc):
+                        # The rebuild outlived every waiter (all timed out or
+                        # disconnected) and its own connection was then torn
+                        # down mid-flight — no live caller depends on this
+                        # result, so a "connection is closed" rollback/
+                        # transaction error here is expected teardown noise,
+                        # not an actionable failure (#3023). Cancelling the
+                        # rebuild instead is not an option: it always runs to
+                        # completion by design (#2900) since cancelling
+                        # in-flight DB work mid-query poisons the pool.
+                        logger.debug(
+                            "cache_rebuild_orphaned key=%s error_type=%s error=%s",
+                            _key, type(exc).__name__, exc,
+                        )
+                    else:
+                        logger.warning(
+                            "cache_rebuild_failed key=%s error_type=%s error=%s",
+                            _key, type(exc).__name__, exc,
+                        )
 
         task.add_done_callback(_cleanup)
     return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
