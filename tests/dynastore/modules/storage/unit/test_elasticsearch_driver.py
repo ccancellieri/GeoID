@@ -1411,6 +1411,180 @@ class TestWriteEntitiesPgCanonicalDetection:
         assert list(doc["geometry"]["coordinates"]) == pytest.approx([1.0, 2.0])
 
     @pytest.mark.asyncio
+    async def test_pending_pg_collection_is_activated_before_canonical_read(self):
+        """#3046 — routing says PG is in the write fan-out, but the
+        collection was never activated (e.g. created by a bulk harvester
+        that never goes through ItemService.upsert's own lazy-activation
+        gate). write_entities must activate it itself, before the batched
+        canonical read — otherwise every batch would deterministically hit
+        _fetch_raw_rows's "cannot resolve physical table" RuntimeError."""
+        from dynastore.modules.storage.driver_config import (
+            ItemsWritePolicy, WriteConflictPolicy,
+        )
+        from dynastore.modules.catalog.canonical_index_read import CanonicalIndexInput
+
+        es = _StubEs(exists=True)
+        policy = ItemsWritePolicy(on_conflict=WriteConflictPolicy.UPDATE)
+        canonical_read_mock = AsyncMock(
+            return_value={
+                "f1": CanonicalIndexInput(
+                    row={"geoid": "f1"},
+                    geometry={"type": "Point", "coordinates": [1.0, 2.0]},
+                    bbox=[1.0, 2.0, 1.0, 2.0],
+                    user_properties={"from_pg": True},
+                )
+            }
+        )
+        catalogs = MagicMock()
+        catalogs.resolve_catalog_id = AsyncMock(return_value=None)
+        catalogs.collections.resolve_collection_id = AsyncMock(return_value=None)
+        catalogs.ensure_alive = AsyncMock(return_value=None)
+        catalogs.is_active = AsyncMock(return_value=False)
+        catalogs.activate_collection = AsyncMock(return_value=None)
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.modules.elasticsearch.client.get_index_prefix",
+            return_value="dynastore",
+        ), patch.object(
+            ItemsElasticsearchDriver, "_resolve_write_policy",
+            AsyncMock(return_value=policy),
+        ), patch.object(
+            ItemsElasticsearchDriver, "_enforce_field_constraints",
+            AsyncMock(return_value=None),
+        ), patch(
+            "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+            new=canonical_read_mock,
+        ), patch(
+            "dynastore.modules.storage.router.get_write_drivers",
+            new=AsyncMock(return_value=[
+                self._resolved_driver(has_resolve_physical_table=True),
+            ]),
+        ), patch(
+            "dynastore.tools.discovery.get_protocol", return_value=catalogs,
+        ):
+            driver = ItemsElasticsearchDriver()
+            await driver.write_entities("cat1", "col1", [self._feature("f1")])
+
+        catalogs.ensure_alive.assert_awaited_once_with(
+            "cat1", "col1", db_resource=None,
+        )
+        catalogs.is_active.assert_awaited_once_with(
+            "cat1", "col1", db_resource=None,
+        )
+        catalogs.activate_collection.assert_awaited_once()
+        canonical_read_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_already_active_pg_collection_skips_reactivation(self):
+        """An already-activated collection must not pay for a redundant
+        activate_collection call on every write."""
+        from dynastore.modules.storage.driver_config import (
+            ItemsWritePolicy, WriteConflictPolicy,
+        )
+        from dynastore.modules.catalog.canonical_index_read import CanonicalIndexInput
+
+        es = _StubEs(exists=True)
+        policy = ItemsWritePolicy(on_conflict=WriteConflictPolicy.UPDATE)
+        canonical_read_mock = AsyncMock(
+            return_value={
+                "f1": CanonicalIndexInput(
+                    row={"geoid": "f1"},
+                    geometry={"type": "Point", "coordinates": [1.0, 2.0]},
+                    bbox=[1.0, 2.0, 1.0, 2.0],
+                    user_properties={"from_pg": True},
+                )
+            }
+        )
+        catalogs = MagicMock()
+        catalogs.resolve_catalog_id = AsyncMock(return_value=None)
+        catalogs.collections.resolve_collection_id = AsyncMock(return_value=None)
+        catalogs.ensure_alive = AsyncMock(return_value=None)
+        catalogs.is_active = AsyncMock(return_value=True)
+        catalogs.activate_collection = AsyncMock(return_value=None)
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.modules.elasticsearch.client.get_index_prefix",
+            return_value="dynastore",
+        ), patch.object(
+            ItemsElasticsearchDriver, "_resolve_write_policy",
+            AsyncMock(return_value=policy),
+        ), patch.object(
+            ItemsElasticsearchDriver, "_enforce_field_constraints",
+            AsyncMock(return_value=None),
+        ), patch(
+            "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+            new=canonical_read_mock,
+        ), patch(
+            "dynastore.modules.storage.router.get_write_drivers",
+            new=AsyncMock(return_value=[
+                self._resolved_driver(has_resolve_physical_table=True),
+            ]),
+        ), patch(
+            "dynastore.tools.discovery.get_protocol", return_value=catalogs,
+        ):
+            driver = ItemsElasticsearchDriver()
+            await driver.write_entities("cat1", "col1", [self._feature("f1")])
+
+        catalogs.is_active.assert_awaited_once()
+        catalogs.activate_collection.assert_not_awaited()
+        canonical_read_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_activation_lifecycle_failure_degrades_to_feature_only(self):
+        """A collection still in a transitional lifecycle (e.g.
+        PROVISIONING) must not crash the write. ensure_canonical_source_ready
+        swallows a CollectionNotAliveError from ensure_alive the same way
+        has_canonical_source swallows a routing-resolution error — this is a
+        background/secondary-index write path with no HTTP client to hand a
+        409 to; the caller falls back to the feature-derived doc."""
+        from dynastore.modules.catalog.collection_service import CollectionNotAliveError
+        from dynastore.modules.storage.driver_config import (
+            ItemsWritePolicy, WriteConflictPolicy,
+        )
+
+        es = _StubEs(exists=True)
+        policy = ItemsWritePolicy(on_conflict=WriteConflictPolicy.UPDATE)
+        canonical_read_mock = AsyncMock(return_value={})
+        catalogs = MagicMock()
+        catalogs.resolve_catalog_id = AsyncMock(return_value=None)
+        catalogs.collections.resolve_collection_id = AsyncMock(return_value=None)
+        catalogs.ensure_alive = AsyncMock(
+            side_effect=CollectionNotAliveError("cat1", "col1", "provisioning")
+        )
+        catalogs.is_active = AsyncMock(return_value=False)
+        catalogs.activate_collection = AsyncMock(return_value=None)
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.modules.elasticsearch.client.get_index_prefix",
+            return_value="dynastore",
+        ), patch.object(
+            ItemsElasticsearchDriver, "_resolve_write_policy",
+            AsyncMock(return_value=policy),
+        ), patch.object(
+            ItemsElasticsearchDriver, "_enforce_field_constraints",
+            AsyncMock(return_value=None),
+        ), patch(
+            "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+            new=canonical_read_mock,
+        ), patch(
+            "dynastore.modules.storage.router.get_write_drivers",
+            new=AsyncMock(return_value=[
+                self._resolved_driver(has_resolve_physical_table=True),
+            ]),
+        ), patch(
+            "dynastore.tools.discovery.get_protocol", return_value=catalogs,
+        ):
+            driver = ItemsElasticsearchDriver()
+            # Must not raise CollectionNotAliveError out of write_entities.
+            await driver.write_entities("cat1", "col1", [self._feature("f1")])
+
+        catalogs.ensure_alive.assert_awaited_once()
+        catalogs.activate_collection.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_write_drivers_resolution_failure_degrades_to_feature_only(self):
         """A routing-resolution error (e.g. ConfigResolutionError) must not
         block the ES write — it degrades to "no PG canonical" and the write
@@ -1663,8 +1837,8 @@ def _patch_bulk_dependencies(es, *, has_pg_write_canonical=True):
     """Wire the module-level helpers used inside ``index_bulk``/``index``.
 
     ``has_pg_write_canonical`` defaults to True so the existing response-shape
-    tests keep exercising the PG-hydration path unchanged; pass False to
-    exercise the ES-only skip-the-canonical-read branch (#2884 follow-up).
+    tests keep exercising the canonical-hydration path unchanged; pass False
+    to exercise the ES-only skip-the-canonical-read branch (#2884 follow-up).
     """
     return [
         patch(
@@ -1686,9 +1860,13 @@ def _patch_bulk_dependencies(es, *, has_pg_write_canonical=True):
             "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
             new=AsyncMock(side_effect=_fake_canonical_inputs),
         ),
-        patch.object(
-            ItemsElasticsearchDriver, "_collection_has_pg_write_canonical",
+        patch(
+            "dynastore.modules.storage.drivers.elasticsearch.has_canonical_source",
             new=AsyncMock(return_value=has_pg_write_canonical),
+        ),
+        patch(
+            "dynastore.modules.storage.drivers.elasticsearch.ensure_canonical_source_ready",
+            new=AsyncMock(return_value=None),
         ),
     ]
 
@@ -1998,8 +2176,8 @@ class TestIndexAndIndexBulkPgCanonicalDetection:
         ), patch(
             "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
             new=canonical_read_mock,
-        ), patch.object(
-            ItemsElasticsearchDriver, "_collection_has_pg_write_canonical",
+        ), patch(
+            "dynastore.modules.storage.drivers.elasticsearch.has_canonical_source",
             new=AsyncMock(return_value=False),
         ), patch.object(
             ItemsElasticsearchDriver, "_resolve_simplify_geometry",
@@ -2019,6 +2197,123 @@ class TestIndexAndIndexBulkPgCanonicalDetection:
         doc = es.index_calls[0]["body"]
         assert doc["id"] == "f1"
         assert doc["properties"]["extras"]["name"] == "Rome"
+
+    @pytest.mark.asyncio
+    async def test_index_bulk_activates_pending_collection_before_canonical_read(self):
+        """#3046 — index_bulk's dispatch fan-out must lazily activate a
+        pending collection before the canonical read, mirroring
+        write_entities's gate. _patch_bulk_dependencies normally mocks
+        ensure_canonical_source_ready as an unconditional no-op, which left
+        this call site's db_resource/catalog/collection wiring untested."""
+        from sqlalchemy.ext.asyncio import AsyncConnection
+        from dynastore.models.protocols.indexer import IndexContext
+
+        es = _StubEsBulk({
+            "errors": False,
+            "items": [{"index": {"_id": "f1", "result": "created", "status": 201}}],
+        })
+        ops = [_make_op("f1")]
+        sentinel_conn = MagicMock(spec=AsyncConnection)
+        ctx = IndexContext(
+            catalog="cat1", collection="col1", entity_type="item",
+            pg_conn=sentinel_conn,
+        )
+        catalogs = MagicMock()
+        catalogs.ensure_alive = AsyncMock(return_value=None)
+        catalogs.is_active = AsyncMock(return_value=False)
+        catalogs.activate_collection = AsyncMock(return_value=None)
+
+        patches = _patch_bulk_dependencies(es, has_pg_write_canonical=True)
+        with patch(
+            "dynastore.tools.discovery.get_protocol", return_value=catalogs,
+        ):
+            for p in patches:
+                if p.attribute != "ensure_canonical_source_ready":
+                    p.start()
+            try:
+                driver = ItemsElasticsearchDriver()
+                result = await driver.index_bulk(ctx, ops)
+            finally:
+                for p in patches:
+                    if p.attribute != "ensure_canonical_source_ready":
+                        p.stop()
+
+        catalogs.ensure_alive.assert_awaited_once_with(
+            "cat1", "col1", db_resource=sentinel_conn,
+        )
+        catalogs.is_active.assert_awaited_once_with(
+            "cat1", "col1", db_resource=sentinel_conn,
+        )
+        catalogs.activate_collection.assert_awaited_once()
+        assert result.succeeded == 1
+
+    @pytest.mark.asyncio
+    async def test_index_single_op_activates_pending_collection_before_canonical_read(self):
+        """Same #3046 coverage as the index_bulk variant above, for the
+        single-op ``index()`` dispatch path."""
+        from sqlalchemy.ext.asyncio import AsyncConnection
+        from dynastore.models.protocols.indexer import IndexContext
+        from dynastore.modules.catalog.canonical_index_read import CanonicalIndexInput
+
+        es = _StubEs(exists=True)
+        sentinel_conn = MagicMock(spec=AsyncConnection)
+        ctx = IndexContext(
+            catalog="cat1", collection="col1", entity_type="item",
+            pg_conn=sentinel_conn,
+        )
+        op = _make_op("f1", payload={
+            "id": "f1", "type": "Feature", "collection": "col1",
+            "geometry": {"type": "Point", "coordinates": [12.0, 41.9]},
+            "properties": {"name": "Rome"},
+        })
+        canonical_read_mock = AsyncMock(
+            return_value={"f1": CanonicalIndexInput(row={"geoid": "f1"})}
+        )
+        catalogs = MagicMock()
+        catalogs.ensure_alive = AsyncMock(return_value=None)
+        catalogs.is_active = AsyncMock(return_value=False)
+        catalogs.activate_collection = AsyncMock(return_value=None)
+
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.modules.elasticsearch.client.get_index_prefix",
+            return_value="dynastore",
+        ), patch(
+            "dynastore.modules.storage.drivers.elasticsearch._ensure_in_public_alias_once",
+            new=AsyncMock(return_value=None),
+        ), patch(
+            "dynastore.modules.elasticsearch.items_projection.resolve_catalog_known_fields",
+            new=AsyncMock(return_value={}),
+        ), patch(
+            "dynastore.modules.storage.drivers.elasticsearch.read_canonical_index_inputs",
+            new=canonical_read_mock,
+        ), patch(
+            "dynastore.modules.storage.drivers.elasticsearch.has_canonical_source",
+            new=AsyncMock(return_value=True),
+        ), patch(
+            "dynastore.tools.discovery.get_protocol", return_value=catalogs,
+        ), patch.object(
+            ItemsElasticsearchDriver, "_resolve_simplify_geometry",
+            new=AsyncMock(return_value=False),
+        ), patch.object(
+            ItemsElasticsearchDriver, "_resolve_snap_to_grid_config",
+            new=AsyncMock(return_value=(False, 0.00001)),
+        ), patch.object(
+            ItemsElasticsearchDriver, "_resolve_simplify_max_bytes",
+            new=AsyncMock(return_value=10_000_000),
+        ):
+            driver = ItemsElasticsearchDriver()
+            await driver.index(ctx, op)
+
+        catalogs.ensure_alive.assert_awaited_once_with(
+            "cat1", "col1", db_resource=sentinel_conn,
+        )
+        catalogs.is_active.assert_awaited_once_with(
+            "cat1", "col1", db_resource=sentinel_conn,
+        )
+        catalogs.activate_collection.assert_awaited_once()
+        canonical_read_mock.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

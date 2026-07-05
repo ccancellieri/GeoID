@@ -87,6 +87,8 @@ from dynastore.tools.cache import cached
 # Imported at module level so tests can patch them as module attributes.
 from dynastore.modules.catalog.canonical_index_read import (
     canonical_input_from_feature,
+    ensure_canonical_source_ready,
+    has_canonical_source,
     read_canonical_index_inputs,
 )
 from dynastore.modules.elasticsearch.items_projection import resolve_catalog_known_fields
@@ -1579,9 +1581,16 @@ class ItemsElasticsearchDriver(
         # equivalent of the canonical shape.
         batch_geoids = [g for g in item_geoids if g is not None]
         canonical_inputs: Dict[str, Any] = {}
-        if batch_geoids and await self._collection_has_pg_write_canonical(
-            catalog_id, collection_id,
-        ):
+        if batch_geoids and await has_canonical_source(catalog_id, collection_id):
+            # #3046: a canonical source being *routed* doesn't mean it has
+            # been activated (its storage provisioned) yet — a collection
+            # created via a bulk harvester never goes through
+            # ItemService.upsert's own lazy-activation gate, so without this
+            # the batched read below would deterministically hit an
+            # unresolved physical table on the collection's first ES write.
+            await ensure_canonical_source_ready(
+                catalog_id, collection_id, db_resource=db_resource,
+            )
             canonical_inputs = await read_canonical_index_inputs(
                 catalog_id, collection_id, batch_geoids, db_resource=db_resource,
             )
@@ -1856,39 +1865,6 @@ class ItemsElasticsearchDriver(
             return False
 
         await check_unique(ft.fields, feature_dicts, exists=_exists)
-
-    @staticmethod
-    async def _collection_has_pg_write_canonical(
-        catalog_id: str, collection_id: str,
-    ) -> bool:
-        """Routing-based signal: does this collection's WRITE fan-out include
-        a PG-capable driver — one that can resolve/pin a physical table?
-
-        Used by :meth:`write_entities` to decide whether the canonical ES
-        envelope can be hydrated from PostgreSQL
-        (:func:`~dynastore.modules.catalog.canonical_index_read.read_canonical_index_inputs`)
-        or must be built directly from the feature payload
-        (:func:`~dynastore.modules.catalog.canonical_index_read.canonical_input_from_feature`).
-        Mirrors the same ``hasattr(driver, "resolve_physical_table")`` capability
-        check ``ItemService._resolve_physical_table`` uses — only
-        ``ItemsPostgresqlDriver`` implements it. Checking this up front (instead
-        of catching the ``RuntimeError`` a PG-less batched read would raise) keeps
-        a genuine PG failure on a PG-backed collection visible instead of being
-        folded into the same except clause as "no PG canonical at all".
-
-        Degrade-safe: any routing-resolution failure is treated as "no PG
-        canonical" — a resolution error here must not block the ES write, it
-        just means the write falls back to the feature-derived doc.
-        """
-        try:
-            from dynastore.modules.storage.router import get_write_drivers
-            write_drivers = await get_write_drivers(catalog_id, collection_id)
-        except Exception:
-            return False
-        return any(
-            hasattr(resolved.driver, "resolve_physical_table")
-            for resolved in write_drivers
-        )
 
     @staticmethod
     async def _resolve_write_policy(
@@ -2440,20 +2416,23 @@ class ItemsElasticsearchDriver(
         # directly from the raw row + resolved sidecars — no read-policy
         # filtering, no external_id_as_feature_id id-flip (#1800).
         known_fields = await resolve_catalog_known_fields(ctx.catalog)
-        # Only attempt the PG canonical read when this collection's WRITE
-        # routing actually resolves a PG-capable driver — same guard
-        # write_entities() uses (#2864/#2884). Pure ES-only routing has no
-        # PG WRITE entry, so this read would deterministically raise
-        # "cannot resolve physical table"; skip straight to the
+        # Only attempt the canonical read when this collection's WRITE
+        # routing actually resolves a canonical-capable driver — same guard
+        # write_entities() uses (#2864/#2884/#3046), including the same
+        # lazy-activation step (a collection reindexed via the outbox before
+        # its first item write went through ItemService.upsert's own
+        # activation gate would otherwise hit an unresolved physical table).
+        # No canonical-capable driver routed: skip straight to the
         # feature-derived fallback below instead.
-        inputs = (
-            await read_canonical_index_inputs(
+        inputs = {}
+        if await has_canonical_source(ctx.catalog, ctx.collection):
+            await ensure_canonical_source_ready(
+                ctx.catalog, ctx.collection, db_resource=ctx.pg_conn,
+            )
+            inputs = await read_canonical_index_inputs(
                 ctx.catalog, ctx.collection, [op.entity_id],
                 db_resource=ctx.pg_conn,
             )
-            if await self._collection_has_pg_write_canonical(ctx.catalog, ctx.collection)
-            else {}
-        )
         ci = inputs.get(op.entity_id)
         if ci is None:
             # No raw PG row.  For a PG-primary collection this means the row
@@ -2539,10 +2518,10 @@ class ItemsElasticsearchDriver(
 
         # Batch-fetch canonical inputs for all upsert ops in one PG round-trip
         # — but only when this collection's WRITE routing actually resolves a
-        # PG-capable driver, same guard write_entities() uses (#2864/#2884).
-        # Pure ES-only routing has no PG WRITE entry, so this read would
-        # deterministically raise "cannot resolve physical table"; skip
-        # straight to the per-op feature-derived fallback below instead.
+        # canonical-capable driver, same guard write_entities() uses
+        # (#2864/#2884/#3046), including the same lazy-activation step. No
+        # canonical-capable driver routed: skip straight to the per-op
+        # feature-derived fallback below instead.
         upsert_geoids = [
             op.entity_id
             for op in ops
@@ -2552,16 +2531,15 @@ class ItemsElasticsearchDriver(
         # connection from the caller's transaction when available (covers the
         # Cloud Run JOB/worker context where the dispatcher's IndexContext
         # carries the wrapping TX opened by _dispatch_index_upsert Phase 2f).
-        canonical_inputs = (
-            await read_canonical_index_inputs(
+        canonical_inputs = {}
+        if upsert_geoids and await has_canonical_source(ctx.catalog, ctx.collection):
+            await ensure_canonical_source_ready(
+                ctx.catalog, ctx.collection, db_resource=ctx.pg_conn,
+            )
+            canonical_inputs = await read_canonical_index_inputs(
                 ctx.catalog, ctx.collection, upsert_geoids,
                 db_resource=ctx.pg_conn,
             )
-            if upsert_geoids and await self._collection_has_pg_write_canonical(
-                ctx.catalog, ctx.collection,
-            )
-            else {}
-        )
 
         body: List[dict] = []
         for op in ops:

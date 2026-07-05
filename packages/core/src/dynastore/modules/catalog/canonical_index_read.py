@@ -418,6 +418,83 @@ async def read_canonical_index_inputs(
     return result
 
 
+async def has_canonical_source(catalog_id: str, collection_id: str) -> bool:
+    """Does this collection's WRITE fan-out include a driver capable of
+    supplying canonical inputs (i.e. one :func:`read_canonical_index_inputs`
+    can actually read from)?
+
+    Routing-based signal only: capability here means "a driver in the fan-out
+    implements ``resolve_physical_table``" — it says nothing about whether
+    that driver's storage has been *provisioned* yet (see
+    :func:`ensure_canonical_source_ready`). Callers building an ES/search
+    document use this to decide between hydrating from the canonical read
+    or falling back to a feature-derived doc (:func:`canonical_input_from_feature`).
+
+    Degrade-safe: any routing-resolution failure is treated as "no canonical
+    source" — a resolution error here must not block the caller's write, it
+    just means the write falls back to the feature-derived doc.
+    """
+    try:
+        from dynastore.modules.storage.router import get_write_drivers
+        write_drivers = await get_write_drivers(catalog_id, collection_id)
+    except Exception:
+        return False
+    return any(
+        hasattr(resolved.driver, "resolve_physical_table")
+        for resolved in write_drivers
+    )
+
+
+async def ensure_canonical_source_ready(
+    catalog_id: str, collection_id: str, *, db_resource: Optional[Any] = None,
+) -> None:
+    """Lazily activate a pending collection via ``CatalogsProtocol``.
+
+    ``has_canonical_source`` only checks routing config — it says nothing
+    about whether the resolved driver's storage has actually been
+    provisioned yet. A collection whose first-ever write reaches
+    :func:`read_canonical_index_inputs` without going through
+    ``ItemService.upsert``'s own lazy-activation gate (e.g. a bulk harvester
+    writing through a non-PG-primary path) would otherwise stay pending
+    forever: every batch would hit :func:`_fetch_raw_rows`'s "cannot resolve
+    physical table" RuntimeError, since nothing ever calls
+    ``activate_collection`` (#3046).
+
+    Mirrors ``ItemService.upsert``'s own gate (``ensure_alive`` →
+    ``is_active`` → ``activate_collection``) and is equally driver-agnostic:
+    ``activate_collection`` provisions whichever driver this collection's
+    WRITE routing resolves to.
+
+    Degrade-safe like ``has_canonical_source``: no ``CatalogsProtocol``
+    registered is a no-op, and any failure of the activation sequence itself
+    (e.g. ``ensure_alive`` raising ``CollectionNotAliveError`` for a
+    collection still in its ``PROVISIONING`` window, or a transient lookup
+    error) is swallowed rather than propagated. Unlike ``ItemService.upsert``
+    — the primary REST write path, where that error is meant to surface as an
+    HTTP 409 for the client to retry — this helper backs the ES driver's
+    secondary-index write path, which has no client to hand a 409 to; the
+    caller's fallback is to skip canonical hydration and use the
+    feature-derived doc instead.
+    """
+    from dynastore.models.protocols import CatalogsProtocol
+    from dynastore.tools.discovery import get_protocol
+
+    catalogs = get_protocol(CatalogsProtocol)
+    if catalogs is None:
+        return
+    try:
+        await catalogs.ensure_alive(catalog_id, collection_id, db_resource=db_resource)
+        if not await catalogs.is_active(catalog_id, collection_id, db_resource=db_resource):
+            from dynastore.models.driver_context import DriverContext
+
+            await catalogs.activate_collection(
+                catalog_id, collection_id,
+                ctx=DriverContext(db_resource=db_resource),
+            )
+    except Exception:
+        return
+
+
 # ---------------------------------------------------------------------------
 # Feature-part extraction (no read policy)
 # ---------------------------------------------------------------------------
