@@ -34,7 +34,7 @@ import json as _json
 import logging
 import os  # noqa: E402
 from contextlib import asynccontextmanager
-from typing import FrozenSet, List, Optional
+from typing import Any, FrozenSet, List, Optional
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -204,74 +204,73 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
     # ------------------------------------------------------------------
 
     def _register_routes(self) -> None:
-        # Standard OGC landing page + conformance
-        self.router.add_api_route("/", self.get_landing_page, methods=["GET"])
-        self.router.add_api_route(
-            "/conformance", self.get_conformance, methods=["GET"]
-        )
-
         col_prefix = "/catalogs/{catalog_id}/collections/{collection_id}/styles"
 
-        self.router.add_api_route(
-            col_prefix,
-            self.create_style_for_collection,
-            methods=["POST"],
-            response_model=Style,
-            status_code=status.HTTP_201_CREATED,
-            summary="Create a style for a collection",
-        )
-        self.router.add_api_route(
-            col_prefix,
-            self.list_styles,
-            methods=["GET"],
-            response_model=StyleList,
-            summary="List styles for a collection",
-        )
-        self.router.add_api_route(
-            col_prefix + "/{style_id}",
-            self.get_style,
-            methods=["GET"],
-            response_model=Style,
-            summary="Get a specific style",
-        )
-        self.router.add_api_route(
-            col_prefix + "/{style_id}",
-            self.update_style,
-            methods=["PUT"],
-            response_model=Style,
-            summary="Update a style",
-        )
-        self.router.add_api_route(
-            col_prefix + "/{style_id}",
-            self.delete_style,
-            methods=["DELETE"],
-            status_code=status.HTTP_204_NO_CONTENT,
-            summary="Delete a style",
-        )
-        self.router.add_api_route(
-            col_prefix + "/{style_id}/stylesheet",
-            self.get_stylesheet,
-            methods=["GET"],
-            summary="Get stylesheet body (content-negotiated)",
-        )
-        self.router.add_api_route(
-            col_prefix + "/{style_id}/metadata",
-            self.get_style_metadata,
-            methods=["GET"],
-            summary="Style metadata with stylesheet links per encoding",
-        )
-        self.router.add_api_route(
-            col_prefix + "/{style_id}/legend",
-            self.get_style_legend,
-            methods=["GET"],
-            summary="Redirect to style legend image (rel=preview)",
-        )
-        self.router.add_api_route(
-            "/all",
-            self.list_all_styles,
-            methods=["GET"],
-            summary="List all styles across catalogs (discovery convenience)",
-        )
+        route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
+            # Standard OGC landing page + conformance
+            ("/", "get_landing_page", ["GET"], {}),
+            ("/conformance", "get_conformance", ["GET"], {}),
+            (
+                col_prefix,
+                "create_style_for_collection",
+                ["POST"],
+                {
+                    "response_model": Style,
+                    "status_code": status.HTTP_201_CREATED,
+                    "summary": "Create a style for a collection",
+                },
+            ),
+            (
+                col_prefix,
+                "list_styles",
+                ["GET"],
+                {"response_model": StyleList, "summary": "List styles for a collection"},
+            ),
+            (
+                col_prefix + "/{style_id}",
+                "get_style",
+                ["GET"],
+                {"response_model": Style, "summary": "Get a specific style"},
+            ),
+            (
+                col_prefix + "/{style_id}",
+                "update_style",
+                ["PUT"],
+                {"response_model": Style, "summary": "Update a style"},
+            ),
+            (
+                col_prefix + "/{style_id}",
+                "delete_style",
+                ["DELETE"],
+                {"status_code": status.HTTP_204_NO_CONTENT, "summary": "Delete a style"},
+            ),
+            (
+                col_prefix + "/{style_id}/stylesheet",
+                "get_stylesheet",
+                ["GET"],
+                {"summary": "Get stylesheet body (content-negotiated)"},
+            ),
+            (
+                col_prefix + "/{style_id}/metadata",
+                "get_style_metadata",
+                ["GET"],
+                {"summary": "Style metadata with stylesheet links per encoding"},
+            ),
+            (
+                col_prefix + "/{style_id}/legend",
+                "get_style_legend",
+                ["GET"],
+                {"summary": "Redirect to style legend image (rel=preview)"},
+            ),
+            (
+                "/all",
+                "list_all_styles",
+                ["GET"],
+                {"summary": "List all styles across catalogs (discovery convenience)"},
+            ),
+        ]
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     # ------------------------------------------------------------------
     # Standard OGC endpoints (delegated to OGCServiceMixin)

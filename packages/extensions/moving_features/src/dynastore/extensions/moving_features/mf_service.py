@@ -29,7 +29,7 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import FrozenSet, List, Optional
+from typing import Any, FrozenSet, List, Optional
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
@@ -105,87 +105,103 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
     # ------------------------------------------------------------------
 
     def _register_routes(self) -> None:
-        self.router.add_api_route("/", self.get_landing_page, methods=["GET"])
-        self.router.add_api_route("/conformance", self.get_conformance, methods=["GET"])
-        self.router.add_api_route(
-            "/catalogs",
-            self.list_catalogs,
-            methods=["GET"],
-            summary="List catalogs available to the Moving Features service",
-        )
-
         col = "/catalogs/{catalog_id}/collections/{collection_id}"
 
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections",
-            self.list_collections,
-            methods=["GET"],
-            summary="List moving-feature collections in a catalog",
-        )
-        self.router.add_api_route(
-            col,
-            self.get_collection,
-            methods=["GET"],
-            summary="Get moving-feature collection metadata",
-        )
-        self.router.add_api_route(
-            col + "/items",
-            self.list_moving_features,
-            methods=["GET"],
-            response_model=MovingFeatureList,
-            summary="List moving features in a collection",
-        )
-        self.router.add_api_route(
-            col + "/items",
-            self.create_moving_feature,
-            methods=["POST"],
-            response_model=MovingFeature,
-            status_code=status.HTTP_201_CREATED,
-            summary="Create a moving feature",
-        )
-        self.router.add_api_route(
-            col + "/items/{mf_id}",
-            self.get_moving_feature,
-            methods=["GET"],
-            response_model=MovingFeature,
-            summary="Get a moving feature",
-        )
-        self.router.add_api_route(
-            col + "/items/{mf_id}",
-            self.delete_moving_feature,
-            methods=["DELETE"],
-            status_code=status.HTTP_204_NO_CONTENT,
-            summary="Delete a moving feature and its temporal data",
-        )
-        self.router.add_api_route(
-            col + "/items/{mf_id}",
-            self.update_moving_feature,
-            methods=["PUT"],
-            response_model=MovingFeature,
-            summary="Update a moving feature's properties",
-        )
-        self.router.add_api_route(
-            col + "/items/{mf_id}/tgsequence",
-            self.list_tg_sequence,
-            methods=["GET"],
-            response_model=List[TemporalGeometry],
-            summary="Get temporal geometry sequences for a moving feature",
-        )
-        self.router.add_api_route(
-            col + "/items/{mf_id}/tgsequence",
-            self.add_tg_sequence,
-            methods=["POST"],
-            response_model=TemporalGeometry,
-            status_code=status.HTTP_201_CREATED,
-            summary="Add a temporal geometry sequence to a moving feature",
-        )
-        self.router.add_api_route(
-            col + "/items/{mf_id}/tgsequence/{tg_id}",
-            self.update_tg_sequence,
-            methods=["PATCH"],
-            response_model=TemporalGeometry,
-            summary="Update a temporal geometry sequence",
-        )
+        route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
+            ("/", "get_landing_page", ["GET"], {}),
+            ("/conformance", "get_conformance", ["GET"], {}),
+            (
+                "/catalogs",
+                "list_catalogs",
+                ["GET"],
+                {"summary": "List catalogs available to the Moving Features service"},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections",
+                "list_collections",
+                ["GET"],
+                {"summary": "List moving-feature collections in a catalog"},
+            ),
+            (
+                col,
+                "get_collection",
+                ["GET"],
+                {"summary": "Get moving-feature collection metadata"},
+            ),
+            (
+                col + "/items",
+                "list_moving_features",
+                ["GET"],
+                {
+                    "response_model": MovingFeatureList,
+                    "summary": "List moving features in a collection",
+                },
+            ),
+            (
+                col + "/items",
+                "create_moving_feature",
+                ["POST"],
+                {
+                    "response_model": MovingFeature,
+                    "status_code": status.HTTP_201_CREATED,
+                    "summary": "Create a moving feature",
+                },
+            ),
+            (
+                col + "/items/{mf_id}",
+                "get_moving_feature",
+                ["GET"],
+                {"response_model": MovingFeature, "summary": "Get a moving feature"},
+            ),
+            (
+                col + "/items/{mf_id}",
+                "delete_moving_feature",
+                ["DELETE"],
+                {
+                    "status_code": status.HTTP_204_NO_CONTENT,
+                    "summary": "Delete a moving feature and its temporal data",
+                },
+            ),
+            (
+                col + "/items/{mf_id}",
+                "update_moving_feature",
+                ["PUT"],
+                {
+                    "response_model": MovingFeature,
+                    "summary": "Update a moving feature's properties",
+                },
+            ),
+            (
+                col + "/items/{mf_id}/tgsequence",
+                "list_tg_sequence",
+                ["GET"],
+                {
+                    "response_model": List[TemporalGeometry],
+                    "summary": "Get temporal geometry sequences for a moving feature",
+                },
+            ),
+            (
+                col + "/items/{mf_id}/tgsequence",
+                "add_tg_sequence",
+                ["POST"],
+                {
+                    "response_model": TemporalGeometry,
+                    "status_code": status.HTTP_201_CREATED,
+                    "summary": "Add a temporal geometry sequence to a moving feature",
+                },
+            ),
+            (
+                col + "/items/{mf_id}/tgsequence/{tg_id}",
+                "update_tg_sequence",
+                ["PATCH"],
+                {
+                    "response_model": TemporalGeometry,
+                    "summary": "Update a temporal geometry sequence",
+                },
+            ),
+        ]
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     # ------------------------------------------------------------------
     # Standard OGC endpoints

@@ -163,60 +163,50 @@ class EDRService(ExtensionProtocol, OGCServiceMixin):
     # ------------------------------------------------------------------
 
     def _register_routes(self) -> None:
-        self.router.add_api_route(
-            "/",
-            self.get_landing_page,
-            methods=["GET"],
-            response_model=em.EDRLandingPage,
-        )
-        self.router.add_api_route(
-            "/conformance",
-            self.get_conformance,
-            methods=["GET"],
-            response_model=em.Conformance,
-        )
-        self.router.add_api_route(
-            "/catalogs",
-            self.list_catalogs,
-            methods=["GET"],
-            summary="List catalogs available to the EDR service",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections",
-            self.list_collections,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}",
-            self.get_collection,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/position",
-            self.query_position,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/area",
-            self.query_area,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/cube",
-            self.query_cube,
-            methods=["GET"],
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/locations",
-            self.list_locations,
-            methods=["GET"],
-            response_model=em.EDRLocations,
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}/locations/{location_id}",
-            self.get_location,
-            methods=["GET"],
-        )
+        route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
+            ("/", "get_landing_page", ["GET"], {"response_model": em.EDRLandingPage}),
+            ("/conformance", "get_conformance", ["GET"], {"response_model": em.Conformance}),
+            (
+                "/catalogs",
+                "list_catalogs",
+                ["GET"],
+                {"summary": "List catalogs available to the EDR service"},
+            ),
+            ("/catalogs/{catalog_id}/collections", "list_collections", ["GET"], {}),
+            ("/catalogs/{catalog_id}/collections/{collection_id}", "get_collection", ["GET"], {}),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/position",
+                "query_position",
+                ["GET"],
+                {},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/area",
+                "query_area",
+                ["GET"],
+                {},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/cube",
+                "query_cube",
+                ["GET"],
+                {},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/locations",
+                "list_locations",
+                ["GET"],
+                {"response_model": em.EDRLocations},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}/locations/{location_id}",
+                "get_location",
+                ["GET"],
+                {},
+            ),
+        ]
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     # ------------------------------------------------------------------
     # Landing page & conformance (delegated to OGCServiceMixin)
