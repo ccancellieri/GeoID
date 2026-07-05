@@ -350,24 +350,30 @@ class WFSService(ExtensionProtocol, OGCServiceMixin):
         """
         if self.router is None:
             return
-        # The root endpoint is disabled to enforce catalog-scoped requests.
-        self.router.add_api_route("", self.handle_root_wfs_request, methods=["GET"])
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}",
-            self.handle_scoped_wfs_request,
-            methods=["GET"],
-            summary="WFS 2.0 catalog-scoped operations (OGC aligned path)",
-        )
-        self.router.add_api_route(
-            "/{catalog_id}",
-            self.handle_scoped_wfs_request,
-            methods=["GET"],
-            deprecated=True,
-            summary=(
-                "WFS 2.0 catalog-scoped operations (deprecated). "
-                "Use /wfs/catalogs/{catalog_id} instead."
+        # (path, handler_name, methods, kwargs)
+        route_table = [
+            # The root endpoint is disabled to enforce catalog-scoped requests.
+            ("", "handle_root_wfs_request", ["GET"], {}),
+            (
+                "/catalogs/{catalog_id}",
+                "handle_scoped_wfs_request", ["GET"],
+                {"summary": "WFS 2.0 catalog-scoped operations (OGC aligned path)"},
             ),
-        )
+            (
+                "/{catalog_id}",
+                "handle_scoped_wfs_request", ["GET"],
+                {
+                    "deprecated": True,
+                    "summary": (
+                        "WFS 2.0 catalog-scoped operations (deprecated). "
+                        "Use /wfs/catalogs/{catalog_id} instead."
+                    ),
+                },
+            ),
+        ]
+
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     async def _dispatch_request(
         self,

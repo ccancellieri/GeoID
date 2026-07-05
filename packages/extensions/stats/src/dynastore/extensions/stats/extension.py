@@ -78,24 +78,27 @@ class StatsExtension(ExtensionProtocol, StatsProtocol):
         self._setup_routes()
 
     def _setup_routes(self):
-        self.router.add_api_route(
-            "/system",
-            self.get_system_stats,
-            methods=["GET"],
-            summary="Retrieve global system-level stats",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}",
-            self.get_catalog_stats,
-            methods=["GET"],
-            summary="Retrieve stats for a specific catalog",
-        )
-        self.router.add_api_route(
-            "/catalogs/{catalog_id}/collections/{collection_id}",
-            self.get_collection_stats,
-            methods=["GET"],
-            summary="Retrieve stats for a specific collection",
-        )
+        # (path, handler_name, methods, kwargs)
+        route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
+            (
+                "/system",
+                "get_system_stats", ["GET"],
+                {"summary": "Retrieve global system-level stats"},
+            ),
+            (
+                "/catalogs/{catalog_id}",
+                "get_catalog_stats", ["GET"],
+                {"summary": "Retrieve stats for a specific catalog"},
+            ),
+            (
+                "/catalogs/{catalog_id}/collections/{collection_id}",
+                "get_collection_stats", ["GET"],
+                {"summary": "Retrieve stats for a specific collection"},
+            ),
+        ]
+
+        for path, handler_name, methods, kwargs in route_table:
+            self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
     def get_web_pages(self):
         # Skip nav registration in deployments without IAM — there are no
