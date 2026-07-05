@@ -2631,6 +2631,71 @@ async def update_task_ingestion_offset(
     return bool(rowcount and rowcount > 0)
 
 
+async def update_task_harvest_cursor(
+    engine: DbResource,
+    task_id: uuid.UUID,
+    collection_id: Optional[str],
+    items_href: Optional[str],
+    done: bool,
+) -> bool:
+    """Stamp a resume cursor onto ``inputs.inputs.resume`` (#3034).
+
+    Mirrors ``update_task_ingestion_offset`` (#2820) for the ``stac_harvest``
+    task: called after each items-page batch write commits so a dispatcher
+    retry after a Cloud Run Job timeout/kill resumes the source walk instead
+    of restarting it from the first collection. ``StacHarvestTask.run``
+    rebuilds ``StacHarvestRequest`` from the claimed row's ``inputs`` on every
+    dispatch (a retry resets ``status``/``owner_id`` via
+    ``fail_task(retry=True)`` but never touches ``inputs``), so stamping the
+    cursor here is sufficient to seed the resumed run.
+
+    ``stac_harvest`` is always submitted via ``execute_process`` (the
+    ``stac_harvester`` preset), so the row's ``inputs`` column carries the
+    ``ExecuteRequest`` wrapper — the actual ``StacHarvestRequest`` fields
+    (and ``resume``) live one level down at ``inputs.inputs``, unlike
+    ingestion's flat ``inputs.ingestion_request``. The whole ``resume``
+    object is replaced in one ``jsonb_set`` call (rather than patching
+    ``collection_id``/``items_href``/``done`` as separate leaf paths) because
+    ``inputs.inputs.resume`` does not exist on the row until the first write:
+    ``jsonb_set`` only auto-creates the *last* path element even with
+    ``create_missing=true``, so a leaf-only path (e.g.
+    ``{inputs,resume,collection_id}``) would silently no-op while ``resume``
+    itself is still missing. Setting the whole object at
+    ``{inputs,resume}`` needs only ``inputs`` (which is always present) to
+    already exist.
+
+    ``collection_id`` is the source collection currently in progress (``None``
+    while a single-collection harvest has not yet started, or between
+    collections). ``items_href`` is the STAC ``rel=next`` page URL to resume
+    items from within that collection (``None`` means start it from the
+    beginning). ``done`` marks that collection's item walk as fully drained,
+    so a resumed catalog walk skips it entirely and moves to the next one.
+
+    Returns ``True`` when a row was updated, ``False`` when none matched.
+    Best-effort: a missed write only degrades to a retry restarting the
+    affected collection from the beginning, never aborts the harvest.
+    """
+    task_schema = get_task_schema()
+    sql = f"""
+        UPDATE {task_schema}.tasks
+        SET inputs = jsonb_set(
+            COALESCE(inputs, '{{}}'::jsonb),
+            '{{inputs,resume}}',
+            CAST(:resume_json AS jsonb),
+            true
+        )
+        WHERE task_id = :task_id;
+    """
+    resume_json = json.dumps(
+        {"collection_id": collection_id, "items_href": items_href, "done": done}
+    )
+    async with managed_transaction(engine) as conn:
+        rowcount = await DQLQuery(
+            sql, result_handler=ResultHandler.ROWCOUNT
+        ).execute(conn, task_id=task_id, resume_json=resume_json)
+    return bool(rowcount and rowcount > 0)
+
+
 async def _emit_task_failed_event(
     task_id: uuid.UUID,
     row: Dict[str, Any],

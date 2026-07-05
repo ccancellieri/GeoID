@@ -136,20 +136,63 @@ async def iter_collections(catalog_url: str) -> AsyncIterator[Dict[str, Any]]:
         url = _next_href(page)
 
 
-async def _iter_items_from(items_url: str, label: str) -> AsyncIterator[Dict[str, Any]]:
+@dataclass
+class PageCursor:
+    """Mutable holder updated by ``_iter_items_from`` as it walks source pages.
+
+    ``next_url`` always holds the URL of the page about to be fetched (or
+    just fetched, while its items are being consumed) — i.e. the STAC
+    ``rel=next`` resume point a caller should persist once the items already
+    consumed are durably written (#3034). Re-fetching this URL after a
+    resume may re-yield a few items from the in-flight page again, which is
+    safe since item upserts are idempotent.
+
+    ``truncated`` is set when the walk gave up on a page fetch (source error,
+    after exhausting the limit-shrink retry on the first page) instead of
+    reaching a page with no ``rel=next`` link. A caller must not treat a
+    truncated walk as "collection fully harvested" — doing so would make a
+    resume skip the still-unfetched tail forever; the last page-boundary
+    cursor already persisted by a prior successful batch remains the correct
+    resume point.
+    """
+
+    next_url: Optional[str] = None
+    truncated: bool = False
+
+
+async def _iter_items_from(
+    items_url: str, label: str, *, cursor: Optional[PageCursor] = None,
+    resume_from_href: bool = False,
+) -> AsyncIterator[Dict[str, Any]]:
     """Walk a source items URL with rel=next cursor pagination.
 
-    ``items_url`` is the items endpoint base (it may already carry query params).
-    If the very first page fetch fails (a source may reject the requested page
-    size with e.g. HTTP 502), retry the first page with a halved limit down to
-    ``_MIN_PAGE_LIMIT`` before giving up — otherwise an over-large default would
-    silently harvest zero items.
+    ``items_url`` is the items endpoint base (it may already carry query
+    params) — a ``limit`` is appended and the first page's fetch is retried
+    with a halved limit down to ``_MIN_PAGE_LIMIT`` on failure (a source may
+    reject the requested page size with e.g. HTTP 502); otherwise an
+    over-large default would silently harvest zero items.
+
+    ``resume_from_href=True`` treats ``items_url`` as an already-complete
+    page URL instead — a persisted ``rel=next`` cursor (#3034) — fetched
+    exactly as-is with no ``limit`` appended (it carries its own) and no
+    limit-shrink retry (that already ran, if needed, on the original first
+    page of this same walk).
+
+    ``cursor``, when given, is updated to the current page's URL before each
+    fetch so a caller can read ``cursor.next_url`` after a batch write commits
+    and persist it as the resume point (see ``PageCursor``).
     """
-    limit = _PAGE_LIMIT
-    sep = "&" if "?" in items_url else "?"
-    url: Optional[str] = f"{items_url}{sep}limit={limit}"
-    first_page = True
+    if resume_from_href:
+        url: Optional[str] = items_url
+        first_page = False
+    else:
+        limit = _PAGE_LIMIT
+        sep = "&" if "?" in items_url else "?"
+        url = f"{items_url}{sep}limit={limit}"
+        first_page = True
     while url:
+        if cursor is not None:
+            cursor.next_url = url
         try:
             page = await asyncio.to_thread(_http_get_json, url)
         except Exception as exc:
@@ -165,6 +208,8 @@ async def _iter_items_from(items_url: str, label: str) -> AsyncIterator[Dict[str
             logger.warning(
                 "stac_harvest: GET items for %s failed: %s", label, exc
             )
+            if cursor is not None:
+                cursor.truncated = True
             return
         first_page = False
         for feat in page.get("features") or []:
@@ -172,10 +217,13 @@ async def _iter_items_from(items_url: str, label: str) -> AsyncIterator[Dict[str
         url = _next_href(page)
 
 
-def iter_items(catalog_url: str, collection_id: str) -> AsyncIterator[Dict[str, Any]]:
+def iter_items(
+    catalog_url: str, collection_id: str, *, cursor: Optional[PageCursor] = None,
+) -> AsyncIterator[Dict[str, Any]]:
     """Walk source /collections/{id}/items with rel=next cursor pagination."""
     return _iter_items_from(
-        f"{catalog_url}/collections/{collection_id}/items", collection_id
+        f"{catalog_url}/collections/{collection_id}/items", collection_id,
+        cursor=cursor,
     )
 
 
@@ -256,6 +304,44 @@ class HarvestStats:
     # Monotonic timestamp of the first failure in the current unbroken
     # zero-write streak; ``None`` while healthy.  See _STALL_ABORT_SECONDS.
     _stall_since: Optional[float] = field(default=None, repr=False)
+
+
+async def _persist_harvest_cursor(
+    engine: Any,
+    task_id: Any,
+    collection_id: Optional[str],
+    items_href: Optional[str],
+    done: bool,
+) -> None:
+    """Persist a resume cursor onto the task row after progress is durable (#3034).
+
+    Stamps ``inputs.inputs.resume`` on the task's own DB row so a dispatcher
+    retry (Cloud Run Job timeout/kill) resumes the source walk instead of
+    replaying the whole catalog from the first collection — mirroring
+    ingestion's ``_persist_ingestion_cursor`` (#2820).
+
+    Best-effort: a write failure here only degrades to a retry restarting the
+    affected collection from the beginning, and must never fail an otherwise
+    successful batch write. No-ops when ``engine``/``task_id`` are unavailable
+    (e.g. a sync in-process execution path with no durable task row to stamp).
+    """
+    if engine is None or not task_id:
+        return
+    try:
+        from dynastore.modules.tasks import tasks_module
+        import uuid as _uuid
+
+        task_uuid = task_id if isinstance(task_id, _uuid.UUID) else _uuid.UUID(str(task_id))
+        await tasks_module.update_task_harvest_cursor(
+            engine, task_uuid, collection_id, items_href, done,
+        )
+    except Exception:  # noqa: BLE001 — cursor persistence is best-effort
+        logger.warning(
+            "stac_harvest: failed to persist resume cursor (collection=%s "
+            "done=%s) for task %s — a retry will restart that collection "
+            "from the beginning.",
+            collection_id, done, task_id, exc_info=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +657,11 @@ async def _harvest_collection(
     items_iter: AsyncIterator[Dict[str, Any]],
     target_collection: str,
     stats: HarvestStats,
+    *,
+    source_collection_id: Optional[str] = None,
+    engine: Any = None,
+    task_id: Any = None,
+    page_cursor: Optional[PageCursor] = None,
 ) -> None:
     """Upsert one collection and stream its items into ``target_collection``.
 
@@ -580,7 +671,18 @@ async def _harvest_collection(
     streak trips the stall abort (see ``_STALL_ABORT_SECONDS``), which raises
     ``RuntimeError`` to stop a harvest that is stuck heartbeating but making
     no progress (geoid#2890).
+
+    ``source_collection_id`` is the *source* collection id (pre-normalisation)
+    used to key the persisted resume cursor (#3034) — it must match what
+    ``iter_collections``/the single-collection probe hand back, since that is
+    what a resumed walk compares against. Defaults to ``target_collection``
+    when not given. When ``engine``/``task_id`` are given, the cursor is
+    stamped after each batch write commits (so a dispatcher retry resumes
+    this collection's items walk instead of restarting it) and once more
+    with ``done=True`` after the whole collection drains (so a resumed
+    catalog walk skips it entirely).
     """
+    source_collection_id = source_collection_id or target_collection
     target_catalog = request.target_catalog
     coll = map_collection(source_coll)
     coll["id"] = target_collection
@@ -609,6 +711,10 @@ async def _harvest_collection(
                 )
         else:
             stats._stall_since = None
+            await _persist_harvest_cursor(
+                engine, task_id, source_collection_id,
+                page_cursor.next_url if page_cursor else None, False,
+            )
         if request.with_assets:
             stats.virtual_assets_written += await _register_virtual_assets(
                 catalogs, target_catalog, target_collection, batch
@@ -627,12 +733,33 @@ async def _harvest_collection(
     if batch:
         await _flush(batch)
 
+    if page_cursor is not None and page_cursor.truncated:
+        # The walk gave up on a page fetch instead of reaching a page with no
+        # rel=next link — a source hiccup, not completion. Marking this
+        # collection "done" would make a resume skip its unfetched tail
+        # forever; leave whatever the last successful batch's flush already
+        # persisted as the resume point (see PageCursor.truncated).
+        logger.warning(
+            "stac_harvest: %s items walk ended on a page-fetch error, not "
+            "exhaustion — leaving the resume cursor at the last committed "
+            "batch instead of marking the collection done.",
+            source_collection_id,
+        )
+    else:
+        # The whole collection drained without tripping the stall abort —
+        # mark it done so a resumed catalog walk skips it entirely instead
+        # of re-checking its (now stale) items_href.
+        await _persist_harvest_cursor(engine, task_id, source_collection_id, None, True)
+
 
 async def run_harvest(
     request: StacHarvestRequest,
     catalogs: Any,
     preset_ctx: Any,
     base_scope: str,
+    *,
+    engine: Any = None,
+    task_id: Any = None,
 ) -> HarvestStats:
     """Walk the source STAC catalog (or single collection) and write locally.
 
@@ -640,6 +767,14 @@ async def run_harvest(
     or a full catalog, resolves the apply scope accordingly (collection scope for
     a single-collection harvest, catalog scope otherwise), pins routing + STAC
     BEFORE the first write, then ingests.
+
+    When ``request.resume`` is set (#3034) — stamped by a previous attempt of
+    this same task via ``engine``/``task_id`` — a full-catalog walk skips every
+    source collection up to and including ``resume.collection_id`` (already
+    completed or in progress in a prior attempt) and resumes that collection's
+    items walk from ``resume.items_href`` instead of restarting the whole
+    catalog from its first collection. A single-collection harvest resumes its
+    one collection's items walk directly from ``resume.items_href``.
 
     Parameters
     ----------
@@ -651,9 +786,14 @@ async def run_harvest(
         PresetContext used to apply the routing / stac_storage presets.
     base_scope:
         The catalog-scope string (``"catalog:{target_catalog}"``).
+    engine, task_id:
+        DB engine + this task's own row id, used to persist the resume cursor
+        after each batch commits. Cursor persistence is skipped (best-effort,
+        never fatal) when either is ``None``.
     """
     stats = HarvestStats()
     target_catalog = request.target_catalog
+    resume = request.resume
 
     # Detect a single-collection source (blocking probe off the event loop).
     single = await asyncio.to_thread(_probe_single_collection, request.catalog_url)
@@ -661,10 +801,19 @@ async def run_harvest(
     if single is not None:
         source_coll, items_url = single
         target_col = str(request.target_collection or source_coll.get("id", "")).lower()
+        source_col_id = str(source_coll.get("id", target_col))
         logger.info(
             "stac_harvest: single-collection source %s → collection %s",
             request.catalog_url, target_col,
         )
+        if resume is not None and resume.done:
+            # A prior attempt already drained this collection fully; nothing
+            # left to walk (should be rare — a COMPLETED task is not retried).
+            logger.info(
+                "stac_harvest: resume cursor marks %s already done — skipping "
+                "items walk.", target_col,
+            )
+            return stats
         # Pin routing at CATALOG scope (collection + items templates), not the
         # narrower collection scope.  ``create_collection`` for the target
         # collection resolves its CollectionRoutingConfig at catalog scope; the
@@ -679,9 +828,21 @@ async def run_harvest(
             if perr:
                 stats.errors.append(perr)
         stats.collections_seen = 1
+        page_cursor = PageCursor()
+        resume_href = resume.items_href if resume is not None else None
+        items_iter = _iter_items_from(
+            resume_href or items_url, target_col, cursor=page_cursor,
+            resume_from_href=bool(resume_href),
+        )
+        if resume_href:
+            logger.info(
+                "stac_harvest: resuming %s items walk from persisted cursor.",
+                target_col,
+            )
         await _harvest_collection(
-            catalogs, request, source_coll,
-            _iter_items_from(items_url, target_col), target_col, stats,
+            catalogs, request, source_coll, items_iter, target_col, stats,
+            source_collection_id=source_col_id, engine=engine, task_id=task_id,
+            page_cursor=page_cursor,
         )
         return stats
 
@@ -694,14 +855,69 @@ async def run_harvest(
         if perr:
             stats.errors.append(perr)
 
+    # Re-walking /collections is cheap (a handful of paginated list requests)
+    # even on a resume — only the per-item walk below needs to skip already
+    # -completed work. ``found_resume_point`` gates the skip: True from the
+    # start when there is nothing to resume.
+    found_resume_point = resume is None or not resume.collection_id
+
     async for coll_raw in iter_collections(request.catalog_url):
         if request.max_collections and stats.collections_seen >= request.max_collections:
             break
-        stats.collections_seen += 1
         cid = str(map_collection(coll_raw)["id"])
+        source_cid = str(coll_raw.get("id", cid))
+
+        if not found_resume_point:
+            # found_resume_point is only False when resume.collection_id is
+            # truthy (see its definition above), so resume is never None here.
+            assert resume is not None
+            if source_cid != resume.collection_id:
+                # Completed by a prior attempt (walk order precedes the
+                # resume point) — skip its items walk entirely.
+                continue
+            found_resume_point = True
+            if resume.done:
+                # This collection itself finished in a prior attempt too;
+                # resume from the one after it.
+                continue
+            resume_href = resume.items_href
+        else:
+            resume_href = None
+
+        stats.collections_seen += 1
+        page_cursor = PageCursor()
+        items_iter = (
+            _iter_items_from(
+                resume_href, source_cid, cursor=page_cursor,
+                resume_from_href=True,
+            )
+            if resume_href
+            else iter_items(request.catalog_url, source_cid, cursor=page_cursor)
+        )
+        if resume_href:
+            logger.info(
+                "stac_harvest: resuming %s items walk from persisted cursor.",
+                cid,
+            )
         await _harvest_collection(
-            catalogs, request, coll_raw,
-            iter_items(request.catalog_url, coll_raw.get("id", cid)), cid, stats,
+            catalogs, request, coll_raw, items_iter, cid, stats,
+            source_collection_id=source_cid, engine=engine, task_id=task_id,
+            page_cursor=page_cursor,
+        )
+
+    if not found_resume_point:
+        # The persisted resume_collection_id never turned up while re-walking
+        # /collections — the source likely renamed or removed it since the
+        # last attempt. Every collection this attempt saw got skipped as
+        # "already done", so silently returning here would report a false
+        # success with 0 collections/items harvested. Fail loudly instead of
+        # masking a source-side change behind an empty result.
+        assert resume is not None  # implied by found_resume_point being False
+        raise RuntimeError(
+            f"stac_harvest: resume cursor collection_id={resume.collection_id!r} "
+            "was not found while re-walking /collections — it may have been "
+            "renamed or removed at the source since the previous attempt; "
+            "resubmit without a resume cursor for a fresh full harvest."
         )
 
     return stats
@@ -790,7 +1006,10 @@ class StacHarvestTask(
                 "skipped): %s(%s)", type(exc).__name__, exc,
             )
 
-        stats = await run_harvest(request, catalogs, preset_ctx, scope)
+        stats = await run_harvest(
+            request, catalogs, preset_ctx, scope,
+            engine=self.engine, task_id=payload.task_id,
+        )
 
         logger.info(
             "stac_harvest: finished — drivers=%s collections=%d/%d "

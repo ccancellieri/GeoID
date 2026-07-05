@@ -34,6 +34,25 @@ _LEGACY_BACKEND_TO_DRIVERS = {
 }
 
 
+class StacHarvestCursor(BaseModel):
+    """Resume position within a harvest walk, stamped by the harvest loop (#3034).
+
+    ``collection_id`` is the *source* collection id currently in progress
+    (``None`` before the first collection starts, or between two collections
+    in a full-catalog harvest). ``items_href`` is the STAC ``rel=next`` items
+    page URL to resume from within that collection (``None`` means start it
+    from the beginning). ``done`` marks that collection's item walk as fully
+    drained, so a resumed catalog walk skips it and moves to the next one.
+
+    Populated automatically after each items-page batch write commits — never
+    set this on submit.
+    """
+
+    collection_id: Optional[str] = None
+    items_href: Optional[str] = None
+    done: bool = False
+
+
 class StacHarvestRequest(BaseModel):
     """Inputs for the ``stac_harvest`` OGC Process.
 
@@ -92,6 +111,15 @@ class StacHarvestRequest(BaseModel):
             "PG primary + async ES secondary; ``pg`` uses PG only; ``pg_pes`` "
             "writes PG primary + private ES secondary.  Legacy ``storage_backend`` "
             "(es / es_pg / pg) is still accepted and mapped to this field."
+        ),
+    )
+    resume: Optional[StacHarvestCursor] = Field(
+        default=None,
+        description=(
+            "Resume cursor stamped by the harvest loop after each completed "
+            "items page (#3034) — do not set on submit. A retry of this task "
+            "after a timeout/kill resumes the walk from here instead of "
+            "restarting the whole source catalog from the beginning."
         ),
     )
 

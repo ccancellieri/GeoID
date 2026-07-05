@@ -196,10 +196,11 @@ async def test_catalog_harvest_applies_at_catalog_scope():
 
 
 class _Payload:
-    """Minimal stand-in for TaskPayload — ``run`` only reads ``.inputs``."""
+    """Minimal stand-in for TaskPayload — ``run`` reads ``.inputs``/``.task_id``."""
 
     def __init__(self, inputs: Dict[str, Any]) -> None:
         self.inputs = {"inputs": inputs}
+        self.task_id = "11111111-1111-1111-1111-111111111111"
 
 
 def _run_task_with_stats(stats: harvest_task.HarvestStats):
