@@ -33,7 +33,7 @@ license-files = ["../../LICENSE"]
 # `module_*` extras and only lands in environments whose SCOPE pulls them in.
 dependencies = [
     "pydantic>=2.0",
-    "pydantic-settings>=2.3.0",
+    "pydantic-settings>=2.14.2",
     "pydantic-extra-types>=2.10.6",
     "python-dotenv>=1.0.0",
     "python-dateutil",
@@ -41,7 +41,7 @@ dependencies = [
     # tools/secrets.py Fernet-encrypts `{"__secret__": ...}` config fields;
     # engine configs carrying encrypted credentials (e.g. valkey_engine_config)
     # fail to load in build_engine_snapshot without it. See #2976.
-    "cryptography>=42.0.0",
+    "cryptography>=48.0.1",
 ]
 
 # ============================================================================

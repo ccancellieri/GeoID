@@ -8,11 +8,13 @@
 # The base image is pinned by DIGEST, not just by the ubuntu-full-<X> tag.
 # osgeo rebuilds those tags in place onto newer Ubuntu releases, so the digest
 # freezes the exact OS/Python/GDAL triple regardless of later tag rebases.
-# Current digest resolves `ubuntu-full-3.13.0` = GDAL 3.13.0 on Ubuntu 26.04 /
+# Current digest resolves `ubuntu-full-3.13.1` = GDAL 3.13.1 on Ubuntu 26.04 /
 # Python 3.14. The full geospatial+columnar stack now ships cp314 wheels
 # (numpy 2, pyarrow 24, shapely, rasterio, pyproj; fiona was retired in favour
 # of pyogrio) so the build no longer falls back to compiling from source.
-# GDAL 3.13.0 also carries the CVE-2026-8087/8088 fixes (no 3.11/3.12 backport).
+# GDAL 3.13.0 carries the CVE-2026-8087/8088 fixes (no 3.11/3.12 backport);
+# 3.13.1 is a bugfix release closing the netCDF driver
+# scanForGeometryContainers stack-overflow flagged against 3.13.0.
 
 # STAGE 0: JupyterLite Builder — pre-builds browser-based Python kernel (Pyodide)
 # Skipped cheaply when BUILD_JUPYTERLITE=false (Cloud Run jobs/workers that
@@ -54,7 +56,7 @@ RUN if [ "${BUILD_JUPYTERLITE}" = "true" ]; then \
     fi
 
 # STAGE 1: Builder (Production dependencies)
-FROM ghcr.io/osgeo/gdal:ubuntu-full-3.13.0@sha256:83d114a6891ae18aa175d81a14c92a96d23944667b36fde9c15c4a10215d8939 AS builder
+FROM ghcr.io/osgeo/gdal:ubuntu-full-3.13.1@sha256:aff1d5515aa0e9b50be34ab11d6c0c2cfabc23cdcb7a2e0bc5748101eedb3e4a AS builder
 
 LABEL maintainer="carlo.cancellieri@fao.org"
 
@@ -329,7 +331,7 @@ WORKDIR ${APP_DIR}
 EXPOSE 5678 5679
 
 # STAGE 4: Runtime (Production image)
-FROM ghcr.io/osgeo/gdal:ubuntu-full-3.13.0@sha256:83d114a6891ae18aa175d81a14c92a96d23944667b36fde9c15c4a10215d8939 AS runtime
+FROM ghcr.io/osgeo/gdal:ubuntu-full-3.13.1@sha256:aff1d5515aa0e9b50be34ab11d6c0c2cfabc23cdcb7a2e0bc5748101eedb3e4a AS runtime
 
 ARG APP_USER=dynastore
 ARG APP_UID=1001
