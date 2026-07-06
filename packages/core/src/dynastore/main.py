@@ -49,6 +49,15 @@ from dynastore.tools.background_service import (
 from dynastore.tools.correlation import _correlation_id_var, set_correlation_id
 from dynastore.tools.memory_watchdog import build_memory_watchdog_service
 from dynastore.tools.serving_state import is_draining
+
+# Register the scaling PluginConfig at the composition root so its class_key is
+# known to the config seeder. The seeder runs inside the TasksModule lifespan
+# and resolves only already-imported PluginConfig subclasses; scaling is
+# otherwise first imported when CatalogModule's lifespan starts its signal
+# publisher — one step too late, so a scaling-policy seed is silently skipped
+# as "unknown class_key". Importing here (main is imported before any lifespan)
+# guarantees registration in time — same pattern as the memory watchdog above.
+from dynastore.modules.scaling import config as _scaling_config  # noqa: F401
 from fastapi.concurrency import run_in_threadpool
 
 # --- Initialize Concurrency Backend ---

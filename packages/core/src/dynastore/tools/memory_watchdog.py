@@ -35,31 +35,21 @@ requiring any new dependency — RSS is read straight from
 this service runs in (returns ``None``, so the watchdog no-ops, on any
 platform where that file does not exist, e.g. local macOS dev).
 
-The memory budget (``MemoryWatchdogConfig.limit_mb``) is platform config,
-resolved through the same ``PluginConfig`` mechanism as every other tunable
-in this codebase — never an env var. Left unset (the default), the budget
-is auto-detected from the container's own cgroup memory limit (v2
-``memory.max``, falling back to v1 ``memory.limit_in_bytes``), which is
-typically the container's memory limit divided by the number of gunicorn
-workers sharing it, since each worker is its own process with its own RSS.
-If neither cgroup file is present or both report "no limit" (e.g. local
-dev on macOS, or a container run without a memory limit), the watchdog
-stays inert rather than guessing.
-
-Cloud Run's sandbox does not expose ``/sys/fs/cgroup`` at all (see
-``modules/scaling/publisher.py`` for the confirmed detail), so cgroup
-auto-detection always returns ``None`` there — the RSS reading itself
-still works (``/proc/self/status`` is present), only the budget to compare
-it against is missing. ``build_memory_watchdog_service`` runs at lifespan
-start, before the platform config store is reachable, so a ``limit_mb``
-set later via per-env deploy config would never be picked up if it were
-resolved only once at build time. To make that per-env value actually
-take effect on Cloud Run, the effective ``limit_mb`` is instead resolved
-lazily on the service's first ``tick()`` (by which point the config store
-is up — the watchdog's own default 15s cadence already comfortably clears
-that window) and cached from then on: explicit ``limit_mb`` wins, else
-cgroup auto-detection (GKE / local dev), else the watchdog stays inert
-for the RSS-vs-budget comparison, logging that once.
+The per-worker memory budget is derived at service construction from the
+deploy env — the container memory size (``RAM`` env var, else the cgroup
+limit) divided by ``GUNICORN_WORKERS`` — because each gunicorn worker is a
+separate process watching its own RSS. This needs no config-store round-trip,
+so the budget is available from the very first ``tick()``. Cloud Run's sandbox
+does not expose ``/sys/fs/cgroup`` at all (see ``modules/scaling/publisher.py``
+for the confirmed detail), so cgroup auto-detection always returns ``None``
+there — which is exactly why the budget is read from the deploy-injected
+``RAM``/``GUNICORN_WORKERS`` env rather than the filesystem. The ratios in
+``MemoryWatchdogConfig`` (``warn_ratio``/``critical_ratio``/``recycle_ratio``)
+are thus percentages of each service's own RAM, with no hand-maintained
+per-service MB to keep in sync with the deploy config. An operator may still
+pin an explicit ``config.limit_mb`` per-worker override (read live every tick);
+when neither the env nor cgroup yields a budget (e.g. local macOS dev), the
+watchdog stays inert rather than guessing.
 
 Lever B — readiness-shed + graceful self-recycle (geoid#2946, #2924)
 ----------------------------------------------------------------------
@@ -112,6 +102,25 @@ _PROC_STATUS_PATH = "/proc/self/status"
 
 _CGROUP_V2_MEMORY_MAX_PATH = "/sys/fs/cgroup/memory.max"
 _CGROUP_V1_MEMORY_LIMIT_PATH = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+
+# Deploy-injected env vars used to derive the per-worker memory budget on
+# Cloud Run, where cgroup memory files are absent. ``RAM`` is the container
+# memory size (e.g. "8Gi"); ``GUNICORN_WORKERS`` is the process count sharing
+# it. See ``resolve_watchdog_budget_mb``.
+_RAM_ENV = "RAM"
+_WORKERS_ENV = "GUNICORN_WORKERS"
+
+# Kubernetes/Cloud-Run memory-quantity suffix factors (binary vs decimal).
+_MEM_SUFFIX_FACTORS = {
+    "k": 1000,
+    "ki": 1024,
+    "m": 1000**2,
+    "mi": 1024**2,
+    "g": 1000**3,
+    "gi": 1024**3,
+    "t": 1000**4,
+    "ti": 1024**4,
+}
 
 # Cgroup v1 reports "no limit" as a huge sentinel (commonly
 # 9223372036854771712, close to but not exactly int64-max, since the kernel
@@ -170,13 +179,22 @@ class MemoryWatchdogService(PeriodicService):
             raise ValueError("limit_bytes must be positive")
         if not 0 < warn_ratio < critical_ratio <= 1:
             raise ValueError("require 0 < warn_ratio < critical_ratio <= 1")
-        # None means "not yet resolved" — resolved lazily on the first tick()
-        # (see _resolve_limit_bytes_once) rather than here, so a limit_mb set
-        # later via deploy config still takes effect once the platform config
-        # store is reachable. Explicitly passing a limit_bytes (as every
-        # tick()-focused unit test below does) marks it resolved immediately.
-        self._limit_bytes = limit_bytes
-        self._limit_resolved = limit_bytes is not None
+        # Test/caller injection of an explicit budget (every tick()-focused
+        # unit test below passes this). None means "derive it".
+        self._explicit_limit_bytes = limit_bytes
+        # Per-worker budget derived from the deploy env (RAM / GUNICORN_WORKERS),
+        # resolved synchronously at startup with NO dependency on the DB-backed
+        # config store. This is the key fix over the previous lazy first-tick
+        # resolution: that ran before the store (or a failed early load) was
+        # reachable and latched "no limit" permanently. The env budget is
+        # available from process start, so the watchdog is armed from the first
+        # tick. An explicit ``config.limit_mb`` (rare) still overrides it live,
+        # read fresh in ``_effective_limit_bytes`` each tick.
+        self._env_budget_bytes: Optional[int] = None
+        if limit_bytes is None:
+            budget_mb = resolve_watchdog_budget_mb()
+            if budget_mb is not None:
+                self._env_budget_bytes = budget_mb * 1024 * 1024
         self._warn_ratio = warn_ratio
         self._critical_ratio = critical_ratio
         self.cadence_seconds = cadence_seconds
@@ -186,48 +204,49 @@ class MemoryWatchdogService(PeriodicService):
         # logs; the CRITICAL transition always logs since it is the
         # actionable, monitored signal this service exists to raise.
         self._warned = False
+        # Throttle the "no budget resolved" inert notice to once per crossing.
+        self._inert_warned = False
         # Lever B (self-recycle) bookkeeping — see _maybe_self_recycle. The
-        # recycle knobs themselves are never cached: they are read fresh
-        # from config on every tick (they are the hot-reload kill-switches),
-        # unlike _limit_bytes above which resolves once and is cached.
+        # recycle knobs are read fresh from config on every tick (they are the
+        # hot-reload kill-switches).
         self._started_at = time.monotonic()
         self._last_recycle_attempt: Optional[float] = None
 
-    async def _resolve_limit_bytes_once(
-        self, config: "MemoryWatchdogConfig", ctx: ServiceContext
-    ) -> None:
-        """Resolve ``self._limit_bytes`` exactly once, on the first tick.
+    def _effective_limit_bytes(
+        self, config: "MemoryWatchdogConfig"
+    ) -> Optional[int]:
+        """The per-worker RSS budget in bytes, recomputed every tick.
 
-        Priority: explicit ``config.limit_mb`` wins, else cgroup
-        auto-detection, else stays ``None`` (inert) — logged once, not
-        retried on later ticks even if config changes afterwards.
+        Priority: an explicit ``limit_bytes`` passed to the constructor (unit
+        tests / callers) > an operator-set ``config.limit_mb`` (a per-worker
+        override, read live so it can be tuned without a redeploy) > the
+        env-derived per-worker budget resolved once at startup. ``None`` when
+        none is available — the watchdog then stays inert.
         """
-        self._limit_resolved = True
-        limit_mb = (
-            config.limit_mb
-            if config.limit_mb is not None
-            else detect_cgroup_memory_limit_mb()
-        )
-        if limit_mb is None:
-            logger.warning(
-                "memory_watchdog: no limit_mb configured and cgroup "
-                "auto-detection found none (or reported unlimited) on %s — "
-                "watchdog stays inert (no RSS budget to compare against).",
-                ctx.name,
-            )
-            return
-        self._limit_bytes = limit_mb * 1024 * 1024
+        if self._explicit_limit_bytes is not None:
+            return self._explicit_limit_bytes
+        if config.limit_mb is not None:
+            return config.limit_mb * 1024 * 1024
+        return self._env_budget_bytes
 
     async def tick(self, ctx: ServiceContext) -> None:
         config = await load_memory_watchdog_config()
-
-        if not self._limit_resolved:
-            await self._resolve_limit_bytes_once(config, ctx)
+        limit_bytes = self._effective_limit_bytes(config)
 
         rss_bytes = self._get_rss_bytes()
-        if rss_bytes is None or self._limit_bytes is None:
+        if rss_bytes is None or limit_bytes is None:
+            if limit_bytes is None and not self._inert_warned:
+                logger.warning(
+                    "memory_watchdog: no per-worker memory budget resolved "
+                    "(no limit_mb in config, and no RAM env / cgroup limit) on "
+                    "%s — watchdog stays inert (no RSS budget to compare "
+                    "against).",
+                    ctx.name,
+                )
+                self._inert_warned = True
             return
-        ratio = rss_bytes / self._limit_bytes
+        self._inert_warned = False
+        ratio = rss_bytes / limit_bytes
         if ratio >= self._critical_ratio:
             logger.error(
                 "memory_watchdog: RSS %.0fMiB is %.0f%% of the %.0fMiB budget "
@@ -235,7 +254,7 @@ class MemoryWatchdogService(PeriodicService):
                 "imminent OOM kill.",
                 rss_bytes / (1024 * 1024),
                 ratio * 100,
-                self._limit_bytes / (1024 * 1024),
+                limit_bytes / (1024 * 1024),
                 self._critical_ratio * 100,
                 ctx.name,
             )
@@ -247,7 +266,7 @@ class MemoryWatchdogService(PeriodicService):
                     "(>= warn %.0f%%) on %s.",
                     rss_bytes / (1024 * 1024),
                     ratio * 100,
-                    self._limit_bytes / (1024 * 1024),
+                    limit_bytes / (1024 * 1024),
                     self._warn_ratio * 100,
                     ctx.name,
                 )
@@ -255,10 +274,14 @@ class MemoryWatchdogService(PeriodicService):
         else:
             self._warned = False
 
-        await self._maybe_self_recycle(ctx, config, ratio)
+        await self._maybe_self_recycle(ctx, config, ratio, limit_bytes)
 
     async def _maybe_self_recycle(
-        self, ctx: ServiceContext, config: "MemoryWatchdogConfig", ratio: float
+        self,
+        ctx: ServiceContext,
+        config: "MemoryWatchdogConfig",
+        ratio: float,
+        limit_bytes: int,
     ) -> None:
         """Pre-empt an OOM kill by gracefully recycling THIS worker (Lever B).
 
@@ -292,10 +315,10 @@ class MemoryWatchdogService(PeriodicService):
         # Re-check after the jitter delay: a transient spike that has
         # already subsided by now should not trigger a recycle.
         rss_bytes = self._get_rss_bytes()
-        if rss_bytes is None or self._limit_bytes is None:
+        if rss_bytes is None:
             clear_draining()
             return
-        recheck_ratio = rss_bytes / self._limit_bytes
+        recheck_ratio = rss_bytes / limit_bytes
         if recheck_ratio < config.recycle_ratio:
             logger.info(
                 "memory_watchdog: self-recycle aborted after %.1fs jitter — "
@@ -334,14 +357,14 @@ class MemoryWatchdogConfig(PluginConfig):
         default=None,
         gt=0,
         description=(
-            "The memory budget (in MB) this process is watched against — "
-            "typically the container's memory limit divided by the number "
-            "of gunicorn workers sharing it, since each worker is its own "
-            "process with its own RSS. When unset (the default), the "
-            "budget is auto-detected from the container's own cgroup "
-            "memory limit (v2 memory.max, falling back to v1 "
-            "memory.limit_in_bytes). If neither is present or both report "
-            "no limit, the watchdog stays inert rather than guessing."
+            "Optional explicit per-worker memory budget (in MB) this process "
+            "is watched against. Leave unset (the default): the budget is then "
+            "derived automatically from the deploy env as the container memory "
+            "(RAM env var, else cgroup limit) divided by GUNICORN_WORKERS, "
+            "since each worker is its own process with its own RSS — so it "
+            "tracks each service's RAM without a hand-maintained per-service "
+            "number. Set this only to override that (e.g. an env where RAM is "
+            "not injected and no cgroup limit is exposed). Read live every tick."
         ),
     )
 
@@ -490,6 +513,70 @@ def detect_cgroup_memory_limit_mb() -> Optional[int]:
     return limit_bytes // (1024 * 1024)
 
 
+def parse_memory_to_mb(raw: Optional[str]) -> Optional[int]:
+    """Parse a Kubernetes/Cloud-Run memory quantity into whole MB.
+
+    Accepts values like ``"8Gi"``, ``"2G"``, ``"512Mi"`` or a bare byte count.
+    Binary suffixes (``Ki``/``Mi``/``Gi``/``Ti``) use 1024; decimal suffixes
+    (``K``/``M``/``G``/``T``) use 1000, per the Kubernetes quantity spec.
+    Returns ``None`` for empty or unparseable input.
+    """
+    if not raw:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    # Longest suffix first so "gi" matches before "g".
+    for suffix in ("ki", "mi", "gi", "ti", "k", "m", "g", "t"):
+        if lowered.endswith(suffix):
+            number = text[: -len(suffix)].strip()
+            factor = _MEM_SUFFIX_FACTORS[suffix]
+            break
+    else:
+        number, factor = text, 1
+    try:
+        value_bytes = float(number) * factor
+    except ValueError:
+        return None
+    if value_bytes <= 0:
+        return None
+    return int(value_bytes) // (1024 * 1024)
+
+
+def _detect_total_container_mb() -> Optional[int]:
+    """Total container memory budget (MB) from the deploy env, then cgroup.
+
+    Cloud Run (gen2) does not expose a readable ``/sys/fs/cgroup`` (see the
+    module docstring), so cgroup auto-detection returns ``None`` there. The
+    deploy does inject the container memory size as the ``RAM`` env var, so we
+    read that first and fall back to cgroup for platforms that expose it
+    (GKE / on-prem). ``None`` when neither yields a value (e.g. local dev).
+    """
+    return parse_memory_to_mb(os.environ.get(_RAM_ENV)) or detect_cgroup_memory_limit_mb()
+
+
+def resolve_watchdog_budget_mb() -> Optional[int]:
+    """Per-worker RSS budget (MB): total container memory / gunicorn workers.
+
+    Each gunicorn worker is its own process watching its own RSS, so the budget
+    a single worker is measured against is the container's memory divided by the
+    worker count (``GUNICORN_WORKERS`` env, default 1). Derived entirely from
+    process env — no dependency on the DB-backed config store — so the budget is
+    available from the very first tick, even before that store is reachable.
+    Returns ``None`` when no total-memory source is available.
+    """
+    total_mb = _detect_total_container_mb()
+    if total_mb is None:
+        return None
+    try:
+        workers = int(os.environ.get(_WORKERS_ENV, "1") or "1")
+    except ValueError:
+        workers = 1
+    workers = max(1, workers)
+    return max(1, total_mb // workers)
+
+
 async def load_memory_watchdog_config() -> MemoryWatchdogConfig:
     """Load ``MemoryWatchdogConfig`` from the platform config store.
 
@@ -521,13 +608,11 @@ async def build_memory_watchdog_service(
     Loads the config from the platform config store when *config* is not
     supplied. Returns ``None`` (watchdog inert) only when disabled via
     config — never merely because a memory budget could not yet be
-    resolved. This runs at lifespan start, before the platform config store
-    is reachable, so resolving ``limit_mb`` here would permanently lock in
-    "no limit" for any environment (Cloud Run above all — see the module
-    docstring) where the operative value is only set later via deploy
-    config. The effective ``limit_mb`` (explicit config, else cgroup
-    auto-detection, else inert) is instead resolved lazily on the service's
-    first ``tick()``, by which point the config store is reachable.
+    resolved. The per-worker budget is derived from the process env
+    (RAM / GUNICORN_WORKERS, else cgroup) inside the service constructor,
+    which needs no config store, so an explicit ``config.limit_mb`` override
+    is read live on every ``tick()`` rather than captured here — this runs at
+    lifespan start, before the store is reachable.
     """
     if config is None:
         config = await load_memory_watchdog_config()
@@ -535,11 +620,7 @@ async def build_memory_watchdog_service(
         logger.debug("memory_watchdog: disabled via config — skipping.")
         return None
 
-    limit_bytes = (
-        config.limit_mb * 1024 * 1024 if config.limit_mb is not None else None
-    )
     return MemoryWatchdogService(
-        limit_bytes=limit_bytes,
         warn_ratio=config.warn_ratio,
         critical_ratio=config.critical_ratio,
         cadence_seconds=config.cadence_seconds,
@@ -552,5 +633,7 @@ __all__ = [
     "build_memory_watchdog_service",
     "detect_cgroup_memory_limit_mb",
     "load_memory_watchdog_config",
+    "parse_memory_to_mb",
     "read_process_rss_bytes",
+    "resolve_watchdog_budget_mb",
 ]

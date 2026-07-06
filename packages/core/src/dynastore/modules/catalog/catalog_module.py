@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from dynastore.modules.storage.hints import Hint
 
 from dynastore.modules import ModuleProtocol
+
 from dynastore.modules.db_config.query_executor import (
     managed_transaction,
     DDLQuery,

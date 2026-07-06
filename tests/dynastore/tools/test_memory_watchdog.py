@@ -32,8 +32,18 @@ from dynastore.tools.memory_watchdog import (
     MemoryWatchdogService,
     build_memory_watchdog_service,
     detect_cgroup_memory_limit_mb,
+    parse_memory_to_mb,
     read_process_rss_bytes,
+    resolve_watchdog_budget_mb,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_budget_env(monkeypatch):
+    """Isolate the env-derived budget: unset RAM / GUNICORN_WORKERS so a test
+    only sees what it explicitly sets. Individual tests re-set them as needed."""
+    monkeypatch.delenv("RAM", raising=False)
+    monkeypatch.delenv("GUNICORN_WORKERS", raising=False)
 
 
 def _make_ctx(name: str = "test-host") -> ServiceContext:
@@ -315,12 +325,9 @@ async def test_build_service_disabled_via_config() -> None:
 
 @pytest.mark.asyncio
 async def test_build_service_never_none_merely_for_unresolved_limit(monkeypatch, tmp_path) -> None:
-    """Fix 1: the service is always built when enabled, regardless of
-    whether a memory budget can be resolved yet — resolution is deferred to
-    the first tick() (see the lazy-resolution tests below), so a per-env
-    limit_mb committed to the config store shortly after boot still takes
-    effect instead of being permanently locked out by an unreachable config
-    store at lifespan-start time."""
+    """The service is always built when enabled, even if no budget can be
+    resolved yet (no RAM env, no cgroup) — it stays inert until a budget
+    appears (an operator limit_mb, read live) rather than refusing to start."""
     monkeypatch.setattr(
         "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
         str(tmp_path / "does-not-exist-v2"),
@@ -331,41 +338,24 @@ async def test_build_service_never_none_merely_for_unresolved_limit(monkeypatch,
     )
     svc = await build_memory_watchdog_service(MemoryWatchdogConfig())
     assert svc is not None
-    assert svc._limit_bytes is None
+    assert svc._env_budget_bytes is None
 
 
 @pytest.mark.asyncio
-async def test_build_service_uses_explicit_limit_mb_over_cgroup(monkeypatch, tmp_path) -> None:
-    """An explicit config.limit_mb is available synchronously at build time
-    (the caller already supplied a resolved config), so it is wired straight
-    into the service — no tick() required, and cgroup detection is never
-    even consulted."""
-    v2_file = tmp_path / "memory.max"
-    v2_file.write_text("536870912\n")  # 512 MiB — must be ignored, explicit limit wins
-    monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH", str(v2_file)
-    )
-
-    svc = await build_memory_watchdog_service(
-        MemoryWatchdogConfig(
-            limit_mb=1024, warn_ratio=0.7, critical_ratio=0.95, cadence_seconds=5.0,
-            recycle_ratio=0.99,  # must exceed critical_ratio=0.95
-        )
-    )
-
+async def test_build_service_derives_per_worker_budget_from_ram_env(monkeypatch) -> None:
+    """The budget is derived at construction from RAM / GUNICORN_WORKERS —
+    no tick, no config store, no cgroup needed."""
+    monkeypatch.setenv("RAM", "8Gi")
+    monkeypatch.setenv("GUNICORN_WORKERS", "4")
+    svc = await build_memory_watchdog_service(MemoryWatchdogConfig())
     assert svc is not None
-    assert svc._limit_bytes == 1024 * 1024 * 1024
-    assert svc._limit_resolved is True
-    assert svc._warn_ratio == pytest.approx(0.7)
-    assert svc._critical_ratio == pytest.approx(0.95)
-    assert svc.cadence_seconds == pytest.approx(5.0)
+    assert svc._env_budget_bytes == 2048 * 1024 * 1024  # 8Gi / 4
 
 
 @pytest.mark.asyncio
-async def test_build_service_auto_detects_limit_from_cgroup_on_first_tick(monkeypatch, tmp_path) -> None:
-    """No explicit limit_mb: the budget is unresolved right after build()
-    (Fix 1) and only becomes available once the service's first tick() runs
-    cgroup auto-detection."""
+async def test_build_service_auto_detects_budget_from_cgroup_at_init(monkeypatch, tmp_path) -> None:
+    """With no RAM env, the budget falls back to the cgroup limit (÷ workers,
+    default 1), resolved at construction."""
     v2_file = tmp_path / "memory.max"
     v2_file.write_text("536870912\n")  # 512 MiB
     monkeypatch.setattr(
@@ -375,17 +365,61 @@ async def test_build_service_auto_detects_limit_from_cgroup_on_first_tick(monkey
     svc = await build_memory_watchdog_service(MemoryWatchdogConfig())
 
     assert svc is not None
-    assert svc._limit_bytes is None
+    assert svc._env_budget_bytes == 512 * 1024 * 1024
     assert svc._warn_ratio == pytest.approx(0.80)
     assert svc._critical_ratio == pytest.approx(0.90)
     assert svc.cadence_seconds == pytest.approx(15.0)
 
-    await svc.tick(_make_ctx())
-    assert svc._limit_bytes == 512 * 1024 * 1024
+
+# ---------------------------------------------------------------------------
+# parse_memory_to_mb / resolve_watchdog_budget_mb
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("8Gi", 8192),
+        ("2Gi", 2048),
+        ("512Mi", 512),
+        ("8G", 7629),          # 8 * 1000^3 bytes in whole MiB
+        ("1073741824", 1024),  # bare bytes = 1 GiB
+        ("", None),
+        ("garbage", None),
+        (None, None),
+    ],
+)
+def test_parse_memory_to_mb(raw, expected) -> None:
+    assert parse_memory_to_mb(raw) == expected
+
+
+def test_resolve_budget_divides_ram_by_workers(monkeypatch) -> None:
+    monkeypatch.setenv("RAM", "8Gi")
+    monkeypatch.setenv("GUNICORN_WORKERS", "5")
+    assert resolve_watchdog_budget_mb() == 8192 // 5  # 1638
+
+
+def test_resolve_budget_defaults_workers_to_one(monkeypatch) -> None:
+    monkeypatch.setenv("RAM", "4Gi")
+    # GUNICORN_WORKERS unset by the autouse fixture -> workers = 1
+    assert resolve_watchdog_budget_mb() == 4096
+
+
+def test_resolve_budget_none_when_no_source(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
+        str(tmp_path / "nope-v2"),
+    )
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH",
+        str(tmp_path / "nope-v1"),
+    )
+    assert resolve_watchdog_budget_mb() is None
 
 
 # ---------------------------------------------------------------------------
-# Fix 1 — lazy limit resolution on first tick()
+# Effective budget resolution per tick (env budget vs live config override) —
+# no first-tick latch: a limit_mb that appears later IS picked up.
 # ---------------------------------------------------------------------------
 
 
@@ -396,47 +430,67 @@ def _fake_config(cfg: MemoryWatchdogConfig):
     return _load
 
 
+def test_effective_limit_prefers_config_over_env_budget(monkeypatch) -> None:
+    """A live config.limit_mb (per-worker override) wins over the env budget."""
+    monkeypatch.setenv("RAM", "8Gi")
+    monkeypatch.setenv("GUNICORN_WORKERS", "4")  # env budget = 2048 MiB
+    svc = MemoryWatchdogService(get_rss_bytes=lambda: 100)
+    assert svc._env_budget_bytes == 2048 * 1024 * 1024
+    assert svc._effective_limit_bytes(MemoryWatchdogConfig(limit_mb=1024)) == 1024 * 1024 * 1024
+    # With no override, the env budget is used.
+    assert svc._effective_limit_bytes(MemoryWatchdogConfig()) == 2048 * 1024 * 1024
+
+
 @pytest.mark.asyncio
-async def test_tick_resolves_limit_from_live_config_over_cgroup(monkeypatch, tmp_path) -> None:
-    """A service built with no limit yet (config store unreachable at boot)
-    picks up a live config.limit_mb on its first tick, even when a cgroup
-    limit is also present — config wins."""
-    v2_file = tmp_path / "memory.max"
-    v2_file.write_text("536870912\n")  # 512 MiB — must be ignored
-    monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH", str(v2_file)
-    )
+async def test_tick_uses_env_budget_when_config_limit_unset(monkeypatch, caplog) -> None:
+    monkeypatch.setenv("RAM", "1Gi")  # workers=1 -> budget 1024 MiB
     monkeypatch.setattr(
         "dynastore.tools.memory_watchdog.load_memory_watchdog_config",
-        _fake_config(MemoryWatchdogConfig(limit_mb=256)),
+        _fake_config(MemoryWatchdogConfig(warn_ratio=0.5, critical_ratio=0.6, recycle_ratio=0.7)),
     )
-
-    svc = MemoryWatchdogService(get_rss_bytes=lambda: 100)
-    assert svc._limit_bytes is None
-
-    await svc.tick(_make_ctx())
-    assert svc._limit_bytes == 256 * 1024 * 1024
+    # RSS = 700 MiB -> 68% of the 1024 MiB env budget: above critical (60%).
+    svc = MemoryWatchdogService(
+        warn_ratio=0.5, critical_ratio=0.6, get_rss_bytes=lambda: 700 * 1024 * 1024,
+    )
+    assert svc._env_budget_bytes == 1024 * 1024 * 1024
+    with caplog.at_level(logging.ERROR, logger="dynastore.tools.memory_watchdog"):
+        await svc.tick(_make_ctx())
+    assert any("critical" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio
-async def test_tick_falls_back_to_cgroup_when_config_limit_unset(monkeypatch, tmp_path) -> None:
-    v2_file = tmp_path / "memory.max"
-    v2_file.write_text("536870912\n")  # 512 MiB
+async def test_tick_config_limit_picked_up_live_no_latch(monkeypatch, tmp_path) -> None:
+    """Regression for the early-boot latch: a service built with NO budget
+    (no RAM env, no cgroup) must pick up a config.limit_mb that only becomes
+    loadable on a LATER tick — the old design latched 'inert' on the first
+    tick and never recovered."""
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH", str(v2_file)
+        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
+        str(tmp_path / "nope-v2"),
     )
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH",
+        str(tmp_path / "nope-v1"),
+    )
+    # First tick: config store 'unreachable' -> default config (no limit_mb).
     monkeypatch.setattr(
         "dynastore.tools.memory_watchdog.load_memory_watchdog_config",
         _fake_config(MemoryWatchdogConfig()),
     )
-
     svc = MemoryWatchdogService(get_rss_bytes=lambda: 100)
-    await svc.tick(_make_ctx())
-    assert svc._limit_bytes == 512 * 1024 * 1024
+    assert svc._env_budget_bytes is None
+    await svc.tick(_make_ctx())  # inert, no crash
+
+    # A later tick: config now carries an explicit per-worker limit_mb.
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog.load_memory_watchdog_config",
+        _fake_config(MemoryWatchdogConfig(limit_mb=512)),
+    )
+    assert svc._effective_limit_bytes(MemoryWatchdogConfig(limit_mb=512)) == 512 * 1024 * 1024
 
 
 @pytest.mark.asyncio
-async def test_tick_stays_inert_when_neither_config_nor_cgroup_resolves(monkeypatch, tmp_path, caplog) -> None:
+async def test_tick_inert_and_warns_once_when_no_budget(monkeypatch, tmp_path, caplog) -> None:
     monkeypatch.setattr(
         "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
         str(tmp_path / "does-not-exist-v2"),
@@ -453,43 +507,11 @@ async def test_tick_stays_inert_when_neither_config_nor_cgroup_resolves(monkeypa
     svc = MemoryWatchdogService(get_rss_bytes=lambda: 100)
     with caplog.at_level(logging.WARNING, logger="dynastore.tools.memory_watchdog"):
         await svc.tick(_make_ctx())
+        await svc.tick(_make_ctx())
 
-    assert svc._limit_bytes is None
-    assert svc._limit_resolved is True
-    assert any("stays inert" in r.getMessage() for r in caplog.records)
-
-
-@pytest.mark.asyncio
-async def test_tick_resolves_limit_only_once_then_caches(monkeypatch, tmp_path) -> None:
-    """A limit_mb committed to config AFTER the first tick must not retroactively
-    change the resolved (and already cached) limit — resolution happens exactly
-    once, per the design (avoids re-detecting cgroup / re-reading config every
-    15s for a value that only matters once at startup)."""
-    monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
-        str(tmp_path / "does-not-exist-v2"),
-    )
-    monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH",
-        str(tmp_path / "does-not-exist-v1"),
-    )
-    monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog.load_memory_watchdog_config",
-        _fake_config(MemoryWatchdogConfig()),
-    )
-
-    svc = MemoryWatchdogService(get_rss_bytes=lambda: 100)
-    await svc.tick(_make_ctx())
-    assert svc._limit_bytes is None
-
-    # A later config commits limit_mb — but the first tick already cached
-    # "inert", so a second tick must not pick it up.
-    monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog.load_memory_watchdog_config",
-        _fake_config(MemoryWatchdogConfig(limit_mb=999)),
-    )
-    await svc.tick(_make_ctx())
-    assert svc._limit_bytes is None
+    assert svc._env_budget_bytes is None
+    inert = [r for r in caplog.records if "stays inert" in r.getMessage()]
+    assert len(inert) == 1  # throttled to once
 
 
 # ---------------------------------------------------------------------------
