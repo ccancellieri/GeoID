@@ -1232,6 +1232,9 @@ async def get_tile_resolution_params(
         simplification_by_zoom: Dict[int, float] = {}
         min_feature_pixel_area_by_zoom: Dict[int, float] = {}
         min_feature_pixel_length_by_zoom: Dict[int, float] = {}
+        max_features_per_tile_by_zoom: Dict[int, int] = {}
+        feature_rank_column: Optional[str] = None
+        min_feature_rank_by_zoom: Dict[int, float] = {}
         if isinstance(tiles_config, TilesConfig):
             simplification_by_zoom = tiles_config.simplification_by_zoom or {}
             min_feature_pixel_area_by_zoom = (
@@ -1239,6 +1242,13 @@ async def get_tile_resolution_params(
             )
             min_feature_pixel_length_by_zoom = (
                 tiles_config.min_feature_pixel_length_by_zoom or {}
+            )
+            max_features_per_tile_by_zoom = (
+                tiles_config.max_features_per_tile_by_zoom or {}
+            )
+            feature_rank_column = tiles_config.feature_rank_column
+            min_feature_rank_by_zoom = (
+                tiles_config.min_feature_rank_by_zoom or {}
             )
 
         # 4. Resolve the collection config for sidecar-aware MVT queries from
@@ -1278,6 +1288,9 @@ async def get_tile_resolution_params(
             "simplification_by_zoom": simplification_by_zoom,
             "min_feature_pixel_area_by_zoom": min_feature_pixel_area_by_zoom,
             "min_feature_pixel_length_by_zoom": min_feature_pixel_length_by_zoom,
+            "max_features_per_tile_by_zoom": max_features_per_tile_by_zoom,
+            "feature_rank_column": feature_rank_column,
+            "min_feature_rank_by_zoom": min_feature_rank_by_zoom,
             "catalog_id": catalog_id,
             "collection_id": collection_id,
             "col_config": col_config,

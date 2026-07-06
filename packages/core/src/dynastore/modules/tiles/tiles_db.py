@@ -113,9 +113,17 @@ async def _build_collection_subquery(
     extent: int = 4096,
     buffer: int = 256,
     tile_wkb: Optional[bytes] = None,
+    max_features: Optional[float] = None,
+    rank_column: Optional[str] = None,
+    min_rank: Optional[float] = None,
 ) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Builds the subquery for a single collection using ItemService.
+
+    ``max_features`` / ``rank_column`` / ``min_rank`` implement pre-transform
+    feature reduction for scalable low-zoom rendering. They are pushed into the
+    shared query builder via its ``limit`` / ``where`` hooks so the reduction
+    happens BEFORE ST_AsMVTGeom (bounding transform cost), not after.
     """
     from dynastore.models.protocols import ConfigsProtocol, ItemsProtocol
     from dynastore.tools.discovery import get_protocol
@@ -195,6 +203,26 @@ async def _build_collection_subquery(
     if subset_params:
         params.update(subset_params)
 
+    # 2b. Pre-transform feature reduction (scalable low-zoom rendering).
+    #
+    # These are honoured by the MVT branch of the query builder
+    # (``item_query._build_base_query_request``), which threads ``limit`` and
+    # ``where``/``raw_params`` into the row-producing subquery — i.e. BEFORE the
+    # per-row ST_AsMVTGeom projection and the wrapping ST_AsMVT aggregate. That
+    # is the whole point: capping/filtering the source rows bounds the transform
+    # cost, which the post-transform density predicates cannot.
+    if max_features and max_features > 0:
+        params["limit"] = int(max_features)
+    if rank_column and min_rank is not None:
+        # Importance-preserving, index-assisted decimation: keep only features
+        # whose stored rank column (e.g. length_m) meets the per-zoom minimum.
+        # ``rank_column`` is operator-configured (TilesConfig.feature_rank_column),
+        # never user input; quote it as an identifier. The threshold is a bind
+        # param. The builder suffixes both the SQL and bind name per collection,
+        # so ``:feat_rank_min`` never collides across a multi-collection tile.
+        params["where"] = f'"{rank_column}" >= :feat_rank_min'
+        params["raw_params"] = {"feat_rank_min": min_rank}
+
     # 3. Get Query from ItemService
     # We pass tile_wkb via params so GeometrySidecar can use it as bind param
 
@@ -264,6 +292,35 @@ async def get_features_as_mvt_filtered(
     all_bind_params = {"tile_wkb": tile_wkb, "target_srid": target_srid}
     union_queries = []
 
+    # Resolve the per-tile feature cap and optional rank predicate ONCE from the
+    # shared (catalog-scoped) TilesConfig, then push them into every
+    # per-collection subquery. Both reduce the feature set BEFORE ST_AsMVTGeom,
+    # so render cost, tile size and ST_AsMVT memory are bounded by the cap rather
+    # than the collection's total feature count — the primitive that lets large
+    # collections preseed at low zoom. Bracket resolution mirrors the density /
+    # simplification maps: the highest zoom key ≤ the current zoom wins.
+    def _bracket(meta_key: str) -> Optional[float]:
+        if not resolved_collections:
+            return None
+        m: Dict[int, float] = resolved_collections[0].get(meta_key) or {}
+        if not m:
+            return None
+        try:
+            zi = int(z)
+        except ValueError:
+            return None
+        for zk, val in sorted(m.items(), reverse=True):
+            if zi >= zk:
+                return val
+        return None
+
+    max_features = _bracket("max_features_per_tile_by_zoom")
+    rank_column = (
+        resolved_collections[0].get("feature_rank_column")
+        if resolved_collections else None
+    )
+    min_rank = _bracket("min_feature_rank_by_zoom")
+
     # 3. Build Subqueries for each collection
     for i, meta in enumerate(resolved_collections):
         # meta contains: catalog_id, collection_id, col_config, source_srid, simplification_by_zoom
@@ -287,6 +344,9 @@ async def get_features_as_mvt_filtered(
             extent=extent,
             buffer=buffer,
             tile_wkb=tile_wkb,
+            max_features=max_features,
+            rank_column=rank_column,
+            min_rank=min_rank,
         )
         if subq:
             union_queries.append(subq)

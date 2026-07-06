@@ -258,26 +258,39 @@ class TilePreseedTask(
 
         for z in range(effective_min_zoom, effective_max_zoom + 1):
             progress = min(99, int(100 * (z - effective_min_zoom) / zoom_span))
-            try:
-                async with managed_transaction(engine) as conn:
-                    await DQLQuery(
-                        f"SET LOCAL statement_timeout = {statement_timeout_ms}",
-                        result_handler=ResultHandler.NONE,
-                    ).execute(conn)
-
-                    for bbox in effective_bboxes:
+            for bbox in effective_bboxes:
+                try:
+                    tiles = mc_tms.tiles(*bbox, zooms=[z])
+                except Exception as e:
+                    logger.error(f"Error generating tiles for bbox {bbox}: {e}")
+                    continue
+                for tile in tiles:
+                    total_processed += 1
+                    for fmt in formats:
+                        simplification = (
+                            preseed_config.simplification_by_zoom_override.get(z)
+                            if preseed_config.simplification_by_zoom_override else None
+                        )
+                        # Each tile renders in its OWN transaction so a slow or
+                        # failing tile is isolated: it is counted and skipped
+                        # instead of aborting the whole zoom's transaction and
+                        # losing every remaining tile at that zoom (the old
+                        # per-zoom transaction cascaded a single timeout into
+                        # thousands of dropped tiles at high zoom). This is what
+                        # lets a preseed of millions of tiles make forward
+                        # progress tile-by-tile.
                         try:
-                            tiles = mc_tms.tiles(*bbox, zooms=[z])
-                        except Exception as e:
-                            logger.error(f"Error generating tiles for bbox {bbox}: {e}")
-                            continue
-                        for tile in tiles:
-                            total_processed += 1
-                            for fmt in formats:
-                                simplification = (
-                                    preseed_config.simplification_by_zoom_override.get(z)
-                                    if preseed_config.simplification_by_zoom_override else None
-                                )
+                            async with managed_transaction(engine) as conn:
+                                # statement_timeout == 0 → unbounded: preseed is
+                                # a batch job, decoupled from the interactive
+                                # serve ceiling, so an operator can let a heavy
+                                # low-zoom tile run to completion. The per-tile
+                                # isolation above bounds the blast radius.
+                                if statement_timeout_ms > 0:
+                                    await DQLQuery(
+                                        f"SET LOCAL statement_timeout = {statement_timeout_ms}",
+                                        result_handler=ResultHandler.NONE,
+                                    ).execute(conn)
                                 data = await tiles_engine.render_tile(
                                     conn, ctx, str(z), tile.x, tile.y,
                                     format=fmt, use_l1_cache=False,
@@ -285,38 +298,36 @@ class TilePreseedTask(
                                     simplification_algorithm=runtime_config.simplification_algorithm
                                     or SimplificationAlgorithm.TOPOLOGY_PRESERVING,
                                 )
-                                # `is not None` (not truthy) so a confirmed-
-                                # empty render (`b""` — zero features) is
-                                # persisted too, matching the live serving
-                                # path's cache discipline (#2898).
-                                if data is not None:
-                                    await storage.save_tile(
-                                        catalog_id=catalog_id, collection_id=col_id,
-                                        tms_id=tms_id, z=z, x=tile.x, y=tile.y,
-                                        data=data, format=fmt,
-                                    )
-                                    results["generated"] += 1
-                                else:
-                                    results["skipped"] += 1
+                        except Exception as exc:
+                            # This tile's transaction is aborted; committed tiles
+                            # (previous, and other tiles this zoom) are unaffected.
+                            # A subsequent run retries whatever was skipped.
+                            logger.warning(
+                                "tiles_preseed: tile %d/%d/%d skipped for %s/%s/%s (%s)",
+                                z, tile.x, tile.y, catalog_id, col_id, tms_id, exc,
+                            )
+                            results["errors"] += 1
+                            continue
 
-                            if total_processed % 100 == 0 and payload.task_id:
-                                new_outputs = {**results, "processed_tiles": total_processed}
-                                await tasks_module.update_task(
-                                    engine, payload.task_id,
-                                    TaskUpdate(outputs=new_outputs, progress=progress), schema=schema,
-                                )
-            except Exception as exc:
-                # A canceled statement (or any other SQL error) leaves this
-                # zoom's transaction aborted — nothing more can be committed
-                # on it. Count it and move on to the next zoom; already-
-                # committed zooms are unaffected, and a subsequent preseed
-                # run picks up whatever this zoom didn't finish.
-                logger.error(
-                    "tiles_preseed: zoom %d aborted for %s/%s/%s (%s); "
-                    "remaining tiles at this zoom will be retried on the next run.",
-                    z, catalog_id, col_id, tms_id, exc,
-                )
-                results["errors"] += 1
+                        # `is not None` (not truthy) so a confirmed-empty render
+                        # (`b""` — zero features) is persisted too, matching the
+                        # live serving path's cache discipline (#2898).
+                        if data is not None:
+                            await storage.save_tile(
+                                catalog_id=catalog_id, collection_id=col_id,
+                                tms_id=tms_id, z=z, x=tile.x, y=tile.y,
+                                data=data, format=fmt,
+                            )
+                            results["generated"] += 1
+                        else:
+                            results["skipped"] += 1
+
+                    if total_processed % 100 == 0 and payload.task_id:
+                        new_outputs = {**results, "processed_tiles": total_processed}
+                        await tasks_module.update_task(
+                            engine, payload.task_id,
+                            TaskUpdate(outputs=new_outputs, progress=progress), schema=schema,
+                        )
 
         if payload.task_id:
             new_outputs = {**results, "processed_tiles": total_processed}

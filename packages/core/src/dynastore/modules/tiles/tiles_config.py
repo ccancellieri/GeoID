@@ -171,6 +171,68 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
         ),
     )
 
+    # Zoom-aware per-tile FEATURE CAP (opt-in, default disabled).
+    #
+    # The density filters above run AFTER ST_AsMVTGeom transforms every feature
+    # intersecting the tile bbox, so at low zoom the transform cost is
+    # O(features in bbox) = O(whole dataset) for a world-scale tile — the reason
+    # low-zoom tiles for million/billion-feature collections are unrenderable.
+    # This cap pushes a LIMIT into the per-collection subquery BEFORE the
+    # transform, so a tile only ever transforms and aggregates at most N
+    # features. Render time, tile size and ST_AsMVT memory become bounded by N,
+    # independent of the collection's total feature count — the primitive that
+    # lets preseed scale to very large collections.
+    #
+    #   - Each key is the minimum zoom for the bracket (highest key ≤ current
+    #     zoom wins), mirroring the simplification/density resolution.
+    #   - Value is the maximum number of features aggregated into one tile.
+    #   - Default None = uncapped (existing behavior, safe for all collections).
+    #   - Example: {0: 20000, 4: 50000, 8: 200000} — tight at world scale,
+    #     looser as each tile covers less ground.
+    #   - Without ``feature_rank_column`` the N kept are storage-order
+    #     (arbitrary); set it to keep the most important features instead.
+    max_features_per_tile_by_zoom: Mutable[Optional[Dict[int, int]]] = Field(
+        default=None,
+        description=(
+            "Opt-in zoom-aware per-tile feature cap. Each key is the minimum zoom "
+            "for the bracket; value is the maximum number of features aggregated "
+            "into a tile (a LIMIT applied before ST_AsMVTGeom, bounding render "
+            "cost and tile size regardless of dataset size). Default None = uncapped."
+        ),
+    )
+
+    # Optional stored column used to rank features when the per-tile cap or the
+    # min-rank filter is active — e.g. a precomputed, indexed length-in-metres or
+    # area-in-metres column on the geometry sidecar. When set, low-zoom tiles
+    # keep the highest-ranked (largest / most important) features instead of an
+    # arbitrary storage-order subset; when the column is indexed the min-rank
+    # filter becomes an index-assisted pre-transform predicate that scales to
+    # billions of features. Default None = no ranking.
+    feature_rank_column: Mutable[Optional[str]] = Field(
+        default=None,
+        description=(
+            "Name of a stored (ideally indexed) numeric column used to rank "
+            "features for the min-rank filter (e.g. length_m / area_m2). "
+            "Default None = no ranking."
+        ),
+    )
+
+    # Zoom-aware minimum value of ``feature_rank_column`` a feature must have to
+    # be included, evaluated BEFORE ST_AsMVTGeom. Importance-preserving
+    # decimation: keeps the long/large features at low zoom and drops the rest
+    # with an index-assisted predicate. Requires ``feature_rank_column``.
+    #   - Highest key ≤ current zoom wins (bracket resolution).
+    #   - Default None = disabled.
+    min_feature_rank_by_zoom: Mutable[Optional[Dict[int, float]]] = Field(
+        default=None,
+        description=(
+            "Opt-in zoom-aware minimum for feature_rank_column (highest key ≤ "
+            "current zoom wins). Applied as a pre-transform WHERE, index-assisted "
+            "when the column is indexed. Requires feature_rank_column. "
+            "Default None = disabled."
+        ),
+    )
+
     # Caching
     cache_on_demand: Mutable[bool] = Field(
         default=True,
