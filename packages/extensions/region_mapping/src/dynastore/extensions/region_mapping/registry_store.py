@@ -32,6 +32,7 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+from dynastore.extensions.tools.response_i18n import resolve_localized
 from dynastore.models.localization import LocalizedText
 from dynastore.modules.db_config.exceptions import UniqueViolationError
 from dynastore.modules.db_config.query_executor import DbResource, managed_transaction
@@ -40,6 +41,7 @@ from dynastore.tools.protocol_helpers import get_engine
 
 from . import registry_queries as _q
 from .claims import (
+    FALLBACK_UNIQUE_ID_PROP,
     ROLE_PRIMARY,
     compute_claim_set,
     fetch_collection_bbox,
@@ -71,10 +73,11 @@ async def apply_mapping(
     *,
     catalog_id: str,
     collection_id: str,
-    column: str,
-    alias: str,
-    extra_aliases: Sequence[str],
+    region_prop: str,
+    aliases: Sequence[str],
+    unique_id_prop: Optional[str],
     title: Optional[Union[str, Dict[str, str]]],
+    mapping_id: Optional[str] = None,
     lang: str = "en",
     layer_name: str = "default",
     server_type: str = "MVT",
@@ -82,39 +85,45 @@ async def apply_mapping(
     server_min_zoom: int = 0,
     server_max_native_zoom: int = 12,
     server_max_zoom: int = 28,
-    unique_id_prop: Optional[str] = None,
     digits: int = 255,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Register (or re-apply) one mapping's claim set.
 
-    Transactional: deletes claims stale to this ``mapping_id`` (a changed
-    alias/column set must not leave old rows squatting the PK forever), then
-    updates-or-inserts every claim in the freshly computed set. A
-    cross-mapping ``claim_ci`` collision surfaces PG's real ``23505`` from
-    :data:`registry_queries.INSERT_CLAIM` -- never caught here, propagated to
-    the global exception-handler chain (-> HTTP 409). Two racing first-applies
-    of the *same* mapping (both see ``UPDATE_OWN_CLAIM`` touch 0 rows) resolve
-    without a spurious conflict -- see :func:`_insert_claim_idempotent`.
+    The claim set is ``{region_prop, *aliases}`` -- every token TerriaJS may
+    match a CSV header against -- one row per token (see
+    :func:`claims.compute_claim_set`). Transactional: deletes claims stale to
+    this ``mapping_id`` (a changed regionProp/alias set must not leave old
+    rows squatting the PK forever), then updates-or-inserts every claim in the
+    freshly computed set. A cross-mapping ``claim_ci`` collision surfaces PG's
+    real ``23505`` from :data:`registry_queries.INSERT_CLAIM` -- never caught
+    here, propagated to the global exception-handler chain (-> HTTP 409): that
+    PK is the enforcement point for "regionProp/alias unique across all
+    mappings". Two racing first-applies of the *same* mapping (both see
+    ``UPDATE_OWN_CLAIM`` touch 0 rows) resolve without a spurious conflict --
+    see :func:`_insert_claim_idempotent`.
 
-    ``title`` (TerriaJS's ``description``) accepts a plain string -- wrapped
-    under ``lang`` via :meth:`LocalizedText.delocalize_input`, the same
-    single-language-input convention as the rest of the platform -- or an
-    already language-keyed dict, stored as-is. The remaining keyword
-    arguments are the rest of the TerriaJS ``regionWmsMap`` entry
-    (dynastore#443) that used to be hardcoded in ``definitions.json.j2``;
-    every claim row of a mapping carries the same values, exactly like the
-    pre-existing ``title``/``alias``/``region_prop`` duplication.
+    ``unique_id_prop`` is the caller-resolved TerriaJS ``uniqueIdProp`` (see
+    :func:`claims.resolve_unique_id_prop`), stored verbatim. ``mapping_id``, when
+    given, is the caller-chosen id for this mapping (its ``/{mapping_id}/...``
+    path segment); it defaults to the ``{catalog}_{collection}`` slug. ``title``
+    (TerriaJS's ``description``) accepts a plain string -- wrapped under
+    ``lang`` via :meth:`LocalizedText.delocalize_input` -- or an already
+    language-keyed dict, stored as-is. The remaining keyword arguments are the
+    rest of the TerriaJS ``regionWmsMap`` entry; every claim row of a mapping
+    carries the same mapping-level values.
 
     Returns ``(mapping_id, claim_rows)``.
     """
-    mapping_id = mapping_id_for(catalog_id, collection_id)
+    mapping_id = mapping_id or mapping_id_for(catalog_id, collection_id)
     row_title = LocalizedText.delocalize_input(title, lang) if title else {lang: collection_id}
     row_subdomains = list(server_subdomains) if server_subdomains else []
+    alias_list = list(aliases)
+    # The CSV header TerriaJS matches against: the first alias if the caller
+    # gave one, else the region property name itself. Stored on every row so
+    # /regionIds.csv can read it off any claim.
+    header_alias = alias_list[0] if alias_list else region_prop
 
-    claims = compute_claim_set(
-        catalog_id=catalog_id, collection_id=collection_id,
-        column=column, alias=alias, extra_aliases=extra_aliases,
-    )
+    claims = compute_claim_set(region_prop=region_prop, aliases=alias_list)
 
     claim_rows: List[Dict[str, Any]] = []
     async with managed_transaction(engine) as conn:
@@ -125,7 +134,7 @@ async def apply_mapping(
             params = dict(
                 claim_ci=claim_ci, claim=claim, mapping_id=mapping_id, role=role,
                 src_catalog=catalog_id, src_collection=collection_id,
-                region_prop=column, alias=alias, title=json.dumps(row_title),
+                region_prop=region_prop, alias=header_alias, title=json.dumps(row_title),
                 layer_name=layer_name, server_type=server_type,
                 server_subdomains=json.dumps(row_subdomains),
                 server_min_zoom=server_min_zoom,
@@ -211,6 +220,77 @@ async def delete_claims_by_source_catalog(engine: DbResource, catalog_id: str) -
     if deleted:
         invalidate_serving_caches()
     return len(deleted)
+
+
+# ---------------------------------------------------------------------------
+# Serialization -- claim rows -> the region.json single-mapping object
+# ---------------------------------------------------------------------------
+
+
+def coerce_stored_title(raw: Any) -> Any:
+    """Normalise a ``title`` value read from the JSONB column into the shape
+    ``resolve_localized`` expects (a ``{lang: text}`` map).
+
+    The column stores ``json.dumps({lang: text})``; on read it comes back as
+    the JSON *text* rather than a decoded ``dict``, and ``resolve_localized``
+    returns a ``str`` input verbatim -- so the raw ``{"en": ...}`` JSON would
+    leak into region.json's ``description``. Decode an object-shaped JSON
+    string back to its map; leave a plain (non-JSON) legacy string untouched.
+    """
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except (ValueError, TypeError):
+            return raw
+        if isinstance(decoded, dict):
+            return decoded
+    return raw
+
+
+def mapping_object_from_claims(
+    claim_rows: Sequence[Dict[str, Any]], *, language: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Assemble the API's region.json-shaped mapping object from one mapping's
+    claim rows.
+
+    The response and list surfaces speak this object (regionProp, aliases,
+    uniqueIdProp, server\\_\\*, ...) -- the internal one-row-per-claim storage
+    stays hidden. ``aliases`` is every claim except the regionProp token
+    (case-insensitively), sorted; the mapping-level fields come off the
+    primary claim (any claim carries them, they are duplicated). ``title`` is
+    resolved to ``language`` when given, else returned as its stored
+    ``{lang: text}`` mapping.
+    """
+    if not claim_rows:
+        return None
+    primary = next(
+        (r for r in claim_rows if r.get("role") == ROLE_PRIMARY), claim_rows[0],
+    )
+    region_prop = primary.get("region_prop") or ""
+    region_prop_ci = region_prop.casefold()
+    aliases = sorted({
+        r["claim"] for r in claim_rows
+        if r.get("claim") and r["claim"].casefold() != region_prop_ci
+    })
+    title = coerce_stored_title(primary.get("title"))
+    if language is not None:
+        title = resolve_localized(title, language)
+    return {
+        "mapping_id": primary.get("mapping_id"),
+        "catalog": primary.get("src_catalog"),
+        "collection": primary.get("src_collection"),
+        "region_prop": region_prop,
+        "unique_id_prop": primary.get("unique_id_prop") or FALLBACK_UNIQUE_ID_PROP,
+        "aliases": aliases,
+        "title": title,
+        "layer_name": primary.get("layer_name") or "default",
+        "server_type": primary.get("server_type") or "MVT",
+        "server_subdomains": primary.get("server_subdomains") or [],
+        "server_min_zoom": primary.get("server_min_zoom", 0),
+        "server_max_native_zoom": primary.get("server_max_native_zoom", 12),
+        "server_max_zoom": primary.get("server_max_zoom", 28),
+        "digits": primary.get("digits", 255),
+    }
 
 
 # ---------------------------------------------------------------------------

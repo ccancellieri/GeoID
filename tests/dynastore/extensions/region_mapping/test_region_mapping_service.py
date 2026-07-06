@@ -55,20 +55,61 @@ def _app(monkeypatch: pytest.MonkeyPatch, catalogs: Any, engine: Any = object())
     return app
 
 
+def _stub_columns(
+    monkeypatch: pytest.MonkeyPatch,
+    svc: Any,
+    *,
+    declared,
+    external_id_field: Optional[str] = None,
+    external_id_path: Optional[str] = None,
+    is_columnar: bool = True,
+) -> None:
+    """Stub ``resolve_collection_columns`` so POST/validate see a columnar
+    source collection declaring ``declared`` (+ optional external_id column and
+    its ``external_id_path`` source column)."""
+    from dynastore.extensions.region_mapping.claims import CollectionColumns
+
+    async def _resolve(catalog: str, collection: str):
+        if not is_columnar and not declared:
+            return CollectionColumns(
+                is_columnar=False, declared=frozenset(),
+                external_id_field=external_id_field, external_id_path=external_id_path,
+                validity_column=None,
+            )
+        return CollectionColumns(
+            is_columnar=is_columnar, declared=frozenset(declared),
+            external_id_field=external_id_field, external_id_path=external_id_path,
+            validity_column=None,
+        )
+
+    monkeypatch.setattr(svc, "resolve_collection_columns", _resolve)
+
+
+_SOUND_STATS = {
+    "feature_count": 1, "distinct_region_count": 1, "distinct_unique_id_count": 1,
+    "null_unique_id_count": 0,
+}
+
+
 @pytest.fixture(autouse=True)
-def _default_sound_mapping_cardinality(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Every ``region.json``/``_build_definitions`` test predates the
-    per-mapping cardinality check -- default it to "sound" (one feature per
-    code) so existing tests keep exercising what they were written for.
-    Tests of the exclusion behavior itself override this per-test."""
+def _default_sound_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default the shared soundness authority to "sound" and the register-time
+    cardinality/uniqueness checks to pass, so every test that predates these
+    guards keeps exercising what it was written for. Tests of the exclusion /
+    rejection behavior itself override these per-test."""
     from dynastore.extensions.region_mapping import region_mapping_service as svc
 
     monkeypatch.setattr(
         svc, "fetch_region_mapping_cardinality",
-        AsyncMock(return_value={
-            "feature_count": 1, "distinct_region_count": 1, "distinct_unique_id_count": 1,
-        }),
+        AsyncMock(return_value=dict(_SOUND_STATS)),
     )
+    monkeypatch.setattr(
+        svc, "evaluate_mapping_soundness",
+        AsyncMock(return_value=([], dict(_SOUND_STATS))),
+    )
+    # No pre-existing mapping owns a chosen id, so the register uniqueness guard
+    # is a no-op unless a test says otherwise.
+    monkeypatch.setattr(svc._store, "fetch_mapping_primary", AsyncMock(return_value=None))
 
 
 # ---------------------------------------------------------------------------
@@ -77,18 +118,25 @@ def _default_sound_mapping_cardinality(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_register_mapping_returns_201_and_claims(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_register_mapping_returns_201_and_object(monkeypatch: pytest.MonkeyPatch) -> None:
     from dynastore.extensions.region_mapping import region_mapping_service as svc
 
     catalogs = _StubCatalogs({("fao", "countries"): MagicMock()})
     app = _app(monkeypatch, catalogs)
+    _stub_columns(monkeypatch, svc, declared={"adm0_code", "FID"})
 
     async def _apply_mapping(engine: Any, **kwargs: Any):
         return "fao_countries", [
             {
-                "claim_ci": "country", "claim": "country", "mapping_id": "fao_countries",
+                "claim_ci": "adm0_code", "claim": "adm0_code", "mapping_id": "fao_countries",
                 "role": "primary", "src_catalog": "fao", "src_collection": "countries",
                 "region_prop": "adm0_code", "alias": "country", "title": "Countries",
+                "unique_id_prop": "FID",
+            },
+            {
+                "claim_ci": "country", "claim": "country", "mapping_id": "fao_countries",
+                "role": "alias", "src_catalog": "fao", "src_collection": "countries",
+                "region_prop": "adm0_code", "alias": "country", "unique_id_prop": "FID",
             },
         ]
 
@@ -98,13 +146,22 @@ async def test_register_mapping_returns_201_and_claims(monkeypatch: pytest.Monke
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.post(
             "/region-mappings",
-            json={"catalog": "fao", "collection": "countries", "column": "adm0_code", "alias": "country"},
+            json={
+                "catalog": "fao", "collection": "countries",
+                "region_prop": "adm0_code", "aliases": ["country"],
+            },
         )
 
     assert resp.status_code == 201, resp.text
     body = resp.json()
+    # The response is the region.json single-object shape, not a claims list.
     assert body["mapping_id"] == "fao_countries"
-    assert body["claims"][0]["claim"] == "country"
+    assert body["catalog"] == "fao"
+    assert body["collection"] == "countries"
+    assert body["region_prop"] == "adm0_code"
+    assert body["unique_id_prop"] == "FID"
+    assert body["aliases"] == ["country"]
+    assert "claims" not in body
 
 
 @pytest.mark.asyncio
@@ -118,7 +175,7 @@ async def test_register_mapping_unknown_collection_returns_404(monkeypatch: pyte
             "/region-mappings",
             json={
                 "catalog": "fao", "collection": "does-not-exist",
-                "column": "adm0_code", "alias": "country",
+                "region_prop": "adm0_code", "aliases": ["country"],
             },
         )
 
@@ -126,9 +183,9 @@ async def test_register_mapping_unknown_collection_returns_404(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
-async def test_register_mapping_missing_alias_returns_422(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``alias`` is required -- TerriaJS always declares one, so there is no
-    safe column-name default to fall back to."""
+async def test_register_mapping_missing_region_prop_returns_422(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``region_prop`` is required -- it is the tile property TerriaJS reads;
+    there is no safe default."""
     catalogs = _StubCatalogs({("fao", "countries"): MagicMock()})
     app = _app(monkeypatch, catalogs)
 
@@ -136,25 +193,22 @@ async def test_register_mapping_missing_alias_returns_422(monkeypatch: pytest.Mo
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.post(
             "/region-mappings",
-            json={"catalog": "fao", "collection": "countries", "column": "adm0_code"},
+            json={"catalog": "fao", "collection": "countries", "aliases": ["country"]},
         )
 
     assert resp.status_code == 422
 
 
 @pytest.mark.asyncio
-async def test_register_mapping_unknown_column_returns_400(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The claimed column must be a real queryable property of the source
-    collection -- checked once, on the write path, before any claim is
-    persisted."""
+async def test_register_mapping_non_columnar_schema_returns_400(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A collection without a columnar items_schema (JSONB-only, or none
+    declared) is refused: JSONB attributes have no fixed columns to back a
+    region layer."""
     from dynastore.extensions.region_mapping import region_mapping_service as svc
 
     catalogs = _StubCatalogs({("fao", "countries"): MagicMock()})
     app = _app(monkeypatch, catalogs)
-    monkeypatch.setattr(
-        svc, "resolve_queryable_property_names",
-        AsyncMock(return_value={"iso3", "title"}),
-    )
+    _stub_columns(monkeypatch, svc, declared=set(), is_columnar=False)
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -162,11 +216,209 @@ async def test_register_mapping_unknown_column_returns_400(monkeypatch: pytest.M
             "/region-mappings",
             json={
                 "catalog": "fao", "collection": "countries",
-                "column": "not_a_real_column", "alias": "country",
+                "region_prop": "adm0_code", "aliases": ["country"],
             },
         )
 
     assert resp.status_code == 400
+    assert "columnar items_schema" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_register_mapping_unknown_region_prop_returns_400(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The region_prop must be a declared column of the source collection's
+    items_schema -- checked once, on the write path, before any claim is
+    persisted."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    catalogs = _StubCatalogs({("fao", "countries"): MagicMock()})
+    app = _app(monkeypatch, catalogs)
+    _stub_columns(monkeypatch, svc, declared={"iso3", "FID"})  # region_prop not declared
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/region-mappings",
+            json={
+                "catalog": "fao", "collection": "countries",
+                "region_prop": "not_a_real_column", "aliases": ["country"],
+            },
+        )
+
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_register_mapping_unresolvable_unique_id_prop_returns_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No external_id configured and no FID column declared: the resolved
+    uniqueIdProp ('FID' fallback) is not a column, so the mapping is refused."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    catalogs = _StubCatalogs({("fao", "countries"): MagicMock()})
+    app = _app(monkeypatch, catalogs)
+    _stub_columns(monkeypatch, svc, declared={"adm0_code"})  # no FID, no external_id
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/region-mappings",
+            json={
+                "catalog": "fao", "collection": "countries",
+                "region_prop": "adm0_code", "aliases": ["country"],
+            },
+        )
+
+    assert resp.status_code == 400
+    assert "uniqueIdProp" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_register_mapping_resolves_unique_id_prop_to_external_id_source_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When no uniqueIdProp is supplied but the collection configures an
+    external_id extraction path, the SOURCE column that path names (the
+    property the tiles carry -- NOT the internal 'external_id' storage column)
+    is resolved and passed to the store."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    catalogs = _StubCatalogs({("fao", "gaul"): MagicMock()})
+    app = _app(monkeypatch, catalogs)
+    # external_id is extracted from the "row_id" source column, which is a
+    # declared (tile-exposed) attribute distinct from the region code.
+    _stub_columns(
+        monkeypatch, svc, declared={"GAUL1_CODE", "row_id"},
+        external_id_field="external_id", external_id_path="row_id",
+    )
+
+    captured: Dict[str, Any] = {}
+
+    async def _apply_mapping(engine: Any, **kwargs: Any):
+        captured.update(kwargs)
+        return "fao_gaul", [{
+            "role": "primary", "mapping_id": "fao_gaul", "src_catalog": "fao",
+            "src_collection": "gaul", "region_prop": "GAUL1_CODE", "claim": "GAUL1_CODE",
+            "unique_id_prop": "row_id",
+        }]
+
+    monkeypatch.setattr(svc._store, "apply_mapping", _apply_mapping)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/region-mappings",
+            json={"catalog": "fao", "collection": "gaul", "region_prop": "GAUL1_CODE"},
+        )
+
+    assert resp.status_code == 201, resp.text
+    assert captured["unique_id_prop"] == "row_id"
+    assert resp.json()["unique_id_prop"] == "row_id"
+
+
+@pytest.mark.asyncio
+async def test_register_mapping_accepts_caller_supplied_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller may name the mapping via ``id``; it becomes the mapping_id
+    (slugified) instead of the ``{catalog}_{collection}`` default."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    catalogs = _StubCatalogs({("fao", "countries"): MagicMock()})
+    app = _app(monkeypatch, catalogs)
+    _stub_columns(monkeypatch, svc, declared={"adm0_code", "FID"})
+
+    captured: Dict[str, Any] = {}
+
+    async def _apply_mapping(engine: Any, **kwargs: Any):
+        captured.update(kwargs)
+        return kwargs["mapping_id"], [{
+            "role": "primary", "mapping_id": kwargs["mapping_id"], "src_catalog": "fao",
+            "src_collection": "countries", "region_prop": "adm0_code", "claim": "adm0_code",
+            "unique_id_prop": "FID",
+        }]
+
+    monkeypatch.setattr(svc._store, "apply_mapping", _apply_mapping)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/region-mappings",
+            json={
+                "id": "my_regions", "catalog": "fao", "collection": "countries",
+                "region_prop": "adm0_code",
+            },
+        )
+
+    assert resp.status_code == 201, resp.text
+    assert captured["mapping_id"] == "my_regions"
+    assert resp.json()["mapping_id"] == "my_regions"
+
+
+@pytest.mark.asyncio
+async def test_register_mapping_id_used_by_other_collection_returns_409(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller-supplied id already owned by a DIFFERENT source collection is a
+    conflict -- ids must map 1:1 to a mapping."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    catalogs = _StubCatalogs({("fao", "countries"): MagicMock()})
+    app = _app(monkeypatch, catalogs)
+    _stub_columns(monkeypatch, svc, declared={"adm0_code", "FID"})
+    monkeypatch.setattr(
+        svc._store, "fetch_mapping_primary",
+        AsyncMock(return_value={
+            "mapping_id": "my_regions", "src_catalog": "other", "src_collection": "thing",
+        }),
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/region-mappings",
+            json={
+                "id": "my_regions", "catalog": "fao", "collection": "countries",
+                "region_prop": "adm0_code",
+            },
+        )
+
+    assert resp.status_code == 409, resp.text
+    assert "already used by" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_register_mapping_null_unique_id_values_returns_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the resolved uniqueIdProp column is NULL on some features it cannot
+    position them in the regionIds array -- the mapping is refused at creation
+    (dynastore region-mapping: every feature must carry the index)."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    catalogs = _StubCatalogs({("fao", "countries"): MagicMock()})
+    app = _app(monkeypatch, catalogs)
+    _stub_columns(monkeypatch, svc, declared={"adm0_code", "FID"})
+    monkeypatch.setattr(
+        svc, "fetch_region_mapping_cardinality",
+        AsyncMock(return_value={
+            "feature_count": 5, "distinct_region_count": 5,
+            "distinct_unique_id_count": 5, "null_unique_id_count": 3,
+        }),
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/region-mappings",
+            json={
+                "catalog": "fao", "collection": "countries", "region_prop": "adm0_code",
+            },
+        )
+
+    assert resp.status_code == 400, resp.text
+    assert "NULL" in resp.text
 
 
 @pytest.mark.asyncio
@@ -177,13 +429,13 @@ async def test_register_mapping_regex_metacharacter_claim_returns_400(
 
     catalogs = _StubCatalogs({("fao", "countries"): MagicMock()})
     app = _app(monkeypatch, catalogs)
+    # region_prop passes the column check, then the real compute_claim_set
+    # rejects its regex metacharacter -> ValueError -> HTTP 400.
+    _stub_columns(monkeypatch, svc, declared={"adm0.code", "FID"})
 
     async def _apply_mapping(engine: Any, **kwargs: Any):
         from dynastore.extensions.region_mapping.claims import compute_claim_set
-        compute_claim_set(
-            catalog_id=kwargs["catalog_id"], collection_id=kwargs["collection_id"],
-            column=kwargs["column"], alias=kwargs["alias"], extra_aliases=kwargs["extra_aliases"],
-        )
+        compute_claim_set(region_prop=kwargs["region_prop"], aliases=kwargs["aliases"])
         raise AssertionError("unreachable -- compute_claim_set should have raised")
 
     monkeypatch.setattr(svc._store, "apply_mapping", _apply_mapping)
@@ -194,7 +446,7 @@ async def test_register_mapping_regex_metacharacter_claim_returns_400(
             "/region-mappings",
             json={
                 "catalog": "fao", "collection": "countries",
-                "column": "adm0.code", "alias": "country",
+                "region_prop": "adm0.code", "aliases": ["country"],
             },
         )
 
@@ -212,7 +464,7 @@ async def test_register_mapping_no_engine_returns_503(monkeypatch: pytest.Monkey
             "/region-mappings",
             json={
                 "catalog": "fao", "collection": "countries",
-                "column": "adm0_code", "alias": "country",
+                "region_prop": "adm0_code", "aliases": ["country"],
             },
         )
 
@@ -263,16 +515,26 @@ async def test_revoke_mapping_unknown_returns_404(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.asyncio
-async def test_list_mappings_returns_items(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_list_mappings_returns_objects(monkeypatch: pytest.MonkeyPatch) -> None:
     from dynastore.extensions.region_mapping import region_mapping_service as svc
 
     app = _app(monkeypatch, _StubCatalogs({}))
-    row = {
-        "claim_ci": "country", "claim": "country", "mapping_id": "fao_countries",
-        "role": "primary", "src_catalog": "fao", "src_collection": "countries",
-        "region_prop": "adm0_code", "alias": "country", "title": "Countries",
-    }
-    monkeypatch.setattr(svc._store, "list_claims", AsyncMock(return_value=[row]))
+    # list_claims returns every claim row; the endpoint groups them by
+    # mapping_id and emits one region.json-object per mapping.
+    rows = [
+        {
+            "claim_ci": "adm0_code", "claim": "adm0_code", "mapping_id": "fao_countries",
+            "role": "primary", "src_catalog": "fao", "src_collection": "countries",
+            "region_prop": "adm0_code", "alias": "country", "title": "Countries",
+            "unique_id_prop": "FID",
+        },
+        {
+            "claim_ci": "country", "claim": "country", "mapping_id": "fao_countries",
+            "role": "alias", "src_catalog": "fao", "src_collection": "countries",
+            "region_prop": "adm0_code", "unique_id_prop": "FID",
+        },
+    ]
+    monkeypatch.setattr(svc._store, "list_claims", AsyncMock(return_value=rows))
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -280,7 +542,12 @@ async def test_list_mappings_returns_items(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["items"][0]["claim"] == "country"
+    assert len(body["items"]) == 1  # two claim rows -> one mapping object
+    item = body["items"][0]
+    assert item["mapping_id"] == "fao_countries"
+    assert item["region_prop"] == "adm0_code"
+    assert item["aliases"] == ["country"]
+    assert item["unique_id_prop"] == "FID"
     assert body["limit"] == 200
     assert body["offset"] == 0
 
@@ -367,10 +634,14 @@ async def test_definitions_excludes_mapping_with_duplicate_region_codes(
     }
     monkeypatch.setattr(svc._store, "fetch_primary_records", AsyncMock(return_value=[primary]))
     monkeypatch.setattr(
-        svc, "fetch_region_mapping_cardinality",
-        AsyncMock(return_value={
-            "feature_count": 3102, "distinct_region_count": 200, "distinct_unique_id_count": 3102,
-        }),
+        svc, "evaluate_mapping_soundness",
+        AsyncMock(return_value=(
+            ["regionProp is not unique per feature: 3102 features share only 200 distinct values."],
+            {
+                "feature_count": 3102, "distinct_region_count": 200,
+                "distinct_unique_id_count": 3102, "null_unique_id_count": 0,
+            },
+        )),
     )
 
     transport = ASGITransport(app=app)
@@ -408,15 +679,18 @@ async def test_definitions_keeps_sound_mappings_alongside_excluded_ones(
     monkeypatch.setattr(svc._store, "fetch_claims_for_mapping", AsyncMock(return_value=[]))
     monkeypatch.setattr(svc, "fetch_collection_bbox", AsyncMock(return_value=[0.0, 0.0, 1.0, 1.0]))
 
-    async def _cardinality(src_catalog: str, *_args: Any, **_kwargs: Any) -> Dict[str, int]:
-        if src_catalog == "gaul_demo":
-            return {
-                "feature_count": 3102, "distinct_region_count": 200,
-                "distinct_unique_id_count": 3102,
-            }
-        return {"feature_count": 1, "distinct_region_count": 1, "distinct_unique_id_count": 1}
+    async def _soundness(catalog: str, *_args: Any, **_kwargs: Any):
+        if catalog == "gaul_demo":
+            return (
+                ["regionProp is not unique per feature: 3102 features share only 200 distinct values."],
+                {
+                    "feature_count": 3102, "distinct_region_count": 200,
+                    "distinct_unique_id_count": 3102, "null_unique_id_count": 0,
+                },
+            )
+        return [], dict(_SOUND_STATS)
 
-    monkeypatch.setattr(svc, "fetch_region_mapping_cardinality", _cardinality)
+    monkeypatch.setattr(svc, "evaluate_mapping_soundness", _soundness)
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -585,10 +859,11 @@ async def test_validate_mapping_sound_returns_valid_true_and_no_reasons(
         }),
     )
     monkeypatch.setattr(
-        svc, "fetch_region_mapping_cardinality",
-        AsyncMock(return_value={
-            "feature_count": 200, "distinct_region_count": 200, "distinct_unique_id_count": 200,
-        }),
+        svc, "evaluate_mapping_soundness",
+        AsyncMock(return_value=([], {
+            "feature_count": 200, "distinct_region_count": 200,
+            "distinct_unique_id_count": 200, "null_unique_id_count": 0,
+        })),
     )
 
     transport = ASGITransport(app=app)
@@ -599,7 +874,10 @@ async def test_validate_mapping_sound_returns_valid_true_and_no_reasons(
     body = resp.json()
     assert body == {
         "mapping_id": "fao_countries", "valid": True, "reasons": [],
+        "catalog": "fao", "collection": "countries",
+        "region_prop": "adm0_code", "unique_id_prop": "FID",
         "feature_count": 200, "distinct_region_count": 200, "distinct_unique_id_count": 200,
+        "null_unique_id_count": 0,
     }
 
 
@@ -618,10 +896,14 @@ async def test_validate_mapping_unsound_returns_valid_false_with_reasons(
         }),
     )
     monkeypatch.setattr(
-        svc, "fetch_region_mapping_cardinality",
-        AsyncMock(return_value={
-            "feature_count": 3102, "distinct_region_count": 200, "distinct_unique_id_count": 3102,
-        }),
+        svc, "evaluate_mapping_soundness",
+        AsyncMock(return_value=(
+            ["regionProp is not unique per feature: 3102 features share only 200 distinct values."],
+            {
+                "feature_count": 3102, "distinct_region_count": 200,
+                "distinct_unique_id_count": 3102, "null_unique_id_count": 0,
+            },
+        )),
     )
 
     transport = ASGITransport(app=app)
@@ -633,6 +915,81 @@ async def test_validate_mapping_unsound_returns_valid_false_with_reasons(
     assert body["valid"] is False
     assert len(body["reasons"]) == 1
     assert "regionProp is not unique per feature" in body["reasons"][0]
+
+
+@pytest.mark.asyncio
+async def test_validate_mapping_source_collection_gone_is_a_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mapping whose source collection was deleted validates False with a
+    clear reason (the mapping row outlived the collection)."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    app = _app(monkeypatch, _StubCatalogs({}))  # collection not known -> None
+    monkeypatch.setattr(
+        svc._store, "fetch_mapping_primary",
+        AsyncMock(return_value={
+            "src_catalog": "fao", "src_collection": "gone",
+            "region_prop": "adm0_code", "unique_id_prop": "FID",
+        }),
+    )
+    monkeypatch.setattr(
+        svc, "evaluate_mapping_soundness",
+        AsyncMock(return_value=(
+            ["Source collection 'fao'/'gone' no longer exists."],
+            {
+                "feature_count": 0, "distinct_region_count": 0,
+                "distinct_unique_id_count": 0, "null_unique_id_count": 0,
+            },
+        )),
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/region-mappings/fao_gone/validate")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["valid"] is False
+    assert any("no longer exists" in r for r in body["reasons"])
+
+
+@pytest.mark.asyncio
+async def test_validate_mapping_region_prop_no_longer_a_column_is_a_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A regionProp that is no longer a declared column (schema changed under
+    the mapping) validates False."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    app = _app(monkeypatch, _StubCatalogs({}))
+    monkeypatch.setattr(
+        svc._store, "fetch_mapping_primary",
+        AsyncMock(return_value={
+            "src_catalog": "fao", "src_collection": "countries",
+            "region_prop": "adm0_code", "unique_id_prop": "FID",
+        }),
+    )
+    monkeypatch.setattr(
+        svc, "evaluate_mapping_soundness",
+        AsyncMock(return_value=(
+            ["regionProp 'adm0_code' is no longer a declared column of the "
+             "source collection's items_schema."],
+            {
+                "feature_count": 0, "distinct_region_count": 0,
+                "distinct_unique_id_count": 0, "null_unique_id_count": 0,
+            },
+        )),
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/region-mappings/fao_countries/validate")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["valid"] is False
+    assert any("regionProp" in r and "no longer a declared column" in r for r in body["reasons"])
 
 
 @pytest.mark.asyncio
@@ -889,12 +1246,17 @@ async def test_register_mapping_passes_terria_params_and_lang_to_store(
 
     catalogs = _StubCatalogs({("fao", "countries"): MagicMock()})
     app = _app(monkeypatch, catalogs)
+    _stub_columns(monkeypatch, svc, declared={"adm0_code", "internal_id"})
 
     captured: Dict[str, Any] = {}
 
     async def _apply_mapping(engine: Any, **kwargs: Any):
         captured.update(kwargs)
-        return "fao_countries", []
+        return "fao_countries", [{
+            "role": "primary", "mapping_id": "fao_countries", "src_catalog": "fao",
+            "src_collection": "countries", "region_prop": "adm0_code", "claim": "adm0_code",
+            "unique_id_prop": "internal_id",
+        }]
 
     monkeypatch.setattr(svc._store, "apply_mapping", _apply_mapping)
 
@@ -903,8 +1265,8 @@ async def test_register_mapping_passes_terria_params_and_lang_to_store(
         resp = await client.post(
             "/region-mappings?lang=it",
             json={
-                "catalog": "fao", "collection": "countries", "column": "adm0_code",
-                "alias": "country", "title": "Paesi",
+                "catalog": "fao", "collection": "countries", "region_prop": "adm0_code",
+                "aliases": ["country"], "title": "Paesi",
                 "layer_name": "gaul_layer", "server_type": "WMS",
                 "server_subdomains": ["a", "b"], "server_min_zoom": 2,
                 "server_max_native_zoom": 8, "server_max_zoom": 20,
@@ -914,6 +1276,8 @@ async def test_register_mapping_passes_terria_params_and_lang_to_store(
 
     assert resp.status_code == 201, resp.text
     assert captured["lang"] == "it"
+    assert captured["region_prop"] == "adm0_code"
+    assert captured["aliases"] == ["country"]
     assert captured["title"] == "Paesi"
     assert captured["layer_name"] == "gaul_layer"
     assert captured["server_type"] == "WMS"

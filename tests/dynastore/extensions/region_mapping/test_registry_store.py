@@ -85,8 +85,8 @@ async def test_apply_mapping_deletes_stale_then_updates_or_inserts(
     _fake_managed_transaction(monkeypatch)
 
     delete_stale = AsyncMock(return_value=[])
-    # First claim ("country", primary) is a fresh insert; the rest already
-    # exist under this mapping (UPDATE succeeds).
+    # One alias claim ("country") is a fresh insert; the rest already exist
+    # under this mapping (UPDATE succeeds).
     update_calls: List[Dict[str, Any]] = []
     insert_calls: List[Dict[str, Any]] = []
 
@@ -109,12 +109,15 @@ async def test_apply_mapping_deletes_stale_then_updates_or_inserts(
 
     mapping_id, rows = await store.apply_mapping(
         object(),
-        catalog_id="fao", collection_id="countries", column="adm0_code",
-        alias="country", extra_aliases=["adm0"], title="Countries",
+        catalog_id="fao", collection_id="countries", region_prop="adm0_code",
+        aliases=["country", "adm0"], unique_id_prop="FID", title="Countries",
     )
 
     assert mapping_id == "fao_countries"
     assert len(rows) == len(update_calls)  # one row per claim
+    # Claim set is {region_prop} ∪ aliases; region_prop is the primary token.
+    assert {c["claim_ci"] for c in update_calls} == {"adm0_code", "country", "adm0"}
+    assert all(c["region_prop"] == "adm0_code" for c in update_calls)
     assert delete_stale.await_args.kwargs["mapping_id"] == mapping_id
     assert set(delete_stale.await_args.kwargs["keep_claim_ci"]) == {
         c["claim_ci"] for c in update_calls
@@ -133,8 +136,8 @@ async def test_apply_mapping_rejects_regex_metacharacter_claims_before_any_write
     with pytest.raises(ValueError, match="regex metacharacters"):
         await store.apply_mapping(
             object(),
-            catalog_id="fao", collection_id="countries", column="adm0.code",
-            alias="country", extra_aliases=[], title=None,
+            catalog_id="fao", collection_id="countries", region_prop="adm0.code",
+            aliases=["country"], unique_id_prop="FID", title=None,
         )
 
 
@@ -168,8 +171,8 @@ async def test_apply_mapping_propagates_unique_violation_for_cross_mapping_colli
     with pytest.raises(UniqueViolationError):
         await store.apply_mapping(
             object(),
-            catalog_id="who", collection_id="regions", column="region",
-            alias="region_name", extra_aliases=[], title=None,
+            catalog_id="who", collection_id="regions", region_prop="region",
+            aliases=["region_name"], unique_id_prop="FID", title=None,
         )
 
 
@@ -203,12 +206,105 @@ async def test_apply_mapping_absorbs_unique_violation_for_concurrent_same_mappin
 
     mapping_id, rows = await store.apply_mapping(
         object(),
-        catalog_id="who", collection_id="regions", column="region",
-        alias="region_name", extra_aliases=[], title=None,
+        catalog_id="who", collection_id="regions", region_prop="region",
+        aliases=["region_name"], unique_id_prop="FID", title=None,
     )
 
     assert mapping_id == "who_regions"
     assert winning_row in rows
+
+
+# ---------------------------------------------------------------------------
+# mapping_object_from_claims -- claim rows -> the region.json single object
+# ---------------------------------------------------------------------------
+
+
+def test_mapping_object_from_claims_assembles_region_json_object() -> None:
+    from dynastore.extensions.region_mapping.registry_store import mapping_object_from_claims
+
+    rows = [
+        {
+            "role": "primary", "mapping_id": "fao_gaul", "src_catalog": "fao",
+            "src_collection": "gaul", "region_prop": "GAUL1_CODE", "claim": "GAUL1_CODE",
+            "unique_id_prop": "external_id", "title": {"en": "GAUL"},
+            "layer_name": "default", "server_type": "MVT", "server_subdomains": [],
+            "server_min_zoom": 0, "server_max_native_zoom": 12, "server_max_zoom": 28,
+            "digits": 3,
+        },
+        {"role": "alias", "mapping_id": "fao_gaul", "region_prop": "GAUL1_CODE",
+         "claim": "iso3", "unique_id_prop": "external_id"},
+        {"role": "alias", "mapping_id": "fao_gaul", "region_prop": "GAUL1_CODE",
+         "claim": "country_code", "unique_id_prop": "external_id"},
+    ]
+
+    obj = mapping_object_from_claims(rows)
+
+    assert obj is not None
+    assert obj["mapping_id"] == "fao_gaul"
+    assert obj["catalog"] == "fao"
+    assert obj["collection"] == "gaul"
+    assert obj["region_prop"] == "GAUL1_CODE"
+    assert obj["unique_id_prop"] == "external_id"
+    # region_prop token excluded from aliases; the rest sorted.
+    assert obj["aliases"] == ["country_code", "iso3"]
+    assert obj["digits"] == 3
+    assert obj["title"] == {"en": "GAUL"}
+
+
+def test_mapping_object_from_claims_resolves_title_language() -> None:
+    from dynastore.extensions.region_mapping.registry_store import mapping_object_from_claims
+
+    rows = [{
+        "role": "primary", "mapping_id": "m", "src_catalog": "c", "src_collection": "col",
+        "region_prop": "R", "claim": "R", "unique_id_prop": "FID",
+        "title": {"en": "Hello", "fr": "Bonjour"},
+    }]
+
+    obj = mapping_object_from_claims(rows, language="fr")
+
+    assert obj is not None
+    assert obj["title"] == "Bonjour"
+    assert obj["aliases"] == []
+
+
+def test_mapping_object_from_claims_resolves_jsonb_text_title() -> None:
+    """The JSONB title column round-trips as JSON *text*, not a decoded dict.
+    ``resolve_localized`` returns a str verbatim, so without coercion the raw
+    ``{"en": ...}`` JSON would leak into region.json's ``description``."""
+    from dynastore.extensions.region_mapping.registry_store import mapping_object_from_claims
+
+    rows = [{
+        "role": "primary", "mapping_id": "m", "src_catalog": "c", "src_collection": "col",
+        "region_prop": "R", "claim": "R", "unique_id_prop": "FID",
+        "title": '{"en": "GAUL admin-1 codes"}',
+    }]
+
+    obj = mapping_object_from_claims(rows, language="en")
+
+    assert obj is not None
+    assert obj["title"] == "GAUL admin-1 codes"
+
+
+def test_mapping_object_from_claims_keeps_plain_string_title() -> None:
+    """A plain (non-JSON) legacy title string survives coercion unchanged."""
+    from dynastore.extensions.region_mapping.registry_store import mapping_object_from_claims
+
+    rows = [{
+        "role": "primary", "mapping_id": "m", "src_catalog": "c", "src_collection": "col",
+        "region_prop": "R", "claim": "R", "unique_id_prop": "FID",
+        "title": "Sri Lanka PIA units (IRMA codes)",
+    }]
+
+    obj = mapping_object_from_claims(rows, language="en")
+
+    assert obj is not None
+    assert obj["title"] == "Sri Lanka PIA units (IRMA codes)"
+
+
+def test_mapping_object_from_claims_empty_returns_none() -> None:
+    from dynastore.extensions.region_mapping.registry_store import mapping_object_from_claims
+
+    assert mapping_object_from_claims([]) is None
 
 
 # ---------------------------------------------------------------------------

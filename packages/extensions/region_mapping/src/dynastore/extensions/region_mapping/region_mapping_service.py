@@ -73,7 +73,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.tools.language_utils import get_language
-from dynastore.extensions.tools.query import resolve_queryable_property_names
 from dynastore.extensions.tools.response_i18n import resolve_localized
 from dynastore.extensions.tools.url import get_root_url
 from dynastore.models.protocols.catalogs import CatalogsProtocol
@@ -85,11 +84,17 @@ from dynastore.tools.protocol_helpers import get_engine
 from . import registry_queries as _q
 from . import registry_store as _store
 from .claims import (
+    FALLBACK_UNIQUE_ID_PROP,
+    evaluate_mapping_soundness,
     fetch_collection_bbox,
     fetch_distinct_region_ids,
     fetch_region_ids_by_unique_id,
     fetch_region_mapping_cardinality,
-    validate_region_mapping_stats,
+    mapping_id_for,
+    resolve_collection_columns,
+    resolve_unique_id_prop,
+    slugify,
+    uncached_if,
 )
 from .config import RegionMappingConfig
 from .lifecycle import register_region_mapping_cleanup_subscriber
@@ -99,110 +104,134 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_LIMIT = 200
 
+_NO_CACHE_DESC = (
+    "Bypass the per-pod read cache and read straight through to the database "
+    "for this request. Use to see writes immediately (the serving reads are "
+    "cached per instance, so a fresh registration can lag on other pods)."
+)
+
 
 # ---------------------------------------------------------------------------
 # DTOs
 # ---------------------------------------------------------------------------
 
 
-class RegisterMappingRequest(BaseModel):
-    """Body of ``POST /region-mappings``."""
+class RegionMappingRequest(BaseModel):
+    """Body of ``POST /region-mappings`` -- one region.json ``regionWmsMap``
+    entry, plus the ``catalog``/``collection`` naming its source.
+
+    The fields are the region.json single-mapping object the server itself
+    emits at ``/region-mappings/region.json``: registering a mapping is
+    declaring that object. ``region_prop`` and every ``alias`` must be a
+    globally unique CSV-header identifier (a duplicate is HTTP 409); the
+    source collection must expose a columnar ``items_schema`` and both
+    ``region_prop`` and the resolved ``unique_id_prop`` must be declared
+    columns of it (otherwise HTTP 400).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
+    id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional caller-chosen mapping id -- the '/{mapping_id}/...' path "
+            "segment for this mapping's regionIds/validate routes, and its key "
+            "on the write/list surfaces. Must be a URL-safe slug "
+            "([a-z0-9_-], case-insensitive). Defaults to the "
+            "'{catalog}_{collection}' slug. Re-posting the same id for the same "
+            "source collection is an idempotent update; a different collection "
+            "reusing an id is HTTP 409."
+        ),
+    )
     catalog: str = Field(..., description="Source catalog id.")
     collection: str = Field(..., description="Source collection id.")
-    column: str = Field(
+    region_prop: str = Field(
         ...,
         description=(
-            "Source collection property carrying the region-id values "
-            "TerriaJS should join against."
+            "The tile property (source collection column) carrying the region "
+            "code TerriaJS joins CSV rows against -- region.json 'regionProp'. "
+            "Must be a declared column of the collection's items_schema, and "
+            "unique across all registered mappings."
         ),
     )
-    alias: str = Field(
-        ...,
+    aliases: List[str] = Field(
+        default_factory=list,
         description=(
-            "Canonical alias TerriaJS's region-mapping config matches CSV "
-            "column names against (its regionProp/uniqueIdProp). Required: "
-            "TerriaJS always declares one, and the raw column name is often "
-            "a database-internal identifier a CSV header would not use, so "
-            "there is no safe default."
+            "Additional CSV column headers TerriaJS accepts for this layer "
+            "(region.json 'aliases'). Each must be unique across all "
+            "registered mappings. region_prop is always matchable on its own; "
+            "aliases add friendlier header names."
         ),
     )
-    extra_aliases: List[str] = Field(
-        default_factory=list, description="Additional alias strings TerriaJS should also accept.",
+    unique_id_prop: Optional[str] = Field(
+        default=None,
+        description=(
+            "region.json 'uniqueIdProp': the per-feature index column the "
+            "positional regionIds array is keyed by -- NOT the region code. "
+            "When omitted, resolves to the collection's external_id column if "
+            "one is configured (its values survive a feature's versions), else "
+            "'FID'. The resolved value must be a declared column."
+        ),
     )
     title: Optional[Union[str, Dict[str, str]]] = Field(
         default=None,
         description=(
-            "TerriaJS's regionWmsMap 'description' -- used in GUI elements and "
-            "error messages. Defaults to the collection id. A plain string is "
-            "stored under the request's language (see the `lang` query "
-            "parameter, same convention as the rest of the platform); a "
+            "region.json 'description' -- used in GUI elements and error "
+            "messages. Defaults to the collection id. A plain string is stored "
+            "under the request's language (`lang` query parameter); a "
             "{lang: text} dict is stored as given."
         ),
     )
     layer_name: str = Field(
         default="default",
-        description="TerriaJS layerName -- the tile layer within this mapping's server.",
+        description="region.json 'layerName' -- the tile layer within this mapping's server.",
     )
     server_type: str = Field(
-        default="MVT", description="TerriaJS serverType, e.g. 'MVT' or 'WMS'.",
+        default="MVT", description="region.json 'serverType', e.g. 'MVT' or 'WMS'.",
     )
     server_subdomains: List[str] = Field(
         default_factory=list,
-        description="TerriaJS serverSubdomains, for {s}-templated tile server URLs.",
+        description="region.json 'serverSubdomains', for {s}-templated tile server URLs.",
     )
-    server_min_zoom: int = Field(default=0, ge=0, description="TerriaJS serverMinZoom.")
+    server_min_zoom: int = Field(default=0, ge=0, description="region.json 'serverMinZoom'.")
     server_max_native_zoom: int = Field(
-        default=12, ge=0, description="TerriaJS serverMaxNativeZoom.",
+        default=12, ge=0, description="region.json 'serverMaxNativeZoom'.",
     )
-    server_max_zoom: int = Field(default=28, ge=0, description="TerriaJS serverMaxZoom.")
-    unique_id_prop: Optional[str] = Field(
-        default=None,
-        description=(
-            "TerriaJS uniqueIdProp: a numeric, zero-based, sequential feature "
-            "index attribute used for positional row lookups -- NOT the region "
-            "code (`column`/regionProp). Defaults to `FID` if not given."
-        ),
-    )
+    server_max_zoom: int = Field(default=28, ge=0, description="region.json 'serverMaxZoom'.")
     digits: int = Field(
         default=255,
-        description="TerriaJS digits -- left-zero-pad width for numeric region codes.",
+        description="region.json 'digits' -- left-zero-pad width for numeric region codes.",
     )
 
 
-class ClaimOut(BaseModel):
-    """One claim row."""
+class RegionMappingOut(BaseModel):
+    """One registered mapping, as the region.json single-object shape.
+
+    The public representation of a mapping on every write/read surface -- the
+    internal one-row-per-claim storage never surfaces. ``aliases`` is the
+    mapping's alias set (everything TerriaJS matches besides ``region_prop``).
+    """
 
     model_config = ConfigDict(from_attributes=True)
 
-    claim_ci: str
-    claim: str
     mapping_id: str
-    role: str
-    src_catalog: str
-    src_collection: str
+    catalog: str
+    collection: str
     region_prop: str
-    alias: Optional[str] = None
+    unique_id_prop: str
+    aliases: List[str] = Field(default_factory=list)
     title: Optional[Any] = None
-    layer_name: Optional[str] = None
-    server_type: Optional[str] = None
-    server_subdomains: Optional[List[str]] = None
-    server_min_zoom: Optional[int] = None
-    server_max_native_zoom: Optional[int] = None
-    server_max_zoom: Optional[int] = None
-    unique_id_prop: Optional[str] = None
-    digits: Optional[int] = None
+    layer_name: str = "default"
+    server_type: str = "MVT"
+    server_subdomains: List[str] = Field(default_factory=list)
+    server_min_zoom: int = 0
+    server_max_native_zoom: int = 12
+    server_max_zoom: int = 28
+    digits: int = 255
 
 
-class RegisterMappingResponse(BaseModel):
-    mapping_id: str
-    claims: List[ClaimOut]
-
-
-class ClaimListResponse(BaseModel):
-    items: List[ClaimOut]
+class RegionMappingListResponse(BaseModel):
+    items: List[RegionMappingOut]
     limit: int
     offset: int
 
@@ -211,9 +240,14 @@ class MappingValidationResponse(BaseModel):
     mapping_id: str
     valid: bool
     reasons: List[str]
-    feature_count: int
-    distinct_region_count: int
-    distinct_unique_id_count: int
+    catalog: Optional[str] = None
+    collection: Optional[str] = None
+    region_prop: Optional[str] = None
+    unique_id_prop: Optional[str] = None
+    feature_count: int = 0
+    distinct_region_count: int = 0
+    distinct_unique_id_count: int = 0
+    null_unique_id_count: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +332,7 @@ async def _build_definitions(
     limit: int,
     offset: int,
     language: str,
+    no_cache: bool = False,
 ) -> Dict[str, Any]:
     alias_ci = alias.strip().casefold() if alias else None
 
@@ -312,7 +347,9 @@ async def _build_definitions(
             limit=_store.DEFINITIONS_FETCH_CAP, offset=0,
         )
     else:
-        records = await _store.fetch_primary_records(catalog, collection, alias_ci)
+        records = await uncached_if(_store.fetch_primary_records, no_cache)(
+            catalog, collection, alias_ci,
+        )
 
     # De-dup by mapping_id, preserving the query's sort order, then paginate
     # over MAPPINGS (not claim rows).
@@ -331,12 +368,11 @@ async def _build_definitions(
         src_catalog = record.get("src_catalog", "")
         src_collection = record.get("src_collection", "")
         region_prop = record.get("region_prop", "")
-        unique_id_prop = record.get("unique_id_prop") or "FID"
+        unique_id_prop = record.get("unique_id_prop") or FALLBACK_UNIQUE_ID_PROP
 
-        stats = await fetch_region_mapping_cardinality(
-            src_catalog, src_collection, region_prop, unique_id_prop,
+        reasons, _stats = await evaluate_mapping_soundness(
+            src_catalog, src_collection, region_prop, unique_id_prop, no_cache=no_cache,
         )
-        reasons = validate_region_mapping_stats(stats)
         if reasons:
             logger.warning(
                 "region_mapping: excluding %r from region.json -- %s",
@@ -344,16 +380,18 @@ async def _build_definitions(
             )
             continue
 
-        title = resolve_localized(record.get("title"), language) or src_collection
+        title = resolve_localized(
+            _store.coerce_stored_title(record.get("title")), language,
+        ) or src_collection
 
-        claim_records = await _store.fetch_claims_for_mapping(mapping_id)
+        claim_records = await uncached_if(_store.fetch_claims_for_mapping, no_cache)(mapping_id)
         region_prop_ci = region_prop.casefold()
         aliases = sorted({
             c["claim"] for c in claim_records
             if c.get("claim") and c["claim"].casefold() != region_prop_ci
         })
 
-        bbox = await fetch_collection_bbox(src_catalog, src_collection)
+        bbox = await uncached_if(fetch_collection_bbox, no_cache)(src_catalog, src_collection)
 
         entries.append({
             "key": f"{src_catalog}_{src_collection}",
@@ -405,18 +443,21 @@ class RegionMappingService(ExtensionProtocol):
     @router.post(
         "",
         status_code=status.HTTP_201_CREATED,
-        summary="Claim a collection's region-id column for TerriaJS WMS region mapping.",
+        summary="Register a collection's region column for TerriaJS WMS region mapping.",
     )
     async def register_mapping(
-        payload: RegisterMappingRequest,  # type: ignore[reportGeneralTypeIssues]
+        payload: RegionMappingRequest,  # type: ignore[reportGeneralTypeIssues]
         lang: str = Depends(get_language),
-    ) -> RegisterMappingResponse:
-        """Register (or idempotently re-apply) one mapping's claim set.
+    ) -> RegionMappingOut:
+        """Register (or idempotently re-apply) one region mapping.
 
-        A claim already owned by a *different* mapping is a genuine PG
-        ``23505`` -> HTTP 409 (see ``registry_store.apply_mapping``); a
-        re-apply of the SAME mapping is an idempotent update and
-        self-cleaning (stale claims from a changed alias set are deleted).
+        Validates before writing: the collection must exist and expose a
+        columnar ``items_schema`` (JSONB-only collections are refused -- their
+        attributes have no fixed columns to back a region layer), and both
+        ``region_prop`` and the resolved ``unique_id_prop`` must be declared
+        columns of it. ``region_prop`` or an ``alias`` already claimed by a
+        *different* mapping is a PG ``23505`` -> HTTP 409; re-applying the SAME
+        mapping is idempotent and self-cleaning (stale aliases are dropped).
         """
         catalogs = get_protocol(CatalogsProtocol)
         if catalogs is None:
@@ -432,37 +473,124 @@ class RegionMappingService(ExtensionProtocol):
                 detail=f"Collection {payload.catalog!r}/{payload.collection!r} not found.",
             )
 
-        valid_names = await resolve_queryable_property_names(payload.catalog, payload.collection)
-        if valid_names and payload.column not in valid_names:
+        cols = await resolve_collection_columns(payload.catalog, payload.collection)
+        if cols is None or not cols.is_columnar or not cols.declared:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
-                    f"Property {payload.column!r} is not a queryable property of "
-                    f"{payload.catalog!r}/{payload.collection!r} -- see its "
-                    "'/queryables' for the supported names."
+                    f"Collection {payload.catalog!r}/{payload.collection!r} has no columnar "
+                    "items_schema. Region mapping requires a declared physical schema: JSONB "
+                    "attributes have no fixed columns, so a region column cannot be guaranteed "
+                    "to exist or share a type across features. Re-ingest the collection with a "
+                    "declared items_schema and retry."
+                ),
+            )
+        if not cols.has_column(payload.region_prop):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"regionProp {payload.region_prop!r} is not a declared column of "
+                    f"{payload.catalog!r}/{payload.collection!r}'s items_schema."
+                ),
+            )
+        unique_id_prop = resolve_unique_id_prop(
+            payload.unique_id_prop, cols.external_id_path,
+            cols.has_column(FALLBACK_UNIQUE_ID_PROP),
+        )
+        if unique_id_prop is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Cannot resolve a uniqueIdProp for {payload.catalog!r}/{payload.collection!r}: "
+                    "none was supplied, the collection configures no external_id source column, and "
+                    f"it declares no {FALLBACK_UNIQUE_ID_PROP!r} column. Pass an explicit uniqueIdProp "
+                    "naming a declared per-feature index column."
+                ),
+            )
+        if not cols.has_column(unique_id_prop):
+            hint = (
+                "."
+                if payload.unique_id_prop
+                else (
+                    f" -- resolved from the collection's external_id-source/{FALLBACK_UNIQUE_ID_PROP} "
+                    "fallback. Pass an explicit uniqueIdProp naming a declared column."
+                )
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"uniqueIdProp {unique_id_prop!r} is not a declared column of "
+                    f"{payload.catalog!r}/{payload.collection!r}'s items_schema{hint}"
+                ),
+            )
+
+        # Every feature must carry a non-null uniqueIdProp value, or it cannot be
+        # positioned in the regionIds array. A mapping over an external_id/index
+        # column with NULL gaps (or over an empty collection) is refused here
+        # rather than silently served with holes.
+        stats = await fetch_region_mapping_cardinality(
+            payload.catalog, payload.collection, payload.region_prop, unique_id_prop,
+        )
+        if stats["feature_count"] == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"No features of {payload.catalog!r}/{payload.collection!r} carry non-null "
+                    f"values for both regionProp {payload.region_prop!r} and uniqueIdProp "
+                    f"{unique_id_prop!r} -- nothing to map."
+                ),
+            )
+        if stats["null_unique_id_count"] > 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"uniqueIdProp {unique_id_prop!r} is NULL on {stats['null_unique_id_count']} "
+                    f"feature(s) of {payload.catalog!r}/{payload.collection!r}. Every feature must "
+                    "carry a non-null per-feature index value for a region mapping; an "
+                    "external_id/index column with gaps cannot be used."
+                ),
+            )
+
+        mapping_id = slugify(payload.id) if payload.id else mapping_id_for(
+            payload.catalog, payload.collection,
+        )
+        if payload.id and not mapping_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="id must contain URL-safe characters ([a-z0-9_-]).",
+            )
+        existing = await _store.fetch_mapping_primary(mapping_id)
+        if existing is not None and (
+            existing.get("src_catalog") != payload.catalog
+            or existing.get("src_collection") != payload.collection
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Region mapping id {mapping_id!r} is already used by "
+                    f"{existing.get('src_catalog')!r}/{existing.get('src_collection')!r}. "
+                    "Choose a different id."
                 ),
             )
 
         try:
-            mapping_id, claim_rows = await _store.apply_mapping(
+            _mapping_id, claim_rows = await _store.apply_mapping(
                 engine,
                 catalog_id=payload.catalog, collection_id=payload.collection,
-                column=payload.column, alias=payload.alias,
-                extra_aliases=tuple(payload.extra_aliases), title=payload.title, lang=lang,
+                region_prop=payload.region_prop, aliases=payload.aliases,
+                unique_id_prop=unique_id_prop, title=payload.title,
+                mapping_id=mapping_id, lang=lang,
                 layer_name=payload.layer_name, server_type=payload.server_type,
                 server_subdomains=payload.server_subdomains,
                 server_min_zoom=payload.server_min_zoom,
                 server_max_native_zoom=payload.server_max_native_zoom,
-                server_max_zoom=payload.server_max_zoom,
-                unique_id_prop=payload.unique_id_prop, digits=payload.digits,
+                server_max_zoom=payload.server_max_zoom, digits=payload.digits,
             )
         except ValueError as ve:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve)) from ve
 
-        return RegisterMappingResponse(
-            mapping_id=mapping_id,
-            claims=[ClaimOut.model_validate(row) for row in claim_rows],
-        )
+        obj = _store.mapping_object_from_claims(claim_rows, language=lang)
+        return RegionMappingOut.model_validate(obj)
 
     # -------------------------------------------------------------------
     # DELETE /region-mappings/{mapping_id}
@@ -488,30 +616,45 @@ class RegionMappingService(ExtensionProtocol):
     # GET /region-mappings
     # -------------------------------------------------------------------
 
-    @router.get("", summary="List registered region-mapping claims.")
+    @router.get("", summary="List registered region mappings.")
     async def list_mappings(
         mapping_id: Optional[str] = Query(None, description="Exact mapping_id match."),  # type: ignore[reportGeneralTypeIssues]
-        role: Optional[str] = Query(None, description="Exact role match ('primary' or 'alias')."),
-        catalog: Optional[str] = Query(None, description="Filter to claims sourced from this catalog id."),
-        collection: Optional[str] = Query(None, description="Filter to claims sourced from this collection id."),
+        catalog: Optional[str] = Query(None, description="Filter to mappings sourced from this catalog id."),
+        collection: Optional[str] = Query(None, description="Filter to mappings sourced from this collection id."),
         filter: Optional[str] = Query(  # noqa: A002 -- OGC/CQL2 query-param convention
             None, description="CQL2-Text filter expression over the claim columns.",
         ),
-        limit: int = Query(_DEFAULT_LIMIT, ge=1, le=1000, description="Claims per page."),
-        offset: int = Query(0, ge=0, description="Claims to skip."),
+        limit: int = Query(_DEFAULT_LIMIT, ge=1, le=1000, description="Mappings per page."),
+        offset: int = Query(0, ge=0, description="Mappings to skip."),
         language: str = Depends(get_language),
-    ) -> ClaimListResponse:
+    ) -> RegionMappingListResponse:
+        """List registered mappings as region.json single-object entries,
+        paginated over MAPPINGS (not the internal claim rows).
+
+        A CQL2 ``filter=`` matches against the claim columns; a mapping is
+        included when any of its claims matches, and its ``aliases`` then
+        reflect only the matching claims. The default (no filter) path returns
+        each mapping's complete alias set.
+        """
         cql_where, cql_params = _parse_cql(filter)
         rows = await _store.list_claims(
-            mapping_id=mapping_id, role=role, src_catalog=catalog, src_collection=collection,
-            cql_where=cql_where, cql_params=cql_params, limit=limit, offset=offset,
+            mapping_id=mapping_id, src_catalog=catalog, src_collection=collection,
+            cql_where=cql_where, cql_params=cql_params,
+            limit=_store.DEFINITIONS_FETCH_CAP, offset=0,
         )
-        items = []
+        grouped: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
         for row in rows:
-            row = dict(row)
-            row["title"] = resolve_localized(row.get("title"), language)
-            items.append(ClaimOut.model_validate(row))
-        return ClaimListResponse(items=items, limit=limit, offset=offset)
+            mid = row.get("mapping_id")
+            if mid:
+                grouped.setdefault(mid, []).append(dict(row))
+
+        page = list(grouped.values())[offset: offset + limit]
+        items = []
+        for claim_rows in page:
+            obj = _store.mapping_object_from_claims(claim_rows, language=language)
+            if obj:
+                items.append(RegionMappingOut.model_validate(obj))
+        return RegionMappingListResponse(items=items, limit=limit, offset=offset)
 
     # -------------------------------------------------------------------
     # GET /region-mappings/region.json
@@ -537,6 +680,7 @@ class RegionMappingService(ExtensionProtocol):
         ),
         limit: int = Query(_DEFAULT_LIMIT, ge=1, le=1000, description="Mappings per page."),
         offset: int = Query(0, ge=0, description="Mappings to skip."),
+        no_cache: bool = Query(False, description=_NO_CACHE_DESC),
         language: str = Depends(get_language),
     ) -> Dict[str, Any]:
         """Return ``{"regionWmsMap": {...}}`` -- one entry per registered mapping."""
@@ -546,7 +690,7 @@ class RegionMappingService(ExtensionProtocol):
         return await _build_definitions(
             request, catalog=catalog, collection=collection, alias=alias,
             cql_where=cql_where, cql_params=cql_params, limit=limit, offset=offset,
-            language=language,
+            language=language, no_cache=no_cache,
         )
 
     # -------------------------------------------------------------------
@@ -555,30 +699,46 @@ class RegionMappingService(ExtensionProtocol):
 
     @router.get(
         "/{mapping_id}/validate",
-        summary="Diagnose why a registered mapping is (or isn't) sound for TerriaJS.",
+        summary="Diagnose whether a registered mapping is sound for TerriaJS.",
     )
-    async def validate_mapping(mapping_id: str):  # type: ignore[reportGeneralTypeIssues]
-        """Report whether ``regionProp``/``uniqueIdProp`` identify one
-        feature per code in the mapping's source collection.
+    async def validate_mapping(
+        mapping_id: str,  # type: ignore[reportGeneralTypeIssues]
+        no_cache: bool = Query(False, description=_NO_CACHE_DESC),
+    ) -> MappingValidationResponse:
+        """Re-check every condition a mapping must satisfy, live against its
+        source collection -- the source still exists, still has a columnar
+        items_schema, still declares both ``region_prop`` and
+        ``unique_id_prop`` as columns, and ``region_prop``/``unique_id_prop``
+        still identify one feature per code (external_id is checked against its
+        latest-version-per-id set, so legitimate versioning is not flagged).
 
-        A mapping failing this check is silently excluded from
-        ``GET /region-mappings/region.json`` -- this endpoint is how to see
+        Any failing condition is a ``reasons`` entry; a mapping with a
+        non-empty ``reasons`` is silently excluded from
+        ``GET /region-mappings/region.json``, and this endpoint is how to see
         why.
         """
-        record = await _store.fetch_mapping_primary(mapping_id)
+        record = await uncached_if(_store.fetch_mapping_primary, no_cache)(mapping_id)
         if record is None:
             raise HTTPException(
                 status_code=404, detail=f"Region mapping {mapping_id!r} not found.",
             )
+        catalog = record.get("src_catalog", "")
+        collection = record.get("src_collection", "")
         region_prop = record.get("region_prop", "")
-        unique_id_prop = record.get("unique_id_prop") or "FID"
-        stats = await fetch_region_mapping_cardinality(
-            record.get("src_catalog", ""), record.get("src_collection", ""),
-            region_prop, unique_id_prop,
+        unique_id_prop = record.get("unique_id_prop") or FALLBACK_UNIQUE_ID_PROP
+
+        reasons, stats = await evaluate_mapping_soundness(
+            catalog, collection, region_prop, unique_id_prop, no_cache=no_cache,
         )
-        reasons = validate_region_mapping_stats(stats)
+
         return MappingValidationResponse(
-            mapping_id=mapping_id, valid=not reasons, reasons=reasons, **stats,
+            mapping_id=mapping_id, valid=not reasons, reasons=reasons,
+            catalog=catalog, collection=collection,
+            region_prop=region_prop, unique_id_prop=unique_id_prop,
+            feature_count=stats["feature_count"],
+            distinct_region_count=stats["distinct_region_count"],
+            distinct_unique_id_count=stats["distinct_unique_id_count"],
+            null_unique_id_count=stats.get("null_unique_id_count", 0),
         )
 
     # -------------------------------------------------------------------
@@ -589,18 +749,21 @@ class RegionMappingService(ExtensionProtocol):
         "/{mapping_id}/regionIds",
         summary="Feature-positional region id values for TerriaJS's regionIdsFile fetch.",
     )
-    async def get_region_ids(mapping_id: str):  # type: ignore[reportGeneralTypeIssues]
+    async def get_region_ids(  # type: ignore[reportGeneralTypeIssues]
+        mapping_id: str,
+        no_cache: bool = Query(False, description=_NO_CACHE_DESC),
+    ):
         """Return ``{"layer", "property", "values"}`` for TerriaJS's regionIds fetch."""
         if get_protocol(CatalogsProtocol) is None:
             raise HTTPException(status_code=503, detail="Catalogs service not available.")
-        record = await _store.fetch_mapping_primary(mapping_id)
+        record = await uncached_if(_store.fetch_mapping_primary, no_cache)(mapping_id)
         if record is None:
             raise HTTPException(
                 status_code=404, detail=f"Region mapping {mapping_id!r} not found.",
             )
         region_prop = record.get("region_prop", "")
-        unique_id_prop = record.get("unique_id_prop") or "FID"
-        values = await fetch_region_ids_by_unique_id(
+        unique_id_prop = record.get("unique_id_prop") or FALLBACK_UNIQUE_ID_PROP
+        values = await uncached_if(fetch_region_ids_by_unique_id, no_cache)(
             record.get("src_catalog", ""), record.get("src_collection", ""),
             region_prop, unique_id_prop,
         )
@@ -614,7 +777,10 @@ class RegionMappingService(ExtensionProtocol):
         "/{mapping_id}/regionIds.csv",
         summary="Downloadable CSV template of this mapping's region-id values.",
     )
-    async def get_region_ids_csv(mapping_id: str):  # type: ignore[reportGeneralTypeIssues]
+    async def get_region_ids_csv(  # type: ignore[reportGeneralTypeIssues]
+        mapping_id: str,
+        no_cache: bool = Query(False, description=_NO_CACHE_DESC),
+    ):
         """One column of every distinct region-id value, headed by the
         mapping's alias -- the exact CSV column name TerriaJS matches
         against. A ready-to-fill template for testing/seeding a
@@ -623,13 +789,13 @@ class RegionMappingService(ExtensionProtocol):
         """
         if get_protocol(CatalogsProtocol) is None:
             raise HTTPException(status_code=503, detail="Catalogs service not available.")
-        record = await _store.fetch_mapping_primary(mapping_id)
+        record = await uncached_if(_store.fetch_mapping_primary, no_cache)(mapping_id)
         if record is None:
             raise HTTPException(
                 status_code=404, detail=f"Region mapping {mapping_id!r} not found.",
             )
         header = record.get("alias") or record.get("region_prop") or "region_id"
-        values = await fetch_distinct_region_ids(
+        values = await uncached_if(fetch_distinct_region_ids, no_cache)(
             record.get("src_catalog", ""), record.get("src_collection", ""),
             record.get("region_prop", ""),
         )

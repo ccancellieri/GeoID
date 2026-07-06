@@ -32,122 +32,238 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
-def test_compute_claim_set_alias_equal_to_column_is_still_one_primary() -> None:
-    """``alias`` is required now (no column fallback), but a caller is free to
-    pass the same value as ``column`` -- that must still collapse to the
-    2-claim set it always did."""
+def test_compute_claim_set_alias_equal_to_region_prop_collapses_to_one() -> None:
+    """An alias identical to region_prop (case-insensitively) collapses into
+    the single primary claim -- no duplicate row, no second primary. The claim
+    set is exactly ``{region_prop} ∪ aliases``: there is no longer a
+    ``{catalog}_{alias}`` token."""
     from dynastore.extensions.region_mapping.claims import compute_claim_set
 
-    claims = compute_claim_set(
-        catalog_id="fao", collection_id="countries",
-        column="adm0_code", alias="adm0_code", extra_aliases=[],
-    )
+    claims = compute_claim_set(region_prop="adm0_code", aliases=["adm0_code"])
 
     values = {claim for claim, _role in claims.values()}
-    assert values == {"adm0_code", "fao_adm0_code"}
+    assert values == {"adm0_code"}
+    assert len(claims) == 1
+    assert list(claims.values())[0][1] == "primary"
 
 
-def test_compute_claim_set_explicit_alias_marks_primary() -> None:
+def test_compute_claim_set_region_prop_is_primary_aliases_are_alias() -> None:
+    """region_prop's token is the sole primary; every alias is role='alias'."""
     from dynastore.extensions.region_mapping.claims import compute_claim_set
 
-    claims = compute_claim_set(
-        catalog_id="fao", collection_id="countries",
-        column="adm0_code", alias="country", extra_aliases=["adm0"],
-    )
+    claims = compute_claim_set(region_prop="adm0_code", aliases=["country", "adm0"])
 
     roles_by_claim = {claim: role for claim, role in claims.values()}
-    assert roles_by_claim["country"] == "primary"
-    assert roles_by_claim["adm0_code"] == "alias"
+    assert roles_by_claim["adm0_code"] == "primary"
+    assert roles_by_claim["country"] == "alias"
     assert roles_by_claim["adm0"] == "alias"
-    assert roles_by_claim["fao_country"] == "alias"
-    assert len(roles_by_claim) == 4
+    assert len(roles_by_claim) == 3
 
 
 def test_compute_claim_set_casefold_dedup() -> None:
-    """Two candidates differing only by case collapse to one claim record."""
+    """A region_prop and an alias differing only by case collapse to one claim."""
     from dynastore.extensions.region_mapping.claims import compute_claim_set
 
-    claims = compute_claim_set(
-        catalog_id="fao", collection_id="countries",
-        column="Country", alias="country", extra_aliases=[],
-    )
+    claims = compute_claim_set(region_prop="Country", aliases=["country"])
 
-    assert len(claims) == 2
+    assert len(claims) == 1
     assert "country" in claims  # casefolded key
 
 
-def test_compute_claim_set_column_casefold_equals_alias_has_one_primary() -> None:
-    """Column and (defaulted-from-column) alias differing only by case must
-    still produce exactly one primary row (dynastore#2821 regression): the
-    role is decided case-insensitively, not by exact string equality, and
-    the claim text kept is the first-seen candidate's spelling."""
+def test_compute_claim_set_alias_casefold_equals_region_prop_has_one_primary() -> None:
+    """An alias that differs from region_prop only by case must still produce
+    exactly one primary row (dynastore#2821 regression): the role is decided
+    case-insensitively, not by exact string equality, and the claim text kept
+    is the first-seen candidate's spelling (region_prop is built first)."""
     from dynastore.extensions.region_mapping.claims import ROLE_PRIMARY, compute_claim_set
 
-    claims = compute_claim_set(
-        catalog_id="fao", collection_id="countries",
-        column="GAUL1_CODE", alias="gaul1_code", extra_aliases=[],
-    )
+    claims = compute_claim_set(region_prop="GAUL1_CODE", aliases=["gaul1_code"])
 
     primaries = [
         (claim, role) for claim, role in claims.values() if role == ROLE_PRIMARY
     ]
     assert len(primaries) == 1
-    # "GAUL1_CODE" is the first candidate built (column before canonical_alias),
-    # so its spelling wins the slot even though role resolution is
-    # case-insensitive.
     assert primaries[0][0] == "GAUL1_CODE"
+    assert len(claims) == 1
 
 
-def test_compute_claim_set_extra_alias_casefold_equals_canonical_has_one_primary() -> None:
-    """An extra_alias that casefold-equals the canonical alias must not
-    steal the primary slot nor create a second primary."""
-    from dynastore.extensions.region_mapping.claims import ROLE_PRIMARY, compute_claim_set
+def test_compute_claim_set_duplicate_aliases_casefold_collapse() -> None:
+    """Two aliases that casefold-equal each other collapse to one alias row,
+    keeping the first-seen spelling, without touching the primary."""
+    from dynastore.extensions.region_mapping.claims import ROLE_ALIAS, ROLE_PRIMARY, compute_claim_set
 
-    claims = compute_claim_set(
-        catalog_id="fao", collection_id="countries",
-        column="adm0_code", alias="Country", extra_aliases=["country"],
-    )
+    claims = compute_claim_set(region_prop="adm0_code", aliases=["Country", "country"])
 
     primaries = [claim for claim, role in claims.values() if role == ROLE_PRIMARY]
-    assert primaries == ["Country"]
+    assert primaries == ["adm0_code"]
+    aliases = sorted(claim for claim, role in claims.values() if role == ROLE_ALIAS)
+    assert aliases == ["Country"]
 
 
 def test_compute_claim_set_exactly_one_primary() -> None:
     from dynastore.extensions.region_mapping.claims import compute_claim_set
 
-    claims = compute_claim_set(
-        catalog_id="fao", collection_id="countries",
-        column="adm0_code", alias="country", extra_aliases=["adm0", "iso3"],
-    )
+    claims = compute_claim_set(region_prop="adm0_code", aliases=["country", "adm0", "iso3"])
 
     primaries = [claim for claim, role in claims.values() if role == "primary"]
-    assert primaries == ["country"]
+    assert primaries == ["adm0_code"]
 
 
-def test_compute_claim_set_rejects_regex_metacharacters() -> None:
+def test_compute_claim_set_rejects_regex_metacharacters_in_region_prop() -> None:
     from dynastore.extensions.region_mapping.claims import compute_claim_set
 
     with pytest.raises(ValueError, match="regex metacharacters"):
-        compute_claim_set(
-            catalog_id="fao", collection_id="countries",
-            column="adm0.code", alias="country", extra_aliases=[],
-        )
+        compute_claim_set(region_prop="adm0.code", aliases=["country"])
 
 
-def test_compute_claim_set_rejects_regex_metacharacters_in_extra_alias() -> None:
+def test_compute_claim_set_rejects_regex_metacharacters_in_alias() -> None:
     from dynastore.extensions.region_mapping.claims import compute_claim_set
 
     with pytest.raises(ValueError, match="regex metacharacters"):
-        compute_claim_set(
-            catalog_id="fao", collection_id="countries",
-            column="adm0", alias="country", extra_aliases=["adm(0)"],
-        )
+        compute_claim_set(region_prop="adm0", aliases=["adm(0)"])
 
 
 def test_validate_claim_text_accepts_plain_literal() -> None:
     from dynastore.extensions.region_mapping.claims import validate_claim_text
 
     validate_claim_text("adm0_code")  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# resolve_unique_id_prop / CollectionColumns -- uniqueIdProp resolution and
+# the columnar-schema check behind POST validation (dynastore region-mapping
+# object API).
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_unique_id_prop_prefers_supplied() -> None:
+    from dynastore.extensions.region_mapping.claims import resolve_unique_id_prop
+
+    assert resolve_unique_id_prop("MY_ID", "CODE", True) == "MY_ID"
+
+
+def test_resolve_unique_id_prop_falls_back_to_external_id_source_column() -> None:
+    from dynastore.extensions.region_mapping.claims import resolve_unique_id_prop
+
+    # The external_id SOURCE column (external_id_path -- e.g. "CODE"), not the
+    # internal "external_id" storage column which the tiles never expose.
+    assert resolve_unique_id_prop(None, "CODE", True) == "CODE"
+
+
+def test_resolve_unique_id_prop_falls_back_to_fid_when_no_external_id() -> None:
+    from dynastore.extensions.region_mapping.claims import (
+        FALLBACK_UNIQUE_ID_PROP,
+        resolve_unique_id_prop,
+    )
+
+    assert resolve_unique_id_prop(None, None, True) == FALLBACK_UNIQUE_ID_PROP == "FID"
+
+
+def test_resolve_unique_id_prop_none_when_no_external_id_and_no_fid() -> None:
+    from dynastore.extensions.region_mapping.claims import resolve_unique_id_prop
+
+    assert resolve_unique_id_prop(None, None, False) is None
+
+
+def test_uncached_if_returns_wrapped_original_only_when_no_cache() -> None:
+    """?no_cache=true reaches the raw ``__wrapped__`` coroutine the @cached
+    decorator hides; without it, the cached wrapper is used unchanged."""
+    from dynastore.extensions.region_mapping.claims import uncached_if
+
+    def raw() -> str:
+        return "raw"
+
+    def wrapper() -> str:
+        return "cached"
+
+    wrapper.__wrapped__ = raw  # type: ignore[attr-defined]  # what functools.wraps sets
+
+    assert uncached_if(wrapper, True) is raw
+    assert uncached_if(wrapper, False) is wrapper
+
+    # A plain (un-decorated) callable has no __wrapped__ -- returned as-is.
+    def plain() -> str:
+        return "x"
+
+    assert uncached_if(plain, True) is plain
+
+
+def test_collection_columns_has_column_declared_and_external_id() -> None:
+    """``has_column`` is True for a declared columnar attribute AND for the
+    driver-managed external_id column (which lives outside attribute_schema),
+    False for anything else."""
+    from dynastore.extensions.region_mapping.claims import CollectionColumns
+
+    cols = CollectionColumns(
+        is_columnar=True,
+        declared=frozenset({"GAUL1_CODE", "FID"}),
+        external_id_field="external_id",
+        external_id_path=None,
+        validity_column=None,
+    )
+    assert cols.has_column("GAUL1_CODE") is True
+    assert cols.has_column("FID") is True
+    assert cols.has_column("external_id") is True  # system column, not declared
+    assert cols.has_column("nope") is False
+    assert cols.enable_external_id is True
+
+
+def test_collection_columns_no_external_id() -> None:
+    from dynastore.extensions.region_mapping.claims import CollectionColumns
+
+    cols = CollectionColumns(
+        is_columnar=True, declared=frozenset({"FID"}),
+        external_id_field=None, external_id_path=None, validity_column=None,
+    )
+    assert cols.has_column("external_id") is False
+    assert cols.enable_external_id is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_collection_columns_columnar_includes_external_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A columnar collection resolves to its declared attribute names plus its
+    configured external_id column, flagged columnar."""
+    from dynastore.extensions.region_mapping import claims
+    from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
+    from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
+        AttributeSchemaEntry,
+        AttributeStorageMode,
+        FeatureAttributeSidecarConfig,
+    )
+
+    attrs = FeatureAttributeSidecarConfig(
+        storage_mode=AttributeStorageMode.COLUMNAR,
+        attribute_schema=[AttributeSchemaEntry(name="GAUL1_CODE"), AttributeSchemaEntry(name="FID")],
+        external_id_field="external_id",
+    )
+    col_config = ItemsPostgresqlDriverConfig(physical_table="t_abc123", sidecars=[attrs])
+    monkeypatch.setattr(
+        claims, "get_protocol", _protocol_router(configs=_StubConfigs(col_config)),
+    )
+
+    cols = await claims.resolve_collection_columns("fao", "gaul")
+    assert cols is not None
+    assert cols.is_columnar is True
+    assert cols.declared == frozenset({"GAUL1_CODE", "FID"})
+    assert cols.external_id_field == "external_id"
+    assert cols.has_column("GAUL1_CODE") and cols.has_column("external_id")
+
+
+@pytest.mark.asyncio
+async def test_resolve_collection_columns_none_without_attributes_sidecar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dynastore.extensions.region_mapping import claims
+    from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
+
+    col_config = ItemsPostgresqlDriverConfig(physical_table="t_abc123", sidecars=[])
+    monkeypatch.setattr(
+        claims, "get_protocol", _protocol_router(configs=_StubConfigs(col_config)),
+    )
+
+    assert await claims.resolve_collection_columns("fao", "gaul") is None
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +598,10 @@ async def test_fetch_region_mapping_cardinality_no_protocols_returns_zeros(
     monkeypatch.setattr(claims, "get_protocol", _protocol_router())
 
     stats = await claims.fetch_region_mapping_cardinality("fao", "countries", "adm0_code", "FID")
-    assert stats == {"feature_count": 0, "distinct_region_count": 0, "distinct_unique_id_count": 0}
+    assert stats == {
+        "feature_count": 0, "distinct_region_count": 0, "distinct_unique_id_count": 0,
+        "null_unique_id_count": 0,
+    }
 
 
 @pytest.mark.asyncio
@@ -515,7 +634,10 @@ async def test_fetch_region_mapping_cardinality_columnar_rejects_undeclared_fiel
     )
 
     stats = await claims.fetch_region_mapping_cardinality("fao", "countries", "adm0_code", "FID")
-    assert stats == {"feature_count": 0, "distinct_region_count": 0, "distinct_unique_id_count": 0}
+    assert stats == {
+        "feature_count": 0, "distinct_region_count": 0, "distinct_unique_id_count": 0,
+        "null_unique_id_count": 0,
+    }
 
 
 def test_validate_region_mapping_stats_sound_mapping_has_no_reasons() -> None:
