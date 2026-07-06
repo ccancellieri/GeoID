@@ -176,12 +176,27 @@ def test_density_config_overridable():
     assert cfg.min_feature_pixel_area_by_zoom == {0: 4.0, 4: 2.0, 8: 0.0}
 
 
+def test_line_density_config_default_is_none():
+    """min_feature_pixel_length_by_zoom must default to None (opt-in; safe for all collections)."""
+    cfg = TilesConfig()
+    assert cfg.min_feature_pixel_length_by_zoom is None
+
+
+def test_line_density_config_overridable():
+    """Operators can activate the line density filter by setting a zoom-keyed dict."""
+    cfg = TilesConfig(min_feature_pixel_length_by_zoom={0: 2.0, 4: 1.0, 8: 0.0})
+    assert cfg.min_feature_pixel_length_by_zoom == {0: 2.0, 4: 1.0, 8: 0.0}
+
+
 # ---------------------------------------------------------------------------
 # tiles_db: density WHERE clause in generated SQL
 # ---------------------------------------------------------------------------
 
 
-def _make_collection_meta(min_feature_pixel_area_by_zoom=None):
+def _make_collection_meta(
+    min_feature_pixel_area_by_zoom=None,
+    min_feature_pixel_length_by_zoom=None,
+):
     """Return a minimal resolved-collection meta dict for tiles_db tests."""
     return {
         "catalog_id": "cat",
@@ -190,6 +205,7 @@ def _make_collection_meta(min_feature_pixel_area_by_zoom=None):
         "source_srid": 4326,
         "simplification_by_zoom": {},
         "min_feature_pixel_area_by_zoom": min_feature_pixel_area_by_zoom,
+        "min_feature_pixel_length_by_zoom": min_feature_pixel_length_by_zoom,
     }
 
 
@@ -311,3 +327,64 @@ async def test_density_filter_not_predicate_preserves_zero_area():
     # The critical safety clause
     assert "NOT (ST_Area(mvtgeom.geom) > 0" in sql
     assert "AND ST_Area(mvtgeom.geom) < :min_pixel_area)" in sql
+
+
+# ---------------------------------------------------------------------------
+# tiles_db: LINE density (length) WHERE clause in generated SQL
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_line_density_filter_sql_added_at_low_zoom():
+    """When min_feature_pixel_length_by_zoom is set and the zoom matches, WHERE ST_Length appears."""
+    meta = _make_collection_meta(min_feature_pixel_length_by_zoom={0: 2.0, 8: 0.0})
+    sql = await _run_mvt_filtered(meta, z="2")  # z2 ≥ key 0 → length = 2.0
+    assert "ST_Length" in sql, "Expected line density WHERE clause in SQL"
+    assert "min_pixel_length" in sql, "Expected :min_pixel_length bind param in WHERE clause"
+
+
+@pytest.mark.asyncio
+async def test_line_density_filter_sql_absent_when_length_is_zero():
+    """0.0 in the line density map disables the filter for that bracket."""
+    meta = _make_collection_meta(min_feature_pixel_length_by_zoom={0: 2.0, 2: 0.0})
+    sql = await _run_mvt_filtered(meta, z="2")  # z2 ≥ key 2 → length = 0.0 → disabled
+    assert "ST_Length" not in sql, "WHERE clause must be absent when resolved length is 0.0"
+
+
+@pytest.mark.asyncio
+async def test_line_density_filter_sql_absent_when_config_is_none():
+    """None line density config (default) produces no ST_Length WHERE clause."""
+    meta = _make_collection_meta(min_feature_pixel_length_by_zoom=None)
+    sql = await _run_mvt_filtered(meta, z="2")
+    assert "ST_Length" not in sql
+
+
+@pytest.mark.asyncio
+async def test_line_density_not_predicate_preserves_zero_length():
+    """The SQL predicate  NOT (ST_Length > 0 AND ST_Length < :threshold)  must appear verbatim.
+
+    This guarantees that length=0 features (points, polygons) are never filtered:
+      - ST_Length(polygon) = 0 in PostGIS
+      - 0 > 0 is False → False AND ... is False → NOT False = True → row kept
+    """
+    meta = _make_collection_meta(min_feature_pixel_length_by_zoom={0: 2.0})
+    sql = await _run_mvt_filtered(meta, z="0")
+    assert "NOT (ST_Length(mvtgeom.geom) > 0" in sql
+    assert "AND ST_Length(mvtgeom.geom) < :min_pixel_length)" in sql
+
+
+@pytest.mark.asyncio
+async def test_area_and_line_density_filters_compose():
+    """Area and length filters are independent and AND-combined in one WHERE clause."""
+    meta = _make_collection_meta(
+        min_feature_pixel_area_by_zoom={0: 4.0},
+        min_feature_pixel_length_by_zoom={0: 2.0},
+    )
+    sql = await _run_mvt_filtered(meta, z="0")
+    assert ":min_pixel_area" in sql and ":min_pixel_length" in sql
+    # Both predicates present and AND-combined in the outer density filter
+    # (which sits after the FROM mvtgeom clause).
+    density_clause = sql.split("FROM mvtgeom", 1)[-1]
+    assert "NOT (ST_Area(mvtgeom.geom) > 0" in density_clause
+    assert "NOT (ST_Length(mvtgeom.geom) > 0" in density_clause
+    assert " AND " in density_clause

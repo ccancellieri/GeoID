@@ -295,48 +295,68 @@ async def get_features_as_mvt_filtered(
     if not union_queries:
         return None
 
-    # 4. Resolve zoom-aware feature density filter.
+    # 4. Resolve zoom-aware feature density filters (area for polygons, length
+    # for lines).
     #
-    # Read min_feature_pixel_area_by_zoom from the first resolved collection (it comes
-    # from TilesConfig which is catalog-scoped; using the first entry is correct for
-    # single-collection tiles, and a reasonable fallback for multi-collection tiles
-    # that share a catalog).  The lookup mirrors the simplification bracket logic:
-    # find the highest zoom key ≤ the current zoom level.
+    # Both maps are read from the first resolved collection (they come from
+    # TilesConfig, which is catalog-scoped; the first entry is correct for
+    # single-collection tiles and a reasonable fallback for multi-collection
+    # tiles that share a catalog). Each lookup mirrors the simplification
+    # bracket logic: find the highest zoom key ≤ the current zoom level.
     #
-    # Safety: points and lines (projected area = 0) always pass because the predicate is
-    #   NOT (ST_Area(geom) > 0 AND ST_Area(geom) < :min_pixel_area)
-    # which is True when area = 0 (first conjunct is False).
-    # NULL geoms (ST_AsMVTGeom returns NULL for out-of-tile features) are also filtered
-    # because ST_Area(NULL) IS NULL, making the NOT(…) expression evaluate to NULL,
-    # which SQL treats as FALSE in a WHERE clause — consistent with the existing
-    # spatial-intersects pre-filter in the per-collection subqueries.
-    area_where = ""
-    min_pixel_area: Optional[float] = None
-    if resolved_collections:
-        density_map: Dict[int, float] = (
-            resolved_collections[0].get("min_feature_pixel_area_by_zoom") or {}
-        )
-        if density_map:
-            try:
-                z_int = int(z)
-                for zoom_key, area_threshold in sorted(
-                    density_map.items(), reverse=True
-                ):
-                    if z_int >= zoom_key:
-                        min_pixel_area = area_threshold
-                        break
-            except ValueError:
-                pass
+    # The two predicates are geometry-family-specific and independent:
+    #   * area   → NOT (ST_Area(geom) > 0 AND ST_Area(geom) < :min_pixel_area)
+    #              drops sub-pixel POLYGONS; points/lines (area = 0) always pass.
+    #   * length → NOT (ST_Length(geom) > 0 AND ST_Length(geom) < :min_pixel_length)
+    #              drops sub-pixel LINES; points/polygons (length = 0) always pass.
+    # The area filter alone can never thin line features (a line's tile-space
+    # area is 0), so line-dominant collections aggregate their full feature set
+    # into every low-zoom tile — the length filter is what makes those tiles
+    # renderable.
+    #
+    # NULL geoms (ST_AsMVTGeom returns NULL for out-of-tile features) are also
+    # filtered because ST_Area/ST_Length(NULL) IS NULL, making the NOT(…)
+    # expression evaluate to NULL, which SQL treats as FALSE in a WHERE clause —
+    # consistent with the spatial-intersects pre-filter in the subqueries.
+    def _resolve_density_bracket(map_key: str) -> Optional[float]:
+        if not resolved_collections:
+            return None
+        density_map: Dict[int, float] = resolved_collections[0].get(map_key) or {}
+        if not density_map:
+            return None
+        try:
+            z_int = int(z)
+        except ValueError:
+            return None
+        for zoom_key, threshold in sorted(density_map.items(), reverse=True):
+            if z_int >= zoom_key:
+                return threshold
+        return None
 
+    min_pixel_area = _resolve_density_bracket("min_feature_pixel_area_by_zoom")
+    min_pixel_length = _resolve_density_bracket("min_feature_pixel_length_by_zoom")
+
+    density_predicates: List[str] = []
     if min_pixel_area and min_pixel_area > 0:
-        # Exclude sub-pixel polygon features; points/lines (area=0) always pass.
-        area_where = (
-            " WHERE NOT (ST_Area(mvtgeom.geom) > 0"
+        # Exclude sub-pixel polygons; points/lines (area=0) always pass.
+        density_predicates.append(
+            "NOT (ST_Area(mvtgeom.geom) > 0"
             " AND ST_Area(mvtgeom.geom) < :min_pixel_area)"
         )
         all_bind_params["min_pixel_area"] = min_pixel_area
+    if min_pixel_length and min_pixel_length > 0:
+        # Exclude sub-pixel lines; points/polygons (length=0) always pass.
+        density_predicates.append(
+            "NOT (ST_Length(mvtgeom.geom) > 0"
+            " AND ST_Length(mvtgeom.geom) < :min_pixel_length)"
+        )
+        all_bind_params["min_pixel_length"] = min_pixel_length
+
+    area_where = f" WHERE {' AND '.join(density_predicates)}" if density_predicates else ""
+    if density_predicates:
         logger.debug(
-            "density filter active: z=%s min_pixel_area=%.4f", z, min_pixel_area
+            "density filter active: z=%s min_pixel_area=%s min_pixel_length=%s",
+            z, min_pixel_area, min_pixel_length,
         )
 
     # 5. Final SQL Execution

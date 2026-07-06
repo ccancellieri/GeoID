@@ -135,6 +135,42 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
         ),
     )
 
+    # Zoom-aware LINE density filter (opt-in, default disabled) — the length
+    # analogue of ``min_feature_pixel_area_by_zoom``.
+    #
+    # The area filter above can never thin line features: a line's projected
+    # area in tile space is 0, so it always passes. Line-dominant collections
+    # (road/river/network graphs) therefore aggregate their FULL feature set
+    # into every low-zoom tile, which is the primary cause of unrenderable
+    # world-scale tiles for such collections. This filter discards lines whose
+    # projected LENGTH in MVT pixels is below the per-zoom threshold — the
+    # sub-pixel segments that inflate tile size and render time without being
+    # visible — before the ST_AsMVT aggregate.
+    #
+    # Safety rules (mirror the area filter):
+    #   - Points and Polygons (projected length = 0) ALWAYS pass through.
+    #     The predicate is NOT (ST_Length(geom) > 0 AND ST_Length(geom) < :threshold),
+    #     so only line geometries can be dropped.
+    #   - The default is None (disabled) to prevent silently dropping valid
+    #     features from mixed-geometry or sparse collections.
+    #   - Activate for line-dominant collections (e.g. transport networks).
+    #   - Conservative example: {0: 2.0, 2: 2.0, 4: 1.0, 6: 1.0, 8: 0.0}
+    #     (a sub-2-pixel line is invisible; 1 px is a single pixel span).
+    #   - 0.0 in any bracket disables filtering for that zoom and above.
+    min_feature_pixel_length_by_zoom: Mutable[Optional[Dict[int, float]]] = Field(
+        default=None,
+        description=(
+            "Opt-in zoom-aware line density filter. "
+            "Each key is the minimum zoom level for the bracket; value is the minimum "
+            "projected length in MVT pixels that a line feature must have to be included "
+            "in the tile (ST_Length(ST_AsMVTGeom(...)) ≥ threshold). "
+            "Points and Polygons (length = 0) always pass. "
+            "0.0 in any bracket disables filtering for that zoom and above. "
+            "Default None = no line density filtering (safe for all collection types). "
+            "Override per-collection via PUT /configs/platform/modules/tiles."
+        ),
+    )
+
     # Caching
     cache_on_demand: Mutable[bool] = Field(
         default=True,
