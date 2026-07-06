@@ -16,7 +16,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-validation = ["cjvalpy>=0.4.1"]
+# cjvalpy 0.4.1 (the only version satisfying >=0.4.1) ships wheels only for
+# cp38-cp311 on macOS/Windows and has no sdist, so it cannot be installed on
+# our >=3.12 floor on any platform. The marker below keeps the requirement
+# resolvable (`uv lock` needs every workspace extra to be satisfiable) while
+# effectively disabling it until upstream publishes a compatible build;
+# validate_cityjson() already treats a missing cjvalpy as a no-op.
+validation = ["cjvalpy>=0.4.1; python_version < '3.12'"]
 
 [project.entry-points."dynastore.extensions"]
 volumes = "dynastore.extensions.volumes.volumes_service:VolumesService"
