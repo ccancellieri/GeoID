@@ -103,6 +103,22 @@ class PyogrioReader(SourceReaderProtocol):
                 chunk = pyogrio.read_dataframe(
                     path, encoding=encoding,
                     skip_features=cursor, max_features=chunk_size,
+                    # fid_as_index=True (GeoID #2964 follow-up): without it
+                    # each read_dataframe() call gets its own 0-based
+                    # RangeIndex, so chunk.iterfeatures()'s "id" restarts at
+                    # 0 on every page — the SECOND and every later chunk
+                    # then reuses the FIRST chunk's ids. prepare_record_for_
+                    # upsert (main_ingestion.py) falls back to this "id" as
+                    # the upsert identity whenever no column_mapping.
+                    # external_id is configured (GeoID #2709 tier 2), so on
+                    # any multi-chunk GeoPackage this silently collapsed
+                    # every "chunk_size"-th row onto the same upserted
+                    # record instead of inserting all of them. The real OGR
+                    # FID is globally unique and stable across pagination —
+                    # exactly the identity GdalOsgeoReader's feat.GetFID()
+                    # already surfaces — so using it here keeps the two
+                    # readers' output contracts identical.
+                    fid_as_index=True,
                 )
                 n = len(chunk)
                 if n == 0:
