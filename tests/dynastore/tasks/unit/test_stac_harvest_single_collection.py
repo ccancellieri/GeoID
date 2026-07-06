@@ -22,6 +22,7 @@ No live DB or network — the source HTTP and the preset apply are mocked.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any, Dict, List
 from unittest.mock import AsyncMock, patch
 
@@ -188,6 +189,110 @@ async def test_catalog_harvest_applies_at_catalog_scope():
     assert applied == ["catalog:cat-7"]
     assert stats.collections_seen == 1
     assert stats.collections_written == 1
+
+
+# ---------------------------------------------------------------------------
+# run_harvest — per-collection read-policy pin (#3070)
+# ---------------------------------------------------------------------------
+
+
+async def _run_single_collection_harvest(request: StacHarvestRequest):
+    """Drive a single-collection harvest with a config writer attached to the
+    preset context, returning ``(stats, config_writer)`` so a test can assert on
+    the pinned ItemsReadPolicy."""
+    source_coll = {"type": "Collection", "id": "MyColl", "description": "d"}
+    items = [{"type": "Feature", "id": "i1", "geometry": None, "properties": {}}]
+
+    async def fake_apply(ctx, scope, catalog_id, drivers):
+        return None
+
+    catalogs = _mock_catalogs()
+    config_writer = AsyncMock()
+    config_writer.set_config = AsyncMock(return_value=None)
+    preset_ctx = SimpleNamespace(config=config_writer)
+
+    with (
+        patch.object(harvest_task, "_probe_single_collection",
+                     return_value=(source_coll, "https://src/c/MyColl/items")),
+        patch.object(harvest_task, "_iter_items_from", return_value=_aiter(items)),
+        patch.object(harvest_task, "_apply_harvest_presets", side_effect=fake_apply),
+    ):
+        stats = await harvest_task.run_harvest(
+            request, catalogs, preset_ctx=preset_ctx, base_scope="catalog:cat-7"
+        )
+    return stats, config_writer
+
+
+@pytest.mark.asyncio
+async def test_harvest_pins_external_id_read_policy_by_default():
+    """#3070 — a harvest pins each collection's ItemsReadPolicy with
+    ``external_id_as_feature_id=True`` (the default) at collection scope, so the
+    harvested item id round-trips the source STAC id across STAC and Features."""
+    from dynastore.modules.storage.read_policy import ItemsReadPolicy
+
+    request = StacHarvestRequest(
+        catalog_url="https://src/c/MyColl", target_catalog="cat-7", drivers="es",
+    )
+    stats, config_writer = await _run_single_collection_harvest(request)
+
+    assert not stats.errors
+    config_writer.set_config.assert_awaited_once()
+    call = config_writer.set_config.await_args
+    # Positional: (config_cls, config, catalog_id, collection_id).
+    assert call.args[0] is ItemsReadPolicy
+    policy = call.args[1]
+    assert isinstance(policy, ItemsReadPolicy)
+    assert policy.feature_type.external_id_as_feature_id is True
+    assert call.args[2] == "cat-7"
+    assert call.args[3] == "mycoll"
+
+
+@pytest.mark.asyncio
+async def test_harvest_read_policy_opt_out_pins_false():
+    """``external_id_as_feature_id=False`` on the request pins the collection
+    policy to expose the internal geoid instead of the source id."""
+    request = StacHarvestRequest(
+        catalog_url="https://src/c/MyColl", target_catalog="cat-7", drivers="es",
+        external_id_as_feature_id=False,
+    )
+    stats, config_writer = await _run_single_collection_harvest(request)
+
+    assert not stats.errors
+    policy = config_writer.set_config.await_args.args[1]
+    assert policy.feature_type.external_id_as_feature_id is False
+
+
+@pytest.mark.asyncio
+async def test_harvest_read_policy_pin_failure_is_soft_error():
+    """A read-policy write failure is recorded as a soft error and never aborts
+    the item walk (best-effort, mirroring the routing/storage presets)."""
+    request = StacHarvestRequest(
+        catalog_url="https://src/c/MyColl", target_catalog="cat-7", drivers="es",
+    )
+    source_coll = {"type": "Collection", "id": "MyColl", "description": "d"}
+    items = [{"type": "Feature", "id": "i1", "geometry": None, "properties": {}}]
+
+    async def fake_apply(ctx, scope, catalog_id, drivers):
+        return None
+
+    catalogs = _mock_catalogs()
+    config_writer = AsyncMock()
+    config_writer.set_config = AsyncMock(side_effect=RuntimeError("boom"))
+    preset_ctx = SimpleNamespace(config=config_writer)
+
+    with (
+        patch.object(harvest_task, "_probe_single_collection",
+                     return_value=(source_coll, "https://src/c/MyColl/items")),
+        patch.object(harvest_task, "_iter_items_from", return_value=_aiter(items)),
+        patch.object(harvest_task, "_apply_harvest_presets", side_effect=fake_apply),
+    ):
+        stats = await harvest_task.run_harvest(
+            request, catalogs, preset_ctx=preset_ctx, base_scope="catalog:cat-7"
+        )
+
+    # Items still ingested; the failure surfaced as a soft error, not a raise.
+    assert stats.items_written == 1
+    assert any(e.startswith("read_policy:mycoll:RuntimeError") for e in stats.errors)
 
 
 # ---------------------------------------------------------------------------

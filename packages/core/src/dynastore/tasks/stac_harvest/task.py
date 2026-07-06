@@ -650,6 +650,56 @@ async def _apply_harvest_presets(
         return f"routing_preset_apply:{type(exc).__name__}:{str(exc)[:240]}"
 
 
+async def _apply_collection_read_policy(
+    config_writer: Any,
+    catalog_id: str,
+    collection_id: str,
+    external_id_as_feature_id: bool,
+) -> Optional[str]:
+    """Pin the harvested collection's read-time item-id wire shape (#3070).
+
+    A harvested collection mirrors a remote STAC source whose item ``id`` is the
+    authored provider id; dynastore keeps it on ingest as the row's
+    ``external_id``. Setting the collection's
+    ``ItemsReadPolicy.feature_type.external_id_as_feature_id`` makes both STAC and
+    OGC Features surface that source id as the item id, so a link walked back to
+    the upstream catalog resolves — instead of exposing the internal geoid the
+    default read policy would (post-#3070). ``ItemsReadPolicy`` is collection
+    -scoped only (no catalog/platform tier), so it is written per collection here
+    rather than through the catalog-scoped harvest presets.
+
+    Best-effort, mirroring ``_apply_harvest_presets``: a failure is logged at
+    WARNING and returned as a soft error string (recorded by the caller) so it
+    never aborts the item walk. No-ops when no config writer is available.
+    """
+    if config_writer is None:
+        return None
+    try:
+        from dynastore.modules.storage.read_policy import ItemsReadPolicy
+        from dynastore.modules.storage.computed_fields import FeatureType
+
+        policy = ItemsReadPolicy(
+            feature_type=FeatureType(
+                external_id_as_feature_id=external_id_as_feature_id
+            )
+        )
+        await config_writer.set_config(
+            ItemsReadPolicy, policy, catalog_id, collection_id
+        )
+        logger.info(
+            "stac_harvest: pinned items_read_policy("
+            "external_id_as_feature_id=%s) on %s/%s",
+            external_id_as_feature_id, catalog_id, collection_id,
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001 — read-policy pin is best-effort
+        logger.warning(
+            "stac_harvest: failed to pin items_read_policy on %s/%s: %s(%s)",
+            catalog_id, collection_id, type(exc).__name__, exc,
+        )
+        return f"read_policy:{collection_id}:{type(exc).__name__}"
+
+
 async def _harvest_collection(
     catalogs: Any,
     request: StacHarvestRequest,
@@ -662,6 +712,7 @@ async def _harvest_collection(
     engine: Any = None,
     task_id: Any = None,
     page_cursor: Optional[PageCursor] = None,
+    config_writer: Any = None,
 ) -> None:
     """Upsert one collection and stream its items into ``target_collection``.
 
@@ -690,6 +741,15 @@ async def _harvest_collection(
         stats.errors.append(f"collection:{target_collection}")
         return
     stats.collections_written += 1
+
+    # Pin the item-id wire shape for this collection (#3070) before its items
+    # are read back, so the harvested item id round-trips the source STAC id.
+    perr = await _apply_collection_read_policy(
+        config_writer, target_catalog, target_collection,
+        request.external_id_as_feature_id,
+    )
+    if perr and len(stats.errors) < _MAX_RECORDED_ERRORS:
+        stats.errors.append(perr)
 
     async def _flush(batch: List[Dict[str, Any]]) -> None:
         written, err = await _upsert_items_batch(
@@ -843,6 +903,7 @@ async def run_harvest(
             catalogs, request, source_coll, items_iter, target_col, stats,
             source_collection_id=source_col_id, engine=engine, task_id=task_id,
             page_cursor=page_cursor,
+            config_writer=getattr(preset_ctx, "config", None),
         )
         return stats
 
@@ -903,6 +964,7 @@ async def run_harvest(
             catalogs, request, coll_raw, items_iter, cid, stats,
             source_collection_id=source_cid, engine=engine, task_id=task_id,
             page_cursor=page_cursor,
+            config_writer=getattr(preset_ctx, "config", None),
         )
 
     if not found_resume_point:

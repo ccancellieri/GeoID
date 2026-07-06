@@ -113,6 +113,19 @@ class StacHarvestRequest(BaseModel):
             "(es / es_pg / pg) is still accepted and mapped to this field."
         ),
     )
+    external_id_as_feature_id: bool = Field(
+        default=True,
+        description=(
+            "Wire-shape for each harvested collection: when True (the default) "
+            "the harvested item id round-trips the source STAC id — dynastore "
+            "stores it as the ``external_id`` and pins each collection's "
+            "``ItemsReadPolicy.feature_type.external_id_as_feature_id`` so both "
+            "STAC and OGC Features expose that source id (so a link back to the "
+            "upstream catalog resolves). Set False to expose the internal geoid "
+            "instead; the source id stays available as the ``external_id`` "
+            "property."
+        ),
+    )
     resume: Optional[StacHarvestCursor] = Field(
         default=None,
         description=(
