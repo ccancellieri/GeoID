@@ -301,8 +301,8 @@ class PostgresqlEngineConfig(EngineConfig):
 
         from dynastore.modules.db_config.db_config import DBConfig
         from dynastore.modules.db_config.db_timeout_config import (
+            build_connection_server_settings,
             clamp_serving_statement_timeout,
-            lock_safety_server_settings,
             resolve_timeout_settings,
         )
         from dynastore.modules.db_config.instance import get_stamped_application_name
@@ -319,18 +319,24 @@ class PostgresqlEngineConfig(EngineConfig):
         statement_timeout = clamp_serving_statement_timeout(
             statement_timeout, DBConfig.serving_statement_timeout_ceiling_seconds
         )
-        server_settings = {
-            # geoid#2924: stamp service + per-process instance id so a
-            # monitoring/reaper query can recognize this pool's connections
-            # and tell dead-instance sessions from live ones. Every other
-            # engine in this codebase already carries this stamp; this
-            # per-catalog pool previously carried none at all.
-            "application_name": get_stamped_application_name(),
-            **lock_safety_server_settings(
-                lock_timeout, idle_in_transaction_session_timeout
-            ),
-            "statement_timeout": statement_timeout,
-        }
+        # geoid#2924: stamp service + per-process instance id so a
+        # monitoring/reaper query can recognize this pool's connections and
+        # tell dead-instance sessions from live ones. Mode-aware (#3081):
+        # behind a transaction pooler this returns application_name only, so
+        # the per-catalog pool CONNECTS instead of being rejected on the
+        # lock-safety/keepalive startup params. NOTE: this raw asyncpg pool has
+        # no SQLAlchemy begin-listener, so in pooler mode it does not yet
+        # re-apply the lock-safety timeouts per transaction the way the serving
+        # and task engines do — per-catalog per-transaction re-enforcement is a
+        # scoped #3081 follow-up; until then a pooled per-catalog connection
+        # relies on the pooler/server-side limits for those bounds.
+        server_settings = build_connection_server_settings(
+            DBConfig,
+            application_name=get_stamped_application_name(),
+            lock_timeout=lock_timeout,
+            idle_in_transaction_session_timeout=idle_in_transaction_session_timeout,
+            statement_timeout=statement_timeout,
+        )
         return await asyncpg.create_pool(
             dsn=dsn,
             min_size=1,

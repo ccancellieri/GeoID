@@ -340,6 +340,22 @@ class DBConfig:
     serving_statement_timeout_ceiling_seconds: int = _cfg_int(
         "DB_SERVING_STATEMENT_TIMEOUT_CEILING", 55
     )
+    # Connection pooling mode (#3081). Governs how the lock-safety GUCs and TCP
+    # keepalives above reach PostgreSQL.
+    #   * "direct" (default) — a direct PostgreSQL/AlloyDB backend (e.g. :5432,
+    #     on-prem or a raw AlloyDB instance). Every lock-safety GUC and TCP
+    #     keepalive is sent as an asyncpg startup ``server_settings`` parameter,
+    #     exactly as before. Nothing changes for existing/on-prem deployments.
+    #   * "transaction_pooler" — a transaction-mode connection pooler (AlloyDB
+    #     Managed Connection Pooling / PgBouncer, e.g. :6432). Such poolers only
+    #     forward an allowlist of startup parameters and abort the connection on
+    #     the first unrecognized one, so ONLY ``application_name`` is sent at
+    #     startup; the lock/statement/idle timeouts are re-applied per
+    #     transaction via ``SET LOCAL`` and the backend TCP keepalives are
+    #     dropped (the pooler owns the backend socket — the client→pooler socket
+    #     keepalives are still armed client-side). Set this on the deployed
+    #     dev/review/prod services whose DATABASE_URL points at the pooler port.
+    db_pooling_mode: str = _cfg_str("DB_POOLING_MODE", "direct")
 
     def validate_pool_sizing(self) -> None:
         """Make a dangerously-small pool LOUD and SAFE at startup.

@@ -90,9 +90,11 @@ def test_engine_server_settings_include_idle_in_transaction_timeout():
         "the timeout values must come from DBConfig via resolve_timeout_settings, "
         "not be hardcoded or duplicated inline."
     )
-    assert "lock_safety_server_settings(" in _db_service_source(), (
-        "db_service.py must consume the shared lock_safety_server_settings() "
-        "helper rather than inlining its own copy of the dict."
+    assert "build_connection_server_settings(" in _db_service_source(), (
+        "db_service.py must build its server_settings through the shared, "
+        "pooler-aware build_connection_server_settings() helper (which merges "
+        "lock_safety_server_settings) rather than inlining its own copy of the "
+        "dict (#2832, #3081)."
     )
 
 
@@ -124,44 +126,62 @@ def test_statement_timeout_is_clamped_before_reaching_server_settings():
         "resolved statement_timeout for the shared serving engine (#2898)."
     )
     clamp_idx = source.index("clamp_serving_statement_timeout(")
-    settings_idx = source.index('"statement_timeout": statement_timeout,')
+    # The clamped value is now passed as the ``statement_timeout=`` keyword of
+    # build_connection_server_settings() (#3081) rather than an inline dict key.
+    settings_idx = source.index("statement_timeout=statement_timeout,")
     assert clamp_idx < settings_idx, (
         "clamp_serving_statement_timeout(...) must be assigned back to "
-        "statement_timeout BEFORE it is placed in server_settings, so the "
-        "clamped value (not the raw resolve_timeout_settings() value) is "
-        "what the engine actually applies."
+        "statement_timeout BEFORE it is passed into "
+        "build_connection_server_settings(), so the clamped value (not the raw "
+        "resolve_timeout_settings() value) is what the engine actually applies."
     )
 
 
-# create_async_engine() sites that do NOT route through
-# task_engine_connect_args() / lock_safety_server_settings() — a justified,
-# reviewed exception, not a silent gap:
+# Bare ``create_async_engine()`` call sites. Each builds an engine directly
+# and is justified — not a silent gap:
 #
-# - modules/db/db_service.py — the shared engine itself; it defines
-#   lock_safety_server_settings() and merges it directly (see
-#   test_engine_server_settings_include_idle_in_transaction_timeout above).
+# - modules/db/db_service.py — the shared serving engine; builds its
+#   server_settings via the pooler-aware build_connection_server_settings()
+#   (see test_engine_server_settings_include_idle_in_transaction_timeout above).
+# - modules/db_config/db_timeout_config.py — create_task_engine(), the single
+#   factory every task/job entrypoint now uses; applies the task lock-safety
+#   net via task_engine_connect_args() and re-applies it per transaction behind
+#   a transaction pooler (#2749, #2832, #3081).
 # - modules/db_config/typed_store/cli.py — a standalone CLI tool (not a
-#   long-lived server/task process); its ``_engine()`` helper builds a
-#   plain, default-pooled engine for one-off operator commands.
-_ALLOWLIST_NO_TASK_HELPER = frozenset(
+#   long-lived server/task process); its ``_engine()`` helper builds a plain,
+#   default-pooled engine for one-off operator commands.
+_ALLOWLIST_BARE_CREATE_ASYNC_ENGINE = frozenset(
     {
         pathlib.Path("modules/db/db_service.py"),
+        pathlib.Path("modules/db_config/db_timeout_config.py"),
         pathlib.Path("modules/db_config/typed_store/cli.py"),
+    }
+)
+
+# Task/job entrypoints must build their ad-hoc engine through the shared
+# create_task_engine() factory (#3057/#3081) rather than calling
+# create_async_engine() by hand — that factory is what carries the lock-safety
+# net, TCP keepalives, and pooler-safe per-transaction timeouts uniformly.
+_TASK_ENTRYPOINTS_VIA_FACTORY = frozenset(
+    {
+        pathlib.Path("main_task.py"),
+        pathlib.Path("tasks/ingestion/ingestion_task.py"),
+        pathlib.Path("tasks/workclass_drain/event_drain_task.py"),
+        pathlib.Path("tasks/workclass_drain/storage_drain_task.py"),
     }
 )
 
 
 def test_bare_engine_sites_carry_lock_safety_settings():
-    """Every ``create_async_engine()`` call site either uses the shared
-    lock-safety helper or is on the explicit, reviewed allowlist above.
+    """Every bare ``create_async_engine()`` call site is on the reviewed
+    allowlist, and every task/job entrypoint builds its engine through the
+    shared ``create_task_engine()`` factory.
 
-    Replaces the prior "known gap" inventory: the three task-side engines
-    (ingestion / event_drain / storage_drain) now pass
-    ``connect_args=task_engine_connect_args(DBConfig)`` and are asserted
-    here, not merely documented. If this fails because a NEW bare
-    ``create_async_engine()`` call site appeared, either wire it to
-    ``task_engine_connect_args()`` or add it to
-    ``_ALLOWLIST_NO_TASK_HELPER`` with a one-line justification.
+    A NEW bare ``create_async_engine()`` site that skips the lock-safety net
+    (and, since #3081, pooler-safety) is caught here instead of silently
+    joining the gap: either build it through ``create_task_engine()`` /
+    ``build_connection_server_settings()`` or add it to the allowlist with a
+    one-line justification.
     """
     core_src = _repo_root() / "packages/core/src/dynastore"
     sites = sorted(
@@ -170,31 +190,34 @@ def test_bare_engine_sites_carry_lock_safety_settings():
         if _calls_create_async_engine(path)
     )
 
-    covered = {
-        pathlib.Path("tasks/ingestion/ingestion_task.py"),
-        pathlib.Path("tasks/workclass_drain/event_drain_task.py"),
-        pathlib.Path("tasks/workclass_drain/storage_drain_task.py"),
-    }
-
-    missing_from_tree = covered - set(sites)
-    assert not missing_from_tree, (
-        f"Expected task-side engine sites not found: {sorted(missing_from_tree)}. "
-        "Update this test's `covered` set if these files moved."
-    )
-
-    uncovered = set(sites) - covered - _ALLOWLIST_NO_TASK_HELPER
+    uncovered = set(sites) - _ALLOWLIST_BARE_CREATE_ASYNC_ENGINE
     assert not uncovered, (
         f"New bare create_async_engine() site(s) with no lock-safety coverage: "
-        f"{sorted(uncovered)}. Either pass "
-        "connect_args=task_engine_connect_args(DBConfig) (see #2832) or add "
-        "to _ALLOWLIST_NO_TASK_HELPER with a justification."
+        f"{sorted(uncovered)}. Either build the engine via create_task_engine() "
+        "(task/job) or build_connection_server_settings() (serving), or add it "
+        "to _ALLOWLIST_BARE_CREATE_ASYNC_ENGINE with a justification (#2832, #3081)."
     )
 
-    for site in covered:
+    # The task/job entrypoints must route through the shared factory and no
+    # longer call create_async_engine() by hand.
+    for site in _TASK_ENTRYPOINTS_VIA_FACTORY:
         source = (core_src / site).read_text(encoding="utf-8")
-        assert "task_engine_connect_args(" in source, (
-            f"{site} calls create_async_engine() but does not pass "
-            "connect_args=task_engine_connect_args(DBConfig) — it would build "
-            "an engine with no lock_timeout / idle_in_transaction_session_timeout "
-            "(#2749, #2832)."
+        assert "create_task_engine(" in source, (
+            f"{site} must build its task engine via create_task_engine(DBConfig) "
+            "so it carries the lock-safety net + TCP keepalives and stays "
+            "pooler-safe (#2832, #3057, #3081)."
         )
+        assert not _calls_create_async_engine(core_src / site), (
+            f"{site} should no longer call create_async_engine() directly — "
+            "build through the create_task_engine() factory instead."
+        )
+
+    # The factory itself must apply the task lock-safety settings.
+    factory_source = (
+        core_src / "modules/db_config/db_timeout_config.py"
+    ).read_text(encoding="utf-8")
+    assert "task_engine_connect_args(" in factory_source, (
+        "create_task_engine() must apply task_engine_connect_args() so every "
+        "task engine carries lock_timeout / idle_in_transaction_session_timeout "
+        "(#2749, #2832)."
+    )

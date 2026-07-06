@@ -45,8 +45,10 @@ from sqlalchemy.engine import Engine
 from dynastore.modules import ModuleProtocol
 from dynastore.modules.db_config.db_config import DBConfig
 from dynastore.modules.db_config.db_timeout_config import (
+    build_connection_server_settings,
     clamp_serving_statement_timeout,
-    lock_safety_server_settings,
+    pooler_timeout_set_local_sql,
+    register_pooler_timeout_guard,
     resolve_timeout_settings,
 )
 from dynastore.modules.db_config.tools import (
@@ -332,50 +334,51 @@ class DBService(ModuleProtocol, DatabaseProtocol):
                                 lambda: f"__asyncpg_{uuid4()}__"
                             ),
                             # asyncpg has no libpq client-side keepalive params;
-                            # the equivalent server-side GUCs must be passed as
-                            # strings via server_settings so Cloud NAT never
-                            # silently drops the idle mapping. See #655.
-                            "server_settings": {
-                                "application_name": app_name,
-                                "tcp_keepalives_idle": str(
-                                    db_config.tcp_keepalives_idle
+                            # in DIRECT mode the equivalent server-side GUCs are
+                            # passed as strings via server_settings so Cloud NAT
+                            # never silently drops the idle mapping (#655), and
+                            # the lock-safety pair + clamped statement_timeout
+                            # ride the startup packet too. Behind a transaction
+                            # pooler (db_pooling_mode="transaction_pooler", #3081)
+                            # the builder returns application_name only — the
+                            # pooler rejects the rest as startup params — and
+                            # those timeouts are re-applied per transaction by
+                            # the begin-listener registered below. See
+                            # build_connection_server_settings() and
+                            # DBConfig.db_pooling_mode.
+                            "server_settings": build_connection_server_settings(
+                                db_config,
+                                application_name=app_name,
+                                lock_timeout=lock_timeout,
+                                idle_in_transaction_session_timeout=(
+                                    idle_in_transaction_session_timeout
                                 ),
-                                "tcp_keepalives_interval": str(
-                                    db_config.tcp_keepalives_interval
-                                ),
-                                "tcp_keepalives_count": str(
-                                    db_config.tcp_keepalives_count
-                                ),
-                                # Bounded lock windows on every connection so a
-                                # stuck DDL or a leaked / interrupted transaction
-                                # can never block the whole application. lock_timeout
-                                # caps how long any statement waits to acquire a
-                                # lock; idle_in_transaction_session_timeout makes
-                                # PostgreSQL release a held lock server-side when a
-                                # transaction is left open idle — even if the client
-                                # was interrupted and never rolled back. See
-                                # DBConfig.lock_timeout. Factored into
-                                # lock_safety_server_settings() so task-side ad-hoc
-                                # engines carry the same pair (#2832).
-                                **lock_safety_server_settings(
-                                    lock_timeout,
-                                    idle_in_transaction_session_timeout,
-                                ),
-                                # statement_timeout bounds total statement EXECUTION
-                                # (not just the lock wait). DB_STATEMENT_TIMEOUT
-                                # resolves to "0" (disabled) or a configured value,
-                                # but this shared serving engine always applies the
-                                # clamped value (see clamp_serving_statement_timeout
-                                # above, #2898) so it never exceeds the LB deadline.
-                                # SET LOCAL in long jobs overrides it.
-                                "statement_timeout": statement_timeout,
-                            },
+                                statement_timeout=statement_timeout,
+                            ),
                         },
                     )
                     # Arm client-side TCP keepalive on every asyncpg socket so a
                     # silently-dropped idle connection is detected fast instead of
                     # hanging the next pool_pre_ping for connect_timeout (#710).
+                    # Client-side, so it is kept in both modes — a transaction
+                    # pooler accepts client→pooler socket keepalives even though
+                    # it rejects the server-side keepalive GUCs (#3081).
                     _arm_client_socket_keepalive(app_state.engine, db_config)
+                    # Behind a transaction pooler the lock-safety timeouts could
+                    # not ride the startup packet (stripped above), so re-apply
+                    # them per transaction via a begin-listener (#3081). No-op in
+                    # direct mode.
+                    register_pooler_timeout_guard(
+                        app_state.engine,
+                        pooler_timeout_set_local_sql(
+                            db_config,
+                            lock_timeout=lock_timeout,
+                            idle_in_transaction_session_timeout=(
+                                idle_in_transaction_session_timeout
+                            ),
+                            statement_timeout=statement_timeout,
+                        ),
+                    )
                     engine_created_by_service = True
                     logger.info(
                         "DBService: ASYNC Database connection pool established successfully."

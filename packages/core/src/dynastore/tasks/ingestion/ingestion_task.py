@@ -74,22 +74,15 @@ async def _maybe_enqueue_tile_preseed(
     if opts.get("tms_ids"):
         preseed_inputs["tms_ids"] = opts["tms_ids"]
 
-    from sqlalchemy.ext.asyncio import create_async_engine
-    from sqlalchemy.pool import NullPool
-
     from dynastore.modules.db_config.db_config import DBConfig
-    from dynastore.modules.db_config.db_timeout_config import task_engine_connect_args
-    from dynastore.modules.db_config.tools import normalize_db_url
+    from dynastore.modules.db_config.db_timeout_config import create_task_engine
     from dynastore.modules.processes import models as _proc_models
     from dynastore.modules.processes.processes_module import execute_process
 
-    db_url = normalize_db_url(DBConfig.database_url, is_async=True)
-    # server_settings carries the same lock_timeout /
-    # idle_in_transaction_session_timeout the shared engine applies, so a
-    # frozen connection here can't hold a lock indefinitely (#2749, #2832).
-    engine = create_async_engine(
-        db_url, poolclass=NullPool, connect_args=task_engine_connect_args(DBConfig)
-    )
+    # Carries the same lock_timeout / idle_in_transaction_session_timeout the
+    # shared engine applies (so a frozen connection can't hold a lock forever,
+    # #2749/#2832), plus TCP keepalives (#3057), and is pooler-safe (#3081).
+    engine = create_task_engine(DBConfig)
     try:
         await execute_process(
             "tiles_preseed",

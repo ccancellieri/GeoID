@@ -79,6 +79,14 @@ class _FakeDBConfig:
     statement_timeout = "0"
     idle_in_transaction_session_timeout = "10s"
     task_idle_in_transaction_session_timeout = "300s"
+    # Task engines now carry the shared engine's TCP keepalives too (#3057),
+    # built via the mode-aware build_connection_server_settings() helper.
+    tcp_keepalives_idle = 300
+    tcp_keepalives_interval = 30
+    tcp_keepalives_count = 5
+    # Default connection mode — full server_settings ride the startup packet
+    # (a transaction pooler would send application_name only, #3081).
+    db_pooling_mode = "direct"
 
 
 def test_task_engine_connect_args_uses_task_tier_idle_value():
@@ -130,4 +138,6 @@ def test_db_service_still_uses_shared_idle_timeout_not_task_tier():
         "db_service.py (the shared serving engine) must not reference the "
         "task-tier idle timeout — only ad-hoc task engines use it."
     )
-    assert "lock_safety_server_settings(" in source
+    # Post-#3081 the shared engine builds its server_settings via the
+    # pooler-aware helper (which still merges lock_safety_server_settings).
+    assert "build_connection_server_settings(" in source
