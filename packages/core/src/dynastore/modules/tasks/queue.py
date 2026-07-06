@@ -33,7 +33,11 @@ import logging
 from typing import Optional, Tuple, Union
 
 
-from dynastore.tools.async_utils import signal_bus, PgListenBridge
+from dynastore.tools.async_utils import (
+    signal_bus,
+    PgListenBridge,
+    PLATFORM_CONFIG_CHANGED,
+)
 from dynastore.modules.db_config.query_executor import DbResource
 from dynastore.tools.background_service import (
     Leadership,
@@ -97,6 +101,14 @@ def _notification_transform(
         # Broadcast wake — identifier=None so every pod's cancel listener wakes.
         return (CANCEL_REQUESTED, None)
 
+    if channel == PLATFORM_CONFIG_CHANGED:
+        # Broadcast wake — identifier=None so ConfigReloadService (which waits
+        # on the bare channel) wakes on a real NOTIFY, not only on the bridge's
+        # health-beat. The payload carries the changed class_key but the
+        # watcher re-lists and diffs all platform configs on every wake, so it
+        # does not need the class_key threaded through as a signal identifier.
+        return (PLATFORM_CONFIG_CHANGED, None)
+
     # TASK_STATUS_CHANGED, EVENTS_CHANNEL — forward with payload as identifier
     return (channel, payload)
 
@@ -129,7 +141,17 @@ async def start_queue_listener(
         return
 
     bridge = PgListenBridge(
-        channels=[NEW_TASK_QUEUED, TASK_STATUS_CHANGED, EVENTS_CHANNEL, CANCEL_REQUESTED],
+        # PLATFORM_CONFIG_CHANGED rides this same connection for the Layer A
+        # config hot-reload watcher (ConfigReloadService) — no dedicated
+        # LISTEN connection of its own; it reuses this bridge's health-beat
+        # too. See modules/db_config/config_reload_service.py.
+        channels=[
+            NEW_TASK_QUEUED,
+            TASK_STATUS_CHANGED,
+            EVENTS_CHANNEL,
+            CANCEL_REQUESTED,
+            PLATFORM_CONFIG_CHANGED,
+        ],
         signal_bus=signal_bus,
         health_timeout=poll_timeout,
         transform=_notification_transform,

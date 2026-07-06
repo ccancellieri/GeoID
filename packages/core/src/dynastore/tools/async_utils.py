@@ -24,6 +24,14 @@ from typing import Optional, Any, Iterator, Callable, List, Awaitable, Dict, Tup
 
 logger = logging.getLogger(__name__)
 
+# pg_notify channel carrying platform-scope config-write commits (Layer A
+# hot-reload watcher). Emitted co-transactionally by PlatformConfigService's
+# platform-tier write paths (set_config / set_config_by_ref) and consumed by
+# ConfigReloadService via SignalBus, riding the same LISTEN connection the
+# task-queue bridge already holds — see modules/tasks/queue.py and
+# modules/db_config/config_reload_service.py.
+PLATFORM_CONFIG_CHANGED = "platform_config_changed"
+
 
 class SyncQueueIterator:
     """

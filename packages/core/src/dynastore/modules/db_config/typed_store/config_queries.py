@@ -126,6 +126,16 @@ list_platform_configs = DQLQuery(
     result_handler=ResultHandler.ALL_DICTS,
 )
 
+# Layer A config hot-reload watcher (ConfigReloadService): the token feed for
+# its startup seed + reconcile diff. ``updated_at`` doubles as the same
+# opaque optimistic-concurrency token used by the CAS queries above; here it
+# is read (never compared-and-set) purely to detect which platform config
+# rows changed since the service last saw them.
+list_platform_configs_versioned = DQLQuery(
+    f"SELECT ref_key, class_key, config_data, updated_at FROM {CONFIGS_SCHEMA}.platform_configs;",
+    result_handler=ResultHandler.ALL_DICTS,
+)
+
 delete_platform_config = DQLQuery(
     f"DELETE FROM {CONFIGS_SCHEMA}.platform_configs WHERE ref_key = :ref_key;",
     result_handler=ResultHandler.ROWCOUNT,

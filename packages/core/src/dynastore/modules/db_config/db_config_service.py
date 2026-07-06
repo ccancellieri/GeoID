@@ -34,6 +34,8 @@ from dynastore.tools.discovery import register_plugin, unregister_plugin
 # them under platform.protocols.storage.*.  DBConfigModule loads at priority=0,
 # so this is the earliest reliable trigger.
 from . import engine_config as _engine_config  # noqa: F401
+from .config_reload_config import ConfigReloadConfig
+from .config_reload_service import ConfigReloadService
 from .db_config import DBConfig
 from .engine_instance_cache import EngineInstanceCache, EngineInstanceCacheSweepService
 from .engine_resolver import (
@@ -119,6 +121,11 @@ class DBConfigModule(ModuleProtocol):
         cancelled on lifespan teardown.
 
         See GeoID #818 for the regression context.
+
+        The returned supervisor also carries ``ConfigReloadService`` (Layer A
+        platform-config hot-reload watcher) alongside the engine-cache sweep —
+        both are RUN_EVERYWHERE services with no leadership election, so
+        sharing one supervisor/shutdown-event pair is correct.
         """
         from dynastore.modules.db_config.instance import get_service_name
 
@@ -132,6 +139,33 @@ class DBConfigModule(ModuleProtocol):
         sweep_shutdown = asyncio.Event()
         supervisor = BackgroundSupervisor()
         supervisor.register(EngineInstanceCacheSweepService(cache))
+
+        # Layer A config hot-reload watcher — read ConfigReloadConfig once at
+        # boot (TasksModule-style; no env var) so operators can size the
+        # reload interval or disable the watcher via the configs API. A
+        # failure to read it (e.g. DB pool not yet up at this priority-0
+        # lifespan point) falls back to enabled with the class default,
+        # mirroring TasksModule's tolerant TasksPluginConfig load.
+        reload_enabled = True
+        reload_interval_seconds = 30.0
+        try:
+            reload_cfg = await pcfg.get_config(ConfigReloadConfig)
+            if isinstance(reload_cfg, ConfigReloadConfig):
+                reload_enabled = reload_cfg.enabled
+                reload_interval_seconds = reload_cfg.reload_interval_seconds
+        except Exception as e:
+            logger.warning(
+                f"DBConfigModule: Failed to load ConfigReloadConfig, "
+                f"defaulting to enabled={reload_enabled}: {e}"
+            )
+        supervisor.register(
+            ConfigReloadService(
+                pcfg,
+                enabled=reload_enabled,
+                reload_interval_seconds=reload_interval_seconds,
+            )
+        )
+
         engine = (
             getattr(app_state, "engine", None)
             or getattr(app_state, "sync_engine", None)
@@ -185,7 +219,8 @@ class DBConfigModule(ModuleProtocol):
     async def _teardown_sweep_supervisor(
         supervisor: BackgroundSupervisor, shutdown: asyncio.Event
     ) -> None:
-        """Signal and drain the engine-cache sweep supervisor."""
+        """Signal and drain this module's background supervisor (engine-cache
+        sweep + the config hot-reload watcher)."""
         shutdown.set()
         await supervisor.stop()
 

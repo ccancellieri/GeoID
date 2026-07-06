@@ -43,6 +43,7 @@ from pydantic import ValidationError
 from typing import (
     Any,
     Dict,
+    List,
     Optional,
     Set,
     Tuple,
@@ -53,6 +54,7 @@ from typing import (
 from dataclasses import dataclass, field as dc_field
 
 from dynastore.tools.cache import cached, DEFAULT_CONFIG_CACHE_TTL, DEFAULT_CONFIG_CACHE_L1_TTL
+from dynastore.tools.async_utils import PLATFORM_CONFIG_CHANGED
 
 from dynastore.modules.db_config.query_executor import (
     DDLQuery,
@@ -547,6 +549,7 @@ async def _platform_table_exists(conn: DbResource) -> bool:
 get_platform_config_query = _cq.get_platform_config
 upsert_platform_config_query = _cq.upsert_platform_config
 list_platform_configs_query = _cq.list_platform_configs
+list_platform_configs_versioned_query = _cq.list_platform_configs_versioned
 delete_platform_config_query = _cq.delete_platform_config
 get_platform_config_by_ref_query = _cq.get_platform_config_by_ref
 list_platform_refs_query = _cq.list_platform_refs
@@ -850,6 +853,20 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
             # Phase 3 — apply (post-persist, best-effort).
             await run_apply_handlers(cls, config, None, None, conn)
 
+            # Co-transactional NOTIFY (Layer A hot-reload watcher): committed
+            # atomically with the row above so every long-lived instance's
+            # ConfigReloadService — woken via the existing task-queue LISTEN
+            # bridge, no dedicated connection of its own — reconciles this
+            # change without a redeploy. Best-effort: a lost NOTIFY only
+            # delays convergence on other pods to the bridge's own health-beat.
+            try:
+                await DQLQuery(
+                    f"SELECT pg_notify('{PLATFORM_CONFIG_CHANGED}', :payload)",
+                    result_handler=ResultHandler.SCALAR,
+                ).execute(conn, payload=class_key)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("set_config: platform_config_changed NOTIFY failed: %s", exc)
+
         self.get_platform_config_internal_cached.cache_invalidate(class_key)
         # Post-commit router bust closes the race where an apply_handler
         # invalidates inside the open transaction and a concurrent reader
@@ -873,6 +890,24 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
                 continue
             configs[cls] = _validate_stored_config(cls, row["config_data"])
         return configs
+
+    async def list_configs_versioned(self) -> List[Tuple[str, str, Any, Any]]:
+        """Return ``(ref_key, class_key, config_data, updated_at)`` for every
+        persisted platform config row — the token feed ``ConfigReloadService``
+        diffs against its ``{class_key: last_seen_updated_at}`` map.
+
+        Strictly against ``configs.platform_configs`` (the single platform
+        table); never enumerates tenant schemas. Unlike :meth:`list_configs`,
+        does NOT resolve/validate against the registered ``PluginConfig``
+        class here — an unknown or malformed row is the reconcile loop's
+        problem to skip, not this listing's to fail on.
+        """
+        async with managed_transaction(self.engine) as conn:
+            rows = await list_platform_configs_versioned_query.execute(conn)
+        return [
+            (row["ref_key"], row["class_key"], row["config_data"], row["updated_at"])
+            for row in rows
+        ]
 
     async def list_refs(self) -> Dict[str, str]:
         """F.4c.2 — return ``{ref_key: class_key}`` for every platform-stored row.
@@ -1005,6 +1040,16 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
 
             # Phase 3 — apply (post-persist, best-effort).
             await run_apply_handlers(cls, config, None, None, conn)
+
+            # Co-transactional NOTIFY (Layer A hot-reload watcher) — see the
+            # matching block in set_config for the rationale.
+            try:
+                await DQLQuery(
+                    f"SELECT pg_notify('{PLATFORM_CONFIG_CHANGED}', :payload)",
+                    result_handler=ResultHandler.SCALAR,
+                ).execute(conn, payload=class_key)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("set_config_by_ref: platform_config_changed NOTIFY failed: %s", exc)
 
         # Invalidate the class-keyed cache for the dispatch class so any
         # waterfall reads pick up the change.  Multi-instance rows still
