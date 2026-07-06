@@ -34,9 +34,9 @@ its proof that an instance is gone.
 
 Gated on the reaper, not just registered
 -----------------------------------------
-The reaper is disabled by default (opt-in). This heartbeat is a fleet-wide,
-every-pod, every-60s background writer, so it must not run at all while the
-reaper is off — running it unconditionally would add exactly the kind of
+An operator can still disable the reaper entirely (``ZombieSessionReaperConfig.enabled = False``).
+This heartbeat is a fleet-wide, every-pod, every-60s background writer, so it
+must not run at all while the reaper is off — running it unconditionally would add exactly the kind of
 ungated background DB load class geoid#2900 already fights. ``tick()``
 re-reads ``ZombieSessionReaperConfig.enabled`` live on every call (cheap: the
 central platform-config getter caches it) rather than being gated once at
@@ -118,7 +118,8 @@ class InstanceLivenessHeartbeat(PeriodicService):
 
     Always registered (see module docstring), but ``tick()`` does zero DB work
     — not even a config-service round trip beyond the cached read — when
-    ``ZombieSessionReaperConfig.enabled`` is False, which is the default.
+    ``ZombieSessionReaperConfig.enabled`` is False (an operator opt-out;
+    True is the default).
 
     Failures are logged and swallowed so a transient DB hiccup never crashes
     the loop; a missed heartbeat just makes this instance briefly look "stale"

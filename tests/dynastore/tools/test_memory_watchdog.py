@@ -26,8 +26,10 @@ import pytest
 
 from dynastore.tools.background_service import BackgroundSupervisor, ServiceContext
 from dynastore.tools.memory_watchdog import (
+    MemoryWatchdogConfig,
     MemoryWatchdogService,
-    build_memory_watchdog_service_from_env,
+    build_memory_watchdog_service,
+    detect_cgroup_memory_limit_mb,
     read_process_rss_bytes,
 )
 
@@ -205,38 +207,149 @@ async def test_tick_noop_when_rss_unavailable(caplog) -> None:
 
 
 # ---------------------------------------------------------------------------
-# build_memory_watchdog_service_from_env
+# MemoryWatchdogConfig
 # ---------------------------------------------------------------------------
 
 
-def test_build_from_env_disabled_by_default(monkeypatch) -> None:
-    monkeypatch.delenv("MEMORY_WATCHDOG_LIMIT_MB", raising=False)
-    assert build_memory_watchdog_service_from_env() is None
+def test_config_enabled_defaults_to_true() -> None:
+    assert MemoryWatchdogConfig().enabled is True
 
 
-def test_build_from_env_disabled_on_non_numeric_limit(monkeypatch) -> None:
-    monkeypatch.setenv("MEMORY_WATCHDOG_LIMIT_MB", "not-a-number")
-    assert build_memory_watchdog_service_from_env() is None
+def test_config_limit_mb_defaults_to_none() -> None:
+    assert MemoryWatchdogConfig().limit_mb is None
 
 
-def test_build_from_env_disabled_on_non_positive_limit(monkeypatch) -> None:
-    monkeypatch.setenv("MEMORY_WATCHDOG_LIMIT_MB", "0")
-    assert build_memory_watchdog_service_from_env() is None
+def test_config_rejects_warn_ratio_not_below_critical_ratio() -> None:
+    with pytest.raises(ValueError):
+        MemoryWatchdogConfig(warn_ratio=0.9, critical_ratio=0.8)
 
 
-def test_build_from_env_builds_service_with_configured_values(monkeypatch) -> None:
-    monkeypatch.setenv("MEMORY_WATCHDOG_LIMIT_MB", "512")
-    monkeypatch.setenv("MEMORY_WATCHDOG_WARN_RATIO", "0.7")
-    monkeypatch.setenv("MEMORY_WATCHDOG_CRITICAL_RATIO", "0.95")
-    monkeypatch.setenv("MEMORY_WATCHDOG_INTERVAL_SECONDS", "5")
+# ---------------------------------------------------------------------------
+# detect_cgroup_memory_limit_mb
+# ---------------------------------------------------------------------------
 
-    svc = build_memory_watchdog_service_from_env()
+
+def test_detect_cgroup_v2_limit(tmp_path, monkeypatch) -> None:
+    v2_file = tmp_path / "memory.max"
+    v2_file.write_text("536870912\n")  # 512 MiB
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH", str(v2_file)
+    )
+    assert detect_cgroup_memory_limit_mb() == 512
+
+
+def test_detect_cgroup_v1_fallback_when_v2_absent(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
+        str(tmp_path / "does-not-exist"),
+    )
+    v1_file = tmp_path / "memory.limit_in_bytes"
+    v1_file.write_text("268435456\n")  # 256 MiB
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH", str(v1_file)
+    )
+    assert detect_cgroup_memory_limit_mb() == 256
+
+
+def test_detect_cgroup_v2_max_sentinel_is_unlimited(tmp_path, monkeypatch) -> None:
+    v2_file = tmp_path / "memory.max"
+    v2_file.write_text("max\n")
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH", str(v2_file)
+    )
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH",
+        str(tmp_path / "does-not-exist"),
+    )
+    assert detect_cgroup_memory_limit_mb() is None
+
+
+def test_detect_cgroup_v1_huge_sentinel_is_unlimited(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
+        str(tmp_path / "does-not-exist"),
+    )
+    v1_file = tmp_path / "memory.limit_in_bytes"
+    v1_file.write_text("9223372036854771712\n")
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH", str(v1_file)
+    )
+    assert detect_cgroup_memory_limit_mb() is None
+
+
+def test_detect_cgroup_none_when_neither_file_present(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
+        str(tmp_path / "does-not-exist-v2"),
+    )
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH",
+        str(tmp_path / "does-not-exist-v1"),
+    )
+    assert detect_cgroup_memory_limit_mb() is None
+
+
+# ---------------------------------------------------------------------------
+# build_memory_watchdog_service
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_build_service_disabled_via_config() -> None:
+    svc = await build_memory_watchdog_service(MemoryWatchdogConfig(enabled=False))
+    assert svc is None
+
+
+@pytest.mark.asyncio
+async def test_build_service_inert_when_no_limit_resolvable(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
+        str(tmp_path / "does-not-exist-v2"),
+    )
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH",
+        str(tmp_path / "does-not-exist-v1"),
+    )
+    svc = await build_memory_watchdog_service(MemoryWatchdogConfig())
+    assert svc is None
+
+
+@pytest.mark.asyncio
+async def test_build_service_uses_explicit_limit_mb_over_cgroup(monkeypatch, tmp_path) -> None:
+    v2_file = tmp_path / "memory.max"
+    v2_file.write_text("536870912\n")  # 512 MiB — must be ignored, explicit limit wins
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH", str(v2_file)
+    )
+
+    svc = await build_memory_watchdog_service(
+        MemoryWatchdogConfig(
+            limit_mb=1024, warn_ratio=0.7, critical_ratio=0.95, cadence_seconds=5.0,
+        )
+    )
 
     assert svc is not None
-    assert svc._limit_bytes == 512 * 1024 * 1024
+    assert svc._limit_bytes == 1024 * 1024 * 1024
     assert svc._warn_ratio == pytest.approx(0.7)
     assert svc._critical_ratio == pytest.approx(0.95)
     assert svc.cadence_seconds == pytest.approx(5.0)
+
+
+@pytest.mark.asyncio
+async def test_build_service_auto_detects_limit_from_cgroup(monkeypatch, tmp_path) -> None:
+    v2_file = tmp_path / "memory.max"
+    v2_file.write_text("536870912\n")  # 512 MiB
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH", str(v2_file)
+    )
+
+    svc = await build_memory_watchdog_service(MemoryWatchdogConfig())
+
+    assert svc is not None
+    assert svc._limit_bytes == 512 * 1024 * 1024
+    assert svc._warn_ratio == pytest.approx(0.80)
+    assert svc._critical_ratio == pytest.approx(0.90)
+    assert svc.cadence_seconds == pytest.approx(15.0)
 
 
 # ---------------------------------------------------------------------------
@@ -270,17 +383,3 @@ async def test_service_runs_under_real_supervisor_and_stops_cleanly(caplog) -> N
         await supervisor.stop(timeout=2.0)
 
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
-
-
-def test_build_from_env_uses_defaults_for_unset_ratios(monkeypatch) -> None:
-    monkeypatch.setenv("MEMORY_WATCHDOG_LIMIT_MB", "1024")
-    monkeypatch.delenv("MEMORY_WATCHDOG_WARN_RATIO", raising=False)
-    monkeypatch.delenv("MEMORY_WATCHDOG_CRITICAL_RATIO", raising=False)
-    monkeypatch.delenv("MEMORY_WATCHDOG_INTERVAL_SECONDS", raising=False)
-
-    svc = build_memory_watchdog_service_from_env()
-
-    assert svc is not None
-    assert svc._warn_ratio == pytest.approx(0.80)
-    assert svc._critical_ratio == pytest.approx(0.90)
-    assert svc.cadence_seconds == pytest.approx(15.0)

@@ -35,20 +35,27 @@ requiring any new dependency — RSS is read straight from
 this service runs in (returns ``None``, so the watchdog no-ops, on any
 platform where that file does not exist, e.g. local macOS dev).
 
-The memory budget itself (``MEMORY_WATCHDOG_LIMIT_MB``) is deploy-time
-configuration — typically the container's memory limit divided by the
-number of gunicorn workers sharing it, since each worker is its own
-process with its own RSS. Unset by default: the watchdog only starts if
-a limit is explicitly configured, so existing deployments are unaffected
-until an operator opts in.
+The memory budget (``MemoryWatchdogConfig.limit_mb``) is platform config,
+resolved through the same ``PluginConfig`` mechanism as every other tunable
+in this codebase — never an env var. Left unset (the default), the budget
+is auto-detected from the container's own cgroup memory limit (v2
+``memory.max``, falling back to v1 ``memory.limit_in_bytes``), which is
+typically the container's memory limit divided by the number of gunicorn
+workers sharing it, since each worker is its own process with its own RSS.
+If neither cgroup file is present or both report "no limit" (e.g. local
+dev on macOS, or a container run without a memory limit), the watchdog
+stays inert rather than guessing.
 """
 
 from __future__ import annotations
 
 import logging
-import os
-from typing import Callable, Optional
+from typing import Callable, ClassVar, Optional, Tuple
 
+from pydantic import Field, model_validator
+
+from dynastore.models.mutability import Mutable
+from dynastore.models.plugin_config import PluginConfig
 from dynastore.tools.background_service import (
     Leadership,
     PeriodicService,
@@ -59,6 +66,16 @@ from dynastore.tools.background_service import (
 logger = logging.getLogger(__name__)
 
 _PROC_STATUS_PATH = "/proc/self/status"
+
+_CGROUP_V2_MEMORY_MAX_PATH = "/sys/fs/cgroup/memory.max"
+_CGROUP_V1_MEMORY_LIMIT_PATH = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+
+# Cgroup v1 reports "no limit" as a huge sentinel (commonly
+# 9223372036854771712, close to but not exactly int64-max, since the kernel
+# rounds it to a page boundary). Anything at or above this threshold is
+# treated as unlimited rather than a real memory budget — no real container
+# or host has anywhere near this much RAM.
+_UNLIMITED_THRESHOLD_BYTES = 1 << 62
 
 
 def read_process_rss_bytes() -> Optional[int]:
@@ -154,59 +171,164 @@ class MemoryWatchdogService(PeriodicService):
             self._warned = False
 
 
-def build_memory_watchdog_service_from_env() -> Optional[MemoryWatchdogService]:
-    """Build a :class:`MemoryWatchdogService` from ``MEMORY_WATCHDOG_*`` env vars.
+class MemoryWatchdogConfig(PluginConfig):
+    """Configuration for the proactive memory-pressure watchdog (geoid#2946)."""
 
-    Returns ``None`` (watchdog disabled) unless ``MEMORY_WATCHDOG_LIMIT_MB``
-    is set to a positive number — this keeps every existing deployment
-    behavior-unchanged until an operator opts in with the per-worker memory
-    budget for that deployment.
+    _address: ClassVar[Tuple[str, ...]] = ("platform", "tools", "memory_watchdog")
+
+    enabled: Mutable[bool] = Field(
+        default=True,
+        description=(
+            "Master switch for the memory watchdog. Defaults to True on "
+            "every environment: the watchdog only ever reads its own "
+            "process's RSS and logs a warning/error as it climbs — no "
+            "connections, no writes, no side effects — so there is no "
+            "reason for it to be opt-in. Read at service-build time."
+        ),
+    )
+
+    limit_mb: Mutable[Optional[int]] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "The memory budget (in MB) this process is watched against — "
+            "typically the container's memory limit divided by the number "
+            "of gunicorn workers sharing it, since each worker is its own "
+            "process with its own RSS. When unset (the default), the "
+            "budget is auto-detected from the container's own cgroup "
+            "memory limit (v2 memory.max, falling back to v1 "
+            "memory.limit_in_bytes). If neither is present or both report "
+            "no limit, the watchdog stays inert rather than guessing."
+        ),
+    )
+
+    warn_ratio: Mutable[float] = Field(
+        default=0.80,
+        description="Ratio of limit_mb at which the watchdog logs a WARNING.",
+    )
+
+    critical_ratio: Mutable[float] = Field(
+        default=0.90,
+        description="Ratio of limit_mb at which the watchdog logs an ERROR.",
+    )
+
+    cadence_seconds: Mutable[float] = Field(
+        default=15.0,
+        gt=0,
+        description="How often (seconds) the watchdog polls this process's RSS.",
+    )
+
+    @model_validator(mode="after")
+    def _warn_below_critical(self) -> "MemoryWatchdogConfig":
+        if not 0 < self.warn_ratio < self.critical_ratio <= 1:
+            raise ValueError(
+                "MemoryWatchdogConfig: require 0 < warn_ratio < critical_ratio <= 1 "
+                f"(got warn_ratio={self.warn_ratio}, critical_ratio={self.critical_ratio})"
+            )
+        return self
+
+
+def _read_cgroup_memory_limit_bytes(path: str) -> Optional[int]:
+    """Read and parse one cgroup memory-limit file.
+
+    Returns ``None`` if the file is absent, unreadable, reports the cgroup
+    v2 "max" sentinel, or reports a value at/above ``_UNLIMITED_THRESHOLD_BYTES``
+    (the cgroup v1 "no limit" sentinel).
     """
-    raw_limit = os.environ.get("MEMORY_WATCHDOG_LIMIT_MB")
-    if not raw_limit:
+    try:
+        with open(path, "r", encoding="ascii") as fh:
+            raw = fh.read().strip()
+    except OSError:
+        return None
+    if raw == "max":
         return None
     try:
-        limit_mb = float(raw_limit)
+        value = int(raw)
     except ValueError:
-        logger.warning(
-            "memory_watchdog: MEMORY_WATCHDOG_LIMIT_MB=%r is not a number; "
-            "watchdog disabled.",
-            raw_limit,
-        )
         return None
-    if limit_mb <= 0:
+    if value <= 0 or value >= _UNLIMITED_THRESHOLD_BYTES:
+        return None
+    return value
+
+
+def detect_cgroup_memory_limit_mb() -> Optional[int]:
+    """Best-effort auto-detection of the container's memory budget, in MB.
+
+    Tries cgroup v2 (``memory.max``) first, then cgroup v1
+    (``memory.limit_in_bytes``). Returns ``None`` when neither file exists
+    or both report "no limit" — e.g. local dev on macOS, or a container run
+    without a memory limit.
+    """
+    limit_bytes = _read_cgroup_memory_limit_bytes(_CGROUP_V2_MEMORY_MAX_PATH)
+    if limit_bytes is None:
+        limit_bytes = _read_cgroup_memory_limit_bytes(_CGROUP_V1_MEMORY_LIMIT_PATH)
+    if limit_bytes is None:
+        return None
+    return limit_bytes // (1024 * 1024)
+
+
+async def load_memory_watchdog_config() -> MemoryWatchdogConfig:
+    """Load ``MemoryWatchdogConfig`` from the platform config store.
+
+    Falls back to the default instance if the store is unavailable or the
+    config has not been set (mirrors ``load_zombie_session_reaper_config``).
+    """
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.tools.discovery import get_protocol
+
+        config_mgr = get_protocol(PlatformConfigsProtocol)
+        if config_mgr is not None:
+            cfg = await config_mgr.get_config(MemoryWatchdogConfig)
+            if isinstance(cfg, MemoryWatchdogConfig):
+                return cfg
+    except Exception as exc:
         logger.warning(
-            "memory_watchdog: MEMORY_WATCHDOG_LIMIT_MB=%r must be positive; "
-            "watchdog disabled.",
-            raw_limit,
+            "memory_watchdog: failed to load MemoryWatchdogConfig (%s) — "
+            "using defaults.", exc,
         )
+    return MemoryWatchdogConfig()
+
+
+async def build_memory_watchdog_service(
+    config: Optional[MemoryWatchdogConfig] = None,
+) -> Optional[MemoryWatchdogService]:
+    """Build a :class:`MemoryWatchdogService` from :class:`MemoryWatchdogConfig`.
+
+    Loads the config from the platform config store when *config* is not
+    supplied. Returns ``None`` (watchdog inert) when disabled via config, or
+    when no memory budget could be resolved — ``limit_mb`` unset and cgroup
+    auto-detection found no bounded limit (e.g. local dev without a memory
+    cgroup).
+    """
+    if config is None:
+        config = await load_memory_watchdog_config()
+    if not config.enabled:
+        logger.debug("memory_watchdog: disabled via config — skipping.")
         return None
 
-    def _float_env(name: str, default: float) -> float:
-        raw = os.environ.get(name)
-        if not raw:
-            return default
-        try:
-            return float(raw)
-        except ValueError:
-            logger.warning(
-                "memory_watchdog: %s=%r is not a number; using default %.2f.",
-                name,
-                raw,
-                default,
-            )
-            return default
+    limit_mb = config.limit_mb if config.limit_mb is not None else detect_cgroup_memory_limit_mb()
+    if limit_mb is None:
+        logger.debug(
+            "memory_watchdog: no limit_mb configured and cgroup "
+            "auto-detection found none (or reported unlimited) — watchdog "
+            "stays inert.",
+        )
+        return None
 
     return MemoryWatchdogService(
-        limit_bytes=int(limit_mb * 1024 * 1024),
-        warn_ratio=_float_env("MEMORY_WATCHDOG_WARN_RATIO", 0.80),
-        critical_ratio=_float_env("MEMORY_WATCHDOG_CRITICAL_RATIO", 0.90),
-        cadence_seconds=_float_env("MEMORY_WATCHDOG_INTERVAL_SECONDS", 15.0),
+        limit_bytes=limit_mb * 1024 * 1024,
+        warn_ratio=config.warn_ratio,
+        critical_ratio=config.critical_ratio,
+        cadence_seconds=config.cadence_seconds,
     )
 
 
 __all__ = [
+    "MemoryWatchdogConfig",
     "MemoryWatchdogService",
-    "build_memory_watchdog_service_from_env",
+    "build_memory_watchdog_service",
+    "detect_cgroup_memory_limit_mb",
+    "load_memory_watchdog_config",
     "read_process_rss_bytes",
 ]

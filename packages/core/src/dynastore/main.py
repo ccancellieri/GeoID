@@ -47,7 +47,7 @@ from dynastore.tools.background_service import (
     ServiceContext,
 )
 from dynastore.tools.correlation import _correlation_id_var, set_correlation_id
-from dynastore.tools.memory_watchdog import build_memory_watchdog_service_from_env
+from dynastore.tools.memory_watchdog import build_memory_watchdog_service
 from fastapi.concurrency import run_in_threadpool
 
 # --- Initialize Concurrency Backend ---
@@ -196,12 +196,14 @@ async def lifespan(app: FastAPI):
     # Memory watchdog (#2946): an OOM kill sends SIGKILL straight to the
     # process, so nothing here can catch or drain it. This proactive
     # RSS poll is the only way to turn the climb leading up to a kill into
-    # a monitored log-based error before it happens. Disabled unless an
-    # operator opts in via MEMORY_WATCHDOG_LIMIT_MB; started outside (and
-    # independent of) module/extension lifespans so it observes memory
+    # a monitored log-based error before it happens. Enabled by default via
+    # MemoryWatchdogConfig, with the memory budget auto-detected from the
+    # container's cgroup when not explicitly configured; started outside
+    # (and independent of) module/extension lifespans so it observes memory
     # pressure from the very start of the process, not just once modules
-    # finish booting.
-    _mem_watchdog_service = build_memory_watchdog_service_from_env()
+    # finish booting (the platform config store is not yet reachable at
+    # this point either way, so this always resolves the config's defaults).
+    _mem_watchdog_service = await build_memory_watchdog_service()
     _mem_watchdog_shutdown = asyncio.Event()
     _mem_watchdog_supervisor = BackgroundSupervisor()
     if _mem_watchdog_service is not None:

@@ -381,6 +381,10 @@ def test_config_shadow_mode_defaults_to_true():
     assert ZombieSessionReaperConfig().zombie_reaper_shadow_mode is True
 
 
+def test_config_enabled_defaults_to_true():
+    assert ZombieSessionReaperConfig().enabled is True
+
+
 def test_config_accepts_stale_after_equal_to_idle_threshold():
     cfg = ZombieSessionReaperConfig(
         idle_threshold_seconds=900, liveness_stale_after_seconds=900,

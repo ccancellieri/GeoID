@@ -54,14 +54,18 @@ candidates, that is a sign the heartbeat mechanism itself is broken for that
 service (not that every one of its candidate instances died simultaneously) —
 that service's candidates are skipped for the tick with a loud warning.
 
-Disabled by default (``ZombieSessionReaperConfig.enabled = False``); an
-operator opts in explicitly via the configs API after reviewing the
-instance-liveness table on their environment.
+Enabled by default (``ZombieSessionReaperConfig.enabled = True``) on every
+environment, but ``zombie_reaper_shadow_mode`` also defaults to True — so out
+of the box the reaper only *observes* (logs ``lock_reaped_shadow``) and never
+terminates anything. An operator reviews the instance-liveness table and the
+shadow log on their environment, then explicitly flips
+``zombie_reaper_shadow_mode`` to False via the configs API to let it actually
+evict sessions.
 
 Shadow mode
 -----------
-Flipping ``enabled`` to True does not, by itself, terminate anything:
-``zombie_reaper_shadow_mode`` defaults to True, so the reaper runs its full
+Flipping ``zombie_reaper_shadow_mode`` to False is what actually lets the
+reaper terminate anything: while it is True (the default), the reaper runs its full
 detection pipeline — candidate scan, per-service liveness resolution, and the
 TOCTOU recheck — exactly as it would to reap a session, but stops short of
 calling ``pg_terminate_backend`` and instead logs a ``lock_reaped_shadow``
@@ -167,18 +171,22 @@ class ZombieSessionReaperConfig(PluginConfig):
     _address: ClassVar[Tuple[str, ...]] = ("platform", "modules", "db")
 
     enabled: Mutable[bool] = Field(
-        default=False,
+        default=True,
         description=(
-            "Master switch for the zombie-session reaper. Defaults to False: "
-            "the reaper calls pg_terminate_backend() on sessions it identifies "
-            "as belonging to a dead instance, so it is opt-in. Read live on "
-            "every tick (and by the instance-liveness heartbeat, which only "
-            "runs while this is True), so flipping it via the configs API "
-            "takes effect immediately — no pod restart needed. Only enable on "
-            "a service running with --no-cpu-throttling, or after confirming "
-            "liveness_stale_after_seconds comfortably exceeds the service's "
-            "longest observed idle-CPU-throttle window (see the module "
-            "docstring's correlated-failure-mode section) — otherwise a "
+            "Master switch for the zombie-session reaper. Defaults to True on "
+            "every environment, but zombie_reaper_shadow_mode also defaults to "
+            "True, so out of the box this only observes candidates (logs "
+            "lock_reaped_shadow) and calls pg_terminate_backend() on none of "
+            "them. Read live on every tick (and by the instance-liveness "
+            "heartbeat, which only runs while this is True), so flipping it "
+            "via the configs API takes effect immediately — no pod restart "
+            "needed. Set this to False to disable the detection pipeline "
+            "entirely. Actually terminating sessions additionally requires "
+            "flipping zombie_reaper_shadow_mode to False, which should only be "
+            "done on a service running with --no-cpu-throttling, or after "
+            "confirming liveness_stale_after_seconds comfortably exceeds the "
+            "service's longest observed idle-CPU-throttle window (see the "
+            "module docstring's correlated-failure-mode section) — otherwise a "
             "throttled-but-alive instance can be misread as dead."
         ),
     )
