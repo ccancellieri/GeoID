@@ -33,6 +33,8 @@ Key facts verified here:
 """
 from __future__ import annotations
 
+import pytest
+
 from dynastore.models.localization import LocalizedText
 from dynastore.models.shared_models import Link
 from dynastore.extensions.records import records_models as rm
@@ -137,6 +139,77 @@ def test_resolve_links_titles_empty_list():
 # ---------------------------------------------------------------------------
 # Record model round-trip
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# list_catalogs — consolidated onto OGCServiceMixin._ogc_list_catalogs (#2692)
+#
+# #3073 reverted this delegation because the shared helper's lang='*' path
+# leaked a raw LocalizedText model (null-padded once serialized). Once the
+# helper switched to resolve_localized_field (clean, filtered dict), Records
+# folds back onto it instead of keeping its own copy of the same logic.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_catalogs_delegates_to_shared_ogc_helper(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from dynastore.extensions.records.config import RecordsPluginConfig
+    from dynastore.extensions.records.records_service import RecordsService
+
+    svc = RecordsService.__new__(RecordsService)
+    catalogs = AsyncMock()
+    catalogs.list_catalogs = AsyncMock(
+        return_value=[
+            type("_Catalog", (), {"id": "internal-1", "external_id": "public-cat", "title": LocalizedText(en="Catalog")})()
+        ]
+    )
+
+    async def _get_catalogs_service():
+        return catalogs
+
+    async def _get_plugin_config(config_cls, catalog_id=None, collection_id=None):
+        return RecordsPluginConfig()
+
+    svc._get_catalogs_service = _get_catalogs_service
+    svc._get_plugin_config = _get_plugin_config
+
+    result = await svc.list_catalogs(language="en", limit=None, offset=0)
+
+    assert result["catalogs"] == [{"id": "public-cat", "title": "Catalog"}]
+
+
+@pytest.mark.asyncio
+async def test_list_catalogs_wildcard_lang_returns_clean_dict_no_null_padding():
+    """Pins the fix: lang='*' must not serialize unset languages as nulls."""
+    from unittest.mock import AsyncMock
+
+    from dynastore.extensions.records.config import RecordsPluginConfig
+    from dynastore.extensions.records.records_service import RecordsService
+
+    svc = RecordsService.__new__(RecordsService)
+    catalogs = AsyncMock()
+    catalogs.list_catalogs = AsyncMock(
+        return_value=[
+            type("_Catalog", (), {"id": "c1", "external_id": "c1", "title": LocalizedText(en="Catalog")})()
+        ]
+    )
+
+    async def _get_catalogs_service():
+        return catalogs
+
+    async def _get_plugin_config(config_cls, catalog_id=None, collection_id=None):
+        return RecordsPluginConfig()
+
+    svc._get_catalogs_service = _get_catalogs_service
+    svc._get_plugin_config = _get_plugin_config
+
+    result = await svc.list_catalogs(language="*", limit=None, offset=0)
+
+    title = result["catalogs"][0]["title"]
+    assert title == {"en": "Catalog"}
+    assert "fr" not in title
 
 
 def test_record_model_dump_links_contain_localized_title():

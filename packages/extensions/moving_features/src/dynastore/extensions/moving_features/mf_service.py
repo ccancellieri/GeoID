@@ -40,6 +40,7 @@ from dynastore.extensions import protocols
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.web.decorators import expose_web_page
 from dynastore.extensions.tools.db import get_async_connection, get_async_engine
+from dynastore.extensions.tools.language_utils import get_language
 from dynastore.extensions.tools.query import parse_hints_param
 from dynastore.models.protocols import MovingFeaturesProtocol
 from dynastore.modules.catalog import catalog_module
@@ -219,7 +220,8 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
             ),
         ),
         offset: int = Query(0, ge=0),
-    ) -> JSONResponse:
+        language: str = Depends(get_language),
+    ):
         from dynastore.extensions.moving_features.config import MovingFeaturesPluginConfig
         from dynastore.extensions.tools.pagination import resolve_page_limit
 
@@ -228,16 +230,7 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
             limit, default_limit=mf_config.default_limit, max_limit=mf_config.max_limit,
         )
 
-        catalogs_svc = await self._get_catalogs_service()
-        catalogs = await catalogs_svc.list_catalogs(limit=limit, offset=offset)
-        return JSONResponse(
-            content={
-                "catalogs": [
-                    {"id": c.id, "title": getattr(c, "title", None)}
-                    for c in (catalogs or [])
-                ]
-            }
-        )
+        return await self._ogc_list_catalogs(limit=limit, offset=offset, language=language)
 
     async def _resolve_internal_catalog_id(self, external_catalog_id: str) -> str:
         """Resolve the public external catalog id to the immutable internal id.
@@ -272,7 +265,8 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
             ),
         ),
         offset: int = Query(0, ge=0),
-    ) -> JSONResponse:
+        language: str = Depends(get_language),
+    ):
         validate_sql_identifier(catalog_id)
 
         from dynastore.extensions.moving_features.config import MovingFeaturesPluginConfig
@@ -283,17 +277,8 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
             limit, default_limit=mf_config.default_limit, max_limit=mf_config.max_limit,
         )
 
-        catalogs_svc = await self._get_catalogs_service()
-        collections = await catalogs_svc.list_collections(
-            catalog_id, limit=limit, offset=offset
-        )
-        return JSONResponse(
-            content={
-                "collections": [
-                    {"id": c.id, "title": getattr(c, "title", None)}
-                    for c in (collections or [])
-                ]
-            }
+        return await self._ogc_list_collections(
+            catalog_id, limit=limit, offset=offset, language=language
         )
 
     async def get_collection(

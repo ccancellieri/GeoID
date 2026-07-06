@@ -322,19 +322,7 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
             max_limit=records_config.max_limit,
         )
 
-        catalogs_svc = await self._get_catalogs_service()
-        catalogs = await catalogs_svc.list_catalogs(limit=limit, offset=offset)
-        return {
-            "catalogs": [
-                {
-                    "id": getattr(c, "external_id", None) or c.id,
-                    "title": resolve_localized_field(
-                        getattr(c, "title", None), language
-                    ),
-                }
-                for c in (catalogs or [])
-            ]
-        }
+        return await self._ogc_list_catalogs(limit=limit, offset=offset, language=language)
 
     async def list_collections(
         self,

@@ -222,3 +222,151 @@ async def test_get_storage_service_returns_none_when_unavailable(monkeypatch):
 
     svc = _Svc()
     assert await svc._get_storage_service() is None
+
+
+# ---------------------------------------------------------------------------
+# OGCServiceMixin._ogc_list_catalogs / _ogc_list_collections
+#
+# Shared by Coverages, EDR, Records, and Moving Features. Two behaviours
+# pinned here:
+# * the internal ``id`` is never exposed — ``external_id`` wins when set.
+# * ``lang='*'`` resolves via resolve_localized_field (clean, filtered dict),
+#   not resolve_localized (raw model -> null-padded dict once serialized).
+# ---------------------------------------------------------------------------
+
+
+class _Catalog:
+    def __init__(self, id, external_id=None, title=None):
+        self.id = id
+        self.external_id = external_id
+        self.title = title
+
+
+class _Collection:
+    def __init__(self, id, external_id=None, title=None, description=None):
+        self.id = id
+        self.external_id = external_id
+        self.title = title
+        self.description = description
+
+
+@pytest.mark.asyncio
+async def test_ogc_list_catalogs_normalizes_id_to_external_id():
+    svc = _Svc()
+    catalogs = AsyncMock()
+    catalogs.list_catalogs = AsyncMock(
+        return_value=[_Catalog(id="internal-1", external_id="public-cat")]
+    )
+    svc._get_catalogs_service = AsyncMock(return_value=catalogs)
+
+    result = await svc._ogc_list_catalogs(limit=10)
+
+    assert result["catalogs"] == [{"id": "public-cat", "title": None}]
+
+
+@pytest.mark.asyncio
+async def test_ogc_list_catalogs_falls_back_to_internal_id_when_no_external_id():
+    svc = _Svc()
+    catalogs = AsyncMock()
+    catalogs.list_catalogs = AsyncMock(return_value=[_Catalog(id="only-internal")])
+    svc._get_catalogs_service = AsyncMock(return_value=catalogs)
+
+    result = await svc._ogc_list_catalogs(limit=10)
+
+    assert result["catalogs"][0]["id"] == "only-internal"
+
+
+@pytest.mark.asyncio
+async def test_ogc_list_catalogs_language_none_passes_title_through_unchanged():
+    from dynastore.models.localization import LocalizedText
+
+    svc = _Svc()
+    title = LocalizedText(en="Catalog", fr="Catalogue")
+    catalogs = AsyncMock()
+    catalogs.list_catalogs = AsyncMock(
+        return_value=[_Catalog(id="c1", external_id="c1", title=title)]
+    )
+    svc._get_catalogs_service = AsyncMock(return_value=catalogs)
+
+    result = await svc._ogc_list_catalogs(limit=10)
+
+    assert result["catalogs"][0]["title"] is title
+
+
+@pytest.mark.asyncio
+async def test_ogc_list_catalogs_resolves_single_language():
+    from dynastore.models.localization import LocalizedText
+
+    svc = _Svc()
+    title = LocalizedText(en="Catalog", fr="Catalogue")
+    catalogs = AsyncMock()
+    catalogs.list_catalogs = AsyncMock(
+        return_value=[_Catalog(id="c1", external_id="c1", title=title)]
+    )
+    svc._get_catalogs_service = AsyncMock(return_value=catalogs)
+
+    result = await svc._ogc_list_catalogs(limit=10, language="fr")
+
+    assert result["catalogs"][0]["title"] == "Catalogue"
+
+
+@pytest.mark.asyncio
+async def test_ogc_list_catalogs_wildcard_returns_clean_dict_no_null_padding():
+    """lang='*' must not leak unset languages as explicit ``None`` keys.
+
+    Regression test for the bug fixed by swapping ``resolve_localized`` for
+    ``resolve_localized_field``: the former returned the raw LocalizedText
+    model unchanged for ``lang='*'``, which serializes with every unset
+    language field as an explicit null once the response is dumped.
+    """
+    from dynastore.models.localization import LocalizedText
+
+    svc = _Svc()
+    title = LocalizedText(en="Catalog")  # fr/es/... left unset
+    catalogs = AsyncMock()
+    catalogs.list_catalogs = AsyncMock(
+        return_value=[_Catalog(id="c1", external_id="c1", title=title)]
+    )
+    svc._get_catalogs_service = AsyncMock(return_value=catalogs)
+
+    result = await svc._ogc_list_catalogs(limit=10, language="*")
+
+    resolved_title = result["catalogs"][0]["title"]
+    assert resolved_title == {"en": "Catalog"}
+    assert "fr" not in resolved_title
+
+
+@pytest.mark.asyncio
+async def test_ogc_list_collections_normalizes_id_and_omits_none_fields():
+    svc = _Svc()
+    catalogs = AsyncMock()
+    catalogs.list_collections = AsyncMock(
+        return_value=[_Collection(id="internal-1", external_id="public-coll")]
+    )
+    svc._get_catalogs_service = AsyncMock(return_value=catalogs)
+
+    result = await svc._ogc_list_collections("cat", limit=10, language="en")
+
+    assert result["collections"] == [{"id": "public-coll"}]
+
+
+@pytest.mark.asyncio
+async def test_ogc_list_collections_wildcard_returns_clean_dicts_no_null_padding():
+    from dynastore.models.localization import LocalizedText
+
+    svc = _Svc()
+    coll = _Collection(
+        id="c1",
+        external_id="c1",
+        title=LocalizedText(en="Coll"),
+        description=LocalizedText(en="Desc", fr="Descr"),
+    )
+    catalogs = AsyncMock()
+    catalogs.list_collections = AsyncMock(return_value=[coll])
+    svc._get_catalogs_service = AsyncMock(return_value=catalogs)
+
+    result = await svc._ogc_list_collections("cat", limit=10, language="*")
+
+    entry = result["collections"][0]
+    assert entry["title"] == {"en": "Coll"}
+    assert entry["description"] == {"en": "Desc", "fr": "Descr"}

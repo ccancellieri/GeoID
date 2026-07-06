@@ -603,12 +603,13 @@ class OGCServiceMixin:
     ) -> Dict[str, List[Dict[str, Any]]]:
         """Shared ``{id, title}`` catalog nav-listing projection.
 
-        Used by the web-browser "list catalogs" endpoints (Coverages, EDR).
-        *limit* must already be resolved (e.g. via ``resolve_page_limit``) —
-        this helper does not apply a default. When *language* is given,
-        ``title`` is resolved via :func:`resolve_localized` to a single
-        string; when ``None`` the raw title value is passed through
-        unchanged.
+        Used by the web-browser "list catalogs" endpoints (Coverages, EDR,
+        Records, Moving Features). *limit* must already be resolved (e.g. via
+        ``resolve_page_limit``) — this helper does not apply a default. When
+        *language* is given, ``title`` is resolved via
+        :func:`resolve_localized_field` to a single string (or, for
+        ``lang='*'``, a filtered ``{lang: text}`` dict with no null padding);
+        when ``None`` the raw title value is passed through unchanged.
         """
         catalogs_svc = await self._get_catalogs_service()
         catalogs = await catalogs_svc.list_catalogs(limit=limit, offset=offset)
@@ -616,9 +617,9 @@ class OGCServiceMixin:
         for c in (catalogs or []):
             title = getattr(c, "title", None)
             if language is not None:
-                from dynastore.extensions.tools.response_i18n import resolve_localized
+                from dynastore.tools.language_utils import resolve_localized_field
 
-                title = resolve_localized(title, language)
+                title = resolve_localized_field(title, language)
             result.append({"id": getattr(c, "external_id", None) or c.id, "title": title})
         return {"catalogs": result}
 
@@ -633,10 +634,12 @@ class OGCServiceMixin:
         """Shared ``{id, title, description}`` collection nav-listing projection.
 
         *limit* must already be resolved (e.g. via ``resolve_page_limit``).
-        ``title``/``description`` are resolved via :func:`resolve_localized`
-        and omitted from an entry when the resolved value is ``None``.
+        ``title``/``description`` are resolved via
+        :func:`resolve_localized_field` (single string, or a filtered
+        ``{lang: text}`` dict with no null padding for ``lang='*'``) and
+        omitted from an entry when the resolved value is ``None``.
         """
-        from dynastore.extensions.tools.response_i18n import resolve_localized
+        from dynastore.tools.language_utils import resolve_localized_field
 
         catalogs_svc = await self._get_catalogs_service()
         collections = await catalogs_svc.list_collections(
@@ -645,10 +648,10 @@ class OGCServiceMixin:
         items: List[Dict[str, Any]] = []
         for c in (collections or []):
             entry: Dict[str, Any] = {"id": getattr(c, "external_id", None) or c.id}
-            title = resolve_localized(getattr(c, "title", None), language)
+            title = resolve_localized_field(getattr(c, "title", None), language)
             if title is not None:
                 entry["title"] = title
-            description = resolve_localized(getattr(c, "description", None), language)
+            description = resolve_localized_field(getattr(c, "description", None), language)
             if description is not None:
                 entry["description"] = description
             items.append(entry)
