@@ -685,12 +685,23 @@ class ItemQueryMixin:
         col_config: ItemsPostgresqlDriverConfig,
         db_resource: Optional[DbResource] = None,
         consumer: ConsumerType = ConsumerType.GENERIC,
+        read_policy: Optional[Any] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """
         Applies registered query transformations and generates optimized SQL.
 
         This centralizes the transformation logic used across get_features_query,
         _prepare_search, and stream_items.
+
+        ``read_policy`` (the collection's :class:`ItemsReadPolicy`) carries the
+        wire-shape contract. Threading it lets the optimizer resolve the
+        feature-id expression (``external_id_as_feature_id``) so the ``AS id``
+        projection and the ``item_ids`` predicate key on the SAME identifier the
+        read representation advertises — without it the optimizer defaults to the
+        bare ``geoid`` and a lookup by the advertised id (e.g. an opted-in
+        collection's ``external_id``) misses or 500s on the uuid cast (#3070).
+        Left ``None`` (the default for callers that don't need it) the behaviour
+        is unchanged.
         """
         from dynastore.models.protocols import QueryTransformProtocol
         from dynastore.tools.discovery import get_protocols
@@ -813,6 +824,7 @@ class ItemQueryMixin:
             col_config,
             consumer=consumer,
             schema_fields=context.get("schema_fields"),
+            read_policy=read_policy,
         )
         sql, params = optimizer.build_optimized_query(
             query_request, schema=phys_schema, table=phys_table
@@ -875,6 +887,29 @@ class ItemQueryMixin:
             if not phys_schema or not phys_table:
                 return None
 
+            # Resolve the wire-shape policy BEFORE the query so the ``item_ids``
+            # predicate keys on the SAME identifier the read representation
+            # advertises (#3070). When the collection opts into
+            # ``external_id_as_feature_id`` the optimizer resolves
+            # COALESCE(external_id, geoid) and a lookup by the authored
+            # external_id (e.g. "1") matches; otherwise the id is the geoid.
+            read_policy = await self._resolve_read_policy(catalog_id, collection_id)
+            _ext_id_as_fid = bool(
+                getattr(getattr(read_policy, "feature_type", None),
+                        "external_id_as_feature_id", False)
+            )
+            if not _ext_id_as_fid:
+                # Geoid id-space: the optimizer builds
+                # ``h.geoid = ANY(CAST(:_item_ids AS uuid[]))``, so a non-UUID id
+                # (a stale external_id from a client that predates #3070, or a
+                # foreign id walked over from STAC) would raise an asyncpg
+                # DataError → 500. Short-circuit to a clean 404 instead.
+                import uuid as _uuid
+                try:
+                    _uuid.UUID(str(item_id))
+                except (ValueError, AttributeError, TypeError):
+                    return None
+
             from dynastore.models.query_builder import FieldSelection
             request = QueryRequest(
                 item_ids=[str(item_id)],
@@ -900,13 +935,12 @@ class ItemQueryMixin:
             consumer = getattr(context, "consumer", None) or ConsumerType.GENERIC
             sql, params = await self._apply_query_transformations(
                 request, query_ctx, catalog_id, collection_id, col_config,
-                db_resource=conn, consumer=consumer,
+                db_resource=conn, consumer=consumer, read_policy=read_policy,
             )
 
             result = await _run_query(conn, text(sql), params)
             row = result.mappings().first()
 
-            read_policy = await self._resolve_read_policy(catalog_id, collection_id)
             return (
                 self.map_row_to_feature(
                     dict(row), col_config, lang=lang, context=context,

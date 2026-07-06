@@ -1126,18 +1126,20 @@ class QueryOptimizer:
         # Resolve the feature-ID expression. ``provides_feature_id`` on the
         # sidecar is a capability flag (at most one sidecar can provide it).
         #
-        # Two cases:
-        # 1. Non-STAC consumers: the wire-shape decision lives on the read
-        #    policy — when ``external_id_as_feature_id`` is False,
-        #    ``feature.id == geoid`` regardless of sidecar capability.
-        # 2. STAC consumers: STAC items MUST expose the authored external_id
-        #    (the original STAC item id) as the stable, client-facing identifier.
-        #    Use COALESCE(external_id, geoid) unconditionally so that GET /items
-        #    and POST /search produce the same id regardless of the per-collection
-        #    read-policy setting (search.py uses the same COALESCE convention).
-        #    Items without an external_id fall back to the geoid UUID.
+        # The wire-shape decision lives on the read policy for EVERY consumer,
+        # STAC included (#3070). When ``external_id_as_feature_id`` is False (the
+        # default) the stable ``geoid`` is the feature id; only when a collection
+        # opts in does the authored ``external_id`` become the id, falling back
+        # to the geoid UUID for rows that carry none. Honouring the policy here
+        # keeps a single item's id identical across OGC Features and STAC instead
+        # of Features showing the geoid while STAC silently forced the external_id
+        # — the id round-trips because GET /items, GET /items/{id} and POST
+        # /search all resolve against this same expression (see search.py, which
+        # gates its hand-written id projection on the same flag). The STAC Item
+        # spec only *recommends* reusing the provider id scheme, so a geoid id is
+        # equally conformant.
         feature_id_expr: str = "h.geoid"
-        use_coalesce = self._external_id_as_feature_id() or self.consumer == ConsumerType.STAC
+        use_coalesce = self._external_id_as_feature_id()
         if use_coalesce:
             for sc_config in required_sidecars:
                 sidecar = SidecarRegistry.get_sidecar(sc_config, lenient=True)

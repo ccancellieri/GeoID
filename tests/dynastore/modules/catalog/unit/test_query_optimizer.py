@@ -401,6 +401,76 @@ def test_read_policy_disables_external_id_as_feature_id(mock_col_config, mock_re
     assert "COALESCE(sc_attributes.external_id, h.geoid::text) AS id" in sql_on
 
 
+def test_stac_consumer_honors_external_id_policy(mock_col_config, mock_registry):
+    """#3070 — the STAC consumer no longer forces COALESCE(external_id, geoid)
+    as the item id. STAC honours ``external_id_as_feature_id`` exactly like
+    Features: geoid by default, the authored external_id only when the
+    collection opts in — so one item carries the same id across both protocols.
+    """
+    from dynastore.modules.storage.read_policy import ItemsReadPolicy
+    from dynastore.modules.storage.computed_fields import FeatureType
+    from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
+
+    mock_geom = MagicMock()
+    mock_geom.config.sidecar_id = "geometries"
+    mock_geom.sidecar_id = "geometries"
+    mock_geom.get_queryable_fields.return_value = {
+        "geom": FieldDefinition(
+            name="geom", sql_expression="sc_geom.geom",
+            capabilities=[FieldCapability.SPATIAL], data_type="geometry",
+        )
+    }
+    mock_geom.get_join_clause.return_value = "LEFT JOIN geom_table sc_geom ON h.geoid = sc_geom.geoid"
+    mock_geom.supports_aggregation.return_value = True
+    mock_geom.supports_transformation.return_value = True
+    mock_geom.get_default_sort.return_value = None
+    mock_geom.provides_feature_id = False
+    mock_geom.get_main_geometry_field.return_value = "geom"
+
+    mock_attr = MagicMock()
+    mock_attr.config.sidecar_id = "attributes"
+    mock_attr.sidecar_id = "attributes"
+    mock_attr.get_queryable_fields.return_value = {
+        "external_id": FieldDefinition(
+            name="external_id", sql_expression="sc_attr.external_id",
+            capabilities=[FieldCapability.FILTERABLE], data_type="string",
+        )
+    }
+    mock_attr.get_join_clause.return_value = "LEFT JOIN attr_table sc_attr ON h.geoid = sc_attr.geoid"
+    mock_attr.supports_aggregation.return_value = True
+    mock_attr.supports_transformation.return_value = True
+    mock_attr.get_default_sort.return_value = None
+    mock_attr.provides_feature_id = True
+    mock_attr.feature_id_field_name = "external_id"
+    mock_attr.get_main_geometry_field.return_value = None
+
+    mock_registry.get_sidecar.side_effect = (
+        lambda sc, lenient=True: mock_geom if getattr(sc, "sidecar_type", "") == "geometries" else mock_attr
+    )
+
+    req = QueryRequest(
+        select=[FieldSelection(field="geom", alias="geometry")],
+        filters=[FilterCondition(field="external_id", operator="=", value="X")],
+        raw_where=None, include_total_count=False,
+    )
+
+    # STAC + default/no policy (external_id_as_feature_id=False) → geoid IS the
+    # id; the external_id COALESCE is NOT forced (the pre-#3070 behaviour).
+    optimizer = QueryOptimizer(mock_col_config, consumer=ConsumerType.STAC)
+    sql_default, _ = optimizer.build_optimized_query(req, "schema", "table")
+    assert "COALESCE(sc_attributes.external_id" not in sql_default
+    assert "h.geoid AS id" in sql_default
+
+    # STAC + policy opts in → external_id IS aliased as id (COALESCE), same as
+    # every other consumer.
+    policy = ItemsReadPolicy(feature_type=FeatureType(external_id_as_feature_id=True))
+    optimizer_on = QueryOptimizer(
+        mock_col_config, consumer=ConsumerType.STAC, read_policy=policy
+    )
+    sql_on, _ = optimizer_on.build_optimized_query(req, "schema", "table")
+    assert "COALESCE(sc_attributes.external_id, h.geoid::text) AS id" in sql_on
+
+
 def test_item_ids_filter_casts_geoid_uuid(mock_col_config, mock_registry):
     """item_ids filter must not emit a bare ``uuid = text`` comparison.
 

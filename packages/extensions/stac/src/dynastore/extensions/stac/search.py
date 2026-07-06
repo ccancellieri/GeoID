@@ -26,7 +26,6 @@ from pydantic import BaseModel, Field
 from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
 from dynastore.models.query_builder import (
     FieldSelection,
-    FilterCondition,
     FilterOperator,
     QueryRequest,
 )
@@ -1044,14 +1043,38 @@ async def search_items(
     # blob must be splatted into individual row keys before mapping, because the
     # COLUMNAR attribute mapper reads ``row[col]`` rather than the blob.
     collection_attr_columnar: set = set()
+    # Per-collection wire-shape flag: does STAC expose the authored
+    # ``external_id`` as the item id, or the stable ``geoid``? Driven by
+    # ``ItemsReadPolicy.feature_type.external_id_as_feature_id`` (default False →
+    # geoid) so STAC honours the same policy as Features and GET /items/{id}
+    # (#3070). Consumed by the fragment and hydration id projections below.
+    collection_ext_id_as_fid: dict = {}
+    from dynastore.extensions.tools.query import resolve_items_read_policy
 
     for collection_id in target_collections:
         config = collection_configs[collection_id]
 
+        # Resolve the wire-shape policy so this collection's STAC id honours
+        # ``external_id_as_feature_id`` — the geoid by default, the authored
+        # external_id only when the collection opts in — and thread it into the
+        # optimizer so the ``id`` filter (POST /search ``ids=``) keys on the same
+        # expression the id projection uses.
+        _read_policy = await resolve_items_read_policy(cat_id, collection_id)
+        _ext_id_as_fid = bool(
+            getattr(
+                getattr(_read_policy, "feature_type", None),
+                "external_id_as_feature_id",
+                False,
+            )
+        )
+        collection_ext_id_as_fid[collection_id] = _ext_id_as_fid
+
         # Instantiate QueryOptimizer for this collection — STAC search needs
         # the stac_metadata sidecar in the SELECT/JOIN.
         from dynastore.modules.storage.drivers.pg_sidecars.base import ConsumerType
-        optimizer = QueryOptimizer(config, consumer=ConsumerType.STAC)
+        optimizer = QueryOptimizer(
+            config, consumer=ConsumerType.STAC, read_policy=_read_policy
+        )
 
         # --- Query Request Construction ---
 
@@ -1116,15 +1139,21 @@ async def search_items(
 
         # Attribute Filters -> Attributes Sidecar
         if search_request.ids:
-            # Use "id" field (aliased external_id)
-            # Operator "IN" with tuple.
-            query_filters.append(
-                FilterCondition(
-                    field="id",
-                    operator=FilterOperator.IN,
-                    value=list(search_request.ids),
-                )
+            # Match the item id honouring ``external_id_as_feature_id`` (#3070):
+            # the SAME policy-gated expression the id projection uses, so a
+            # client can round-trip whatever id it was shown — the geoid by
+            # default, the authored external_id when the collection opts in.
+            # (The old ``field="id"`` filter always keyed on the external_id
+            # column, which after the policy-honouring projection would no longer
+            # match a geoid id.) ``h.geoid::text`` keeps the comparison textual so
+            # a foreign/non-uuid id can't raise a uuid-cast error.
+            _id_filter_expr = (
+                "COALESCE(sc_attributes.external_id, h.geoid::text)"
+                if _ext_id_as_fid
+                else "h.geoid::text"
             )
+            raw_where_clauses.append(f"{_id_filter_expr} = ANY(:_stac_id_filter)")
+            query_params["_stac_id_filter"] = list(search_request.ids)
 
         # Datetime is usually handled in where_sql (from build_filter_clause).
         # We added where_sql to raw_where.
@@ -1229,10 +1258,15 @@ async def search_items(
                 raw_selects.append(
                     "(sc_attributes.attributes->>'datetime')::timestamptz as valid_from"
                 )
-            # Use raw select for ID coalescence
-            # QueryOptimizer uses sc_attributes for the attributes sidecar
+            # Project the item id honouring ``external_id_as_feature_id``
+            # (#3070): the authored external_id only when the collection opts
+            # in, else the stable geoid. Kept identical to the hydration and
+            # ``id``-filter expressions so the candidate cursor round-trips.
+            # QueryOptimizer uses sc_attributes for the attributes sidecar.
             raw_selects.append(
                 "COALESCE(sc_attributes.external_id, h.geoid::text) as id"
+                if _ext_id_as_fid
+                else "h.geoid::text as id"
             )
 
         elif not req_stac:
@@ -1476,8 +1510,18 @@ async def search_items(
             # COLUMNAR attribute sidecars have no ``attributes`` blob column;
             # reconstruct it from the declared property columns (#1253 follow-up).
             attr_select = collection_attr_projection.get(coll_id, "s.attributes")
+            # Item id honours ``external_id_as_feature_id`` (#3070): geoid by
+            # default, the authored external_id only when the collection opts
+            # in. ``s.external_id`` is always projected as its own column (the
+            # STAC generator / expose merge may still read it) — only the ``id``
+            # alias is policy-gated. This is the id that surfaces to the client.
+            _id_expr = (
+                "COALESCE(s.external_id, h.geoid::text) as id"
+                if collection_ext_id_as_fid.get(coll_id, False)
+                else "h.geoid::text as id"
+            )
             select_parts.append(
-                ", COALESCE(s.external_id, h.geoid::text) as id"
+                f", {_id_expr}"
                 ", s.external_id"
                 f"{validity_select}"
                 f", {attr_select} as attributes, s.asset_id"
@@ -1558,12 +1602,12 @@ async def search_items(
     # Resolve the read policy once per collection (STAC search may span
     # several), so the row mapper surfaces ``feature_type.expose`` computed
     # values onto ``feature.properties`` for the STAC item generator to read.
-    # NOTE: STAC search keeps its own native id projection — the hydration
-    # SQL above aliases ``COALESCE(s.external_id, h.geoid::text) AS id`` for
-    # every row, which is the STAC Item convention (items key on external_id).
-    # ``ItemsReadPolicy.feature_type.external_id_as_feature_id`` therefore does
-    # NOT override the STAC item id on this path by design; only the expose
-    # merge is honoured here.
+    # The hydration SQL above already gated the ``AS id`` projection on
+    # ``ItemsReadPolicy.feature_type.external_id_as_feature_id`` (#3070), so the
+    # id surfaced here (via the row's ``id`` column) already honours the policy —
+    # geoid by default, the authored external_id only when the collection opts
+    # in — matching Features and GET /items/{id}. This resolution additionally
+    # drives the expose merge.
     _read_policy_by_collection: Dict[str, Any] = {}
 
     async def _read_policy_for(collection_id: str) -> Any:
