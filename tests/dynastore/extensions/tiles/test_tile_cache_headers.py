@@ -287,3 +287,54 @@ async def test_redirect_signed_url_exception_type_in_warning(caplog):
     assert any("ValueError" in w for w in warnings), (
         f"Exception class name should appear in warning; got {warnings}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Raster render-cache path (`_try_render_cache`) honors per-request serve_mode.
+# Redirect-averse clients (e.g. QGIS) can force `serve=proxy` on map tiles too.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_render_cache_redirect_default_uses_signed_url():
+    """Default serve_mode='redirect': signed URL → 307 (offload to bucket)."""
+    provider = MagicMock()
+    provider.get_tile_url = AsyncMock(
+        return_value="https://storage.googleapis.com/bkt/map/c/default/WMQ/5/17/11.png?sig=…"
+    )
+    provider.get_tile = AsyncMock(return_value=None)
+    cfg = MagicMock()
+    cfg.ttl_seconds = 60
+
+    resp = await TilesService._try_render_cache(
+        provider, "cat", "map/coll/default/WMQ/5/17/11.png", "WebMercatorQuad",
+        5, 17, 11, "png", time.perf_counter(), cfg,
+    )
+
+    assert isinstance(resp, RedirectResponse)
+    assert resp.status_code == 307
+    assert resp.headers["X-Render-Source"] == "bucket_redirect"
+
+
+@pytest.mark.asyncio
+async def test_render_cache_proxy_mode_skips_signed_url():
+    """serve_mode='proxy' never resolves a signed URL — streams bytes (QGIS-safe)."""
+    provider = MagicMock()
+    provider.get_tile_url = AsyncMock(
+        return_value="https://storage.googleapis.com/bkt/map/tile.png?sig=x"
+    )
+    provider.get_tile = AsyncMock(return_value=b"\x89PNGbytes")
+    cfg = MagicMock()
+    cfg.ttl_seconds = 60
+
+    resp = await TilesService._try_render_cache(
+        provider, "cat", "map/coll/default/WMQ/5/17/11.png", "WebMercatorQuad",
+        5, 17, 11, "png", time.perf_counter(), cfg,
+        serve_mode="proxy",
+    )
+
+    provider.get_tile_url.assert_not_called()
+    assert resp is not None
+    assert resp.status_code == 200
+    assert resp.body == b"\x89PNGbytes"
+    assert resp.headers["X-Render-Source"] == "bucket_proxy"
