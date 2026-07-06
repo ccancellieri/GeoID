@@ -324,6 +324,69 @@ def test_no_cpu_signal_falls_back_to_pool_only_algorithm():
     assert result == 2
 
 
+def test_scale_in_never_actuates_below_min_instances_floor():
+    """The hard floor (independent of ``min_replicas``) must dominate the
+    final clamp — a cooling fleet ratchets down to the floor, not to 0."""
+    policy = _policy(
+        min_replicas=0, min_instances_floor=1, max_replicas=10,
+        scale_out_saturation=0.80, deadband=0.10, scale_in_step=5,
+    )
+    signals = [_instance_signal(0.1)]
+
+    result = compute_desired_min(
+        signals, policy, current_min=1, last_change_ts=0.0, now=1000.0
+    )
+
+    assert result >= 1
+
+
+def test_no_instance_signals_still_honors_min_instances_floor():
+    """Data-starvation branch (#2872 guardrail): with zero fresh signals the
+    reconciler must never report a desired floor below the configured hard
+    floor, even when ``current_min`` is already 0."""
+    policy = _policy(min_instances_floor=1)
+
+    result = compute_desired_min(
+        [], policy, current_min=0, last_change_ts=0.0, now=1000.0
+    )
+
+    assert result == 1
+
+
+def test_min_instances_floor_dominates_a_tiny_budget():
+    """Even when the DB-connection budget clamps ``effective_max`` below the
+    hard floor, the floor still wins — the guardrail must never be starved
+    out by a small budget ceiling."""
+    policy = _policy(
+        min_replicas=0, min_instances_floor=1, max_replicas=10,
+        scale_out_saturation=0.80, deadband=0.10, scale_in_step=5,
+        per_instance_pool=100, db_max_connections=10, connection_headroom=0,
+    )
+    signals = [_instance_signal(0.1)]
+
+    result = compute_desired_min(
+        signals, policy, current_min=3, last_change_ts=0.0, now=1000.0
+    )
+
+    assert result >= policy.min_instances_floor
+
+
+def test_min_instances_floor_does_not_pin_down_scale_out():
+    """The floor is a lower bound only — a hot fleet must still scale OUT
+    normally with a nonzero floor configured."""
+    policy = _policy(
+        min_replicas=0, min_instances_floor=1, max_replicas=10,
+        scale_out_saturation=0.80, step=1,
+    )
+    signals = [_instance_signal(0.9)]
+
+    result = compute_desired_min(
+        signals, policy, current_min=2, last_change_ts=0.0, now=1000.0
+    )
+
+    assert result == 3
+
+
 def test_scale_out_clamps_to_effective_max_replicas():
     policy = _policy(
         min_replicas=0, max_replicas=5, scale_out_saturation=0.80,

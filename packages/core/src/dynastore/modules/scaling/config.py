@@ -88,6 +88,10 @@ class ScalingPolicyConfig(PluginConfig):
             "once that pressure clears."
         ),
     )
+    min_instances_floor: Mutable[int] = Field(
+        default=1, ge=1,
+        description="Hard floor the reconciler will never actuate below, independent of min_replicas. Guarantees the service never scales to zero once the loop is enabled.",
+    )
     max_replicas: Mutable[int] = Field(
         default=10,
         ge=1,

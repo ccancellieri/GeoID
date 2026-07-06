@@ -274,7 +274,7 @@ def compute_desired_min(
     # fleet reading below would take the scale-in branch every tick and silently
     # drain the service to min_replicas regardless of real load.
     if not instance_values:
-        return current_min
+        return max(policy.min_instances_floor, current_min)
 
     global_conn_pressure = extract_global_metric(signals, "conn_pressure")
     cpu_utilization = extract_global_metric(signals, "cpu_utilization")
@@ -314,7 +314,8 @@ def compute_desired_min(
         target = current_min - policy.scale_in_step
     # else: inside the deadband — no change.
 
-    target = max(policy.min_replicas, min(effective_max, target))
+    floor = max(policy.min_instances_floor, policy.min_replicas)
+    target = max(floor, min(effective_max, target))
 
     if target > current_min:
         cooldown = policy.scale_out_cooldown_seconds
