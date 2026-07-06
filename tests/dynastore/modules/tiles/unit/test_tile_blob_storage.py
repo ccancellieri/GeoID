@@ -34,10 +34,12 @@ class _FakeStorage:
     def __init__(self) -> None:
         self._objects: Dict[str, bytes] = {}
         self.upload_calls: List[str] = []
+        self.content_types: Dict[str, Optional[str]] = {}
 
     async def upload_file_content(self, target_path: str, content: bytes, content_type=None) -> str:
         self._objects[target_path] = content
         self.upload_calls.append(target_path)
+        self.content_types[target_path] = content_type
         return target_path
 
     async def download_file_content(self, path: str) -> Optional[bytes]:
@@ -64,6 +66,36 @@ class _FakeSigner:
     async def sign(self, object_uri: str) -> Optional[str]:
         self.signed.append(object_uri)
         return self._url
+
+
+@pytest.mark.parametrize(
+    "fmt, expected_ct",
+    [
+        ("mvt", "application/vnd.mapbox-vector-tile"),
+        ("pbf", "application/vnd.mapbox-vector-tile"),
+        ("png", "image/png"),
+        ("PNG", "image/png"),  # case-insensitive
+        ("webp", "image/webp"),
+        ("jpeg", "image/jpeg"),
+        ("jpg", "image/jpeg"),
+        ("bin", "application/octet-stream"),  # unknown -> safe fallback
+    ],
+)
+@pytest.mark.asyncio
+async def test_save_tile_stamps_correct_content_type(fmt, expected_ct):
+    """Store-time Content-Type must be the real media type per format.
+
+    This header is authoritative in redirect serve mode (client fetches from
+    the bucket directly), so a PNG/WebP tile stored as octet-stream would be
+    handed to the browser mislabelled.
+    """
+    storage = _FakeStorage()
+    writer = StorageTileWriter(storage, "gs://bucket", "tiles/collections")
+
+    uri = await writer.save_tile("cat", "coll", "WebMercatorQuad", 5, 17, 11, b"bytes", fmt)
+
+    assert uri is not None
+    assert storage.content_types[uri] == expected_ct
 
 
 @pytest.mark.asyncio

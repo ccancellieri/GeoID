@@ -56,6 +56,7 @@ def _make_service() -> TilesService:
     svc._ogc_catalogs_protocol = None  # type: ignore[attr-defined]
     svc._ogc_configs_protocol = None  # type: ignore[attr-defined]
     svc._ogc_storage_protocol = None  # type: ignore[attr-defined]
+    svc._tile_cache_writer = MagicMock()  # type: ignore[attr-defined]
     return svc
 
 
@@ -197,7 +198,7 @@ class TestGetMapTileRasterHappyPath:
             assert response.media_type == "image/png"
             assert response.headers["X-Render-Cache"] == "miss"
             assert response.headers["X-Render-Source"] == "rio-tiler"
-            bg.add_task.assert_not_called()
+            svc._tile_cache_writer.submit_nowait.assert_not_called()
         finally:
             _ts_mod._RENDER_COG_TILE = original
 
@@ -233,10 +234,10 @@ class TestGetMapTileRasterHappyPath:
 
             assert response.status_code == 200
             assert "1234" in response.headers["Cache-Control"]
-            bg.add_task.assert_called_once()
-            call_args = bg.add_task.call_args.args
-            # (save_tile, catalog_id, cache_key, tms_id, z, x, y, tile_bytes, fmt)
-            assert call_args[0] == provider.save_tile
+            svc._tile_cache_writer.submit_nowait.assert_called_once()
+            call_args = svc._tile_cache_writer.submit_nowait.call_args.args
+            # (provider, catalog_id, cache_key, tms_id, z, x, y, tile_bytes, fmt)
+            assert call_args[0] is provider
             assert call_args[1] == "internal-cat"
             assert call_args[3] == "WebMercatorQuad"
             assert call_args[4:7] == (5, 1, 2)
@@ -433,8 +434,8 @@ class TestHillshadeDispatch:
                     rescale=None,
                 )
 
-            bg.add_task.assert_called_once()
-            call_args = bg.add_task.call_args.args
+            svc._tile_cache_writer.submit_nowait.assert_called_once()
+            call_args = svc._tile_cache_writer.submit_nowait.call_args.args
             assert call_args[7] == b"HILLSHADE-BYTES"
             assert call_args[8] == "png"
         finally:
@@ -667,8 +668,8 @@ class TestTerrainRgbDoesNotCheckInvalidExpression:
 
             assert response.status_code == 200
             assert response.media_type == "image/png"
-            bg.add_task.assert_called_once()
-            call_args = bg.add_task.call_args.args
+            svc._tile_cache_writer.submit_nowait.assert_called_once()
+            call_args = svc._tile_cache_writer.submit_nowait.call_args.args
             assert call_args[7] == b"TERRAIN-BYTES"
             assert call_args[8] == "png"
         finally:

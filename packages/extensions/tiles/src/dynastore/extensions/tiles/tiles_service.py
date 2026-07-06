@@ -83,8 +83,14 @@ from dynastore.modules.tiles.tiles_models import (
     TileSetList,
 )
 from dynastore.modules.tiles.tms_definitions import BUILTIN_TILE_MATRIX_SETS
+from .tile_cache_writer import TileCacheWriter
 
 logger = logging.getLogger(__name__)
+
+# Upper bound on how long TilesService.lifespan waits for the tile-cache
+# writer to drain its queue on shutdown, kept comfortably below the Cloud Run
+# SIGTERM grace period so shutdown never stalls on a slow bucket write.
+_TILE_CACHE_WRITER_DRAIN_SECONDS = 8.0
 
 # PostgreSQL pgcode for "query_canceled" — raised when a statement exceeds
 # ``statement_timeout``. Used by ``get_vector_tile`` (#2813) to distinguish a
@@ -173,6 +179,14 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         "(dataType=map) rendered from COG assets via rio-tiler"
     )
     router: APIRouter
+
+    # Bounded background writer draining interactive tile-cache writes
+    # (see tile_cache_writer.py). Stashed here at startup so request
+    # handlers can submit without touching the raw BackgroundTasks queue.
+    # Defaults to None so tests that construct TilesService without running
+    # lifespan (object.__new__ + manual attribute wiring) degrade to a no-op
+    # write instead of raising.
+    _tile_cache_writer: Optional[TileCacheWriter] = None
 
     def get_web_pages(self):
         from dynastore.extensions.tools.web_collect import collect_web_pages
@@ -468,9 +482,20 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         except ValueError:
             logger.debug("TilesColdBootContributor already registered; skipping duplicate.")
 
+        from dynastore.modules.tiles.tiles_config import _load_caching_config
+        caching_cfg = await _load_caching_config()
+        self._tile_cache_writer = TileCacheWriter(
+            buffer_max_bytes=caching_cfg.cache_writer_buffer_max_bytes,
+            workers=caching_cfg.cache_writer_workers,
+        )
+        self._tile_cache_writer.start()
+
         try:
             yield
         finally:
+            await self._tile_cache_writer.stop(
+                drain_timeout=_TILE_CACHE_WRITER_DRAIN_SECONDS
+            )
             unregister_plugin(contributor)
             logger.info("Tiles Service shutdown.")
 
@@ -1188,9 +1213,9 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                     f"{cache_id}@{params_hash}" if params_hash else cache_id
                 )
                 provider = get_protocol(TileStorageProtocol)
-                if provider:
-                    background_tasks.add_task(
-                        provider.save_tile,
+                if provider and self._tile_cache_writer is not None:
+                    self._tile_cache_writer.submit_nowait(
+                        provider,
                         dataset,
                         effective_cache_id,
                         tileMatrixSetId,
@@ -1744,7 +1769,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
 
     @staticmethod
     async def _render_raster_tile(
-        background_tasks: BackgroundTasks,
+        tile_cache_writer: Optional[TileCacheWriter],
         renderer,
         renderer_args: tuple,
         renderer_kwargs: dict,
@@ -1798,9 +1823,9 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 detail=f"{error_prefix} failed: {exc}",
             ) from exc
 
-        if provider and cfg and cfg.cache_enabled and tile_bytes:
-            background_tasks.add_task(
-                provider.save_tile,
+        if provider and cfg and cfg.cache_enabled and tile_bytes and tile_cache_writer is not None:
+            tile_cache_writer.submit_nowait(
+                provider,
                 catalog_id,
                 cache_key,
                 tms_id,
@@ -2012,7 +2037,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         )
         assert _RENDER_COG_TILE is not None  # guaranteed by _require_raster_engine()
         return await self._render_raster_tile(
-            background_tasks,
+            self._tile_cache_writer,
             _RENDER_COG_TILE,
             (cog_href, z, x, y),
             dict(
@@ -2156,9 +2181,9 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         # Persist on `is not None` (not truthy) so a confirmed-empty render
         # (`b""` — zero features) is cached too; otherwise every empty tile
         # re-renders from PostGIS on every request (#2898).
-        if tile_bytes is not None and provider and cache_enabled:
-            background_tasks.add_task(
-                provider.save_tile,
+        if tile_bytes is not None and provider and cache_enabled and self._tile_cache_writer is not None:
+            self._tile_cache_writer.submit_nowait(
+                provider,
                 internal_catalog_id, cache_id, tms_id, z, x, y, tile_bytes, "png",
             )
 
@@ -2334,7 +2359,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             )
             assert _RENDER_COG_TERRAIN_RGB is not None  # guaranteed by _require_raster_engine()
             return await self._render_raster_tile(
-                background_tasks,
+                self._tile_cache_writer,
                 _RENDER_COG_TERRAIN_RGB,
                 (cog_href, z, x, y),
                 dict(band=band),
@@ -2402,7 +2427,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             )
             assert _RENDER_COG_HILLSHADE is not None  # guaranteed by _require_raster_engine()
             return await self._render_raster_tile(
-                background_tasks,
+                self._tile_cache_writer,
                 _RENDER_COG_HILLSHADE,
                 (cog_href, z, x, y),
                 dict(band=band, azimuth=azimuth, altitude=altitude, colormap=colormap),
@@ -2431,7 +2456,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         )
         assert _RENDER_COG_TILE is not None  # guaranteed by _require_raster_engine()
         return await self._render_raster_tile(
-            background_tasks,
+            self._tile_cache_writer,
             _RENDER_COG_TILE,
             (cog_href, z, x, y),
             dict(

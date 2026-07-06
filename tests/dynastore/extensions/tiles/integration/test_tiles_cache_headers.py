@@ -103,8 +103,8 @@ async def test_first_request_is_miss_second_request_is_hit(
     assert first.headers.get("X-Tile-Source") == "postgis"
 
     # Prime the cache directly through the provider — the route's
-    # `background_tasks.add_task(provider.save_tile, ...)` runs after
-    # the response is sent and is not deterministic to await in
+    # background tile-cache write runs on the bounded cache-writer's worker
+    # pool after the response is sent and is not deterministic to await in
     # AsyncTestClient. We're testing the READ-PATH header contract here;
     # the save-path is covered by the helper-level unit test in
     # `test_tile_cache_headers.py`.

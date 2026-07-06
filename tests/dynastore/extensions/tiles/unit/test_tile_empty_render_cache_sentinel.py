@@ -43,6 +43,7 @@ def _make_service() -> TilesService:
     svc._ogc_catalogs_protocol = None  # type: ignore[attr-defined]
     svc._ogc_configs_protocol = None  # type: ignore[attr-defined]
     svc._ogc_storage_protocol = None  # type: ignore[attr-defined]
+    svc._tile_cache_writer = MagicMock()  # type: ignore[attr-defined]
     return svc
 
 
@@ -154,7 +155,7 @@ async def _run_get_vector_tile(*, render_result, cache_enabled: bool, bg_tasks):
             background_tasks=bg_tasks,
             **_minimal_tile_kwargs(disable_cache=False),
         )
-    return result, protocol_mock
+    return result, protocol_mock, svc
 
 
 @pytest.mark.asyncio
@@ -163,14 +164,14 @@ async def test_confirmed_empty_render_is_persisted_and_served_as_204():
     ``save_tile`` and still respond 204 — same wire behavior as before, but
     now cached."""
     bg_tasks = _make_bg_tasks()
-    result, _ = await _run_get_vector_tile(
+    result, _, svc = await _run_get_vector_tile(
         render_result=b"", cache_enabled=True, bg_tasks=bg_tasks,
     )
 
     assert result.status_code == 204
-    bg_tasks.add_task.assert_called_once()
-    call_args = bg_tasks.add_task.call_args
-    # add_task(provider.save_tile, dataset, cache_id, tms_id, z, x, y, data, format)
+    svc._tile_cache_writer.submit_nowait.assert_called_once()
+    call_args = svc._tile_cache_writer.submit_nowait.call_args
+    # submit_nowait(provider, dataset, cache_id, tms_id, z, x, y, data, format)
     assert call_args.args[7] == b""
 
 
@@ -180,12 +181,12 @@ async def test_failed_render_none_is_not_persisted():
     handed to ``save_tile`` — only a confirmed-empty or non-empty render is
     cacheable."""
     bg_tasks = _make_bg_tasks()
-    result, _ = await _run_get_vector_tile(
+    result, _, svc = await _run_get_vector_tile(
         render_result=None, cache_enabled=True, bg_tasks=bg_tasks,
     )
 
     assert result.status_code == 204
-    bg_tasks.add_task.assert_not_called()
+    svc._tile_cache_writer.submit_nowait.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -108,6 +108,25 @@ def _build_object_uri(
     return f"{base_uri}/{_build_blob_path(prefix, collection_id, tms_id, z, x, y, format)}"
 
 
+# Content-Type stamped on the stored object. This is authoritative in
+# redirect serve mode, where the client fetches bytes straight from the
+# bucket and sees exactly this header — so every served format must map to
+# its real media type, not a generic octet-stream fallback (which would hand
+# a PNG/WebP tile to the browser mislabelled).
+_TILE_CONTENT_TYPE: dict[str, str] = {
+    "mvt": "application/vnd.mapbox-vector-tile",
+    "pbf": "application/vnd.mapbox-vector-tile",
+    "png": "image/png",
+    "webp": "image/webp",
+    "jpeg": "image/jpeg",
+    "jpg": "image/jpeg",
+}
+
+
+def _tile_content_type(format: str) -> str:
+    return _TILE_CONTENT_TYPE.get(format.lower(), "application/octet-stream")
+
+
 @cached(maxsize=16, ttl=60, namespace="tile_external_bucket_exists")
 async def external_bucket_exists(bucket_name: str) -> bool:
     """True if an explicitly-targeted GCS bucket exists and is reachable.
@@ -169,9 +188,7 @@ class StorageTileWriter(TileStorageProtocol):
         self, catalog_id: str, collection_id: str, tms_id: str, z: int, x: int, y: int, data: bytes, format: str
     ) -> Optional[str]:
         object_uri = _build_object_uri(self._base_uri, self._prefix, collection_id, tms_id, z, x, y, format)
-        content_type = (
-            "application/vnd.mapbox-vector-tile" if format == "mvt" else "application/octet-stream"
-        )
+        content_type = _tile_content_type(format)
         await self._storage.upload_file_content(object_uri, data, content_type=content_type)
         return object_uri
 

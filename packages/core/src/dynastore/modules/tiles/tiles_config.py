@@ -281,6 +281,31 @@ class TilesCachingConfig(PluginConfig):
         ),
     )
 
+    # --- Bounded background cache writer (Tier A) ---
+    cache_writer_buffer_max_bytes: Mutable[int] = Field(
+        default=134217728,  # 128 MiB
+        ge=0,
+        le=2147483648,
+        description=(
+            "Max total bytes of tile-cache writes buffered + in-flight in "
+            "the process-wide background writer. Bounds the RAM the "
+            "cache-writer can hold regardless of tile size; writes that "
+            "would exceed the budget are dropped and re-rendered on the "
+            "next request. 0 disables buffering (every write overflows and "
+            "is dropped). Read once at process startup."
+        ),
+    )
+    cache_writer_workers: Mutable[int] = Field(
+        default=6,
+        ge=1,
+        le=64,
+        description=(
+            "Number of concurrent background workers draining tile-cache "
+            "writes to the bucket. Bounds concurrent PUTs / connections. "
+            "Read once at process startup; changing it requires a restart."
+        ),
+    )
+
     # --- Serve mode ---
     #
     # Controls how cache hits are delivered to the client.
