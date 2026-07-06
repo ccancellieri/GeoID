@@ -1439,6 +1439,14 @@ FOREIGN KEY ({", ".join([f'"{c}"' for c in ref_cols])}) REFERENCES {{schema}}."{
         # never leak it into Feature.properties.  Only present in Mode B (JSONB).
         if self.resolved_storage_mode == AttributeStorageMode.JSONB:
             cols.add("attributes_hash")
+            # The JSONB blob column itself (default "attributes") is pure internal
+            # storage: map_row_to_feature promotes its *content* into
+            # Feature.properties, so the raw column must never surface on the
+            # Feature root. Without this, item_service.map_row_to_feature's
+            # sidecar-data bridge flattens the whole row and re-emits the blob as
+            # a top-level foreign member -- non-spec GeoJSON on the OGC Features
+            # wire (an "attributes" member beside "properties").
+            cols.add(self.config.jsonb_column_name)
         # Attribute-statistics columns surface via the expose loop, never as raw
         # Feature properties. #1074
         if self._has_jsonb_stats():

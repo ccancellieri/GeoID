@@ -97,3 +97,37 @@ def test_explicitly_requested_system_field_still_surfaces() -> None:
     assert feat.properties.get("CODE") == "IT"
     assert "CODE" not in (feat.model_extra or {})
     assert "CODE" not in feat.model_dump(exclude_none=True)
+
+
+def test_jsonb_blob_column_not_echoed_as_foreign_member() -> None:
+    """JSONB-blob mode: a row carrying the raw ``attributes`` blob column must
+    promote the blob *content* into ``properties`` and NOT re-emit the blob as a
+    top-level ``attributes`` foreign member.
+
+    This reproduces the ``sri_lanka_pia`` /items regression where the OGC
+    Features wire showed ``{"properties":{...}, "attributes":{...}}`` — the raw
+    JSONB storage column leaking beside ``properties``.
+    """
+    svc = _svc()
+    col_config = ItemsPostgresqlDriverConfig()
+    row = {
+        "geoid": "g-1",
+        "external_id": "LKA_1944_984",
+        "attributes": {
+            "FID": 984,
+            "OBJECTID": 1944,
+            "IRMA_CODE": "LKA_1944_984",
+        },
+    }
+
+    feat = svc.map_row_to_feature(row, col_config)
+
+    # Blob content is promoted into properties ...
+    assert feat.properties.get("FID") == 984
+    assert feat.properties.get("OBJECTID") == 1944
+    assert feat.properties.get("IRMA_CODE") == "LKA_1944_984"
+    # ... and the raw blob column never surfaces on the Feature root.
+    assert "attributes" not in (feat.model_extra or {})
+    dumped = feat.model_dump(exclude_none=True)
+    assert "attributes" not in dumped
+    assert set(dumped) <= {"id", "type", "properties", "geometry", "bbox"}

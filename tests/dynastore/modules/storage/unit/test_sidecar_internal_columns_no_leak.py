@@ -75,3 +75,43 @@ def test_geom_type_column_is_internal() -> None:
     sidecar = GeometriesSidecar(GeometriesSidecarConfig())
 
     assert "geom_type" in sidecar.get_internal_columns()
+
+
+def test_jsonb_blob_column_is_internal() -> None:
+    # The JSONB storage blob (default column name "attributes") holds raw
+    # storage; map_row_to_feature promotes its *content* into
+    # Feature.properties. The blob column name itself must be internal so the
+    # raw column never leaks onto the Feature root as a foreign member
+    # (an "attributes" member beside "properties" is non-spec GeoJSON on the
+    # OGC API Features wire).
+    sidecar = FeatureAttributeSidecar(
+        FeatureAttributeSidecarConfig(storage_mode=AttributeStorageMode.JSONB)
+    )
+
+    assert "attributes" in sidecar.get_internal_columns()
+
+
+def test_custom_jsonb_blob_column_name_is_internal() -> None:
+    # A collection can name its JSONB blob column anything; the internal-columns
+    # set must track the configured name, not the "attributes" literal.
+    sidecar = FeatureAttributeSidecar(
+        FeatureAttributeSidecarConfig(
+            storage_mode=AttributeStorageMode.JSONB,
+            jsonb_column_name="props",
+        )
+    )
+
+    cols = sidecar.get_internal_columns()
+    assert "props" in cols
+    assert "attributes" not in cols
+
+
+def test_columnar_mode_has_no_jsonb_blob_column() -> None:
+    # COLUMNAR collections have no JSONB blob column; the "attributes" name must
+    # not be force-added as internal (a real attribute could legitimately be
+    # named "attributes" in columnar schema).
+    sidecar = FeatureAttributeSidecar(
+        FeatureAttributeSidecarConfig(storage_mode=AttributeStorageMode.COLUMNAR)
+    )
+
+    assert "attributes" not in sidecar.get_internal_columns()
