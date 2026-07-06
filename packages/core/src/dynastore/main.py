@@ -48,6 +48,7 @@ from dynastore.tools.background_service import (
 )
 from dynastore.tools.correlation import _correlation_id_var, set_correlation_id
 from dynastore.tools.memory_watchdog import build_memory_watchdog_service
+from dynastore.tools.serving_state import is_draining
 from fastapi.concurrency import run_in_threadpool
 
 # --- Initialize Concurrency Backend ---
@@ -197,12 +198,14 @@ async def lifespan(app: FastAPI):
     # process, so nothing here can catch or drain it. This proactive
     # RSS poll is the only way to turn the climb leading up to a kill into
     # a monitored log-based error before it happens. Enabled by default via
-    # MemoryWatchdogConfig, with the memory budget auto-detected from the
-    # container's cgroup when not explicitly configured; started outside
-    # (and independent of) module/extension lifespans so it observes memory
-    # pressure from the very start of the process, not just once modules
-    # finish booting (the platform config store is not yet reachable at
-    # this point either way, so this always resolves the config's defaults).
+    # MemoryWatchdogConfig; started outside (and independent of) module/
+    # extension lifespans so it observes memory pressure from the very
+    # start of the process, not just once modules finish booting (the
+    # platform config store is not yet reachable at this point either way,
+    # so this always resolves the config's defaults). The effective memory
+    # budget (explicit limit_mb, else cgroup auto-detection, else inert) is
+    # resolved lazily on the service's own first tick, once the config store
+    # is reachable — see tools/memory_watchdog.py.
     _mem_watchdog_service = await build_memory_watchdog_service()
     _mem_watchdog_shutdown = asyncio.Event()
     _mem_watchdog_supervisor = BackgroundSupervisor()
@@ -438,6 +441,16 @@ async def readiness_check():
         deps["valkey"] = {"status": "failed", "detail": str(exc)}
         logger.warning("readiness: valkey error: %s", exc)
 
+    # --- Self-recycle draining flag (geoid#2946 / #2924) ---
+    # Set by the memory watchdog's self-recycle lever when this worker has
+    # decided to gracefully SIGTERM itself ahead of an OOM kill. Always
+    # folded into the real readiness signal (not gated by any config flag —
+    # unlike the readiness-shed middleware, which IS opt-in) since this is
+    # the platform's own probe and must reflect true state.
+    if is_draining():
+        all_ok = False
+        deps["draining"] = {"status": "failed", "detail": "worker is draining for self-recycle"}
+
     payload = {"status": "ready" if all_ok else "not_ready", "dependencies": deps}
     from fastapi.responses import JSONResponse
     return JSONResponse(
@@ -470,6 +483,17 @@ setup_exception_handlers(app)
 # body.
 from dynastore.extensions.tools.body_size_limit import SyncIngestBodyLimitMiddleware
 app.add_middleware(SyncIngestBodyLimitMiddleware)
+
+# Sheds new requests with 503 while this worker is draining for a memory-
+# watchdog self-recycle (Lever B, geoid#2946 / #2924). Added AFTER (so it
+# sits OUTSIDE) SyncIngestBodyLimitMiddleware — under Starlette's insert-at-
+# front semantics the last-added middleware runs first — so a draining worker
+# sheds with a cheap 503 before SyncIngestBodyLimitMiddleware eagerly buffers
+# a (chunked) body it will refuse anyway, which would only pile memory onto a
+# worker recycling precisely because of memory pressure. Still added before
+# CorrelationIdMiddleware, so it stays inside it and shed 503s keep X-Request-ID.
+from dynastore.extensions.tools.readiness_shed_middleware import ReadinessShedMiddleware
+app.add_middleware(ReadinessShedMiddleware)
 
 # Correlation ID middleware must be the outermost middleware so it stamps
 # X-Request-ID on every response — including error responses produced by

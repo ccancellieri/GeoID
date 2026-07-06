@@ -45,11 +45,53 @@ workers sharing it, since each worker is its own process with its own RSS.
 If neither cgroup file is present or both report "no limit" (e.g. local
 dev on macOS, or a container run without a memory limit), the watchdog
 stays inert rather than guessing.
+
+Cloud Run's sandbox does not expose ``/sys/fs/cgroup`` at all (see
+``modules/scaling/publisher.py`` for the confirmed detail), so cgroup
+auto-detection always returns ``None`` there — the RSS reading itself
+still works (``/proc/self/status`` is present), only the budget to compare
+it against is missing. ``build_memory_watchdog_service`` runs at lifespan
+start, before the platform config store is reachable, so a ``limit_mb``
+set later via per-env deploy config would never be picked up if it were
+resolved only once at build time. To make that per-env value actually
+take effect on Cloud Run, the effective ``limit_mb`` is instead resolved
+lazily on the service's first ``tick()`` (by which point the config store
+is up — the watchdog's own default 15s cadence already comfortably clears
+that window) and cached from then on: explicit ``limit_mb`` wins, else
+cgroup auto-detection (GKE / local dev), else the watchdog stays inert
+for the RSS-vs-budget comparison, logging that once.
+
+Lever B — readiness-shed + graceful self-recycle (geoid#2946, #2924)
+----------------------------------------------------------------------
+An OOM kill is a bare ``SIGKILL`` — no drain, no lifespan shutdown, DB
+sessions and locks leaked (#2924), in-flight requests dropped (#2946). This
+watchdog can pre-empt that: when RSS crosses ``recycle_ratio`` of the
+budget, it sets the process-global draining flag
+(``tools/serving_state.py``) and sends itself ``SIGTERM`` — which the
+``DrainAwareUvicornWorker`` gunicorn worker class DOES turn into a bounded
+drain (see ``scripts/gunicorn_worker.py`` / ``scripts/start.sh``), running
+ASGI lifespan shutdown and releasing DB-side resources before the process
+exits. The draining flag also makes ``/ready`` report unhealthy and, when
+``readiness_shed_enabled`` is on, makes the app-level shed middleware
+answer new requests 503 — Cloud Run itself has no readiness gate, so that
+middleware is the only lever that actually steers new traffic away from a
+draining worker before its SIGTERM lands.
+
+Every self-recycle behavior is gated by its own ``Mutable`` config field —
+default OFF everywhere — with a minimum uptime, a cooldown, and a
+per-worker random jitter so a fleet of workers crossing the threshold
+together does not recycle in lockstep (each worker recycles itself only,
+never anything instance- or fleet-wide).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
+import random
+import signal
+import time
 from typing import Callable, ClassVar, Optional, Tuple
 
 from pydantic import Field, model_validator
@@ -62,6 +104,7 @@ from dynastore.tools.background_service import (
     PodPolicy,
     ServiceContext,
 )
+from dynastore.tools.serving_state import clear_draining, set_draining
 
 logger = logging.getLogger(__name__)
 
@@ -117,17 +160,23 @@ class MemoryWatchdogService(PeriodicService):
     def __init__(
         self,
         *,
-        limit_bytes: int,
+        limit_bytes: Optional[int] = None,
         warn_ratio: float = 0.80,
         critical_ratio: float = 0.90,
         cadence_seconds: float = 15.0,
         get_rss_bytes: Callable[[], Optional[int]] = read_process_rss_bytes,
     ) -> None:
-        if limit_bytes <= 0:
+        if limit_bytes is not None and limit_bytes <= 0:
             raise ValueError("limit_bytes must be positive")
         if not 0 < warn_ratio < critical_ratio <= 1:
             raise ValueError("require 0 < warn_ratio < critical_ratio <= 1")
+        # None means "not yet resolved" — resolved lazily on the first tick()
+        # (see _resolve_limit_bytes_once) rather than here, so a limit_mb set
+        # later via deploy config still takes effect once the platform config
+        # store is reachable. Explicitly passing a limit_bytes (as every
+        # tick()-focused unit test below does) marks it resolved immediately.
         self._limit_bytes = limit_bytes
+        self._limit_resolved = limit_bytes is not None
         self._warn_ratio = warn_ratio
         self._critical_ratio = critical_ratio
         self.cadence_seconds = cadence_seconds
@@ -137,10 +186,46 @@ class MemoryWatchdogService(PeriodicService):
         # logs; the CRITICAL transition always logs since it is the
         # actionable, monitored signal this service exists to raise.
         self._warned = False
+        # Lever B (self-recycle) bookkeeping — see _maybe_self_recycle. The
+        # recycle knobs themselves are never cached: they are read fresh
+        # from config on every tick (they are the hot-reload kill-switches),
+        # unlike _limit_bytes above which resolves once and is cached.
+        self._started_at = time.monotonic()
+        self._last_recycle_attempt: Optional[float] = None
+
+    async def _resolve_limit_bytes_once(
+        self, config: "MemoryWatchdogConfig", ctx: ServiceContext
+    ) -> None:
+        """Resolve ``self._limit_bytes`` exactly once, on the first tick.
+
+        Priority: explicit ``config.limit_mb`` wins, else cgroup
+        auto-detection, else stays ``None`` (inert) — logged once, not
+        retried on later ticks even if config changes afterwards.
+        """
+        self._limit_resolved = True
+        limit_mb = (
+            config.limit_mb
+            if config.limit_mb is not None
+            else detect_cgroup_memory_limit_mb()
+        )
+        if limit_mb is None:
+            logger.warning(
+                "memory_watchdog: no limit_mb configured and cgroup "
+                "auto-detection found none (or reported unlimited) on %s — "
+                "watchdog stays inert (no RSS budget to compare against).",
+                ctx.name,
+            )
+            return
+        self._limit_bytes = limit_mb * 1024 * 1024
 
     async def tick(self, ctx: ServiceContext) -> None:
+        config = await load_memory_watchdog_config()
+
+        if not self._limit_resolved:
+            await self._resolve_limit_bytes_once(config, ctx)
+
         rss_bytes = self._get_rss_bytes()
-        if rss_bytes is None:
+        if rss_bytes is None or self._limit_bytes is None:
             return
         ratio = rss_bytes / self._limit_bytes
         if ratio >= self._critical_ratio:
@@ -169,6 +254,64 @@ class MemoryWatchdogService(PeriodicService):
                 self._warned = True
         else:
             self._warned = False
+
+        await self._maybe_self_recycle(ctx, config, ratio)
+
+    async def _maybe_self_recycle(
+        self, ctx: ServiceContext, config: "MemoryWatchdogConfig", ratio: float
+    ) -> None:
+        """Pre-empt an OOM kill by gracefully recycling THIS worker (Lever B).
+
+        Guardrails, all non-negotiable: default-off (``self_recycle_enabled``
+        is the live kill-switch); a minimum uptime so a just-booted worker is
+        never recycled; a cooldown between attempts; and a per-worker random
+        jitter, re-checking the ratio afterwards, so a fleet of workers
+        crossing the threshold together does not all recycle in lockstep and
+        a transient spike does not trigger an unnecessary recycle.
+        """
+        if not config.self_recycle_enabled or ratio < config.recycle_ratio:
+            return
+
+        now = time.monotonic()
+        uptime = now - self._started_at
+        if uptime < config.recycle_min_uptime_seconds:
+            return
+        if (
+            self._last_recycle_attempt is not None
+            and now - self._last_recycle_attempt < config.recycle_cooldown_seconds
+        ):
+            return
+
+        self._last_recycle_attempt = now
+        set_draining()
+
+        jitter = random.uniform(0, config.recycle_jitter_seconds)
+        if jitter > 0:
+            await asyncio.sleep(jitter)
+
+        # Re-check after the jitter delay: a transient spike that has
+        # already subsided by now should not trigger a recycle.
+        rss_bytes = self._get_rss_bytes()
+        if rss_bytes is None or self._limit_bytes is None:
+            clear_draining()
+            return
+        recheck_ratio = rss_bytes / self._limit_bytes
+        if recheck_ratio < config.recycle_ratio:
+            logger.info(
+                "memory_watchdog: self-recycle aborted after %.1fs jitter — "
+                "RSS dropped to %.0f%% (< recycle threshold %.0f%%) on %s.",
+                jitter, recheck_ratio * 100, config.recycle_ratio * 100, ctx.name,
+            )
+            clear_draining()
+            return
+
+        pid = os.getpid()
+        logger.warning(
+            "self-recycle: RSS %.0f%%>=%.0f%%, SIGTERM worker pid %d to "
+            "drain before OOM (uptime=%.0fs) on %s.",
+            recheck_ratio * 100, config.recycle_ratio * 100, pid, uptime, ctx.name,
+        )
+        os.kill(pid, signal.SIGTERM)
 
 
 class MemoryWatchdogConfig(PluginConfig):
@@ -218,12 +361,92 @@ class MemoryWatchdogConfig(PluginConfig):
         description="How often (seconds) the watchdog polls this process's RSS.",
     )
 
+    readiness_shed_enabled: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "Kill-switch for the app-level request-shedding middleware "
+            "(Lever B). While a worker is draining (see self_recycle_enabled) "
+            "AND this is True, ordinary requests get 503 + Retry-After instead "
+            "of reaching the app — the actual traffic-steering lever on Cloud "
+            "Run, which exposes no readiness gate of its own. Defaults to "
+            "False: enabling self-recycle without this only stops the worker "
+            "from reporting itself /ready; new requests can still land on it "
+            "during the drain window. Read live on every request while "
+            "draining."
+        ),
+    )
+
+    self_recycle_enabled: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "Kill-switch for graceful self-recycle (Lever B): when RSS "
+            "crosses recycle_ratio, this worker sets the draining flag and "
+            "sends itself SIGTERM (drained by DrainAwareUvicornWorker) instead "
+            "of waiting for the platform's SIGKILL, which skips any drain "
+            "entirely. Defaults to False. Read live on every tick."
+        ),
+    )
+
+    recycle_ratio: Mutable[float] = Field(
+        default=0.92,
+        gt=0,
+        lt=1,
+        description=(
+            "Ratio of limit_mb at which a self-recycle is triggered (subject "
+            "to recycle_min_uptime_seconds and recycle_cooldown_seconds). MUST "
+            "be strictly greater than critical_ratio and less than 1 (enforced "
+            "by a validator) — recycling must never trigger before the "
+            "critical warning it follows. Read live on every tick."
+        ),
+    )
+
+    recycle_min_uptime_seconds: Mutable[float] = Field(
+        default=120.0,
+        ge=0,
+        description=(
+            "Minimum worker uptime before a self-recycle is even considered — "
+            "guards against recycling a worker that has barely finished "
+            "booting. Read live on every tick."
+        ),
+    )
+
+    recycle_cooldown_seconds: Mutable[float] = Field(
+        default=300.0,
+        ge=0,
+        description=(
+            "Minimum time between two self-recycle attempts by this worker. "
+            "Read live on every tick."
+        ),
+    )
+
+    recycle_jitter_seconds: Mutable[float] = Field(
+        default=10.0,
+        ge=0,
+        description=(
+            "Upper bound of a random per-worker delay (seconds) applied "
+            "between deciding to recycle and actually sending SIGTERM, so a "
+            "fleet of workers crossing recycle_ratio together does not all "
+            "recycle in lockstep. The ratio is re-checked after the delay; a "
+            "transient spike that has already subsided aborts the recycle. "
+            "Read live on every tick."
+        ),
+    )
+
     @model_validator(mode="after")
     def _warn_below_critical(self) -> "MemoryWatchdogConfig":
         if not 0 < self.warn_ratio < self.critical_ratio <= 1:
             raise ValueError(
                 "MemoryWatchdogConfig: require 0 < warn_ratio < critical_ratio <= 1 "
                 f"(got warn_ratio={self.warn_ratio}, critical_ratio={self.critical_ratio})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _recycle_ratio_above_critical(self) -> "MemoryWatchdogConfig":
+        if not self.critical_ratio < self.recycle_ratio < 1:
+            raise ValueError(
+                "MemoryWatchdogConfig: require critical_ratio < recycle_ratio < 1 "
+                f"(got critical_ratio={self.critical_ratio}, recycle_ratio={self.recycle_ratio})"
             )
         return self
 
@@ -296,10 +519,15 @@ async def build_memory_watchdog_service(
     """Build a :class:`MemoryWatchdogService` from :class:`MemoryWatchdogConfig`.
 
     Loads the config from the platform config store when *config* is not
-    supplied. Returns ``None`` (watchdog inert) when disabled via config, or
-    when no memory budget could be resolved — ``limit_mb`` unset and cgroup
-    auto-detection found no bounded limit (e.g. local dev without a memory
-    cgroup).
+    supplied. Returns ``None`` (watchdog inert) only when disabled via
+    config — never merely because a memory budget could not yet be
+    resolved. This runs at lifespan start, before the platform config store
+    is reachable, so resolving ``limit_mb`` here would permanently lock in
+    "no limit" for any environment (Cloud Run above all — see the module
+    docstring) where the operative value is only set later via deploy
+    config. The effective ``limit_mb`` (explicit config, else cgroup
+    auto-detection, else inert) is instead resolved lazily on the service's
+    first ``tick()``, by which point the config store is reachable.
     """
     if config is None:
         config = await load_memory_watchdog_config()
@@ -307,17 +535,11 @@ async def build_memory_watchdog_service(
         logger.debug("memory_watchdog: disabled via config — skipping.")
         return None
 
-    limit_mb = config.limit_mb if config.limit_mb is not None else detect_cgroup_memory_limit_mb()
-    if limit_mb is None:
-        logger.debug(
-            "memory_watchdog: no limit_mb configured and cgroup "
-            "auto-detection found none (or reported unlimited) — watchdog "
-            "stays inert.",
-        )
-        return None
-
+    limit_bytes = (
+        config.limit_mb * 1024 * 1024 if config.limit_mb is not None else None
+    )
     return MemoryWatchdogService(
-        limit_bytes=limit_mb * 1024 * 1024,
+        limit_bytes=limit_bytes,
         warn_ratio=config.warn_ratio,
         critical_ratio=config.critical_ratio,
         cadence_seconds=config.cadence_seconds,

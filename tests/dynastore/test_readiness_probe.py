@@ -181,3 +181,29 @@ async def test_ready_200_all_deps_ok():
     assert body["status"] == "ready"
     assert body["dependencies"]["postgres"]["status"] == "ok"
     assert body["dependencies"]["elasticsearch"]["status"] == "ok"
+
+
+# ── Draining flag (Lever B self-recycle) ──────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_ready_503_when_draining():
+    """/ready reports 503 when this worker has flagged itself as draining,
+    regardless of every other dependency being healthy — unconditional, not
+    gated by any config flag (unlike the readiness-shed middleware)."""
+    from dynastore.tools.serving_state import clear_draining, set_draining
+
+    set_draining()
+    try:
+        with (
+            patch("dynastore.main.get_protocol", return_value=None),
+            patch("dynastore.modules.elasticsearch.client.get_client", return_value=None),
+            patch("dynastore.tools.cache_valkey._CACHE_DEPS_OK", False),
+        ):
+            resp = await _call_readiness()
+    finally:
+        clear_draining()
+
+    assert resp.status_code == 503
+    import json
+    body = json.loads(resp.body)
+    assert body["dependencies"]["draining"]["status"] == "failed"
