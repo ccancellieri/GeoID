@@ -44,7 +44,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.ogc_base import OGCServiceMixin, OGCTransactionMixin
-from dynastore.extensions.web.decorators import expose_web_page, expose_static
+from dynastore.extensions.web.decorators import expose_web_page
 from dynastore.extensions.tools.db import (
     get_async_connection,
     get_async_connection_bounded,
@@ -136,6 +136,11 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
     prefix = "/records"
     protocol_title = "DynaStore OGC API - Records"
     protocol_description = "Access to catalog records via OGC API - Records"
+    landing_response_model = rm.LandingPage
+
+    # StaticPageMixin (folded into OGCServiceMixin) class attributes
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    static_prefix = "records"
 
     def __init__(self, app: Optional[FastAPI] = None):
         super().__init__()
@@ -152,34 +157,9 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         # Policies declared via PolicyContributor; IAM forwards centrally.
         yield
 
-    def get_notebooks(self):
-        try:
-            from .notebooks import build_contributions
-        except Exception:
-            return []
-        return build_contributions()
-
-    # ------------------------------------------------------------------
-    # Web page contribution (WebPageContributor / StaticAssetProvider)
-    # ------------------------------------------------------------------
-
-    def get_web_pages(self):
-        from dynastore.extensions.tools.web_collect import collect_web_pages
-        return collect_web_pages(self)
-
-    def get_static_assets(self):
-        from dynastore.extensions.tools.web_collect import collect_static_assets
-        return collect_static_assets(self)
-
-    @expose_static("records")
-    def provide_static_files(self) -> list[str]:
-        """Exposes the internal static directory for the Records browser."""
-        static_dir = os.path.join(os.path.dirname(__file__), "static")
-        files = []
-        for root, _, filenames in os.walk(static_dir):
-            for filename in filenames:
-                files.append(os.path.join(root, filename))
-        return files
+    # get_web_pages / get_static_assets / get_notebooks / provide_static_files /
+    # _serve_page_template are provided by OGCServiceMixin (static_dir /
+    # static_prefix above opt this service into the default wiring).
 
     @expose_web_page(
         page_id="records_browser",
@@ -189,14 +169,6 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
     )
     async def provide_records_browser(self, request: Request):
         return await self._serve_page_template("records_browser.html")
-
-    async def _serve_page_template(self, filename: str):
-        from dynastore._version import VERSION
-        file_path = os.path.join(os.path.dirname(__file__), "static", filename)
-        if not os.path.exists(file_path):
-            return Response(content=f"Template {filename} not found", status_code=404)
-        with open(file_path, "r", encoding="utf-8") as f:
-            return Response(content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html")
 
     # ------------------------------------------------------------------
     # Route registration
@@ -213,10 +185,8 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         # unchanged for existing consumers, but every self/collection link
         # now resolves to this canonical shape regardless of which route was
         # used to reach it (see ``records_generator._records_collection_url``).
+        self.register_ogc_standard_routes()
         route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
-            # Landing page & conformance
-            ("/", "get_landing_page", ["GET"], {"response_model": rm.LandingPage}),
-            ("/conformance", "get_conformance", ["GET"], {"response_model": rm.Conformance}),
             # Catalog listing (drives the web browser's top-level navigation)
             (
                 "/catalogs",
@@ -314,17 +284,8 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         for path, handler_name, methods, kwargs in route_table:
             self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
-    # ------------------------------------------------------------------
-    # Landing page & conformance (delegated to OGCServiceMixin)
-    # ------------------------------------------------------------------
-
-    async def get_landing_page(
-        self, request: Request, language: str = Depends(get_language)
-    ) -> JSONResponse:
-        return await self.ogc_landing_page_handler(request, language=language)
-
-    async def get_conformance(self, request: Request) -> rm.Conformance:
-        return await self.ogc_conformance_handler(request)
+    # Landing page & conformance are delegated to OGCServiceMixin via
+    # register_ogc_standard_routes (see _register_routes).
 
     # ------------------------------------------------------------------
     # Collections (filtered to RECORDS type)

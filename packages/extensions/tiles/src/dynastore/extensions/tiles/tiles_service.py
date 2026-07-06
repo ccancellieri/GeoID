@@ -42,9 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from dynastore.extensions import protocols
 from dynastore.extensions.ogc_base import OGCServiceMixin
-from dynastore.extensions.tools.fast_api import AppJSONResponse as JSONResponse
-from dynastore.extensions.tools.language_utils import get_language
-from dynastore.extensions.tools.ogc_common_models import Conformance, LandingPage
+from dynastore.extensions.tools.ogc_common_models import LandingPage
 from dynastore.tools.discovery import get_protocol
 from dynastore.models.protocols.configs import ConfigsProtocol
 from dynastore.models.protocols.web import WebModuleProtocol, StaticFilesProtocol
@@ -178,6 +176,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         "Vector tile generation (MVT) backed by PostGIS and raster map tiles "
         "(dataType=map) rendered from COG assets via rio-tiler"
     )
+    landing_response_model = LandingPage
     router: APIRouter
 
     # Bounded background writer draining interactive tile-cache writes
@@ -232,25 +231,9 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         )
 
     def _register_routes(self):
+        self.register_ogc_standard_routes()
         col = "/catalogs/{catalog_id}/collections/{collection_id}"
         route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
-            # OGC API Common: landing + conformance (delegated to OGCServiceMixin)
-            (
-                "/", "get_landing_page", ["GET"],
-                {
-                    "response_model": LandingPage,
-                    "summary": "OGC API - Tiles landing page",
-                    "name": "get_tiles_landing_page",
-                },
-            ),
-            (
-                "/conformance", "get_conformance", ["GET"],
-                {
-                    "response_model": Conformance,
-                    "summary": "OGC API - Tiles conformance",
-                    "name": "get_tiles_conformance",
-                },
-            ),
             # Tile Matrix Sets (server-level, untouched)
             (
                 "/tileMatrixSets", "get_tile_matrix_sets", ["GET"],
@@ -531,15 +514,8 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 media_type="text/html",
             )
 
-    # --- OGC API Common (delegated to OGCServiceMixin) ---
-
-    async def get_landing_page(
-        self, request: Request, language: str = Depends(get_language)
-    ) -> JSONResponse:
-        return await self.ogc_landing_page_handler(request, language=language)
-
-    async def get_conformance(self, request: Request) -> Conformance:
-        return await self.ogc_conformance_handler(request)
+    # OGC API Common (landing/conformance) delegated to OGCServiceMixin via
+    # register_ogc_standard_routes; see _register_routes.
 
     # --- Tile Matrix Sets Endpoints ---
 

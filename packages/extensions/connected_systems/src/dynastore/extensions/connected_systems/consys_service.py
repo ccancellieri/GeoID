@@ -27,7 +27,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any, FrozenSet, List, Optional, Tuple
 
-from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request
+from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection
 from starlette import status
@@ -35,8 +35,6 @@ from starlette import status
 from dynastore.extensions import protocols
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.tools.db import get_async_connection, get_async_engine
-from dynastore.extensions.tools.fast_api import AppJSONResponse as JSONResponse
-from dynastore.extensions.tools.language_utils import get_language
 from dynastore.extensions.tools.query import parse_hints_param
 from dynastore.models.protocols import ConnectedSystemsProtocol
 from dynastore.modules.connected_systems import db as consys_db
@@ -112,9 +110,8 @@ class ConnectedSystemsService(
     # ------------------------------------------------------------------
 
     def _register_routes(self) -> None:
+        self.register_ogc_standard_routes()
         route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
-            ("/", "get_landing_page", ["GET"], {}),
-            ("/conformance", "get_conformance", ["GET"], {}),
             # Systems
             (
                 "/systems",
@@ -223,17 +220,7 @@ class ConnectedSystemsService(
         for path, handler_name, methods, kwargs in route_table:
             self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
-    # ------------------------------------------------------------------
-    # Standard OGC endpoints
-    # ------------------------------------------------------------------
-
-    async def get_landing_page(
-        self, request: Request, language: str = Depends(get_language)
-    ) -> JSONResponse:
-        return await self.ogc_landing_page_handler(request, language=language)
-
-    async def get_conformance(self, request: Request):
-        return await self.ogc_conformance_handler(request)
+    # Standard OGC endpoints (delegated to OGCServiceMixin via register_ogc_standard_routes)
 
     # ------------------------------------------------------------------
     # Systems

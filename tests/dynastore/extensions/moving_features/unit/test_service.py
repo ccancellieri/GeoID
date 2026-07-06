@@ -127,7 +127,7 @@ async def test_landing_page_contains_self_link(monkeypatch):
     )
     svc = _build_service()
     req = _make_request()
-    resp = await svc.get_landing_page(req, language="en")
+    resp = await svc.ogc_landing_page_handler(req, language="en")
     body = _json.loads(resp.body)
     hrefs = [lnk["href"] for lnk in body["links"]]
     assert any("self" in lnk["rel"] for lnk in body["links"])
@@ -143,7 +143,7 @@ async def test_landing_page_contains_conformance_link(monkeypatch):
     )
     svc = _build_service()
     req = _make_request()
-    resp = await svc.get_landing_page(req, language="en")
+    resp = await svc.ogc_landing_page_handler(req, language="en")
     body = _json.loads(resp.body)
     assert any("conformance" in lnk["rel"] for lnk in body["links"])
 
@@ -152,7 +152,7 @@ async def test_landing_page_contains_conformance_link(monkeypatch):
 async def test_conformance_returns_uris():
     svc = _build_service()
     req = _make_request()
-    conf = await svc.get_conformance(req)
+    conf = await svc.ogc_conformance_handler(req)
     assert set(OGC_API_MOVING_FEATURES_URIS).issubset(set(conf.conformsTo))
 
 

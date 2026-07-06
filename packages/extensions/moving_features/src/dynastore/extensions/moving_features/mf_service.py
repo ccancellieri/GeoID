@@ -32,15 +32,13 @@ from datetime import datetime
 from typing import Any, FrozenSet, List, Optional
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncConnection
 from starlette import status
 
 from dynastore.extensions import protocols
 from dynastore.extensions.ogc_base import OGCServiceMixin
-from dynastore.extensions.tools.fast_api import AppJSONResponse as _AppJSONResponse
-from dynastore.extensions.tools.language_utils import get_language
-from dynastore.extensions.web.decorators import expose_web_page, expose_static
+from dynastore.extensions.web.decorators import expose_web_page
 from dynastore.extensions.tools.db import get_async_connection, get_async_engine
 from dynastore.extensions.tools.query import parse_hints_param
 from dynastore.models.protocols import MovingFeaturesProtocol
@@ -84,6 +82,10 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
     protocol_title = "DynaStore OGC API - Moving Features"
     protocol_description = "Temporal tracking of moving objects via OGC API - Moving Features"
 
+    # StaticPageMixin (folded into OGCServiceMixin) class attributes
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    static_prefix = "movingfeatures"
+
     def __init__(self, app: Optional[FastAPI] = None):
         super().__init__()
         self.app = app
@@ -107,9 +109,8 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
     def _register_routes(self) -> None:
         col = "/catalogs/{catalog_id}/collections/{collection_id}"
 
+        self.register_ogc_standard_routes()
         route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
-            ("/", "get_landing_page", ["GET"], {}),
-            ("/conformance", "get_conformance", ["GET"], {}),
             (
                 "/catalogs",
                 "list_catalogs",
@@ -203,17 +204,8 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
         for path, handler_name, methods, kwargs in route_table:
             self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
 
-    # ------------------------------------------------------------------
-    # Standard OGC endpoints
-    # ------------------------------------------------------------------
-
-    async def get_landing_page(
-        self, request: Request, language: str = Depends(get_language)
-    ) -> _AppJSONResponse:
-        return await self.ogc_landing_page_handler(request, language=language)
-
-    async def get_conformance(self, request: Request):
-        return await self.ogc_conformance_handler(request)
+    # Standard OGC endpoints (landing/conformance delegated to OGCServiceMixin
+    # via register_ogc_standard_routes; see _register_routes).
 
     async def list_catalogs(
         self,
@@ -650,34 +642,9 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
             raise HTTPException(status_code=500, detail="Failed to update temporal geometry sequence.")
         return updated.model_copy(update={"catalog_id": catalog_id})
 
-    # ------------------------------------------------------------------
-    # Web page contribution (WebPageContributor / StaticAssetProvider)
-    # ------------------------------------------------------------------
-
-    def get_web_pages(self):
-        from dynastore.extensions.tools.web_collect import collect_web_pages
-        return collect_web_pages(self)
-
-    def get_static_assets(self):
-        from dynastore.extensions.tools.web_collect import collect_static_assets
-        return collect_static_assets(self)
-
-    def get_notebooks(self):
-        try:
-            from .notebooks import build_contributions
-        except Exception:
-            return []
-        return build_contributions()
-
-    @expose_static("movingfeatures")
-    def provide_static_files(self) -> list[str]:
-        """Exposes the internal static directory for the MovingFeatures browser."""
-        static_dir = os.path.join(os.path.dirname(__file__), "static")
-        files = []
-        for root, _, filenames in os.walk(static_dir):
-            for filename in filenames:
-                files.append(os.path.join(root, filename))
-        return files
+    # get_web_pages / get_static_assets / get_notebooks / provide_static_files /
+    # _serve_page_template are provided by OGCServiceMixin (static_dir /
+    # static_prefix above opt this service into the default wiring).
 
     @expose_web_page(
         page_id="movingfeatures_browser",
@@ -687,11 +654,3 @@ class MovingFeaturesService(protocols.ExtensionProtocol, OGCServiceMixin, Moving
     )
     async def provide_movingfeatures_browser(self, request: Request):
         return await self._serve_page_template("movingfeatures_browser.html")
-
-    async def _serve_page_template(self, filename: str):
-        from dynastore._version import VERSION
-        file_path = os.path.join(os.path.dirname(__file__), "static", filename)
-        if not os.path.exists(file_path):
-            return Response(content=f"Template {filename} not found", status_code=404)
-        with open(file_path, "r", encoding="utf-8") as f:
-            return Response(content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html")

@@ -64,7 +64,7 @@ from dynastore.extensions.volumes.volumes_models import (
     _bbox_intersects,
     _parse_bbox,
 )
-from dynastore.extensions.web.decorators import expose_static, expose_web_page
+from dynastore.extensions.web.decorators import expose_web_page
 from dynastore.models.protocols.bounds_source import (
     BoundsSourceProtocol,
     EmptyBoundsSource,
@@ -110,6 +110,10 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
     protocol_title = "DynaStore OGC API - 3D GeoVolumes"
     protocol_description = "Access to 3D tile data via OGC API - 3D GeoVolumes"
 
+    # StaticPageMixin (folded into OGCServiceMixin) class attributes
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    static_prefix = "volumes"
+
     def __init__(self, app: Optional[FastAPI] = None):
         super().__init__()
         self.app = app
@@ -131,21 +135,9 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
             logger.warning("volumes: could not register sidecar bounds source: %s", exc)
         yield
 
-    async def get_conformance(self, request: Request):
-        return await self.ogc_conformance_handler(request)
-
-    async def get_landing_page(self, request: Request):
-        return await self.ogc_landing_page_handler(request)
-
     def _register_routes(self) -> None:
+        self.register_ogc_standard_routes()
         route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
-            ("/", "get_landing_page", ["GET"], {"summary": "OGC API - 3D GeoVolumes landing page"}),
-            (
-                "/conformance",
-                "get_conformance",
-                ["GET"],
-                {"summary": "OGC API - 3D GeoVolumes conformance"},
-            ),
             (
                 "/catalogs/{catalog_id}/collections/{collection_id}/3dtiles/tileset.json",
                 "get_tileset_json",
@@ -406,32 +398,9 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
     # ------------------------------------------------------------------
     # Web page contributions (globe browser)
     # ------------------------------------------------------------------
-
-    def get_web_pages(self):
-        from dynastore.extensions.tools.web_collect import collect_web_pages
-        return collect_web_pages(self)
-
-    def get_static_assets(self):
-        from dynastore.extensions.tools.web_collect import collect_static_assets
-        return collect_static_assets(self)
-
-    def get_notebooks(self):
-        try:
-            from .notebooks import build_contributions
-        except Exception:
-            return []
-        return build_contributions()
-
-    @expose_static("volumes")
-    def provide_static_files(self) -> list:
-        """Exposes the static directory for the GeoVolumes globe browser."""
-        static_dir = os.path.join(os.path.dirname(__file__), "static")
-        files = []
-        if os.path.isdir(static_dir):
-            for root, _, filenames in os.walk(static_dir):
-                for filename in filenames:
-                    files.append(os.path.join(root, filename))
-        return files
+    # get_web_pages / get_static_assets / get_notebooks / provide_static_files /
+    # _serve_page_template are provided by OGCServiceMixin (static_dir /
+    # static_prefix above opt this service into the default wiring).
 
     @expose_web_page(
         page_id="volumes_browser",
@@ -445,18 +414,6 @@ class VolumesService(ExtensionProtocol, OGCServiceMixin):
     )
     async def provide_volumes_browser(self, request: Request):
         return await self._serve_page_template("volumes_browser.html")
-
-    async def _serve_page_template(self, filename: str):
-        from dynastore._version import VERSION
-
-        file_path = os.path.join(os.path.dirname(__file__), "static", filename)
-        if not os.path.exists(file_path):
-            return Response(content=f"Template {filename} not found", status_code=404)
-        with open(file_path, "r", encoding="utf-8") as f:
-            return Response(
-                content=f.read().replace("{{VERSION}}", VERSION),
-                media_type="text/html",
-            )
 
     # ------------------------------------------------------------------
     # Internals — tileset pipeline

@@ -69,7 +69,7 @@ from dynastore.extensions.tools.response_i18n import (  # noqa: E402
 )
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.ogc_base import OGCServiceMixin, OGCTransactionMixin
-from dynastore.extensions.web.decorators import expose_web_page, expose_static
+from dynastore.extensions.web.decorators import expose_web_page
 from dynastore.extensions.tools.db import (
     get_async_connection,
     get_async_connection_bounded,
@@ -165,6 +165,11 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         "OGC API Features (Parts 1-4) with CQL2 filtering, multi-CRS support, "
         "queryables, sorting, and full CRUD transactions."
     )
+    landing_response_model = ogc_models.LandingPage
+
+    # StaticPageMixin (folded into OGCServiceMixin) class attributes
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    static_prefix = "features"
 
     def configure_app(self, app: FastAPI):
         """Early configuration for the Features extension."""
@@ -196,9 +201,8 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
 
     def _register_routes(self):
         """Registers all OGC API Features routes."""
+        self.register_ogc_standard_routes()
         route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
-            ("/", "get_landing_page", ["GET"], {"response_model": ogc_models.LandingPage}),
-            ("/conformance", "get_conformance", ["GET"], {"response_model": ogc_models.Conformance}),
             ("/functions", "get_supported_functions", ["GET"], {"response_model": FunctionsResponse}),
             # --- Catalog Endpoints ---
             ("/catalogs", "list_catalogs", ["GET"], {"response_model": ogc_models.Catalogs}),
@@ -276,16 +280,8 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
         logger.info("OGCFeaturesService: policies registered.")
         yield
 
-    # NotebookContributorProtocol — opt-in surface picked up by
-    # NotebooksModule via discovery. Returning an empty list when
-    # NotebookContribution can't be imported keeps the extension
-    # usable in SCOPEs that don't load the notebooks module.
-    def get_notebooks(self):
-        try:
-            from .notebooks import build_contributions
-        except Exception:
-            return []
-        return build_contributions()
+    # get_notebooks is provided by OGCServiceMixin (delegates to
+    # dynastore.extensions.features.notebooks.build_contributions).
 
     async def _resolve_crs_srid(
         self, conn: DbResource, catalog_id: str, crs_uri: Optional[str]
@@ -324,15 +320,19 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
 
         return await resolve_queryable_property_names(catalog_id, collection_id)
 
-    async def get_landing_page(
+    async def ogc_landing_page_handler(
         self, request: Request, language: str = Depends(get_language)
-    ):
+    ) -> JSONResponse:
+        """Features landing page: overrides OGCServiceMixin's generic landing page.
+
+        ``ogc_generator.create_landing_page`` adds an extra ``rel=catalogs``
+        link to ``/features/catalogs`` that no other OGC extension exposes,
+        so Features keeps its own body rather than the mixin default.
+        """
         landing_page = ogc_generator.create_landing_page(request, language=language)
         return JSONResponse(content=localize_model(landing_page, language))
 
-    async def get_conformance(self, request: Request):
-        """Returns the list of conformance classes (Part 1)."""
-        return await self.ogc_conformance_handler(request)
+    # get_conformance is delegated to OGCServiceMixin via register_ogc_standard_routes.
 
     # --- Catalog Endpoints ---
     async def list_catalogs(
@@ -1238,27 +1238,9 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
                 caller_id=self._principal_caller_id(request),
             )
 
-    # ------------------------------------------------------------------
-    # Web page contribution (WebPageContributor / StaticAssetProvider)
-    # ------------------------------------------------------------------
-
-    def get_web_pages(self):
-        from dynastore.extensions.tools.web_collect import collect_web_pages
-        return collect_web_pages(self)
-
-    def get_static_assets(self):
-        from dynastore.extensions.tools.web_collect import collect_static_assets
-        return collect_static_assets(self)
-
-    @expose_static("features")
-    def provide_static_files(self) -> list:
-        """Exposes the internal static directory for the Features browser."""
-        static_dir = os.path.join(os.path.dirname(__file__), "static")
-        files = []
-        for root, _, filenames in os.walk(static_dir):
-            for filename in filenames:
-                files.append(os.path.join(root, filename))
-        return files
+    # get_web_pages / get_static_assets / get_notebooks / provide_static_files /
+    # _serve_page_template are provided by OGCServiceMixin (static_dir /
+    # static_prefix above opt this service into the default wiring).
 
     @expose_web_page(
         page_id="features_browser",
@@ -1272,11 +1254,3 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
     )
     async def provide_features_browser(self, request: Request):
         return await self._serve_page_template("features_browser.html")
-
-    async def _serve_page_template(self, filename: str):
-        from dynastore._version import VERSION
-        file_path = os.path.join(os.path.dirname(__file__), "static", filename)
-        if not os.path.exists(file_path):
-            return Response(content=f"Template {filename} not found", status_code=404)
-        with open(file_path, "r", encoding="utf-8") as f:
-            return Response(content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html")

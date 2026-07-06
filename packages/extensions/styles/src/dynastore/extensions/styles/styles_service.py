@@ -34,7 +34,7 @@ import json as _json
 import logging
 import os  # noqa: E402
 from contextlib import asynccontextmanager
-from typing import Any, FrozenSet, List, Optional
+from typing import Any, FrozenSet, Optional
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -44,9 +44,7 @@ from starlette import status
 
 from dynastore.extensions import protocols
 from dynastore.extensions.ogc_base import OGCServiceMixin
-from dynastore.extensions.tools.fast_api import AppJSONResponse as _AppJSONResponse
-from dynastore.extensions.tools.language_utils import get_language
-from dynastore.extensions.web.decorators import expose_web_page, expose_static  # noqa: E402
+from dynastore.extensions.web.decorators import expose_web_page  # noqa: E402
 from dynastore.extensions.tools.db import get_async_connection, get_async_engine
 from dynastore.extensions.tools.url import get_root_url
 from dynastore.models.protocols import StylesProtocol
@@ -137,6 +135,10 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
     protocol_title = "DynaStore OGC API - Styles"
     protocol_description = "Style management and retrieval via OGC API - Styles"
 
+    # StaticPageMixin (folded into OGCServiceMixin) class attributes
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    static_prefix = "styles"
+
     def __init__(self, app: Optional[FastAPI] = None):
         super().__init__()
         self.app = app
@@ -153,34 +155,9 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         yield
         logger.info("StylesService: stopped.")
 
-    # ------------------------------------------------------------------
-    # Web page contribution (WebPageContributor / StaticAssetProvider)
-    # ------------------------------------------------------------------
-
-    def get_web_pages(self):
-        from dynastore.extensions.tools.web_collect import collect_web_pages
-        return collect_web_pages(self)
-
-    def get_static_assets(self):
-        from dynastore.extensions.tools.web_collect import collect_static_assets
-        return collect_static_assets(self)
-
-    def get_notebooks(self):
-        try:
-            from .notebooks import build_contributions
-        except Exception:
-            return []
-        return build_contributions()
-
-    @expose_static("styles")
-    def provide_static_files(self) -> List[str]:
-        """Exposes the internal static directory for the Styles browser."""
-        static_dir = os.path.join(os.path.dirname(__file__), "static")
-        files = []
-        for root, _, filenames in os.walk(static_dir):
-            for filename in filenames:
-                files.append(os.path.join(root, filename))
-        return files
+    # get_web_pages / get_static_assets / get_notebooks / provide_static_files /
+    # _serve_page_template are provided by OGCServiceMixin (static_dir /
+    # static_prefix above opt this service into the default wiring).
 
     @expose_web_page(
         page_id="styles_browser",
@@ -191,25 +168,15 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
     async def provide_styles_browser(self, request: Request):
         return await self._serve_page_template("styles_browser.html")
 
-    async def _serve_page_template(self, filename: str):
-        from dynastore._version import VERSION
-        file_path = os.path.join(os.path.dirname(__file__), "static", filename)
-        if not os.path.exists(file_path):
-            return Response(content=f"Template {filename} not found", status_code=404)
-        with open(file_path, "r", encoding="utf-8") as f:
-            return Response(content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html")
-
     # ------------------------------------------------------------------
     # Route registration (Pattern B)
     # ------------------------------------------------------------------
 
     def _register_routes(self) -> None:
+        self.register_ogc_standard_routes()
         col_prefix = "/catalogs/{catalog_id}/collections/{collection_id}/styles"
 
         route_table: list[tuple[str, str, list[str], dict[str, Any]]] = [
-            # Standard OGC landing page + conformance
-            ("/", "get_landing_page", ["GET"], {}),
-            ("/conformance", "get_conformance", ["GET"], {}),
             (
                 col_prefix,
                 "create_style_for_collection",
@@ -271,18 +238,6 @@ class StylesService(protocols.ExtensionProtocol, OGCServiceMixin, StylesProtocol
         ]
         for path, handler_name, methods, kwargs in route_table:
             self.router.add_api_route(path, getattr(self, handler_name), methods=methods, **kwargs)
-
-    # ------------------------------------------------------------------
-    # Standard OGC endpoints (delegated to OGCServiceMixin)
-    # ------------------------------------------------------------------
-
-    async def get_landing_page(
-        self, request: Request, language: str = Depends(get_language)
-    ) -> _AppJSONResponse:
-        return await self.ogc_landing_page_handler(request, language=language)
-
-    async def get_conformance(self, request: Request):
-        return await self.ogc_conformance_handler(request)
 
     # ------------------------------------------------------------------
     # Internal helpers
