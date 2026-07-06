@@ -16,10 +16,10 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-from typing import AsyncGenerator
+from typing import Annotated, AsyncGenerator
 
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncConnection
-from fastapi import Request
+from fastapi import Depends, Request
 
 from dynastore.modules.db_config.query_executor import (
     _read_live_fg_acquire_timeout,
@@ -48,12 +48,13 @@ def get_async_engine(request: Request) -> AsyncEngine:
     )
 
 
-async def get_async_connection(
+async def get_write_connection(
     request: Request,
 ) -> AsyncGenerator[AsyncConnection, None]:
     """
-    FastAPI dependency that provides a transaction-managed asynchronous `Connection`
-    to API endpoints. This is the correct pattern for endpoint dependencies.
+    FastAPI dependency that provides a transaction-managed asynchronous
+    read-write `Connection` to API endpoints (#2753 write lane). This is the
+    correct pattern for endpoint dependencies that mutate data.
     """
     engine = get_async_engine(request)
 
@@ -68,19 +69,33 @@ async def get_async_connection(
         yield conn
 
 
+# Backward-compatible alias: every existing handler and test importing
+# ``get_async_connection`` keeps working, byte-for-byte unchanged behaviour
+# (#2753 step 2, phase 0 — landing the lane primitives with zero handler
+# edits). New/migrating write handlers should prefer ``get_write_connection``
+# or the ``WriteConn`` annotation below.
+get_async_connection = get_write_connection
+
+
 async def get_async_connection_bounded(
     request: Request,
 ) -> AsyncGenerator[AsyncConnection, None]:
-    """FastAPI dependency variant of :func:`get_async_connection` for read
+    """FastAPI dependency variant of :func:`get_write_connection` for read
     surfaces that should fail fast under pool saturation (#2933/#2948).
 
-    Identical to :func:`get_async_connection` except the checkout is bounded
+    Identical to :func:`get_write_connection` except the checkout is bounded
     by ``ConnectionHealthConfig.foreground_pool_acquire_timeout_s`` instead of
     only the engine's own ``pool_timeout`` — a saturated pool raises
     ``PoolSaturationError`` (mapped to a 503 + Retry-After by the existing
     ``PoolSaturationExceptionHandler``) well before the request rides the
     full pool_timeout. Reserved for item-GET/search reads; write routes keep
-    the plain :func:`get_async_connection`.
+    the plain :func:`get_write_connection`.
+
+    Predates the explicit ``ReadConn``/``WriteConn`` lanes (#2753) and is
+    left as-is — still a read-write transaction, just fail-fast on acquire —
+    so its existing callers see no behaviour change. New read surfaces should
+    prefer :func:`get_read_connection`, which adds ``READ ONLY`` semantics on
+    top of the same fail-fast acquire.
     """
     engine = get_async_engine(request)
 
@@ -89,3 +104,40 @@ async def get_async_connection_bounded(
     ) as conn:
         assert isinstance(conn, AsyncConnection)
         yield conn
+
+
+async def get_read_connection(
+    request: Request,
+) -> AsyncGenerator[AsyncConnection, None]:
+    """FastAPI dependency for the read lane (#2753 step 2).
+
+    Fail-fast bounded pool acquire (same as :func:`get_async_connection_bounded`)
+    plus ``READ ONLY`` transaction semantics: PostgreSQL rejects any write
+    attempted through this connection instead of silently allowing it, and a
+    single consistent snapshot is kept for the whole request (unlike
+    AUTOCOMMIT, which would let a count-then-page request observe phantom
+    drift between statements). Reserved for handlers that never write and
+    never trigger lazy DDL/provisioning; such handlers stay on
+    :func:`get_write_connection`.
+
+    This lane shares the single serving engine/pool with the write lane —
+    no new connections are opened by this change — so it carries the exact
+    same lock-safety GUCs (``lock_timeout``, ``idle_in_transaction_session_timeout``,
+    ``statement_timeout``) and TCP keepalive/user-timeout settings the engine
+    was built with (``modules/db/db_service.py``). A dedicated read-side
+    budget reserve and/or replica routing are later, separately-soaked phases
+    of #2753 — not part of this change.
+    """
+    engine = get_async_engine(request)
+
+    async with managed_transaction(
+        engine,
+        acquire_timeout=await _read_live_fg_acquire_timeout(),
+        read_only=True,
+    ) as conn:
+        assert isinstance(conn, AsyncConnection)
+        yield conn
+
+
+WriteConn = Annotated[AsyncConnection, Depends(get_write_connection)]
+ReadConn = Annotated[AsyncConnection, Depends(get_read_connection)]

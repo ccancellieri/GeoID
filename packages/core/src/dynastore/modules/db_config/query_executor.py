@@ -2267,7 +2267,10 @@ def sync_managed_transaction(db_resource: DbSyncResource) -> Iterator[Any]:
 
 @asynccontextmanager
 async def managed_transaction(
-    db_resource: Optional[DbResource], *, acquire_timeout: Optional[float] = None
+    db_resource: Optional[DbResource],
+    *,
+    acquire_timeout: Optional[float] = None,
+    read_only: bool = False,
 ):
     """Async-native re-entrant transaction manager.
 
@@ -2301,6 +2304,12 @@ async def managed_transaction(
             ``PoolSaturationError`` fast on a shorter, live-configurable
             deadline (#2933). ``None`` (the default) preserves prior
             behaviour for every existing caller.
+        read_only: Engine input only. When ``True``, the connection is put
+            into ``postgresql_readonly`` execution mode before ``begin()``,
+            so PostgreSQL opens the transaction with ``SET TRANSACTION READ
+            ONLY`` — any write attempted through it fails at the database
+            instead of silently succeeding (#2753). ``False`` (the default)
+            preserves prior behaviour for every existing caller.
 
     Yields:
         The connection/session ready for transactional work.
@@ -2328,6 +2337,8 @@ async def managed_transaction(
                 )
             else:
                 conn = await _acquire_async_engine_connection(db_resource)
+            if read_only:
+                conn = await conn.execution_options(postgresql_readonly=True)
             try:
                 txn_cm = conn.begin()
                 await txn_cm.__aenter__()
