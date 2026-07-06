@@ -31,6 +31,7 @@ import pytest
 
 from dynastore.tools.db import (
     InvalidIdentifierError,
+    build_upsert,
     qualify_column,
     qualify_table,
     quote_ident,
@@ -117,3 +118,94 @@ def test_qualify_column_preserves_case():
 def test_qualify_column_rejects_invalid_name():
     with pytest.raises(InvalidIdentifierError):
         qualify_column("bad name")
+
+
+# ---------------------------------------------------------------------------
+# build_upsert
+# ---------------------------------------------------------------------------
+
+
+def test_build_upsert_simple_single_pk():
+    sql = build_upsert(
+        table='"my_schema"."widgets"',
+        columns=["id", "name", "price"],
+        conflict_cols=["id"],
+    )
+    assert sql == (
+        'INSERT INTO "my_schema"."widgets" ("id", "name", "price") '
+        "VALUES (:id, :name, :price) "
+        'ON CONFLICT ("id") DO UPDATE SET '
+        '"name" = EXCLUDED."name", "price" = EXCLUDED."price";'
+    )
+
+
+def test_build_upsert_escapes_identifier_needing_quoting():
+    # A column name carrying an embedded double quote must come out escaped
+    # the same way quote_ident escapes it standalone.
+    sql = build_upsert(
+        table='"s"."t"',
+        columns=['weird"col', "id"],
+        conflict_cols=["id"],
+    )
+    assert '"weird""col"' in sql
+    assert 'SET "weird""col" = EXCLUDED."weird""col"' in sql
+
+
+def test_build_upsert_explicit_update_cols_is_a_strict_subset():
+    # A caller can refresh only some of the non-conflict columns on update —
+    # e.g. a freshness column stays untouched by an explicit list.
+    sql = build_upsert(
+        table='"s"."t"',
+        columns=["notebook_id", "title", "owner_id"],
+        conflict_cols=["notebook_id"],
+        update_cols=["title"],
+    )
+    assert 'ON CONFLICT ("notebook_id") DO UPDATE SET "title" = EXCLUDED."title";' in sql
+    assert "owner_id" not in sql.split("DO UPDATE SET")[1]
+
+
+def test_build_upsert_empty_update_cols_renders_do_nothing():
+    sql = build_upsert(
+        table='"s"."t"',
+        columns=["notebook_id", "title"],
+        conflict_cols=["notebook_id"],
+        update_cols=[],
+    )
+    assert "ON CONFLICT (\"notebook_id\") DO NOTHING;" in sql
+
+
+def test_build_upsert_literal_values_used_in_values_clause_only():
+    # literal_values overrides the VALUES-clause entry for a column but the
+    # UPDATE SET clause still uses the ordinary EXCLUDED form.
+    sql = build_upsert(
+        table='"s"."t"',
+        columns=["ref_key", "config_data", "updated_at"],
+        conflict_cols=["ref_key"],
+        literal_values={
+            "config_data": "CAST(:config_data AS jsonb)",
+            "updated_at": "NOW()",
+        },
+    )
+    assert "VALUES (:ref_key, CAST(:config_data AS jsonb), NOW())" in sql
+    assert '"updated_at" = EXCLUDED."updated_at"' in sql
+    assert '"config_data" = EXCLUDED."config_data"' in sql
+
+
+def test_build_upsert_returning_clause():
+    sql = build_upsert(
+        table='"s"."t"',
+        columns=["id", "name"],
+        conflict_cols=["id"],
+        returning=["id", "name"],
+    )
+    assert sql.endswith('RETURNING "id", "name";')
+
+
+def test_build_upsert_rejects_empty_columns():
+    with pytest.raises(ValueError):
+        build_upsert(table='"s"."t"', columns=[], conflict_cols=["id"])
+
+
+def test_build_upsert_rejects_empty_conflict_cols():
+    with pytest.raises(ValueError):
+        build_upsert(table='"s"."t"', columns=["id"], conflict_cols=[])

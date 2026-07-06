@@ -17,6 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import re
+from typing import Mapping, Optional, Sequence
 
 # A set of common reserved SQL keywords to prevent identifier collision.
 POSTGRES_RESERVED_WORDS = {
@@ -182,3 +183,76 @@ def qualify_column(name: str) -> str:
     """
     validate_column_identifier(name)
     return quote_ident(name)
+
+
+def build_upsert(
+    table: str,
+    columns: Sequence[str],
+    conflict_cols: Sequence[str],
+    update_cols: Optional[Sequence[str]] = None,
+    literal_values: Optional[Mapping[str, str]] = None,
+    returning: Optional[Sequence[str]] = None,
+) -> str:
+    """
+    Render a single-row ``INSERT INTO {table} (...) VALUES (...) ON CONFLICT
+    (...) DO UPDATE SET col = EXCLUDED.col`` statement for the common
+    single-PK upsert shape hand-written across the storage/config/notebooks
+    modules.
+
+    - ``table``: a table reference the caller has already quoted/qualified
+      (e.g. via :func:`qualify_table`, or a literal ``"schema"."table"``
+      string) — used verbatim, not touched here.
+    - ``columns``: every column to insert. Each binds as ``:column_name``
+      unless overridden via ``literal_values``. Quoted (escape-only, via
+      :func:`quote_ident`) rather than validated — matching the convention
+      used for payload-derived column names elsewhere in this module, so a
+      name that already worked continues to.
+    - ``conflict_cols``: columns forming the ``ON CONFLICT`` target.
+    - ``update_cols``: columns refreshed with ``col = EXCLUDED.col`` on
+      conflict (defaults to every column not in ``conflict_cols``). Pass an
+      empty sequence for ``ON CONFLICT (...) DO NOTHING``.
+    - ``literal_values``: column -> raw SQL expression (e.g.
+      ``{"updated_at": "NOW()", "config_data": "CAST(:config_data AS jsonb)"}``)
+      to inline directly into the VALUES clause instead of a bare bind. On
+      conflict, ``col = EXCLUDED.col`` still re-evaluates to the same value
+      within one statement, so this doesn't change ``NOW()``-stamping
+      semantics.
+    - ``returning``: columns to append as ``RETURNING col1, col2, ...``.
+
+    This only covers the plain single-row, EXCLUDED-based case — CAS
+    predicates, additive/COALESCE conflict semantics, and multi-row VALUES
+    batches stay hand-written.
+
+    Raises:
+        ValueError: if ``columns`` or ``conflict_cols`` is empty.
+    """
+    if not columns:
+        raise ValueError("build_upsert requires at least one column.")
+    if not conflict_cols:
+        raise ValueError("build_upsert requires at least one conflict column.")
+
+    literal_values = literal_values or {}
+    if update_cols is None:
+        update_cols = [c for c in columns if c not in conflict_cols]
+
+    col_list = ", ".join(quote_ident(c) for c in columns)
+    value_list = ", ".join(
+        literal_values[c] if c in literal_values else f":{c}" for c in columns
+    )
+    conflict_target = ", ".join(quote_ident(c) for c in conflict_cols)
+
+    if update_cols:
+        set_clause = ", ".join(
+            f"{quote_ident(c)} = EXCLUDED.{quote_ident(c)}" for c in update_cols
+        )
+        conflict_action = f"DO UPDATE SET {set_clause}"
+    else:
+        conflict_action = "DO NOTHING"
+
+    sql = (
+        f"INSERT INTO {table} ({col_list}) VALUES ({value_list}) "
+        f"ON CONFLICT ({conflict_target}) {conflict_action}"
+    )
+    if returning:
+        sql += f" RETURNING {', '.join(quote_ident(c, allow_star=True) for c in returning)}"
+    return sql + ";"

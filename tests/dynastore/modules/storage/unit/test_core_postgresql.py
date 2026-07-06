@@ -229,8 +229,10 @@ async def test_collection_core_upsert_uses_core_columns_only(fake_conn_with_dql)
     # UPDATE set — so "title" shows up twice.  Assert both directions.
     assert sql.count("title") >= 2
     assert "NOW()" in sql  # updated_at stamping
-    # Bind params cover only the five CORE keys the caller supplied (plus :id).
-    assert set(params) == {"id", "title", "description", "keywords", "license", "extra_metadata"}
+    # Bind params cover only the five CORE keys the caller supplied (plus :collection_id).
+    assert set(params) == {
+        "collection_id", "title", "description", "keywords", "license", "extra_metadata",
+    }
 
 
 @pytest.mark.asyncio
@@ -268,8 +270,8 @@ async def test_collection_core_upsert_partial_update_preserves_other_columns(
             f"this would NULL-out the existing column value.  Check "
             f"_filter_payload / _upsert_collection_row."
         )
-    # Bind params contain only :id + the one supplied column.
-    assert set(params) == {"id", "title"}
+    # Bind params contain only :collection_id + the one supplied column.
+    assert set(params) == {"collection_id", "title"}
 
 
 @pytest.mark.asyncio
@@ -293,10 +295,13 @@ async def test_collection_core_upsert_empty_payload_only_bumps_updated_at(
     sql, params = dql_execute.call_args.args[0], dql_execute.call_args.kwargs
     assert sql.startswith(
         'INSERT INTO "t_alpha".collection_core '
-        '(collection_id, updated_at)'
+        '("collection_id", "updated_at")'
     )
-    assert "ON CONFLICT (collection_id) DO UPDATE SET updated_at = NOW()" in sql
-    assert set(params) == {"id"}
+    assert (
+        'ON CONFLICT ("collection_id") DO UPDATE SET '
+        '"updated_at" = EXCLUDED."updated_at"'
+    ) in sql
+    assert set(params) == {"collection_id"}
 
 
 @pytest.mark.asyncio

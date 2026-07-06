@@ -31,6 +31,7 @@ from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler, 
 from dynastore.modules.db_config.exceptions import ResourceNotFoundError
 from dynastore.modules.db_config.core_metadata_ddl import core_metadata_columns
 from dynastore.tools.cache import cached
+from dynastore.tools.db import build_upsert
 from .models import PlatformNotebookCreate
 
 logger = logging.getLogger(__name__)
@@ -66,18 +67,15 @@ def _serialize_localized(value) -> Optional[str]:
 
 async def seed_platform_notebook(conn: DbResource, notebook: PlatformNotebookCreate) -> None:
     """Insert or update a platform notebook (always syncs content from package on deploy)."""
-    query = text("""
-        INSERT INTO notebooks.platform_notebooks
-            (notebook_id, title, description, tags, content, metadata, registered_by, owner_type)
-        VALUES
-            (:notebook_id, :title, :description, :tags, :content, :metadata, :registered_by, :owner_type)
-        ON CONFLICT (notebook_id) DO UPDATE SET
-            title       = EXCLUDED.title,
-            description = EXCLUDED.description,
-            tags        = EXCLUDED.tags,
-            content     = EXCLUDED.content,
-            metadata    = EXCLUDED.metadata
-    """)
+    query = text(build_upsert(
+        table="notebooks.platform_notebooks",
+        columns=(
+            "notebook_id", "title", "description", "tags", "content",
+            "metadata", "registered_by", "owner_type",
+        ),
+        conflict_cols=("notebook_id",),
+        update_cols=("title", "description", "tags", "content", "metadata"),
+    ))
     params = {
         "notebook_id": notebook.notebook_id,
         "title": _serialize_localized(notebook.title),
@@ -181,24 +179,19 @@ async def save_platform_notebook(
     conn: DbResource, notebook: PlatformNotebookCreate
 ) -> Dict[str, Any]:
     """Upsert a platform notebook (sysadmin use). Invalidates cache."""
-    query = text("""
-        INSERT INTO notebooks.platform_notebooks
-            (notebook_id, title, description, tags, content, metadata, registered_by, owner_type, updated_at)
-        VALUES
-            (:notebook_id, :title, :description, :tags, :content, :metadata, :registered_by, :owner_type, NOW())
-        ON CONFLICT (notebook_id) DO UPDATE SET
-            title = EXCLUDED.title,
-            description = EXCLUDED.description,
-            tags = EXCLUDED.tags,
-            content = EXCLUDED.content,
-            metadata = EXCLUDED.metadata,
-            registered_by = EXCLUDED.registered_by,
-            owner_type = EXCLUDED.owner_type,
-            updated_at = NOW(),
-            deleted_at = NULL
-        RETURNING notebook_id, title, description, tags, content, metadata, registered_by,
-                  owner_type, created_at, updated_at, deleted_at
-    """)
+    query = text(build_upsert(
+        table="notebooks.platform_notebooks",
+        columns=(
+            "notebook_id", "title", "description", "tags", "content",
+            "metadata", "registered_by", "owner_type", "updated_at", "deleted_at",
+        ),
+        conflict_cols=("notebook_id",),
+        literal_values={"updated_at": "NOW()", "deleted_at": "NULL"},
+        returning=(
+            "notebook_id", "title", "description", "tags", "content", "metadata",
+            "registered_by", "owner_type", "created_at", "updated_at", "deleted_at",
+        ),
+    ))
     params = {
         "notebook_id": notebook.notebook_id,
         "title": _serialize_localized(notebook.title),

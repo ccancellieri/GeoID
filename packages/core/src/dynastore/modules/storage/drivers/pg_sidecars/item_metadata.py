@@ -228,24 +228,8 @@ class ItemMetadataSidecar(SidecarProtocol):
             f"{alias}.keywords AS item_keywords",
         ]
 
-    def get_join_clause(
-        self,
-        schema: str,
-        hub_table: str,
-        hub_alias: str = "h",
-        sidecar_alias: Optional[str] = None,
-        join_type: str = "LEFT",
-        extra_condition: Optional[str] = None,
-    ) -> str:
-        """Generate JOIN clause for item metadata sidecar."""
-        alias = sidecar_alias or f"sc_{self.sidecar_id}"
-        table_name = f"{hub_table}_{self.sidecar_id}"
-
-        on_clause = f"{hub_alias}.geoid = {alias}.geoid"
-        if extra_condition:
-            on_clause += f" AND {extra_condition}"
-
-        return f'{join_type} JOIN "{schema}"."{table_name}" AS {alias} ON {on_clause}'
+    # get_join_clause: uses the SidecarProtocol base default (plain
+    # hub.geoid = sidecar.geoid join against "{hub_table}_item_metadata").
 
     async def validate_upsert(
         self,

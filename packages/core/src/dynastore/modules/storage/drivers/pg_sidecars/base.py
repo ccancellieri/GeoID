@@ -1007,7 +1007,18 @@ class SidecarProtocol(ABC):
         """
         pass
 
-    @abstractmethod
+    def _default_sidecar_alias(self) -> str:
+        """Default table alias used by :meth:`get_join_clause` when the
+        caller doesn't pass an explicit ``sidecar_alias``.
+
+        Override when a sidecar's established alias doesn't follow the
+        ``sc_<sidecar_id>`` convention (see
+        :class:`.access_envelope.AccessEnvelopeSidecar`, whose short ``ae``
+        alias is also hardcoded into its own ``apply_query_context`` /
+        ``get_queryable_fields``).
+        """
+        return f"sc_{self.sidecar_id}"
+
     def get_join_clause(
         self,
         schema: str,
@@ -1018,20 +1029,32 @@ class SidecarProtocol(ABC):
         extra_condition: Optional[str] = None,
     ) -> str:
         """
-        Returns JOIN clause for this sidecar.
+        Returns the default geoid-only JOIN clause for this sidecar — a
+        plain ``hub.geoid = sidecar.geoid`` equality against the physical
+        table ``{hub_table}_{sidecar_id}``. Override this for a sidecar
+        whose join needs an extra baked-in predicate ahead of
+        ``extra_condition`` (see the attributes sidecar's validity-range
+        check).
 
         Args:
             schema: Physical schema name
             hub_table: Physical hub table name
             hub_alias: Alias for hub table
-            sidecar_alias: Alias for sidecar (auto-generated if None)
+            sidecar_alias: Alias for sidecar (defaults to :meth:`_default_sidecar_alias`)
             join_type: JOIN type (LEFT, INNER, etc.)
-            extra_condition: Additional condition to append to the ON clause (e.g. 'AND sc.validity @> NOW()')
+            extra_condition: Additional condition appended verbatim to the ON
+                clause — include its own leading ``AND`` (e.g.
+                ``'AND sc.validity @> NOW()'``).
 
         Returns:
             Complete JOIN clause (e.g., 'LEFT JOIN "schema"."table_geom" sc_geom ON h.geoid = sc_geom.geoid')
         """
-        pass
+        alias = sidecar_alias or self._default_sidecar_alias()
+        table_name = f"{hub_table}_{self.sidecar_id}"
+        on_clause = f"{hub_alias}.geoid = {alias}.geoid"
+        if extra_condition:
+            on_clause = f"{on_clause} {extra_condition}"
+        return f'{join_type} JOIN "{schema}"."{table_name}" {alias} ON {on_clause}'
 
     def get_where_conditions(
         self, sidecar_alias: Optional[str] = None, **filters

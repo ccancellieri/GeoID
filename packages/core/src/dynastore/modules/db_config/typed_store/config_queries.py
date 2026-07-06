@@ -56,7 +56,7 @@ from typing import Any, Dict, List, Tuple
 
 from dynastore.modules.db_config.query_executor import DbResource, DQLQuery, ResultHandler
 from dynastore.modules.db_config.shared_queries import list_page_with_count
-from dynastore.tools.db import validate_sql_identifier
+from dynastore.tools.db import build_upsert, validate_sql_identifier
 from dynastore.modules.db_config.typed_store.ddl import (
     CONFIGS_SCHEMA,
     CATALOG_CONFIGS_TABLE,
@@ -109,15 +109,15 @@ cas_update_platform_config = DQLQuery(
 )
 
 upsert_platform_config = DQLQuery(
-    f"""
-    INSERT INTO {CONFIGS_SCHEMA}.platform_configs (ref_key, class_key, schema_id, config_data, updated_at)
-    VALUES (:ref_key, :class_key, :schema_id, CAST(:config_data AS jsonb), NOW())
-    ON CONFLICT (ref_key) DO UPDATE SET
-        class_key   = EXCLUDED.class_key,
-        schema_id   = EXCLUDED.schema_id,
-        config_data = EXCLUDED.config_data,
-        updated_at  = NOW();
-    """,
+    build_upsert(
+        table=f"{CONFIGS_SCHEMA}.platform_configs",
+        columns=("ref_key", "class_key", "schema_id", "config_data", "updated_at"),
+        conflict_cols=("ref_key",),
+        literal_values={
+            "config_data": "CAST(:config_data AS jsonb)",
+            "updated_at": "NOW()",
+        },
+    ),
     result_handler=ResultHandler.ROWCOUNT,
 )
 
@@ -224,15 +224,15 @@ def upsert_catalog_config(phys_schema: str) -> DQLQuery:
     """INSERT … ON CONFLICT DO UPDATE for catalog-level config."""
     validate_sql_identifier(phys_schema)
     return DQLQuery(
-        f"""
-        INSERT INTO "{phys_schema}".{CATALOG_CONFIGS_TABLE} (ref_key, class_key, schema_id, config_data, updated_at)
-        VALUES (:ref_key, :class_key, :schema_id, CAST(:config_data AS jsonb), NOW())
-        ON CONFLICT (ref_key) DO UPDATE SET
-            class_key   = EXCLUDED.class_key,
-            schema_id   = EXCLUDED.schema_id,
-            config_data = EXCLUDED.config_data,
-            updated_at  = NOW();
-        """,
+        build_upsert(
+            table=f'"{phys_schema}".{CATALOG_CONFIGS_TABLE}',
+            columns=("ref_key", "class_key", "schema_id", "config_data", "updated_at"),
+            conflict_cols=("ref_key",),
+            literal_values={
+                "config_data": "CAST(:config_data AS jsonb)",
+                "updated_at": "NOW()",
+            },
+        ),
         result_handler=ResultHandler.ROWCOUNT,
     )
 
@@ -356,15 +356,18 @@ def upsert_collection_config(phys_schema: str) -> DQLQuery:
     """INSERT … ON CONFLICT DO UPDATE for collection-level config."""
     validate_sql_identifier(phys_schema)
     return DQLQuery(
-        f"""
-        INSERT INTO "{phys_schema}".{COLLECTION_CONFIGS_TABLE} (collection_id, ref_key, class_key, schema_id, config_data, updated_at)
-        VALUES (:collection_id, :ref_key, :class_key, :schema_id, CAST(:config_data AS jsonb), NOW())
-        ON CONFLICT (collection_id, ref_key) DO UPDATE SET
-            class_key   = EXCLUDED.class_key,
-            schema_id   = EXCLUDED.schema_id,
-            config_data = EXCLUDED.config_data,
-            updated_at  = NOW();
-        """,
+        build_upsert(
+            table=f'"{phys_schema}".{COLLECTION_CONFIGS_TABLE}',
+            columns=(
+                "collection_id", "ref_key", "class_key", "schema_id",
+                "config_data", "updated_at",
+            ),
+            conflict_cols=("collection_id", "ref_key"),
+            literal_values={
+                "config_data": "CAST(:config_data AS jsonb)",
+                "updated_at": "NOW()",
+            },
+        ),
         result_handler=ResultHandler.ROWCOUNT,
     )
 

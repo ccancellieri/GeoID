@@ -953,22 +953,9 @@ class GeometriesSidecar(SidecarProtocol):
 
         return fields
 
-    def get_join_clause(
-        self,
-        schema: str,
-        hub_table: str,
-        hub_alias: str = "h",
-        sidecar_alias: Optional[str] = None,
-        join_type: str = "LEFT",
-        extra_condition: Optional[str] = None,
-    ) -> str:
-        """Returns JOIN clause for geometry sidecar (geoid-only join)."""
-        alias = sidecar_alias or f"sc_{self.sidecar_id}"
-        table = f"{hub_table}_geometries"
-        on_clause = f"{hub_alias}.geoid = {alias}.geoid"
-        if extra_condition:
-            on_clause = f"{on_clause} {extra_condition}"
-        return f'{join_type} JOIN "{schema}"."{table}" {alias} ON {on_clause}'
+    # get_join_clause: uses the SidecarProtocol base default (plain
+    # hub.geoid = sidecar.geoid join against "{hub_table}_geometries",
+    # since sidecar_id is always "geometries").
 
     def get_spatial_condition(
         self,

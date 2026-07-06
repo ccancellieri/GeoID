@@ -196,22 +196,14 @@ class AccessEnvelopeSidecar(SidecarProtocol):
 
     # ── Query building ────────────────────────────────────────────────────────
 
-    def get_join_clause(
-        self,
-        schema: str,
-        hub_table: str,
-        hub_alias: str = "h",
-        sidecar_alias: Optional[str] = None,
-        join_type: str = "LEFT",
-        extra_condition: Optional[str] = None,
-    ) -> str:
-        """LEFT JOIN the access_envelope sub-table onto the hub."""
-        alias = sidecar_alias or _SIDECAR_ALIAS
-        table_name = f"{hub_table}_{_SIDECAR_ID}"
-        on_clause = f"{hub_alias}.geoid = {alias}.geoid"
-        if extra_condition:
-            on_clause += f" AND {extra_condition}"
-        return f'{join_type} JOIN "{schema}"."{table_name}" {alias} ON {on_clause}'
+    def _default_sidecar_alias(self) -> str:
+        """Short ``ae`` alias — also hardcoded into ``apply_query_context``
+        and ``get_queryable_fields`` below, so it must stay in sync with
+        whatever alias a caller ultimately joins this sidecar under."""
+        return _SIDECAR_ALIAS
+
+    # get_join_clause: uses the SidecarProtocol base default (plain
+    # hub.geoid = sidecar.geoid join against "{hub_table}_access_envelope").
 
     def get_select_fields(
         self,

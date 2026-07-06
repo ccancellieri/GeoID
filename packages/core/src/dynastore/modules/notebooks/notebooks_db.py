@@ -31,7 +31,7 @@ from sqlalchemy import text
 from dynastore.modules.db_config.exceptions import ResourceNotFoundError
 from dynastore.modules.db_config.query_executor import DDLQuery, DQLQuery, ResultHandler
 from dynastore.modules.db_config.core_metadata_ddl import core_metadata_columns
-from dynastore.tools.db import qualify_table
+from dynastore.tools.db import build_upsert, qualify_table
 
 from .models import NotebookCreate
 
@@ -164,23 +164,21 @@ async def save_notebook(
     copied_from: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Save or update a notebook."""
-    query = text(f"""
-        INSERT INTO {qualify_table(schema, "notebooks")}
-            (notebook_id, catalog_id, title, description, tags, content, metadata,
-             owner_id, copied_from, updated_at)
-        VALUES
-            (:notebook_id, :catalog_id, :title, :description, :tags, :content,
-             :metadata, :owner_id, :copied_from, NOW())
-        ON CONFLICT (notebook_id) DO UPDATE SET
-            title = EXCLUDED.title,
-            description = EXCLUDED.description,
-            tags = EXCLUDED.tags,
-            content = EXCLUDED.content,
-            metadata = EXCLUDED.metadata,
-            updated_at = NOW()
-        RETURNING notebook_id, catalog_id, title, description, tags, content, metadata,
-                  created_at, updated_at, deleted_at, owner_id, copied_from
-    """)
+    query = text(build_upsert(
+        table=qualify_table(schema, "notebooks"),
+        columns=(
+            "notebook_id", "catalog_id", "title", "description", "tags",
+            "content", "metadata", "owner_id", "copied_from", "updated_at",
+        ),
+        conflict_cols=("notebook_id",),
+        update_cols=("title", "description", "tags", "content", "metadata", "updated_at"),
+        literal_values={"updated_at": "NOW()"},
+        returning=(
+            "notebook_id", "catalog_id", "title", "description", "tags",
+            "content", "metadata", "created_at", "updated_at", "deleted_at",
+            "owner_id", "copied_from",
+        ),
+    ))
     params = {
         "notebook_id": notebook.notebook_id,
         "catalog_id": catalog_id,
@@ -203,17 +201,20 @@ async def copy_from_platform(
     owner_id: str,
 ) -> Dict[str, Any]:
     """Copy a platform notebook into a tenant catalog (no-op if already exists)."""
-    query = text(f"""
-        INSERT INTO {qualify_table(schema, "notebooks")}
-            (notebook_id, catalog_id, title, description, tags, content, metadata,
-             owner_id, copied_from)
-        VALUES
-            (:notebook_id, :catalog_id, :title, :description, :tags, :content,
-             :metadata, :owner_id, :copied_from)
-        ON CONFLICT (notebook_id) DO NOTHING
-        RETURNING notebook_id, catalog_id, title, description, tags, content, metadata,
-                  created_at, updated_at, deleted_at, owner_id, copied_from
-    """)
+    query = text(build_upsert(
+        table=qualify_table(schema, "notebooks"),
+        columns=(
+            "notebook_id", "catalog_id", "title", "description", "tags",
+            "content", "metadata", "owner_id", "copied_from",
+        ),
+        conflict_cols=("notebook_id",),
+        update_cols=(),
+        returning=(
+            "notebook_id", "catalog_id", "title", "description", "tags",
+            "content", "metadata", "created_at", "updated_at", "deleted_at",
+            "owner_id", "copied_from",
+        ),
+    ))
     title = platform_notebook.get("title")
     description = platform_notebook.get("description")
     tags = platform_notebook.get("tags", [])

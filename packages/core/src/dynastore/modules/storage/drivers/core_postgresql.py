@@ -75,6 +75,7 @@ from dynastore.modules.db_config.query_executor import (
 )
 from dynastore.modules.storage.driver_config import DriverPluginConfig
 from dynastore.modules.storage.routing_config import Operation
+from dynastore.tools.db import build_upsert
 
 if TYPE_CHECKING:
     from dynastore.modules.storage.storage_location import StorageLocation
@@ -300,39 +301,22 @@ class _PgCollectionCoreBase:
         also writes a derived extent index) can override it without
         duplicating the engine / schema resolution boilerplate.
         """
+        # Caller may supply no column values at all — the upsert still fires
+        # to bump ``updated_at``, writing the minimal row (collection_id +
+        # default NULLs) on fresh insert, then just ticking the freshness
+        # token on repeat calls. ``EXCLUDED.updated_at`` re-evaluates the
+        # same ``NOW()`` inserted by this statement, so it's equivalent to
+        # writing ``updated_at = NOW()`` directly on the UPDATE branch.
         supplied_cols: Tuple[str, ...] = tuple(payload.keys())
-        params: Dict[str, Any] = {"id": collection_id}
+        params: Dict[str, Any] = {"collection_id": collection_id}
         for c in supplied_cols:
             params[c] = _to_json(payload[c])
 
-        if not supplied_cols:
-            # Caller supplied no column values — only bump updated_at.
-            # INSERT … ON CONFLICT DO UPDATE SET updated_at = NOW()
-            # writes the minimal row (collection_id + default NULLs) on
-            # fresh insert, then subsequent upserts just tick the
-            # freshness token.
-            sql = (
-                f'INSERT INTO "{phys_schema}".{self._table} '
-                f'(collection_id, updated_at) VALUES (:id, NOW()) '
-                f'ON CONFLICT (collection_id) DO UPDATE SET '
-                f'updated_at = NOW();'
-            )
-            await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
-                conn, **params,
-            )
-            return
-
-        col_list = ", ".join(supplied_cols)
-        val_placeholders = ", ".join(f":{c}" for c in supplied_cols)
-        update_list = ", ".join(
-            f"{c} = EXCLUDED.{c}" for c in supplied_cols
-        )
-        sql = (
-            f'INSERT INTO "{phys_schema}".{self._table} '
-            f'(collection_id, {col_list}, updated_at) '
-            f'VALUES (:id, {val_placeholders}, NOW()) '
-            f'ON CONFLICT (collection_id) DO UPDATE SET '
-            f'{update_list}, updated_at = NOW();'
+        sql = build_upsert(
+            table=f'"{phys_schema}".{self._table}',
+            columns=("collection_id", *supplied_cols, "updated_at"),
+            conflict_cols=("collection_id",),
+            literal_values={"updated_at": "NOW()"},
         )
         await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
             conn, **params,
@@ -699,34 +683,20 @@ class _PgCatalogCoreBase:
         catalog_id: str,
         payload: Dict[str, Any],
     ) -> None:
+        # See the mirrored comment in _upsert_collection_row: the
+        # empty-payload case still fires to bump updated_at, and
+        # EXCLUDED.updated_at re-evaluating this statement's NOW() is
+        # equivalent to writing updated_at = NOW() on the UPDATE branch.
         supplied_cols: Tuple[str, ...] = tuple(payload.keys())
-        params: Dict[str, Any] = {"id": catalog_id}
+        params: Dict[str, Any] = {"catalog_id": catalog_id}
         for c in supplied_cols:
             params[c] = _to_json(payload[c])
 
-        if not supplied_cols:
-            sql = (
-                f"INSERT INTO catalog.{self._table} "
-                f"(catalog_id, updated_at) VALUES (:id, NOW()) "
-                f"ON CONFLICT (catalog_id) DO UPDATE SET "
-                f"updated_at = NOW();"
-            )
-            await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
-                conn, **params,
-            )
-            return
-
-        col_list = ", ".join(supplied_cols)
-        val_placeholders = ", ".join(f":{c}" for c in supplied_cols)
-        update_list = ", ".join(
-            f"{c} = EXCLUDED.{c}" for c in supplied_cols
-        )
-        sql = (
-            f"INSERT INTO catalog.{self._table} "
-            f"(catalog_id, {col_list}, updated_at) "
-            f"VALUES (:id, {val_placeholders}, NOW()) "
-            f"ON CONFLICT (catalog_id) DO UPDATE SET "
-            f"{update_list}, updated_at = NOW();"
+        sql = build_upsert(
+            table=f"catalog.{self._table}",
+            columns=("catalog_id", *supplied_cols, "updated_at"),
+            conflict_cols=("catalog_id",),
+            literal_values={"updated_at": "NOW()"},
         )
         await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
             conn, **params,
