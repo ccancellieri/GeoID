@@ -80,6 +80,10 @@ class _FakePcfg:
     def __init__(self, rows: List[Tuple[str, str, Any, datetime]]) -> None:
         self.rows = rows
         self.calls = 0
+        # Sentinel standing in for ``PlatformConfigService.engine`` — the
+        # reconcile transaction runs on THIS engine, not on ctx.engine (which
+        # is None at the priority-0 lifespan point where this service starts).
+        self.engine = object()
 
     async def list_configs_versioned(self) -> List[Tuple[str, str, Any, datetime]]:
         self.calls += 1
@@ -146,10 +150,41 @@ class TestConfigReloadServiceReconcile:
             assert calls == []
 
             pcfg.rows = [_row("a", _ReloadTestConfigA, _t(5))]
-            await svc._reconcile(_ctx())
+            await svc._reconcile()
 
             assert calls == ["a"]
             assert svc._last_seen[_ReloadTestConfigA.class_key()] == _t(5)
+        finally:
+            _cleanup(_ReloadTestConfigA)
+
+    async def test_reconcile_runs_apply_on_pcfg_engine_not_ctx_engine(self, monkeypatch):
+        """Regression (#3084): the apply transaction must run on the
+        PlatformConfigService engine, NOT ``ServiceContext.engine`` — the
+        latter is None at the priority-0 lifespan point where this service
+        starts, which made every reconcile raise
+        ``Cannot start managed_transaction: db_resource is None`` in prod."""
+        import dynastore.modules.db_config.config_reload_service as crs
+        from dynastore.modules.db_config.config_reload_service import ConfigReloadService
+
+        seen_engines: List[Any] = []
+
+        @contextlib.asynccontextmanager
+        async def _capturing_mt(engine):
+            seen_engines.append(engine)
+            yield object()
+
+        monkeypatch.setattr(crs, "managed_transaction", _capturing_mt)
+
+        _ReloadTestConfigA.register_apply_handler(lambda *a: None)
+        try:
+            pcfg = _FakePcfg([_row("a", _ReloadTestConfigA, _t(0))])
+            svc = ConfigReloadService(pcfg)
+            await svc._seed()
+
+            pcfg.rows = [_row("a", _ReloadTestConfigA, _t(5))]
+            await svc._reconcile()
+
+            assert seen_engines == [pcfg.engine]
         finally:
             _cleanup(_ReloadTestConfigA)
 
@@ -164,7 +199,7 @@ class TestConfigReloadServiceReconcile:
             await svc._seed()
 
             # Same rows, same updated_at — nothing advanced.
-            await svc._reconcile(_ctx())
+            await svc._reconcile()
 
             assert calls == []
         finally:
@@ -199,7 +234,7 @@ class TestConfigReloadServiceReconcile:
                 _row("a", _ReloadTestConfigA, _t(5)),
                 _row("b", _ReloadTestConfigB, _t(5)),
             ]
-            await svc._reconcile(_ctx())
+            await svc._reconcile()
 
             assert calls == ["b"]
             assert svc._last_seen[_ReloadTestConfigB.class_key()] == _t(5)
@@ -217,7 +252,7 @@ class TestConfigReloadServiceReconcile:
         svc = ConfigReloadService(pcfg)
 
         # Must not raise.
-        await svc._reconcile(_ctx())
+        await svc._reconcile()
         assert "not_a_registered_class" not in svc._last_seen
 
 

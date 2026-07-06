@@ -115,7 +115,7 @@ class ConfigReloadService:
             )
             if ctx.shutdown.is_set():
                 break
-            await self._reconcile(ctx)
+            await self._reconcile()
 
     async def _seed(self) -> None:
         """Populate the last-seen ``updated_at`` baseline at startup.
@@ -138,13 +138,21 @@ class ConfigReloadService:
         for _ref_key, class_key, _config_data, updated_at in rows:
             self._last_seen[class_key] = updated_at
 
-    async def _reconcile(self, ctx: ServiceContext) -> None:
+    async def _reconcile(self) -> None:
         """One reconcile pass triggered by a wake (NOTIFY, health-beat, or timeout).
 
         Best-effort per class: a class that fails to resolve/validate/apply
         is logged and skipped without touching its last-seen token (so the
         next wake retries it), and does not prevent the remaining classes in
         the same batch from reconciling.
+
+        The apply transaction runs on ``self._pcfg.engine`` — the same engine
+        the listing above uses — NOT on ``ServiceContext.engine``: this service
+        shares the engine-cache sweep supervisor, whose context is built at a
+        priority-0 lifespan point where ``app_state.engine`` is still None, so
+        ``ctx.engine`` would be None here. ``PlatformConfigService.engine``
+        resolves the live engine (falling back to the process-global) and is
+        already proven valid by the successful ``list_configs_versioned`` call.
         """
         try:
             rows = await self._pcfg.list_configs_versioned()
@@ -170,7 +178,7 @@ class ConfigReloadService:
 
             try:
                 config = _validate_stored_config(cls, config_data)
-                async with managed_transaction(ctx.engine) as conn:
+                async with managed_transaction(self._pcfg.engine) as conn:
                     await run_apply_handlers(cls, config, None, None, conn)
             except Exception:
                 logger.error(
