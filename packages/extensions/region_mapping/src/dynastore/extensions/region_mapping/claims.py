@@ -531,21 +531,32 @@ async def fetch_region_ids_by_unique_id(
     async with managed_transaction(
         engine, acquire_timeout=await _read_live_fg_acquire_timeout()
     ) as conn:
+        # Plain Row objects rather than ALL_DICTS: this collection-sized
+        # fetch has no LIMIT (every feature must land at its positional
+        # index), so per-row dict overhead is pure multiplier on top of an
+        # already-unbounded result set -- avoid it rather than pay it twice
+        # over (once for the dict, again for the fid/value tuples below).
         rows = await DQLQuery(
-            sql, result_handler=ResultHandler.ALL_DICTS,
+            sql, result_handler=ResultHandler.ALL,
         ).execute(conn, **params)
+    rows = rows or []
 
-    indexed = []
-    for row in rows or []:
-        idx = _fid_index(row["fid"])
-        if idx is not None:
-            indexed.append((idx, str(row["region_value"])))
-    if not indexed:
+    max_idx = -1
+    for row in rows:
+        idx = _fid_index(row.fid)
+        if idx is not None and idx > max_idx:
+            max_idx = idx
+    if max_idx < 0:
         return []
 
-    ordered: List[str] = [""] * (max(i for i, _ in indexed) + 1)
-    for idx, region_value in indexed:
-        ordered[idx] = region_value
+    # Two passes over the already-materialised `rows` instead of building an
+    # intermediate (idx, value) list: keeps only one collection-sized
+    # structure (the final positional array) live at a time.
+    ordered: List[str] = [""] * (max_idx + 1)
+    for row in rows:
+        idx = _fid_index(row.fid)
+        if idx is not None:
+            ordered[idx] = str(row.region_value)
     return ordered
 
 

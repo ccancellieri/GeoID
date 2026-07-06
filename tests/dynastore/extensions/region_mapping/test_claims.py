@@ -795,3 +795,62 @@ async def test_fetch_region_ids_by_unique_id_acquire_is_bounded(
                 )
     finally:
         await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Memory footprint (dynastore#2946): this fetch has no LIMIT (every feature
+# of the source collection lands at its positional index), so per-row dict
+# overhead multiplies straight onto an already-unbounded, per-worker-cached
+# result. Pins that rows are read via plain ``ResultHandler.ALL`` attribute
+# access, not re-wrapped into a dict per row.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fetch_region_ids_by_unique_id_reads_rows_by_attribute_not_dict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``DQLQuery`` stub returning plain attribute-only rows (no
+    ``__getitem__``) must still be read correctly -- proves the positional
+    array is built without an ``ALL_DICTS``-style ``row["..."]`` round trip
+    that would double the per-row cost of this collection-sized fetch."""
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from dynastore.extensions.region_mapping import claims
+
+    catalogs = _StubCatalogs()
+    configs = _StubConfigs(_columnar_col_config(["adm0_code", "FID"]))
+    monkeypatch.setattr(
+        claims, "get_protocol", _protocol_router(catalogs=catalogs, configs=configs),
+    )
+    monkeypatch.setattr(claims, "get_engine", lambda: object())
+
+    # fid 0 and 2 share "ITA" -- the many-features-one-code shape the
+    # positional array must preserve.
+    stub_rows = [
+        SimpleNamespace(region_value="ITA", fid=0),
+        SimpleNamespace(region_value="FRA", fid=1),
+        SimpleNamespace(region_value="ITA", fid=2),
+    ]
+
+    class _FakeDQLQuery:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        async def execute(self, *_args: Any, **_kwargs: Any) -> List[SimpleNamespace]:
+            return stub_rows
+
+    monkeypatch.setattr(claims, "DQLQuery", _FakeDQLQuery)
+
+    @asynccontextmanager
+    async def _fake_managed_transaction(*_args: Any, **_kwargs: Any):
+        yield object()
+
+    monkeypatch.setattr(claims, "managed_transaction", _fake_managed_transaction)
+
+    values = await claims.fetch_region_ids_by_unique_id(
+        "fao", "countries", "adm0_code", "FID",
+    )
+
+    assert values == ["ITA", "FRA", "ITA"]
