@@ -57,7 +57,6 @@ from .maps_models import MapsLandingPage, DatasetMaps, MapContent, Link
 from .maps_config import MapsConfig
 from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.ogc_base import OGCServiceMixin
-from dynastore.extensions.tools.ogc_common_models import Conformance
 from dynastore.extensions.web.decorators import expose_web_page
 from dynastore.extensions.tools.language_utils import get_language
 import os
@@ -460,20 +459,25 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
     router:APIRouter = APIRouter(tags=["OGC API - Maps (WMS)"], prefix="/maps")
     process_pool: Optional[ProcessPoolExecutor] = None
 
-    def get_web_pages(self):
-        from dynastore.extensions.tools.web_collect import collect_web_pages
-        return collect_web_pages(self)
+    # OGCServiceMixin standard-route wiring: landing_response_model matches
+    # what the "/" route declared before migration. static_dir lets the
+    # inherited _serve_page_template() locate this extension's own static/
+    # directory; static_prefix is intentionally left unset (Maps has no
+    # @expose_static-decorated static-files provider today, so leaving it
+    # unset keeps get_static_assets() returning the same empty list as
+    # before this migration).
+    landing_response_model = MapsLandingPage
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
 
-    def get_static_assets(self):
-        from dynastore.extensions.tools.web_collect import collect_static_assets
-        return collect_static_assets(self)
-
-    def get_notebooks(self):
-        try:
-            from .notebooks import build_contributions
-        except Exception:
-            return []
-        return build_contributions()
+    def __init__(self, app: Optional[FastAPI] = None):
+        self.app = app
+        # Maps' landing page lists dataset links only (no self/conformance/
+        # service-doc links) — a genuinely different shape from the shared
+        # default, so ogc_landing_page_handler is overridden below rather
+        # than reused as-is. landing_name preserves the pre-existing route
+        # name: get_catalog_maps/get_collection_maps resolve it via
+        # request.url_for("get_maps_landing_page").
+        self.register_ogc_standard_routes(landing_name="get_maps_landing_page")
 
     def configure_app(self, app: FastAPI):
         """Early configuration for the Maps extension."""
@@ -552,12 +556,12 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
             roles=("thumbnail", "visual"),
         )
 
-    @router.get("/conformance", response_model=Conformance)
-    async def get_maps_conformance() -> Conformance:  # type: ignore[reportGeneralTypeIssues]
-        return Conformance(conformsTo=OGC_API_MAPS_URIS)
-
-    @router.get("/", response_model=MapsLandingPage)
-    async def get_maps_landing_page(request: Request):  # type: ignore[reportGeneralTypeIssues]
+    async def ogc_landing_page_handler(self, request: Request) -> MapsLandingPage:  # type: ignore[override]
+        """Maps landing page: dataset links only (no self/conformance/
+        service-doc links) — overrides OGCServiceMixin's generic default
+        since OGC API - Maps' landing shape here is per-catalog map access,
+        not a plain OGC Common landing page.
+        """
         catalogs_svc = get_protocol(CatalogsProtocol)
         catalogs = await catalogs_svc.list_catalogs(limit=1000) if catalogs_svc else []
         base = str(request.url).rstrip("/")
@@ -582,14 +586,6 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
     )
     async def provide_map_viewer(self, request: Request):
         return await self._serve_page_template("map_viewer.html")
-
-    async def _serve_page_template(self, filename: str):
-        from dynastore._version import VERSION
-        file_path = os.path.join(os.path.dirname(__file__), "static", filename)
-        if not os.path.exists(file_path):
-             return Response(content=f"Template {filename} not found", status_code=404)
-        with open(file_path, "r", encoding="utf-8") as f:
-             return Response(content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html")
 
     # --- Map Endpoint (shared implementation) ---
 

@@ -51,7 +51,6 @@ from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.tools.fast_api import AppJSONResponse as JSONResponse  # noqa: E402
 from dynastore.extensions.tools.language_utils import get_language  # noqa: E402
-from dynastore.extensions.tools.ogc_common_models import Conformance
 from dynastore.extensions.tools.db import get_async_connection, get_async_engine
 from dynastore.extensions.tools.response_i18n import localize_response_dict, resolve_links, resolve_localized  # noqa: E402
 from dynastore.extensions.tools.problem_details import ProblemDetails, ProblemException  # noqa: E402
@@ -510,15 +509,6 @@ def _localize_job_list(jl: models.JobList, language: str) -> dict:
         if "links" in job:
             job["links"] = resolve_links(job["links"], language)
     return data
-
-
-@router.get(
-    "/conformance",
-    response_model=Conformance,
-    name="get_processes_conformance",
-)
-async def get_processes_conformance() -> Conformance:
-    return Conformance(conformsTo=PROCESSES_CONFORMANCE)
 
 
 @router.get(
@@ -1945,6 +1935,25 @@ class ProcessesService(ExtensionProtocol, OGCServiceMixin):
     protocol_description = "Process discovery and execution per OGC API - Processes"
     router = router
 
+    # OGCServiceMixin static-page wiring: static_dir lets the inherited
+    # _serve_page_template() locate this extension's own static/ directory.
+    # static_prefix is intentionally left unset — the @expose_static
+    # decorator on provide_static_files below already contributes the
+    # "processes" StaticAsset, so setting both would double-register it.
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+
+    def __init__(self, app: Optional[FastAPI] = None):
+        self.app = app
+        # Processes has no pre-existing landing page ("/") — only
+        # /conformance migrates onto the shared handler here. Adding a new
+        # "/" route would be a distinct behavior change (and would need its
+        # own IAM policy grant, since processes_policies() only allows GET on
+        # conformance/processes/jobs today) — out of scope for this
+        # migration (Refs #2692).
+        self.register_ogc_standard_routes(
+            include_landing=False, conformance_name="get_processes_conformance"
+        )
+
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
         from dynastore.tools.discovery import register_plugin
@@ -1955,21 +1964,11 @@ class ProcessesService(ExtensionProtocol, OGCServiceMixin):
     # ------------------------------------------------------------------
     # Web page contribution (WebPageContributor / StaticAssetProvider)
     # ------------------------------------------------------------------
-
-    def get_web_pages(self):
-        from dynastore.extensions.tools.web_collect import collect_web_pages
-        return collect_web_pages(self)
-
-    def get_static_assets(self):
-        from dynastore.extensions.tools.web_collect import collect_static_assets
-        return collect_static_assets(self)
-
-    def get_notebooks(self):
-        try:
-            from .notebooks import build_contributions
-        except Exception:
-            return []
-        return build_contributions()
+    # get_web_pages / get_static_assets / get_notebooks / _serve_page_template
+    # are provided by OGCServiceMixin (static_dir above opts this service
+    # into the default wiring); only the @expose_static-decorated
+    # provide_static_files and the @expose_web_page-decorated browser page
+    # handler stay here.
 
     @expose_static("processes")
     def provide_static_files(self) -> List[str]:
@@ -1989,14 +1988,6 @@ class ProcessesService(ExtensionProtocol, OGCServiceMixin):
     )
     async def provide_processes_browser(self, request: Request):
         return await self._serve_page_template("processes_browser.html")
-
-    async def _serve_page_template(self, filename: str):
-        from dynastore._version import VERSION
-        file_path = os.path.join(os.path.dirname(__file__), "static", filename)
-        if not os.path.exists(file_path):
-            return Response(content=f"Template {filename} not found", status_code=404)
-        with open(file_path, "r", encoding="utf-8") as f:
-            return Response(content=f.read().replace("{{VERSION}}", VERSION), media_type="text/html")
 
 
 

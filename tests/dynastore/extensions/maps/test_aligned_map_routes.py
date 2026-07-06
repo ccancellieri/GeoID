@@ -424,7 +424,7 @@ class TestGetCollectionMapStyled:
 
 
 # ---------------------------------------------------------------------------
-# get_maps_landing_page — top-level landing page
+# ogc_landing_page_handler — top-level landing page (dataset-links override)
 # ---------------------------------------------------------------------------
 
 
@@ -433,6 +433,12 @@ def _make_cat(cid: str, ext: str | None = None) -> MagicMock:
     c.id = cid
     c.external_id = ext
     return c
+
+
+def _bare_maps_service() -> "ms.MapsService":
+    """A MapsService instance that never ran __init__ (avoids mutating the
+    class-level ``router`` singleton via register_ogc_standard_routes)."""
+    return ms.MapsService.__new__(ms.MapsService)
 
 
 class TestGetMapsLandingPage:
@@ -449,7 +455,7 @@ class TestGetMapsLandingPage:
         )
         monkeypatch.setattr(ms, "get_protocol", lambda _proto: svc)
 
-        result = await ms.MapsService.get_maps_landing_page(_mock_request())
+        result = await _bare_maps_service().ogc_landing_page_handler(_mock_request())
 
         dataset_links = [link for link in result.links if link.rel == "dataset"]
         hrefs = [link.href for link in dataset_links]

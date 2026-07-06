@@ -562,7 +562,15 @@ class OGCServiceMixin:
         )
         return JSONResponse(content=localize_model(landing_page, language))
 
-    def register_ogc_standard_routes(self, router: Optional[APIRouter] = None) -> None:
+    def register_ogc_standard_routes(
+        self,
+        router: Optional[APIRouter] = None,
+        *,
+        include_landing: bool = True,
+        include_conformance: bool = True,
+        landing_name: Optional[str] = None,
+        conformance_name: Optional[str] = None,
+    ) -> None:
         """Register the standard ``/`` and ``/conformance`` GET routes.
 
         Wires ``self.ogc_landing_page_handler``/``self.ogc_conformance_handler``
@@ -575,20 +583,33 @@ class OGCServiceMixin:
         ``response_model`` for each route comes from the ``landing_response_model``/
         ``conformance_response_model`` class attributes, so the OpenAPI schema
         stays protocol-specific even though the handlers are shared.
+
+        ``include_landing``/``include_conformance`` let a subclass migrate
+        only one of the two routes onto the shared handler — e.g. a service
+        that has no pre-existing landing page and doesn't want to introduce
+        one sets ``include_landing=False``. ``landing_name``/``conformance_name``
+        preserve a pre-existing FastAPI route ``name`` (relevant when other
+        handlers resolve that route via ``request.url_for(...)``); ``None``
+        (the default) leaves the name auto-derived from the handler, matching
+        prior behavior for every existing caller.
         """
         target_router = router if router is not None else self.router  # type: ignore[attr-defined]
-        target_router.add_api_route(
-            "/",
-            self.ogc_landing_page_handler,
-            methods=["GET"],
-            response_model=self.landing_response_model,
-        )
-        target_router.add_api_route(
-            "/conformance",
-            self.ogc_conformance_handler,
-            methods=["GET"],
-            response_model=self.conformance_response_model,
-        )
+        if include_landing:
+            target_router.add_api_route(
+                "/",
+                self.ogc_landing_page_handler,
+                methods=["GET"],
+                response_model=self.landing_response_model,
+                name=landing_name,
+            )
+        if include_conformance:
+            target_router.add_api_route(
+                "/conformance",
+                self.ogc_conformance_handler,
+                methods=["GET"],
+                response_model=self.conformance_response_model,
+                name=conformance_name,
+            )
 
     # ------------------------------------------------------------------
     # Web-nav listing helpers (catalog/collection {id, title, description})
