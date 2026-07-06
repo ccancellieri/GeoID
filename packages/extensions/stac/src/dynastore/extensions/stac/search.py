@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from pydantic import BaseModel, Field
 
-from dynastore.models.protocols import CatalogsProtocol
+from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
 from dynastore.models.query_builder import (
     FieldSelection,
     FilterCondition,
@@ -880,26 +880,74 @@ async def search_items(
         )
     ]
 
-    async def _check_layer_def(cid):
-        from dynastore.modules.storage.router import get_driver
-        from dynastore.modules.storage.routing_config import Operation
-        driver = await get_driver(Operation.READ, cat_id, cid)
-        return await driver.get_driver_config(
-            cat_id, cid, db_resource=db_resource
-        )
+    # Layer-config resolution (#2865 PG-fallback fix). `initial_collection_ids`
+    # can be the full auto-expanded catalog (a bare `/search`), so resolving
+    # the READ driver AND its layer config once PER COLLECTION reproduced the
+    # same O(collections) shape the merged ES-dispatch fix addressed for
+    # driver resolution alone (#2873) — thousands of sequential round trips on
+    # the single `db_resource` connection right after a large harvest.
+    #
+    # Mirrors that fix here, split the same way ``_maybe_dispatch_to_es_search``
+    # is: an explicitly-scoped request (``had_explicit_scope`` — bounded by
+    # what the caller asked for, never the whole catalog) keeps the original
+    # per-collection driver + config resolution unchanged. An auto-expanded
+    # scope resolves the READ driver ONCE at catalog level
+    # (``collection_id=None``); when that driver is the PostgreSQL items
+    # driver (the case this fix targets) every collection's layer config is
+    # fetched in ONE batched query (``ConfigsProtocol.get_configs_batch``)
+    # instead of one ``get_config`` round trip per collection. Any other
+    # driver class, or a missing ``ConfigsProtocol``, falls back to the
+    # original per-collection loop — ``get_driver_config`` is polymorphic
+    # per driver class, so the PG-shaped batch call would be wrong there.
+    from dynastore.modules.storage.router import get_driver
+    from dynastore.modules.storage.routing_config import Operation
 
     # Sequential — every check forwards the SAME `db_resource` (a live
     # asyncpg Connection); concurrent SELECTs over a single wire deadlock
     # asyncpg's single-stream protocol (regression observed in PRs #28,
-    # #32, #43).
-    results = [await _check_layer_def(cid) for cid in initial_collection_ids]
+    # #32, #43). `get_driver_config` is polymorphic per driver class
+    # (postgresql/bigquery/iceberg/duckdb each return their own config
+    # type), so this per-collection resolution is the only correct path
+    # for a non-PostgreSQL READ driver.
+    async def _check_layer_def(cid: str):
+        driver = await get_driver(Operation.READ, cat_id, cid)
+        return await driver.get_driver_config(cat_id, cid, db_resource=db_resource)
 
-    # Store configs map
-    collection_configs = {
-        initial_collection_ids[i]: config
-        for i, config in enumerate(results)
-        if config is not None
-    }
+    async def _per_collection_layer_defs() -> Dict[str, Any]:
+        results = [await _check_layer_def(cid) for cid in initial_collection_ids]
+        return {
+            initial_collection_ids[i]: config
+            for i, config in enumerate(results)
+            if config is not None
+        }
+
+    collection_configs: Dict[str, Any] = {}
+    if had_explicit_scope:
+        collection_configs = await _per_collection_layer_defs()
+    else:
+        # Auto-expanded (bare `/search`) scope: one catalog-level driver
+        # resolution — raises, same as the old per-collection loop, when no
+        # READ driver is configured for the catalog at all.
+        from dynastore.modules.storage.drivers.postgresql import ItemsPostgresqlDriver
+
+        catalog_driver = await get_driver(Operation.READ, cat_id, None)
+        configs = get_protocol(ConfigsProtocol)
+        if isinstance(catalog_driver, ItemsPostgresqlDriver) and configs is not None:
+            # The common case this fix targets: batch the config fetch
+            # instead of one round trip per collection.
+            from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
+            collection_configs = await configs.get_configs_batch(
+                ItemsPostgresqlDriverConfig, cat_id, initial_collection_ids,
+                ctx=DriverContext(db_resource=db_resource),
+            )
+        else:
+            # A non-PostgreSQL READ driver (BigQuery/Iceberg/DuckDB) — the
+            # batched fetch above assumes ItemsPostgresqlDriverConfig, which
+            # would be the wrong config type here — or ConfigsProtocol is
+            # unavailable. Fall back to the original per-collection loop
+            # rather than silently returning no results.
+            collection_configs = await _per_collection_layer_defs()
+
     target_collections = list(collection_configs.keys())
 
     if not target_collections:

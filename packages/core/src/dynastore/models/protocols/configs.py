@@ -27,7 +27,7 @@ side-by-side.  For single-instance configs ``ref_key == class_key`` and
 both APIs return the same row.
 """
 
-from typing import Protocol, Optional, Any, Dict, Tuple, Type, TypeVar, runtime_checkable, TYPE_CHECKING
+from typing import Protocol, Optional, Any, Dict, List, Tuple, Type, TypeVar, runtime_checkable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from dynastore.models.plugin_config import PluginConfig
@@ -60,6 +60,25 @@ class ConfigsProtocol(Protocol):
         2. Catalog (if provided)
         3. Platform (global)
         4. Code-level Defaults
+        """
+        ...
+
+    async def get_configs_batch(
+        self,
+        config_cls: Type[_T_Config],
+        catalog_id: str,
+        collection_ids: List[str],
+        ctx: Optional["DriverContext"] = None,
+    ) -> Dict[str, _T_Config]:
+        """Resolve ``config_cls`` for every id in ``collection_ids`` in a bounded
+        number of round trips instead of one ``get_config`` call per id.
+
+        Same base → catalog → collection waterfall as :meth:`get_config`, but
+        the catalog-tier work runs once and the collection-tier deltas are
+        fetched in a single batched query. Built for callers that must
+        resolve the same config class across many/most collections of a
+        catalog in one request (e.g. a PG-fallback search over an
+        auto-expanded collection scope) — see ``ConfigService.get_configs_batch``.
         """
         ...
 

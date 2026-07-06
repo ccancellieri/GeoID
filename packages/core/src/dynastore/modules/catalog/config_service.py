@@ -18,7 +18,7 @@
 
 import logging
 import json
-from typing import Optional, Dict, Any, Tuple, Type, Union
+from typing import Optional, Dict, Any, List, Tuple, Type, Union
 from dynastore.tools.cache import cached, DEFAULT_CONFIG_CACHE_TTL, DEFAULT_CONFIG_CACHE_L1_TTL
 from dynastore.modules.storage.router import invalidate_router_cache
 
@@ -451,6 +451,114 @@ class ConfigService(ConfigsProtocol):
         for delta in deltas:
             merged.update(delta)
         return _validate_stored_config(cls, merged)
+
+    async def get_configs_batch(
+        self,
+        config_cls: "Union[str, Type[PluginConfig]]",
+        catalog_id: str,
+        collection_ids: "List[str]",
+        ctx: Optional[DriverContext] = None,
+    ) -> "Dict[str, PluginConfig]":
+        """Resolve the same waterfall as :meth:`get_config` for many collections
+        of one catalog in a bounded number of round trips (#2865 PG-fallback
+        fix).
+
+        ``get_config`` called once per collection with ``ctx.db_resource`` set
+        bypasses the L1/L2 caches by design (a live connection means "read
+        through", e.g. inside an open transaction) and re-does the catalog-tier
+        work — physical-schema resolution, table-existence checks, catalog
+        delta fetch — on every call even though none of it varies by
+        collection. For a large catalog (thousands of collections) that is
+        thousands of redundant round trips on a single connection.
+
+        This fetches the catalog-tier delta ONCE and the collection-tier
+        deltas for every id in ``collection_ids`` in a SINGLE
+        ``collection_id = ANY(...)`` query, then applies the identical
+        base → catalog → collection merge :meth:`get_config` uses. Only
+        meaningful when ``ctx.db_resource`` is set; without it, per-collection
+        resolution already goes through the (cheap, already-cached)
+        ``get_collection_config_internal_cached`` path.
+
+        Returns a config for every id in ``collection_ids`` (never partial).
+        """
+        cls, class_key = _resolve(config_cls)
+        db_resource = ctx.db_resource if ctx else None
+
+        base = await self._get_platform_config_service().get_config(
+            cls, ctx=DriverContext(db_resource=db_resource) if db_resource else None
+        )
+
+        from dynastore.modules.catalog.config_snapshot import (
+            resolve_catalog_snapshot_base,
+        )
+        snap_base = await resolve_catalog_snapshot_base(
+            cls, catalog_id, self.get_catalog_defaults_snapshot,
+        )
+        if snap_base is not None:
+            base = snap_base
+
+        catalog_delta: Optional[dict] = None
+        collection_delta_by_id: Dict[str, dict] = {}
+
+        if not db_resource:
+            catalog_delta = await self.get_catalog_config_internal_cached(catalog_id, class_key)
+            for cid in collection_ids:
+                delta = await self.get_collection_config_internal_cached(
+                    catalog_id, cid, class_key
+                )
+                if delta:
+                    collection_delta_by_id[cid] = delta
+        else:
+            async with managed_transaction(db_resource) as conn:
+                phys_schema = await self._get_catalog_manager().resolve_physical_schema(
+                    catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True,
+                )
+                if phys_schema:
+                    if await check_table_exists(conn, CATALOG_CONFIGS_TABLE, phys_schema):
+                        catalog_delta = await _cq.select_catalog_config(phys_schema).execute(
+                            conn, ref_key=class_key,
+                        )
+                    if collection_ids and await check_table_exists(
+                        conn, COLLECTION_CONFIGS_TABLE, phys_schema
+                    ):
+                        internal_to_external: Dict[str, str] = {}
+                        internal_ids: List[str] = []
+                        for cid in collection_ids:
+                            try:
+                                resolved = await (
+                                    self._get_catalog_manager().collections.resolve_collection_ids(
+                                        catalog_id, cid, allow_missing=True,
+                                    )
+                                )
+                                internal_id = resolved.id
+                            except Exception:
+                                internal_id = cid
+                            internal_ids.append(internal_id)
+                            internal_to_external[internal_id] = cid
+                        rows = await _cq.select_collection_configs_batch(phys_schema).execute(
+                            conn, collection_ids=internal_ids, ref_key=class_key,
+                        )
+                        for row in rows:
+                            raw_id: str = row["collection_id"]
+                            ext_id: str = internal_to_external.get(raw_id, raw_id)
+                            collection_delta_by_id[ext_id] = row["config_data"]
+
+        result: Dict[str, PluginConfig] = {}
+        base_dump: Optional[Dict[str, Any]] = None
+        for cid in collection_ids:
+            delta = collection_delta_by_id.get(cid)
+            if not catalog_delta and not delta:
+                result[cid] = base
+                continue
+            if base_dump is None:
+                base_dump = base.model_dump(mode="python")
+            merged = dict(base_dump)
+            if catalog_delta:
+                merged.update(catalog_delta)
+            if delta:
+                merged.update(delta)
+            result[cid] = _validate_stored_config(cls, merged)
+        return result
 
     async def _internal_catalog_id(self, catalog_id: str) -> str:
         """Normalize ``catalog_id`` to its immutable internal id for cache keys.
