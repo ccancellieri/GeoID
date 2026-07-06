@@ -243,16 +243,19 @@ def _reset_caches():
         fetch_collection_bbox,
         fetch_distinct_region_ids,
         fetch_region_ids_by_unique_id,
+        fetch_region_mapping_cardinality,
     )
     from dynastore.tools.cache import cache_clear
 
     cache_clear(fetch_collection_bbox)
     cache_clear(fetch_distinct_region_ids)
     cache_clear(fetch_region_ids_by_unique_id)
+    cache_clear(fetch_region_mapping_cardinality)
     yield
     cache_clear(fetch_collection_bbox)
     cache_clear(fetch_distinct_region_ids)
     cache_clear(fetch_region_ids_by_unique_id)
+    cache_clear(fetch_region_mapping_cardinality)
 
 
 @pytest.mark.asyncio
@@ -460,6 +463,104 @@ async def test_fetch_region_ids_by_unique_id_columnar_rejects_undeclared_unique_
 
     values = await claims.fetch_region_ids_by_unique_id("fao", "countries", "adm0_code", "FID")
     assert values == []
+
+
+# ---------------------------------------------------------------------------
+# fetch_region_mapping_cardinality / validate_region_mapping_stats -- the
+# misconfiguration-detection signal behind GET .../validate and region.json's
+# exclusion of unsound mappings. Only guard clauses are unit-tested here for
+# the fetch side; the query itself is covered by a real-PG integration test.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fetch_region_mapping_cardinality_no_protocols_returns_zeros(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dynastore.extensions.region_mapping import claims
+
+    monkeypatch.setattr(claims, "get_protocol", _protocol_router())
+
+    stats = await claims.fetch_region_mapping_cardinality("fao", "countries", "adm0_code", "FID")
+    assert stats == {"feature_count": 0, "distinct_region_count": 0, "distinct_unique_id_count": 0}
+
+
+@pytest.mark.asyncio
+async def test_fetch_region_mapping_cardinality_no_physical_table_returns_zeros(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dynastore.extensions.region_mapping import claims
+    from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
+
+    catalogs = _StubCatalogs()
+    configs = _StubConfigs(ItemsPostgresqlDriverConfig())
+    monkeypatch.setattr(
+        claims, "get_protocol", _protocol_router(catalogs=catalogs, configs=configs),
+    )
+
+    stats = await claims.fetch_region_mapping_cardinality("fao", "countries", "adm0_code", "FID")
+    assert stats["feature_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_fetch_region_mapping_cardinality_columnar_rejects_undeclared_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dynastore.extensions.region_mapping import claims
+
+    catalogs = _StubCatalogs()
+    configs = _StubConfigs(_columnar_col_config(["adm0_code"]))  # "FID" not declared
+    monkeypatch.setattr(
+        claims, "get_protocol", _protocol_router(catalogs=catalogs, configs=configs),
+    )
+
+    stats = await claims.fetch_region_mapping_cardinality("fao", "countries", "adm0_code", "FID")
+    assert stats == {"feature_count": 0, "distinct_region_count": 0, "distinct_unique_id_count": 0}
+
+
+def test_validate_region_mapping_stats_sound_mapping_has_no_reasons() -> None:
+    from dynastore.extensions.region_mapping.claims import validate_region_mapping_stats
+
+    reasons = validate_region_mapping_stats(
+        {"feature_count": 10, "distinct_region_count": 10, "distinct_unique_id_count": 10},
+    )
+    assert reasons == []
+
+
+def test_validate_region_mapping_stats_flags_duplicate_region_codes() -> None:
+    """E.g. an admin-1 collection (many features per country) claimed under
+    an ISO3 country-code column -- exactly the ambiguous-region-mapping case
+    from the live gaul_demo_gaul_level_1 mapping."""
+    from dynastore.extensions.region_mapping.claims import validate_region_mapping_stats
+
+    reasons = validate_region_mapping_stats(
+        {"feature_count": 3102, "distinct_region_count": 200, "distinct_unique_id_count": 3102},
+    )
+    assert len(reasons) == 1
+    assert "regionProp is not unique per feature" in reasons[0]
+
+
+def test_validate_region_mapping_stats_flags_duplicate_unique_ids() -> None:
+    from dynastore.extensions.region_mapping.claims import validate_region_mapping_stats
+
+    reasons = validate_region_mapping_stats(
+        {"feature_count": 10, "distinct_region_count": 10, "distinct_unique_id_count": 4},
+    )
+    assert len(reasons) == 1
+    assert "uniqueIdProp is not unique per feature" in reasons[0]
+
+
+def test_validate_region_mapping_stats_zero_features_short_circuits() -> None:
+    """Zero matching features is its own single reason -- it must not also
+    report duplicate-code/duplicate-id findings computed from a 0-by-0
+    ratio, which would be meaningless noise."""
+    from dynastore.extensions.region_mapping.claims import validate_region_mapping_stats
+
+    reasons = validate_region_mapping_stats(
+        {"feature_count": 0, "distinct_region_count": 0, "distinct_unique_id_count": 0},
+    )
+    assert len(reasons) == 1
+    assert "No features have non-null values" in reasons[0]
 
 
 # ---------------------------------------------------------------------------

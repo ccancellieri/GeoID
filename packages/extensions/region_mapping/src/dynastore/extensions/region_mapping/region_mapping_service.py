@@ -32,9 +32,12 @@ Routes:
 * ``POST   /region-mappings``                           -- register/re-apply a mapping
 * ``DELETE /region-mappings/{mapping_id}``               -- revoke a mapping (all its claims)
 * ``GET    /region-mappings``                            -- list claim rows (CQL2 filter)
-* ``GET    /region-mappings/region.json``                -- ``{"regionWmsMap": {...}}``
-* ``GET    /region-mappings/{mapping_id}/regionIds``      -- sorted distinct values
-* ``GET    /region-mappings/{mapping_id}/regionIds.csv``  -- same values, as a downloadable CSV
+* ``GET    /region-mappings/region.json``                -- ``{"regionWmsMap": {...}}``,
+  silently excluding any mapping whose regionProp/uniqueIdProp don't identify
+  one feature per code (see ``/validate`` below)
+* ``GET    /region-mappings/{mapping_id}/validate``       -- reasons a mapping is (not) sound
+* ``GET    /region-mappings/{mapping_id}/regionIds``      -- feature-positional values (TerriaJS's regionIdsFile)
+* ``GET    /region-mappings/{mapping_id}/regionIds.csv``  -- sorted distinct values, as a downloadable CSV
 
 REGISTRATION IS PUBLICATION -- unchanged from dynastore#443. Applying a
 mapping via ``POST`` is an explicit decision to publish, to anyone who can
@@ -85,6 +88,8 @@ from .claims import (
     fetch_collection_bbox,
     fetch_distinct_region_ids,
     fetch_region_ids_by_unique_id,
+    fetch_region_mapping_cardinality,
+    validate_region_mapping_stats,
 )
 from .config import RegionMappingConfig
 from .lifecycle import register_region_mapping_cleanup_subscriber
@@ -202,6 +207,15 @@ class ClaimListResponse(BaseModel):
     offset: int
 
 
+class MappingValidationResponse(BaseModel):
+    mapping_id: str
+    valid: bool
+    reasons: List[str]
+    feature_count: int
+    distinct_region_count: int
+    distinct_unique_id_count: int
+
+
 # ---------------------------------------------------------------------------
 # CQL2 helper
 # ---------------------------------------------------------------------------
@@ -314,13 +328,30 @@ async def _build_definitions(
 
     entries = []
     for mapping_id, record in page:
-        claim_records = await _store.fetch_claims_for_mapping(mapping_id)
-        aliases = sorted({c["claim"] for c in claim_records if c.get("claim")})
-
         src_catalog = record.get("src_catalog", "")
         src_collection = record.get("src_collection", "")
         region_prop = record.get("region_prop", "")
+        unique_id_prop = record.get("unique_id_prop") or "FID"
+
+        stats = await fetch_region_mapping_cardinality(
+            src_catalog, src_collection, region_prop, unique_id_prop,
+        )
+        reasons = validate_region_mapping_stats(stats)
+        if reasons:
+            logger.warning(
+                "region_mapping: excluding %r from region.json -- %s",
+                mapping_id, "; ".join(reasons),
+            )
+            continue
+
         title = resolve_localized(record.get("title"), language) or src_collection
+
+        claim_records = await _store.fetch_claims_for_mapping(mapping_id)
+        region_prop_ci = region_prop.casefold()
+        aliases = sorted({
+            c["claim"] for c in claim_records
+            if c.get("claim") and c["claim"].casefold() != region_prop_ci
+        })
 
         bbox = await fetch_collection_bbox(src_catalog, src_collection)
 
@@ -341,7 +372,7 @@ async def _build_definitions(
             "server_min_zoom": record.get("server_min_zoom", 0),
             "server_max_native_zoom": record.get("server_max_native_zoom", 12),
             "server_max_zoom": record.get("server_max_zoom", 28),
-            "unique_id_prop": record.get("unique_id_prop") or "FID",
+            "unique_id_prop": unique_id_prop,
             "digits": record.get("digits", 255),
         })
     return render_definitions(entries)
@@ -519,12 +550,44 @@ class RegionMappingService(ExtensionProtocol):
         )
 
     # -------------------------------------------------------------------
+    # GET /region-mappings/{mapping_id}/validate
+    # -------------------------------------------------------------------
+
+    @router.get(
+        "/{mapping_id}/validate",
+        summary="Diagnose why a registered mapping is (or isn't) sound for TerriaJS.",
+    )
+    async def validate_mapping(mapping_id: str):  # type: ignore[reportGeneralTypeIssues]
+        """Report whether ``regionProp``/``uniqueIdProp`` identify one
+        feature per code in the mapping's source collection.
+
+        A mapping failing this check is silently excluded from
+        ``GET /region-mappings/region.json`` -- this endpoint is how to see
+        why.
+        """
+        record = await _store.fetch_mapping_primary(mapping_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404, detail=f"Region mapping {mapping_id!r} not found.",
+            )
+        region_prop = record.get("region_prop", "")
+        unique_id_prop = record.get("unique_id_prop") or "FID"
+        stats = await fetch_region_mapping_cardinality(
+            record.get("src_catalog", ""), record.get("src_collection", ""),
+            region_prop, unique_id_prop,
+        )
+        reasons = validate_region_mapping_stats(stats)
+        return MappingValidationResponse(
+            mapping_id=mapping_id, valid=not reasons, reasons=reasons, **stats,
+        )
+
+    # -------------------------------------------------------------------
     # GET /region-mappings/{mapping_id}/regionIds
     # -------------------------------------------------------------------
 
     @router.get(
         "/{mapping_id}/regionIds",
-        summary="Sorted distinct region id values for a registered mapping.",
+        summary="Feature-positional region id values for TerriaJS's regionIdsFile fetch.",
     )
     async def get_region_ids(mapping_id: str):  # type: ignore[reportGeneralTypeIssues]
         """Return ``{"layer", "property", "values"}`` for TerriaJS's regionIds fetch."""

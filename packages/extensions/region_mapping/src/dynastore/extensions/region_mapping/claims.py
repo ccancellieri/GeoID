@@ -385,3 +385,121 @@ async def fetch_region_ids_by_unique_id(
     for idx, region_value in indexed:
         ordered[idx] = region_value
     return ordered
+
+
+_EMPTY_CARDINALITY: Dict[str, int] = {
+    "feature_count": 0, "distinct_region_count": 0, "distinct_unique_id_count": 0,
+}
+
+
+@cached(maxsize=128, ttl=120, namespace="region_mapping_cardinality")
+async def fetch_region_mapping_cardinality(
+    src_catalog: str, src_collection: str, region_prop: str, unique_id_prop: str,
+) -> Dict[str, int]:
+    """Feature count vs. distinct-value counts of ``region_prop`` and
+    ``unique_id_prop`` in the source collection.
+
+    The cardinality signal :func:`validate_region_mapping_stats` uses to
+    detect a misconfigured mapping: either column repeating a value across
+    more features than there are distinct values means that column can't
+    identify one feature per code. Returns all zeros when the source
+    collection/columns can't be resolved.
+    """
+    catalogs = get_protocol(CatalogsProtocol)
+    configs = get_protocol(ConfigsProtocol)
+    if catalogs is None or configs is None:
+        return dict(_EMPTY_CARDINALITY)
+
+    phys_schema = await catalogs.resolve_physical_schema(src_catalog, allow_missing=True)
+    col_config = await configs.get_config(
+        ItemsPostgresqlDriverConfig,
+        catalog_id=src_catalog,
+        collection_id=src_collection,
+    )
+    phys_table = col_config.physical_table
+    if not phys_schema or not phys_table:
+        return dict(_EMPTY_CARDINALITY)
+
+    attrs_config = _find_attributes_sidecar(col_config)
+    if attrs_config is None:
+        return dict(_EMPTY_CARDINALITY)
+    attrs_sidecar = SidecarRegistry.get_sidecar(attrs_config, lenient=True)
+    if not isinstance(attrs_sidecar, FeatureAttributeSidecar):
+        return dict(_EMPTY_CARDINALITY)
+
+    schema = validate_sql_identifier(phys_schema)
+    hub_table = validate_sql_identifier(phys_table)
+    attrs_table = validate_sql_identifier(
+        sidecar_table_name(phys_table, attrs_config.sidecar_id)
+    )
+
+    params: Dict[str, Any] = {}
+    if attrs_sidecar.resolved_storage_mode == AttributeStorageMode.COLUMNAR:
+        declared = {attr.name for attr in (attrs_config.attribute_schema or [])}
+        if region_prop not in declared or unique_id_prop not in declared:
+            return dict(_EMPTY_CARDINALITY)
+        region_expr = f's."{validate_column_identifier(region_prop)}"'
+        fid_expr = f's."{validate_column_identifier(unique_id_prop)}"'
+    else:
+        jsonb_col = validate_column_identifier(attrs_config.jsonb_column_name)
+        region_expr = f's."{jsonb_col}" ->> :region_prop'
+        fid_expr = f's."{jsonb_col}" ->> :unique_id_prop'
+        params["region_prop"] = region_prop
+        params["unique_id_prop"] = unique_id_prop
+
+    sql = (
+        f'SELECT COUNT(*) AS feature_count, '
+        f'COUNT(DISTINCT {region_expr}) AS distinct_region_count, '
+        f'COUNT(DISTINCT {fid_expr}) AS distinct_unique_id_count '
+        f'FROM "{schema}"."{hub_table}" h '
+        f'JOIN "{schema}"."{attrs_table}" s ON s.geoid = h.geoid '
+        f'WHERE h.deleted_at IS NULL AND {region_expr} IS NOT NULL AND {fid_expr} IS NOT NULL'
+    )
+
+    engine = get_engine()
+    if engine is None:
+        return dict(_EMPTY_CARDINALITY)
+    async with managed_transaction(
+        engine, acquire_timeout=await _read_live_fg_acquire_timeout()
+    ) as conn:
+        row = await DQLQuery(sql, result_handler=ResultHandler.ONE_DICT).execute(conn, **params)
+    if not row:
+        return dict(_EMPTY_CARDINALITY)
+    return {
+        "feature_count": int(row["feature_count"] or 0),
+        "distinct_region_count": int(row["distinct_region_count"] or 0),
+        "distinct_unique_id_count": int(row["distinct_unique_id_count"] or 0),
+    }
+
+
+def validate_region_mapping_stats(stats: Dict[str, int]) -> List[str]:
+    """Human-readable reasons ``stats`` (from
+    :func:`fetch_region_mapping_cardinality`) describes a misconfigured
+    mapping. Empty list means the mapping is sound."""
+    feature_count = stats.get("feature_count", 0)
+    reasons: List[str] = []
+    if feature_count == 0:
+        reasons.append(
+            "No features have non-null values for both regionProp and "
+            "uniqueIdProp -- the source collection/columns may be wrong, "
+            "or every value is missing."
+        )
+        return reasons
+    distinct_region_count = stats.get("distinct_region_count", 0)
+    if distinct_region_count < feature_count:
+        reasons.append(
+            f"regionProp is not unique per feature: {feature_count} features share only "
+            f"{distinct_region_count} distinct values. TerriaJS will highlight every "
+            "feature carrying a given code whenever that code appears in a CSV row, "
+            "instead of exactly one -- register a column with one distinct value per "
+            "feature (e.g. an admin-1 code on an admin-1 collection, not a country code)."
+        )
+    distinct_unique_id_count = stats.get("distinct_unique_id_count", 0)
+    if distinct_unique_id_count < feature_count:
+        reasons.append(
+            f"uniqueIdProp is not unique per feature: {feature_count} features share only "
+            f"{distinct_unique_id_count} distinct values. The regionIds array is positioned "
+            "by this column, so features sharing a value silently overwrite each other's "
+            "region code."
+        )
+    return reasons

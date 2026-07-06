@@ -55,6 +55,22 @@ def _app(monkeypatch: pytest.MonkeyPatch, catalogs: Any, engine: Any = object())
     return app
 
 
+@pytest.fixture(autouse=True)
+def _default_sound_mapping_cardinality(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every ``region.json``/``_build_definitions`` test predates the
+    per-mapping cardinality check -- default it to "sound" (one feature per
+    code) so existing tests keep exercising what they were written for.
+    Tests of the exclusion behavior itself override this per-test."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    monkeypatch.setattr(
+        svc, "fetch_region_mapping_cardinality",
+        AsyncMock(return_value={
+            "feature_count": 1, "distinct_region_count": 1, "distinct_unique_id_count": 1,
+        }),
+    )
+
+
 # ---------------------------------------------------------------------------
 # POST /region-mappings
 # ---------------------------------------------------------------------------
@@ -324,11 +340,90 @@ async def test_definitions_shape_and_prefixed_alias(monkeypatch: pytest.MonkeyPa
     # to be a numeric, zero-based, sequential feature index, so defaulting
     # it to a string region code breaks matching.
     assert entry["uniqueIdProp"] == "FID"
-    assert set(entry["aliases"]) == {"country", "adm0_code", "fao_country"}
+    # regionProp's own value is never repeated inside aliases -- TerriaJS
+    # already matches it via the "regionProp" field.
+    assert set(entry["aliases"]) == {"country", "fao_country"}
     assert entry["bbox"] == [10.0, 20.0, 30.0, 40.0]
     assert entry["regionIdsFile"].endswith("/region-mappings/fao_countries/regionIds")
     assert "{z}/{x}/{y}.mvt" in entry["server"]
     assert "collections=countries" in entry["server"]
+
+
+@pytest.mark.asyncio
+async def test_definitions_excludes_mapping_with_duplicate_region_codes(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A mapping whose regionProp repeats across features (e.g. an ISO3
+    claim on an admin-1 collection) never reaches region.json -- TerriaJS
+    can't tell its features apart by that code, so publishing it there is
+    actively misleading. GET .../validate is how to see why."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    app = _app(monkeypatch, _StubCatalogs({}))
+
+    primary = {
+        "mapping_id": "gaul_demo_gaul_level_1", "claim": "iso3", "src_catalog": "gaul_demo",
+        "src_collection": "gaul_level_1", "region_prop": "ISO3_CODE", "title": "GAUL level 1",
+    }
+    monkeypatch.setattr(svc._store, "fetch_primary_records", AsyncMock(return_value=[primary]))
+    monkeypatch.setattr(
+        svc, "fetch_region_mapping_cardinality",
+        AsyncMock(return_value={
+            "feature_count": 3102, "distinct_region_count": 200, "distinct_unique_id_count": 3102,
+        }),
+    )
+
+    transport = ASGITransport(app=app)
+    with caplog.at_level("WARNING"):
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/region-mappings/region.json")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"regionWmsMap": {}}
+    assert "gaul_demo_gaul_level_1" in caplog.text
+    assert "regionProp is not unique per feature" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_definitions_keeps_sound_mappings_alongside_excluded_ones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One unsound mapping among several must not take down the rest of
+    region.json -- each mapping's cardinality is judged independently."""
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    app = _app(monkeypatch, _StubCatalogs({}))
+
+    sound = {
+        "mapping_id": "fao_countries", "claim": "country", "src_catalog": "fao",
+        "src_collection": "countries", "region_prop": "adm0_code", "title": "Countries",
+    }
+    unsound = {
+        "mapping_id": "gaul_demo_gaul_level_1", "claim": "iso3", "src_catalog": "gaul_demo",
+        "src_collection": "gaul_level_1", "region_prop": "ISO3_CODE", "title": "GAUL level 1",
+    }
+    monkeypatch.setattr(
+        svc._store, "fetch_primary_records", AsyncMock(return_value=[sound, unsound]),
+    )
+    monkeypatch.setattr(svc._store, "fetch_claims_for_mapping", AsyncMock(return_value=[]))
+    monkeypatch.setattr(svc, "fetch_collection_bbox", AsyncMock(return_value=[0.0, 0.0, 1.0, 1.0]))
+
+    async def _cardinality(src_catalog: str, *_args: Any, **_kwargs: Any) -> Dict[str, int]:
+        if src_catalog == "gaul_demo":
+            return {
+                "feature_count": 3102, "distinct_region_count": 200,
+                "distinct_unique_id_count": 3102,
+            }
+        return {"feature_count": 1, "distinct_region_count": 1, "distinct_unique_id_count": 1}
+
+    monkeypatch.setattr(svc, "fetch_region_mapping_cardinality", _cardinality)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/region-mappings/region.json")
+
+    assert resp.status_code == 200
+    assert list(resp.json()["regionWmsMap"].keys()) == ["fao_countries"]
 
 
 def test_default_maps_base_url_swaps_last_path_segment_for_maps() -> None:
@@ -468,6 +563,90 @@ async def test_definitions_with_cql_filter_bypasses_cache(monkeypatch: pytest.Mo
     assert resp.status_code == 200
     cached_fetch.assert_not_called()
     uncached.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# GET /region-mappings/{mapping_id}/validate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_validate_mapping_sound_returns_valid_true_and_no_reasons(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    app = _app(monkeypatch, _StubCatalogs({}))
+    monkeypatch.setattr(
+        svc._store, "fetch_mapping_primary",
+        AsyncMock(return_value={
+            "src_catalog": "fao", "src_collection": "countries",
+            "region_prop": "adm0_code", "unique_id_prop": "FID",
+        }),
+    )
+    monkeypatch.setattr(
+        svc, "fetch_region_mapping_cardinality",
+        AsyncMock(return_value={
+            "feature_count": 200, "distinct_region_count": 200, "distinct_unique_id_count": 200,
+        }),
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/region-mappings/fao_countries/validate")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {
+        "mapping_id": "fao_countries", "valid": True, "reasons": [],
+        "feature_count": 200, "distinct_region_count": 200, "distinct_unique_id_count": 200,
+    }
+
+
+@pytest.mark.asyncio
+async def test_validate_mapping_unsound_returns_valid_false_with_reasons(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    app = _app(monkeypatch, _StubCatalogs({}))
+    monkeypatch.setattr(
+        svc._store, "fetch_mapping_primary",
+        AsyncMock(return_value={
+            "src_catalog": "gaul_demo", "src_collection": "gaul_level_1",
+            "region_prop": "ISO3_CODE", "unique_id_prop": "FID",
+        }),
+    )
+    monkeypatch.setattr(
+        svc, "fetch_region_mapping_cardinality",
+        AsyncMock(return_value={
+            "feature_count": 3102, "distinct_region_count": 200, "distinct_unique_id_count": 3102,
+        }),
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/region-mappings/gaul_demo_gaul_level_1/validate")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["valid"] is False
+    assert len(body["reasons"]) == 1
+    assert "regionProp is not unique per feature" in body["reasons"][0]
+
+
+@pytest.mark.asyncio
+async def test_validate_mapping_unknown_returns_404(monkeypatch: pytest.MonkeyPatch) -> None:
+    from dynastore.extensions.region_mapping import region_mapping_service as svc
+
+    app = _app(monkeypatch, _StubCatalogs({}))
+    monkeypatch.setattr(svc._store, "fetch_mapping_primary", AsyncMock(return_value=None))
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/region-mappings/does-not-exist/validate")
+
+    assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------
