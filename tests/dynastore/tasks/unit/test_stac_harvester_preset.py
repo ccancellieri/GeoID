@@ -149,7 +149,7 @@ async def test_preset_apply_explicit_target_catalog_overrides_scope() -> None:
 
 @pytest.mark.asyncio
 async def test_preset_apply_maps_all_params() -> None:
-    """Custom max_collections / max_items / with_assets / drivers are forwarded."""
+    """Custom harvest parameters are forwarded."""
     from dynastore.extensions.stac.presets.stac_harvester import (
         STAC_HARVESTER_PRESET,
         StacHarvesterParams,
@@ -167,6 +167,7 @@ async def test_preset_apply_maps_all_params() -> None:
         max_collections=5,
         max_items=100,
         with_assets=False,
+        skip_empty_collections=True,
         drivers="pg_es",
     )
 
@@ -180,6 +181,7 @@ async def test_preset_apply_maps_all_params() -> None:
     assert inp["max_collections"] == 5
     assert inp["max_items"] == 100
     assert inp["with_assets"] is False
+    assert inp["skip_empty_collections"] is True
     assert inp["drivers"] == "pg_es"
 
 
@@ -563,6 +565,7 @@ def test_harvest_request_default_drivers_is_es() -> None:
         target_catalog="my-cat",
     )
     assert req.drivers == RoutingDrivers.ES
+    assert req.skip_empty_collections is False
 
 
 def test_harvest_request_legacy_storage_backend_maps_to_drivers() -> None:
@@ -585,6 +588,7 @@ def test_preset_params_default_drivers_is_es() -> None:
 
     p = StacHarvesterParams(url="https://example.test/stac")
     assert p.drivers == RoutingDrivers.ES
+    assert p.skip_empty_collections is False
 
 
 @pytest.mark.asyncio

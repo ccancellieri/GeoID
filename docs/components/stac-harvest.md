@@ -75,7 +75,16 @@ can be rejected by the gateway before it reaches the service.
 | `max_collections` | integer | `0` | Maximum source collections to harvest (`0` = all). |
 | `max_items` | integer | `0` | Maximum items per collection (`0` = all). |
 | `with_assets` | boolean | `true` | Register each item asset `href` as a virtual asset (stores only the href). |
+| `skip_empty_collections` | boolean | `false` | When `true`, probe each source collection's item stream before creating local collection metadata and skip collections that yield no items. |
 | `storage_backend` | `es` \| `es_pg` \| `pg` | `es` | Item storage routing for the target catalog (see below). |
+
+`skip_empty_collections` is useful when a source catalog advertises many
+collections that currently have no item pages. The harvester still counts those
+collections as seen, so `max_collections` remains a source-collection limit, but
+it does not create local collection records for them. A source page-fetch failure
+is not treated as empty; in that case the harvester keeps the existing
+collection-write behavior so a transient source problem is visible instead of
+silently skipped.
 
 ### `storage_backend` — the routing preset
 

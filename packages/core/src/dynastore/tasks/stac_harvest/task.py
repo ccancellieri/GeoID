@@ -297,6 +297,7 @@ def virtual_assets_for(feature: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
 class HarvestStats:
     collections_seen: int = 0
     collections_written: int = 0
+    collections_skipped_empty: int = 0
     items_written: int = 0
     items_failed: int = 0
     virtual_assets_written: int = 0
@@ -812,6 +813,48 @@ async def _harvest_collection(
         await _persist_harvest_cursor(engine, task_id, source_collection_id, None, True)
 
 
+async def _prepend_item(
+    first: Dict[str, Any],
+    rest: AsyncIterator[Dict[str, Any]],
+) -> AsyncIterator[Dict[str, Any]]:
+    yield first
+    async for item in rest:
+        yield item
+
+
+async def _skip_empty_collection_if_requested(
+    request: StacHarvestRequest,
+    items_iter: AsyncIterator[Dict[str, Any]],
+    target_collection: str,
+    stats: HarvestStats,
+    *,
+    source_collection_id: str,
+    page_cursor: Optional[PageCursor] = None,
+    engine: Any = None,
+    task_id: Any = None,
+) -> Optional[AsyncIterator[Dict[str, Any]]]:
+    """Return an item iterator, or ``None`` when an empty source is skipped."""
+    if not request.skip_empty_collections:
+        return items_iter
+
+    try:
+        first = await anext(items_iter)
+    except StopAsyncIteration:
+        if page_cursor is not None and page_cursor.truncated:
+            return items_iter
+        stats.collections_skipped_empty += 1
+        logger.info(
+            "stac_harvest: skipping empty source collection %s → %s",
+            source_collection_id, target_collection,
+        )
+        await _persist_harvest_cursor(
+            engine, task_id, source_collection_id, None, True
+        )
+        return None
+
+    return _prepend_item(first, items_iter)
+
+
 async def run_harvest(
     request: StacHarvestRequest,
     catalogs: Any,
@@ -899,6 +942,13 @@ async def run_harvest(
                 "stac_harvest: resuming %s items walk from persisted cursor.",
                 target_col,
             )
+        items_iter = await _skip_empty_collection_if_requested(
+            request, items_iter, target_col, stats,
+            source_collection_id=source_col_id, page_cursor=page_cursor,
+            engine=engine, task_id=task_id,
+        )
+        if items_iter is None:
+            return stats
         await _harvest_collection(
             catalogs, request, source_coll, items_iter, target_col, stats,
             source_collection_id=source_col_id, engine=engine, task_id=task_id,
@@ -960,6 +1010,13 @@ async def run_harvest(
                 "stac_harvest: resuming %s items walk from persisted cursor.",
                 cid,
             )
+        items_iter = await _skip_empty_collection_if_requested(
+            request, items_iter, cid, stats,
+            source_collection_id=source_cid, page_cursor=page_cursor,
+            engine=engine, task_id=task_id,
+        )
+        if items_iter is None:
+            continue
         await _harvest_collection(
             catalogs, request, coll_raw, items_iter, cid, stats,
             source_collection_id=source_cid, engine=engine, task_id=task_id,
@@ -1075,10 +1132,12 @@ class StacHarvestTask(
 
         logger.info(
             "stac_harvest: finished — drivers=%s collections=%d/%d "
-            "items_written=%d items_failed=%d virtual_assets=%d errors=%d",
+            "skipped_empty=%d items_written=%d items_failed=%d "
+            "virtual_assets=%d errors=%d",
             request.drivers.value,
             stats.collections_written,
             stats.collections_seen,
+            stats.collections_skipped_empty,
             stats.items_written,
             stats.items_failed,
             stats.virtual_assets_written,
@@ -1090,6 +1149,7 @@ class StacHarvestTask(
 
         summary = (
             f"collections={stats.collections_written}/{stats.collections_seen} "
+            f"skipped_empty={stats.collections_skipped_empty} "
             f"items_written={stats.items_written} items_failed={stats.items_failed} "
             f"virtual_assets={stats.virtual_assets_written} "
             f"errors={len(stats.errors)} "
@@ -1113,6 +1173,7 @@ class StacHarvestTask(
             "message": summary,
             "collections_written": stats.collections_written,
             "collections_seen": stats.collections_seen,
+            "collections_skipped_empty": stats.collections_skipped_empty,
             "items_written": stats.items_written,
             "items_failed": stats.items_failed,
             "virtual_assets_written": stats.virtual_assets_written,

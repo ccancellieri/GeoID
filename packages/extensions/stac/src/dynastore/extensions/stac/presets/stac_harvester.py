@@ -124,6 +124,13 @@ class StacHarvesterParams(BaseModel):
             "(dynastore stores only the href, never the bytes)."
         ),
     )
+    skip_empty_collections: bool = Field(
+        default=False,
+        description=(
+            "When True, skip source collections whose item stream yields no "
+            "items instead of creating empty local collection metadata."
+        ),
+    )
     drivers: RoutingDrivers = Field(
         default=RoutingDrivers.ES,
         description=(
@@ -243,6 +250,7 @@ class _StacHarvesterPreset:
                         "max_collections": p.max_collections,
                         "max_items": p.max_items,
                         "with_assets": p.with_assets,
+                        "skip_empty_collections": p.skip_empty_collections,
                         "drivers": p.drivers.value,
                     },
                 },
@@ -347,6 +355,7 @@ class _StacHarvesterPreset:
             "max_collections": p.max_collections,
             "max_items": p.max_items,
             "with_assets": p.with_assets,
+            "skip_empty_collections": p.skip_empty_collections,
             "drivers": p.drivers.value,
         }
 

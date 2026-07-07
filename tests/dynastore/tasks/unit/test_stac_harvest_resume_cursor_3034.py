@@ -350,6 +350,79 @@ async def test_catalog_walk_raises_when_resume_point_never_found():
             )
 
 
+@pytest.mark.asyncio
+async def test_skip_empty_resumed_collection_marks_done_and_continues():
+    """When a retry resumes onto a collection whose remaining item walk yields
+    nothing, skip_empty_collections marks it done and continues the catalog walk."""
+    coll1 = {"type": "Collection", "id": "c1", "description": "d"}
+    coll2 = {"type": "Collection", "id": "c2", "description": "d"}
+    coll3 = {"type": "Collection", "id": "c3", "description": "d"}
+    href = "https://src/c2/items?page=2"
+    request = _request(
+        skip_empty_collections=True,
+        resume=StacHarvestCursor(collection_id="c2", items_href=href, done=False),
+    )
+    catalogs = _mock_catalogs()
+    seen_collections: list = []
+
+    async def fake_harvest_collection(catalogs_, request_, source_coll, items_iter, target_collection, stats, **kw):
+        seen_collections.append(kw.get("source_collection_id"))
+        async for _ in items_iter:
+            pass
+
+    with (
+        patch.object(harvest_task, "_probe_single_collection", return_value=None),
+        patch.object(harvest_task, "iter_collections", return_value=_aiter([coll1, coll2, coll3])),
+        patch.object(harvest_task, "_iter_items_from", return_value=_aiter([])),
+        patch.object(harvest_task, "iter_items", return_value=_aiter(_valid_items(1))),
+        patch.object(harvest_task, "_harvest_collection", side_effect=fake_harvest_collection),
+        patch.object(harvest_task, "_persist_harvest_cursor", AsyncMock()) as mock_persist,
+    ):
+        stats = await harvest_task.run_harvest(
+            request, catalogs, preset_ctx=None, base_scope="catalog:cat-7",
+            engine=object(), task_id="tid",
+        )
+
+    assert stats.collections_seen == 2
+    assert stats.collections_skipped_empty == 1
+    assert seen_collections == ["c3"]
+    mock_persist.assert_awaited_once()
+    assert mock_persist.await_args.args[2:] == ("c2", None, True)
+
+
+@pytest.mark.asyncio
+async def test_skip_empty_collection_counts_toward_max_collections_on_resume():
+    """Skipped-empty collections count as inspected source collections, so
+    max_collections remains a limit on source collections, not written ones."""
+    coll1 = {"type": "Collection", "id": "c1", "description": "d"}
+    coll2 = {"type": "Collection", "id": "c2", "description": "d"}
+    href = "https://src/c1/items?page=2"
+    request = _request(
+        max_collections=1,
+        skip_empty_collections=True,
+        resume=StacHarvestCursor(collection_id="c1", items_href=href, done=False),
+    )
+    catalogs = _mock_catalogs()
+
+    with (
+        patch.object(harvest_task, "_probe_single_collection", return_value=None),
+        patch.object(harvest_task, "iter_collections", return_value=_aiter([coll1, coll2])),
+        patch.object(harvest_task, "_iter_items_from", return_value=_aiter([])),
+        patch.object(harvest_task, "iter_items") as mock_fresh_iter,
+        patch.object(harvest_task, "_harvest_collection", AsyncMock()) as mock_harvest,
+        patch.object(harvest_task, "_persist_harvest_cursor", AsyncMock()),
+    ):
+        stats = await harvest_task.run_harvest(
+            request, catalogs, preset_ctx=None, base_scope="catalog:cat-7",
+            engine=object(), task_id="tid",
+        )
+
+    assert stats.collections_seen == 1
+    assert stats.collections_skipped_empty == 1
+    mock_fresh_iter.assert_not_called()
+    mock_harvest.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # run_harvest — single-collection resume wiring
 # ---------------------------------------------------------------------------

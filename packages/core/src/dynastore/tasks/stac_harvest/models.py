@@ -102,6 +102,15 @@ class StacHarvestRequest(BaseModel):
             "(dynastore stores only the href, never the bytes)."
         ),
     )
+    skip_empty_collections: bool = Field(
+        default=False,
+        description=(
+            "When True, probe each source collection's item stream before "
+            "creating local collection metadata and skip collections whose "
+            "item walk yields no items. Fetch failures are not treated as "
+            "empty collections."
+        ),
+    )
     drivers: RoutingDrivers = Field(
         default=RoutingDrivers.ES,
         description=(

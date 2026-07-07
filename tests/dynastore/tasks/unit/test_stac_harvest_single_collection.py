@@ -191,6 +191,106 @@ async def test_catalog_harvest_applies_at_catalog_scope():
     assert stats.collections_written == 1
 
 
+@pytest.mark.asyncio
+async def test_catalog_harvest_can_skip_empty_source_collections():
+    """skip_empty_collections avoids creating local collection metadata when
+    the source collection's item walk drains without yielding any item."""
+    empty = {"type": "Collection", "id": "empty-source", "description": "d"}
+    full = {"type": "Collection", "id": "full-source", "description": "d"}
+    item = {"type": "Feature", "id": "i1", "geometry": None, "properties": {}}
+
+    def fake_iter_items(_catalog_url: str, collection_id: str, *, cursor=None):
+        if collection_id == "empty-source":
+            return _aiter([])
+        return _aiter([item])
+
+    request = StacHarvestRequest(
+        catalog_url="https://src",
+        target_catalog="cat-7",
+        drivers="es",
+        skip_empty_collections=True,
+    )
+    catalogs = _mock_catalogs()
+
+    with (
+        patch.object(harvest_task, "_probe_single_collection", return_value=None),
+        patch.object(harvest_task, "iter_collections", return_value=_aiter([empty, full])),
+        patch.object(harvest_task, "iter_items", side_effect=fake_iter_items),
+        patch.object(harvest_task, "_apply_harvest_presets", return_value=None),
+    ):
+        stats = await harvest_task.run_harvest(
+            request, catalogs, preset_ctx=object(), base_scope="catalog:cat-7"
+        )
+
+    assert stats.collections_seen == 2
+    assert stats.collections_written == 1
+    assert stats.collections_skipped_empty == 1
+    catalogs.create_collection.assert_awaited_once()
+    assert catalogs.create_collection.await_args.args[1]["id"] == "full-source"
+
+
+@pytest.mark.asyncio
+async def test_single_collection_harvest_can_skip_empty_source_collection():
+    """The skip option also applies when catalog_url points at one Collection."""
+    source_coll = {"type": "Collection", "id": "MyColl", "description": "d"}
+    request = StacHarvestRequest(
+        catalog_url="https://src/c/MyColl",
+        target_catalog="cat-7",
+        drivers="es",
+        skip_empty_collections=True,
+    )
+    catalogs = _mock_catalogs()
+
+    with (
+        patch.object(harvest_task, "_probe_single_collection",
+                     return_value=(source_coll, "https://src/c/MyColl/items")),
+        patch.object(harvest_task, "_iter_items_from", return_value=_aiter([])),
+        patch.object(harvest_task, "_apply_harvest_presets", return_value=None),
+    ):
+        stats = await harvest_task.run_harvest(
+            request, catalogs, preset_ctx=object(), base_scope="catalog:cat-7"
+        )
+
+    assert stats.collections_seen == 1
+    assert stats.collections_written == 0
+    assert stats.collections_skipped_empty == 1
+    catalogs.create_collection.assert_not_awaited()
+    catalogs.upsert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_skip_empty_does_not_skip_truncated_first_page():
+    """A fetch failure can drain the iterator with PageCursor.truncated=True;
+    that is not evidence that the source collection is empty."""
+    coll = {"type": "Collection", "id": "C1", "description": "d"}
+    request = StacHarvestRequest(
+        catalog_url="https://src",
+        target_catalog="cat-7",
+        drivers="es",
+        skip_empty_collections=True,
+    )
+    catalogs = _mock_catalogs()
+
+    def fake_iter_items(_catalog_url: str, _collection_id: str, *, cursor=None):
+        cursor.truncated = True
+        return _aiter([])
+
+    with (
+        patch.object(harvest_task, "_probe_single_collection", return_value=None),
+        patch.object(harvest_task, "iter_collections", return_value=_aiter([coll])),
+        patch.object(harvest_task, "iter_items", side_effect=fake_iter_items),
+        patch.object(harvest_task, "_apply_harvest_presets", return_value=None),
+    ):
+        stats = await harvest_task.run_harvest(
+            request, catalogs, preset_ctx=object(), base_scope="catalog:cat-7"
+        )
+
+    assert stats.collections_seen == 1
+    assert stats.collections_written == 1
+    assert stats.collections_skipped_empty == 0
+    catalogs.create_collection.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # run_harvest — per-collection read-policy pin (#3070)
 # ---------------------------------------------------------------------------
