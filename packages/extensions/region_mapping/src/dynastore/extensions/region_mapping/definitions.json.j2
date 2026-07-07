@@ -15,6 +15,8 @@
       "digits": {{ m.digits | tojson }},
       "description": {{ m.title | tojson }},
       "regionIdsFile": {{ m.region_ids_file | tojson }},
+      "stac_link": {{ m.stac_link | tojson }},
+      "features_link": {{ m.features_link | tojson }},
       "bbox": {{ m.bbox | tojson }}
     }{% if not loop.last %},{% endif %}
     {%- endfor %}

@@ -403,6 +403,8 @@ async def _build_definitions(
             "aliases": aliases,
             "title": title,
             "region_ids_file": f"{base_url}/region-mappings/{mapping_id}/regionIds",
+            "stac_link": f"{base_url}/stac/catalogs/{src_catalog}/collections/{src_collection}",
+            "features_link": f"{base_url}/features/catalogs/{src_catalog}/collections/{src_collection}",
             "bbox": bbox,
             "layer_name": record.get("layer_name") or "default",
             "server_type": record.get("server_type") or "MVT",

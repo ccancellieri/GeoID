@@ -46,6 +46,8 @@ class MappingEntry(TypedDict):
     aliases: List[str]
     title: str
     region_ids_file: str
+    stac_link: str
+    features_link: str
     bbox: List[float]
     layer_name: str
     server_type: str
