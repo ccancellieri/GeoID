@@ -83,6 +83,8 @@ class TileSourceProtocol(Protocol):
         format: str = "mvt",
         datetime_str: Optional[str] = None,
         cql_filter: Optional[str] = None,
+        filter_lang: str = "cql2-text",
+        filter_crs_srid: Optional[int] = None,
         subset_params: Optional[Dict[str, Any]] = None,
         simplification: Optional[float] = None,
         simplification_algorithm: SimplificationAlgorithm = SimplificationAlgorithm.TOPOLOGY_PRESERVING,
@@ -120,6 +122,8 @@ class PostgisTileSource(TileSourceProtocol):
         format: str = "mvt",
         datetime_str: Optional[str] = None,
         cql_filter: Optional[str] = None,
+        filter_lang: str = "cql2-text",
+        filter_crs_srid: Optional[int] = None,
         subset_params: Optional[Dict[str, Any]] = None,
         simplification: Optional[float] = None,
         simplification_algorithm: SimplificationAlgorithm = SimplificationAlgorithm.TOPOLOGY_PRESERVING,
@@ -137,11 +141,15 @@ class PostgisTileSource(TileSourceProtocol):
                 y=y,
                 datetime_str=datetime_str,
                 cql_filter=cql_filter,
+                filter_lang=filter_lang,
+                filter_crs_srid=filter_crs_srid,
                 subset_params=subset_params,
                 simplification=simplification,
                 simplification_algorithm=simplification_algorithm,
             )
         except ValueError as exc:
+            if str(exc).startswith("Invalid CQL filter"):
+                raise
             # Storage resolution failed mid-pipeline (e.g. driver config has no
             # physical_table) — the render was never attempted, so this is
             # `None` (not cacheable), distinct from `tiles_db`'s `b""` return

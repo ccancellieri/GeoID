@@ -2,6 +2,15 @@
 
 This extension provides standardized access to geospatial vector and map tiles following the [OGC API - Tiles](https://ogcapi.ogc.org/tiles/) specification.
 
+## Vector Tile Filtering
+
+MVT requests accept CQL2 filters through `filter`. The `filter-lang` query
+parameter selects `cql2-text` or `cql2-json`, and `filter-crs` identifies the
+CRS used by geometry literals in the filter expression. Tile rendering forwards
+these values through the shared `ItemsProtocol.get_features_query` path, so
+queryables, sidecars, and storage-driver details remain owned by the items
+query layer rather than the tiles extension.
+
 ## 🏗️ Tiles Pre-seeding Process
 
 Tile pre-seeding is a background process that generates and stores tiles in advance to ensure low-latency serving and high performance.

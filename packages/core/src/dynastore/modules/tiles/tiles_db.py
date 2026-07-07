@@ -107,6 +107,8 @@ async def _build_collection_subquery(
     index_i: int,
     datetime_str: Optional[str] = None,
     cql_filter: Optional[str] = None,
+    filter_lang: str = "cql2-text",
+    filter_crs_srid: Optional[int] = None,
     subset_params: Optional[Dict[str, Any]] = None,
     simplification: Optional[float] = None,
     simplification_algorithm: SimplificationAlgorithm = SimplificationAlgorithm.TOPOLOGY_PRESERVING,
@@ -195,6 +197,8 @@ async def _build_collection_subquery(
         else str(simplification_algorithm),
         "datetime": datetime_str,
         "cql_filter": cql_filter,
+        "filter_lang": filter_lang,
+        "filter_crs_srid": filter_crs_srid,
         "tile_wkb": tile_wkb,
         "feature_type": feature_type,
         "schema_fields": schema_fields,
@@ -240,6 +244,8 @@ async def _build_collection_subquery(
             access_filter=AccessFilter.allow_everything(),
         )
     except ValueError as exc:
+        if str(exc).startswith("Invalid CQL filter"):
+            raise
         # Storage resolution failed mid-pipeline (e.g. driver config has no
         # physical_table, or catalog row's physical_schema is null).  The
         # tile-resolution-params cache may have served a non-empty meta
@@ -267,6 +273,8 @@ async def get_features_as_mvt_filtered(
     y: int,
     datetime_str: Optional[str] = None,
     cql_filter: Optional[str] = None,
+    filter_lang: str = "cql2-text",
+    filter_crs_srid: Optional[int] = None,
     subset_params: Optional[Dict[str, Any]] = None,
     simplification: Optional[float] = None,
     simplification_algorithm: SimplificationAlgorithm = SimplificationAlgorithm.TOPOLOGY_PRESERVING,
@@ -338,6 +346,8 @@ async def get_features_as_mvt_filtered(
             index_i=i,
             datetime_str=datetime_str,
             cql_filter=cql_filter,
+            filter_lang=filter_lang,
+            filter_crs_srid=filter_crs_srid,
             subset_params=subset_params,
             simplification=simplification,
             simplification_algorithm=simplification_algorithm,

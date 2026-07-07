@@ -45,6 +45,7 @@ from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.tools.ogc_common_models import LandingPage
 from dynastore.tools.discovery import get_protocol
 from dynastore.models.protocols.configs import ConfigsProtocol
+from dynastore.models.protocols.crs import CRSProtocol
 from dynastore.models.protocols.web import WebModuleProtocol, StaticFilesProtocol
 from dynastore.extensions.web.decorators import expose_static
 from dynastore.extensions.tools.db import get_async_engine
@@ -55,7 +56,7 @@ from dynastore.modules.db_config.query_executor import (
     ResultHandler,
 )
 from dynastore.modules.db_config.exceptions import PoolSaturationError, QueryExecutionError
-from dynastore.extensions.tools.query import parse_hints_param
+from dynastore.extensions.tools.query import parse_hints_param, validate_filter_lang
 from dynastore.extensions.tools.resolvers import (
     resolve_internal_catalog_id_or_404,
     resolve_internal_collection_id_or_404,
@@ -84,6 +85,20 @@ from dynastore.modules.tiles.tms_definitions import BUILTIN_TILE_MATRIX_SETS
 from .tile_cache_writer import TileCacheWriter
 
 logger = logging.getLogger(__name__)
+
+_FILTER_LANG_QUERY = Query(
+    "cql2-text",
+    alias="filter-lang",
+    description="CQL2 filter encoding. Supported: 'cql2-text' and 'cql2-json'.",
+)
+_FILTER_CRS_QUERY = Query(
+    None,
+    alias="filter-crs",
+    description=(
+        "URI of the CRS used by geometry literals in the CQL2 filter. "
+        "Defaults to CRS84 / EPSG:4326 semantics."
+    ),
+)
 
 # Upper bound on how long TilesService.lifespan waits for the tile-cache
 # writer to drain its queue on shutdown, kept comfortably below the Cloud Run
@@ -205,6 +220,25 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
     def configure_app(self, app: FastAPI):
         """Early configuration for the Tiles extension."""
         pass
+
+    async def _resolve_crs_srid(
+        self, conn: Any, catalog_id: str, crs_uri: Optional[str]
+    ) -> Optional[int]:
+        """Resolve a CRS URI to an SRID for CQL geometry literals."""
+        if not crs_uri:
+            return None
+        if "CRS84" in crs_uri.upper():
+            return 4326
+        match = re.search(r"[/|:](\d+)$", crs_uri)
+        if match:
+            return int(match.group(1))
+
+        crs_svc = get_protocol(CRSProtocol)
+        if crs_svc:
+            crs_def = await crs_svc.get_crs_by_uri(conn, catalog_id, crs_uri)
+            if crs_def and hasattr(crs_def, "srid"):
+                return crs_def.srid
+        return None
 
     def __init__(self, app: Optional[FastAPI] = None):
         super().__init__()
@@ -639,7 +673,8 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         collections: str = Query(..., description="Comma-separated collection IDs."),
         datetime: Optional[str] = Query(None),
         filter: Optional[str] = Query(None, description="CQL2 Filter expression."),
-        filter_lang: Optional[str] = Query("cql2-text"),
+        filter_lang: Optional[str] = _FILTER_LANG_QUERY,
+        filter_crs: Optional[str] = _FILTER_CRS_QUERY,
         subset: Optional[str] = Query(None),
         simplification: Optional[float] = Query(None),
         simplification_by_zoom: Optional[str] = Query(None),
@@ -681,6 +716,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             datetime=datetime,
             filter=filter,
             filter_lang=filter_lang,
+            filter_crs=filter_crs,
             subset=subset,
             simplification=simplification,
             simplification_by_zoom=simplification_by_zoom,
@@ -705,7 +741,8 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         ),
         datetime: Optional[str] = Query(None, description="Temporal filter."),
         filter: Optional[str] = Query(None, description="CQL2 Filter expression."),
-        filter_lang: Optional[str] = Query("cql2-text"),
+        filter_lang: Optional[str] = _FILTER_LANG_QUERY,
+        filter_crs: Optional[str] = _FILTER_CRS_QUERY,
         subset: Optional[str] = Query(None),
         simplification: Optional[float] = Query(None),
         simplification_by_zoom: Optional[str] = Query(None),
@@ -747,6 +784,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             datetime=datetime,
             filter=filter,
             filter_lang=filter_lang,
+            filter_crs=filter_crs,
             subset=subset,
             simplification=simplification,
             simplification_by_zoom=simplification_by_zoom,
@@ -767,7 +805,8 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         collections: str = Query(..., description="Comma-separated collection IDs."),
         datetime: Optional[str] = Query(None),
         filter: Optional[str] = Query(None, description="CQL2 Filter expression."),
-        filter_lang: Optional[str] = Query("cql2-text"),
+        filter_lang: Optional[str] = _FILTER_LANG_QUERY,
+        filter_crs: Optional[str] = _FILTER_CRS_QUERY,
         subset: Optional[str] = Query(None),
         simplification: Optional[float] = Query(None),
         simplification_by_zoom: Optional[str] = Query(None),
@@ -809,6 +848,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             datetime=datetime,
             filter=filter,
             filter_lang=filter_lang,
+            filter_crs=filter_crs,
             subset=subset,
             simplification=simplification,
             simplification_by_zoom=simplification_by_zoom,
@@ -833,7 +873,8 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         ),
         datetime: Optional[str] = Query(None, description="Temporal filter."),
         filter: Optional[str] = Query(None, description="CQL2 Filter expression."),
-        filter_lang: Optional[str] = Query("cql2-text"),
+        filter_lang: Optional[str] = _FILTER_LANG_QUERY,
+        filter_crs: Optional[str] = _FILTER_CRS_QUERY,
         subset: Optional[str] = Query(None),
         simplification: Optional[float] = Query(None),
         simplification_by_zoom: Optional[str] = Query(None),
@@ -893,6 +934,28 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 config_manager, dataset
             )
 
+            query_params = getattr(request, "query_params", {}) or {}
+
+            def _query_value(name: str) -> Optional[str]:
+                getter = getattr(query_params, "get", None)
+                if getter is None:
+                    return None
+                value = getter(name)
+                return value if isinstance(value, str) else None
+
+            if not isinstance(filter_lang, str) or not filter_lang:
+                filter_lang = "cql2-text"
+            if not isinstance(filter_crs, str):
+                filter_crs = None
+            raw_filter_lang = _query_value("filter-lang") or _query_value("filter_lang")
+            if raw_filter_lang and filter_lang == "cql2-text":
+                filter_lang = raw_filter_lang
+            filter_lang = validate_filter_lang(filter_lang)
+
+            raw_filter_crs = _query_value("filter-crs") or _query_value("filter_crs")
+            if raw_filter_crs and filter_crs is None:
+                filter_crs = raw_filter_crs
+
             # Render wall-clock budget + client-disconnect check (#2898).
             # Checked only at the render-phase loop boundaries below (never
             # per-feature) — the cache lookup/redirect path above never calls
@@ -920,6 +983,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 datetime,
                 filter,
                 filter_lang,
+                filter_crs,
                 subset,
                 simplification,
                 simplification_by_zoom,
@@ -1113,6 +1177,12 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                     headers={"Retry-After": str(exc.retry_after)},
                 ) from None
             conn = _conn
+            filter_crs_srid = await self._resolve_crs_srid(conn, dataset, filter_crs)
+            if filter_crs and filter_crs_srid is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported filter-crs '{filter_crs}'.",
+                )
 
             # Retrieve MVT content via the unified render engine — L1 cache
             # enabled (the live request-serving path); the preseed task
@@ -1149,6 +1219,8 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                         use_l1_cache=True,
                         datetime_str=datetime,
                         cql_filter=filter,
+                        filter_lang=filter_lang,
+                        filter_crs_srid=filter_crs_srid,
                         subset_params=subset,  # type: ignore[arg-type]
                         simplification=simplification,
                         simplification_algorithm=simplification_algorithm,
@@ -1184,6 +1256,10 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                     detail="Tile render timed out, try again shortly.",
                     headers={"Retry-After": "5"},
                 ) from None
+            except ValueError as exc:
+                if str(exc).startswith("Invalid CQL filter"):
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                raise
             except asyncio.CancelledError:
                 if render_task is not None and not render_task.done():
                     # The client already gave up, so there is no response
@@ -2619,7 +2695,8 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         background_tasks: BackgroundTasks,
         datetime: Optional[str] = Query(None),
         filter: Optional[str] = Query(None, description="CQL2 Filter expression."),
-        filter_lang: Optional[str] = Query("cql2-text"),
+        filter_lang: Optional[str] = _FILTER_LANG_QUERY,
+        filter_crs: Optional[str] = _FILTER_CRS_QUERY,
         subset: Optional[str] = Query(None),
         simplification: Optional[float] = Query(None),
         simplification_by_zoom: Optional[str] = Query(None),
@@ -2660,6 +2737,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             datetime=datetime,
             filter=filter,
             filter_lang=filter_lang,
+            filter_crs=filter_crs,
             subset=subset,
             simplification=simplification,
             simplification_by_zoom=simplification_by_zoom,
@@ -2682,7 +2760,8 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         background_tasks: BackgroundTasks,
         datetime: Optional[str] = Query(None),
         filter: Optional[str] = Query(None, description="CQL2 Filter expression."),
-        filter_lang: Optional[str] = Query("cql2-text"),
+        filter_lang: Optional[str] = _FILTER_LANG_QUERY,
+        filter_crs: Optional[str] = _FILTER_CRS_QUERY,
         subset: Optional[str] = Query(None),
         simplification: Optional[float] = Query(None),
         simplification_by_zoom: Optional[str] = Query(None),
@@ -2723,6 +2802,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             datetime=datetime,
             filter=filter,
             filter_lang=filter_lang,
+            filter_crs=filter_crs,
             subset=subset,
             simplification=simplification,
             simplification_by_zoom=simplification_by_zoom,

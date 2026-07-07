@@ -78,10 +78,11 @@ same registry; it does **not** maintain a separate copy.
 
 ### L1 — in-process LRU
 
-`_generate_mvt` is decorated with `@cached(maxsize=512, ttl=60, jitter=5,
-namespace="mvt_l1")`. Cache is keyed on `(resolved_collections, tms_def,
-target_srid, z, x, y, datetime_str, cql_filter, subset_params, simplification,
-algorithm)`. The `conn` parameter is excluded from the key.
+The live MVT render path uses an in-process LRU cache with a 60 second TTL
+and jitter. Cache variation includes the resolved collections, TMS, target
+SRID, z/x/y, temporal filter, CQL filter, `filter-lang`, `filter-crs`,
+subset, simplification, and simplification algorithm. The database connection
+is excluded from the key.
 
 ### L2 — storage provider
 
@@ -155,7 +156,8 @@ storage providers.
 | `collections` | `str` | Comma-separated collection IDs (required) |
 | `datetime` | `str` | ISO 8601 temporal filter |
 | `filter` | `str` | CQL2 filter expression |
-| `filter_lang` | `str` | `cql2-text` (default) |
+| `filter-lang` | `str` | `cql2-text` (default) or `cql2-json` |
+| `filter-crs` | `str` | CRS URI for geometry literals in `filter`; defaults to CRS84 / EPSG:4326 semantics |
 | `subset` | `str` | Custom dimension filter |
 | `simplification` | `float` | Douglas-Peucker tolerance |
 | `simplification_by_zoom` | `str` | JSON `{zoom: tolerance}` map |

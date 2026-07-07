@@ -309,6 +309,7 @@ class TestGetVectorTileAligned:
             datetime=None,
             filter=None,
             filter_lang="cql2-text",
+            filter_crs=None,
             subset=None,
             simplification=None,
             simplification_by_zoom=None,
@@ -322,6 +323,48 @@ class TestGetVectorTileAligned:
         assert delegated[0]["dataset"] == "int-cat"
         assert delegated[0]["collections"] == "int-coll"
         assert delegated[0]["tileMatrixSetId"] == "WorldCRS84Quad"
+
+    @pytest.mark.asyncio
+    async def test_delegates_cql_language_and_filter_crs(self):
+        svc = _make_service()
+        svc._resolve_catalog_and_collection = AsyncMock(
+            return_value=("int-cat", "int-coll")
+        )
+
+        delegated: list[dict] = []
+
+        async def _fake_get_vector_tile(**kwargs):
+            delegated.append(kwargs)
+            return MagicMock(status_code=200)
+
+        svc.get_vector_tile = _fake_get_vector_tile
+
+        await svc.get_vector_tile_aligned(
+            catalog_id="ext-cat",
+            collection_id="ext-coll",
+            tileMatrixSetId="WorldCRS84Quad",
+            z=2,
+            x=0,
+            y=0,
+            format="mvt",
+            request=_make_request(),
+            background_tasks=_make_bg_tasks(),
+            datetime=None,
+            filter='{"op":"s_intersects","args":[{"property":"geom"},{"type":"Point","coordinates":[0,0]}]}',
+            filter_lang="cql2-json",
+            filter_crs="http://www.opengis.net/def/crs/EPSG/0/3857",
+            subset=None,
+            simplification=None,
+            simplification_by_zoom=None,
+            simplification_algorithm=MagicMock(),
+            disable_cache=False,
+            refresh_cache=False,
+            request_hints=frozenset(),
+        )
+
+        assert len(delegated) == 1
+        assert delegated[0]["filter_lang"] == "cql2-json"
+        assert delegated[0]["filter_crs"] == "http://www.opengis.net/def/crs/EPSG/0/3857"
 
 
 # ---------------------------------------------------------------------------

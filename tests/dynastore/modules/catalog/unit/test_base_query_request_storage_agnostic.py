@@ -128,6 +128,40 @@ def test_cql_filter_deferred_to_transform_path_not_parsed_with_null_mapping():
     assert not req.raw_where
 
 
+def test_mvt_cql_metadata_is_deferred_with_filter_expression():
+    """MVT must carry the complete CQL request metadata to the transform path.
+
+    Tiles build SQL through ``ItemsProtocol.get_features_query``; the base
+    request builder should not parse CQL early or reach into storage-driver
+    internals. It only records the filter language and filter CRS so the shared
+    item query transformer can parse against the collection's queryables.
+    """
+    cfg = SimpleNamespace(
+        sidecars=[
+            GeometriesSidecarConfig(),
+            FeatureAttributeSidecarConfig(
+                attribute_schema=[
+                    AttributeSchemaEntry(name="CODE", type=PostgresType.TEXT),
+                ]
+            ),
+        ]
+    )
+    req = _mixin()._build_base_query_request(
+        {
+            "geom_format": "MVT",
+            "cql_filter": '{"op":"=","args":[{"property":"CODE"},"IT"]}',
+            "filter_lang": "cql2-json",
+            "filter_crs_srid": 3857,
+        },
+        cfg,
+    )
+
+    assert req.cql_filter == '{"op":"=","args":[{"property":"CODE"},"IT"]}'
+    assert req.filter_lang == "cql2-json"
+    assert req.filter_crs_srid == 3857
+    assert not req.raw_where
+
+
 def test_mvt_with_feature_type_sets_skip_geometry_to_avoid_geom_alias_collision():
     """MVT branch must set ``skip_geometry=True``.
 

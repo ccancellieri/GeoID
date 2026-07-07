@@ -629,6 +629,8 @@ class ItemQueryMixin:
             )
             if params.get("cql_filter"):
                 query_req.cql_filter = params["cql_filter"]
+                query_req.filter_lang = params.get("filter_lang") or "cql2-text"
+                query_req.filter_crs_srid = params.get("filter_crs_srid")
             return query_req
 
         # Mandatory ID
@@ -673,6 +675,8 @@ class ItemQueryMixin:
         # tile filter, e.g. per-``asset_id`` rendering.
         if params.get("cql_filter"):
             query_req.cql_filter = params["cql_filter"]
+            query_req.filter_lang = params.get("filter_lang") or "cql2-text"
+            query_req.filter_crs_srid = params.get("filter_crs_srid")
 
         return query_req
 

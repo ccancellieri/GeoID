@@ -19,6 +19,7 @@
 import pytest
 import logging
 from unittest.mock import MagicMock, AsyncMock, patch
+from dynastore.models.protocols import ItemsProtocol
 from dynastore.modules.tiles import tiles_db
 from dynastore.modules.tiles.tiles_models import TileMatrixSet
 
@@ -57,64 +58,59 @@ async def test_get_features_as_mvt_filtered_query_structure():
         ]
         mock_query_instance.execute = mock_execute
 
-        # Mock table column names
+        # Setup TMS
+        tms_def = MagicMock(spec=TileMatrixSet)
+        tms_def.tileMatrices = [
+            MagicMock(
+                id="0",
+                pointOfOrigin=[-180, 90],
+                tileWidth=256,
+                tileHeight=256,
+                cellSize=0.703125,
+            )
+        ]
+
+        # Mock get_protocol for CatalogModule config lookup fallback
         with patch(
-            "dynastore.modules.tiles.tiles_db.get_table_column_names",
-            new_callable=AsyncMock,
-        ) as mock_cols:
-            mock_cols.return_value = {"id", "geom", "attributes"}
+            "dynastore.modules.get_protocol"
+        ) as mock_get_module:
+            mock_catalog_module = MagicMock()
+            mock_config_manager = AsyncMock()
+            mock_config_manager.get_config.return_value = None  # No special config
+            mock_catalog_module.get_config_manager.return_value = (
+                mock_config_manager
+            )
+            mock_get_module.return_value = mock_catalog_module
 
-            # Setup TMS
-            tms_def = MagicMock(spec=TileMatrixSet)
-            tms_def.tileMatrices = [
-                MagicMock(
-                    id="0",
-                    pointOfOrigin=[-180, 90],
-                    tileWidth=256,
-                    tileHeight=256,
-                    cellSize=0.703125,
+            # Mock get_protocol for ItemsService
+            with patch("dynastore.tools.discovery.get_protocol") as mock_get_proto:
+                mock_items = AsyncMock()
+                # Mock get_features_query to return a fake SQL and params
+                mock_items.get_features_query.return_value = ("SELECT 1", {})
+                mock_get_proto.side_effect = (
+                    lambda proto: mock_items if proto is ItemsProtocol else None
                 )
-            ]
 
-            # Mock get_protocol for CatalogModule config lookup fallback
-            with patch(
-                "dynastore.modules.get_protocol"
-            ) as mock_get_module:
-                mock_catalog_module = MagicMock()
-                mock_config_manager = AsyncMock()
-                mock_config_manager.get_config.return_value = None  # No special config
-                mock_catalog_module.get_config_manager.return_value = (
-                    mock_config_manager
+                # Call function
+                result = await tiles_db.get_features_as_mvt_filtered(
+                    conn=conn,
+                    resolved_collections=[
+                        {
+                            "phys_schema": "s_test",
+                            "phys_table": "my_table",
+                            "source_srid": 4326,
+                            "simplification_by_zoom": {},
+                            "catalog_id": "my_catalog",
+                            "collection_id": "my_collection",
+                            "col_config": MagicMock(),
+                        }
+                    ],
+                    tms_def=tms_def,
+                    target_srid=3857,
+                    z="0",
+                    x=0,
+                    y=0,
                 )
-                mock_get_module.return_value = mock_catalog_module
-
-                # Mock get_protocol for ItemsService
-                with patch("dynastore.tools.discovery.get_protocol") as mock_get_proto:
-                    mock_items = AsyncMock()
-                    # Mock get_features_query to return a fake SQL and params
-                    mock_items.get_features_query.return_value = ("SELECT 1", {})
-                    mock_get_proto.return_value = mock_items
-
-                    # Call function
-                    result = await tiles_db.get_features_as_mvt_filtered(
-                        conn=conn,
-                        resolved_collections=[
-                            {
-                                "phys_schema": "s_test",
-                                "phys_table": "my_table",
-                                "source_srid": 4326,
-                                "simplification_by_zoom": {},
-                                "catalog_id": "my_catalog",
-                                "collection_id": "my_collection",
-                                "col_config": MagicMock(),
-                            }
-                        ],
-                        tms_def=tms_def,
-                        target_srid=3857,
-                        z="0",
-                        x=0,
-                        y=0,
-                    )
 
             # Assertions
             assert result == b"fake_mvt_bytes"
@@ -166,8 +162,6 @@ async def test_get_features_as_mvt_filtered_returns_empty_bytes_for_zero_feature
             mock_get_module.return_value = mock_catalog_module
 
             with patch("dynastore.tools.discovery.get_protocol") as mock_get_proto:
-                from dynastore.models.protocols import ItemsProtocol
-
                 mock_items = AsyncMock()
                 mock_items.get_features_query.return_value = ("SELECT 1", {})
                 # Only resolve ItemsProtocol; other protocol lookups (e.g. the
@@ -219,7 +213,9 @@ async def test_build_collection_subquery_swallows_value_error(caplog):
                 "(phys_schema=None, phys_table='t_x', db_resource=passed)"
             )
         )
-        mock_get_proto.return_value = mock_items
+        mock_get_proto.side_effect = (
+            lambda proto: mock_items if proto is ItemsProtocol else None
+        )
 
         col_config = MagicMock()
         with caplog.at_level(logging.WARNING):
@@ -244,6 +240,83 @@ async def test_build_collection_subquery_swallows_value_error(caplog):
         "Skipping collection cat/col in tile" in rec.message
         for rec in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_build_collection_subquery_propagates_invalid_cql_filter():
+    """Invalid client CQL must not be treated as a missing storage backend."""
+    conn = AsyncMock()
+
+    with patch("dynastore.tools.discovery.get_protocol") as mock_get_proto:
+        mock_items = AsyncMock()
+        mock_items.get_features_query = AsyncMock(
+            side_effect=ValueError("Invalid CQL filter: Unknown field 'BAD'")
+        )
+        mock_get_proto.side_effect = (
+            lambda proto: mock_items if proto is ItemsProtocol else None
+        )
+
+        with pytest.raises(ValueError, match="Invalid CQL filter"):
+            await tiles_db._build_collection_subquery(
+                conn,
+                catalog_id="cat",
+                collection_id="col",
+                col_config=MagicMock(),
+                source_srid=4326,
+                target_srid=3857,
+                simplification_by_zoom={},
+                z="0",
+                x=0,
+                y=0,
+                index_i=0,
+                cql_filter="BAD = 1",
+                tile_wkb=b"\\x00",
+            )
+
+
+@pytest.mark.asyncio
+async def test_build_collection_subquery_threads_cql_metadata_via_items_protocol():
+    """Tile rendering must carry CQL metadata through ItemsProtocol params.
+
+    The tile layer should not inspect concrete storage drivers to parse CQL; it
+    delegates row SQL construction to ItemsProtocol, where queryables and
+    sidecars are resolved storage-agnostically.
+    """
+    conn = AsyncMock()
+
+    with patch("dynastore.tools.discovery.get_protocol") as mock_get_proto:
+        mock_items = AsyncMock()
+        mock_items.get_features_query.return_value = ("SELECT 1", {"p_0": "v"})
+        mock_get_proto.side_effect = (
+            lambda proto: mock_items if proto is ItemsProtocol else None
+        )
+
+        sql, params = await tiles_db._build_collection_subquery(
+            conn,
+            catalog_id="cat",
+            collection_id="col",
+            col_config=MagicMock(),
+            source_srid=4326,
+            target_srid=3857,
+            simplification_by_zoom={},
+            z="0",
+            x=0,
+            y=0,
+            index_i=0,
+            cql_filter='{"op":"=","args":[{"property":"CODE"},"IT"]}',
+            filter_lang="cql2-json",
+            filter_crs_srid=3857,
+            tile_wkb=b"\\x00",
+        )
+
+    assert sql == "SELECT 1"
+    assert params == {"p_0": "v"}
+    mock_items.get_features_query.assert_awaited_once()
+    call_kwargs = mock_items.get_features_query.await_args.kwargs
+    item_params = call_kwargs["params"]
+    assert item_params["cql_filter"] == '{"op":"=","args":[{"property":"CODE"},"IT"]}'
+    assert item_params["filter_lang"] == "cql2-json"
+    assert item_params["filter_crs_srid"] == 3857
 
 
 @pytest.mark.asyncio
