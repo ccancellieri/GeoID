@@ -605,6 +605,16 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
 
     def __init__(self, engine: Optional[DbResource] = None):
         self._engine = engine
+        # #2946: memoize the *validated* config model keyed by class_key.
+        # Re-running _validate_stored_config on every get_config hit re-fires the
+        # routing-config @model_validator (driver self-registration), which is the
+        # several-hundred-MB cold-wake allocation spike behind the chronic OOM
+        # kills. We key each entry on the identity of the source raw dict so a
+        # cache refresh (new dict object) transparently forces a single
+        # re-validation -- no staleness risk, since the raw-dict cache
+        # (get_platform_config_internal_cached) remains the sole TTL/version SSOT.
+        # Value: (source_dict_ref, validated_model).
+        self._validated_config_cache: Dict[str, tuple[Any, PluginConfig]] = {}
         self._setup_cache()
 
     @property
@@ -625,6 +635,16 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
             namespace="platform_config",
             l1_ttl=DEFAULT_CONFIG_CACHE_L1_TTL,
         )(self._get_platform_config_internal_db)
+
+    def _invalidate_config_cache(self, class_key: str) -> None:
+        """Bust the raw-dict cache and the #2946 validated-model memo in lockstep.
+
+        Every write path must call this (not the raw ``cache_invalidate``
+        directly) so a stale validated model can never outlive the raw dict it
+        was derived from.
+        """
+        self.get_platform_config_internal_cached.cache_invalidate(class_key)
+        self._validated_config_cache.pop(class_key, None)
 
     @asynccontextmanager
     async def lifespan(self, app_state: Any) -> typing.AsyncGenerator[None, None]:
@@ -747,18 +767,39 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
     ) -> Optional[PluginConfig]:
         class_key = cls.class_key()
         if db_resource:
+            # Explicit-connection read: bypass both caches for read-your-writes
+            # consistency. Never memoize — the caller wants the live row.
             if not await _platform_table_exists(db_resource):
                 return None
             data = await get_platform_config_query.execute(
                 db_resource, ref_key=class_key
             )
-        else:
-            data = await self.get_platform_config_internal_cached(class_key)
+            if not data:
+                return None
+            if isinstance(data, cls):
+                return data
+            return _validate_stored_config(cls, data)
+
+        data = await self.get_platform_config_internal_cached(class_key)
         if not data:
             return None
         if isinstance(data, cls):
             return data
-        return _validate_stored_config(cls, data)
+
+        # #2946: validated-model memo. Reuse the previously-validated model only
+        # when the source raw dict is the *same object* the cache returned last
+        # time (identity, not equality). A cache refresh yields a new dict object
+        # => cache miss here => exactly one re-validation. This keeps the raw-dict
+        # cache as the sole TTL/version authority while eliminating the repeated
+        # routing-config @model_validator driver re-registration that spiked
+        # several hundred MB on every cold-wake detached rebuild.
+        cached_entry = self._validated_config_cache.get(class_key)
+        if cached_entry is not None and cached_entry[0] is data:
+            return cached_entry[1]
+
+        validated = _validate_stored_config(cls, data)
+        self._validated_config_cache[class_key] = (data, validated)
+        return validated
 
     async def set_config(
         self,
@@ -867,7 +908,7 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
             except Exception as exc:  # noqa: BLE001
                 logger.debug("set_config: platform_config_changed NOTIFY failed: %s", exc)
 
-        self.get_platform_config_internal_cached.cache_invalidate(class_key)
+        self._invalidate_config_cache(class_key)
         # Post-commit router bust closes the race where an apply_handler
         # invalidates inside the open transaction and a concurrent reader
         # re-caches the pre-commit row. Mirrors catalog/collection tiers.
@@ -966,7 +1007,7 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
                 conn, ref_key=class_key
             )
             if rows_affected > 0:
-                self.get_platform_config_internal_cached.cache_invalidate(class_key)
+                self._invalidate_config_cache(class_key)
                 _post_commit_router_bust(cls)
                 return True
         return False
@@ -1054,7 +1095,7 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
         # Invalidate the class-keyed cache for the dispatch class so any
         # waterfall reads pick up the change.  Multi-instance rows still
         # share their class with the single-instance default.
-        self.get_platform_config_internal_cached.cache_invalidate(class_key)
+        self._invalidate_config_cache(class_key)
         _post_commit_router_bust(cls)
 
     async def delete_config_by_ref(
@@ -1081,7 +1122,7 @@ class PlatformConfigService(ProtocolPlugin[object], PlatformConfigsProtocol):
         # Best-effort cache + router invalidation.  resolve_config_class
         # returns None when the class has been unregistered (warning
         # logged); skip the router bust in that case.
-        self.get_platform_config_internal_cached.cache_invalidate(stored_class_key)
+        self._invalidate_config_cache(stored_class_key)
         cls = resolve_config_class(stored_class_key)
         if cls is not None:
             _post_commit_router_bust(cls)
