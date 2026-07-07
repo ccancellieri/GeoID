@@ -16,6 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
+import asyncio
 import logging
 
 from typing import Optional, Any, Union, Dict
@@ -91,95 +92,149 @@ BASE_DB_EXTENSIONS: tuple[str, ...] = (
 # Presence of the last-created extension implies the whole set is present.
 _EXT_SENTINEL: str = BASE_DB_EXTENSIONS[-1]
 
+# Upper bound on how long the foundational lifespan (``DatastoreModule``,
+# priority 7) waits for the bootstrap-marker read before giving up and booting
+# without running the one-time init. Deliberately small: the marker read is a
+# single indexed ``SELECT`` that is sub-millisecond once it holds a connection,
+# so the only thing this budget covers is *acquiring* a connection. During a
+# cold-boot thundering herd (a rollout or scale-up storm) the shared pool can be
+# momentarily saturated; rather than let the marker read block and abort the
+# whole pod (which crash-loops the fleet), we cap the wait here and skip init —
+# a serving pod assumes an already-initialised database.
+_BOOTSTRAP_MARKER_READ_TIMEOUT_SECONDS: float = 3.0
 
-async def _resolve_db_identity(resource: DbResource) -> str:
-    """A stable per-database cache key (``host:port/dbname``).
+# Upper bound on the one-time init (base-extension bootstrap + platform-config
+# storage) run from the priority-7 foundational lifespan on a not-yet-marked
+# database. Generous enough for genuine ``CREATE EXTENSION`` work (PostGIS et al.)
+# against a free pool on a fresh DB, but bounded so a cold-boot pool storm can
+# never let a DB probe hang — and then abort — the foundational lifespan. On
+# expiry (or any failure) the pod boots degraded; a later boot or the dedicated
+# init job completes the idempotent, advisory-locked steps once the pool clears.
+_INIT_DB_BOOTSTRAP_TIMEOUT_SECONDS: float = 20.0
 
-    Taken from the engine URL when available (no round-trip); falls back to
-    ``current_database()`` for a bare connection. The key MUST identify the
-    physical database: a repoint to a fresh database (different name) then
-    misses the cache and re-bootstraps instead of inheriting a stale "present"
-    marker from the previous database — the exact failure mode that left a
-    freshly-provisioned dev DB without PostGIS.
+# PostgreSQL SQLSTATEs that mean the marker's schema/table does not exist yet —
+# i.e. a genuinely un-bootstrapped database (``catalog.shared_properties`` is
+# created later, by ``CatalogModule`` at priority 20, so at this priority-7 read
+# a fresh DB legitimately has neither the ``catalog`` schema nor the table).
+# These are the ONLY read failures that should route into the one-time init; any
+# other failure (a connection/pool error, a timeout) means the DB is reachable-
+# but-saturated — an already-initialised DB under load — where init must be
+# skipped, never re-run.
+_FRESH_DB_SQLSTATES: frozenset[str] = frozenset(
+    {"42P01", "3F000"}  # undefined_table, invalid_schema_name
+)
+
+
+def _is_fresh_db_error(exc: BaseException) -> bool:
+    """True iff ``exc`` (or a cause in its chain) is a missing-schema/table error.
+
+    Distinguishes a genuinely fresh database (the marker's schema/table has not
+    been created yet → bootstrap) from an already-initialised database we simply
+    could not reach under pool pressure (→ skip). Walks the ``__cause__`` /
+    ``__context__`` chain and inspects both the exception and any DBAPI
+    ``orig`` for an asyncpg ``sqlstate`` or psycopg ``pgcode``.
     """
-    url = getattr(resource, "url", None)
-    if url is not None:
-        return (
-            f"{getattr(url, 'host', '') or ''}:"
-            f"{getattr(url, 'port', '') or ''}/"
-            f"{getattr(url, 'database', '') or ''}"
-        )
-    try:
-        res = await DQLQuery(
-            "SELECT current_database()", result_handler=ResultHandler.SCALAR
-        ).execute(resource)
-        return f"db/{res}"
-    except Exception:  # noqa: BLE001 — identity is best-effort; fall back to a constant
-        return "db/unknown"
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        for obj in (cur, getattr(cur, "orig", None)):
+            if obj is None:
+                continue
+            code = getattr(obj, "sqlstate", None) or getattr(obj, "pgcode", None)
+            if code in _FRESH_DB_SQLSTATES:
+                return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
-@cached(ttl=600, namespace="db_bootstrap", ignore=["resource"], condition=bool)
-async def _base_extensions_present(resource: DbResource, db_key: str) -> bool:
-    """True iff the base extensions are installed in ``db_key``'s database.
+async def _base_extensions_present(resource: DbResource) -> bool:
+    """True iff the base extensions are installed in this database.
 
-    DB-backed truth (a ``pg_extension`` probe on the sentinel). ``condition=bool``
-    caches ONLY the positive result, keyed by database identity (``db_key``), so:
+    DB-backed truth: a direct ``pg_extension`` probe on the sentinel extension.
 
-      * steady state across the multi-Cloud-Run fleet costs one cache read — no
-        repeated ``CREATE EXTENSION`` on every pod boot;
-      * a fresh / repointed database (sentinel absent → ``False`` → uncached)
-        always re-probes cheaply and bootstraps. It can never inherit a stale
-        "true" from a different database.
+    Deliberately **uncached**. A ``@cached`` wrapper here is not merely
+    ineffective at the priority-7 ``DatastoreModule`` lifespan (which runs before
+    ``CacheModule`` at priority 9 registers the distributed backend) — it is
+    actively harmful during a cold-boot thundering herd: every pod misses the
+    positive and blocks in the cache slow-path (``_await_shared_rebuild``, ~30s)
+    waiting for *another* pod to compute and publish the value, but none ever
+    does (they are all waiting on each other), so the wait re-raises and aborts
+    the foundational lifespan — and no pod runs the probe that would let it
+    create the extensions. A direct probe lets each pod get its own answer, so
+    exactly one wins the advisory lock in ``ensure_base_extensions`` and creates
+    the extensions while the rest observe them present. The probe is a single
+    indexed ``pg_extension`` ``SELECT`` — cheap enough to run on every boot.
+
+    Reading the live catalog is also inherently repoint-safe: a freshly
+    provisioned / repointed database (sentinel absent) always reports ``False``
+    and re-bootstraps, and can never inherit a stale "present" answer keyed to a
+    previous database.
     """
     from dynastore.modules.db_config.locking_tools import check_extension_exists
 
-    # ``db_key`` is consumed by the cache layer as the per-database key; logging
-    # it here both documents that contract and aids diagnosing a wrong-key skip.
-    logging.getLogger(__name__).debug(
-        "base-extension presence probe for database %s", db_key
-    )
     return await check_extension_exists(resource, _EXT_SENTINEL)
 
 
-@cached(ttl=600, namespace="db_bootstrap", ignore=["resource"], condition=bool)
-async def _platform_bootstrap_present(resource: DbResource, db_key: str) -> bool:
+async def _platform_bootstrap_present(resource: DbResource) -> bool:
     """True iff a prior boot fully initialised this platform (marker set).
 
-    Sibling of :func:`_base_extensions_present` and cached the same way:
-    ``condition=bool`` stores ONLY the positive result, keyed by database
-    identity (``db_key``). The marker (``platform.bootstrap_initialized`` in
-    ``catalog.shared_properties``) is written once, after a fully-successful
-    boot, so:
+    Deliberately **uncached** and **error-propagating**, unlike
+    :func:`dynastore.modules.catalog.bootstrap_guard.is_initialized`, which
+    swallows every read failure into ``False``. That swallowing is unsafe here:
+    a serving pod whose marker IS set but which cannot reach the DB under a
+    cold-boot pool storm would degrade to "not initialised" and wrongly re-run
+    the one-time init (which then blocks and aborts the foundational lifespan).
+    By letting the read raise, the sole caller can tell a genuinely fresh DB
+    (missing schema/table → bootstrap) from an unreachable one (→ skip).
 
-      * steady state across the fleet costs one cache read — a cold-booting
-        serving pod skips the extension + platform-config bootstrap (and its
-        DB-blocking presence probe) without touching PostgreSQL at all once the
-        result is warm in L1/L2;
-      * a fresh / repointed / reset database (marker absent → ``False`` →
-        uncached) always re-reads cheaply and bootstraps; it can never inherit
-        a stale "true" from a different database.
+    Reads ``platform.bootstrap_initialized`` from ``catalog.shared_properties``
+    via ``PropertiesProtocol`` on the passed engine. Two kinds of "cannot read"
+    are treated differently, which is the whole point of not delegating to
+    ``is_initialized`` (that helper collapses both into ``False``):
+
+    * ``PropertiesProtocol`` not registered → return ``False`` (degrade to "not
+      initialised"). Protocol registration is in-memory and independent of the
+      database/pool, so this can NEVER be a cold-boot pool-pressure signal; it
+      only happens in a degenerate/unconfigured context, where re-running the
+      idempotent init is harmless and a genuinely fresh DB must still bootstrap.
+    * a DB read failure (missing schema/table, or a connection/pool error) →
+      **propagate**, so the caller can tell a fresh DB (bootstrap) from an
+      unreachable-under-pressure one (skip).
+
+    Not ``@cached``: this runs from the priority-7 ``DatastoreModule`` lifespan,
+    before ``CacheModule`` (priority 9) registers the distributed backend, so a
+    cache wrapper would resolve to a process-local backend only — no cross-fleet
+    dedup, no intra-pod reuse (called once per boot) — while dragging in the
+    cache slow-path that blocks ~30s and re-raises on a cold miss.
     """
-    from dynastore.modules.catalog.bootstrap_guard import is_initialized
+    from dynastore.modules.catalog.bootstrap_guard import BOOTSTRAP_GUARD_KEY
+    from dynastore.models.protocols.properties import PropertiesProtocol
+    from dynastore.tools.discovery import get_protocol
 
-    # ``db_key`` is consumed by the cache layer as the per-database key; logging
-    # it here documents that contract and aids diagnosing a wrong-key skip.
-    logging.getLogger(__name__).debug(
-        "platform bootstrap-marker probe for database %s", db_key
-    )
-    return await is_initialized(resource)
+    props = get_protocol(PropertiesProtocol)
+    if props is None:
+        logging.getLogger(__name__).debug(
+            "bootstrap-marker read: PropertiesProtocol not registered — "
+            "degrading to 'not initialised'."
+        )
+        return False
+    value = await props.get_property(BOOTSTRAP_GUARD_KEY, db_resource=resource)
+    return value == "true"
 
 
 async def ensure_base_extensions(resource: DbResource) -> None:
     """Ensure the base Postgres extensions exist — guarded for per-boot cheapness.
 
     Safe to call from any service's startup on any (sync or async) engine: the
-    guard above collapses the steady-state cost to a single cache read. Only
-    when the sentinel extension is genuinely absent are the ``CREATE EXTENSION``
-    statements issued — each one advisory-locked + idempotent via
-    ``ensure_db_extension`` (which embeds its own connection-invalidation retry).
+    presence probe collapses the steady-state cost to a single indexed
+    ``pg_extension`` ``SELECT``. Only when the sentinel extension is genuinely
+    absent are the ``CREATE EXTENSION`` statements issued — each one advisory-
+    locked + idempotent via ``ensure_db_extension`` (which embeds its own
+    connection-invalidation retry), so a fleet-wide boot herd converges with a
+    single winner creating the extensions and the rest observing them present.
     """
-    db_key = await _resolve_db_identity(resource)
-    if await _base_extensions_present(resource, db_key):
+    if await _base_extensions_present(resource):
         return
     for ext in BASE_DB_EXTENSIONS:
         await maintenance_tools.ensure_db_extension(resource, ext)
@@ -189,39 +244,115 @@ async def ensure_init_db(resource: DbResource):
     """Initializes the database base extensions + platform-config storage.
 
     The base-extension step is delegated to :func:`ensure_base_extensions`,
-    whose boot guard makes repeated calls cheap; the platform-config initializer
-    (which issues raw DDL directly) is wrapped in ``retry_on_invalidated_connection``
-    so a transient DB drop during dev startup (db_entrypoint_dev.sh reset) does
-    not abort the foundational lifespan.
+    whose direct presence probe makes repeated calls cheap; the platform-config
+    initializer (which issues raw DDL directly) is wrapped in
+    ``retry_on_invalidated_connection`` so a transient DB drop during dev startup
+    (db_entrypoint_dev.sh reset) does not abort the foundational lifespan.
 
-    Gated on the platform bootstrap marker via the cached
+    Gated on the platform bootstrap marker via
     :func:`_platform_bootstrap_present`: once a prior boot has fully initialised
     this deployment (marker ``platform.bootstrap_initialized`` set in
     ``catalog.shared_properties``), the whole one-time step is skipped from a
-    single cache read. This keeps a serving pod's foundational lifespan from
+    single direct read. This keeps a serving pod's foundational lifespan from
     re-running DDL — and, more importantly, from re-issuing the DB-blocking
     extension-presence probe — on every cold boot against an already-initialised
-    DB. The marker is read directly (no ``PropertiesProtocol`` dependency, which
-    is not registered this early); absent/unreadable degrades to "not
-    initialised", so a genuinely fresh DB still bootstraps.
+    DB.
+
+    The marker read is bounded (:data:`_BOOTSTRAP_MARKER_READ_TIMEOUT_SECONDS`)
+    and its failures are classified rather than uniformly treated as "fresh DB":
+
+    * marker present → skip (already initialised);
+    * marker read fails with a missing-schema/table error → genuinely fresh DB
+      (``catalog.shared_properties`` is created later, by ``CatalogModule`` at
+      priority 20) → run the one-time init;
+    * marker absent but readable → also run init (partially-initialised DB);
+    * marker read times out or fails any other way → the DB is reachable-but-
+      saturated, i.e. an already-initialised DB under a cold-boot thundering
+      herd → **skip**. Re-running init here would drive the extension-presence
+      probe into a ~30s block that re-raises and aborts the pod, crash-looping
+      the fleet during a rollout / scale-up storm.
+
+    Init proceeds only on a genuinely fresh (or partially-initialised, absent-
+    but-readable-marker) DB. Even then it is **best-effort and bounded**
+    (:data:`_INIT_DB_BOOTSTRAP_TIMEOUT_SECONDS`): a rollout / scale-up storm can
+    hit a freshly reset dev database with many pods at once, so if the idempotent,
+    advisory-locked bootstrap cannot complete in time the pod boots degraded
+    rather than aborting — a later boot or the dedicated init job finishes it.
+    A serving pod against an already-marked DB skips the whole step outright.
     """
-    db_key = await _resolve_db_identity(resource)
-    if await _platform_bootstrap_present(resource, db_key):
+    try:
+        initialized = await asyncio.wait_for(
+            _platform_bootstrap_present(resource),
+            timeout=_BOOTSTRAP_MARKER_READ_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logging.getLogger(__name__).warning(
+            "ensure_init_db: bootstrap-marker read did not complete within "
+            "%.0fs (database reachable but connection pool likely saturated at "
+            "cold boot) — skipping one-time init to keep the foundational "
+            "lifespan from aborting.",
+            _BOOTSTRAP_MARKER_READ_TIMEOUT_SECONDS,
+        )
+        return
+    except Exception as exc:  # noqa: BLE001 — classified below
+        if not _is_fresh_db_error(exc):
+            # Reachable-but-saturated: an already-initialised DB we could not
+            # read under pool pressure. Skipping is correct and safe — re-running
+            # init would block the extension probe ~30s and abort the pod.
+            logging.getLogger(__name__).warning(
+                "ensure_init_db: bootstrap-marker read failed (%s) — treating as "
+                "an already-initialised database under pool pressure and skipping "
+                "one-time init to keep the foundational lifespan from aborting.",
+                exc,
+            )
+            return
+        # Missing schema/table → genuinely fresh DB → fall through to init.
+        logging.getLogger(__name__).info(
+            "ensure_init_db: bootstrap-marker schema/table absent — treating as a "
+            "fresh database and running one-time init."
+        )
+        initialized = False
+    if initialized:
         logging.getLogger(__name__).info(
             "ensure_init_db: platform already initialised (bootstrap marker "
             "present) — skipping extension + platform-config bootstrap."
         )
         return
 
-    await ensure_base_extensions(resource)
+    # One-time init on a genuinely fresh (or partially-initialised) database.
+    # Best-effort AND bounded: the base-extension bootstrap and platform-config
+    # storage init are idempotent + advisory-locked, so if a cold-boot pool storm
+    # keeps them from completing in time, booting degraded is strictly better than
+    # aborting and crash-looping the fleet — a later boot or the dedicated init
+    # job completes them once the pool clears. This mirrors the best-effort
+    # treatment DBService already applies to its async-engine extension ensure;
+    # the foundational DatastoreModule lifespan must be just as resilient.
+    async def _run_one_time_init() -> None:
+        await ensure_base_extensions(resource)
+        # --- Initialize Platform Config Storage ---
+        from dynastore.modules.db_config.platform_config_service import (
+            PlatformConfigService,
+        )
 
-    # --- Initialize Platform Config Storage ---
-    from dynastore.modules.db_config.platform_config_service import PlatformConfigService
+        await maintenance_tools.retry_on_invalidated_connection(
+            lambda: PlatformConfigService.initialize_storage(resource),
+            label="PlatformConfigService.initialize_storage",
+        )
 
-    await maintenance_tools.retry_on_invalidated_connection(
-        lambda: PlatformConfigService.initialize_storage(resource),
-        label="PlatformConfigService.initialize_storage",
-    )
+    try:
+        await asyncio.wait_for(
+            _run_one_time_init(), timeout=_INIT_DB_BOOTSTRAP_TIMEOUT_SECONDS
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort; must never abort boot
+        logging.getLogger(__name__).warning(
+            "ensure_init_db: one-time bootstrap (base extensions + platform-config "
+            "storage) did not complete within %.0fs (%s) — continuing startup "
+            "degraded rather than aborting the foundational lifespan; the steps are "
+            "idempotent and advisory-locked, so a later boot or the init job "
+            "completes them.",
+            _INIT_DB_BOOTSTRAP_TIMEOUT_SECONDS,
+            exc,
+        )
 
 
 def get_config(app_state) -> DBConfig:

@@ -22,13 +22,18 @@ The base Postgres extensions (postgis et al.) must exist before any geometry /
 columnar write. ``ensure_base_extensions`` is called from every service's
 startup (notably the catalog service's async engine — #1748 gated the historical
 sync-engine owner off the API/catalog SCOPE), so it MUST be cheap on every boot
-in a multi-pod / multi-Cloud-Run fleet: a DB-backed presence probe whose POSITIVE
-result is cached (Valkey), keyed by database identity.
+in a multi-pod / multi-Cloud-Run fleet: a direct, DB-backed ``pg_extension``
+presence probe (a single indexed ``SELECT``).
 
-The repoint-safety property is load-bearing: a freshly-provisioned database
-(sentinel extension absent) must re-bootstrap rather than inherit a stale
-"present" marker from a previous database — the exact failure that left a fresh
-dev DB without PostGIS. These tests use pure mocks; no DB.
+The probe is deliberately **uncached**: a cached wrapper here runs at the
+priority-7 foundational lifespan before the distributed cache backend exists and,
+under a cold-boot herd, drives every pod into the cache slow-path waiting on a
+rebuild none of them performs — re-raising and aborting startup without ever
+creating the extensions. Reading the live catalog is also inherently repoint-
+safe: a freshly-provisioned database (sentinel extension absent) always reports
+absent and re-bootstraps rather than inheriting a stale "present" answer from a
+previous database — the exact failure that left a fresh dev DB without PostGIS.
+These tests use pure mocks; no DB.
 """
 from __future__ import annotations
 
@@ -73,34 +78,14 @@ def test_sentinel_is_last_extension():
 
 
 @pytest.mark.asyncio
-async def test_db_identity_from_engine_url_no_round_trip():
-    key = await tools._resolve_db_identity(_engine(host="h", port=5432, database="fresh_db"))
-    assert key == "h:5432/fresh_db"
-
-
-@pytest.mark.asyncio
-async def test_db_identity_falls_back_to_current_database():
-    """A bare connection (no .url) resolves identity via current_database()."""
-
-    class _FakeDQL:
-        def __init__(self, *a, **k):
-            pass
-
-        async def execute(self, *a, **k):
-            return "fallback_db"
-
-    with patch.object(tools, "DQLQuery", _FakeDQL):
-        key = await tools._resolve_db_identity(object())
-    assert key == "db/fallback_db"
-
-
-@pytest.mark.asyncio
 async def test_presence_probe_reads_pg_extension_sentinel():
-    """The probe returns the DB-backed truth for the sentinel extension."""
-    tools._base_extensions_present.cache_clear()
-    with patch(_LOCK, new=AsyncMock(return_value=True)):
-        assert await tools._base_extensions_present(object(), "k_true") is True
+    """The probe returns the live DB-backed truth for the sentinel extension.
 
-    tools._base_extensions_present.cache_clear()
+    Uncached — each call reads the catalog directly, so a repointed/fresh DB can
+    never inherit a stale "present" answer (the repoint-safety property).
+    """
+    with patch(_LOCK, new=AsyncMock(return_value=True)):
+        assert await tools._base_extensions_present(object()) is True
+
     with patch(_LOCK, new=AsyncMock(return_value=False)):
-        assert await tools._base_extensions_present(object(), "k_false") is False
+        assert await tools._base_extensions_present(object()) is False
