@@ -87,6 +87,10 @@ def _links_by_rel(body):
     return {link["rel"]: link["href"] for link in body["links"]}
 
 
+def _collection_links_by_rel(collection):
+    return {link["rel"]: link for link in collection["links"]}
+
+
 @pytest.mark.asyncio
 async def test_first_page_emits_self_and_next_no_prev(monkeypatch):
     """limit=1 over 1971 collections: self + next (offset=1), no prev."""
@@ -108,6 +112,33 @@ async def test_first_page_emits_self_and_next_no_prev(monkeypatch):
     assert "offset=1" in links["next"]
     assert "limit=1" in links["next"]  # other query params are preserved
     assert body["context"]["matched"] == 1971
+
+
+@pytest.mark.asyncio
+async def test_collection_entries_emit_navigation_links(monkeypatch):
+    """The fast PG-backed listing path must still return crawlable STAC
+    Collection objects. It cannot hydrate each collection through
+    stac_generator.create_collection(), but it can add deterministic navigation
+    links from the catalog and collection ids."""
+    svc = _mk_service(monkeypatch, page=[object()], matched=1, effective_limit=10)
+
+    response = await svc.list_stac_collections(
+        catalog_id="cat-1",
+        request=_make_request(b"limit=10"),
+        engine="fake-engine",
+        language="en",
+        request_hints=frozenset(),
+        bbox=None, datetime=None, q=None, limit=10, offset=0, sortby=None,
+    )
+    body = json.loads(response.body)
+
+    links = _collection_links_by_rel(body["collections"][0])
+    assert set(links) == {"self", "root", "parent", "items"}
+    assert links["self"]["href"].endswith("/stac/catalogs/cat-1/collections/col-0")
+    assert links["root"]["href"].endswith("/stac")
+    assert links["parent"]["href"].endswith("/stac/catalogs/cat-1")
+    assert links["items"]["href"].endswith("/stac/catalogs/cat-1/collections/col-0/items")
+    assert links["items"]["type"] == "application/geo+json"
 
 
 @pytest.mark.asyncio

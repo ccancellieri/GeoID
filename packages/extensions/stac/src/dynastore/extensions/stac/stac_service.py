@@ -19,6 +19,7 @@
 # dynastore/extensions/stac/stac_service.py
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any, Tuple, List, FrozenSet, cast
 
@@ -26,6 +27,7 @@ import pystac
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import Response
 from dynastore.extensions.tools.fast_api import AppJSONResponse as JSONResponse
+from dynastore.extensions.tools.language_utils import get_language
 from dynastore.models.driver_context import DriverContext
 from dynastore.models.protocols import ConfigsProtocol
 
@@ -64,9 +66,12 @@ from .stac_models import (
 )
 from .stac_aggregation_models import AggregationRequest
 from dynastore.extensions.ogc_base import OGCServiceMixin, OGCTransactionMixin
-from dynastore.extensions.tools.url import get_url
+from dynastore.extensions.tools.url import get_root_url, get_url
 from dynastore.tools.discovery import get_protocol, get_protocols
 from dynastore.models.localization import normalize_i18n_for_replace
+from dynastore.extensions.web.decorators import expose_web_page
+from dynastore.models.protocols.web import StaticFilesProtocol
+from .stac_virtual import StacVirtualMixin
 
 logger = logging.getLogger(__name__)
 
@@ -88,12 +93,6 @@ def _reject_internal_id(value: str, prefix: str, resource_name: str) -> None:
             status_code=404, detail=f"{resource_name} '{value}' not found."
         )
 
-
-from dynastore.extensions.tools.language_utils import get_language
-from dynastore.extensions.web.decorators import expose_web_page
-from dynastore.models.protocols.web import StaticFilesProtocol
-import os
-from .stac_virtual import StacVirtualMixin
 
 def _assert_stac_capable_collection_stack() -> None:
     """Verify the catalog-tier can persist a STAC envelope; warn on the
@@ -284,6 +283,65 @@ def _pg_collections_to_stac_dicts(
             stac_coll.extra_fields["languages"] = localized_coll["languages"]
         stac_collections.append(stac_coll.to_dict())
     return stac_collections
+
+
+def _add_collection_navigation_links(
+    collections: List[Dict[str, Any]],
+    *,
+    request: Request,
+    catalog_id: str,
+    language: str,
+) -> None:
+    """Attach deterministic STAC navigation links to listed collections.
+
+    The fast collection-listing path deliberately avoids the full
+    ``create_collection`` hydration pass. These links are derived only from
+    the already-rendered public collection id, so the listing stays bounded
+    while remaining crawlable by STAC clients.
+    """
+    root_url = get_root_url(request)
+    catalog_href = f"{root_url}/stac/catalogs/{catalog_id}"
+    root_link = {
+        "rel": "root",
+        "href": f"{root_url}/stac",
+        "type": "application/json",
+        "title": "Root Catalog",
+    }
+    parent_link = {
+        "rel": "parent",
+        "href": catalog_href,
+        "type": "application/json",
+        "title": "Parent Catalog",
+    }
+    if language != "*":
+        root_link["hreflang"] = language
+        parent_link["hreflang"] = language
+
+    for collection in collections:
+        collection_id = collection.get("id")
+        if not collection_id:
+            continue
+        collection_href = f"{catalog_href}/collections/{collection_id}"
+        self_link = {
+            "rel": "self",
+            "href": collection_href,
+            "type": "application/json",
+        }
+        items_link = {
+            "rel": "items",
+            "href": f"{collection_href}/items",
+            "type": "application/geo+json",
+            "title": "Items in this Collection",
+        }
+        if language != "*":
+            self_link["hreflang"] = language
+            items_link["hreflang"] = language
+        collection["links"] = [
+            self_link,
+            dict(root_link),
+            dict(parent_link),
+            items_link,
+        ]
 
 
 STAC_API_URIS = [
@@ -740,6 +798,12 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         stac_collections = _pg_collections_to_stac_dicts(collections_list, language)
+        _add_collection_navigation_links(
+            stac_collections,
+            request=request,
+            catalog_id=catalog_id,
+            language=language,
+        )
 
         # search_collections has resolved/clamped search_req.limit in place, so
         # offset/limit are concrete ints here. Emit self + prev/next so a client
