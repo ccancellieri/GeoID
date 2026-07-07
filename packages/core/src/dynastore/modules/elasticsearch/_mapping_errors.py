@@ -32,6 +32,23 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
+def _bulk_response_is_clean(bulk_resp: Any, ids: "List[str]") -> bool:
+    """True only when ES reported no errors AND the response accounts for
+    every submitted id.
+
+    The ``errors`` flag alone is insufficient (#2799): a truncated/partial
+    ``items`` array can arrive with ``errors: false``, in which case the
+    trailing ids were never acknowledged. When the item count does not match
+    the submitted id count we must NOT take the fast ``return list(ids)``
+    path — the response has to be classified so the unconfirmed tail is
+    surfaced as a failure rather than assumed successful.
+    """
+    if not isinstance(bulk_resp, dict) or bulk_resp.get("errors"):
+        return False
+    items = bulk_resp.get("items", []) or []
+    return len(items) == len(ids)
+
+
 def maybe_raise_mapping_mismatch(
     exc: Exception, index_name: str, doc_keys: Iterable[str],
 ) -> None:
@@ -135,7 +152,7 @@ def raise_on_bulk_errors(
     (raised as :class:`~dynastore.modules.storage.errors.EsBulkWriteError`)
     the same list is available on the exception's ``.acknowledged``.
     """
-    if not isinstance(bulk_resp, dict) or not bulk_resp.get("errors"):
+    if _bulk_response_is_clean(bulk_resp, ids):
         return list(ids)
 
     from dynastore.modules.elasticsearch.bulk_classify import classify_bulk_response
@@ -200,7 +217,7 @@ async def raise_on_bulk_errors_with_ladder(
     — callers MUST use it instead of assuming every non-failed id in the
     request succeeded, since a rejected sub-chunk is not all-or-nothing.
     """
-    if not isinstance(bulk_resp, dict) or not bulk_resp.get("errors"):
+    if _bulk_response_is_clean(bulk_resp, ids):
         return list(ids)
 
     from dynastore.modules.elasticsearch.bulk_classify import classify_bulk_response

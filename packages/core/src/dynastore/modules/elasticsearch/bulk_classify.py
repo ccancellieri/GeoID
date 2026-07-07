@@ -139,7 +139,21 @@ def classify_bulk_response(
     poison: List[Tuple[str, str]] = []
 
     items = response.get("items", []) if isinstance(response, dict) else []
-    for raw_item, doc_id in zip(items, ids):
+
+    # #2799: iterate over ``ids`` (the authoritative submitted set), NOT
+    # ``zip(items, ids)``.  ``zip`` stops at the shorter sequence, so if ES
+    # returns fewer entries than we sent (truncated/partial response) the
+    # trailing ids would be silently dropped — never passed, transient, or
+    # poison — and the caller would treat them as acknowledged though they
+    # were never confirmed. Any id with no corresponding item entry is
+    # classified **transient** so it is retried rather than lost.
+    for idx, doc_id in enumerate(ids):
+        raw_item = items[idx] if idx < len(items) else None
+        if raw_item is None:
+            transient.append(
+                (doc_id, "no bulk response entry for submitted id (truncated response)")
+            )
+            continue
         entry = next(iter(raw_item.values())) if isinstance(raw_item, dict) and raw_item else {}
         status = entry.get("status", 200) if isinstance(entry, dict) else 200
         error = entry.get("error") if isinstance(entry, dict) else None

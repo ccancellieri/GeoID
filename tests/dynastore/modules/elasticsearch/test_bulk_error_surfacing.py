@@ -218,6 +218,88 @@ class TestClassifyBulkResponse:
 
 
 # ---------------------------------------------------------------------------
+# #2799 — id/items length-mismatch (truncated bulk response)
+# ---------------------------------------------------------------------------
+
+
+class TestBulkIdLengthMismatch:
+    """A truncated ``items`` array (fewer entries than ids submitted) must
+    never silently drop the unaccounted tail — those ids must resurface as
+    transient (retryable) rather than being assumed acknowledged (#2799)."""
+
+    def test_classify_marks_missing_tail_as_transient(self):
+        from dynastore.modules.elasticsearch.bulk_classify import classify_bulk_response
+
+        # Two ids submitted, ES only echoed one item.
+        resp = {
+            "errors": False,
+            "items": [{"index": {"_id": "a", "status": 200}}],
+        }
+        passed, transient, poison = classify_bulk_response(resp, ["a", "b"])
+        assert passed == ["a"]
+        assert poison == []
+        # The dropped tail id must be surfaced, not lost.
+        assert [t[0] for t in transient] == ["b"]
+        assert "truncated" in transient[0][1]
+
+    def test_classify_all_missing_when_items_empty(self):
+        from dynastore.modules.elasticsearch.bulk_classify import classify_bulk_response
+
+        resp = {"errors": False, "items": []}
+        passed, transient, poison = classify_bulk_response(resp, ["a", "b"])
+        assert passed == []
+        assert poison == []
+        assert [t[0] for t in transient] == ["a", "b"]
+
+    def test_raise_on_bulk_errors_does_not_swallow_truncated_tail(self):
+        """errors:false is NOT sufficient to fast-return list(ids) when the
+        response is truncated — the tail must be raised as a failure."""
+        from dynastore.modules.elasticsearch._mapping_errors import raise_on_bulk_errors
+        from dynastore.modules.storage.errors import EsBulkWriteError
+
+        resp = {
+            "errors": False,
+            "items": [{"index": {"_id": "a", "status": 200}}],
+        }
+        with pytest.raises(EsBulkWriteError) as exc_info:
+            raise_on_bulk_errors(resp, "my-index", ["a", "b"])
+        assert exc_info.value.acknowledged == ["a"]
+        assert [f[0] for f in exc_info.value.failures] == ["b"]
+
+    def test_clean_full_response_still_fast_returns(self):
+        """The fast path must still trigger when counts match and no errors."""
+        from dynastore.modules.elasticsearch._mapping_errors import raise_on_bulk_errors
+
+        resp = {
+            "errors": False,
+            "items": [
+                {"index": {"_id": "a", "status": 200}},
+                {"index": {"_id": "b", "status": 201}},
+            ],
+        }
+        assert raise_on_bulk_errors(resp, "my-index", ["a", "b"]) == ["a", "b"]
+
+    @pytest.mark.asyncio
+    async def test_ladder_variant_does_not_swallow_truncated_tail(self):
+        from dynastore.modules.elasticsearch._mapping_errors import (
+            raise_on_bulk_errors_with_ladder,
+        )
+        from dynastore.modules.storage.errors import EsBulkWriteError
+
+        resp = {
+            "errors": False,
+            "items": [{"index": {"_id": "a", "status": 200}}],
+        }
+        with pytest.raises(EsBulkWriteError) as exc_info:
+            await raise_on_bulk_errors_with_ladder(
+                es=MagicMock(), bulk_resp=resp, index_name="my-index",
+                ids=["a", "b"], doc_by_id={},
+            )
+        assert exc_info.value.acknowledged == ["a"]
+        assert [f[0] for f in exc_info.value.failures] == ["b"]
+
+
+# ---------------------------------------------------------------------------
 # Task 2 helper — raise_on_bulk_errors
 # ---------------------------------------------------------------------------
 
@@ -683,8 +765,14 @@ class TestItemsElasticsearchDriverWriteEntities:
             with pytest.raises(EsBulkWriteError) as exc_info:
                 await driver.write_entities("cat1", "col1", items)
 
+        # item-1 confirmed; item-2 explicitly rejected; item-3 had NO entry in
+        # the (truncated) response — it must resurface as a failure (transient),
+        # never silently assumed acknowledged (#2799).
         assert exc_info.value.acknowledged == ["item-1"]
-        assert [f[0] for f in exc_info.value.failures] == ["item-2"]
+        failure_ids = {f[0] for f in exc_info.value.failures}
+        assert failure_ids == {"item-2", "item-3"}
+        item3_reason = next(r for i, r in exc_info.value.failures if i == "item-3")
+        assert "truncated" in item3_reason
 
 
 # ---------------------------------------------------------------------------
