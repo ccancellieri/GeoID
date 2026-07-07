@@ -221,6 +221,66 @@ async def test_apply_handler_success_swaps_backend_and_logs_metric(
     assert "duration_ms=" in msg
 
 
+@pytest.mark.asyncio
+async def test_apply_handler_ping_success_keeps_info_metadata_best_effort(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Reconnect should not reject Valkey only because INFO metadata times out
+    after a successful PING."""
+    old_backend = MagicMock()
+    old_backend.close = AsyncMock(return_value=None)
+
+    new_client = MagicMock()
+    engine_cache = _stub_engine_cache(new_client)
+
+    cm._app_state = _make_app_state(engine_cache)
+    cm._current_backend = old_backend
+
+    class _PingOnlyBackend:
+        required = False
+
+        def __init__(self) -> None:
+            self.ping_mock = AsyncMock(return_value=True)
+            self.info_mock = AsyncMock(side_effect=asyncio.TimeoutError())
+            self.topology_mock = AsyncMock(return_value={"is_cluster": False})
+            self.close = AsyncMock(return_value=None)
+
+        async def ping(self) -> bool:
+            return await self.ping_mock()
+
+        async def info(self) -> dict:
+            return await self.info_mock()
+
+        async def topology(self) -> dict:
+            return await self.topology_mock()
+
+    new_backend = _PingOnlyBackend()
+    manager = MagicMock()
+
+    with (
+        patch(
+            "dynastore.tools.cache_valkey.ValkeyCacheBackend", return_value=new_backend
+        ),
+        patch("dynastore.tools.cache.get_cache_manager", return_value=manager),
+        patch("dynastore.tools.cache._notify_backend_upgrade") as notify,
+        caplog.at_level("INFO"),
+    ):
+        await cm._on_valkey_engine_config_change(None, None, None, None)
+
+    new_backend.ping_mock.assert_awaited_once()
+    new_backend.info_mock.assert_awaited_once()
+    manager.register_backend.assert_called_once_with(new_backend)
+    notify.assert_called_once()
+    assert cm._current_backend is new_backend
+
+    metric_lines = [r for r in caplog.records if "CACHE RECONNECT" in r.getMessage()]
+    assert len(metric_lines) == 1
+    msg = metric_lines[0].getMessage()
+    assert "success=true" in msg
+    assert "version=?" in msg
+    assert "mode=standalone" in msg
+
+
 # --------------------------------------------------------------------------
 # _on_valkey_engine_config_change — failure paths
 # --------------------------------------------------------------------------
@@ -314,6 +374,57 @@ async def test_apply_handler_probe_failure_degrades_to_l1(
     assert "success=false" in msg
     assert "stage=probe" in msg
     assert "TimeoutError" in msg
+
+
+@pytest.mark.asyncio
+async def test_required_apply_handler_probe_failure_keeps_old_backend(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    old_backend = MagicMock()
+    old_backend.close = AsyncMock(return_value=None)
+
+    new_client = MagicMock()
+    engine_cache = _stub_engine_cache(new_client)
+
+    cm._app_state = _make_app_state(engine_cache)
+    cm._current_backend = old_backend
+
+    new_backend = MagicMock()
+    new_backend.info = AsyncMock(side_effect=asyncio.TimeoutError())
+    new_backend.close = AsyncMock(return_value=None)
+
+    manager = MagicMock()
+
+    class _RequiredCacheCfg:
+        probe_timeout_seconds = 1.0
+        circuit_breaker_threshold = 3
+        shared_backend_required = True
+
+    with (
+        patch("dynastore.modules.cache.cache_module._load_cache_config",
+              new=AsyncMock(return_value=_RequiredCacheCfg())),
+        patch(
+            "dynastore.tools.cache_valkey.ValkeyCacheBackend", return_value=new_backend
+        ),
+        patch("dynastore.tools.cache.get_cache_manager", return_value=manager),
+        patch("dynastore.tools.cache._notify_backend_upgrade") as notify,
+        caplog.at_level("INFO"),
+    ):
+        await cm._on_valkey_engine_config_change(None, None, None, None)
+
+    manager.unregister_backend.assert_not_called()
+    old_backend.close.assert_not_called()
+    manager.register_backend.assert_not_called()
+    notify.assert_not_called()
+    new_backend.close.assert_awaited_once()
+    assert cm._current_backend is old_backend
+
+    metric_lines = [r for r in caplog.records if "CACHE RECONNECT" in r.getMessage()]
+    assert len(metric_lines) == 1
+    msg = metric_lines[0].getMessage()
+    assert "success=false" in msg
+    assert "stage=probe" in msg
+    assert "required=true" in msg
 
 
 @pytest.mark.asyncio

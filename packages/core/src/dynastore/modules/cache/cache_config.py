@@ -74,6 +74,18 @@ class CachePluginConfig(PluginConfig):
         ),
     )
 
+    shared_backend_required: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "When True, the shared Valkey backend is required for this "
+            "deployment: startup/reconnect probe failures are fatal or keep "
+            "the last healthy backend, and runtime failures must not silently "
+            "degrade distributed caches to local-only L1. Enable in "
+            "environments where cross-instance cache consistency is part of "
+            "the service contract."
+        ),
+    )
+
     oracle_inner_timeout_seconds: Mutable[float] = Field(
         default=0.5,
         ge=0.05,

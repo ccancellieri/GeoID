@@ -205,6 +205,34 @@ async def _load_valkey_engine_config() -> "ValkeyEngineConfig":
     return ValkeyEngineConfig()
 
 
+async def _probe_valkey_backend(backend: Any, timeout: float) -> dict:
+    """Probe Valkey connectivity without requiring full INFO metadata.
+
+    ``INFO all`` can be slower or broader than the liveness check we need
+    during startup/reconnect, especially for managed cluster clients.  When
+    the backend exposes ``ping()``, use it as the gate and treat ``info()``
+    as best-effort metadata for logs.  Older test doubles that only expose
+    ``info()`` keep the historical behavior.
+    """
+
+    ping_method = getattr(type(backend), "ping", None)
+    if callable(ping_method):
+        ok = await asyncio.wait_for(backend.ping(), timeout=timeout)
+        if not ok:
+            raise RuntimeError("Valkey ping returned false")
+        try:
+            return await asyncio.wait_for(backend.info(), timeout=timeout)
+        except Exception as exc:
+            logger.warning(
+                "CacheModule: Valkey INFO metadata probe failed after "
+                "successful ping (%s); continuing with unknown metadata.",
+                exc,
+            )
+            return {}
+
+    return await asyncio.wait_for(backend.info(), timeout=timeout)
+
+
 async def _detect_and_correct_cluster_mismatch(
     *,
     server_redis_mode: Optional[str],
@@ -262,6 +290,7 @@ async def _detect_and_correct_cluster_mismatch(
             owns_client=True,
             circuit_breaker_threshold=cache_cfg.circuit_breaker_threshold,
             on_trip=_on_backend_trip,
+            required=getattr(cache_cfg, "shared_backend_required", False),
         )
     except Exception as exc:
         logger.warning(
@@ -355,9 +384,14 @@ async def _on_valkey_engine_config_change(
             )
             return
 
+        cache_cfg = await _load_cache_config()
+        shared_required = bool(
+            getattr(cache_cfg, "shared_backend_required", False)
+        )
+
         # 1. Close + unregister old backend.
         old_backend = _current_backend
-        if old_backend is not None:
+        if old_backend is not None and not shared_required:
             try:
                 from dynastore.tools.cache import get_cache_manager
 
@@ -398,15 +432,30 @@ async def _on_valkey_engine_config_change(
             _target = getattr(client, "_ds_resolved_target", "<engine>")
         except Exception as e:
             _dur_ms = int((asyncio.get_event_loop().time() - _t0) * 1000)
-            logger.error(
-                "ValkeyEngineConfig apply handler: failed to re-init engine (%s). "
-                "Cache degrades to L1-only until next successful config apply.",
-                e,
-            )
+            if shared_required:
+                logger.critical(
+                    "ValkeyEngineConfig apply handler: failed to re-init required "
+                    "Valkey engine (%s). %s; refusing local-only degrade.",
+                    e,
+                    "Keeping previous backend"
+                    if old_backend is not None
+                    else "No previous backend is available",
+                )
+                if old_backend is None:
+                    raise RuntimeError(
+                        "ValkeyEngineConfig apply handler: required Valkey engine "
+                        "failed to initialize and no previous backend is available"
+                    ) from e
+            else:
+                logger.error(
+                    "ValkeyEngineConfig apply handler: failed to re-init engine (%s). "
+                    "Cache degrades to L1-only until next successful config apply.",
+                    e,
+                )
             logger.info(
                 "CACHE RECONNECT: success=false stage=engine_init "
-                "duration_ms=%d error=%s",
-                _dur_ms, type(e).__name__,
+                "duration_ms=%d error=%s required=%s",
+                _dur_ms, type(e).__name__, str(shared_required).lower(),
             )
             return
 
@@ -414,17 +463,17 @@ async def _on_valkey_engine_config_change(
         from dynastore.tools.cache_valkey import ValkeyCacheBackend
         from dynastore.tools.cache import _notify_backend_upgrade, get_cache_manager
 
-        cache_cfg = await _load_cache_config()
         new_backend = ValkeyCacheBackend(
             client=client,
             owns_client=False,
             circuit_breaker_threshold=cache_cfg.circuit_breaker_threshold,
             on_trip=_on_backend_trip,
+            required=shared_required,
         )
 
         try:
-            info = await asyncio.wait_for(
-                new_backend.info(), timeout=cache_cfg.probe_timeout_seconds
+            info = await _probe_valkey_backend(
+                new_backend, cache_cfg.probe_timeout_seconds
             )
             version = info.get("server", {}).get("redis_version", "?")
             # ``redis_mode`` is the *server node's* self-view and may be
@@ -491,16 +540,39 @@ async def _on_valkey_engine_config_change(
                 "probe timed out" if isinstance(exc, asyncio.TimeoutError) else str(exc)
             )
             _dur_ms = int((asyncio.get_event_loop().time() - _t0) * 1000)
-            logger.error(
-                "CacheModule (reconnect): Valkey probe failed at %s (%s). "
-                "Cache degrades to L1-only.",
-                _target,
-                _reason,
-            )
+            if shared_required:
+                logger.critical(
+                    "CacheModule (reconnect): required Valkey probe failed at %s "
+                    "(%s). %s; refusing local-only degrade.",
+                    _target,
+                    _reason,
+                    "Keeping previous backend"
+                    if old_backend is not None
+                    else "No previous backend is available",
+                )
+                try:
+                    await new_backend.close()
+                except Exception:
+                    logger.exception(
+                        "CacheModule (reconnect): failed to close unregistered "
+                        "required Valkey probe backend"
+                    )
+                if old_backend is None:
+                    raise RuntimeError(
+                        "CacheModule (reconnect): required Valkey probe failed "
+                        "and no previous backend is available"
+                    ) from exc
+            else:
+                logger.error(
+                    "CacheModule (reconnect): Valkey probe failed at %s (%s). "
+                    "Cache degrades to L1-only.",
+                    _target,
+                    _reason,
+                )
             logger.info(
                 "CACHE RECONNECT: success=false stage=probe host=%s "
-                "duration_ms=%d error=%s",
-                _target, _dur_ms, type(exc).__name__,
+                "duration_ms=%d error=%s required=%s",
+                _target, _dur_ms, type(exc).__name__, str(shared_required).lower(),
             )
             return
 
@@ -517,6 +589,20 @@ async def _on_valkey_engine_config_change(
         )
         if corrected is not None:
             new_backend = corrected
+
+        if old_backend is not None and shared_required:
+            try:
+                get_cache_manager().unregister_backend(old_backend)
+            except Exception:
+                logger.exception(
+                    "ValkeyEngineConfig apply handler: unregister_backend failed"
+                )
+            try:
+                await old_backend.close()
+            except Exception:
+                logger.exception(
+                    "ValkeyEngineConfig apply handler: backend.close failed"
+                )
 
         get_cache_manager().register_backend(new_backend)
         _notify_backend_upgrade()
@@ -659,11 +745,13 @@ async def _on_cache_plugin_config_change(
     * ``probe_timeout_seconds`` — only consumed during (re)connect via
       ``_load_cache_config()``; the next reconnect already picks up
       the new value, no live update needed.
+    * ``shared_backend_required`` — live-applied to the backend so runtime
+      circuit-breaker behavior and tiered-cache reads switch immediately.
     * ``oracle_inner_timeout_seconds`` — hot-read per dispatch in
       ``modules/tasks/dispatcher.py`` (calls ``configs_proto.get_config
       (CachePluginConfig)`` each time), no live update needed.
 
-    So this handler only has to push the threshold onto the live
+    So this handler pushes runtime flags onto the live
     backend.  Safe to no-op when ``_current_backend`` is ``None``
     (e.g. cache degraded to L1-only) — the next reconnect will pick
     up the new value via ``_load_cache_config()``.
@@ -679,22 +767,27 @@ async def _on_cache_plugin_config_change(
         )
         return
 
-    new_threshold = getattr(config, "circuit_breaker_threshold", None)
-    if new_threshold is None:
-        return
-
-    # Set the attribute on whatever backend type is live — the test
-    # double + ``ValkeyCacheBackend`` both expose it as ``_circuit_breaker_threshold``.
+    # Set attributes on whatever backend type is live — the test double +
+    # ``ValkeyCacheBackend`` expose these as plain attributes.
     try:
-        setattr(backend, "_circuit_breaker_threshold", int(new_threshold))
-        logger.info(
-            "CachePluginConfig: circuit_breaker_threshold live-applied = %d",
-            int(new_threshold),
-        )
+        new_threshold = getattr(config, "circuit_breaker_threshold", None)
+        if new_threshold is not None:
+            setattr(backend, "_circuit_breaker_threshold", int(new_threshold))
+            logger.info(
+                "CachePluginConfig: circuit_breaker_threshold live-applied = %d",
+                int(new_threshold),
+            )
+        if hasattr(config, "shared_backend_required"):
+            required = bool(getattr(config, "shared_backend_required"))
+            setattr(backend, "required", required)
+            logger.info(
+                "CachePluginConfig: shared_backend_required live-applied = %s",
+                str(required).lower(),
+            )
     except Exception:
         logger.exception(
             "CachePluginConfig apply handler: failed to update "
-            "_circuit_breaker_threshold on live backend (%s)",
+            "runtime cache settings on live backend (%s)",
             type(backend).__name__,
         )
 
@@ -967,6 +1060,12 @@ class CacheModule(ModuleProtocol):
             from dynastore.tools.cache_valkey import _CACHE_DEPS_OK
 
             if not _CACHE_DEPS_OK:
+                if cache_cfg.shared_backend_required:
+                    raise RuntimeError(
+                        "CacheModule: shared_backend_required=true but the "
+                        "module_cache extra is not installed; refusing local-only "
+                        "cache."
+                    )
                 _log_local_fallback(
                     "CACHE BACKEND: LOCAL (in-memory, per-instance) — "
                     "engine_cache present but 'module_cache' extra not in "
@@ -1024,9 +1123,15 @@ class CacheModule(ModuleProtocol):
                 owns_client=False,
                 circuit_breaker_threshold=cache_cfg.circuit_breaker_threshold,
                 on_trip=_on_backend_trip,
+                required=cache_cfg.shared_backend_required,
             )
 
         if backend is None:
+            if cache_cfg.shared_backend_required:
+                raise RuntimeError(
+                    "CacheModule: shared_backend_required=true but no Valkey "
+                    "backend was constructed; refusing local-only cache."
+                )
             _log_local_fallback(
                 "CACHE BACKEND: LOCAL (in-memory, per-instance) — "
                 "no Valkey backend constructed; cross-instance consistency NOT guaranteed."
@@ -1041,8 +1146,8 @@ class CacheModule(ModuleProtocol):
 
         # Probe the backend.
         try:
-            info = await asyncio.wait_for(
-                backend.info(), timeout=cache_cfg.probe_timeout_seconds
+            info = await _probe_valkey_backend(
+                backend, cache_cfg.probe_timeout_seconds
             )
             version = info.get("server", {}).get("redis_version", "?")
             used_mb = info.get("memory", {}).get("used_memory_human", "?")
@@ -1092,6 +1197,12 @@ class CacheModule(ModuleProtocol):
             _reason = (
                 "probe timed out" if isinstance(exc, asyncio.TimeoutError) else str(exc)
             )
+            if cache_cfg.shared_backend_required:
+                await backend.close()
+                raise RuntimeError(
+                    "CacheModule: shared_backend_required=true but Valkey probe "
+                    f"failed at {_safe_url} ({_reason}); refusing local-only cache."
+                ) from exc
             logger.warning(
                 "CacheModule: Valkey unreachable at %s (%s) — falling back to local cache.",
                 _safe_url,

@@ -690,6 +690,7 @@ class ValkeyCacheBackend:
         owns_client: bool = True,
         circuit_breaker_threshold: Optional[int] = None,
         on_trip: Optional[Callable[["ValkeyCacheBackend"], None]] = None,
+        required: bool = False,
     ) -> None:
         """Wrap an engine-built Valkey ``client`` as the cache backend.
 
@@ -734,6 +735,7 @@ class ValkeyCacheBackend:
         self._pool = pool
         self._owns_client = owns_client
         self._on_trip = on_trip
+        self.required = required
 
         self._prefix = key_prefix
         self._stats = CacheStats(maxsize=0)
@@ -790,6 +792,14 @@ class ValkeyCacheBackend:
             )
         self._consecutive_failures += 1
         if self._consecutive_failures >= self._circuit_breaker_threshold:
+            if self.required:
+                logger.critical(
+                    "ValkeyCacheBackend: circuit breaker threshold reached after "
+                    "%d consecutive failures, but this backend is required; "
+                    "keeping Valkey registered and refusing local-only degrade.",
+                    self._consecutive_failures,
+                )
+                return
             logger.error(
                 "ValkeyCacheBackend: circuit breaker tripped after %d consecutive failures — degrading to L1-only.",
                 self._consecutive_failures,

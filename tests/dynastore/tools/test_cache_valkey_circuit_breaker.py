@@ -105,6 +105,23 @@ def test_no_on_trip_callback_is_fine() -> None:
         backend._record_failure()  # must not raise
 
 
+def test_required_backend_circuit_breaker_does_not_unregister_or_trip() -> None:
+    calls: List[Any] = []
+    backend = ValkeyCacheBackend(
+        client=MagicMock(),
+        owns_client=False,
+        circuit_breaker_threshold=1,
+        on_trip=calls.append,
+        required=True,
+    )
+
+    with _patched_manager() as manager_patch:
+        backend._record_failure(ConnectionError("boom"))
+
+    manager_patch.return_value.unregister_backend.assert_not_called()
+    assert calls == []
+
+
 @pytest.mark.asyncio
 async def test_get_failure_triggers_on_trip_at_threshold() -> None:
     """End-to-end through a real backend method, not just _record_failure directly."""

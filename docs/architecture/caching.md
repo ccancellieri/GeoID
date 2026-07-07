@@ -109,6 +109,25 @@ manager.register_backend(LocalAsyncCacheBackend(max_size=1024))
 cache = manager.create_cache(CacheConfig(namespace="my_ns", default_ttl=300))
 ```
 
+### Required Shared Backend
+
+Deployments that require cross-instance cache consistency can set
+`CachePluginConfig.shared_backend_required=true`. In that mode the Valkey
+backend is treated as part of the service contract rather than an optional
+accelerator:
+
+- startup refuses to enter local-only cache mode when Valkey cannot be built or
+  probed;
+- live reconnects keep the last healthy Valkey backend until a replacement has
+  been built and probed successfully;
+- the Valkey circuit breaker does not unregister the shared backend and drift to
+  in-process L1;
+- tiered cache reads re-raise distributed-tier failures instead of serving a
+  potentially stale local value.
+
+Leave the flag `false` for local development, tests, or deployments where
+best-effort in-process caching is acceptable.
+
 ## Protocols
 
 Defined in `dynastore/models/protocols/cache.py`:

@@ -802,6 +802,9 @@ class TieredAsyncBackend:
             if l2_retry_backoff is None
             else float(l2_retry_backoff)
         )
+        self._required_l2 = any(
+            getattr(backend, "required", False) for backend in backends[1:]
+        )
         self._stats = CacheStats()
         self._pending_bg_tasks: Set[asyncio.Task] = set()
 
@@ -842,7 +845,10 @@ class TieredAsyncBackend:
                     l2_present = True
                     l2_ver, l2_val, l2_tomb = _ev_parse(l2_raw)
             except Exception as e:
-                logger.debug("L2 cache get failed (key=%s): %s", key, e)
+                log = logger.error if self._required_l2 else logger.warning
+                log("L2 cache get failed (key=%s): %s", key, e)
+                if self._required_l2:
+                    raise
                 # L2 unavailable — fall back to L1 best-effort.
                 if l1_present and not l1_tomb:
                     return l1_val

@@ -27,22 +27,19 @@ re-applied" failure mode #756 describes. The only path that picked up the
 new value was a Valkey engine config change (which rebuilds the backend).
 
 Fix: register ``_on_cache_plugin_config_change`` as the apply handler for
-``CachePluginConfig``; it pushes ``circuit_breaker_threshold`` onto the
-live ``_current_backend`` in-place. The other two fields on
-``CachePluginConfig`` don't need a live update — ``probe_timeout_seconds``
-is only consumed on (re)connect, and ``oracle_inner_timeout_seconds`` is
-hot-read per dispatch by the tasks dispatcher.
+``CachePluginConfig``; it pushes runtime settings onto the live
+``_current_backend`` in-place. ``probe_timeout_seconds`` is only consumed on
+(re)connect, and ``oracle_inner_timeout_seconds`` is hot-read per dispatch
+by the tasks dispatcher.
 
 This test pins both halves: source-level guard that the handler exists
 and is wired in lifespan, and empirical pin that calling the handler
-updates ``_circuit_breaker_threshold`` on a fake live backend.
+updates ``_circuit_breaker_threshold`` and ``required`` on a fake live backend.
 """
 from __future__ import annotations
 
 import asyncio
 import inspect
-
-import pytest
 
 
 def test_handler_exists_with_correct_signature():
@@ -93,6 +90,33 @@ def test_handler_pushes_threshold_onto_live_backend():
         cache_module._current_backend = None
 
 
+def test_handler_pushes_required_flag_onto_live_backend():
+    """``shared_backend_required`` must take effect immediately on a live
+    backend so circuit-breaker behavior cannot drift until the next reconnect."""
+    from dynastore.modules.cache import cache_module
+
+    class _FakeBackend:
+        def __init__(self):
+            self._circuit_breaker_threshold = 3
+            self.required = False
+
+    fake = _FakeBackend()
+    cache_module._current_backend = fake
+    try:
+        class _FakeCfg:
+            circuit_breaker_threshold = 3
+            shared_backend_required = True
+
+        asyncio.run(
+            cache_module._on_cache_plugin_config_change(
+                _FakeCfg(), None, None, None
+            )
+        )
+        assert fake.required is True
+    finally:
+        cache_module._current_backend = None
+
+
 def test_handler_is_noop_when_no_live_backend():
     """The handler must tolerate ``_current_backend is None`` (cache
     degraded to L1-only) without raising — the new value will take
@@ -136,10 +160,10 @@ def test_lifespan_registers_and_unregisters_handler():
     )
 
 
-def test_handler_only_touches_threshold_not_other_fields():
+def test_handler_only_touches_runtime_cache_settings_not_other_fields():
     """Defensive: the handler should not blanket-overwrite arbitrary
-    fields on the backend (e.g. ``_consecutive_failures``) — its job
-    is to live-apply ``circuit_breaker_threshold`` only. A regression
+    fields on the backend (e.g. ``_consecutive_failures``) — its job is
+    to live-apply runtime cache settings only. A regression
     that reset failure counters via this handler would silently
     deplete the circuit breaker."""
     from dynastore.modules.cache import cache_module
