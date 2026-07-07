@@ -32,6 +32,16 @@ from dynastore.tasks.stac_harvest import task as harvest_task
 from dynastore.tasks.stac_harvest.models import StacHarvestRequest
 
 
+@pytest.fixture(autouse=True)
+def _mock_pg_collection_metadata_upsert():
+    with patch.object(
+        harvest_task,
+        "_upsert_collection_metadata_pg",
+        AsyncMock(),
+    ):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # _probe_single_collection
 # ---------------------------------------------------------------------------

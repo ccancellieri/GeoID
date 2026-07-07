@@ -810,7 +810,11 @@ async def test_ensure_collection_creates_with_concrete_write_lang() -> None:
     catalogs.create_collection = AsyncMock(return_value=object())
     catalogs.update_collection = AsyncMock()
 
-    ok = await _ensure_collection(catalogs, "cat", {"id": "col"})
+    with patch(
+        "dynastore.tasks.stac_harvest.task._upsert_collection_metadata_pg",
+        AsyncMock(),
+    ):
+        ok = await _ensure_collection(catalogs, "cat", {"id": "col"})
 
     assert ok is True
     assert _WRITE_LANG != "*"
@@ -829,7 +833,11 @@ async def test_ensure_collection_updates_existing_with_concrete_write_lang() -> 
     catalogs.create_collection = AsyncMock()
     catalogs.update_collection = AsyncMock(return_value=object())
 
-    ok = await _ensure_collection(catalogs, "cat", {"id": "col"})
+    with patch(
+        "dynastore.tasks.stac_harvest.task._upsert_collection_metadata_pg",
+        AsyncMock(),
+    ):
+        ok = await _ensure_collection(catalogs, "cat", {"id": "col"})
 
     assert ok is True
     catalogs.update_collection.assert_awaited_once()
@@ -849,7 +857,11 @@ async def test_ensure_collection_resilient_when_write_raises_but_row_lands() -> 
     catalogs.create_collection = AsyncMock(side_effect=RuntimeError("indexer boom"))
     catalogs.update_collection = AsyncMock()
 
-    ok = await _ensure_collection(catalogs, "cat", {"id": "col"})
+    with patch(
+        "dynastore.tasks.stac_harvest.task._upsert_collection_metadata_pg",
+        AsyncMock(),
+    ):
+        ok = await _ensure_collection(catalogs, "cat", {"id": "col"})
 
     assert ok is True
     assert catalogs.get_collection.await_count == 2
@@ -868,6 +880,67 @@ async def test_ensure_collection_returns_false_when_row_absent_after_raise() -> 
     ok = await _ensure_collection(catalogs, "cat", {"id": "col"})
 
     assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_upsert_collection_metadata_pg_uses_resolved_ids_and_preserves_extras() -> None:
+    from dynastore.tasks.stac_harvest.task import _upsert_collection_metadata_pg
+
+    writes: list[dict[str, Any]] = []
+
+    class _FakeCollectionPgDriver:
+        async def upsert_metadata(
+            self,
+            catalog_id: str,
+            collection_id: str,
+            metadata: dict[str, Any],
+            **_kw: Any,
+        ) -> None:
+            writes.append({
+                "catalog_id": catalog_id,
+                "collection_id": collection_id,
+                "metadata": metadata,
+            })
+
+    catalogs = MagicMock()
+    catalogs.resolve_catalog_id = AsyncMock(return_value="cat_internal")
+    catalogs.resolve_collection_id = AsyncMock(return_value="col_internal")
+
+    coll = {
+        "id": "agera5-rh12",
+        "title": "Relative humidity",
+        "stac_extensions": ["https://example.test/ext.json"],
+        "extent": {
+            "spatial": {"bbox": [[-180, -90, 180, 90]]},
+            "temporal": {"interval": [["1979-01-01T00:00:00Z", None]]},
+        },
+        "extra_metadata": {
+            "assets": {"thumbnail": {"href": "https://example.test/thumb.png"}},
+            "cube:dimensions": {"x": {"type": "spatial"}},
+        },
+    }
+
+    with patch(
+        "dynastore.modules.storage.drivers.collection_postgresql.CollectionPostgresqlDriver",
+        return_value=_FakeCollectionPgDriver(),
+    ):
+        await _upsert_collection_metadata_pg(catalogs, "fao", "agera5-rh12", coll)
+
+    assert len(writes) == 1
+    assert writes[0]["catalog_id"] == "cat_internal"
+    assert writes[0]["collection_id"] == "col_internal"
+    metadata = writes[0]["metadata"]
+    assert metadata["stac_extensions"] == ["https://example.test/ext.json"]
+    assert metadata["extent"] == {
+        "spatial": {"bbox": [[-180.0, -90.0, 180.0, 90.0]]},
+        "temporal": {"interval": [["1979-01-01T00:00:00Z", None]]},
+    }
+    assert metadata["extra_metadata"]["en"]["assets"] == {
+        "thumbnail": {"href": "https://example.test/thumb.png"}
+    }
+    assert metadata["extra_metadata"]["en"]["cube:dimensions"] == {
+        "x": {"type": "spatial"}
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -29,6 +29,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from inspect import isawaitable
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Tuple
 
 from dynastore.models.ogc import Feature
@@ -395,6 +396,60 @@ async def _persist_harvest_cursor(
 # ---------------------------------------------------------------------------
 
 
+async def _maybe_resolve_id(
+    resolver: Any,
+    fallback: str,
+    *args: Any,
+    **kwargs: Any,
+) -> str:
+    if not callable(resolver):
+        return fallback
+    resolved = resolver(*args, **kwargs)
+    if isawaitable(resolved):
+        resolved = await resolved
+    return resolved if isinstance(resolved, str) and resolved else fallback
+
+
+async def _upsert_collection_metadata_pg(
+    catalogs: Any,
+    catalog_id: str,
+    collection_id: str,
+    coll: Dict[str, Any],
+) -> None:
+    """Persist harvested collection metadata in PG even for ES-only item routing.
+
+    The harvest's ``drivers=es`` routing applies to item storage.  Collection
+    metadata is the STAC catalog document and must remain queryable from PG so
+    collection-level assets/extensions/extent survive reads and listings.
+    """
+    from dynastore.models.shared_models import Collection
+    from dynastore.modules.storage.drivers.collection_postgresql import (
+        CollectionPostgresqlDriver,
+    )
+
+    internal_catalog = await _maybe_resolve_id(
+        getattr(catalogs, "resolve_catalog_id", None),
+        catalog_id,
+        catalog_id,
+        allow_missing=True,
+    )
+    internal_collection = await _maybe_resolve_id(
+        getattr(catalogs, "resolve_collection_id", None),
+        collection_id,
+        internal_catalog,
+        collection_id,
+        allow_missing=True,
+    )
+    metadata_payload = Collection.create_from_localized_input(
+        coll, _WRITE_LANG
+    ).model_dump(by_alias=True, exclude_none=True, mode="json")
+    await CollectionPostgresqlDriver().upsert_metadata(
+        internal_catalog,
+        internal_collection,
+        metadata_payload,
+    )
+
+
 async def _ensure_collection(
     catalogs: Any,
     catalog_id: str,
@@ -414,6 +469,7 @@ async def _ensure_collection(
             await catalogs.create_collection(catalog_id, coll, lang=_WRITE_LANG)
         else:
             await catalogs.update_collection(catalog_id, cid, coll, lang=_WRITE_LANG)
+        await _upsert_collection_metadata_pg(catalogs, catalog_id, cid, coll)
         return True
     except Exception as exc:
         logger.warning(
@@ -424,6 +480,7 @@ async def _ensure_collection(
         # to items rather than discarding the whole collection's harvest.
         try:
             if await catalogs.get_collection(catalog_id, cid, lang=_WRITE_LANG) is not None:
+                await _upsert_collection_metadata_pg(catalogs, catalog_id, cid, coll)
                 logger.warning(
                     "stac_harvest: collection %s/%s exists post-write — continuing to items",
                     catalog_id, cid,
