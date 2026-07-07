@@ -110,6 +110,35 @@ def test_pack_stac_extras_copies_providers_and_summaries_as_fallback():
     assert em.get("summaries") == summaries
 
 
+def test_pack_stac_extras_copies_assets_extent_and_extensions_as_fallback():
+    from dynastore.extensions.stac.stac_service import _pack_stac_extras
+
+    assets = {"thumbnail": {"href": "https://example.test/thumb.png"}}
+    extent = {
+        "spatial": {"bbox": [[10.0, 20.0, 30.0, 40.0]]},
+        "temporal": {"interval": [["2020-01-01T00:00:00Z", None]]},
+    }
+    stac_extensions = ["https://stac-extensions.github.io/datacube/v2.3.0/schema.json"]
+    input_data = {
+        "id": "rich",
+        "type": "Collection",
+        "description": "A collection",
+        "extent": extent,
+        "license": "notspecified",
+        "assets": assets,
+        "stac_extensions": stac_extensions,
+    }
+
+    out = _pack_stac_extras(dict(input_data), "en")
+
+    assert out.get("assets") == assets
+    assert out.get("extent") == extent
+    em = out.get("extra_metadata", {})
+    assert em.get("assets") == assets
+    assert em.get("extent") == extent
+    assert em.get("stac_extensions") == stac_extensions
+
+
 def test_pack_stac_extras_merges_with_existing_flat_extra_metadata():
     from dynastore.extensions.stac.stac_service import _pack_stac_extras
 
@@ -289,6 +318,65 @@ def test_generator_cube_dimensions_survives_via_extra_fields():
         collection.extra_fields.pop(k, None)
     # cube:dimensions must still be in extra_fields
     assert collection.extra_fields.get("cube:dimensions") == cube_dims
+
+
+def test_generator_promotes_assets_and_item_assets_from_extra_fields():
+    from dynastore.extensions.stac.stac_generator import _apply_extra_metadata_fallbacks
+
+    assets = {"thumbnail": {"href": "https://example.test/thumb.png"}}
+    item_assets = {"data": {"type": "image/tiff"}}
+    collection = _make_pystac_collection_with_extra_fields({
+        "assets": assets,
+        "item_assets": item_assets,
+    })
+
+    _apply_extra_metadata_fallbacks(collection, {})
+
+    as_dict = collection.to_dict()
+    assert as_dict["assets"]["thumbnail"]["href"] == assets["thumbnail"]["href"]
+    assert as_dict["item_assets"] == item_assets
+    assert "assets" not in collection.extra_fields
+    assert collection.extra_fields["item_assets"] == item_assets
+
+
+def test_pg_collection_listing_restores_extra_metadata_extent_and_bbox():
+    from dynastore.extensions.stac.stac_service import _pg_collections_to_stac_dicts
+    from dynastore.models.shared_models import Collection
+
+    source_extent = {
+        "spatial": {"bbox": [[10.0, 20.0, 30.0, 40.0]]},
+        "temporal": {"interval": [["2020-01-01T00:00:00Z", None]]},
+    }
+    coll = Collection.model_validate({
+        "id": "agera5-rh12",
+        "type": "Collection",
+        "description": {"en": "Relative humidity"},
+        "license": "CC-BY-SA-4.0",
+        "extra_metadata": {
+            "en": {
+                "extent": source_extent,
+                "assets": {
+                    "thumbnail": {"href": "https://example.test/thumb.png"}
+                },
+                "stac_extensions": [
+                    "https://stac-extensions.github.io/datacube/v2.3.0/schema.json"
+                ],
+                "cube:dimensions": {
+                    "time": {"type": "temporal", "extent": ["2020", "2020"]}
+                },
+            }
+        },
+    })
+
+    rendered = _pg_collections_to_stac_dicts([coll], "en")[0]
+
+    assert rendered["extent"] == source_extent
+    assert rendered["assets"]["thumbnail"]["href"] == "https://example.test/thumb.png"
+    assert (
+        "https://stac-extensions.github.io/datacube/v2.3.0/schema.json"
+        in rendered["stac_extensions"]
+    )
+    assert rendered["cube:dimensions"]["time"]["type"] == "temporal"
 
 
 # ---------------------------------------------------------------------------

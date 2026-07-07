@@ -29,10 +29,13 @@ FieldSelection(field="geom", transformation="ST_SRID", alias="_srid")
 
 `GET /stac/catalogs/{catalog_id}/collections` is served by a bounded
 PG-backed collection-search path, not by hydrating every collection through the
-full collection generator. Each returned Collection still includes deterministic
-`self`, `root`, `parent`, and `items` links, so STAC clients can crawl from the
-list response to the full collection representation and its item page without
-the list request scaling with catalog size.
+full collection generator. Each returned Collection includes deterministic
+`self`, `root`, `parent`, and `items` links, and the fast path still surfaces
+stored collection STAC metadata such as `assets`, `item_assets`, `providers`,
+`summaries`, `stac_extensions`, `cube:dimensions`, `cube:variables`, and the
+declared `extent` when those values are present in the collection metadata or
+its fallback `extra_metadata`. This keeps list responses useful for STAC
+clients without making the request scale with catalog size.
 
 ## Geometry Fidelity
 

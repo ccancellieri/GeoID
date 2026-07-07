@@ -640,10 +640,64 @@ def test_map_collection_normalises_id_and_sets_defaults() -> None:
 
     assert result["id"] == "mycollection", "id must be lowercased"
     assert "links" not in result, "links must be stripped"
-    assert "assets" not in result, "collection-level assets must be stripped"
+    assert result["assets"] == raw["assets"], "collection-level assets must round-trip"
     assert result["type"] == "Collection"
     assert "extent" in result
     assert "description" in result
+
+
+def test_map_collection_preserves_source_stac_metadata_fallbacks() -> None:
+    """Harvested source Collection metadata must survive generic catalog writes."""
+    from dynastore.tasks.stac_harvest.task import map_collection
+
+    source_extent = {
+        "spatial": {"bbox": [[10.0, 20.0, 30.0, 40.0]]},
+        "temporal": {"interval": [["2020-01-01T00:00:00Z", "2020-12-31T00:00:00Z"]]},
+    }
+    raw = {
+        "id": "AGERA5-RH12",
+        "type": "Collection",
+        "stac_version": "1.1.0",
+        "stac_extensions": [
+            "https://stac-extensions.github.io/datacube/v2.3.0/schema.json",
+            "https://stac-extensions.github.io/render/v2.0.0/schema.json",
+        ],
+        "description": "Relative humidity",
+        "extent": source_extent,
+        "license": "CC-BY-SA-4.0",
+        "assets": {"thumbnail": {"href": "https://example.test/thumb.png"}},
+        "providers": [{"name": "ECMWF", "roles": ["producer"]}],
+        "summaries": {"datetime": {"min": "2020-01-01", "max": "2020-12-31"}},
+        "cube:dimensions": {"time": {"type": "temporal", "extent": ["2020", "2020"]}},
+        "cube:variables": {"rh": {"type": "data", "unit": "%"}},
+        "created": "2022-03-17T09:00:21.813722Z",
+        "updated": "2026-05-11T14:56:56.640574Z",
+        "links": [{"rel": "self", "href": "https://example.test"}],
+    }
+
+    result = map_collection(raw)
+
+    assert result["id"] == "agera5-rh12"
+    assert result["extent"] == source_extent
+    assert result["assets"] == raw["assets"]
+    assert result["providers"] == raw["providers"]
+    assert result["summaries"] == raw["summaries"]
+    extra = result.get("extra_metadata")
+    assert isinstance(extra, dict)
+    for key in (
+        "extent",
+        "stac_extensions",
+        "assets",
+        "providers",
+        "summaries",
+        "cube:dimensions",
+        "cube:variables",
+        "created",
+        "updated",
+    ):
+        assert extra.get(key) == raw[key]
+    assert "links" not in result
+    assert "links" not in extra
 
 
 def test_map_collection_preserves_existing_extent() -> None:

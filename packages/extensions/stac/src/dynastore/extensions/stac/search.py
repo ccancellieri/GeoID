@@ -1847,7 +1847,7 @@ async def search_collections(
         "c.id, c.external_id, c.catalog_id, "
         "mc.title, mc.description, mc.keywords, mc.license, "
         "ms.links, ms.assets, ms.extent, ms.providers, ms.summaries, "
-        "ms.item_assets, mc.extra_metadata"
+        "ms.item_assets, ms.stac_extensions, mc.extra_metadata"
     )
     union_queries = []
     for idx, (cid, schema) in enumerate(target_pairs):

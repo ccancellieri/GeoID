@@ -52,6 +52,31 @@ _MIN_PAGE_LIMIT = 20
 # Cap how many per-batch errors are recorded into the job result.
 _MAX_RECORDED_ERRORS = 5
 _STRIP_LINKS = frozenset({"links"})
+_STAC_COLLECTION_SCHEMA_FIELDS = frozenset({
+    "type",
+    "stac_version",
+    "stac_extensions",
+    "id",
+    "title",
+    "description",
+    "keywords",
+    "license",
+    "providers",
+    "extent",
+    "summaries",
+    "assets",
+    "item_assets",
+    "links",
+    "extra_metadata",
+})
+_STAC_COLLECTION_FALLBACK_FIELDS = frozenset({
+    "assets",
+    "extent",
+    "item_assets",
+    "providers",
+    "stac_extensions",
+    "summaries",
+})
 # Concrete write language for collection create/update.  Source STAC
 # collections carry no language, and ``"*"`` is a *read-time* wildcard
 # (all translations) — passing it to a write throws, which previously
@@ -241,13 +266,33 @@ def map_collection(coll: Dict[str, Any]) -> Dict[str, Any]:
     """Map a source STAC collection dict to a dynastore collection payload.
 
     - Drops ``links`` (server-managed navigation).
-    - Drops ``assets`` at collection level (can cause 409 on STAC item writes;
-      per-item assets pass through unaffected).
     - Lowercases the ``id`` (dynastore normalises ids; mismatched case between
       collection creation and item writes causes 409 collisions).
     - Ensures required ``extent``.
+    - Mirrors source STAC extras into ``extra_metadata`` so rich collection
+      metadata survives generic CatalogsProtocol writes even when the
+      collection_stac sidecar is not active.
     """
-    out = {k: v for k, v in coll.items() if k not in _STRIP_LINKS and k != "assets"}
+    out = {k: v for k, v in coll.items() if k not in _STRIP_LINKS}
+
+    extras: Dict[str, Any] = {}
+    for key, value in out.items():
+        if key == "extra_metadata" or value is None:
+            continue
+        if key not in _STAC_COLLECTION_SCHEMA_FIELDS:
+            extras[key] = value
+    for key in _STAC_COLLECTION_FALLBACK_FIELDS:
+        value = out.get(key)
+        if value:
+            extras[key] = value
+
+    if extras:
+        existing = out.get("extra_metadata")
+        if isinstance(existing, dict):
+            existing.update(extras)
+        else:
+            out["extra_metadata"] = extras
+
     out.setdefault("type", "Collection")
     out["id"] = str(out.get("id", "")).lower()
     out.setdefault("description", out.get("title") or out["id"])

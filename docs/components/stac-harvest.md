@@ -104,6 +104,22 @@ ES index is created from the current `build_item_mapping`, so the canonical
 `system.*` / `stats.*` fields and the root `external_id` / `asset_id` keyword
 lanes are typed and queryable immediately.
 
+## Collection metadata fidelity
+
+Harvest preserves the source STAC Collection metadata needed to reconstruct the
+collection response after ingest. Source navigation links are still
+server-managed and are not copied, but collection-level STAC members such as
+`assets`, `item_assets`, `providers`, `summaries`, `stac_extensions`,
+`cube:dimensions`, `cube:variables`, timestamps, and the declared `extent` are
+carried through the collection payload. The same values are mirrored into
+`extra_metadata` as a fallback so they remain available even when a storage
+backend does not materialize the dedicated STAC collection sidecar.
+
+The declared collection `extent` is preserved as supplied by the source catalog,
+including exact spatial `bbox` arrays and temporal intervals. Item geometries
+and item bboxes remain item-level data; the collection extent is not recomputed
+from harvested items during the mapping step.
+
 ## Execution mode: remote job vs in-process background task
 
 How an async harvest *runs* depends on the deployment's task-runner

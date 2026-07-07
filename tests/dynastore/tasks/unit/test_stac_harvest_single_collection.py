@@ -163,6 +163,63 @@ async def test_single_collection_harvest_explicit_target_collection():
 
 
 @pytest.mark.asyncio
+async def test_single_collection_harvest_preserves_source_collection_metadata():
+    """Harvest collection creation carries source STAC metadata and extent."""
+    source_extent = {
+        "spatial": {"bbox": [[10.0, 20.0, 30.0, 40.0]]},
+        "temporal": {"interval": [["2020-01-01T00:00:00Z", None]]},
+    }
+    source_coll = {
+        "type": "Collection",
+        "id": "AGERA5-RH12",
+        "stac_version": "1.1.0",
+        "stac_extensions": [
+            "https://stac-extensions.github.io/datacube/v2.3.0/schema.json"
+        ],
+        "description": "Relative humidity",
+        "license": "CC-BY-SA-4.0",
+        "extent": source_extent,
+        "assets": {"thumbnail": {"href": "https://example.test/thumb.png"}},
+        "providers": [{"name": "ECMWF", "roles": ["producer"]}],
+        "summaries": {"datetime": {"min": "2020-01-01"}},
+        "cube:dimensions": {"time": {"type": "temporal", "extent": ["2020", None]}},
+        "cube:variables": {"rh": {"type": "data", "unit": "%"}},
+        "links": [{"rel": "self", "href": "https://example.test"}],
+    }
+    items = [{"type": "Feature", "id": "i1", "geometry": None, "properties": {}}]
+    request = StacHarvestRequest(
+        catalog_url="https://src/c/AGERA5-RH12", target_catalog="cat-7", drivers="es",
+    )
+    catalogs = _mock_catalogs()
+
+    with (
+        patch.object(harvest_task, "_probe_single_collection",
+                     return_value=(source_coll, "https://src/c/AGERA5-RH12/items")),
+        patch.object(harvest_task, "_iter_items_from", return_value=_aiter(items)),
+        patch.object(harvest_task, "_apply_harvest_presets", return_value=None),
+    ):
+        stats = await harvest_task.run_harvest(
+            request, catalogs, preset_ctx=object(), base_scope="catalog:cat-7"
+        )
+
+    assert stats.collections_written == 1
+    payload = catalogs.create_collection.await_args.args[1]
+    assert payload["id"] == "agera5-rh12"
+    assert payload["extent"] == source_extent
+    assert payload["assets"] == source_coll["assets"]
+    assert payload["providers"] == source_coll["providers"]
+    assert payload["summaries"] == source_coll["summaries"]
+    extra = payload["extra_metadata"]
+    assert extra["extent"] == source_extent
+    assert extra["stac_extensions"] == source_coll["stac_extensions"]
+    assert extra["assets"] == source_coll["assets"]
+    assert extra["cube:dimensions"] == source_coll["cube:dimensions"]
+    assert extra["cube:variables"] == source_coll["cube:variables"]
+    assert "links" not in payload
+    assert "links" not in extra
+
+
+@pytest.mark.asyncio
 async def test_catalog_harvest_applies_at_catalog_scope():
     """A catalog source pins routing at catalog scope and walks /collections."""
     applied: list = []

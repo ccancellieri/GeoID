@@ -218,7 +218,7 @@ def _pack_stac_extras(input_data: Dict[str, Any], language: str) -> Dict[str, An
     # stac_generator helpers before falling back to hardcoded defaults.
     # Only store non-empty values: an empty extent/stac_extensions carries no
     # useful data to preserve and should not force extra_metadata creation.
-    for key in ("providers", "summaries"):
+    for key in ("assets", "item_assets", "providers", "summaries"):
         if key in input_data and input_data[key] is not None:
             extras[key] = input_data[key]
     for key in ("extent", "stac_extensions"):
@@ -243,40 +243,126 @@ def _pack_stac_extras(input_data: Dict[str, Any], language: str) -> Dict[str, An
     return input_data
 
 
+def _localized_extra_metadata(localized: Dict[str, Any], language: str) -> Dict[str, Any]:
+    extra = localized.get("extra_metadata")
+    if not isinstance(extra, dict):
+        return {}
+    if language != "*" and isinstance(extra.get(language), dict):
+        return cast(Dict[str, Any], extra[language])
+    try:
+        from dynastore.models.localization import _LANGUAGE_METADATA
+
+        if any(k in _LANGUAGE_METADATA for k in extra):
+            for value in extra.values():
+                if isinstance(value, dict):
+                    return cast(Dict[str, Any], value)
+            return {}
+    except Exception:
+        pass
+    return extra
+
+
+def _asset_from_stac_dict(asset_data: Dict[str, Any]) -> pystac.Asset:
+    return pystac.Asset(
+        href=asset_data.get("href", ""),
+        title=asset_data.get("title"),
+        description=asset_data.get("description"),
+        media_type=asset_data.get("type"),
+        roles=asset_data.get("roles"),
+        extra_fields={
+            k: v for k, v in asset_data.items()
+            if k not in {"href", "title", "description", "type", "roles"}
+        },
+    )
+
+
 def _pg_collections_to_stac_dicts(
     collections_list: List[Any], language: str,
 ) -> List[Dict[str, Any]]:
-    """Convert PG-backed ``Collection`` models into minimal STAC Collection
+    """Convert PG-backed ``Collection`` models into STAC Collection
     dicts, as used by the Collection Search response path.
 
     Shared by the search branch of ``list_stac_collections`` and its
     ES-empty/PG-populated fallback so both surfaces render collections the
-    same (minimal) way.
+    same way without per-collection driver hydration.
     """
     stac_collections: List[Dict[str, Any]] = []
     for coll in collections_list:
         localized_coll, _ = stac_localize(coll, language)
+        extra_meta = _localized_extra_metadata(localized_coll, language)
+
         if coll.extent is not None:
             extent = pystac.Extent(
                 spatial=pystac.SpatialExtent(coll.extent.spatial.bbox),
                 temporal=pystac.TemporalExtent(coll.extent.temporal.interval),
             )
         else:
+            spatial, temporal = stac_generator._restore_extent_from_extras(
+                extra_meta.get("extent")
+            )
             # Harvested collections may not have an aggregated extent
             # persisted in PG. Render the standard STAC "unknown extent"
             # fallback instead of dropping the collection from the page —
             # the caller already promised it in `matched`.
             extent = pystac.Extent(
-                spatial=pystac.SpatialExtent([[-180.0, -90.0, 180.0, 90.0]]),
-                temporal=pystac.TemporalExtent([[None, None]]),
+                spatial=spatial or pystac.SpatialExtent([[-180.0, -90.0, 180.0, 90.0]]),
+                temporal=temporal or pystac.TemporalExtent([[None, None]]),
             )
+
+        stac_extensions = list(localized_coll.get("stac_extensions") or [])
+        for uri in extra_meta.get("stac_extensions") or []:
+            if uri not in stac_extensions:
+                stac_extensions.append(uri)
+
         stac_coll = pystac.Collection(
             id=str(localized_coll.get("id") or ""),
             description=str(localized_coll.get("description") or ""),
             title=localized_coll.get("title"),
             license=str(localized_coll.get("license") or ""),
             extent=extent,
+            stac_extensions=stac_extensions,
         )
+
+        providers = localized_coll.get("providers") or extra_meta.get("providers")
+        if providers and isinstance(providers, list):
+            stac_coll.providers = [
+                pystac.Provider(**p) if isinstance(p, dict) else p
+                for p in providers
+            ]
+
+        summaries = localized_coll.get("summaries") or extra_meta.get("summaries")
+        if summaries and isinstance(summaries, dict):
+            stac_coll.summaries = pystac.Summaries(summaries)
+
+        assets = localized_coll.get("assets") or extra_meta.get("assets")
+        if assets and isinstance(assets, dict):
+            stac_coll.assets = {
+                asset_id: _asset_from_stac_dict(asset_data)
+                for asset_id, asset_data in assets.items()
+                if isinstance(asset_data, dict)
+            }
+
+        item_assets = localized_coll.get("item_assets") or extra_meta.get("item_assets")
+        if item_assets and isinstance(item_assets, dict):
+            stac_coll.extra_fields["item_assets"] = item_assets
+            item_assets_uri = "https://stac-extensions.github.io/item-assets/v1.0.0/schema.json"
+            if item_assets_uri not in stac_coll.stac_extensions:
+                stac_coll.stac_extensions.append(item_assets_uri)
+
+        for key, value in extra_meta.items():
+            if key in {
+                "assets",
+                "extent",
+                "item_assets",
+                "language",
+                "languages",
+                "providers",
+                "stac_extensions",
+                "summaries",
+            }:
+                continue
+            stac_coll.extra_fields[key] = value
+
         if "language" in localized_coll:
             stac_coll.extra_fields["language"] = localized_coll["language"]
         if "languages" in localized_coll:

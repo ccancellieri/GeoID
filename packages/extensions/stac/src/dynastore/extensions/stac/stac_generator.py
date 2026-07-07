@@ -48,13 +48,12 @@ from dynastore.extensions.tools.conformance import get_active_conformance
 from dynastore.models.localization import (
     get_language_object,
 )
+from . import stac_db, asset_factory
 from .stac_models import stac_localize
 from dynastore.tools.discovery import get_protocol
 from .metadata_helpers import merge_stac_metadata
 
 logger = logging.getLogger(__name__)
-
-from . import stac_db, asset_factory
 
 SUPPORTED_STAC_EXTENSIONS = [
     "https://stac-extensions.github.io/datacube/v2.3.0/schema.json",
@@ -171,6 +170,35 @@ def _apply_extra_metadata_fallbacks(
                 collection.summaries = pystac.Summaries(merged_summaries)
     else:
         collection.extra_fields.pop("summaries", None)
+
+    extra_assets = collection.extra_fields.pop("assets", None)
+    if not collection.assets and extra_assets and isinstance(extra_assets, dict):
+        collection.assets = {
+            asset_id: (
+                pystac.Asset(
+                    href=asset_data.get("href", ""),
+                    title=asset_data.get("title"),
+                    description=asset_data.get("description"),
+                    media_type=asset_data.get("type"),
+                    roles=asset_data.get("roles"),
+                    extra_fields={
+                        k: v for k, v in asset_data.items()
+                        if k not in {"href", "title", "description", "type", "roles"}
+                    },
+                )
+                if isinstance(asset_data, dict)
+                else asset_data
+            )
+            for asset_id, asset_data in extra_assets.items()
+        }
+
+    extra_item_assets = collection.extra_fields.pop("item_assets", None)
+    if extra_item_assets and isinstance(extra_item_assets, dict):
+        if "item_assets" not in collection.extra_fields:
+            collection.extra_fields["item_assets"] = extra_item_assets
+        item_assets_uri = "https://stac-extensions.github.io/item-assets/v1.0.0/schema.json"
+        if item_assets_uri not in collection.stac_extensions:
+            collection.stac_extensions.append(item_assets_uri)
 
 
 def _parse_dt(value: Optional[Any]) -> Optional[datetime]:

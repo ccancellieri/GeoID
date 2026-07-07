@@ -999,6 +999,7 @@ class CollectionService:
             "description": meta_dict.get("description"),
             "keywords": meta_dict.get("keywords"),
             "license": meta_dict.get("license"),
+            "stac_extensions": meta_dict.get("stac_extensions"),
             "links": meta_dict.get("links"),
             "assets": meta_dict.get("assets"),
             "extent": meta_dict.get("extent"),
@@ -2361,4 +2362,3 @@ class CollectionService:
 
             _invalidate_collection_model_cache(catalog_id, collection_id)
             return True
-
