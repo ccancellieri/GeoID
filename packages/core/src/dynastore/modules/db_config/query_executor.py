@@ -2090,7 +2090,7 @@ async def _acquire_async_engine_connection(engine: AsyncEngine) -> AsyncConnecti
         # A successful-but-slow acquire crossing this threshold means the
         # pool is sliding towards saturation -- surface it at WARNING with
         # occupancy stats instead of letting it blend into the routine
-        # INFO/DEBUG lines below.
+        # INFO line below.
         logger.warning(
             "db_pool_acquire slow service=%s wait_seconds=%.4f threshold=%.2f%s%s",
             _SERVICE_NAME_FOR_METRICS, wait_s, warn_threshold_s,
@@ -2102,11 +2102,10 @@ async def _acquire_async_engine_connection(engine: AsyncEngine) -> AsyncConnecti
             _SERVICE_NAME_FOR_METRICS, wait_s, slow_threshold_s,
             _acquire_scope_suffix(),
         )
-    else:
-        logger.debug(
-            "db_pool_acquire service=%s wait_seconds=%.4f%s",
-            _SERVICE_NAME_FOR_METRICS, wait_s, _acquire_scope_suffix(),
-        )
+    # A fast acquire (below slow_threshold_s) is the overwhelmingly common
+    # case and carries no signal -- one line per successful checkout drowns
+    # the log. We deliberately emit nothing here; only slow (INFO) and
+    # saturating (WARNING) acquires are logged.
     try:
         try:
             await conn.rollback()

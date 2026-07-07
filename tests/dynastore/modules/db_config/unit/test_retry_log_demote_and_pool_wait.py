@@ -23,8 +23,10 @@
    unified format (issue #2511): ``retry attempt=N/M kind=db_connect ...``.
    Terminal exhaustion after ``max_retries`` still logs at WARNING.
 2. ``_acquire_async_engine_connection`` emits a structured ``db_pool_acquire``
-   log line carrying ``wait_seconds``. INFO when slow (>= threshold), DEBUG
-   otherwise. Feeds a GCP log-based metric without requiring a prometheus dep.
+   log line carrying ``wait_seconds`` only when the acquire is slow: INFO at
+   ``>= slow_threshold`` and WARNING at ``>= warn_threshold``. A fast acquire
+   (the common case) emits nothing, so routine checkouts do not flood the log.
+   Feeds a GCP log-based metric without requiring a prometheus dep.
 """
 
 from __future__ import annotations
@@ -140,7 +142,10 @@ class _FakeEngine:
 
 
 class TestPoolWaitMetric:
-    def test_fast_acquire_logs_debug(self, caplog):
+    def test_fast_acquire_logs_nothing(self, caplog):
+        # A fast acquire (below the slow threshold) is the common case and
+        # carries no signal, so it emits no log line at all — only slow (INFO)
+        # and saturating (WARNING) acquires are logged.
         engine = _FakeEngine(delay=0)
         caplog.set_level(logging.DEBUG, logger=query_executor.__name__)
         asyncio.run(_acquire_async_engine_connection(engine))  # type: ignore[arg-type]
@@ -151,8 +156,10 @@ class TestPoolWaitMetric:
             and "slow" not in r.getMessage()
             and "failed" not in r.getMessage()
         ]
-        assert acquires, "expected a db_pool_acquire DEBUG record"
-        assert all(r.levelno == logging.DEBUG for r in acquires)
+        assert not acquires, (
+            "fast acquire must not emit a db_pool_acquire log line, got "
+            f"{[r.getMessage() for r in acquires]}"
+        )
 
     def test_slow_acquire_logs_info(self, caplog):
         engine = _FakeEngine(delay=_SLOW_POOL_ACQUIRE_THRESHOLD_S + 0.05)
