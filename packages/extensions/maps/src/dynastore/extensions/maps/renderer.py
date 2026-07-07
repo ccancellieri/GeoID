@@ -90,10 +90,21 @@ def _render_default_style(
 
         temp_fill_source.Destroy()
 
-        # Collect the boundary for the batched stroke pass
-        boundary = geom.GetBoundary()
-        if boundary and not boundary.IsEmpty():
-            all_boundaries.append(boundary)
+        # Collect the stroke geometry for the batched stroke pass.
+        #
+        # For (multi)polygons the stroke is the ring boundary. For
+        # (multi)line geometries — road/river/network layers — the line IS
+        # the drawable feature: ``GetBoundary()`` on a LineString returns only
+        # its endpoints (a MultiPoint), so the fill pass (no area) plus a
+        # point-boundary stroke pass would render the whole layer invisible
+        # (blank/white tiles). Use the geometry itself as the stroke for lines.
+        flat_type = ogr.GT_Flatten(geom.GetGeometryType())
+        if flat_type in (ogr.wkbLineString, ogr.wkbMultiLineString):
+            stroke_geom = geom
+        else:
+            stroke_geom = geom.GetBoundary()
+        if stroke_geom and not stroke_geom.IsEmpty():
+            all_boundaries.append(stroke_geom)
 
     # Pass 2: Render all strokes at once for performance
     if all_boundaries:
@@ -360,10 +371,18 @@ def _render_custom_style(
             )
             ogr_layer.ResetReading()
             for feature in ogr_layer:
-                boundary = feature.GetGeometryRef().GetBoundary()
-                if boundary:
+                geom = feature.GetGeometryRef()
+                # Lines are drawn as themselves; only polygons stroke their
+                # ring boundary. GetBoundary() on a LineString yields just its
+                # endpoints, which would leave line/network layers invisible.
+                flat_type = ogr.GT_Flatten(geom.GetGeometryType())
+                if flat_type in (ogr.wkbLineString, ogr.wkbMultiLineString):
+                    stroke_geom = geom
+                else:
+                    stroke_geom = geom.GetBoundary()
+                if stroke_geom and not stroke_geom.IsEmpty():
                     stroke_feature = ogr.Feature(stroke_layer.GetLayerDefn())
-                    stroke_feature.SetGeometry(boundary)
+                    stroke_feature.SetGeometry(stroke_geom)
                     stroke_layer.CreateFeature(stroke_feature)
 
             gdal.RasterizeLayer(

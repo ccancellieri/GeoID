@@ -196,6 +196,13 @@ async def _validate_collections_helper(conn, dataset, requested_collections):
     if not catalogs_svc:
         return []
 
+    # Physical schema != catalog_id: the physical table lives in the resolved
+    # physical schema, not one named after the logical catalog_id. Qualify the
+    # table-existence probe with it (mirroring the tiles path,
+    # tiles_module._get_schema); fall back to ``dataset`` when unresolved. No
+    # db_resource is passed so the alru_cache is not bypassed (AGENTS.md).
+    physical_schema = await catalogs_svc.resolve_physical_schema(dataset) or dataset
+
     collection_metadata_coroutines = [
         catalogs_svc.get_collection(catalog_id=dataset, collection_id=coll_id)
         for coll_id in requested_collections
@@ -214,7 +221,7 @@ async def _validate_collections_helper(conn, dataset, requested_collections):
             )
             physical_table_results.append(
                 await shared_queries.table_exists_query.execute(
-                    conn, schema=dataset, table=physical_table or coll_id
+                    conn, schema=physical_schema, table=physical_table or coll_id
                 )
             )
         else:
@@ -721,12 +728,23 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
                 render_source_srid = MVT_TILE_SRID
 
         if layers_data is None:
+            # Physical schema != catalog_id: the physical table lives in the
+            # resolved physical schema, not one named after the logical
+            # catalog_id. Resolve it via the protocol (mirroring the tiles
+            # path, tiles_module._get_schema) and fall back to ``dataset``
+            # when unresolved. ``dataset`` is already the INTERNAL catalog id
+            # (resolved by the caller — see docstring). No ``ctx``/db_resource
+            # is passed so the alru_cache is not bypassed (AGENTS.md caching).
+            physical_schema = (
+                await catalogs_svc.resolve_physical_schema(dataset) or dataset
+            )
             # Connection 2: source geometry fetch (short-lived, released before render).
             async with managed_transaction(db_engine) as conn:
                 try:
                     layers_data = await maps_db.get_features_for_rendering(
                         conn=conn,
                         schema=dataset,
+                        physical_schema=physical_schema,
                         collections=valid_collections,
                         bbox=bbox_list,
                         crs=crs,

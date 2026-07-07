@@ -191,10 +191,27 @@ class MapsPngTileSource(TileSourceProtocol):
             # #703: no connection is held across the CPU-bound render below —
             # this query runs on the connection the caller already acquired
             # per-request, released by the caller before/after this returns.
+            #
+            # Physical schema != catalog_id: the physical table lives in the
+            # resolved physical schema, not one named after the logical
+            # catalog_id. Resolve it via the protocol (mirroring the tiles
+            # path, tiles_module._get_schema) and fall back to ``catalog_id``
+            # when unresolved. No db_resource is passed so the alru_cache is
+            # not bypassed (AGENTS.md caching discipline).
+            from dynastore.tools.discovery import get_protocol
+            from dynastore.models.protocols import CatalogsProtocol
+
+            _catalogs = get_protocol(CatalogsProtocol)
+            physical_schema = (
+                (await _catalogs.resolve_physical_schema(catalog_id) or catalog_id)
+                if _catalogs
+                else catalog_id
+            )
             try:
                 layers_data = await maps_db.get_features_for_rendering(
                     conn=conn,
                     schema=catalog_id,
+                    physical_schema=physical_schema,
                     collections=[collection_id],
                     bbox=tile_bbox,
                     crs=f"EPSG:{target_srid}",

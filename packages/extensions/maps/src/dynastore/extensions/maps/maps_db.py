@@ -35,10 +35,20 @@ async def get_features_for_rendering(
     height: int,
     bbox_srid: int = 4326, # Defaults to OGC:CRS84 per OGC API Maps Req 18
     datetime_str: Optional[str] = None,
-    subset_params: Optional[Dict[str, Any]] = None
+    subset_params: Optional[Dict[str, Any]] = None,
+    physical_schema: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Fetches geometries and attributes for rendering, with full filter capabilities.
+
+    ``schema`` is the LOGICAL catalog_id and is used only for driver/config
+    resolution (``get_driver``/``resolve_physical_table``/``get_driver_config``,
+    whose ``catalog_id`` params want the logical id). Raw SQL identifiers must be
+    qualified with ``physical_schema`` — the resolved PHYSICAL schema, which can
+    differ from the catalog_id — mirroring the tiles path
+    (``tiles_module._get_schema`` → ``resolve_physical_schema``). When
+    ``physical_schema`` is None we fall back to ``schema`` (legacy behaviour /
+    physically-unresolved catalogs).
 
     Optimizations:
     1. Decouples Input BBOX CRS (bbox_srid) from Output Map CRS.
@@ -61,6 +71,12 @@ async def get_features_for_rendering(
     from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
         GeometriesSidecarConfig,
     )
+
+    # Physical schema != catalog_id: the physical table lives in the resolved
+    # PHYSICAL schema, not in a schema literally named after the logical
+    # catalog_id. Callers resolve it via CatalogsProtocol.resolve_physical_schema
+    # (see tiles_module._get_schema); fall back to ``schema`` when unresolved.
+    sql_schema = physical_schema or schema
 
     def _resolve_source_srid(layer_cfg: Any) -> int:
         # Sidecars are PG-driver-internal — driver_sidecars() returns []
@@ -89,7 +105,8 @@ async def get_features_for_rendering(
             )
             physical_table = resolved or collection
         cols, cfg = await asyncio.gather(
-            shared_queries.get_table_column_names(conn, schema, physical_table),
+            # Raw SQL qualifier → physical schema; driver config → logical id.
+            shared_queries.get_table_column_names(conn, sql_schema, physical_table),
             drv.get_driver_config(schema, collection),
         )
         return physical_table, cols, _resolve_source_srid(cfg)
@@ -170,9 +187,9 @@ async def get_features_for_rendering(
                 ) as geom,
                 h.geoid,
                 a.attributes
-            FROM "{schema}"."{physical_table}" h
-            JOIN "{schema}"."{physical_table}_geometries" g ON h.geoid = g.geoid
-            JOIN "{schema}"."{physical_table}_attributes" a ON h.geoid = a.geoid
+            FROM "{sql_schema}"."{physical_table}" h
+            JOIN "{sql_schema}"."{physical_table}_geometries" g ON h.geoid = g.geoid
+            JOIN "{sql_schema}"."{physical_table}_attributes" a ON h.geoid = a.geoid
             WHERE {spatial_filter} AND ({where_clause})
         """)
 
