@@ -999,7 +999,18 @@ class GeometriesSidecar(SidecarProtocol):
         target_srid = params.get("target_srid", source_srid)
         geom_col = f"{alias}.{self.config.geom_column}"
 
-        # 2. Transform Logic
+        # 2. Simplification — runs in source CRS so :simplification tolerances are
+        # interpreted in source units (degrees for EPSG:4326 collections, metres for
+        # EPSG:3857). The simplification_by_zoom defaults are degree-based; applying
+        # them before ST_Transform keeps ~5 km resolution at z=0 for 4326 sources.
+        simplification = params.get("simplification")
+        if simplification and simplification > 0:
+            algo = params.get("simplification_algorithm") or ""
+            func = _SIMPLIFY_SQL_FUNCTIONS.get(algo, _DEFAULT_SIMPLIFY_SQL_FUNCTION)
+            geom_col = f"{func}({geom_col}, :simplification)"
+
+        # 3. Transform — after simplification so the projection operates on already-
+        # reduced vertex counts rather than projecting full-complexity geometry first.
         if target_srid != source_srid:
             # ``ST_Transform`` is overloaded — ``(geometry, integer)`` and
             # ``(geometry, text)`` (a proj string). A bare untyped bind param
@@ -1007,13 +1018,6 @@ class GeometriesSidecar(SidecarProtocol):
             # SRID ("expected str, got int"). The cast pins the param type to
             # integer (matching the tile-bounds expression below).
             geom_col = f"ST_Transform({geom_col}, CAST(:target_srid AS INTEGER))"
-
-        # 3. Simplification
-        simplification = params.get("simplification")
-        if simplification and simplification > 0:
-            algo = params.get("simplification_algorithm") or ""
-            func = _SIMPLIFY_SQL_FUNCTIONS.get(algo, _DEFAULT_SIMPLIFY_SQL_FUNCTION)
-            geom_col = f"{func}({geom_col}, :simplification)"
 
         # 4. Final Formatting
         geom_format = params.get("geom_format", "WKB")

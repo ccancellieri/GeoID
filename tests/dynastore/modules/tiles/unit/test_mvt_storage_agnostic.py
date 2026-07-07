@@ -142,6 +142,27 @@ def test_mvt_simplification_defaults_to_preserve_topology():
     assert req.raw_params["simplification"] == 0.001
 
 
+def test_mvt_simplifies_source_geometry_before_transforming_to_tile_srid():
+    """Per-zoom simplification tolerances are source-CRS units.
+
+    For EPSG:4326 sources rendered into WebMercator tiles, simplifying after
+    ST_Transform would interpret a degree tolerance as metres and effectively
+    disable low-zoom simplification.
+    """
+    req = MVTQueryTransform().transform_query(
+        _base_request(),
+        _mvt_context(_col_config(), simplification=0.044),
+    )
+
+    raw = " ".join(req.raw_selects)
+    assert (
+        "ST_AsMVTGeom(ST_Transform("
+        "ST_SimplifyPreserveTopology(sc_geometries.geom, :simplification), "
+        "CAST(:target_srid AS INTEGER))"
+    ) in raw
+    assert req.raw_params["simplification"] == 0.044
+
+
 def test_mvt_extent_buffer_are_literals_not_binds():
     req = MVTQueryTransform().transform_query(_base_request(), _mvt_context(_col_config()))
     raw = " ".join(req.raw_selects)
