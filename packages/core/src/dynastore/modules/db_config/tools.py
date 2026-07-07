@@ -141,6 +141,34 @@ async def _base_extensions_present(resource: DbResource, db_key: str) -> bool:
     return await check_extension_exists(resource, _EXT_SENTINEL)
 
 
+@cached(ttl=600, namespace="db_bootstrap", ignore=["resource"], condition=bool)
+async def _platform_bootstrap_present(resource: DbResource, db_key: str) -> bool:
+    """True iff a prior boot fully initialised this platform (marker set).
+
+    Sibling of :func:`_base_extensions_present` and cached the same way:
+    ``condition=bool`` stores ONLY the positive result, keyed by database
+    identity (``db_key``). The marker (``platform.bootstrap_initialized`` in
+    ``catalog.shared_properties``) is written once, after a fully-successful
+    boot, so:
+
+      * steady state across the fleet costs one cache read — a cold-booting
+        serving pod skips the extension + platform-config bootstrap (and its
+        DB-blocking presence probe) without touching PostgreSQL at all once the
+        result is warm in L1/L2;
+      * a fresh / repointed / reset database (marker absent → ``False`` →
+        uncached) always re-reads cheaply and bootstraps; it can never inherit
+        a stale "true" from a different database.
+    """
+    from dynastore.modules.catalog.bootstrap_guard import is_initialized
+
+    # ``db_key`` is consumed by the cache layer as the per-database key; logging
+    # it here documents that contract and aids diagnosing a wrong-key skip.
+    logging.getLogger(__name__).debug(
+        "platform bootstrap-marker probe for database %s", db_key
+    )
+    return await is_initialized(resource)
+
+
 async def ensure_base_extensions(resource: DbResource) -> None:
     """Ensure the base Postgres extensions exist — guarded for per-boot cheapness.
 
@@ -165,7 +193,26 @@ async def ensure_init_db(resource: DbResource):
     (which issues raw DDL directly) is wrapped in ``retry_on_invalidated_connection``
     so a transient DB drop during dev startup (db_entrypoint_dev.sh reset) does
     not abort the foundational lifespan.
+
+    Gated on the platform bootstrap marker via the cached
+    :func:`_platform_bootstrap_present`: once a prior boot has fully initialised
+    this deployment (marker ``platform.bootstrap_initialized`` set in
+    ``catalog.shared_properties``), the whole one-time step is skipped from a
+    single cache read. This keeps a serving pod's foundational lifespan from
+    re-running DDL — and, more importantly, from re-issuing the DB-blocking
+    extension-presence probe — on every cold boot against an already-initialised
+    DB. The marker is read directly (no ``PropertiesProtocol`` dependency, which
+    is not registered this early); absent/unreadable degrades to "not
+    initialised", so a genuinely fresh DB still bootstraps.
     """
+    db_key = await _resolve_db_identity(resource)
+    if await _platform_bootstrap_present(resource, db_key):
+        logging.getLogger(__name__).info(
+            "ensure_init_db: platform already initialised (bootstrap marker "
+            "present) — skipping extension + platform-config bootstrap."
+        )
+        return
+
     await ensure_base_extensions(resource)
 
     # --- Initialize Platform Config Storage ---

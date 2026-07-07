@@ -22,7 +22,7 @@ All DB interactions are mocked — no real PostgreSQL required.
 """
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -87,6 +87,72 @@ async def test_is_initialized_passes_db_resource() -> None:
         result = await is_initialized(db_resource=sentinel_conn)
     assert result is True
     mock_props.get_property.assert_awaited_once_with(BOOTSTRAP_GUARD_KEY, db_resource=sentinel_conn)
+
+
+# ---------------------------------------------------------------------------
+# is_initialized — early-boot direct fallback (PropertiesProtocol not yet up)
+# ---------------------------------------------------------------------------
+
+
+def _dqlquery_factory(*, value: object = None, error: BaseException | None = None):
+    """Build a DQLQuery(...) replacement whose .execute resolves value/raises."""
+    inst = MagicMock()
+    if error is not None:
+        inst.execute = AsyncMock(side_effect=error)
+    else:
+        inst.execute = AsyncMock(return_value=value)
+    return MagicMock(return_value=inst), inst
+
+
+@pytest.mark.asyncio
+async def test_direct_fallback_true_when_marker_set() -> None:
+    """Protocol absent but marker row reads 'true' → initialised (direct read)."""
+    factory, inst = _dqlquery_factory(value="true")
+    conn = object()
+    with patch("dynastore.tools.discovery.get_protocol", return_value=None), patch(
+        "dynastore.modules.db_config.query_executor.DQLQuery", factory
+    ):
+        result = await is_initialized(db_resource=conn)
+    assert result is True
+    inst.execute.assert_awaited_once()
+    call = inst.execute.await_args
+    assert call.args[0] is conn
+    assert call.kwargs.get("key_name") == BOOTSTRAP_GUARD_KEY
+
+
+@pytest.mark.asyncio
+async def test_direct_fallback_false_when_marker_absent() -> None:
+    """Protocol absent and marker row missing (None) → not initialised."""
+    factory, _ = _dqlquery_factory(value=None)
+    with patch("dynastore.tools.discovery.get_protocol", return_value=None), patch(
+        "dynastore.modules.db_config.query_executor.DQLQuery", factory
+    ):
+        result = await is_initialized(db_resource=object())
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_direct_fallback_false_on_db_error() -> None:
+    """Protocol absent and the direct read raises (e.g. table missing on a fresh
+    DB) → degrade to not-initialised so the caller bootstraps."""
+    factory, _ = _dqlquery_factory(error=RuntimeError("relation does not exist"))
+    with patch("dynastore.tools.discovery.get_protocol", return_value=None), patch(
+        "dynastore.modules.db_config.query_executor.DQLQuery", factory
+    ):
+        result = await is_initialized(db_resource=object())
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_direct_fallback_false_when_no_resource() -> None:
+    """Protocol absent AND no db_resource → not initialised, no query attempted."""
+    factory, inst = _dqlquery_factory(value="true")
+    with patch("dynastore.tools.discovery.get_protocol", return_value=None), patch(
+        "dynastore.modules.db_config.query_executor.DQLQuery", factory
+    ):
+        result = await is_initialized()
+    assert result is False
+    inst.execute.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

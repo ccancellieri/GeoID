@@ -59,20 +59,30 @@ _BOOTSTRAP_OWNER = "platform"
 async def is_initialized(db_resource: Optional[Any] = None) -> bool:
     """Return ``True`` if the platform bootstrap has already completed.
 
-    Consults ``catalog.shared_properties`` via ``PropertiesProtocol``.  Returns
-    ``False`` — not initialised — when:
-    * ``PropertiesProtocol`` is not yet registered (very early boot);
-    * the property row does not exist;
-    * any DB error (degrade safely; the caller will re-run initialisation,
-      which is idempotent).
+    Consults ``catalog.shared_properties``.  Prefers ``PropertiesProtocol``
+    (cache-backed) once ``CatalogModule`` has registered it; before that — the
+    foundational-lifespan window when a low-level caller (e.g.
+    ``ensure_init_db`` at ``DatastoreModule`` priority 7) needs the answer but
+    ``PropertiesProtocol`` is not up yet — falls back to a direct read of the
+    marker row on the supplied ``db_resource``.
+
+    The marker records **data state**, not a protocol dependency: if a prior
+    boot fully initialised the platform, the row exists and reads back
+    ``"true"`` (everything is in place); if the DB is fresh the row — or the
+    ``catalog.shared_properties`` table itself — is absent and the read raises,
+    so we degrade to ``False``.  Returns ``False`` — not initialised — when:
+    * neither ``PropertiesProtocol`` nor a ``db_resource`` is available;
+    * the property row / table does not exist;
+    * any DB error (degrade safely; the caller re-runs initialisation, which
+      is idempotent).
     """
     from dynastore.tools.discovery import get_protocol
     from dynastore.models.protocols.properties import PropertiesProtocol
 
     props = get_protocol(PropertiesProtocol)
     if props is None:
-        logger.debug("bootstrap_guard: PropertiesProtocol not registered — treating as uninitialised.")
-        return False
+        # Early-boot fallback: read the marker directly, without the protocol.
+        return await _is_initialized_direct(db_resource)
 
     try:
         value = await props.get_property(BOOTSTRAP_GUARD_KEY, db_resource=db_resource)
@@ -81,6 +91,38 @@ async def is_initialized(db_resource: Optional[Any] = None) -> bool:
         logger.warning(
             "bootstrap_guard: could not read %r (%s) — treating as uninitialised.",
             BOOTSTRAP_GUARD_KEY,
+            exc,
+        )
+        return False
+
+
+async def _is_initialized_direct(db_resource: Optional[Any]) -> bool:
+    """Read the bootstrap marker straight from ``catalog.shared_properties``.
+
+    Used before ``PropertiesProtocol`` is registered. Any error — no resource,
+    missing table on a fresh DB, unreachable backend — degrades to ``False``
+    (uninitialised), so the worst case is a redundant idempotent re-init, never
+    a wrong "already done" skip.
+    """
+    if db_resource is None:
+        logger.debug(
+            "bootstrap_guard: no PropertiesProtocol and no db_resource — "
+            "treating as uninitialised."
+        )
+        return False
+    from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
+
+    try:
+        value = await DQLQuery(
+            "SELECT key_value FROM catalog.shared_properties "
+            "WHERE key_name = :key_name",
+            result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+        ).execute(db_resource, key_name=BOOTSTRAP_GUARD_KEY)
+        return value == "true"
+    except Exception as exc:
+        logger.debug(
+            "bootstrap_guard: direct marker read failed (%s) — treating as "
+            "uninitialised.",
             exc,
         )
         return False
