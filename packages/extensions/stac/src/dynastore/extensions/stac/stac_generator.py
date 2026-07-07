@@ -1249,7 +1249,7 @@ async def create_item_from_feature(
             _extract_langs_from_dict(feature.model_extra.get("stac_extra_fields", {}))
 
     # 5. Geometry and BBox
-    geometry = feature.geometry.model_dump() if feature.geometry else None
+    geometry = feature.geometry.model_dump(exclude_none=True) if feature.geometry else None
 
     # 6. Datetimes handling
     # Strip GeoJSON/STAC structural members (id, geometry, …) that can ride into
@@ -1277,8 +1277,14 @@ async def create_item_from_feature(
         from .stac_validator import _coerce_for_stac_validation
         properties = _coerce_for_stac_validation(properties, lang=lang)
 
-    item_dt = resolve_item_datetime(properties)
-    if item_dt is None:
+    preserve_null_datetime = (
+        "datetime" in properties
+        and properties.get("datetime") is None
+        and properties.get("start_datetime")
+        and properties.get("end_datetime")
+    )
+    item_dt = None if preserve_null_datetime else resolve_item_datetime(properties)
+    if item_dt is None and not preserve_null_datetime:
         # STAC requires a datetime. A COLUMNAR collection without a validity
         # sink drops the item's datetime on write (#1253), so the echoed row
         # carries no temporal value. Rather than 500 on an invalid item, stamp

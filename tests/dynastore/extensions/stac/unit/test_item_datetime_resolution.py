@@ -34,7 +34,15 @@ from the (already reserved-member-stripped) feature properties via
 
 from datetime import datetime, timezone
 
-from dynastore.extensions.stac.stac_generator import resolve_item_datetime
+import pytest
+from starlette.requests import Request as StarletteRequest
+
+from dynastore.extensions.stac.stac_generator import (
+    create_item_from_feature,
+    resolve_item_datetime,
+)
+from dynastore.models.ogc import Feature
+from dynastore.modules.stac.stac_config import StacPluginConfig
 
 
 _EXPECTED = datetime(2024, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
@@ -95,3 +103,56 @@ def test_skips_unparseable_then_uses_next_candidate():
         {"datetime": "not-a-real-date", "created": "2024-01-01T10:00:00Z"}
     )
     assert dt == _EXPECTED
+
+
+def _make_request() -> StarletteRequest:
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/stac/catalogs/cat/collections/col/items/item1",
+        "query_string": b"",
+        "headers": [],
+        "server": ("localhost", 80),
+    }
+    return StarletteRequest(scope)
+
+
+@pytest.mark.asyncio
+async def test_create_item_preserves_source_null_datetime_with_interval():
+    feature = Feature(
+        type="Feature",
+        id="interval-item",
+        geometry={
+            "type": "Polygon",
+            "coordinates": [
+                [
+                    [180.0, -90.0],
+                    [180.0, 90.0],
+                    [-180.0, 90.0],
+                    [-180.0, -90.0],
+                    [180.0, -90.0],
+                ]
+            ],
+        },
+        bbox=[-180.0, -90.0, 180.0, 90.0],
+        properties={
+            "datetime": None,
+            "start_datetime": "2024-01-01T00:00:00Z",
+            "end_datetime": "2024-01-01T00:00:00Z",
+        },
+    )
+
+    item = await create_item_from_feature(
+        request=_make_request(),
+        catalog_id="fao",
+        collection_id="agera5-rh12",
+        feature=feature,
+        stac_config=StacPluginConfig(),
+    )
+
+    assert item is not None
+    item_dict = item.to_dict()
+    assert item_dict["properties"]["datetime"] is None
+    assert item_dict["properties"]["start_datetime"] == "2024-01-01T00:00:00Z"
+    assert item_dict["properties"]["end_datetime"] == "2024-01-01T00:00:00Z"
+    assert "bbox" not in item_dict["geometry"]
