@@ -895,6 +895,13 @@ async def create_collection(
     internal_cols = metadata_model.get_internal_columns() | stac_top_level
     for internal in internal_cols:
         collection.extra_fields.pop(internal, None)
+    if (
+        "summaries" in _stored_extras
+        and isinstance(_stored_extras.get("summaries"), dict)
+        and not _stored_extras["summaries"]
+        and not merged_summaries
+    ):
+        collection.extra_fields["summaries"] = {}
 
     # Set the root catalog to avoid pystac trying to resolve it via network
     root_catalog = pystac.Catalog(

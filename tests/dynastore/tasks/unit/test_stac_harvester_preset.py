@@ -670,6 +670,8 @@ def test_map_collection_preserves_source_stac_metadata_fallbacks() -> None:
         "summaries": {"datetime": {"min": "2020-01-01", "max": "2020-12-31"}},
         "cube:dimensions": {"time": {"type": "temporal", "extent": ["2020", "2020"]}},
         "cube:variables": {"rh": {"type": "data", "unit": "%"}},
+        "sci:citation": None,
+        "supplemental_information": None,
         "created": "2022-03-17T09:00:21.813722Z",
         "updated": "2026-05-11T14:56:56.640574Z",
         "links": [{"rel": "self", "href": "https://example.test"}],
@@ -692,6 +694,8 @@ def test_map_collection_preserves_source_stac_metadata_fallbacks() -> None:
         "summaries",
         "cube:dimensions",
         "cube:variables",
+        "sci:citation",
+        "supplemental_information",
         "created",
         "updated",
     ):
@@ -917,6 +921,9 @@ async def test_upsert_collection_metadata_pg_uses_resolved_ids_and_preserves_ext
         "extra_metadata": {
             "assets": {"thumbnail": {"href": "https://example.test/thumb.png"}},
             "cube:dimensions": {"x": {"type": "spatial"}},
+            "sci:citation": None,
+            "supplemental_information": None,
+            "summaries": {},
         },
     }
 
@@ -941,6 +948,9 @@ async def test_upsert_collection_metadata_pg_uses_resolved_ids_and_preserves_ext
     assert metadata["extra_metadata"]["en"]["cube:dimensions"] == {
         "x": {"type": "spatial"}
     }
+    assert metadata["extra_metadata"]["en"]["sci:citation"] is None
+    assert metadata["extra_metadata"]["en"]["supplemental_information"] is None
+    assert metadata["extra_metadata"]["en"]["summaries"] == {}
 
 
 # ---------------------------------------------------------------------------

@@ -275,6 +275,27 @@ def test_generator_reads_summaries_from_extra_fields_when_typed_is_none():
     assert "summaries" not in collection.extra_fields
 
 
+def test_generator_can_serialize_explicit_empty_summaries_from_extras():
+    collection = _make_pystac_collection_with_extra_fields({"summaries": {}})
+
+    stac_top_level = {
+        "stac_version", "stac_extensions", "links", "conformsTo", "id",
+        "title", "description", "extent", "keywords", "license",
+        "providers", "summaries",
+    }
+    stored_extras = dict(collection.extra_fields)
+    for internal in stac_top_level:
+        collection.extra_fields.pop(internal, None)
+    if (
+        "summaries" in stored_extras
+        and isinstance(stored_extras.get("summaries"), dict)
+        and not stored_extras["summaries"]
+    ):
+        collection.extra_fields["summaries"] = {}
+
+    assert collection.to_dict()["summaries"] == {}
+
+
 def test_generator_does_not_overwrite_providers_from_stac_sidecar():
     """When providers are already set (from collection_stac), the fallback must not
     replace them.

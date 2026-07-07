@@ -278,14 +278,13 @@ def map_collection(coll: Dict[str, Any]) -> Dict[str, Any]:
 
     extras: Dict[str, Any] = {}
     for key, value in out.items():
-        if key == "extra_metadata" or value is None:
+        if key == "extra_metadata":
             continue
         if key not in _STAC_COLLECTION_SCHEMA_FIELDS:
             extras[key] = value
     for key in _STAC_COLLECTION_FALLBACK_FIELDS:
-        value = out.get(key)
-        if value:
-            extras[key] = value
+        if key in out and out[key] is not None:
+            extras[key] = out[key]
 
     if extras:
         existing = out.get("extra_metadata")
