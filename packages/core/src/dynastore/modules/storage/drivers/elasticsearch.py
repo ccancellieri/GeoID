@@ -1952,13 +1952,17 @@ class ItemsElasticsearchDriver(
         props = clean.get("properties")
         if read_policy is not None and isinstance(props, dict):
             ft = read_policy.feature_type
+            source_props = source.get("properties") if isinstance(source, dict) else None
+            source_authored_created = (
+                isinstance(source_props, dict) and "created" in source_props
+            )
             if getattr(ft, "external_id_as_feature_id", False) and isinstance(source, dict):
                 ext = source.get("external_id")
                 if ext is not None:
                     clean["id"] = str(ext)
             if not getattr(ft, "expose_geoid", False):
                 props.pop("geoid", None)
-            if not getattr(ft, "expose_created", False):
+            if not getattr(ft, "expose_created", False) and not source_authored_created:
                 props.pop("created", None)
         return Feature.model_validate(clean)
 
@@ -3305,5 +3309,4 @@ class AssetElasticsearchDriver(
             identifiers={"index": index_name, "prefix": prefix, "catalog_id": catalog_id},
             display_label=index_name,
         )
-
 

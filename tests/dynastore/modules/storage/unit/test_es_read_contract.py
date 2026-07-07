@@ -117,6 +117,36 @@ def test_es_source_to_feature_expose_geoid_and_created() -> None:
     assert out["properties"]["created"] == "2026-05-22T00:00:00Z"
 
 
+def test_es_source_to_feature_preserves_source_authored_created() -> None:
+    policy = ItemsReadPolicy(
+        feature_type=FeatureType(
+            expose=["area"],
+            external_id_as_feature_id=True,
+            expose_geoid=False,
+            expose_created=False,
+        )
+    )
+    source = {
+        "type": "Feature",
+        "id": "geoid-uuid-value",
+        "geometry": None,
+        "collection": "agera5-rh12",
+        "external_id": "C3S.AGERA5-RH12.1999-02-08",
+        "properties": {
+            "datetime": None,
+            "start_datetime": "1999-02-08T00:00:00Z",
+            "end_datetime": "1999-02-08T00:00:00Z",
+            "created": "2022-03-17T09:00:21.813722Z",
+        },
+    }
+
+    feat = ItemsElasticsearchDriver._es_source_to_feature(source, policy)
+    out = _dump(feat)
+
+    assert out["id"] == "C3S.AGERA5-RH12.1999-02-08"
+    assert out["properties"]["created"] == "2022-03-17T09:00:21.813722Z"
+
+
 def test_es_source_to_feature_no_policy_keeps_source_id() -> None:
     feat = ItemsElasticsearchDriver._es_source_to_feature(
         _malformed_source(), None
