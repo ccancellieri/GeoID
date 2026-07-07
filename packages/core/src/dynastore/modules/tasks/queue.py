@@ -30,20 +30,9 @@ Janitor sweep even when no notifications arrive.
 
 import asyncio
 import logging
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
-
-from dynastore.tools.async_utils import (
-    signal_bus,
-    PgListenBridge,
-    PLATFORM_CONFIG_CHANGED,
-)
-from dynastore.modules.db_config.query_executor import DbResource
-from dynastore.tools.background_service import (
-    Leadership,
-    PodPolicy,
-    ServiceContext,
-)
+from dynastore.tools.async_utils import register_listen_channel
 
 logger = logging.getLogger(__name__)
 
@@ -101,99 +90,18 @@ def _notification_transform(
         # Broadcast wake — identifier=None so every pod's cancel listener wakes.
         return (CANCEL_REQUESTED, None)
 
-    if channel == PLATFORM_CONFIG_CHANGED:
-        # Broadcast wake — identifier=None so ConfigReloadService (which waits
-        # on the bare channel) wakes on a real NOTIFY, not only on the bridge's
-        # health-beat. The payload carries the changed class_key but the
-        # watcher re-lists and diffs all platform configs on every wake, so it
-        # does not need the class_key threaded through as a signal identifier.
-        return (PLATFORM_CONFIG_CHANGED, None)
-
     # TASK_STATUS_CHANGED, EVENTS_CHANNEL — forward with payload as identifier
     return (channel, payload)
 
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
-
-async def start_queue_listener(
-    engine: DbResource,
-    shutdown_event: asyncio.Event,
-    channel: str = NEW_TASK_QUEUED,
-    poll_timeout: float = 30.0,
-) -> None:
-    """
-    Starts the queue listener using PgListenBridge for zero-polling
-    notification delivery.
-
-    Every instance opens its own lightweight LISTEN connection.
-    PgListenBridge handles auto-reconnect and periodic health signals.
-    """
-    from dynastore.modules.db_config.query_executor import is_async_resource
-
-    if not is_async_resource(engine):
-        logger.info("QueueListener: Sync engine — periodic signal mode.")
-        while not shutdown_event.is_set():
-            await asyncio.sleep(poll_timeout)
-            await signal_bus.emit(NEW_TASK_QUEUED)
-        logger.info("QueueListener: Stopped.")
-        return
-
-    bridge = PgListenBridge(
-        # PLATFORM_CONFIG_CHANGED rides this same connection for the Layer A
-        # config hot-reload watcher (ConfigReloadService) — no dedicated
-        # LISTEN connection of its own; it reuses this bridge's health-beat
-        # too. See modules/db_config/config_reload_service.py.
-        channels=[
-            NEW_TASK_QUEUED,
-            TASK_STATUS_CHANGED,
-            EVENTS_CHANNEL,
-            CANCEL_REQUESTED,
-            PLATFORM_CONFIG_CHANGED,
-        ],
-        signal_bus=signal_bus,
-        health_timeout=poll_timeout,
-        transform=_notification_transform,
-    )
-
-    bridge_task = asyncio.create_task(bridge.run(engine), name="pg_listen_bridge")
-
-    try:
-        await shutdown_event.wait()
-    except asyncio.CancelledError:
-        logger.info("QueueListener: Cancelled.")
-    finally:
-        await bridge.stop()
-        bridge_task.cancel()
-        try:
-            await bridge_task
-        except asyncio.CancelledError:
-            pass
-
-    logger.info("QueueListener: Stopped.")
-
-
-class QueueListenerService:
-    """BackgroundService wrapper for the pg_notify queue listener.
-
-    Runs on every pod (RUN_EVERYWHERE) and skips ephemeral Cloud Run Job pods
-    (SKIP_EPHEMERAL) — job pods claim exactly one task and exit; they never
-    need to listen for incoming notifications. Resolves #2279 for this loop.
-
-    No leadership election: every long-lived pod opens its own LISTEN
-    connection; the dispatcher's SKIP LOCKED handles claim contention safely.
-    """
-
-    name = "queue_listener"
-    leadership = Leadership.RUN_EVERYWHERE
-    pod_policy = PodPolicy.SKIP_EPHEMERAL
-    lock_key: Optional[Union[int, str]] = None
-
-    def __init__(self, *, poll_timeout: float = 30.0) -> None:
-        self._poll_timeout = poll_timeout
-
-    async def run(self, ctx: ServiceContext) -> None:
-        await start_queue_listener(
-            ctx.engine, ctx.shutdown, poll_timeout=self._poll_timeout,
-        )
+# Register the task-queue channels with the shared notification hub. Each maps
+# through ``_notification_transform`` above. The single bridge is owned by
+# ``modules/db_config/notification_hub.py``; this module no longer opens its own
+# LISTEN connection. PLATFORM_CONFIG_CHANGED is owned by db_config, not here.
+for _task_channel in (
+    NEW_TASK_QUEUED,
+    TASK_STATUS_CHANGED,
+    EVENTS_CHANNEL,
+    CANCEL_REQUESTED,
+):
+    register_listen_channel(_task_channel, _notification_transform)

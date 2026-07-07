@@ -36,6 +36,7 @@ from dynastore.tools.discovery import register_plugin, unregister_plugin
 from . import engine_config as _engine_config  # noqa: F401
 from .config_reload_config import ConfigReloadConfig
 from .config_reload_service import ConfigReloadService
+from .notification_hub import NotificationHubService
 from .db_config import DBConfig
 from .engine_instance_cache import EngineInstanceCache, EngineInstanceCacheSweepService
 from .engine_resolver import (
@@ -164,6 +165,17 @@ class DBConfigModule(ModuleProtocol):
                 enabled=reload_enabled,
                 reload_interval_seconds=reload_interval_seconds,
             )
+        )
+
+        # Shared cross-pod wake hub — owns the one LISTEN bridge per process
+        # for every registered channel (task queue, platform-config reload,
+        # future collection L1 invalidation #2143). Lives here on the
+        # foundational db_config supervisor rather than in TasksModule so no
+        # feature has to import tasks to get a cross-pod wake. It watches the
+        # channel registry and (re)builds the bridge as later modules register
+        # their channels at their own lifespan priorities.
+        supervisor.register(
+            NotificationHubService(poll_timeout=reload_interval_seconds)
         )
 
         engine = (

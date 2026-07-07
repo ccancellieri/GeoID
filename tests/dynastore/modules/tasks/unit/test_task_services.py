@@ -47,32 +47,66 @@ def _ctx(*, is_ephemeral: bool = False) -> ServiceContext:
 
 
 # ---------------------------------------------------------------------------
-# QueueListenerService
+# NotificationHubService (shared cross-pod wake hub) + channel registration
 # ---------------------------------------------------------------------------
 
-class TestQueueListenerService:
+class TestNotificationHubService:
     def test_policy_fields(self):
-        from dynastore.modules.tasks.queue import QueueListenerService
+        from dynastore.modules.db_config.notification_hub import (
+            NotificationHubService,
+        )
 
-        svc = QueueListenerService(poll_timeout=5.0)
-        assert svc.name == "queue_listener"
+        svc = NotificationHubService(poll_timeout=5.0)
+        assert svc.name == "notification_hub"
         assert svc.leadership is Leadership.RUN_EVERYWHERE
         assert svc.pod_policy is PodPolicy.SKIP_EPHEMERAL
         assert svc.lock_key is None
 
+    def test_queue_import_registers_task_channels(self):
+        """Importing the queue module registers its channels with the hub."""
+        import dynastore.modules.tasks.queue  # noqa: F401  (registers channels)
+        from dynastore.tools.async_utils import registered_listen_channels
+        from dynastore.modules.tasks.queue import (
+            NEW_TASK_QUEUED,
+            TASK_STATUS_CHANGED,
+            EVENTS_CHANNEL,
+            CANCEL_REQUESTED,
+        )
+
+        channels = registered_listen_channels()
+        for ch in (
+            NEW_TASK_QUEUED,
+            TASK_STATUS_CHANGED,
+            EVENTS_CHANNEL,
+            CANCEL_REQUESTED,
+        ):
+            assert ch in channels
+
+    def test_config_channel_registered_by_db_config(self):
+        """The platform-config wake channel is owned by db_config, not tasks."""
+        import dynastore.modules.db_config.config_reload_service  # noqa: F401
+        from dynastore.tools.async_utils import (
+            registered_listen_channels,
+            PLATFORM_CONFIG_CHANGED,
+        )
+
+        assert PLATFORM_CONFIG_CHANGED in registered_listen_channels()
+
     @pytest.mark.asyncio
-    async def test_run_delegates_to_start_queue_listener(self, monkeypatch):
-        import dynastore.modules.tasks.queue as q_mod
-        from dynastore.modules.tasks.queue import QueueListenerService
+    async def test_run_delegates_to_run_notification_hub(self, monkeypatch):
+        import dynastore.modules.db_config.notification_hub as hub_mod
+        from dynastore.modules.db_config.notification_hub import (
+            NotificationHubService,
+        )
 
         calls: list = []
 
-        async def _fake_listener(engine, shutdown, poll_timeout):
+        async def _fake_hub(engine, shutdown, poll_timeout):
             calls.append({"engine": engine, "poll_timeout": poll_timeout})
 
-        monkeypatch.setattr(q_mod, "start_queue_listener", _fake_listener)
+        monkeypatch.setattr(hub_mod, "run_notification_hub", _fake_hub)
 
-        svc = QueueListenerService(poll_timeout=7.5)
+        svc = NotificationHubService(poll_timeout=7.5)
         ctx = _ctx()
         await svc.run(ctx)
 

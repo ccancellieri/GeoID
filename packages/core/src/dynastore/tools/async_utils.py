@@ -570,6 +570,67 @@ class PgListenBridge:
         self._running = False
 
 
+# ---------------------------------------------------------------------------
+# Shared LISTEN/NOTIFY channel registry
+# ---------------------------------------------------------------------------
+#
+# One ``PgListenBridge`` per process is enough: LISTEN multiplexes every
+# channel over a single connection. Historically the only bridge was started
+# by the task queue, so any feature that wanted a cross-pod wake (config
+# hot-reload, and soon collection L1 invalidation) had to bolt its channel
+# and transform onto ``modules/tasks/queue.py`` — making TasksModule the
+# accidental owner of unrelated wakeups.
+#
+# This registry inverts that: each feature registers its channel(s) and an
+# optional transform here, from its own module, and a single neutral hub
+# service (``modules/db_config/notification_hub.py``) owns the one bridge.
+# Nothing needs to import TasksModule to get a cross-pod wake.
+
+# channel -> transform. A ``None`` transform forwards the payload verbatim as
+# the SignalBus identifier (the bridge's default behaviour).
+_LISTEN_CHANNELS: "Dict[str, Optional[Callable[[str, Optional[str]], Optional[Tuple[str, Optional[str]]]]]]" = {}
+
+
+def register_listen_channel(
+    channel: str,
+    transform: Optional[Callable[[str, Optional[str]], Optional[Tuple[str, Optional[str]]]]] = None,
+) -> None:
+    """Register a NOTIFY *channel* (and optional transform) with the shared hub.
+
+    Idempotent per channel name. The last registration for a channel wins, so a
+    module can refine its own transform without ordering constraints. Register
+    at import/lifespan time, before the hub builds its bridge; the hub reads a
+    snapshot of the registry when it starts.
+
+    The *transform* maps ``(channel, payload)`` to ``(signal_name, identifier)``
+    for ``SignalBus``, or returns ``None`` to suppress the notification. When
+    omitted, the bridge forwards the payload as the identifier.
+    """
+    _LISTEN_CHANNELS[channel] = transform
+
+
+def registered_listen_channels() -> "List[str]":
+    """Return the currently-registered channel names (sorted, stable order)."""
+    return sorted(_LISTEN_CHANNELS)
+
+
+def build_registry_transform() -> "Callable[[str, Optional[str]], Optional[Tuple[str, Optional[str]]]]":
+    """Build a single transform dispatching per-channel to registered transforms.
+
+    Channels without a registered transform (or registered with ``None``) fall
+    through to the default behaviour: forward the payload as the identifier.
+    """
+    def _dispatch(
+        channel: str, payload: Optional[str]
+    ) -> Optional[Tuple[str, Optional[str]]]:
+        fn = _LISTEN_CHANNELS.get(channel)
+        if fn is None:
+            return (channel, payload)
+        return fn(channel, payload)
+
+    return _dispatch
+
+
 # --- Leader-elected periodic loops ---
 
 async def run_leader_loop(

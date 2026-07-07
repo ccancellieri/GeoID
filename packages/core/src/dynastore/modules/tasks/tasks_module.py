@@ -795,7 +795,12 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                     BackgroundSupervisor,
                     ServiceContext as _ServiceContext,
                 )
-                from dynastore.modules.tasks.queue import QueueListenerService
+                # Task-queue LISTEN channels are registered with the shared
+                # notification hub at ``queue`` import time; the single bridge
+                # is owned by DBConfigModule's NotificationHubService. Import
+                # the module here so its ``register_listen_channel`` calls run
+                # before the hub next polls the registry.
+                import dynastore.modules.tasks.queue  # noqa: F401  (registers channels)
                 from dynastore.modules.tasks.dispatcher import DispatcherService
                 from dynastore.modules.tasks.capability_publisher import (
                     CapabilityPublisherService,
@@ -815,7 +820,6 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
                     name=_get_service_name() or "unknown",
                 )
                 supervisor = BackgroundSupervisor(executor)
-                supervisor.register(QueueListenerService(poll_timeout=poll_interval))
                 supervisor.register(DispatcherService())
                 supervisor.register(StuckPendingWarnerService(schema=schema))
                 supervisor.register(

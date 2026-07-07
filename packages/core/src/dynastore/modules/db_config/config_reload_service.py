@@ -48,7 +48,7 @@ here.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 from dynastore.modules.db_config.query_executor import managed_transaction
 from dynastore.modules.db_config.stored_config_read import _validate_stored_config
@@ -57,7 +57,11 @@ from dynastore.modules.db_config.platform_config_service import (
     run_apply_handlers,
 )
 from dynastore.models.plugin_config import resolve_config_class
-from dynastore.tools.async_utils import signal_bus, PLATFORM_CONFIG_CHANGED
+from dynastore.tools.async_utils import (
+    signal_bus,
+    PLATFORM_CONFIG_CHANGED,
+    register_listen_channel,
+)
 from dynastore.tools.background_service import (
     Leadership,
     LeaseRenewalMode,
@@ -66,6 +70,25 @@ from dynastore.tools.background_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _platform_config_changed_transform(
+    channel: str, payload: Optional[str]
+) -> Optional[Tuple[str, Optional[str]]]:
+    """Broadcast wake for ConfigReloadService.
+
+    The payload carries the changed ``class_key``, but the watcher re-lists and
+    diffs every platform config's ``updated_at`` on each wake, so the identifier
+    is dropped (``None``) and every pod's watcher wakes on a real NOTIFY, not
+    only on the health-beat.
+    """
+    return (PLATFORM_CONFIG_CHANGED, None)
+
+
+# Own our cross-pod wake channel here, next to its only consumer, rather than
+# bolting it onto the task-queue bridge. The shared NotificationHubService
+# (modules/db_config/notification_hub.py) picks this up from the registry.
+register_listen_channel(PLATFORM_CONFIG_CHANGED, _platform_config_changed_transform)
 
 
 class ConfigReloadService:
