@@ -82,6 +82,7 @@ import os
 import random
 import signal
 import time
+import tracemalloc
 from typing import Callable, ClassVar, Optional, Tuple
 
 from pydantic import Field, model_validator
@@ -211,6 +212,10 @@ class MemoryWatchdogService(PeriodicService):
         # hot-reload kill-switches).
         self._started_at = time.monotonic()
         self._last_recycle_attempt: Optional[float] = None
+        # Diagnostic (geoid#3121) bookkeeping: throttle tracemalloc snapshots
+        # and warn only once if tracing was never started.
+        self._last_diag_snapshot: Optional[float] = None
+        self._diag_tracing_warned = False
 
     def _effective_limit_bytes(
         self, config: "MemoryWatchdogConfig"
@@ -274,7 +279,73 @@ class MemoryWatchdogService(PeriodicService):
         else:
             self._warned = False
 
+        self._maybe_emit_tracemalloc(ctx, config, ratio, rss_bytes, limit_bytes)
         await self._maybe_self_recycle(ctx, config, ratio, limit_bytes)
+
+    def _maybe_emit_tracemalloc(
+        self,
+        ctx: ServiceContext,
+        config: "MemoryWatchdogConfig",
+        ratio: float,
+        rss_bytes: int,
+        limit_bytes: int,
+    ) -> None:
+        """Diagnostic (geoid#3121): log the top RSS allocation sites as a worker
+        climbs toward its budget.
+
+        A kernel OOM kill is a bare SIGKILL between watchdog polls — no handler
+        runs, so the allocation that spiked RSS is otherwise invisible. When
+        ``diagnostic_tracemalloc_enabled`` is on (tracemalloc must have been
+        started at process init — see ``build_memory_watchdog_service``), this
+        logs the top Python allocation sites once RSS crosses
+        ``diagnostic_ratio``. That threshold sits deliberately below the OOM
+        point so the snapshot's own allocation has headroom and the *climb*
+        toward the kill is captured. Snapshots are throttled to
+        ``diagnostic_min_interval_seconds`` so a sustained climb does not log
+        every tick. Off by default — tracemalloc adds per-allocation overhead.
+        """
+        if not config.diagnostic_tracemalloc_enabled:
+            return
+        if ratio < config.diagnostic_ratio:
+            return
+        if not tracemalloc.is_tracing():
+            if not self._diag_tracing_warned:
+                logger.warning(
+                    "memory_watchdog: diagnostic_tracemalloc_enabled but "
+                    "tracemalloc is not tracing on %s — it must be started at "
+                    "process init; no snapshot taken.",
+                    ctx.name,
+                )
+                self._diag_tracing_warned = True
+            return
+
+        now = time.monotonic()
+        if (
+            self._last_diag_snapshot is not None
+            and now - self._last_diag_snapshot
+            < config.diagnostic_min_interval_seconds
+        ):
+            return
+        self._last_diag_snapshot = now
+
+        snapshot = tracemalloc.take_snapshot()
+        stats = snapshot.statistics("lineno")
+        top = stats[: max(1, config.diagnostic_top_n)]
+        lines = "\n".join(
+            f"  {i + 1}. {s.size / (1024 * 1024):.1f}MiB in {s.count} blocks: "
+            f"{s.traceback}"
+            for i, s in enumerate(top)
+        )
+        logger.error(
+            "memory_watchdog[diagnostic]: RSS %.0fMiB (%.0f%% of %.0fMiB budget) "
+            "on %s — top %d Python allocation sites by size:\n%s",
+            rss_bytes / (1024 * 1024),
+            ratio * 100,
+            limit_bytes / (1024 * 1024),
+            ctx.name,
+            len(top),
+            lines,
+        )
 
     async def _maybe_self_recycle(
         self,
@@ -455,6 +526,63 @@ class MemoryWatchdogConfig(PluginConfig):
         ),
     )
 
+    diagnostic_tracemalloc_enabled: Mutable[bool] = Field(
+        default=False,
+        description=(
+            "Diagnostic (geoid#3121): when True, tracemalloc is started at "
+            "process init and the watchdog logs the top Python allocation "
+            "sites by size once RSS climbs past diagnostic_ratio, so a "
+            "between-poll OOM spike leaves a breadcrumb naming the allocation "
+            "instead of a bare SIGKILL. Off by default — tracemalloc adds "
+            "per-allocation overhead — and meant to be switched on transiently "
+            "in one environment to locate a leak/spike, then switched back off "
+            "and the process recycled. Read at service-build time (starting "
+            "tracemalloc needs a fresh process)."
+        ),
+    )
+
+    diagnostic_ratio: Mutable[float] = Field(
+        default=0.60,
+        gt=0,
+        le=1,
+        description=(
+            "Ratio of the per-worker budget at which a diagnostic tracemalloc "
+            "snapshot is logged (when diagnostic_tracemalloc_enabled). "
+            "Deliberately well below the OOM point so the snapshot's own "
+            "allocation has headroom and the climb toward the kill is "
+            "captured. Read live every tick."
+        ),
+    )
+
+    diagnostic_top_n: Mutable[int] = Field(
+        default=12,
+        gt=0,
+        description=(
+            "How many top allocation sites (by size) the diagnostic snapshot "
+            "logs. Read live every tick."
+        ),
+    )
+
+    diagnostic_min_interval_seconds: Mutable[float] = Field(
+        default=6.0,
+        ge=0,
+        description=(
+            "Minimum time between two diagnostic tracemalloc snapshots so a "
+            "sustained climb does not log one every tick. Read live every tick."
+        ),
+    )
+
+    diagnostic_cadence_seconds: Mutable[float] = Field(
+        default=3.0,
+        gt=0,
+        description=(
+            "Polling cadence used INSTEAD of cadence_seconds while "
+            "diagnostic_tracemalloc_enabled, so a fast between-poll OOM spike "
+            "is more likely to be sampled during its climb. Read at "
+            "service-build time."
+        ),
+    )
+
     @model_validator(mode="after")
     def _warn_below_critical(self) -> "MemoryWatchdogConfig":
         if not 0 < self.warn_ratio < self.critical_ratio <= 1:
@@ -620,10 +748,25 @@ async def build_memory_watchdog_service(
         logger.debug("memory_watchdog: disabled via config — skipping.")
         return None
 
+    cadence = config.cadence_seconds
+    if config.diagnostic_tracemalloc_enabled:
+        # Poll faster so a fast between-poll OOM spike is sampled during its
+        # climb, and start tracemalloc here (lifespan start) so it captures the
+        # later allocations that spike RSS. 1 frame keeps the per-allocation
+        # overhead down while still naming the allocation site.
+        cadence = config.diagnostic_cadence_seconds
+        if not tracemalloc.is_tracing():
+            tracemalloc.start(1)
+            logger.warning(
+                "memory_watchdog: diagnostic_tracemalloc_enabled — started "
+                "tracemalloc (1 frame); expect extra per-allocation memory "
+                "overhead until it is disabled and the process is recycled."
+            )
+
     return MemoryWatchdogService(
         warn_ratio=config.warn_ratio,
         critical_ratio=config.critical_ratio,
-        cadence_seconds=config.cadence_seconds,
+        cadence_seconds=cadence,
     )
 
 

@@ -719,3 +719,171 @@ async def test_service_runs_under_real_supervisor_and_stops_cleanly(caplog) -> N
         await supervisor.stop(timeout=2.0)
 
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic tracemalloc snapshot (geoid#3121)
+# ---------------------------------------------------------------------------
+
+
+def _patch_config(monkeypatch, config: MemoryWatchdogConfig) -> None:
+    import dynastore.tools.memory_watchdog as mw
+
+    async def _fake_load() -> MemoryWatchdogConfig:
+        return config
+
+    monkeypatch.setattr(mw, "load_memory_watchdog_config", _fake_load)
+
+
+@pytest.fixture
+def _stop_tracemalloc():
+    """Leave tracemalloc off after any diagnostic test (it is process-global)."""
+    import tracemalloc
+
+    yield
+    if tracemalloc.is_tracing():
+        tracemalloc.stop()
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_off_by_default_takes_no_snapshot(
+    monkeypatch, caplog, _stop_tracemalloc
+) -> None:
+    """With diagnostics disabled (the default), no snapshot log is emitted even
+    while RSS is high enough to have crossed diagnostic_ratio."""
+    import tracemalloc
+
+    tracemalloc.start(1)
+    _patch_config(monkeypatch, MemoryWatchdogConfig())  # diagnostic off by default
+    svc = MemoryWatchdogService(
+        limit_bytes=1000,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: 700,  # 70% — above default diagnostic_ratio 0.60
+    )
+    with caplog.at_level(logging.ERROR, logger="dynastore.tools.memory_watchdog"):
+        await svc.tick(_make_ctx())
+    assert not any("diagnostic" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_logs_top_allocations_above_ratio(
+    monkeypatch, caplog, _stop_tracemalloc
+) -> None:
+    """When enabled and RSS is above diagnostic_ratio, a tracemalloc snapshot of
+    the top allocation sites is logged (naming the between-poll spike)."""
+    import tracemalloc
+
+    tracemalloc.start(1)  # build_memory_watchdog_service does this in production
+    # Give the snapshot something concrete to rank at the top.
+    big = [bytearray(1024 * 512) for _ in range(8)]  # ~4MiB
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            diagnostic_ratio=0.50,
+            diagnostic_min_interval_seconds=0.0,
+            self_recycle_enabled=False,
+        ),
+    )
+    svc = MemoryWatchdogService(
+        limit_bytes=1000,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: 700,  # 70% — above diagnostic_ratio
+    )
+    with caplog.at_level(logging.ERROR, logger="dynastore.tools.memory_watchdog"):
+        await svc.tick(_make_ctx())
+    diag = [r for r in caplog.records if "diagnostic" in r.getMessage()]
+    assert len(diag) == 1
+    assert "top" in diag[0].getMessage()
+    assert "allocation sites" in diag[0].getMessage()
+    assert len(big) == 8  # keep the allocation alive until after the snapshot
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_throttles_repeated_snapshots(
+    monkeypatch, caplog, _stop_tracemalloc
+) -> None:
+    """A sustained climb does not log a snapshot every tick — throttled by
+    diagnostic_min_interval_seconds."""
+    import tracemalloc
+
+    tracemalloc.start(1)
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            diagnostic_ratio=0.50,
+            diagnostic_min_interval_seconds=60.0,  # long enough to suppress tick 2/3
+            self_recycle_enabled=False,
+        ),
+    )
+    svc = MemoryWatchdogService(
+        limit_bytes=1000,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: 700,
+    )
+    ctx = _make_ctx()
+    with caplog.at_level(logging.ERROR, logger="dynastore.tools.memory_watchdog"):
+        await svc.tick(ctx)
+        await svc.tick(ctx)
+        await svc.tick(ctx)
+    diag = [r for r in caplog.records if "diagnostic" in r.getMessage()]
+    assert len(diag) == 1
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_warns_once_when_tracing_not_started(
+    monkeypatch, caplog, _stop_tracemalloc
+) -> None:
+    """Enabled but tracemalloc was never started: warn once, take no snapshot."""
+    import tracemalloc
+
+    if tracemalloc.is_tracing():
+        tracemalloc.stop()
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            diagnostic_ratio=0.50,
+            self_recycle_enabled=False,
+        ),
+    )
+    svc = MemoryWatchdogService(
+        limit_bytes=1000,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: 700,
+    )
+    ctx = _make_ctx()
+    with caplog.at_level(logging.WARNING, logger="dynastore.tools.memory_watchdog"):
+        await svc.tick(ctx)
+        await svc.tick(ctx)
+    not_tracing = [r for r in caplog.records if "not tracing" in r.getMessage()]
+    assert len(not_tracing) == 1
+
+
+@pytest.mark.asyncio
+async def test_build_starts_tracemalloc_and_uses_diagnostic_cadence(
+    monkeypatch, _stop_tracemalloc
+) -> None:
+    """build_memory_watchdog_service starts tracemalloc and swaps in the faster
+    diagnostic cadence when the diagnostic flag is on."""
+    import tracemalloc
+
+    if tracemalloc.is_tracing():
+        tracemalloc.stop()
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            diagnostic_cadence_seconds=2.5,
+            cadence_seconds=15.0,
+        ),
+    )
+    svc = await build_memory_watchdog_service()
+    assert svc is not None
+    assert tracemalloc.is_tracing()
+    assert svc.cadence_seconds == 2.5
