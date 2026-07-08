@@ -38,6 +38,7 @@ Related issues:
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
+from uuid import uuid4
 
 # Connection pooling mode values for ``DBConfig.db_pooling_mode`` (#3081).
 POOLING_MODE_DIRECT = "direct"
@@ -137,7 +138,7 @@ def lock_safety_server_settings(
     }
 
 
-def task_engine_connect_args(db_config) -> Dict[str, Dict[str, str]]:
+def task_engine_connect_args(db_config) -> Dict[str, Any]:
     """``connect_args`` carrying the lock-safety ``server_settings`` for a
     task-side, NullPool-backed ad-hoc async engine.
 
@@ -154,6 +155,9 @@ def task_engine_connect_args(db_config) -> Dict[str, Dict[str, str]]:
     Wraps the result via :func:`lock_safety_server_settings`. Intended for
     the short-lived, single-use engines built outside the shared engine —
     pass the result straight as the engine's ``connect_args`` keyword.
+    Disables both SQLAlchemy's asyncpg prepared-statement cache and asyncpg's
+    own driver statement cache, matching the shared serving engine, so task
+    engines stay safe if their DSN points at a pooler.
 
     Also stamps ``application_name`` with this process's service + instance
     id (geoid#2924) — these ad-hoc task engines previously carried no
@@ -173,6 +177,9 @@ def task_engine_connect_args(db_config) -> Dict[str, Dict[str, str]]:
         resolve_timeout_settings(db_config)
     )
     return {
+        "prepared_statement_cache_size": 0,
+        "statement_cache_size": 0,
+        "prepared_statement_name_func": lambda: f"__asyncpg_{uuid4()}__",
         "server_settings": build_connection_server_settings(
             db_config,
             application_name=get_stamped_application_name(),

@@ -342,6 +342,7 @@ class PostgresqlEngineConfig(EngineConfig):
             min_size=1,
             max_size=self.pool_size,
             timeout=self.pool_timeout_sec,
+            statement_cache_size=0,
             server_settings=server_settings,
             # Discard (rather than recycle) a connection whose protocol
             # state was corrupted by a cancelled operation — this pool has

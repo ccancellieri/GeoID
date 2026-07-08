@@ -16,7 +16,7 @@ advisory lock, admin migrate/rollback endpoints) was removed in commit
 | **DB engine config** | `DBConfig` + `EngineInstanceCache` — manages async / sync SQLAlchemy engine pools and exposes them via `DriverContext`. |
 | **Platform config persistence** | `PlatformConfigService` — CRUD for `PluginConfig` subclasses at platform scope, stored in `configs.platform_configs`. |
 | **Bootstrap DDL** | `tools.py:ensure_init_db` — installs PG extensions and creates the `configs` schema tables on first startup (idempotent). |
-| **Typed-store query layer** | `typed_store/` — DML query objects (`config_queries.py`), DDL constants (`ddl.py`), and the schema-registry CLI (`cli.py`). |
+| **Typed-store query layer** | `typed_store/` — DML query objects (`config_queries.py`), DDL constants (`ddl.py`), and the schema audit CLI (`cli.py`). |
 
 ---
 
@@ -36,25 +36,24 @@ or at provision time.
 -- packages/core/src/dynastore/modules/db_config/typed_store/ddl.py
 CREATE SCHEMA IF NOT EXISTS configs;
 
-CREATE TABLE IF NOT EXISTS configs.schemas (
-    schema_id    TEXT PRIMARY KEY,
-    class_key    TEXT NOT NULL,
-    schema_json  JSONB NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_by   TEXT
-);
-
 CREATE TABLE IF NOT EXISTS configs.platform_configs (
     ref_key     TEXT PRIMARY KEY,
     class_key   TEXT NOT NULL,
-    schema_id   TEXT NOT NULL REFERENCES configs.schemas(schema_id),
+    schema_id   TEXT NOT NULL,
     config_data JSONB NOT NULL,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS ix_platform_configs_class_key
+    ON configs.platform_configs (class_key);
 ```
 
 Source: `packages/core/src/dynastore/modules/db_config/typed_store/ddl.py`
 (`PLATFORM_SCHEMAS_DDL`).
+
+JSON schemas are not persisted in a `configs.schemas` registry table. Each
+stored config row carries a plain `schema_id` version tag, and the current JSON
+Schema is generated from the registered `PluginConfig` class when needed.
 
 Per-tenant typed-config tables (`catalog_configs`, `collection_configs`) are
 created inside each tenant's physical schema at catalog provisioning time
@@ -106,6 +105,22 @@ COLUMN`, type changes, backfill loops) against an existing collection table.
 Schema columns are established once at provisioning via `CREATE TABLE IF NOT
 EXISTS`. Adding a column for real requires a fresh (re)provision. This invariant
 applies at all levels and is enforced by design; no migration runner bypasses it.
+
+---
+
+## AsyncPG Pooler Safety
+
+Async SQLAlchemy engines that run through PgBouncer-style or AlloyDB connection
+pooling must disable both SQLAlchemy's asyncpg prepared-statement cache
+(`prepared_statement_cache_size=0`) and asyncpg's own driver statement cache
+(`statement_cache_size=0`). The shared serving engine and the task async engine
+factory apply both settings so `pool_pre_ping` and normal queries do not reuse
+prepared statements that a pooler has already discarded on the backend session.
+
+The deployment can still switch between modes with `DB_POOLING_MODE`: `direct`
+remains the default for direct PostgreSQL/AlloyDB connections, while
+`transaction_pooler` enables the transaction-pooler startup-parameter behavior.
+Sync psycopg/libpq engines do not use asyncpg statement-cache settings.
 
 ---
 

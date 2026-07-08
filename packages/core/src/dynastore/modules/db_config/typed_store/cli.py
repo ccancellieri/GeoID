@@ -57,6 +57,8 @@ from typing import Any, Dict, List
 
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from dynastore.modules.db_config.db_config import DBConfig
+from dynastore.modules.db_config.db_timeout_config import task_engine_connect_args
 from dynastore.modules.db_config.typed_store import config_queries as _cq
 from dynastore.tools.typed_store import TypedModelRegistry
 from dynastore.tools.typed_store.migrations import find_path
@@ -66,7 +68,7 @@ def _engine(url: str | None = None):
     url = url or os.environ["DATABASE_URL"]
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    return create_async_engine(url)
+    return create_async_engine(url, connect_args=task_engine_connect_args(DBConfig))
 
 
 async def _discover() -> None:

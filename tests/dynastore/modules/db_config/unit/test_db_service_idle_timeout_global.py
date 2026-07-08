@@ -137,6 +137,16 @@ def test_statement_timeout_is_clamped_before_reaching_server_settings():
     )
 
 
+def test_db_service_disables_asyncpg_driver_statement_cache():
+    source = _db_service_source()
+    assert '"prepared_statement_cache_size": 0,' in source
+    assert '"statement_cache_size": 0,' in source, (
+        "prepared_statement_cache_size=0 only disables SQLAlchemy's asyncpg "
+        "prepared-statement cache; pool_pre_ping calls asyncpg.fetchrow() "
+        "directly, so asyncpg's own statement_cache_size must also be disabled."
+    )
+
+
 # Bare ``create_async_engine()`` call sites. Each builds an engine directly
 # and is justified — not a silent gap:
 #
@@ -147,9 +157,9 @@ def test_statement_timeout_is_clamped_before_reaching_server_settings():
 #   factory every task/job entrypoint now uses; applies the task lock-safety
 #   net via task_engine_connect_args() and re-applies it per transaction behind
 #   a transaction pooler (#2749, #2832, #3081).
-# - modules/db_config/typed_store/cli.py — a standalone CLI tool (not a
-#   long-lived server/task process); its ``_engine()`` helper builds a plain,
-#   default-pooled engine for one-off operator commands.
+# - modules/db_config/typed_store/cli.py — a standalone CLI tool; its
+#   ``_engine()`` helper still builds a one-off engine directly, but now passes
+#   the shared pooler-safe connect args used by task engines.
 _ALLOWLIST_BARE_CREATE_ASYNC_ENGINE = frozenset(
     {
         pathlib.Path("modules/db/db_service.py"),

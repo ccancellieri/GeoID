@@ -228,3 +228,11 @@ def test_task_connect_args_direct_carries_keepalives_and_task_idle():
 def test_task_connect_args_pooler_is_application_name_only():
     ss = t.task_engine_connect_args(_pooler())["server_settings"]
     assert list(ss.keys()) == ["application_name"]
+
+
+def test_task_connect_args_disable_asyncpg_statement_caches_in_all_modes():
+    for cfg in (_direct(), _pooler()):
+        connect_args = t.task_engine_connect_args(cfg)
+        assert connect_args["prepared_statement_cache_size"] == 0
+        assert connect_args["statement_cache_size"] == 0
+        assert callable(connect_args["prepared_statement_name_func"])

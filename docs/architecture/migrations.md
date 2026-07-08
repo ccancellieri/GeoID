@@ -36,13 +36,15 @@ via `tools.py:ensure_init_db`) issues:
 ```python
 # packages/core/src/dynastore/modules/db_config/typed_store/ddl.py
 PLATFORM_SCHEMAS_DDL   # CREATE SCHEMA IF NOT EXISTS configs;
-                       # CREATE TABLE IF NOT EXISTS configs.schemas (…)
                        # CREATE TABLE IF NOT EXISTS configs.platform_configs (…)
                        # CREATE INDEX IF NOT EXISTS …
 ```
 
 Source: `packages/core/src/dynastore/modules/db_config/typed_store/ddl.py`
 (constants `PLATFORM_SCHEMAS_DDL`, `tenant_configs_ddl`).
+JSON schemas are not stored in a `configs.schemas` registry table; each config
+row stores its `schema_id` version tag, and the current schema is generated from
+the registered `PluginConfig` class.
 
 ### Catalog registry and metadata tables (`catalog` schema)
 

@@ -89,6 +89,20 @@ async def test_engine_init_still_passes_pool_sizing_kwargs() -> None:
     assert kwargs["timeout"] == 12
 
 
+async def test_engine_init_disables_asyncpg_statement_cache() -> None:
+    """Raw asyncpg pools do not use SQLAlchemy's dialect cache, so they must
+    disable asyncpg's own statement cache directly when running behind a
+    PgBouncer-style pooler."""
+    cfg = PostgresqlEngineConfig()
+    with patch(
+        "asyncpg.create_pool", new_callable=AsyncMock
+    ) as mock_create_pool:
+        await cfg.engine_init()
+
+    _args, kwargs = mock_create_pool.call_args
+    assert kwargs["statement_cache_size"] == 0
+
+
 class _FakeAsyncpgConnection:
     """Minimal asyncpg.Connection stand-in for the pool ``reset`` hook."""
 

@@ -330,6 +330,7 @@ class DBService(ModuleProtocol, DatabaseProtocol):
                             # empty, or orphaned prepared statements accumulate per
                             # backend for the life of the SQLAlchemy pool.
                             "prepared_statement_cache_size": 0,
+                            "statement_cache_size": 0,
                             "prepared_statement_name_func": (
                                 lambda: f"__asyncpg_{uuid4()}__"
                             ),
