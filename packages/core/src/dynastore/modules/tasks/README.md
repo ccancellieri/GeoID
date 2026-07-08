@@ -52,6 +52,14 @@ returning the ordered candidate list. When **both** maps are empty the
 registry, so an empty seed still yields a complete, consumer-bearing config
 (visible at `GET /configs/?resolved=true`).
 
+The dispatcher claim gate uses the same routing selection model as execution:
+`CapabilityMap.refresh()` evaluates the selected `RunnerTarget` for each task
+and advertises the task only when this process has that target's `runner` type.
+This matters for offloaded work such as `catalog_provision`: under the cloud
+profile it is claimable only by a service that has a matching `gcp_cloud_run`
+runner. Under the on-prem profile the target runner is `background`, so the
+same task remains claimable by the in-process worker tier.
+
 ### RunnerTarget
 
 | Field | Meaning |
@@ -122,15 +130,57 @@ loud (a WARN plus the `starving` report) instead of an indefinitely PENDING row.
   Two tenants sharing the same `dedup_key` do not collide.
 - The cross-partition dedup guard in `enqueue()` is also scoped by `schema_name`.
 
+## Claim Leases
+
+`tasks.tasks.locked_until` is the queue visibility timeout. Claiming a PENDING
+row sets `status = 'ACTIVE'`, `owner_id`, and `locked_until`; runners heartbeat
+or extend that lease while work continues. The task reaper moves expired ACTIVE
+rows back to PENDING, or to DEAD_LETTER when retry limits are exhausted. It is a
+lease column, not a permanent ownership flag.
+
 ## Initialization
 
 On startup `TasksModule` (priority=15, before `CatalogModule` at 20):
 
 1. Acquires an advisory lock for the duration of all DDL — prevents concurrent-revision
-   races on Cloud Run rolling deploys.
-2. Creates the `tasks` table, indexes, and pg_notify triggers if absent.
-3. Ensures 12 monthly future partitions exist and registers retention cron jobs.
+   races on rolling deploys. If that outer startup lock times out, the module
+   replays idempotent startup DDL in a scoped fallback that skips only the nested
+   per-query advisory wait; ordinary DDL errors still fail startup.
+2. Creates the `tasks` table, indexes, pg_notify triggers, and the DEFAULT
+   partition if absent. Warm starts also repair `tasks.tasks_default` with a
+   separate `to_regclass` check so the sentinel-skipped DDL batch cannot leave
+   retention pointing at a missing default partition.
+3. Ensures 12 monthly future partitions exist.
 4. Asserts the current-month partition is present before starting the dispatcher.
+
+## Maintenance Schedule
+
+Periodic task maintenance is driven by `tasks.maintenance_schedule`; it is the
+single scheduler table for the in-process maintenance supervisor. Each row has a
+`job_name`, cadence (`interval_seconds`), the latest run outcome, and
+`running_since` while a leader is executing it. The supervisor reclaims stale
+`running_since` values with a row-derived threshold:
+`min(600s, max(180s, interval_seconds * 3))`. Short-cadence jobs such as
+`task_reaper` recover after about three minutes; daily jobs still recover within
+ten minutes.
+
+Optional jobs are dependency-aware. `iam_prune` is registered only when the IAM
+tables exist, and `es_logs_retention` is registered only when the OpenSearch
+client dependency is available. If an old schedule row remains, the job records
+`last_status = 'skipped'` instead of creating recurring errors.
+
+The supervisor also owns `control_plane_retention`, a daily bounded cleanup job
+for small control-plane tables:
+
+- `configs.leader_lease` rows whose leases are comfortably expired.
+- `configs.task_capability_registry` rows older than the configured capability
+  publisher TTL multiplied by ten.
+- `configs.instance_liveness` rows older than twice the zombie-session liveness
+  window, with a one-hour minimum.
+
+These rows are operational state. They should remain in PostgreSQL because they
+coordinate durable task routing, leadership, and session safety, but they are
+prunable by age and should stay roughly bounded by deployed services/instances.
 
 ## Task Attribution
 

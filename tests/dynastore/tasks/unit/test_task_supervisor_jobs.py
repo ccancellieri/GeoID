@@ -36,9 +36,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from dynastore.modules.catalog.maintenance_supervisor import (
+    JOB_CONTROL_PLANE_RETENTION,
     JOB_TASK_PARTITION_CREATE,
     JOB_TASK_REAPER,
     JOB_TASK_RETENTION,
+    _CADENCE_CONTROL_PLANE_RETENTION,
     _CADENCE_TASK_PARTITION_CREATE,
     _CADENCE_TASK_REAPER,
     _CADENCE_TASK_RETENTION,
@@ -124,6 +126,14 @@ async def test_register_supervisor_jobs_includes_task_jobs():
             side_effect=_dql_factory,
         ),
         patch(
+            "dynastore.modules.catalog.maintenance_supervisor._iam_prune_available",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor._es_logs_retention_available",
+            return_value=True,
+        ),
+        patch(
             "dynastore.modules.catalog.maintenance_supervisor.managed_transaction",
         ) as mock_mtx,
     ):
@@ -135,17 +145,19 @@ async def test_register_supervisor_jobs_includes_task_jobs():
     cadence_map = dict(upserted)
     job_names = list(cadence_map.keys())
 
-    # Total: 3 logs/iam + 3 task + 4 events/storage partition+retention = 10
+    # Total: 3 optional/logs/iam + 3 task + 4 events/storage + control-plane = 11
     # (the 3 legacy events.events accumulation jobs were retired in #1807 P4).
-    assert len(job_names) == 10
+    assert len(job_names) == 11
 
     assert JOB_TASK_REAPER in cadence_map
     assert JOB_TASK_PARTITION_CREATE in cadence_map
     assert JOB_TASK_RETENTION in cadence_map
+    assert JOB_CONTROL_PLANE_RETENTION in cadence_map
 
     assert cadence_map[JOB_TASK_REAPER] == _CADENCE_TASK_REAPER
     assert cadence_map[JOB_TASK_PARTITION_CREATE] == _CADENCE_TASK_PARTITION_CREATE
     assert cadence_map[JOB_TASK_RETENTION] == _CADENCE_TASK_RETENTION
+    assert cadence_map[JOB_CONTROL_PLANE_RETENTION] == _CADENCE_CONTROL_PLANE_RETENTION
 
 
 # ---------------------------------------------------------------------------
@@ -162,16 +174,20 @@ async def test_dispatch_task_reaper_calls_reap_stuck_tasks():
     async def _fake_execute(c, **kw):
         return 2
 
-    with patch(
-        "dynastore.modules.catalog.maintenance_supervisor.DQLQuery"
-    ) as MockDQL:
+    with patch("dynastore.modules.catalog.maintenance_supervisor.DQLQuery") as MockDQL:
         instance = MagicMock()
         instance.execute = AsyncMock(side_effect=_fake_execute)
         MockDQL.side_effect = lambda sql, **kw: (executed_sqls.append(sql), instance)[1]
 
         result = await _dispatch_job(
-            JOB_TASK_REAPER, conn, {"hard_cap": 7, "dead_letter_days": 30,
-                                    "timeout_minutes": 15, "max_retries": 3}
+            JOB_TASK_REAPER,
+            conn,
+            {
+                "hard_cap": 7,
+                "dead_letter_days": 30,
+                "timeout_minutes": 15,
+                "max_retries": 3,
+            },
         )
 
     assert result == 2
@@ -190,16 +206,20 @@ async def test_dispatch_task_partition_create_calls_create_func():
     async def _fake_execute(c, **kw):
         return None
 
-    with patch(
-        "dynastore.modules.catalog.maintenance_supervisor.DQLQuery"
-    ) as MockDQL:
+    with patch("dynastore.modules.catalog.maintenance_supervisor.DQLQuery") as MockDQL:
         instance = MagicMock()
         instance.execute = AsyncMock(side_effect=_fake_execute)
         MockDQL.side_effect = lambda sql, **kw: (executed_sqls.append(sql), instance)[1]
 
         result = await _dispatch_job(
-            JOB_TASK_PARTITION_CREATE, conn,
-            {"hard_cap": 5, "dead_letter_days": 30, "timeout_minutes": 15, "max_retries": 3}
+            JOB_TASK_PARTITION_CREATE,
+            conn,
+            {
+                "hard_cap": 5,
+                "dead_letter_days": 30,
+                "timeout_minutes": 15,
+                "max_retries": 3,
+            },
         )
 
     assert result == 0
@@ -215,16 +235,20 @@ async def test_dispatch_task_retention_calls_maintain_func():
     async def _fake_execute(c, **kw):
         return None
 
-    with patch(
-        "dynastore.modules.catalog.maintenance_supervisor.DQLQuery"
-    ) as MockDQL:
+    with patch("dynastore.modules.catalog.maintenance_supervisor.DQLQuery") as MockDQL:
         instance = MagicMock()
         instance.execute = AsyncMock(side_effect=_fake_execute)
         MockDQL.side_effect = lambda sql, **kw: (executed_sqls.append(sql), instance)[1]
 
         result = await _dispatch_job(
-            JOB_TASK_RETENTION, conn,
-            {"hard_cap": 5, "dead_letter_days": 30, "timeout_minutes": 15, "max_retries": 3}
+            JOB_TASK_RETENTION,
+            conn,
+            {
+                "hard_cap": 5,
+                "dead_letter_days": 30,
+                "timeout_minutes": 15,
+                "max_retries": 3,
+            },
         )
 
     assert result == 0
@@ -252,7 +276,10 @@ def test_build_supervisor_config_includes_hard_cap():
 @pytest.mark.asyncio
 async def test_ensure_task_storage_no_cron_schedule():
     """ensure_task_storage_exists must not call register_cron_job or cron.schedule."""
-    from dynastore.modules.tasks.tasks_module import ensure_task_storage_exists, get_task_schema
+    from dynastore.modules.tasks.tasks_module import (
+        ensure_task_storage_exists,
+        get_task_schema,
+    )
 
     conn = AsyncMock()
     schema = get_task_schema()
@@ -280,6 +307,9 @@ async def test_ensure_task_storage_no_cron_schedule():
         patch(
             "dynastore.modules.tasks.tasks_module.DDLQuery",
         ) as MockDDL,
+        patch(
+            "dynastore.modules.tasks.tasks_module.DQLQuery",
+        ) as MockDQL,
     ):
         # Fake DDLBatch
         fake_batch = MagicMock()
@@ -295,12 +325,15 @@ async def test_ensure_task_storage_no_cron_schedule():
             return inst
 
         MockDDL.side_effect = _dql_factory
+        dql_inst = MagicMock()
+        dql_inst.execute = AsyncMock(return_value="tasks.tasks_default")
+        MockDQL.return_value = dql_inst
 
         await ensure_task_storage_exists(conn, schema)
 
-    assert cron_calls == [], (
-        f"ensure_task_storage_exists should not emit cron.schedule; got: {cron_calls}"
-    )
+    assert (
+        cron_calls == []
+    ), f"ensure_task_storage_exists should not emit cron.schedule; got: {cron_calls}"
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +344,10 @@ async def test_ensure_task_storage_no_cron_schedule():
 @pytest.mark.asyncio
 async def test_ensure_task_storage_provisions_maintenance_functions():
     """ensure_task_storage_exists must execute DDLQuery for each of the 3 helper functions."""
-    from dynastore.modules.tasks.tasks_module import ensure_task_storage_exists, get_task_schema
+    from dynastore.modules.tasks.tasks_module import (
+        ensure_task_storage_exists,
+        get_task_schema,
+    )
 
     conn = AsyncMock()
     schema = get_task_schema()
@@ -333,6 +369,9 @@ async def test_ensure_task_storage_provisions_maintenance_functions():
         patch(
             "dynastore.modules.tasks.tasks_module.DDLQuery",
         ) as MockDDL,
+        patch(
+            "dynastore.modules.tasks.tasks_module.DQLQuery",
+        ) as MockDQL,
     ):
         fake_batch = MagicMock()
         fake_batch.execute = AsyncMock()
@@ -345,13 +384,20 @@ async def test_ensure_task_storage_provisions_maintenance_functions():
             return inst
 
         MockDDL.side_effect = _dql_factory
+        dql_inst = MagicMock()
+        dql_inst.execute = AsyncMock(return_value="tasks.tasks_default")
+        MockDQL.return_value = dql_inst
 
         await ensure_task_storage_exists(conn, schema)
 
     combined = " ".join(ddl_sqls_executed)
     assert "reap_stuck_tasks" in combined, "Reaper DDL must be provisioned"
-    assert "maintain_partitions" in combined, "Retention function DDL must be provisioned"
-    assert "create_partitions" in combined, "Partition-create function DDL must be provisioned"
+    assert (
+        "maintain_partitions" in combined
+    ), "Retention function DDL must be provisioned"
+    assert (
+        "create_partitions" in combined
+    ), "Partition-create function DDL must be provisioned"
 
 
 # ---------------------------------------------------------------------------
@@ -422,14 +468,14 @@ def test_retention_ddl_uses_day_not_daily():
     """
     from dynastore.modules.tasks.tasks_module import GLOBAL_TASKS_RETENTION_FUNC_DDL
 
-    assert "date_trunc('day'," in GLOBAL_TASKS_RETENTION_FUNC_DDL, (
-        "Retention DDL must call date_trunc('day', ...) — 'daily' is invalid PG syntax"
-    )
+    assert (
+        "date_trunc('day'," in GLOBAL_TASKS_RETENTION_FUNC_DDL
+    ), "Retention DDL must call date_trunc('day', ...) — 'daily' is invalid PG syntax"
     # The literal date_trunc call must not use 'daily'.  Comments may reference
     # the old buggy value for documentation purposes — check only the call site.
-    assert "date_trunc('daily'" not in GLOBAL_TASKS_RETENTION_FUNC_DDL, (
-        "Retention DDL must not call date_trunc('daily', ...) — 'daily' is invalid PG syntax"
-    )
+    assert (
+        "date_trunc('daily'" not in GLOBAL_TASKS_RETENTION_FUNC_DDL
+    ), "Retention DDL must not call date_trunc('daily', ...) — 'daily' is invalid PG syntax"
 
 
 def test_retention_ddl_drains_tasks_default():
@@ -441,12 +487,39 @@ def test_retention_ddl_drains_tasks_default():
     """
     from dynastore.modules.tasks.tasks_module import GLOBAL_TASKS_RETENTION_FUNC_DDL
 
-    assert "tasks_default" in GLOBAL_TASKS_RETENTION_FUNC_DDL, (
-        "Retention DDL must include a sweep of the tasks_default partition"
-    )
-    assert "DELETE FROM" in GLOBAL_TASKS_RETENTION_FUNC_DDL, (
-        "Retention DDL must DELETE stale rows from tasks_default"
-    )
+    assert (
+        "tasks_default" in GLOBAL_TASKS_RETENTION_FUNC_DDL
+    ), "Retention DDL must include a sweep of the tasks_default partition"
+    assert (
+        "DELETE FROM" in GLOBAL_TASKS_RETENTION_FUNC_DDL
+    ), "Retention DDL must DELETE stale rows from tasks_default"
+
+
+@pytest.mark.asyncio
+async def test_tasks_default_partition_repair_creates_when_missing():
+    """Warm starts must repair tasks.tasks_default even when the DDLBatch sentinel skips."""
+    from dynastore.modules.tasks import tasks_module
+
+    conn = MagicMock()
+    executed_ddl: list[str] = []
+
+    def _dql_factory(sql, **kwargs):
+        inst = MagicMock()
+        inst.execute = AsyncMock(return_value=None)
+        return inst
+
+    def _ddl_factory(sql, **kwargs):
+        inst = MagicMock()
+        inst.execute = AsyncMock(side_effect=lambda c, **kw: executed_ddl.append(sql))
+        return inst
+
+    with (
+        patch.object(tasks_module, "DQLQuery", side_effect=_dql_factory),
+        patch.object(tasks_module, "DDLQuery", side_effect=_ddl_factory),
+    ):
+        await tasks_module._ensure_tasks_default_partition(conn, "tasks")
+
+    assert tasks_module.GLOBAL_TASKS_DEFAULT_PARTITION_DDL in executed_ddl
 
 
 def test_retention_ddl_partition_regex_is_single_brace():

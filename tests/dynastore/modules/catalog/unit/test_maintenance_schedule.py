@@ -39,6 +39,7 @@ import pytest
 from dynastore.modules.catalog.db_init.maintenance_schedule import (
     MAINTENANCE_SCHEDULE_DDL,
     MaintenanceScheduleRepository,
+    TASKS_SCHEMA_DDL,
     _GET_DUE_JOBS,
     _MARK_DONE,
     _MARK_RUNNING,
@@ -286,5 +287,9 @@ async def test_ensure_maintenance_schedule_calls_ddlquery():
 
         await ensure_maintenance_schedule(conn)
 
-    MockDDL.assert_called_once_with(MAINTENANCE_SCHEDULE_DDL)
-    mock_execute.assert_awaited_once_with(conn)
+    assert [call.args[0] for call in MockDDL.call_args_list] == [
+        TASKS_SCHEMA_DDL,
+        MAINTENANCE_SCHEDULE_DDL,
+    ]
+    assert mock_execute.await_count == 2
+    mock_execute.assert_any_await(conn)

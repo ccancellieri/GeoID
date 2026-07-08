@@ -116,9 +116,15 @@ _RECLAIM_STALE_JOBS = DQLQuery(
     UPDATE tasks.maintenance_schedule
     SET running_since = NULL,
         last_status   = 'error',
-        last_error    = 'reclaimed: running_since stale'
+        last_error    = 'reclaimed: running_since stale',
+        last_rows     = 0
     WHERE running_since IS NOT NULL
-      AND running_since < :cutoff
+      AND running_since < :now - (
+          LEAST(
+              :max_stale_after_seconds,
+              GREATEST(:min_stale_after_seconds, interval_seconds * :stale_multiplier)
+          ) * INTERVAL '1 second'
+      )
     """,
     result_handler=ResultHandler.ROWCOUNT,
 )
@@ -178,21 +184,29 @@ class MaintenanceScheduleRepository:
         )
 
     async def reclaim_stale_jobs(
-        self, conn: DbResource, *, now: datetime, stale_after_seconds: int
+        self,
+        conn: DbResource,
+        *,
+        now: datetime,
+        min_stale_after_seconds: int,
+        max_stale_after_seconds: int,
+        stale_multiplier: int,
     ) -> int:
         """Clear ``running_since`` for rows whose leader crashed mid-run.
 
-        A row whose ``running_since`` is older than ``now - stale_after_seconds``
-        seconds is assumed to belong to a dead leader.  ``get_due_jobs`` filters
-        ``running_since IS NULL``, so without this reclaim a crashed-mid-run job
-        would be permanently wedged.
+        The threshold is derived from each row's cadence and clamped by the
+        caller-provided bounds.  Short-cadence jobs recover quickly; daily jobs
+        still recover within the max bound.
 
         Returns the number of rows reclaimed.
         """
-        from datetime import timedelta
-
-        cutoff = now - timedelta(seconds=stale_after_seconds)
-        return await _RECLAIM_STALE_JOBS.execute(conn, cutoff=cutoff)
+        return await _RECLAIM_STALE_JOBS.execute(
+            conn,
+            now=now,
+            min_stale_after_seconds=min_stale_after_seconds,
+            max_stale_after_seconds=max_stale_after_seconds,
+            stale_multiplier=stale_multiplier,
+        )
 
 
 # Re-export for tests (mirrors existing pattern for _GET_DUE_JOBS, _MARK_RUNNING etc.)

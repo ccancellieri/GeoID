@@ -29,10 +29,14 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncConnection
 
 from dynastore.modules.db_config import locking_tools
+from dynastore.modules.db_config.exceptions import QueryExecutionError
+from dynastore.modules.db_config.query_executor import DDLQuery
 
 
 class LockNotAvailableError(Exception):
@@ -77,13 +81,14 @@ async def test_lock_timeout_falls_back_to_unlocked_ddl_instead_of_raising(
     async def _fake_managed_transaction(engine: Any):
         yield fake_conn
 
-    monkeypatch.setattr(
-        locking_tools, "managed_transaction", _fake_managed_transaction
-    )
+    monkeypatch.setattr(locking_tools, "managed_transaction", _fake_managed_transaction)
 
     seen_conns = []
 
     async def _ddl_body(conn: Any) -> None:
+        from dynastore.modules.db_config import query_executor
+
+        assert query_executor.startup_ddl_fallback_active() is True
         seen_conns.append(conn)
 
     # Must complete without raising despite the simulated lock timeout.
@@ -96,6 +101,83 @@ async def test_lock_timeout_falls_back_to_unlocked_ddl_instead_of_raising(
     # The idempotent DDL still ran exactly once, on the unlocked fallback
     # connection.
     assert seen_conns == [fake_conn]
+
+
+@pytest.mark.asyncio
+async def test_inner_ddl_advisory_wait_is_skipped_inside_startup_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fallback startup DDL may proceed when the per-query advisory lock is busy."""
+    from dynastore.modules.db_config import query_executor
+
+    outer_conn = AsyncMock(spec=AsyncConnection)
+    tx_conn = AsyncMock(spec=AsyncConnection)
+    executed_sql: list[str] = []
+
+    async def _execute(statement, params=None):
+        sql = str(statement)
+        executed_sql.append(sql)
+        result = MagicMock()
+        result.scalar.return_value = (
+            False if "pg_try_advisory_xact_lock" in sql else None
+        )
+        return result
+
+    tx_conn.execute = AsyncMock(side_effect=_execute)
+
+    @asynccontextmanager
+    async def _fake_managed_transaction(_conn):
+        yield tx_conn
+
+    monkeypatch.setattr(
+        query_executor, "managed_transaction", _fake_managed_transaction
+    )
+
+    with query_executor.startup_ddl_unlocked_fallback_scope():
+        await DDLQuery("DO $$ BEGIN NULL; END $$;").execute(outer_conn)
+
+    assert any("pg_try_advisory_xact_lock" in sql for sql in executed_sql)
+    assert not any(
+        sql.startswith("SELECT pg_advisory_xact_lock") for sql in executed_sql
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_lock_ddl_error_still_propagates_inside_startup_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fallback scope only skips the nested wait; DDL execution errors still raise."""
+    from dynastore.modules.db_config import query_executor
+
+    outer_conn = AsyncMock(spec=AsyncConnection)
+    tx_conn = AsyncMock(spec=AsyncConnection)
+
+    async def _execute(statement, params=None):
+        sql = str(statement)
+        result = MagicMock()
+        if "pg_try_advisory_xact_lock" in sql:
+            result.scalar.return_value = False
+            return result
+        if sql.startswith("SET LOCAL"):
+            result.scalar.return_value = None
+            return result
+        raise RuntimeError("bad ddl")
+
+    tx_conn.execute = AsyncMock(side_effect=_execute)
+
+    @asynccontextmanager
+    async def _fake_managed_transaction(_conn):
+        yield tx_conn
+
+    monkeypatch.setattr(
+        query_executor, "managed_transaction", _fake_managed_transaction
+    )
+
+    with pytest.raises(QueryExecutionError):
+        with query_executor.startup_ddl_unlocked_fallback_scope():
+            await DDLQuery("DO $$ BEGIN RAISE EXCEPTION 'bad'; END $$;").execute(
+                outer_conn
+            )
 
 
 @pytest.mark.asyncio
@@ -112,7 +194,9 @@ async def test_non_lock_timeout_error_still_propagates(
     )
 
     async def _ddl_body(conn: Any) -> None:
-        raise AssertionError("ddl_body must not run when the error isn't a lock timeout")
+        raise AssertionError(
+            "ddl_body must not run when the error isn't a lock timeout"
+        )
 
     with pytest.raises(ConnectionError, match="db is unreachable"):
         await locking_tools.run_startup_ddl_tolerating_lock_timeout(

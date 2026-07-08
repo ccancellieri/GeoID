@@ -42,7 +42,7 @@ tests are gone rather than skipped.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -57,6 +57,7 @@ from dynastore.modules.catalog.db_init.maintenance_schedule import (
     _RECLAIM_STALE_JOBS,
 )
 from dynastore.modules.catalog.maintenance_supervisor import (
+    JOB_CONTROL_PLANE_RETENTION,
     JOB_ES_LOGS_RETENTION,
     JOB_IAM_PRUNE,
     JOB_STORAGE_PARTITION_CREATE,
@@ -66,16 +67,21 @@ from dynastore.modules.catalog.maintenance_supervisor import (
     JOB_TASK_RETENTION,
     JOB_EVENTS_PARTITION_CREATE,
     JOB_EVENTS_RETENTION,
+    MaintenanceJobResult,
     MaintenanceSupervisor,
+    _CADENCE_CONTROL_PLANE_RETENTION,
     _CADENCE_ES_LOGS_RETENTION,
     _CADENCE_IAM_PRUNE,
     _CADENCE_TASK_PARTITION_CREATE,
     _CADENCE_TASK_REAPER,
     _CADENCE_TASK_RETENTION,
-    _STALE_AFTER_SECONDS,
+    _STALE_MAX_AFTER_SECONDS,
+    _STALE_MIN_AFTER_SECONDS,
+    _STALE_MULTIPLIER,
     _SUPERSEDED_CRON_JOBS,
     _SUPERSEDED_TENANT_LOG_PREFIX,
     _dispatch_job,
+    _run_control_plane_retention,
     _run_es_logs_retention,
     _run_health_alert,
     _run_iam_prune,
@@ -118,28 +124,41 @@ def _fake_engine():
 
 
 def test_reclaim_stale_jobs_sql_contains_running_since():
-    """The reclaim query must filter on running_since IS NOT NULL and cutoff."""
+    """The reclaim query must filter on running_since and derive per-row thresholds."""
     sql = _RECLAIM_STALE_JOBS.template
     assert "running_since IS NOT NULL" in sql
-    assert "running_since < :cutoff" in sql
+    assert "interval_seconds" in sql
+    assert "LEAST" in sql
+    assert "GREATEST" in sql
     assert "last_status" in sql
     assert "last_error" in sql
+    assert "last_rows" in sql
 
 
 @pytest.mark.asyncio
-async def test_reclaim_stale_jobs_cutoff_calculation():
-    """reclaim_stale_jobs computes cutoff = now - stale_after_seconds."""
+async def test_reclaim_stale_jobs_uses_row_derived_threshold_params():
+    """reclaim_stale_jobs passes min/max/multiplier instead of one global cutoff."""
     conn = MagicMock()
     now = _utc(2026, 6, 1, 12, 0, 0)
-    stale_after = 3600
-    expected_cutoff = now - timedelta(seconds=stale_after)
 
     mock_exec = AsyncMock(return_value=0)
     with patch.object(_RECLAIM_STALE_JOBS, "execute", new=mock_exec):
         repo = MaintenanceScheduleRepository()
-        result = await repo.reclaim_stale_jobs(conn, now=now, stale_after_seconds=stale_after)
+        result = await repo.reclaim_stale_jobs(
+            conn,
+            now=now,
+            min_stale_after_seconds=180,
+            max_stale_after_seconds=600,
+            stale_multiplier=3,
+        )
 
-    mock_exec.assert_awaited_once_with(conn, cutoff=expected_cutoff)
+    mock_exec.assert_awaited_once_with(
+        conn,
+        now=now,
+        min_stale_after_seconds=180,
+        max_stale_after_seconds=600,
+        stale_multiplier=3,
+    )
     assert result == 0
 
 
@@ -150,7 +169,11 @@ async def test_reclaim_stale_jobs_returns_reclaimed_count():
     now = _utc(2026, 6, 1)
     with patch.object(_RECLAIM_STALE_JOBS, "execute", new=AsyncMock(return_value=3)):
         result = await MaintenanceScheduleRepository().reclaim_stale_jobs(
-            conn, now=now, stale_after_seconds=_STALE_AFTER_SECONDS
+            conn,
+            now=now,
+            min_stale_after_seconds=_STALE_MIN_AFTER_SECONDS,
+            max_stale_after_seconds=_STALE_MAX_AFTER_SECONDS,
+            stale_multiplier=_STALE_MULTIPLIER,
         )
     assert result == 3
 
@@ -164,9 +187,7 @@ async def test_reclaim_stale_jobs_returns_reclaimed_count():
 async def test_run_once_dispatches_due_jobs_only():
     """run_once only calls _dispatch_job for jobs returned by get_due_jobs."""
     engine = _fake_engine()
-    supervisor = MaintenanceSupervisor(
-        {"hard_cap": 5}
-    )
+    supervisor = MaintenanceSupervisor({"hard_cap": 5})
 
     due = [_make_job_row(JOB_TASK_REAPER)]
 
@@ -223,9 +244,7 @@ async def test_run_once_dispatches_due_jobs_only():
 async def test_run_once_no_due_jobs_does_nothing():
     """run_once with an empty due list logs debug and does not call _dispatch_job."""
     engine = _fake_engine()
-    supervisor = MaintenanceSupervisor(
-        {"hard_cap": 5}
-    )
+    supervisor = MaintenanceSupervisor({"hard_cap": 5})
 
     repo_mock = MagicMock(spec=MaintenanceScheduleRepository)
     repo_mock.reclaim_stale_jobs = AsyncMock(return_value=0)
@@ -267,9 +286,7 @@ async def test_run_once_no_due_jobs_does_nothing():
 async def test_run_once_failing_job_marks_error_others_still_run():
     """A job that raises → mark_done(status='error'); remaining jobs still run."""
     engine = _fake_engine()
-    supervisor = MaintenanceSupervisor(
-        {"hard_cap": 5}
-    )
+    supervisor = MaintenanceSupervisor({"hard_cap": 5})
 
     due = [
         _make_job_row(JOB_TASK_REAPER),
@@ -342,14 +359,16 @@ async def test_run_once_failing_job_marks_error_others_still_run():
 async def test_run_job_calls_mark_running_before_dispatch():
     """_run_job must call mark_running before invoking _dispatch_job."""
     engine = _fake_engine()
-    supervisor = MaintenanceSupervisor(
-        {"hard_cap": 5}
-    )
+    supervisor = MaintenanceSupervisor({"hard_cap": 5})
 
     repo_mock = MagicMock(spec=MaintenanceScheduleRepository)
     call_order: list[str] = []
-    repo_mock.mark_running = AsyncMock(side_effect=lambda *a, **kw: call_order.append("mark_running") or 1)
-    repo_mock.mark_done = AsyncMock(side_effect=lambda *a, **kw: call_order.append("mark_done") or 1)
+    repo_mock.mark_running = AsyncMock(
+        side_effect=lambda *a, **kw: call_order.append("mark_running") or 1
+    )
+    repo_mock.mark_done = AsyncMock(
+        side_effect=lambda *a, **kw: call_order.append("mark_done") or 1
+    )
 
     async def _fake_dispatch(job_name, conn, config):
         call_order.append("dispatch")
@@ -382,9 +401,7 @@ async def test_run_job_calls_mark_running_before_dispatch():
 async def test_run_job_mark_done_receives_status_ok_and_rows():
     """_run_job records status='ok' and the rowcount returned by _dispatch_job."""
     engine = _fake_engine()
-    supervisor = MaintenanceSupervisor(
-        {"hard_cap": 5}
-    )
+    supervisor = MaintenanceSupervisor({"hard_cap": 5})
 
     repo_mock = MagicMock(spec=MaintenanceScheduleRepository)
     repo_mock.mark_running = AsyncMock(return_value=1)
@@ -418,6 +435,50 @@ async def test_run_job_mark_done_receives_status_ok_and_rows():
     assert mark_done_kwargs["error"] is None
 
 
+@pytest.mark.asyncio
+async def test_run_job_records_skipped_result_without_error():
+    """Optional jobs can complete as skipped without becoming health-alert errors."""
+    engine = _fake_engine()
+    supervisor = MaintenanceSupervisor({"hard_cap": 5})
+
+    repo_mock = MagicMock(spec=MaintenanceScheduleRepository)
+    repo_mock.mark_running = AsyncMock(return_value=1)
+    mark_done_kwargs: dict = {}
+
+    async def _capture_done(conn, job_name, **kw):
+        mark_done_kwargs.update(kw)
+
+    repo_mock.mark_done = _capture_done
+
+    skipped = MaintenanceJobResult(
+        rows=0,
+        status="skipped",
+        error="optional dependency unavailable",
+    )
+
+    with (
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor.background_managed_transaction",
+        ) as mock_mtx,
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor._dispatch_job",
+            new=AsyncMock(return_value=skipped),
+        ),
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor._set_statement_timeout",
+            new=AsyncMock(),
+        ),
+    ):
+        fake_conn = AsyncMock()
+        mock_mtx.return_value.__aenter__ = AsyncMock(return_value=fake_conn)
+        mock_mtx.return_value.__aexit__ = AsyncMock(return_value=False)
+        await supervisor._run_job(engine, repo_mock, JOB_IAM_PRUNE, _utc(2026, 6, 1))
+
+    assert mark_done_kwargs["status"] == "skipped"
+    assert mark_done_kwargs["rows"] == 0
+    assert mark_done_kwargs["error"] == "optional dependency unavailable"
+
+
 # ---------------------------------------------------------------------------
 # Job SQL / predicate checks
 # ---------------------------------------------------------------------------
@@ -432,9 +493,7 @@ async def test_iam_prune_sql_references_all_six_tables():
     async def _fake_execute(c, **kw):
         return 0
 
-    with patch(
-        "dynastore.modules.catalog.maintenance_supervisor.DQLQuery"
-    ) as MockDQL:
+    with patch("dynastore.modules.catalog.maintenance_supervisor.DQLQuery") as MockDQL:
         # Each call to DQLQuery(sql) creates a new instance; track all sqls
         instances: list[MagicMock] = []
 
@@ -446,11 +505,36 @@ async def test_iam_prune_sql_references_all_six_tables():
             return inst
 
         MockDQL.side_effect = _dql_factory
-        await _run_iam_prune(conn)
+        with patch(
+            "dynastore.modules.catalog.maintenance_supervisor._iam_prune_available",
+            new=AsyncMock(return_value=True),
+        ):
+            await _run_iam_prune(conn)
 
     combined = " ".join(tables_hit)
-    for table in ("refresh_tokens", "oauth_codes", "oauth_tokens", "grants", "usage_counters"):
+    for table in (
+        "refresh_tokens",
+        "oauth_codes",
+        "oauth_tokens",
+        "grants",
+        "usage_counters",
+    ):
         assert table in combined, f"Expected table {table!r} in IAM prune SQL"
+
+
+@pytest.mark.asyncio
+async def test_iam_prune_returns_skipped_when_tables_absent():
+    """A stale iam_prune row should not become a recurring error on non-IAM DBs."""
+    conn = AsyncMock()
+    with patch(
+        "dynastore.modules.catalog.maintenance_supervisor._iam_prune_available",
+        new=AsyncMock(return_value=False),
+    ):
+        result = await _run_iam_prune(conn)
+
+    assert isinstance(result, MaintenanceJobResult)
+    assert result.status == "skipped"
+    assert result.rows == 0
 
 
 # ---------------------------------------------------------------------------
@@ -476,14 +560,13 @@ def test_build_supervisor_config_provides_task_reaper_hard_cap():
 
 
 # ---------------------------------------------------------------------------
-# register_supervisor_jobs upserts all 6 expected names
+# register_supervisor_jobs upserts all available names
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_register_supervisor_jobs_upserts_all_expected_jobs():
-    """register_supervisor_jobs upserts all 10 jobs (iam + 3 task + 4 events/storage
-    partition+retention + health + es_logs_retention)."""
+    """register_supervisor_jobs upserts all available jobs, including control-plane retention."""
     engine = _fake_engine()
     upserted: list[tuple[str, int]] = []
 
@@ -511,6 +594,14 @@ async def test_register_supervisor_jobs_upserts_all_expected_jobs():
             side_effect=_dql_factory,
         ),
         patch(
+            "dynastore.modules.catalog.maintenance_supervisor._iam_prune_available",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor._es_logs_retention_available",
+            return_value=True,
+        ),
+        patch(
             "dynastore.modules.catalog.maintenance_supervisor.managed_transaction",
         ) as mock_mtx,
     ):
@@ -523,25 +614,87 @@ async def test_register_supervisor_jobs_upserts_all_expected_jobs():
     from dynastore.modules.catalog.maintenance_supervisor import JOB_HEALTH_ALERT
 
     job_names = [name for name, _ in upserted]
-    assert sorted(job_names) == sorted([
-        JOB_IAM_PRUNE,
-        JOB_TASK_REAPER,
-        JOB_TASK_PARTITION_CREATE,
-        JOB_TASK_RETENTION,
-        JOB_EVENTS_PARTITION_CREATE,
-        JOB_EVENTS_RETENTION,
-        JOB_STORAGE_PARTITION_CREATE,
-        JOB_STORAGE_RETENTION,
-        JOB_HEALTH_ALERT,
-        JOB_ES_LOGS_RETENTION,
-    ])
+    assert sorted(job_names) == sorted(
+        [
+            JOB_IAM_PRUNE,
+            JOB_TASK_REAPER,
+            JOB_TASK_PARTITION_CREATE,
+            JOB_TASK_RETENTION,
+            JOB_EVENTS_PARTITION_CREATE,
+            JOB_EVENTS_RETENTION,
+            JOB_STORAGE_PARTITION_CREATE,
+            JOB_STORAGE_RETENTION,
+            JOB_HEALTH_ALERT,
+            JOB_ES_LOGS_RETENTION,
+            JOB_CONTROL_PLANE_RETENTION,
+        ]
+    )
 
     cadence_map = dict(upserted)
     assert cadence_map[JOB_ES_LOGS_RETENTION] == _CADENCE_ES_LOGS_RETENTION
+    assert cadence_map[JOB_CONTROL_PLANE_RETENTION] == _CADENCE_CONTROL_PLANE_RETENTION
     assert cadence_map[JOB_IAM_PRUNE] == _CADENCE_IAM_PRUNE
     assert cadence_map[JOB_TASK_REAPER] == _CADENCE_TASK_REAPER
     assert cadence_map[JOB_TASK_PARTITION_CREATE] == _CADENCE_TASK_PARTITION_CREATE
     assert cadence_map[JOB_TASK_RETENTION] == _CADENCE_TASK_RETENTION
+
+
+@pytest.mark.asyncio
+async def test_register_supervisor_jobs_skips_unavailable_optional_jobs():
+    """IAM and ES jobs are optional; unavailable dependencies should prune old rows."""
+    engine = _fake_engine()
+    upserted: list[str] = []
+    deleted_names: list[str] = []
+
+    repo_mock = MagicMock(spec=MaintenanceScheduleRepository)
+
+    async def _capture_upsert(conn, job_name, *, interval_seconds):
+        upserted.append(job_name)
+
+    repo_mock.upsert_job = _capture_upsert
+
+    def _dql_factory(sql, **_kw):
+        inst = MagicMock()
+
+        async def _execute(conn, **kw):
+            deleted_names.extend(kw.get("names", []))
+            return 0
+
+        inst.execute = AsyncMock(side_effect=_execute)
+        return inst
+
+    with (
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor.MaintenanceScheduleRepository",
+            return_value=repo_mock,
+        ),
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor.DQLQuery",
+            side_effect=_dql_factory,
+        ),
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor._iam_prune_available",
+            new=AsyncMock(return_value=False),
+        ),
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor._es_logs_retention_available",
+            return_value=False,
+        ),
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor.managed_transaction",
+        ) as mock_mtx,
+    ):
+        fake_conn = AsyncMock()
+        mock_mtx.return_value.__aenter__ = AsyncMock(return_value=fake_conn)
+        mock_mtx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        await register_supervisor_jobs(engine)
+
+    assert JOB_IAM_PRUNE not in upserted
+    assert JOB_ES_LOGS_RETENTION not in upserted
+    assert JOB_CONTROL_PLANE_RETENTION in upserted
+    assert JOB_IAM_PRUNE in deleted_names
+    assert JOB_ES_LOGS_RETENTION in deleted_names
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +704,9 @@ async def test_register_supervisor_jobs_upserts_all_expected_jobs():
 
 def test_supervisor_advisory_lock_key_differs_from_reaper():
     """The supervisor must use a different advisory lock key than SoftDeleteReaper."""
-    from dynastore.modules.catalog.maintenance_supervisor import _SUPERVISOR_ADVISORY_LOCK_KEY
+    from dynastore.modules.catalog.maintenance_supervisor import (
+        _SUPERVISOR_ADVISORY_LOCK_KEY,
+    )
     from dynastore.modules.catalog.soft_delete_reaper import _REAPER_ADVISORY_LOCK_KEY
 
     assert _SUPERVISOR_ADVISORY_LOCK_KEY != _REAPER_ADVISORY_LOCK_KEY
@@ -665,9 +820,7 @@ async def test_run_job_skips_when_mark_running_returns_zero_rows(caplog):
     import logging
 
     engine = _fake_engine()
-    supervisor = MaintenanceSupervisor(
-        {"hard_cap": 5}
-    )
+    supervisor = MaintenanceSupervisor({"hard_cap": 5})
 
     repo_mock = MagicMock(spec=MaintenanceScheduleRepository)
     # mark_running returns 0 → claimed by another leader
@@ -693,14 +846,18 @@ async def test_run_job_skips_when_mark_running_returns_zero_rows(caplog):
         mock_mtx.return_value.__aenter__ = AsyncMock(return_value=fake_conn)
         mock_mtx.return_value.__aexit__ = AsyncMock(return_value=False)
 
-        with caplog.at_level(logging.DEBUG, logger="dynastore.modules.catalog.maintenance_supervisor"):
-            await supervisor._run_job(engine, repo_mock, JOB_TASK_REAPER, _utc(2026, 6, 10))
+        with caplog.at_level(
+            logging.DEBUG, logger="dynastore.modules.catalog.maintenance_supervisor"
+        ):
+            await supervisor._run_job(
+                engine, repo_mock, JOB_TASK_REAPER, _utc(2026, 6, 10)
+            )
 
     assert dispatched == [], "dispatch must NOT be called when mark_running returns 0"
     repo_mock.mark_done.assert_not_called()
-    assert any("claimed" in r.message.lower() for r in caplog.records), (
-        "Expected a DEBUG log about the job being claimed by another leader"
-    )
+    assert any(
+        "claimed" in r.message.lower() for r in caplog.records
+    ), "Expected a DEBUG log about the job being claimed by another leader"
     assert all(r.levelno <= logging.DEBUG for r in caplog.records), (
         "The claim-miss log must be at DEBUG, not WARNING — it's an expected "
         "leader-handoff race, not an anomaly"
@@ -708,19 +865,46 @@ async def test_run_job_skips_when_mark_running_returns_zero_rows(caplog):
 
 
 # ---------------------------------------------------------------------------
-# _STALE_AFTER_SECONDS is <= 600 (not 3600)
+# stale reclaim bounds
 # ---------------------------------------------------------------------------
 
 
-def test_stale_after_seconds_is_at_most_600():
-    """_STALE_AFTER_SECONDS must be <= 600 so a crashed leader unblocks within
-    10 minutes (5x the 60s task_reaper cadence, the shortest job cadence).
-    1 hour (3600) is too long — a crashed pod blocks all jobs for up to an hour."""
-    assert _STALE_AFTER_SECONDS <= 600, (
-        f"_STALE_AFTER_SECONDS={_STALE_AFTER_SECONDS} is too large; "
-        "it must be at most 600 (10 minutes) so a crashed leader unblocks within "
-        "10 minutes. The longest meaningful reclaim window is 5x the shortest "
-        "job cadence (task_reaper = 60s). See #1997."
+def test_stale_reclaim_thresholds_match_task_reaper_recovery_window():
+    """task_reaper should reclaim after about 3 minutes, daily jobs within 10 minutes."""
+    assert _STALE_MIN_AFTER_SECONDS == 180
+    assert _STALE_MAX_AFTER_SECONDS <= 600
+    assert _STALE_MULTIPLIER == 3
+
+
+# ---------------------------------------------------------------------------
+# control_plane_retention
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_control_plane_retention_uses_bounded_deletes():
+    """control-plane cleanup prunes the three configs tables in bounded batches."""
+    conn = AsyncMock()
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def _fake_bounded_delete(conn_arg, sql_template, batch_size=1000, **params):
+        calls.append((sql_template, params))
+        return len(calls)
+
+    with patch(
+        "dynastore.modules.catalog.maintenance_supervisor._bounded_batch_delete",
+        new=AsyncMock(side_effect=_fake_bounded_delete),
+    ):
+        rows = await _run_control_plane_retention(conn)
+
+    assert rows == 6
+    sql = " ".join(call[0] for call in calls)
+    assert "configs.leader_lease" in sql
+    assert "configs.task_capability_registry" in sql
+    assert "configs.instance_liveness" in sql
+    params_by_sql = {call[0]: call[1] for call in calls}
+    assert any(
+        params.get("stale_seconds", 0) >= 600 for params in params_by_sql.values()
     )
 
 
@@ -732,11 +916,13 @@ def test_stale_after_seconds_is_at_most_600():
 def test_job_dispatch_timeout_constant_exists_and_reasonable():
     """A module-level JOB_DISPATCH_TIMEOUT_SECONDS constant must exist and be
     between 60 and 3600 seconds (1 min to 1 hour)."""
-    from dynastore.modules.catalog.maintenance_supervisor import JOB_DISPATCH_TIMEOUT_SECONDS
-
-    assert 60 <= JOB_DISPATCH_TIMEOUT_SECONDS <= 3600, (
-        f"JOB_DISPATCH_TIMEOUT_SECONDS={JOB_DISPATCH_TIMEOUT_SECONDS} is outside [60, 3600]"
+    from dynastore.modules.catalog.maintenance_supervisor import (
+        JOB_DISPATCH_TIMEOUT_SECONDS,
     )
+
+    assert (
+        60 <= JOB_DISPATCH_TIMEOUT_SECONDS <= 3600
+    ), f"JOB_DISPATCH_TIMEOUT_SECONDS={JOB_DISPATCH_TIMEOUT_SECONDS} is outside [60, 3600]"
 
 
 @pytest.mark.asyncio
@@ -747,9 +933,7 @@ async def test_dispatch_job_raises_timeout_on_slow_job():
     The job must record status='error' with a message mentioning 'timeout'.
     """
     engine = _fake_engine()
-    supervisor = MaintenanceSupervisor(
-        {"hard_cap": 5}
-    )
+    supervisor = MaintenanceSupervisor({"hard_cap": 5})
 
     repo_mock = MagicMock(spec=MaintenanceScheduleRepository)
     repo_mock.mark_running = AsyncMock(return_value=1)
@@ -788,9 +972,9 @@ async def test_dispatch_job_raises_timeout_on_slow_job():
 
     assert mark_done_kwargs.get("status") == "error"
     assert mark_done_kwargs.get("error") is not None
-    assert "timeout" in mark_done_kwargs["error"].lower(), (
-        f"Expected 'timeout' in error message, got: {mark_done_kwargs['error']!r}"
-    )
+    assert (
+        "timeout" in mark_done_kwargs["error"].lower()
+    ), f"Expected 'timeout' in error message, got: {mark_done_kwargs['error']!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -821,6 +1005,39 @@ def test_health_alert_config_has_pending_age_and_dlq_fields():
     assert cfg.dead_letter_threshold == 100
 
 
+@pytest.mark.asyncio
+async def test_health_alert_job_error_query_includes_reclaimed_but_not_skipped():
+    """Reclaimed stale jobs are actionable; skipped optional jobs are not errors."""
+    conn = AsyncMock()
+    created_sql: list[str] = []
+    call_num = [0]
+
+    def _dql_factory(sql, **kwargs):
+        created_sql.append(sql)
+        inst = MagicMock()
+        call_idx = call_num[0]
+        call_num[0] += 1
+        inst.execute = AsyncMock(return_value=[] if call_idx == 0 else 0)
+        return inst
+
+    with (
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor.DQLQuery",
+            side_effect=_dql_factory,
+        ),
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor.load_health_alert_config",
+            new=AsyncMock(return_value=HealthAlertConfig()),
+        ),
+    ):
+        await _run_health_alert(conn)
+
+    sql = created_sql[0]
+    assert "last_status = 'error'" in sql
+    assert "last_error LIKE 'reclaimed:%'" in sql
+    assert "skipped" not in sql
+
+
 # ---------------------------------------------------------------------------
 # _run_health_alert: alerts on ANY error in the past hour (not a streak)
 # ---------------------------------------------------------------------------
@@ -843,7 +1060,11 @@ async def test_run_health_alert_alerts_on_single_error(caplog):
     # 3. tasks DEAD_LETTER COUNT → 0
     # 4. events DEAD_LETTER COUNT → 0
     call_num = [0]
-    error_row = {"job_name": "iam_prune", "last_error": "boom", "last_run_at": "2026-06-26"}
+    error_row = {
+        "job_name": "iam_prune",
+        "last_error": "boom",
+        "last_run_at": "2026-06-26",
+    }
 
     def _dql_factory(sql, **kwargs):
         inst = MagicMock()
@@ -869,16 +1090,21 @@ async def test_run_health_alert_alerts_on_single_error(caplog):
             "dynastore.modules.catalog.maintenance_supervisor.load_health_alert_config",
             new=AsyncMock(return_value=HealthAlertConfig()),
         ),
-        patch.dict("sys.modules", {"dynastore.modules.catalog.event_service": fake_event_service}),
-        caplog.at_level(logging.ERROR, logger="dynastore.modules.catalog.maintenance_supervisor"),
+        patch.dict(
+            "sys.modules",
+            {"dynastore.modules.catalog.event_service": fake_event_service},
+        ),
+        caplog.at_level(
+            logging.ERROR, logger="dynastore.modules.catalog.maintenance_supervisor"
+        ),
     ):
         alerts = await _run_health_alert(conn)
 
     assert alerts >= 1, "Expected at least 1 alert for a single error job"
     error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR]
-    assert any("iam_prune" in r.message for r in error_logs), (
-        "Expected an ERROR log mentioning the failing job name"
-    )
+    assert any(
+        "iam_prune" in r.message for r in error_logs
+    ), "Expected an ERROR log mentioning the failing job name"
 
 
 @pytest.mark.asyncio
@@ -886,7 +1112,11 @@ async def test_run_health_alert_emits_job_error_alert_type():
     """_run_health_alert must emit alert_type='job_error' (not 'job_error_streak')."""
     conn = AsyncMock()
     emitted_events: list[dict] = []
-    error_row = {"job_name": "iam_prune", "last_error": "timeout", "last_run_at": "2026-06-26"}
+    error_row = {
+        "job_name": "iam_prune",
+        "last_error": "timeout",
+        "last_run_at": "2026-06-26",
+    }
 
     call_num = [0]
 
@@ -913,7 +1143,10 @@ async def test_run_health_alert_emits_job_error_alert_type():
             "dynastore.modules.catalog.maintenance_supervisor.load_health_alert_config",
             new=AsyncMock(return_value=HealthAlertConfig()),
         ),
-        patch.dict("sys.modules", {"dynastore.modules.catalog.event_service": fake_event_service}),
+        patch.dict(
+            "sys.modules",
+            {"dynastore.modules.catalog.event_service": fake_event_service},
+        ),
     ):
         await _run_health_alert(conn)
 
@@ -922,10 +1155,12 @@ async def test_run_health_alert_emits_job_error_alert_type():
         "Expected an emitted event with alert_type='job_error'; "
         f"got: {[e.get('alert_type') for e in emitted_events]}"
     )
-    streak_events = [e for e in emitted_events if e.get("alert_type") == "job_error_streak"]
-    assert not streak_events, (
-        "alert_type='job_error_streak' must not be emitted — field was removed"
-    )
+    streak_events = [
+        e for e in emitted_events if e.get("alert_type") == "job_error_streak"
+    ]
+    assert (
+        not streak_events
+    ), "alert_type='job_error_streak' must not be emitted — field was removed"
 
 
 @pytest.mark.asyncio
@@ -991,6 +1226,20 @@ async def test_dispatch_job_es_logs_retention_calls_run_es_logs_retention():
 
 
 @pytest.mark.asyncio
+async def test_dispatch_job_control_plane_retention_calls_retention_job():
+    """_dispatch_job routes JOB_CONTROL_PLANE_RETENTION to the cleanup job."""
+    conn = AsyncMock()
+    with patch(
+        "dynastore.modules.catalog.maintenance_supervisor._run_control_plane_retention",
+        new=AsyncMock(return_value=4),
+    ) as mock_run:
+        rows = await _dispatch_job(JOB_CONTROL_PLANE_RETENTION, conn, {"hard_cap": 5})
+
+    assert rows == 4
+    mock_run.assert_awaited_once_with(conn)
+
+
+@pytest.mark.asyncio
 async def test_run_es_logs_retention_reads_config_and_delegates():
     """_run_es_logs_retention loads LogServiceConfig fresh (hot-reloadable,
     like HealthAlertConfig) and forwards retention_months to the ES driver."""
@@ -1004,6 +1253,10 @@ async def test_run_es_logs_retention_reads_config_and_delegates():
             new=AsyncMock(return_value=cfg),
         ),
         patch(
+            "dynastore.modules.catalog.maintenance_supervisor._es_logs_retention_available",
+            return_value=True,
+        ),
+        patch(
             "dynastore.modules.elasticsearch.log_retention.run_es_logs_retention",
             new=AsyncMock(return_value=2),
         ) as mock_run,
@@ -1012,6 +1265,20 @@ async def test_run_es_logs_retention_reads_config_and_delegates():
 
     assert rows == 2
     mock_run.assert_awaited_once_with(9)
+
+
+@pytest.mark.asyncio
+async def test_run_es_logs_retention_skips_when_dependency_missing():
+    """A stale es_logs_retention row should be skipped when opensearchpy is absent."""
+    with patch(
+        "dynastore.modules.catalog.maintenance_supervisor._es_logs_retention_available",
+        return_value=False,
+    ):
+        result = await _run_es_logs_retention()
+
+    assert isinstance(result, MaintenanceJobResult)
+    assert result.status == "skipped"
+    assert result.rows == 0
 
 
 def test_es_logs_retention_job_registered_in_dispatch_table():
@@ -1037,5 +1304,3 @@ def test_maintenance_health_alert_event_is_registered():
     assert EventRegistry.is_valid("maintenance.health_alert")
     assert EventRegistry._events["maintenance.health_alert"] == EventScope.PLATFORM
     assert CatalogEventType.MAINTENANCE_HEALTH_ALERT == "maintenance.health_alert"
-
-

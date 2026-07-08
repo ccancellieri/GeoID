@@ -399,6 +399,18 @@ def _build_tasks_ddl_batch(schema: str) -> DDLBatch:
     )
 
 
+async def _ensure_tasks_default_partition(conn: DbResource, schema: str) -> None:
+    """Repair the default partition even when the warm-start DDL batch skips."""
+    fq_name = f'"{schema}"."tasks_default"'
+    exists = await DQLQuery(
+        "SELECT to_regclass(:fq)",
+        result_handler=ResultHandler.SCALAR,
+    ).execute(conn, fq=fq_name)
+    if exists is not None:
+        return
+    await DDLQuery(GLOBAL_TASKS_DEFAULT_PARTITION_DDL).execute(conn, schema=schema)
+
+
 class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
     priority: int = 15  # Must start before CatalogModule (20) to create global tables
 
@@ -1614,6 +1626,7 @@ async def ensure_task_storage_exists(conn: DbResource, schema: str):
     # Cold starts create the table (+ DEFAULT partition), indexes, notify
     # functions, and both triggers in order under nested savepoints.
     await _build_tasks_ddl_batch(schema).execute(conn, schema=schema)
+    await _ensure_tasks_default_partition(conn, schema)
 
     # Ensure current + future partitions exist.
     # Critical path — must succeed for the dispatcher to start.

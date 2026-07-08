@@ -1199,6 +1199,58 @@ def _service_can_run_sync(task_type: str) -> bool:
     return any(r.can_handle(task_type) for r in get_runners(TaskExecutionMode.SYNCHRONOUS))
 
 
+def _runner_type_can_run(task_type: str, runner_type: str) -> bool:
+    return any(
+        getattr(r, "runner_type", None) == runner_type and r.can_handle(task_type)
+        for mode in (TaskExecutionMode.ASYNCHRONOUS, TaskExecutionMode.SYNCHRONOUS)
+        for r in get_runners(mode)
+    )
+
+
+def _runner_type_can_run_async(task_type: str, runner_type: str) -> bool:
+    return any(
+        getattr(r, "runner_type", None) == runner_type and r.can_handle(task_type)
+        for r in get_runners(TaskExecutionMode.ASYNCHRONOUS)
+    )
+
+
+def _runner_type_can_run_sync(task_type: str, runner_type: str) -> bool:
+    return any(
+        getattr(r, "runner_type", None) == runner_type and r.can_handle(task_type)
+        for r in get_runners(TaskExecutionMode.SYNCHRONOUS)
+    )
+
+
+async def _selected_routing_target(task_type: str):
+    """Return (has_routing_opinion, selected_target) for this service.
+
+    A concrete routing entry is authoritative: the capability map must advertise
+    only the selected runner type, not every runner whose can_handle() happens
+    to accept the task. No routing entry, no service identity, or resolver
+    failure remains fail-open for backwards compatibility.
+    """
+    if _SERVICE_NAME is None:
+        return False, None
+    try:
+        from dynastore.modules.tasks.routing import resolver as routing_resolver
+
+        targets = await routing_resolver.resolved_targets(task_type)
+        if not targets:
+            return False, None
+        target = routing_resolver.select_target(
+            targets,
+            frozenset(),
+            _SERVICE_NAME or "",
+            lambda runner_type: _runner_type_can_run(task_type, runner_type),
+        )
+        return True, target
+    except Exception:  # noqa: BLE001 — routing read is best-effort
+        logger.warning(
+            "CapabilityMap: routing read failed for %r — failing open", task_type
+        )
+        return False, None
+
+
 class CapabilityMap:
     """
     In-memory map of task_type to capable runners, grouped by execution mode.
@@ -1227,15 +1279,15 @@ class CapabilityMap:
            a service without the dep won't even register the task.
         2. ``runner.can_handle(task_type)`` — at least one runner of the
            required execution mode admits the type.
-        3. Routing consumers for the type — when the resolver returns a
-           concrete, non-empty consumer list, this process's
-           ``service_name`` must appear in it; otherwise the type is not
-           claimable here.
+        3. Routing target selection for the type — when the resolver returns
+           a concrete ``RunnerTarget`` list, this process must match the
+           selected target's service consumers AND have the selected
+           ``runner`` type.  The old consumer-only check was too broad: a
+           background runner could claim work routed to ``gcp_cloud_run``.
 
-        Step 3 is fail-open: a resolver that returns ``None`` (no opinion)
-        or raises leaves the type claimable, preserving "any capable
-        service may claim" behaviour. Only a concrete consumer list that
-        excludes this service filters a type out.
+        Step 3 is fail-open only when routing has no opinion, no service
+        identity is available, or the resolver itself fails.  A concrete route
+        whose selected runner is unavailable is not advertised by this process.
         """
         async with self._lock:
             self._async_types.clear()
@@ -1243,18 +1295,21 @@ class CapabilityMap:
             global _WORKER_ROUTED_TYPES
             routed_types: set = set()
             for task_type in get_loaded_task_types():
-                consumers = None
-                try:
-                    consumers = await _routed_consumers(task_type)
-                except Exception:  # noqa: BLE001 — routing read is best-effort
-                    logger.warning(
-                        "CapabilityMap: routing read failed for %r — failing open", task_type
-                    )
-                    consumers = None
-                # Filter ONLY when routing gives a concrete, non-empty consumer list
-                # that excludes this service. None/empty == no opinion -> stay claimable.
-                if consumers and _SERVICE_NAME is not None and _SERVICE_NAME not in consumers:
+                has_route, target = await _selected_routing_target(task_type)
+                if has_route:
+                    if target is None:
+                        continue
+                    consumers = list(getattr(target, "consumers", []) or [])
+                    if consumers:
+                        routed_types.add(task_type)
+                    runner_type = getattr(target, "runner", "")
+                    if _runner_type_can_run_async(task_type, runner_type):
+                        self._async_types.add(task_type)
+                    if _runner_type_can_run_sync(task_type, runner_type):
+                        self._sync_types.add(task_type)
                     continue
+
+                consumers = await _routed_consumers(task_type)
                 if consumers:
                     routed_types.add(task_type)
                 if _service_can_run_async(task_type):

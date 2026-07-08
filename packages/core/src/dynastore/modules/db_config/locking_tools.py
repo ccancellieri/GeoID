@@ -1033,8 +1033,13 @@ async def run_startup_ddl_tolerating_lock_timeout(
             lock_key, exc,
         )
 
+    from dynastore.modules.db_config.query_executor import (
+        startup_ddl_unlocked_fallback_scope,
+    )
+
     async with managed_transaction(engine) as unlocked_conn:
-        await ddl_body(unlocked_conn)
+        with startup_ddl_unlocked_fallback_scope():
+            await ddl_body(unlocked_conn)
 
 
 @asynccontextmanager

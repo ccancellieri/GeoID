@@ -45,8 +45,10 @@ Architecture contract
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
 import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, ClassVar, Optional, Tuple, Union
 
@@ -132,6 +134,53 @@ async def load_health_alert_config() -> HealthAlertConfig:
     return HealthAlertConfig()
 
 
+async def _load_tasks_plugin_config():
+    from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.tools.discovery import get_protocol
+
+        config_mgr = get_protocol(PlatformConfigsProtocol)
+        if config_mgr is not None:
+            cfg = await config_mgr.get_config(TasksPluginConfig)
+            if isinstance(cfg, TasksPluginConfig):
+                return cfg
+    except Exception as exc:
+        logger.warning(
+            "maintenance_supervisor: failed to load TasksPluginConfig "
+            "(%s) — using defaults.", exc,
+        )
+    return TasksPluginConfig()
+
+
+async def _load_zombie_session_reaper_config():
+    from dynastore.modules.db.zombie_session_reaper import ZombieSessionReaperConfig
+
+    try:
+        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+        from dynastore.tools.discovery import get_protocol
+
+        config_mgr = get_protocol(PlatformConfigsProtocol)
+        if config_mgr is not None:
+            cfg = await config_mgr.get_config(ZombieSessionReaperConfig)
+            if isinstance(cfg, ZombieSessionReaperConfig):
+                return cfg
+    except Exception as exc:
+        logger.warning(
+            "maintenance_supervisor: failed to load ZombieSessionReaperConfig "
+            "(%s) — using defaults.", exc,
+        )
+    return ZombieSessionReaperConfig()
+
+
+@dataclass(frozen=True)
+class MaintenanceJobResult:
+    rows: Optional[int]
+    status: str = "ok"
+    error: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # Advisory lock key — see modules/tasks/durable/lock_registry.py, the
 # central registry of every leader-elected loop's key (collision avoidance
@@ -152,6 +201,7 @@ JOB_STORAGE_PARTITION_CREATE = "storage_partition_create"
 JOB_STORAGE_RETENTION = "storage_retention"
 JOB_HEALTH_ALERT = "health_alert"
 JOB_ES_LOGS_RETENTION = "es_logs_retention"
+JOB_CONTROL_PLANE_RETENTION = "control_plane_retention"
 
 # Obsolete supervisor job names retired by #1807 renames. An environment that
 # booted a prior build holds these rows in tasks.maintenance_schedule;
@@ -207,17 +257,17 @@ _CADENCE_STORAGE_PARTITION_CREATE = 86400    # daily
 _CADENCE_STORAGE_RETENTION = 86400           # daily
 _CADENCE_HEALTH_ALERT = 300                  # every 5 minutes
 _CADENCE_ES_LOGS_RETENTION = 86400           # daily
+_CADENCE_CONTROL_PLANE_RETENTION = 86400     # daily
 
 # Bounded-batch DELETE size — no single DELETE removes more than this many rows.
 _PRUNE_BATCH = 1000
 
-# Stale-after threshold for reclaim (seconds): a job running for more than
-# this long is assumed to belong to a dead leader and its running_since is
-# cleared so the job can run again.  Set to 5× the shortest job cadence
-# (task_reaper = 60 s) so a crashed pod unblocks all jobs within 10 minutes.
-# Using 3600 (1 hour) was too long — it blocked every job for up to an hour
-# after a pod crash.
-_STALE_AFTER_SECONDS = 600  # 10 minutes (5× the 60 s task_reaper cadence)
+# Stale reclaim derives a threshold per schedule row:
+# min(max, max(min, interval_seconds * multiplier)).  The 60s task_reaper
+# recovers after ~3 minutes, while daily jobs still recover within 10 minutes.
+_STALE_MIN_AFTER_SECONDS = 180
+_STALE_MAX_AFTER_SECONDS = 600
+_STALE_MULTIPLIER = 3
 
 # Per-job statement timeout — a hung job resigns rather than wedging the supervisor.
 _JOB_STATEMENT_TIMEOUT_MS = 60_000  # 60 seconds
@@ -231,6 +281,14 @@ JOB_DISPATCH_TIMEOUT_SECONDS = 900  # 15 minutes
 
 # IAM schema — always "iam"
 _IAM_SCHEMA = "iam"
+_IAM_PRUNE_REQUIRED_TABLES = (
+    "refresh_tokens",
+    "oauth_codes",
+    "oauth_tokens",
+    "grants",
+    "usage_counters",
+    "policies",
+)
 
 # Tasks schema — mirrors tasks_module.get_task_schema()
 _TASKS_SCHEMA = os.getenv("DYNASTORE_TASK_SCHEMA", "tasks")
@@ -247,6 +305,26 @@ async def _set_statement_timeout(conn: Any, timeout_ms: int) -> None:
         f"SET LOCAL statement_timeout = {timeout_ms}",
         result_handler=ResultHandler.NONE,
     ).execute(conn)
+
+
+async def _table_exists(conn: Any, schema: str, table: str) -> bool:
+    fq_name = f'"{schema}"."{table}"'
+    result = await DQLQuery(
+        "SELECT to_regclass(:fq)",
+        result_handler=ResultHandler.SCALAR,
+    ).execute(conn, fq=fq_name)
+    return result is not None
+
+
+async def _iam_prune_available(conn: Any) -> bool:
+    for table in _IAM_PRUNE_REQUIRED_TABLES:
+        if not await _table_exists(conn, _IAM_SCHEMA, table):
+            return False
+    return True
+
+
+def _es_logs_retention_available() -> bool:
+    return importlib.util.find_spec("opensearchpy") is not None
 
 
 async def _bounded_batch_delete(
@@ -278,7 +356,7 @@ async def _bounded_batch_delete(
 # ---------------------------------------------------------------------------
 
 
-async def _run_iam_prune(conn: Any) -> int:
+async def _run_iam_prune(conn: Any) -> Union[int, MaintenanceJobResult]:
     """Delete expired IAM tokens, grants, and usage counters.
 
     Ports the former IAM prune PL/pgSQL body (deleted in #1911 / #1927) into a
@@ -287,6 +365,13 @@ async def _run_iam_prune(conn: Any) -> int:
     ``iam_queries`` so the WHERE clause stays single-sourced with the
     in-process driver (#800 gap #6).
     """
+    if not await _iam_prune_available(conn):
+        return MaintenanceJobResult(
+            rows=0,
+            status="skipped",
+            error="optional IAM prune skipped: required IAM tables are absent",
+        )
+
     # Function-local import: keeps this catalog-module function's coupling to
     # the IAM SQL predicates lazy and cycle-proof (constants only, not the
     # AuthorizationProtocol).
@@ -599,6 +684,58 @@ async def _run_storage_retention(conn: Any) -> int:
     return 0
 
 
+async def _run_control_plane_retention(conn: Any) -> int:
+    """Prune stale configs-schema control-plane rows in bounded batches."""
+    tasks_cfg = await _load_tasks_plugin_config()
+    zombie_cfg = await _load_zombie_session_reaper_config()
+
+    capability_stale_seconds = int(tasks_cfg.capability_publisher_ttl_seconds * 10)
+    liveness_stale_seconds = max(
+        int(zombie_cfg.liveness_stale_after_seconds * 2),
+        3600,
+    )
+    leader_lease_grace_seconds = 600
+
+    total = 0
+    total += await _bounded_batch_delete(
+        conn,
+        """
+        DELETE FROM configs.leader_lease
+        WHERE ctid IN (
+            SELECT ctid FROM configs.leader_lease
+            WHERE expires_at < NOW() - (:stale_seconds * INTERVAL '1 second')
+            LIMIT :batch_size
+        )
+        """,
+        stale_seconds=leader_lease_grace_seconds,
+    )
+    total += await _bounded_batch_delete(
+        conn,
+        """
+        DELETE FROM configs.task_capability_registry
+        WHERE ctid IN (
+            SELECT ctid FROM configs.task_capability_registry
+            WHERE last_seen < NOW() - (:stale_seconds * INTERVAL '1 second')
+            LIMIT :batch_size
+        )
+        """,
+        stale_seconds=capability_stale_seconds,
+    )
+    total += await _bounded_batch_delete(
+        conn,
+        """
+        DELETE FROM configs.instance_liveness
+        WHERE ctid IN (
+            SELECT ctid FROM configs.instance_liveness
+            WHERE renewed_at < NOW() - (:stale_seconds * INTERVAL '1 second')
+            LIMIT :batch_size
+        )
+        """,
+        stale_seconds=liveness_stale_seconds,
+    )
+    return total
+
+
 async def _run_health_alert(conn: Any) -> int:
     """Check maintenance health and emit alerts for anomalies.
 
@@ -623,8 +760,10 @@ async def _run_health_alert(conn: Any) -> int:
         SELECT job_name, last_error, last_run_at
         FROM tasks.maintenance_schedule
         WHERE last_status = 'error'
-          AND last_run_at IS NOT NULL
-          AND last_run_at > NOW() - INTERVAL '1 hour'
+          AND (
+              (last_run_at IS NOT NULL AND last_run_at > NOW() - INTERVAL '1 hour')
+              OR last_error LIKE 'reclaimed:%'
+          )
         """,
         result_handler=ResultHandler.ALL_DICTS,
     ).execute(conn)
@@ -743,7 +882,7 @@ async def _run_health_alert(conn: Any) -> int:
 # ---------------------------------------------------------------------------
 
 
-async def _run_es_logs_retention() -> int:
+async def _run_es_logs_retention() -> Union[int, MaintenanceJobResult]:
     """Delete monthly ES log indices older than ``LogServiceConfig.retention_months``.
 
     ES-only work — no PG connection involved, unlike every other job in this
@@ -754,6 +893,13 @@ async def _run_es_logs_retention() -> int:
     ``modules/catalog`` stays importable on a SCOPE without
     ``module_elasticsearch`` installed.
     """
+    if not _es_logs_retention_available():
+        return MaintenanceJobResult(
+            rows=0,
+            status="skipped",
+            error="optional OpenSearch log retention skipped: opensearchpy is unavailable",
+        )
+
     from dynastore.modules.catalog.log_service_config import load as load_log_service_config
     from dynastore.modules.elasticsearch.log_retention import run_es_logs_retention
 
@@ -770,7 +916,9 @@ async def _run_es_logs_retention() -> int:
 # Config params are captured at upsert time; the supervisor reads them once
 # per startup when registering jobs.
 
-async def _dispatch_job(job_name: str, conn: Any, config: dict[str, Any]) -> int:
+async def _dispatch_job(
+    job_name: str, conn: Any, config: dict[str, Any]
+) -> Union[int, MaintenanceJobResult]:
     """Dispatch a single maintenance job by name.
 
     Returns the number of rows affected (0 if not applicable).
@@ -796,6 +944,8 @@ async def _dispatch_job(job_name: str, conn: Any, config: dict[str, Any]) -> int
         return await _run_health_alert(conn)
     if job_name == JOB_ES_LOGS_RETENTION:
         return await _run_es_logs_retention()
+    if job_name == JOB_CONTROL_PLANE_RETENTION:
+        return await _run_control_plane_retention(conn)
     raise ValueError(f"maintenance_supervisor: unknown job_name {job_name!r}")
 
 
@@ -851,7 +1001,11 @@ class MaintenanceSupervisor(PeriodicService):
         try:
             async with background_managed_transaction(engine) as conn:
                 reclaimed = await repo.reclaim_stale_jobs(
-                    conn, now=now, stale_after_seconds=_STALE_AFTER_SECONDS
+                    conn,
+                    now=now,
+                    min_stale_after_seconds=_STALE_MIN_AFTER_SECONDS,
+                    max_stale_after_seconds=_STALE_MAX_AFTER_SECONDS,
+                    stale_multiplier=_STALE_MULTIPLIER,
                 )
             if reclaimed:
                 logger.warning(
@@ -914,12 +1068,19 @@ class MaintenanceSupervisor(PeriodicService):
         try:
             async with background_managed_transaction(engine) as conn:
                 await _set_statement_timeout(conn, _JOB_STATEMENT_TIMEOUT_MS)
-                rows = await asyncio.wait_for(
+                result = await asyncio.wait_for(
                     _dispatch_job(job_name, conn, self._config),
                     timeout=JOB_DISPATCH_TIMEOUT_SECONDS,
                 )
+                if isinstance(result, MaintenanceJobResult):
+                    rows = result.rows
+                    status = result.status
+                    error = result.error
+                else:
+                    rows = result
             logger.info(
-                "maintenance_supervisor: job %r done — rows=%s.", job_name, rows
+                "maintenance_supervisor: job %r done — status=%s rows=%s.",
+                job_name, status, rows,
             )
             # Post-reaper sweep: emit task.failed for rows the SQL reaper moved
             # to DEAD_LETTER.  Runs in a separate transaction AFTER the reaper
@@ -1019,8 +1180,7 @@ async def register_supervisor_jobs(engine: Any) -> None:
     CatalogModule startup before the supervisor loop is started.
     """
     repo = MaintenanceScheduleRepository()
-    jobs = [
-        (JOB_IAM_PRUNE, _CADENCE_IAM_PRUNE),
+    base_jobs = [
         (JOB_TASK_REAPER, _CADENCE_TASK_REAPER),
         (JOB_TASK_PARTITION_CREATE, _CADENCE_TASK_PARTITION_CREATE),
         (JOB_TASK_RETENTION, _CADENCE_TASK_RETENTION),
@@ -1029,9 +1189,20 @@ async def register_supervisor_jobs(engine: Any) -> None:
         (JOB_STORAGE_PARTITION_CREATE, _CADENCE_STORAGE_PARTITION_CREATE),
         (JOB_STORAGE_RETENTION, _CADENCE_STORAGE_RETENTION),
         (JOB_HEALTH_ALERT, _CADENCE_HEALTH_ALERT),
-        (JOB_ES_LOGS_RETENTION, _CADENCE_ES_LOGS_RETENTION),
+        (JOB_CONTROL_PLANE_RETENTION, _CADENCE_CONTROL_PLANE_RETENTION),
     ]
     async with managed_transaction(engine) as conn:
+        jobs = list(base_jobs)
+        disabled_jobs = []
+        if await _iam_prune_available(conn):
+            jobs.append((JOB_IAM_PRUNE, _CADENCE_IAM_PRUNE))
+        else:
+            disabled_jobs.append(JOB_IAM_PRUNE)
+        if _es_logs_retention_available():
+            jobs.append((JOB_ES_LOGS_RETENTION, _CADENCE_ES_LOGS_RETENTION))
+        else:
+            disabled_jobs.append(JOB_ES_LOGS_RETENTION)
+
         for job_name, cadence in jobs:
             await repo.upsert_job(conn, job_name, interval_seconds=cadence)
         # Retire schedule rows for jobs this build no longer dispatches (e.g. the
@@ -1040,10 +1211,10 @@ async def register_supervisor_jobs(engine: Any) -> None:
         pruned = await DQLQuery(
             "DELETE FROM tasks.maintenance_schedule WHERE job_name = ANY(:names)",
             result_handler=ResultHandler.ROWCOUNT,
-        ).execute(conn, names=list(_OBSOLETE_SCHEDULE_JOBS))
+        ).execute(conn, names=list(_OBSOLETE_SCHEDULE_JOBS) + disabled_jobs)
     logger.info(
         "maintenance_supervisor: registered %d job cadences in "
-        "tasks.maintenance_schedule (pruned %d obsolete row(s)).",
+        "tasks.maintenance_schedule (pruned %d obsolete/disabled row(s)).",
         len(jobs),
         pruned or 0,
     )

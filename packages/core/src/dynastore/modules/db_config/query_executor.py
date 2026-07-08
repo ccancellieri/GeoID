@@ -354,6 +354,25 @@ P = ParamSpec("P")
 
 logger = logging.getLogger(__name__)
 
+_STARTUP_DDL_UNLOCKED_FALLBACK: contextvars.ContextVar[bool] = (
+    contextvars.ContextVar("startup_ddl_unlocked_fallback", default=False)
+)
+
+
+@contextmanager
+def startup_ddl_unlocked_fallback_scope() -> Iterator[None]:
+    """Mark the current call stack as the startup-DDL unlocked fallback path."""
+    token = _STARTUP_DDL_UNLOCKED_FALLBACK.set(True)
+    try:
+        yield
+    finally:
+        _STARTUP_DDL_UNLOCKED_FALLBACK.reset(token)
+
+
+def startup_ddl_fallback_active() -> bool:
+    """Return True while startup DDL is replaying after the outer lock timed out."""
+    return _STARTUP_DDL_UNLOCKED_FALLBACK.get()
+
 
 # DDL execution timeouts — short by default to surface deadlocks fast in
 # prod, but tunable for CI where xdist parallelism + shared PG instance
@@ -1353,18 +1372,24 @@ class DDLExecutor(BaseExecutor):
                 acquired = result.scalar()
 
                 if not acquired:
-                    # Another worker holds the lock. Wait for them to finish so that
-                    # their transaction is committed before we re-check existence.
-                    await tx_conn.execute(text(f"SET LOCAL lock_timeout = '{_DDL_LOCK_TIMEOUT}'"))
-                    await tx_conn.execute(
-                        text("SELECT pg_advisory_xact_lock(:lock_id)"),
-                        {"lock_id": lock_id},
-                    )
-                    # Re-check: the other worker should have committed the object by now.
-                    if self.existence_check:
-                        res_post = await self._call_existence_check(tx_conn, params)
-                        if res_post:
-                            return True  # peer created it during our wait
+                    if startup_ddl_fallback_active():
+                        logger.warning(
+                            "DDL advisory lock busy during startup fallback; "
+                            "running idempotent DDL without the nested advisory wait."
+                        )
+                    else:
+                        # Another worker holds the lock. Wait for them to finish so that
+                        # their transaction is committed before we re-check existence.
+                        await tx_conn.execute(text(f"SET LOCAL lock_timeout = '{_DDL_LOCK_TIMEOUT}'"))
+                        await tx_conn.execute(
+                            text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                            {"lock_id": lock_id},
+                        )
+                        # Re-check: the other worker should have committed the object by now.
+                        if self.existence_check:
+                            res_post = await self._call_existence_check(tx_conn, params)
+                            if res_post:
+                                return True  # peer created it during our wait
 
                 # Timeout guard to prevent DDL hangs
                 await tx_conn.execute(text(f"SET LOCAL statement_timeout = '{_DDL_STATEMENT_TIMEOUT}'"))

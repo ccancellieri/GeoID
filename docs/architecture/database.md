@@ -183,15 +183,16 @@ Consumed events are **deleted** after successful processing. Failed events are r
 
 ### Partition Management
 
-Partition lifecycle is managed by two complementary mechanisms:
+Partition lifecycle is managed by startup DDL plus the leader-elected
+maintenance supervisor:
 
 1. **Startup creation** (`ensure_future_partitions`): On every application startup, partitions are created 12 months ahead (monthly) or 5-10 years ahead (yearly). This covers normal operations where services restart periodically.
 
-2. **pg_cron creation** (`register_partition_creation_policy`): A `pg_cron` job (`partcreate_{schema}_{table}`) runs on the 1st of each month at 2 AM (monthly tables) or January 1st at 2 AM (yearly tables), creating 3 future partitions. This is the safety net for long-running services that may not restart within the initial window.
+2. **Scheduled creation and retention** (`tasks.maintenance_schedule`): Global task, event, and storage workclass partitions are maintained by supervisor jobs such as `task_partition_create`, `task_retention`, `events_retention`, and `storage_retention`. The schedule table records cadence, running state, and the latest outcome for each job.
 
-3. **pg_cron retention** (`register_retention_policy`): A `pg_cron` job (`prune_{schema}_{table}`) runs weekly and drops partitions older than the retention period.
+3. **Stale-run recovery**: If a leader dies mid-job, the supervisor clears stale `running_since` values with a per-row threshold of `min(600s, max(180s, interval_seconds * 3))`. Short-cadence jobs recover quickly while daily jobs still recover within ten minutes.
 
-4. **Orphan cleanup** (`ensure_global_cron_cleanup`): A daily job removes `prune_*` and `partcreate_*` cron jobs for schemas that no longer exist (deleted tenants).
+4. **Control-plane cleanup**: The same supervisor prunes small operational tables (`configs.leader_lease`, `configs.task_capability_registry`, `configs.instance_liveness`) by age in bounded batches. These tables are retained as PostgreSQL source-of-truth state, not moved to a cache-only subsystem.
 
 **Locking:** Partition creation uses `CREATE TABLE IF NOT EXISTS` — metadata-only DDL with no lock on the parent table or sibling partitions. Partition drops take `ACCESS EXCLUSIVE` on the child partition only; queries on other partitions are unaffected.
 
@@ -200,20 +201,20 @@ Partition lifecycle is managed by two complementary mechanisms:
 | COMPLETED/FAILED tasks | 30 days | Monthly partition DROP |
 | DEAD_LETTER tasks | 90 days | Separate retention window |
 | Consumed events | Immediate | DELETE after processing |
-| Dead letter events | 30 days | pg_cron cleanup |
+| Dead letter events | 30 days | Supervisor retention |
 
 ### All Time-Partitioned Tables
 
-| Module | Schema | Table | Column | Interval | Startup Ahead | Cron Ahead | Retention |
+| Module | Schema | Table | Column | Interval | Startup Ahead | Scheduled Maintenance | Retention |
 |---|---|---|---|---|---|---|---|
-| Tasks | tasks | tasks | timestamp | monthly | 12 months | 3 months | 1 month |
-| Tasks | tasks | events | created_at | monthly | 12 months | 3 months | 1 month |
-| Stats | catalog | access_logs | timestamp | monthly | 12 months | 3 months | 3 months |
-| Stats | catalog | stats_aggregates | period_start | yearly | 5 years | 2 years | 5 years |
-| Stats | tenant | access_logs | timestamp | monthly | 12 months | 3 months | 3 months |
-| Stats | tenant | stats_aggregates | period_start | yearly | 10 years | 2 years | 10 years |
-| Proxy | tenant | url_analytics | timestamp | monthly | 12 months | 3 months | 1 month |
-| Proxy | proxy | url_analytics | timestamp | monthly | 1 month | 3 months | 6 months |
+| Tasks | tasks | tasks | timestamp | monthly | 12 months | supervisor create/retention jobs | 1 month |
+| Tasks | tasks | events | created_at | monthly | 12 months | supervisor create/retention jobs | 1 month |
+| Stats | catalog | access_logs | timestamp | monthly | 12 months | module maintenance | 3 months |
+| Stats | catalog | stats_aggregates | period_start | yearly | 5 years | module maintenance | 5 years |
+| Stats | tenant | access_logs | timestamp | monthly | 12 months | module maintenance | 3 months |
+| Stats | tenant | stats_aggregates | period_start | yearly | 10 years | module maintenance | 10 years |
+| Proxy | tenant | url_analytics | timestamp | monthly | 12 months | module maintenance | 1 month |
+| Proxy | proxy | url_analytics | timestamp | monthly | 1 month | module maintenance | 6 months |
 
 ### Atomic Claiming with SKIP LOCKED
 
@@ -245,11 +246,12 @@ No application table may reside in the `public` schema. All objects are organize
 
 | Schema | Owner | Contents |
 |--------|-------|----------|
-| `platform` | `db_config` | Global tracking: `schema_migrations`, `app_state`, `event_subscriptions`. Shared stored procedures: `update_collection_extents()`, `asset_cleanup()`, `cleanup_orphaned_cron_jobs()`. |
+| `platform` | `db_config` | Global tracking: `schema_migrations`, `app_state`. Shared stored procedures: `update_collection_extents()`, `asset_cleanup()`, `cleanup_orphaned_cron_jobs()`. |
 | `catalog` | `catalog` | `catalogs` (the registry of all tenants), `shared_properties`. |
 | `iam` | `iam` | Global auth: `principals`, `identity_links`, `policies`, `roles`, `role_hierarchy`, `refresh_tokens`, `audit_log`. |
-| `tasks` | `tasks` | Global task queue: `tasks` (RANGE-partitioned), `events` (RANGE-partitioned). |
-| `configs` | `configs` | Platform-level configuration overrides. |
+| `tasks` | `tasks` | Global task queue: `tasks` (RANGE-partitioned), `events` (RANGE-partitioned), `maintenance_schedule`, and durable webhook `event_subscriptions`. |
+| `configs` | `configs` | Platform-level configuration overrides plus small control-plane tables for leader leases, task-capability liveness, and instance liveness. |
+| `consys` | connected systems | Connected Systems feature tables. An empty enabled-feature schema is not stale by itself; it may be waiting for the first resource using that feature. |
 | `tiles` | `tiles` | Tile cache metadata and statistics. |
 | `proxy` | `proxy` | URL proxy analytics (RANGE-partitioned). |
 | `s_{base62}` | `catalog` (tenant) | Per-tenant schema auto-generated on catalog creation. Contains `collections`, `assets`, physical feature tables, `catalog_configs`, `collection_configs`, sidecars, tenant `access_logs`, `stats_aggregates`, tenant `url_analytics`, tenant `policies`, and `roles`. |
