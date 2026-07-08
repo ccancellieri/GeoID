@@ -181,18 +181,19 @@ def _infer_existence_check(sql_template: str):
     # --- Pattern: CREATE OR REPLACE FUNCTION {schema}.func_name() ---
     m = re.search(
         r'CREATE\s+OR\s+REPLACE\s+FUNCTION\s+'
-        r'(?:"?(\{?\w+\}?)"?\.)?'    # optional schema
-        r'"?(\w+)"?'                   # function name
+        r'(?:"?(\{?\w+\}?)"?\.)?'     # optional schema
+        r'(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))'  # function name
         r'\s*\(',                      # opening paren
         trimmed, re.IGNORECASE | re.DOTALL,
     )
     if m:
         raw_schema = m.group(1)
-        func_name = m.group(2)
+        raw_func_name = m.group(2) or m.group(3)
 
         async def _check_function(conn, params, raw_params):
             from .locking_tools import check_function_exists
             schema = _resolve_schema(raw_schema, raw_params)
+            func_name = _resolve_identifier(raw_func_name, raw_params)
             return await _cached_check_async(
                 "function", schema, func_name,
                 check_function_exists, conn, func_name, schema,
@@ -249,3 +250,11 @@ def _resolve_schema(raw_schema, raw_params):
         # It was a template placeholder — resolve from raw_params
         return str(raw_params.get(stripped, "public"))
     return raw_schema
+
+
+def _resolve_identifier(raw_identifier: str, raw_params) -> str:
+    """Resolve ``{placeholder}`` tokens embedded in an identifier template."""
+    identifier = raw_identifier
+    for key, value in raw_params.items():
+        identifier = identifier.replace("{" + str(key) + "}", str(value))
+    return identifier

@@ -122,7 +122,10 @@ existence re-check. If a concurrent worker wins a catalog race, PostgreSQL may
 raise either a duplicate-object SQLSTATE or the internal `tuple concurrently
 updated` catalog error for `CREATE OR REPLACE` statements. Those errors are
 treated as success only when the inferred existence check confirms the object is
-now present; unrelated internal database errors still propagate.
+now present. Function checks resolve placeholders embedded in quoted function
+names (for example `maintain_partitions_{schema}_tasks`) before verifying
+`pg_proc`, so rendered maintenance-helper DDL participates in the same recovery
+path. Unrelated internal database errors still propagate.
 
 ---
 

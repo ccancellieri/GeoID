@@ -120,6 +120,35 @@ def test_infer_drop_returns_none():
     assert _infer_existence_check("ALTER TABLE foo ADD COLUMN bar int;") is None
 
 
+@pytest.mark.asyncio
+async def test_infer_function_check_resolves_embedded_schema_placeholder(monkeypatch):
+    from dynastore.modules.db_config.ddl_inference import (
+        _infer_existence_check,
+        clear_ddl_existence_cache,
+    )
+
+    clear_ddl_existence_cache()
+    calls = []
+
+    async def _fake_check_function_exists(conn, function_name, schema="platform"):
+        calls.append((function_name, schema))
+        return True
+
+    monkeypatch.setattr(
+        "dynastore.modules.db_config.locking_tools.check_function_exists",
+        _fake_check_function_exists,
+    )
+
+    check = _infer_existence_check(
+        'CREATE OR REPLACE FUNCTION "{schema}"."maintain_partitions_{schema}_tasks"() '
+        "RETURNS void AS $$ BEGIN NULL; END; $$ LANGUAGE plpgsql;"
+    )
+
+    assert check is not None
+    assert await check(object(), {}, {"schema": "tasks"}) is True
+    assert calls == [("maintain_partitions_tasks_tasks", "tasks")]
+
+
 # ---------------------------------------------------------------------------
 # check_trigger_exists — table parameter
 # ---------------------------------------------------------------------------
