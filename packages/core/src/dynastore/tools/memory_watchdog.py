@@ -130,6 +130,11 @@ _MEM_SUFFIX_FACTORS = {
 # or host has anywhere near this much RAM.
 _UNLIMITED_THRESHOLD_BYTES = 1 << 62
 
+# Number of stack frames tracemalloc keeps per allocation for the diagnostic
+# (geoid#3121). One frame (the allocation site) is enough to pin the culprit
+# line while keeping tracemalloc's per-allocation memory overhead minimal.
+_TRACEMALLOC_FRAMES = 1
+
 
 def read_process_rss_bytes() -> Optional[int]:
     """Return this process's current resident set size (RSS) in bytes.
@@ -213,9 +218,10 @@ class MemoryWatchdogService(PeriodicService):
         self._started_at = time.monotonic()
         self._last_recycle_attempt: Optional[float] = None
         # Diagnostic (geoid#3121) bookkeeping: throttle tracemalloc snapshots
-        # and warn only once if tracing was never started.
+        # and remember whether THIS service started tracing (so it can stop it
+        # again when the flag is turned back off).
         self._last_diag_snapshot: Optional[float] = None
-        self._diag_tracing_warned = False
+        self._diag_started = False
 
     def _effective_limit_bytes(
         self, config: "MemoryWatchdogConfig"
@@ -295,28 +301,43 @@ class MemoryWatchdogService(PeriodicService):
 
         A kernel OOM kill is a bare SIGKILL between watchdog polls — no handler
         runs, so the allocation that spiked RSS is otherwise invisible. When
-        ``diagnostic_tracemalloc_enabled`` is on (tracemalloc must have been
-        started at process init — see ``build_memory_watchdog_service``), this
-        logs the top Python allocation sites once RSS crosses
+        ``diagnostic_tracemalloc_enabled`` is on, this lazily starts tracemalloc
+        (see below) and logs the top Python allocation sites once RSS crosses
         ``diagnostic_ratio``. That threshold sits deliberately below the OOM
         point so the snapshot's own allocation has headroom and the *climb*
         toward the kill is captured. Snapshots are throttled to
         ``diagnostic_min_interval_seconds`` so a sustained climb does not log
         every tick. Off by default — tracemalloc adds per-allocation overhead.
+
+        The flag is read live here (per tick), not at service-build time: the
+        watchdog is built before the platform config store is reachable (see
+        ``build_memory_watchdog_service``), so a build-time read would always
+        see the default (off) and the diagnostic could never be turned on
+        through the config store. Starting tracemalloc on the first tick that
+        sees the flag misses allocations made before that tick, but a recurring
+        leak keeps allocating, so the culprit still surfaces on the climb.
         """
         if not config.diagnostic_tracemalloc_enabled:
+            # Turned back off: release tracemalloc's per-allocation overhead if
+            # this service was the one that started it.
+            if self._diag_started and tracemalloc.is_tracing():
+                tracemalloc.stop()
+            self._diag_started = False
             return
         if ratio < config.diagnostic_ratio:
             return
         if not tracemalloc.is_tracing():
-            if not self._diag_tracing_warned:
-                logger.warning(
-                    "memory_watchdog: diagnostic_tracemalloc_enabled but "
-                    "tracemalloc is not tracing on %s — it must be started at "
-                    "process init; no snapshot taken.",
-                    ctx.name,
-                )
-                self._diag_tracing_warned = True
+            # Lazy start: arm tracing now and snapshot on the next qualifying
+            # tick (a snapshot taken the same instant tracing starts is empty).
+            tracemalloc.start(_TRACEMALLOC_FRAMES)
+            self._diag_started = True
+            logger.warning(
+                "memory_watchdog: diagnostic_tracemalloc_enabled — started "
+                "tracemalloc (%d frame) on %s; allocation snapshots begin on "
+                "the next tick above diagnostic_ratio.",
+                _TRACEMALLOC_FRAMES,
+                ctx.name,
+            )
             return
 
         now = time.monotonic()
@@ -529,15 +550,15 @@ class MemoryWatchdogConfig(PluginConfig):
     diagnostic_tracemalloc_enabled: Mutable[bool] = Field(
         default=False,
         description=(
-            "Diagnostic (geoid#3121): when True, tracemalloc is started at "
-            "process init and the watchdog logs the top Python allocation "
-            "sites by size once RSS climbs past diagnostic_ratio, so a "
-            "between-poll OOM spike leaves a breadcrumb naming the allocation "
-            "instead of a bare SIGKILL. Off by default — tracemalloc adds "
-            "per-allocation overhead — and meant to be switched on transiently "
-            "in one environment to locate a leak/spike, then switched back off "
-            "and the process recycled. Read at service-build time (starting "
-            "tracemalloc needs a fresh process)."
+            "Diagnostic (geoid#3121): when True, the watchdog lazily starts "
+            "tracemalloc and logs the top Python allocation sites by size once "
+            "RSS climbs past diagnostic_ratio, so a between-poll OOM spike "
+            "leaves a breadcrumb naming the allocation instead of a bare "
+            "SIGKILL. Off by default — tracemalloc adds per-allocation "
+            "overhead — and meant to be switched on transiently in one "
+            "environment to locate a leak/spike, then switched back off (which "
+            "stops tracemalloc again — no restart needed either way). Read "
+            "live every tick."
         ),
     )
 
@@ -569,17 +590,6 @@ class MemoryWatchdogConfig(PluginConfig):
         description=(
             "Minimum time between two diagnostic tracemalloc snapshots so a "
             "sustained climb does not log one every tick. Read live every tick."
-        ),
-    )
-
-    diagnostic_cadence_seconds: Mutable[float] = Field(
-        default=3.0,
-        gt=0,
-        description=(
-            "Polling cadence used INSTEAD of cadence_seconds while "
-            "diagnostic_tracemalloc_enabled, so a fast between-poll OOM spike "
-            "is more likely to be sampled during its climb. Read at "
-            "service-build time."
         ),
     )
 
@@ -748,25 +758,14 @@ async def build_memory_watchdog_service(
         logger.debug("memory_watchdog: disabled via config — skipping.")
         return None
 
-    cadence = config.cadence_seconds
-    if config.diagnostic_tracemalloc_enabled:
-        # Poll faster so a fast between-poll OOM spike is sampled during its
-        # climb, and start tracemalloc here (lifespan start) so it captures the
-        # later allocations that spike RSS. 1 frame keeps the per-allocation
-        # overhead down while still naming the allocation site.
-        cadence = config.diagnostic_cadence_seconds
-        if not tracemalloc.is_tracing():
-            tracemalloc.start(1)
-            logger.warning(
-                "memory_watchdog: diagnostic_tracemalloc_enabled — started "
-                "tracemalloc (1 frame); expect extra per-allocation memory "
-                "overhead until it is disabled and the process is recycled."
-            )
-
+    # The tracemalloc diagnostic is armed lazily from the tick path, not here:
+    # this runs at lifespan start, before the platform config store is
+    # reachable, so ``config`` is always the code defaults at build time and any
+    # store-set flag would be missed. See ``_maybe_emit_tracemalloc``.
     return MemoryWatchdogService(
         warn_ratio=config.warn_ratio,
         critical_ratio=config.critical_ratio,
-        cadence_seconds=cadence,
+        cadence_seconds=config.cadence_seconds,
     )
 
 

@@ -774,7 +774,7 @@ async def test_diagnostic_logs_top_allocations_above_ratio(
     the top allocation sites is logged (naming the between-poll spike)."""
     import tracemalloc
 
-    tracemalloc.start(1)  # build_memory_watchdog_service does this in production
+    tracemalloc.start(1)  # pre-armed so this tick exercises the snapshot path
     # Give the snapshot something concrete to rank at the top.
     big = [bytearray(1024 * 512) for _ in range(8)]  # ~4MiB
     _patch_config(
@@ -835,10 +835,13 @@ async def test_diagnostic_throttles_repeated_snapshots(
 
 
 @pytest.mark.asyncio
-async def test_diagnostic_warns_once_when_tracing_not_started(
+async def test_diagnostic_lazy_starts_tracing_then_snapshots(
     monkeypatch, caplog, _stop_tracemalloc
 ) -> None:
-    """Enabled but tracemalloc was never started: warn once, take no snapshot."""
+    """Enabled while tracemalloc is off: the first qualifying tick lazily arms
+    tracing (no snapshot yet), and a later tick emits the snapshot. The flag is
+    read live, so the diagnostic can be switched on through the config store with
+    no restart."""
     import tracemalloc
 
     if tracemalloc.is_tracing():
@@ -848,6 +851,7 @@ async def test_diagnostic_warns_once_when_tracing_not_started(
         MemoryWatchdogConfig(
             diagnostic_tracemalloc_enabled=True,
             diagnostic_ratio=0.50,
+            diagnostic_min_interval_seconds=0.0,
             self_recycle_enabled=False,
         ),
     )
@@ -859,18 +863,23 @@ async def test_diagnostic_warns_once_when_tracing_not_started(
     )
     ctx = _make_ctx()
     with caplog.at_level(logging.WARNING, logger="dynastore.tools.memory_watchdog"):
-        await svc.tick(ctx)
-        await svc.tick(ctx)
-    not_tracing = [r for r in caplog.records if "not tracing" in r.getMessage()]
-    assert len(not_tracing) == 1
+        await svc.tick(ctx)  # arms tracing, no snapshot on this tick
+        assert tracemalloc.is_tracing()
+        assert any("started tracemalloc" in r.getMessage() for r in caplog.records)
+        assert not any("[diagnostic]" in r.getMessage() for r in caplog.records)
+        await svc.tick(ctx)  # now snapshots
+    diag = [r for r in caplog.records if "[diagnostic]" in r.getMessage()]
+    assert len(diag) == 1
 
 
 @pytest.mark.asyncio
-async def test_build_starts_tracemalloc_and_uses_diagnostic_cadence(
+async def test_build_does_not_start_tracemalloc(
     monkeypatch, _stop_tracemalloc
 ) -> None:
-    """build_memory_watchdog_service starts tracemalloc and swaps in the faster
-    diagnostic cadence when the diagnostic flag is on."""
+    """The diagnostic is armed lazily from the tick path, never at build time:
+    the platform config store is unreachable when the service is built, so a
+    build-time read of the flag always sees the default. build_memory_watchdog_service
+    therefore leaves tracing off and keeps the plain cadence even with the flag set."""
     import tracemalloc
 
     if tracemalloc.is_tracing():
@@ -879,11 +888,44 @@ async def test_build_starts_tracemalloc_and_uses_diagnostic_cadence(
         monkeypatch,
         MemoryWatchdogConfig(
             diagnostic_tracemalloc_enabled=True,
-            diagnostic_cadence_seconds=2.5,
             cadence_seconds=15.0,
         ),
     )
     svc = await build_memory_watchdog_service()
     assert svc is not None
+    assert not tracemalloc.is_tracing()
+    assert svc.cadence_seconds == pytest.approx(15.0)
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_disable_stops_tracing_it_started(
+    monkeypatch, _stop_tracemalloc
+) -> None:
+    """Flipping the flag back off releases tracemalloc if this service started
+    it — so an operator can turn the diagnostic off live and reclaim the
+    per-allocation overhead without recycling the process."""
+    import tracemalloc
+
+    if tracemalloc.is_tracing():
+        tracemalloc.stop()
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            diagnostic_ratio=0.50,
+            diagnostic_min_interval_seconds=0.0,
+            self_recycle_enabled=False,
+        ),
+    )
+    svc = MemoryWatchdogService(
+        limit_bytes=1000,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: 700,
+    )
+    ctx = _make_ctx()
+    await svc.tick(ctx)  # lazy-starts tracing
     assert tracemalloc.is_tracing()
-    assert svc.cadence_seconds == 2.5
+    _patch_config(monkeypatch, MemoryWatchdogConfig())  # diagnostic now off
+    await svc.tick(ctx)
+    assert not tracemalloc.is_tracing()
