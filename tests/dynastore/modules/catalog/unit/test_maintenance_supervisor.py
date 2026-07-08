@@ -127,7 +127,7 @@ def test_reclaim_stale_jobs_sql_contains_running_since():
     """The reclaim query must filter on running_since and derive per-row thresholds."""
     sql = _RECLAIM_STALE_JOBS.template
     assert "running_since IS NOT NULL" in sql
-    assert "running_since < :now - make_interval" in sql
+    assert "running_since < CAST(:now AS TIMESTAMPTZ) - make_interval" in sql
     assert "interval_seconds" in sql
     assert "LEAST" in sql
     assert "GREATEST" in sql
