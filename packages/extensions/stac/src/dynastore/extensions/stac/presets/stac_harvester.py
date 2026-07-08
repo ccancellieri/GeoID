@@ -42,7 +42,7 @@ Re-applying re-syncs idempotently.
 from __future__ import annotations
 
 import logging
-from typing import Any, ClassVar, Optional, Tuple, Type
+from typing import Any, ClassVar, Literal, Optional, Tuple, Type
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -129,6 +129,14 @@ class StacHarvesterParams(BaseModel):
         description=(
             "When True, skip source collections whose item stream yields no "
             "items instead of creating empty local collection metadata."
+        ),
+    )
+    kind: Optional[Literal["VECTOR", "RASTER", "RECORDS"]] = Field(
+        default=None,
+        description=(
+            "Optional collection kind to set before the harvest writes "
+            "collections. When omitted, the harvest task auto-detects raster "
+            "collections from STAC raster metadata or COG/raster assets."
         ),
     )
     drivers: RoutingDrivers = Field(
@@ -251,6 +259,7 @@ class _StacHarvesterPreset:
                         "max_items": p.max_items,
                         "with_assets": p.with_assets,
                         "skip_empty_collections": p.skip_empty_collections,
+                        "kind": p.kind,
                         "drivers": p.drivers.value,
                     },
                 },
@@ -356,6 +365,7 @@ class _StacHarvesterPreset:
             "max_items": p.max_items,
             "with_assets": p.with_assets,
             "skip_empty_collections": p.skip_empty_collections,
+            "kind": p.kind,
             "drivers": p.drivers.value,
         }
 

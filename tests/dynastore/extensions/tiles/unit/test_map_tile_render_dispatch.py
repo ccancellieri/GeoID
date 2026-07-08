@@ -112,7 +112,7 @@ def _wire_common_mocks(
 
 _STYLED_DEFAULTS: dict[str, Any] = dict(
     relief=None, band=1, azimuth=315.0, altitude=45.0,
-    bands=None, expression=None, rescale=None,
+    bands=None, expression=None, rescale=None, style_url=None,
 )
 
 
@@ -191,6 +191,7 @@ class TestGetMapTileRasterHappyPath:
                     bands=None,
                     expression=None,
                     rescale=None,
+                    style_url=None,
                 )
 
             assert response.status_code == 200
@@ -230,6 +231,7 @@ class TestGetMapTileRasterHappyPath:
                     bands=None,
                     expression=None,
                     rescale=None,
+                    style_url=None,
                 )
 
             assert response.status_code == 200
@@ -275,6 +277,7 @@ class TestGetMapTileRasterHappyPath:
                         bands=None,
                         expression="(B1-B2)/(B1+B2)",
                         rescale=None,
+                        style_url=None,
                     )
             assert exc_info.value.status_code == 422
             assert "Invalid band expression" in exc_info.value.detail
@@ -309,6 +312,7 @@ class TestGetMapTileRasterHappyPath:
                     bands=None,
                     expression=None,
                     rescale=None,
+                    style_url=None,
                 )
             assert response.status_code == 204
         finally:
@@ -343,6 +347,7 @@ class TestGetMapTileRasterHappyPath:
                         bands=None,
                         expression=None,
                         rescale=None,
+                        style_url=None,
                     )
             assert exc_info.value.status_code == 500
             assert exc_info.value.detail == "Raster render failed: disk on fire"
@@ -389,6 +394,7 @@ class TestHillshadeDispatch:
                     bands=None,
                     expression=None,
                     rescale=None,
+                    style_url=None,
                 )
 
             assert response.status_code == 200
@@ -429,9 +435,10 @@ class TestHillshadeDispatch:
                     band=1,
                     azimuth=315.0,
                     altitude=45.0,
-                    bands=None,
-                    expression=None,
-                    rescale=None,
+                   bands=None,
+                   expression=None,
+                   rescale=None,
+                    style_url=None,
                 )
 
             svc._tile_cache_writer.submit_nowait.assert_called_once()
@@ -472,9 +479,10 @@ class TestHillshadeDispatch:
                         band=1,
                         azimuth=315.0,
                         altitude=45.0,
-                        bands=None,
-                        expression=None,
-                        rescale=None,
+                       bands=None,
+                       expression=None,
+                       rescale=None,
+                        style_url=None,
                     )
             assert exc_info.value.status_code == 422
         finally:
@@ -513,6 +521,7 @@ class TestHillshadeDispatch:
                     bands=None,
                     expression=None,
                     rescale=None,
+                    style_url=None,
                 )
             assert response.status_code == 204
         finally:
@@ -552,6 +561,7 @@ class TestHillshadeDispatch:
                         bands=None,
                         expression=None,
                         rescale=None,
+                        style_url=None,
                     )
             assert exc_info.value.status_code == 500
             assert exc_info.value.detail == "Hillshade render failed: boom"
@@ -683,6 +693,58 @@ class TestTerrainRgbDoesNotCheckInvalidExpression:
 
 
 class TestStyledRasterDispatch:
+    @pytest.mark.asyncio
+    async def test_source_sld_link_styles_tile_without_internal_style(self):
+        original_rct = _ts_mod._RENDER_COG_TILE
+        original_fetch = _ts_mod._FETCH_SLD_BODY
+        original_parse = _ts_mod._PARSE_SLD_COLORMAP
+        try:
+            captured: dict[str, Any] = {}
+
+            def _render(*a, **kw):
+                captured.update(kw)
+                return b"STYLED-BYTES"
+
+            _ts_mod._RENDER_COG_TILE = _render
+            _ts_mod._FETCH_SLD_BODY = AsyncMock(return_value="<StyledLayerDescriptor/>")
+            _ts_mod._PARSE_SLD_COLORMAP = lambda _sld: {1: (255, 0, 0, 255)}
+
+            svc = _make_service()
+            _wire_common_mocks(svc)
+            svc._get_first_item = AsyncMock(return_value={
+                "assets": {"data": {"href": "https://s3/cog.tif", "roles": ["data"]}},
+                "links": [{"rel": "sld", "href": "https://styles.example.test/ndvi.sld"}],
+                "properties": {},
+            })
+            cfg = _make_render_config(cache_enabled=False)
+
+            p1, p2, p3, p4, p5 = _patch_common(cfg, provider=None)
+            with p1, p2, p3, p4, p5:
+                response = await svc.get_map_tile_styled(
+                    request=_make_request(),
+                    background_tasks=_make_bg_tasks(),
+                    catalog_id="cat",
+                    collection_id="coll",
+                    style_id="ndvi",
+                    tms_id="WebMercatorQuad",
+                    z=5,
+                    x=0,
+                    y=0,
+                    format="png",
+                    **_STYLED_DEFAULTS,
+                )
+
+            assert response.status_code == 200
+            assert response.body == b"STYLED-BYTES"
+            _ts_mod._FETCH_SLD_BODY.assert_awaited_once_with(  # type: ignore[attr-defined]
+                "https://styles.example.test/ndvi.sld"
+            )
+            assert captured["colormap"] == {1: (255, 0, 0, 255)}
+        finally:
+            _ts_mod._RENDER_COG_TILE = original_rct
+            _ts_mod._FETCH_SLD_BODY = original_fetch
+            _ts_mod._PARSE_SLD_COLORMAP = original_parse
+
     @pytest.mark.asyncio
     async def test_generic_exception_raises_500_with_raster_render_detail(self):
         original = _ts_mod._RENDER_COG_TILE

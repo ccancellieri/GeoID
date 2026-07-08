@@ -430,6 +430,80 @@ async def test_harvest_read_policy_opt_out_pins_false():
 
 
 @pytest.mark.asyncio
+async def test_harvest_explicit_kind_pins_collection_info_before_read_policy():
+    """An explicit harvest kind pins CollectionInfo.kind for the collection."""
+    from dynastore.modules.catalog.catalog_config import CollectionInfo, CollectionKind
+    from dynastore.modules.storage.read_policy import ItemsReadPolicy
+
+    request = StacHarvestRequest(
+        catalog_url="https://src/c/MyColl",
+        target_catalog="cat-7",
+        drivers="es",
+        kind="RASTER",
+    )
+    stats, config_writer = await _run_single_collection_harvest(request)
+
+    assert not stats.errors
+    assert config_writer.set_config.await_count == 2
+    first_call = config_writer.set_config.await_args_list[0]
+    assert first_call.args[0] is CollectionInfo
+    assert first_call.args[1].kind is CollectionKind.RASTER
+    assert first_call.args[2:4] == ("cat-7", "mycoll")
+    second_call = config_writer.set_config.await_args_list[1]
+    assert second_call.args[0] is ItemsReadPolicy
+
+
+@pytest.mark.asyncio
+async def test_harvest_auto_detects_raster_kind_from_first_item_asset():
+    """When the collection doc is thin, the first item can still mark it raster."""
+    from dynastore.modules.catalog.catalog_config import CollectionInfo, CollectionKind
+
+    source_coll = {"type": "Collection", "id": "MyColl", "description": "d"}
+    items = [
+        {
+            "type": "Feature",
+            "id": "i1",
+            "geometry": None,
+            "properties": {},
+            "assets": {
+                "data": {
+                    "href": "https://example.test/i1.tif",
+                    "type": "image/tiff; application=geotiff",
+                    "roles": ["data"],
+                }
+            },
+        }
+    ]
+
+    async def fake_apply(ctx, scope, catalog_id, drivers):
+        return None
+
+    request = StacHarvestRequest(
+        catalog_url="https://src/c/MyColl", target_catalog="cat-7", drivers="es",
+    )
+    catalogs = _mock_catalogs()
+    config_writer = AsyncMock()
+    config_writer.set_config = AsyncMock(return_value=None)
+    preset_ctx = SimpleNamespace(config=config_writer)
+
+    with (
+        patch.object(harvest_task, "_probe_single_collection",
+                     return_value=(source_coll, "https://src/c/MyColl/items")),
+        patch.object(harvest_task, "_iter_items_from", return_value=_aiter(items)),
+        patch.object(harvest_task, "_apply_harvest_presets", side_effect=fake_apply),
+    ):
+        stats = await harvest_task.run_harvest(
+            request, catalogs, preset_ctx=preset_ctx, base_scope="catalog:cat-7"
+        )
+
+    assert stats.items_written == 1
+    first_call = config_writer.set_config.await_args_list[0]
+    assert first_call.args[0] is CollectionInfo
+    assert first_call.args[1].kind is CollectionKind.RASTER
+    assert catalogs.upsert.await_args.args[2][0].id == "i1"
+
+
+@pytest.mark.asyncio
 async def test_harvest_read_policy_pin_failure_is_soft_error():
     """A read-policy write failure is recorded as a soft error and never aborts
     the item walk (best-effort, mirroring the routing/storage presets)."""

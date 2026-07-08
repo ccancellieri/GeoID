@@ -121,6 +121,9 @@ _RENDER_COG_TERRAIN_RGB = None
 _RENDER_COG_HILLSHADE = None
 _PARSE_SLD_COLORMAP = None
 _EXTRACT_SLD_BODY = None
+_FETCH_SLD_BODY = None
+_STYLE_URL_FROM_ITEM = None
+_STYLE_URL_CACHE_ID = None
 _BUILD_RENDER_CACHE_KEY = None
 _BUILD_RENDER_PARAMS_HASH = None
 _RenderCachingConfig = None
@@ -134,6 +137,11 @@ try:
         parse_sld_colormap as _psc,
         extract_sld_body as _esb,
     )
+    from dynastore.modules.renders.style_url import (  # noqa: E402
+        fetch_sld_body as _fsb,
+        style_url_from_item as _sufi,
+        style_url_cache_id as _suci,
+    )
     from dynastore.modules.renders.config import (  # noqa: E402
         build_render_cache_key as _brck,
         build_render_params_hash as _brph,
@@ -144,6 +152,9 @@ try:
     _RENDER_COG_HILLSHADE = _rch
     _PARSE_SLD_COLORMAP = _psc
     _EXTRACT_SLD_BODY = _esb
+    _FETCH_SLD_BODY = _fsb
+    _STYLE_URL_FROM_ITEM = _sufi
+    _STYLE_URL_CACHE_ID = _suci
     _BUILD_RENDER_CACHE_KEY = _brck
     _BUILD_RENDER_PARAMS_HASH = _brph
     _RenderCachingConfig = _RCC
@@ -1653,13 +1664,26 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
 
     @staticmethod
     async def _validate_tms_and_matrix(dataset, tms_id, z, x, y):
-        tms_def = await tms_manager.get_custom_tms(catalog_id=dataset, tms_id=tms_id)
+        # Built-ins are global and need no catalog lookup. Checking them first
+        # also avoids false 404s when a route has already resolved a public
+        # catalog id to its immutable id but the custom-TMS registry expects
+        # public dataset ids.
+        tms_def = BUILTIN_TILE_MATRIX_SETS.get(tms_id)
         if not tms_def:
-            tms_def = BUILTIN_TILE_MATRIX_SETS.get(tms_id)
-            if not tms_def:
-                raise HTTPException(
-                    status_code=404, detail=f"TMS '{tms_id}' not supported."
+            try:
+                tms_def = await tms_manager.get_custom_tms(
+                    catalog_id=dataset, tms_id=tms_id
                 )
+            except Exception as exc:
+                logger.debug(
+                    "tiles: custom TMS lookup failed for %s/%s: %s",
+                    dataset, tms_id, exc,
+                )
+                tms_def = None
+        if not tms_def:
+            raise HTTPException(
+                status_code=404, detail=f"TMS '{tms_id}' not supported."
+            )
 
         matrix = next((m for m in tms_def.tileMatrices if m.id == str(z)), None)
         if not matrix:
@@ -1775,6 +1799,60 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 ) from exc
 
         return bands, expression, rescale
+
+    @staticmethod
+    def _style_url_from_item(item: dict, style_id: Optional[str]) -> Optional[str]:
+        if _STYLE_URL_FROM_ITEM is None:
+            return None
+        try:
+            return _STYLE_URL_FROM_ITEM(item, style_id)
+        except Exception as exc:
+            logger.debug("map_tile: style URL extraction failed: %s", exc)
+            return None
+
+    @staticmethod
+    async def _colormap_from_style_url(
+        style_url: Optional[str],
+        *,
+        catalog_id: str,
+        collection_id: str,
+        style_id: str,
+        required: bool,
+    ):
+        if not style_url:
+            return None
+        if _FETCH_SLD_BODY is None or _PARSE_SLD_COLORMAP is None:
+            if required:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Style URL rendering is unavailable: SLD parser is not installed.",
+                )
+            return None
+        try:
+            sld_body = await _FETCH_SLD_BODY(style_url)
+            return _PARSE_SLD_COLORMAP(sld_body) or None
+        except ValueError as exc:
+            if required:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"SLD colormap parse failed: {exc}",
+                ) from exc
+            logger.warning(
+                "map_tile: style_url SLD parse failed for %s/%s style=%s url=%s: %s",
+                catalog_id, collection_id, style_id, style_url, exc,
+            )
+            return None
+        except Exception as exc:
+            if required:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Style URL could not be fetched or parsed: {exc}",
+                ) from exc
+            logger.warning(
+                "map_tile: style_url fetch failed for %s/%s style=%s url=%s: %s",
+                catalog_id, collection_id, style_id, style_url, exc,
+            )
+            return None
 
     @staticmethod
     async def _load_render_caching_config():  # type: ignore[return]
@@ -1967,6 +2045,34 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         )
         return internal_catalog_id, internal_collection_id
 
+    async def _get_raster_source_item(
+        self,
+        catalog_id: str,
+        collection_id: str,
+    ) -> Optional[dict]:
+        """Return an item-like raster source from items or collection assets."""
+        item = await self._get_first_item(catalog_id, collection_id)
+        if item:
+            return item
+
+        try:
+            catalogs_svc = await self._get_catalogs_service()
+            collection = await catalogs_svc.get_collection(catalog_id, collection_id)
+        except Exception:
+            return None
+        if not collection:
+            return None
+        data = (
+            collection.model_dump(by_alias=True, exclude_none=True)
+            if hasattr(collection, "model_dump")
+            else dict(collection)
+        )
+        assets = data.get("assets") or data.get("item_assets") or {}
+        links = data.get("links") or []
+        if not assets and not links:
+            return None
+        return {"assets": assets, "links": links, "properties": data.get("properties") or {}}
+
     # ------------------------------------------------------------------
     # Map-tile route handlers
     # ------------------------------------------------------------------
@@ -1993,6 +2099,11 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         rescale: Optional[str] = Query(
             None,
             description="Per-band rescale ranges as semicolon-separated 'min,max' pairs.",
+        ),
+        style_url: Optional[str] = Query(
+            None,
+            alias="style-url",
+            description="External SLD URL to apply to raster tile rendering.",
         ),
         serve: Optional[Literal["proxy", "redirect"]] = Query(
             None,
@@ -2031,8 +2142,9 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         )
         await self._require_collection_visible(internal_catalog_id, internal_collection_id)
 
-        # Validate TMS before cache check (avoids a spurious cache lookup on bad TMS)
-        await self._validate_tms_and_matrix(internal_catalog_id, tms_id, z, x, y)
+        # Validate TMS before cache check (avoids a spurious cache lookup on bad TMS).
+        # Built-ins are global; custom TMS lookup follows the public dataset id.
+        await self._validate_tms_and_matrix(catalog_id, tms_id, z, x, y)
 
         kind = await self._collection_kind(internal_catalog_id, internal_collection_id)
         if kind != CollectionKind.RASTER:
@@ -2062,19 +2174,12 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             bands, expression, rescale
         )
 
-        cfg = await self._load_render_caching_config()
-        params_hash = _BUILD_RENDER_PARAMS_HASH(  # type: ignore[misc]
-            bands=bands_parsed,
-            expression=expression_parsed,
-            rescale=rescale_parsed,
-        ) if _BUILD_RENDER_PARAMS_HASH else None
-
         # Resolve default style via binding — needs the first item's properties.
-        item = await self._get_first_item(internal_catalog_id, internal_collection_id)
+        item = await self._get_raster_source_item(internal_catalog_id, internal_collection_id)
         if not item:
             raise HTTPException(
                 status_code=404,
-                detail=f"Collection '{collection_id}' has no items.",
+                detail=f"Collection '{collection_id}' has no raster source item or asset.",
             )
 
         style_id = "default"
@@ -2092,10 +2197,22 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 internal_catalog_id, internal_collection_id, exc,
             )
 
+        effective_style_url = style_url or self._style_url_from_item(item, style_id)
+        cache_style_id = style_id
+        if effective_style_url and _STYLE_URL_CACHE_ID is not None:
+            cache_style_id = f"{style_id}-url-{_STYLE_URL_CACHE_ID(effective_style_url)}"
+
+        cfg = await self._load_render_caching_config()
+        params_hash = _BUILD_RENDER_PARAMS_HASH(  # type: ignore[misc]
+            bands=bands_parsed,
+            expression=expression_parsed,
+            rescale=rescale_parsed,
+        ) if _BUILD_RENDER_PARAMS_HASH else None
+
         cache_key = _BUILD_RENDER_CACHE_KEY(  # type: ignore[misc]
             cfg.key_prefix if cfg else "",  # cfg is non-None when _BUILD_RENDER_CACHE_KEY is set
             internal_collection_id,
-            style_id,
+            cache_style_id,
             tms_id,
             z,
             x,
@@ -2115,9 +2232,17 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
 
         # Resolve style colormap
         colormap = None
+        if effective_style_url:
+            colormap = await self._colormap_from_style_url(
+                effective_style_url,
+                catalog_id=internal_catalog_id,
+                collection_id=internal_collection_id,
+                style_id=style_id,
+                required=False,
+            )
         from dynastore.models.protocols import StylesProtocol as _StylesProtocol
         styles_svc = get_protocol(_StylesProtocol)
-        if styles_svc and style_id != "default":
+        if colormap is None and styles_svc and style_id != "default":
             style_obj = await styles_svc.get_style(
                 internal_catalog_id, internal_collection_id, style_id
             )
@@ -2353,6 +2478,11 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             None,
             description="Relief mode. Use 'hillshade' to render shaded-relief + colormap.",
         ),
+        style_url: Optional[str] = Query(
+            None,
+            alias="style-url",
+            description="External SLD URL to apply to raster tile rendering.",
+        ),
         azimuth: float = Query(default=315.0, ge=0.0, lt=360.0, description="Hillshade sun azimuth in degrees (0=North, clockwise)."),
         altitude: float = Query(default=45.0, ge=0.0, le=90.0, description="Hillshade sun altitude above horizon in degrees."),
         serve: Optional[Literal["proxy", "redirect"]] = Query(
@@ -2413,10 +2543,21 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         )
         await self._require_collection_visible(internal_catalog_id, internal_collection_id)
 
-        # Validate TMS before cache check
-        await self._validate_tms_and_matrix(internal_catalog_id, tms_id, z, x, y)
+        # Validate TMS before cache check. Built-in TMS definitions are global;
+        # custom TMS lookup is keyed like the public route, so use catalog_id.
+        await self._validate_tms_and_matrix(catalog_id, tms_id, z, x, y)
 
         cfg = await self._load_render_caching_config()
+
+        # Resolve first COG asset href before cache-key construction so an
+        # attached source SLD URL can participate in the cache key.
+        item = await self._get_raster_source_item(internal_catalog_id, internal_collection_id)
+        if not item:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Collection '{collection_id}' has no raster source item or asset.",
+            )
+        effective_style_url = style_url or self._style_url_from_item(item, style_id)
 
         # Build cache key
         if is_terrain_rgb:
@@ -2425,13 +2566,18 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             az_int = int(round(azimuth))
             alt_int = int(round(altitude))
             cache_style_segment = f"hillshade-{style_id}-az{az_int}-alt{alt_int}"
+            if effective_style_url and _STYLE_URL_CACHE_ID is not None:
+                cache_style_segment += f"-url-{_STYLE_URL_CACHE_ID(effective_style_url)}"
         else:
             params_hash = _BUILD_RENDER_PARAMS_HASH(  # type: ignore[misc]
                 bands=bands_parsed,
                 expression=expression_parsed,
                 rescale=rescale_parsed,
             ) if _BUILD_RENDER_PARAMS_HASH else None
-            cache_style_segment = f"{style_id}@{params_hash}" if params_hash else style_id
+            style_segment = style_id
+            if effective_style_url and _STYLE_URL_CACHE_ID is not None:
+                style_segment = f"{style_id}-url-{_STYLE_URL_CACHE_ID(effective_style_url)}"
+            cache_style_segment = f"{style_segment}@{params_hash}" if params_hash else style_segment
 
         cache_key = _BUILD_RENDER_CACHE_KEY(  # type: ignore[misc]
             cfg.key_prefix if cfg else "",  # cfg is non-None when _BUILD_RENDER_CACHE_KEY is set
@@ -2454,14 +2600,6 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             )
             if res is not None:
                 return res
-
-        # Resolve first COG asset href
-        item = await self._get_first_item(internal_catalog_id, internal_collection_id)
-        if not item:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Collection '{collection_id}' has no items.",
-            )
 
         from dynastore.extensions.ogc_base import ogc_asset_href
         cog_href = ogc_asset_href(
@@ -2502,10 +2640,16 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         # ------------------------------------------------------------------
         # Resolve SLD colormap (shared by styled and hillshade paths)
         # ------------------------------------------------------------------
-        colormap = None
+        colormap = await self._colormap_from_style_url(
+            effective_style_url,
+            catalog_id=internal_catalog_id,
+            collection_id=internal_collection_id,
+            style_id=style_id,
+            required=bool(effective_style_url and not is_hillshade),
+        )
         from dynastore.models.protocols import StylesProtocol as _StylesProtocol
         styles_svc = get_protocol(_StylesProtocol)
-        if styles_svc:
+        if colormap is None and styles_svc:
             style_obj = await styles_svc.get_style(
                 internal_catalog_id, internal_collection_id, style_id
             )
@@ -2530,7 +2674,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                             "falling back to greyscale",
                             style_id, exc,
                         )
-        elif not is_hillshade:
+        elif colormap is None and not is_hillshade:
             raise HTTPException(
                 status_code=500, detail="Styles service not available."
             )

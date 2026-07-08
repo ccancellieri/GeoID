@@ -53,6 +53,19 @@ _MIN_PAGE_LIMIT = 20
 # Cap how many per-batch errors are recorded into the job result.
 _MAX_RECORDED_ERRORS = 5
 _STRIP_LINKS = frozenset({"links"})
+_SERVER_MANAGED_ITEM_LINK_RELS = frozenset(
+    {"self", "root", "parent", "collection", "items", "next", "prev"}
+)
+_RASTER_STAC_EXTENSION_MARKERS = (
+    "/raster/",
+)
+_RASTER_MEDIA_MARKERS = (
+    "image/tiff",
+    "image/geotiff",
+    "application/geotiff",
+    "application/x-geotiff",
+)
+_RASTER_ROLES = frozenset({"data", "coverage", "cloud-optimized"})
 _STAC_COLLECTION_SCHEMA_FIELDS = frozenset({
     "type",
     "stac_version",
@@ -300,12 +313,111 @@ def map_collection(coll: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _filter_source_item_links(feature: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Keep provider style/legend/data links while dropping navigation links."""
+    kept: List[Dict[str, Any]] = []
+    for link in feature.get("links") or []:
+        if not isinstance(link, dict):
+            continue
+        rel = str(link.get("rel") or "").lower()
+        if rel in _SERVER_MANAGED_ITEM_LINK_RELS:
+            continue
+        if link.get("href"):
+            kept.append(dict(link))
+    return kept
+
+
 def map_item(feature: Dict[str, Any], target_collection: str) -> Dict[str, Any]:
-    """Map a source STAC item; strip navigation links, fix collection reference."""
+    """Map a source STAC item; strip navigation links, keep provider links."""
     out = {k: v for k, v in feature.items() if k not in _STRIP_LINKS}
+    links = _filter_source_item_links(feature)
+    if links:
+        out["links"] = links
     out["type"] = "Feature"
     out["collection"] = target_collection
     return out
+
+
+def _has_raster_extension(doc: Dict[str, Any]) -> bool:
+    return any(
+        any(marker in str(uri).lower() for marker in _RASTER_STAC_EXTENSION_MARKERS)
+        for uri in doc.get("stac_extensions") or []
+    )
+
+
+def _asset_dicts(doc: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+    for container_name in ("assets", "item_assets"):
+        container = doc.get(container_name) or {}
+        if isinstance(container, dict):
+            for asset in container.values():
+                if isinstance(asset, dict):
+                    yield asset
+
+
+def _has_raster_asset(doc: Dict[str, Any]) -> bool:
+    for asset in _asset_dicts(doc):
+        media_type = str(asset.get("type") or "").lower()
+        roles = {str(role).lower() for role in (asset.get("roles") or [])}
+        href = str(asset.get("href") or "").lower()
+        if any(marker in media_type for marker in _RASTER_MEDIA_MARKERS):
+            return True
+        if any(href.endswith(ext) for ext in (".tif", ".tiff", ".geotiff")):
+            return True
+        if roles & _RASTER_ROLES and any(
+            marker in media_type for marker in ("image/", "geotiff", "tiff")
+        ):
+            return True
+    return False
+
+
+def infer_collection_kind(
+    source_coll: Dict[str, Any],
+    first_item: Optional[Dict[str, Any]] = None,
+    explicit_kind: Optional[str] = None,
+) -> Optional[str]:
+    """Return the collection kind to pin, or None to keep inherited defaults."""
+    if explicit_kind:
+        return explicit_kind
+    if _has_raster_extension(source_coll) or _has_raster_asset(source_coll):
+        return "RASTER"
+    if first_item and (_has_raster_extension(first_item) or _has_raster_asset(first_item)):
+        return "RASTER"
+    return None
+
+
+async def _apply_collection_kind(
+    config_writer: Any,
+    catalog_id: str,
+    collection_id: str,
+    kind: Optional[str],
+) -> Optional[str]:
+    """Pin CollectionInfo.kind before the collection is created, best-effort."""
+    if kind is None:
+        return None
+    try:
+        from dynastore.modules.catalog.catalog_config import (
+            CollectionInfo,
+            CollectionKind,
+        )
+        from dynastore.models.protocols.configs import ConfigsProtocol
+        from dynastore.tools.discovery import get_protocol
+
+        writer = config_writer or get_protocol(ConfigsProtocol)
+        if writer is None:
+            return f"collection_kind:{collection_id}:no_config_writer"
+        info = CollectionInfo(kind=CollectionKind(kind))
+        await writer.set_config(CollectionInfo, info, catalog_id, collection_id)
+        logger.info(
+            "stac_harvest: pinned collection_info.kind=%s on %s/%s",
+            kind, catalog_id, collection_id,
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "stac_harvest: failed to pin collection_info.kind=%s on %s/%s: %s(%s)",
+            kind, catalog_id, collection_id, type(exc).__name__, exc,
+        )
+        return f"collection_kind:{collection_id}:{type(exc).__name__}"
 
 
 def virtual_assets_for(feature: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
@@ -837,6 +949,26 @@ async def _harvest_collection(
     """
     source_collection_id = source_collection_id or target_collection
     target_catalog = request.target_catalog
+
+    first_item: Optional[Dict[str, Any]] = None
+    if request.kind is None and not (
+        _has_raster_extension(source_coll) or _has_raster_asset(source_coll)
+    ):
+        try:
+            first_item = await anext(items_iter)
+            items_iter = _prepend_item(first_item, items_iter)
+        except StopAsyncIteration:
+            first_item = None
+
+    inferred_kind = infer_collection_kind(
+        source_coll, first_item=first_item, explicit_kind=request.kind
+    )
+    perr = await _apply_collection_kind(
+        config_writer, target_catalog, target_collection, inferred_kind
+    )
+    if perr and len(stats.errors) < _MAX_RECORDED_ERRORS:
+        stats.errors.append(perr)
+
     coll = map_collection(source_coll)
     coll["id"] = target_collection
     if not await _ensure_collection(catalogs, target_catalog, coll):

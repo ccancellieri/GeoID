@@ -18,7 +18,7 @@
 
 """Input model for the stac_harvest OGC Process."""
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -109,6 +109,15 @@ class StacHarvestRequest(BaseModel):
             "creating local collection metadata and skip collections whose "
             "item walk yields no items. Fetch failures are not treated as "
             "empty collections."
+        ),
+    )
+    kind: Optional[Literal["VECTOR", "RASTER", "RECORDS"]] = Field(
+        default=None,
+        description=(
+            "Optional dynastore collection kind to set before writing harvested "
+            "collections. When omitted, the harvester infers RASTER from STAC "
+            "raster extension metadata or COG/raster data assets and otherwise "
+            "leaves the platform default in place."
         ),
     )
     drivers: RoutingDrivers = Field(

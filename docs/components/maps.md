@@ -37,9 +37,9 @@ GET /maps/{dataset}/map?collections=...&bbox=...&crs=...&width=...&height=...
         │
         ├─ 1. Validate dataset + collections (catalog_module)
         ├─ 2. Resolve bbox CRS (pyproj / modules/crs)
-        ├─ 3. Fetch geometries (maps_db.get_features_for_rendering → PostGIS)
-        ├─ 4. Fetch style (styles_db — optional)
-        ├─ 5. Render PNG (renderer.render_map_image via ProcessPoolExecutor)
+        ├─ 3. Render vector collections from geometries or raster collections from a COG asset
+        ├─ 4. Fetch style from the Styles extension or a source-linked SLD URL
+        ├─ 5. Render PNG (renderer.render_map_image or rio-tiler, depending on collection kind)
         └─ 6. Convert PNG → JPEG | GeoTIFF (format_convert)
 ```
 
@@ -114,6 +114,17 @@ The Maps extension integrates with the **Styles extension**
 
 - `SLD_1.1` — parsed and applied by the GDAL renderer
 - `MapboxGL` — passed through to the renderer for client-side fallback
+
+Raster map requests also accept `style-url=<http-or-https SLD URL>`. Raster
+rendering resolves the source COG through routed item storage, so an
+Elasticsearch-only or otherwise optimized read driver can provide the item when
+the PostgreSQL item driver is not active for the collection. If no item row is
+available, raster rendering can still use collection-level `assets` or
+`item_assets` with a `data` or `coverage` href. When `style-url` is omitted,
+the same source lookup is used to find a preserved `rel=sld` link or SLD-looking
+style asset. The fetched SLD body is cached through the platform cache backend,
+so deployments with Valkey use Valkey for that style-body cache. The rendered
+map or tile bytes remain cached through the normal tile storage path.
 
 If no style is requested the renderer uses default fill/stroke rules from
 `MapsConfig`.

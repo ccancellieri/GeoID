@@ -70,15 +70,20 @@ logger = logging.getLogger(__name__)
 _RENDER_COG_MAP = None
 _RENDER_COG_TILE = None
 _PARSE_SLD_COLORMAP = None
+_FETCH_SLD_BODY = None
+_STYLE_URL_FROM_ITEM = None
 _BUILD_RENDER_CACHE_KEY = None
 _RenderCachingConfig = None
 try:
     from dynastore.modules.renders.engine import render_cog_map as _rcm, render_cog_tile as _rct  # noqa: E402
     from dynastore.modules.renders.colormap import parse_sld_colormap as _psc  # noqa: E402
+    from dynastore.modules.renders.style_url import fetch_sld_body as _fsb, style_url_from_item as _sufi  # noqa: E402
     from dynastore.modules.renders.config import build_render_cache_key as _brck, RenderCachingConfig as _RCC  # noqa: E402
     _RENDER_COG_MAP = _rcm
     _RENDER_COG_TILE = _rct
     _PARSE_SLD_COLORMAP = _psc
+    _FETCH_SLD_BODY = _fsb
+    _STYLE_URL_FROM_ITEM = _sufi
     _BUILD_RENDER_CACHE_KEY = _brck
     _RenderCachingConfig = _RCC
 except ImportError:
@@ -233,6 +238,77 @@ async def _validate_collections_helper(conn, dataset, requested_collections):
             valid_collections.append(coll_id)
     return valid_collections
 
+
+def _feature_to_dict(feature: Any) -> dict:
+    if hasattr(feature, "model_dump"):
+        return feature.model_dump(by_alias=True, exclude_none=True)
+    return dict(feature)
+
+
+def _first_asset_href(source: dict) -> Optional[str]:
+    assets = source.get("assets") or {}
+    for key in ("data", "coverage"):
+        asset = assets.get(key) or {}
+        if asset.get("href"):
+            return asset["href"]
+    for asset in assets.values():
+        if isinstance(asset, dict) and asset.get("href"):
+            return asset["href"]
+    return None
+
+
+async def _first_routed_item(
+    catalog_id: str,
+    collection_id: str,
+) -> Optional[dict]:
+    try:
+        from dynastore.models.query_builder import QueryRequest  # type: ignore[import]
+        from dynastore.modules.storage.hints import Hint
+        from dynastore.modules.storage.router import get_driver
+        from dynastore.modules.storage.routing_config import Operation
+
+        query = QueryRequest(limit=1)
+        driver = await get_driver(
+            Operation.READ,
+            catalog_id,
+            collection_id,
+            hints=frozenset({Hint.GEOMETRY_EXACT}),
+        )
+        async for first in driver.read_entities(
+            catalog_id, collection_id, request=query, limit=1
+        ):
+            return _feature_to_dict(first)
+    except Exception:
+        logger.debug(
+            "maps/raster: routed item lookup failed for %s/%s",
+            catalog_id,
+            collection_id,
+            exc_info=True,
+        )
+    return None
+
+
+async def _collection_asset_source(
+    catalog_id: str,
+    collection_id: str,
+) -> Optional[dict]:
+    catalogs_svc = get_protocol(CatalogsProtocol)
+    if not catalogs_svc:
+        return None
+    try:
+        collection = await catalogs_svc.get_collection(catalog_id, collection_id)
+    except Exception:
+        return None
+    if not collection:
+        return None
+    data = _feature_to_dict(collection)
+    assets = data.get("assets") or data.get("item_assets") or {}
+    links = data.get("links") or []
+    if not assets and not links:
+        return None
+    return {"assets": assets, "links": links, "properties": data.get("properties") or {}}
+
+
 async def _resolve_raster_cog_href(
     catalog_id: str,
     collection_id: str,
@@ -243,31 +319,63 @@ async def _resolve_raster_cog_href(
     to the first asset carrying an ``href``.  Returns ``None`` when the
     collection has no items or no usable href.
     """
+    item = await _first_routed_item(catalog_id, collection_id)
+    if item:
+        href = _first_asset_href(item)
+        if href:
+            return href
+
     catalogs_svc = get_protocol(CatalogsProtocol)
-    if not catalogs_svc:
+    if catalogs_svc:
+        try:
+            from dynastore.models.query_builder import QueryRequest  # type: ignore[import]
+            features = await catalogs_svc.search_items(
+                catalog_id, collection_id, QueryRequest(limit=1)
+            )
+        except Exception:
+            features = []
+        if features:
+            href = _first_asset_href(_feature_to_dict(features[0]))
+            if href:
+                return href
+
+    collection_source = await _collection_asset_source(catalog_id, collection_id)
+    if collection_source:
+        return _first_asset_href(collection_source)
+    return None
+
+
+async def _resolve_raster_style_url(
+    catalog_id: str,
+    collection_id: str,
+    style_name: Optional[str],
+) -> Optional[str]:
+    """Resolve a source-linked SLD/style URL from the first raster item."""
+    if _STYLE_URL_FROM_ITEM is None:
         return None
-    try:
-        from dynastore.models.query_builder import QueryRequest  # type: ignore[import]
-        features = await catalogs_svc.search_items(
-            catalog_id, collection_id, QueryRequest(limit=1)
-        )
-    except Exception:
-        return None
-    if not features:
-        return None
-    first = features[0]
-    item: dict = (
-        first.model_dump(by_alias=True, exclude_none=True)
-        if hasattr(first, "model_dump")
-        else dict(first)
-    )
-    assets = item.get("assets") or {}
-    for key in ("data", "coverage"):
-        if key in assets and assets[key].get("href"):
-            return assets[key]["href"]
-    for a in assets.values():
-        if a.get("href"):
-            return a["href"]
+    item = await _first_routed_item(catalog_id, collection_id)
+    if item:
+        resolved = _STYLE_URL_FROM_ITEM(item, style_name)
+        if resolved:
+            return resolved
+
+    catalogs_svc = get_protocol(CatalogsProtocol)
+    if catalogs_svc:
+        try:
+            from dynastore.models.query_builder import QueryRequest  # type: ignore[import]
+            features = await catalogs_svc.search_items(
+                catalog_id, collection_id, QueryRequest(limit=1)
+            )
+        except Exception:
+            features = []
+        if features:
+            resolved = _STYLE_URL_FROM_ITEM(_feature_to_dict(features[0]), style_name)
+            if resolved:
+                return resolved
+
+    collection_source = await _collection_asset_source(catalog_id, collection_id)
+    if collection_source:
+        return _STYLE_URL_FROM_ITEM(collection_source, style_name)
     return None
 
 
@@ -275,6 +383,7 @@ async def _resolve_raster_colormap(
     catalog_id: str,
     collection_id: str,
     style_name: Optional[str],
+    style_url: Optional[str],
     conn: Any,
 ) -> Optional[Any]:
     """Parse an SLD colormap for a raster collection.
@@ -284,7 +393,20 @@ async def _resolve_raster_colormap(
     requested or no SLD stylesheet is available. A parse failure is logged
     and treated as no colormap (raw pixel values rendered).
     """
-    if not style_name or _PARSE_SLD_COLORMAP is None:
+    if _PARSE_SLD_COLORMAP is None:
+        return None
+    if style_url and _FETCH_SLD_BODY is not None:
+        try:
+            sld_body = await _FETCH_SLD_BODY(style_url)
+            return _PARSE_SLD_COLORMAP(sld_body) or None
+        except Exception as exc:
+            logger.warning(
+                "maps/raster: style_url SLD colormap parse failed for %s/%s "
+                "style=%s url=%s: %s",
+                catalog_id, collection_id, style_name, style_url, exc,
+            )
+            return None
+    if not style_name:
         return None
     sheet = await _get_style_to_render(conn, catalog_id, collection_id, style_name)
     if sheet is None:
@@ -355,6 +477,7 @@ async def _render_raster_map(
     width: int,
     height: int,
     style_name: Optional[str],
+    style_url: Optional[str],
     fmt: str,
     request: Any,
 ) -> Response:
@@ -414,11 +537,17 @@ async def _render_raster_map(
     # Resolve colormap from SLD style if requested (opens and closes a DB
     # connection for the style lookup, then releases before the render).
     colormap = None
-    if style_name:
+    effective_style_url = style_url
+    if not effective_style_url:
+        effective_style_url = await _resolve_raster_style_url(
+            internal_catalog_id, internal_collection_id, style_name
+        )
+    if style_name or effective_style_url:
         engine = get_async_engine(request)
         async with managed_transaction(engine) as conn:
             colormap = await _resolve_raster_colormap(
-                internal_catalog_id, internal_collection_id, style_name, conn
+                internal_catalog_id, internal_collection_id, style_name,
+                effective_style_url, conn
             )
 
     # Render via rio-tiler in a thread (no DB connection held during render).
@@ -608,6 +737,7 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         width: int,
         height: int,
         style: Optional[str],
+        style_url: Optional[str],
         bgcolor: Optional[str],
         transparent: bool,
         datetime: Optional[str],
@@ -668,6 +798,7 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
                 width=width,
                 height=height,
                 style_name=style,
+                style_url=style_url,
                 fmt=fmt,
                 request=request,
             )
@@ -863,6 +994,11 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         width: int = Query(768, description="Width of the output image."),
         height: int = Query(768, description="Height of the output image."),
         style: Optional[str] = Query(None, description="Name of the style to apply."),
+        style_url: Optional[str] = Query(
+            None,
+            alias="style-url",
+            description="External SLD URL to apply to raster map rendering.",
+        ),
         bgcolor: Optional[str] = Query(None, description="Background color of the map."),
         transparent: bool = Query(True, description="Whether the map background should be transparent."),
         datetime: Optional[str] = Query(None, description="Temporal filter (timestamp or interval)."),
@@ -908,6 +1044,7 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
             width=width,
             height=height,
             style=style,
+            style_url=style_url,
             bgcolor=bgcolor,
             transparent=transparent,
             datetime=datetime,
@@ -983,6 +1120,11 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         datetime: Optional[str] = Query(None, description="Temporal filter (timestamp or interval)."),
         subset: Optional[str] = Query(None, description="Custom dimension filter."),
         f: str = Query("png", description="Output format: png | jpeg | geotiff."),
+        style_url: Optional[str] = Query(
+            None,
+            alias="style-url",
+            description="External SLD URL to apply to raster map rendering.",
+        ),
     ):
         """Render the default-style map for a specific collection under the aligned path.
 
@@ -1017,6 +1159,7 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
             width=width,
             height=height,
             style=None,
+            style_url=style_url,
             bgcolor=bgcolor,
             transparent=transparent,
             datetime=datetime,
@@ -1043,6 +1186,11 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         datetime: Optional[str] = Query(None, description="Temporal filter (timestamp or interval)."),
         subset: Optional[str] = Query(None, description="Custom dimension filter."),
         f: str = Query("png", description="Output format: png | jpeg | geotiff."),
+        style_url: Optional[str] = Query(
+            None,
+            alias="style-url",
+            description="External SLD URL to apply to raster map rendering.",
+        ),
     ):
         """Render a map for a specific collection with an explicit style under the aligned path.
 
@@ -1077,6 +1225,7 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
             width=width,
             height=height,
             style=style_id,
+            style_url=style_url,
             bgcolor=bgcolor,
             transparent=transparent,
             datetime=datetime,

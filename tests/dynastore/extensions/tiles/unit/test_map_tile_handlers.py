@@ -109,6 +109,46 @@ def _first_item_stub() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# _get_raster_source_item
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_raster_source_item_prefers_first_item():
+    svc = _make_service()
+    svc._get_first_item = AsyncMock(return_value=_first_item_stub())
+
+    result = await svc._get_raster_source_item("cat", "coll")
+
+    assert result == _first_item_stub()
+
+
+@pytest.mark.asyncio
+async def test_get_raster_source_item_falls_back_to_collection_assets():
+    svc = _make_service()
+    svc._get_first_item = AsyncMock(return_value=None)
+
+    class _Collection:
+        def model_dump(self, **kwargs):
+            return {
+                "assets": {"data": {"href": "gs://bucket/from-collection.tif"}},
+                "links": [{"rel": "sld", "href": "https://styles/sld"}],
+            }
+
+    catalogs = AsyncMock()
+    catalogs.get_collection = AsyncMock(return_value=_Collection())
+    svc._get_catalogs_service = AsyncMock(return_value=catalogs)
+
+    result = await svc._get_raster_source_item("cat", "coll")
+
+    assert result == {
+        "assets": {"data": {"href": "gs://bucket/from-collection.tif"}},
+        "links": [{"rel": "sld", "href": "https://styles/sld"}],
+        "properties": {},
+    }
+
+
+# ---------------------------------------------------------------------------
 # _validate_style_id
 # ---------------------------------------------------------------------------
 
@@ -306,7 +346,7 @@ class TestStyleIdRe:
 
 _STYLED_DEFAULTS = dict(
     relief=None, band=1, azimuth=315.0, altitude=45.0,
-    bands=None, expression=None, rescale=None,
+    bands=None, expression=None, rescale=None, style_url=None,
 )
 
 
@@ -519,6 +559,7 @@ class TestCacheHitRedirect:
             svc._get_catalogs_service = AsyncMock(return_value=_mock_catalogs_svc())
             svc._require_collection_visible = AsyncMock()
             svc._validate_tms_and_matrix = AsyncMock(return_value=MagicMock())
+            svc._get_first_item = AsyncMock(return_value=_first_item_stub())
 
             provider = MagicMock()
             provider.get_tile_url = AsyncMock(return_value="https://storage.example.com/tile.png")

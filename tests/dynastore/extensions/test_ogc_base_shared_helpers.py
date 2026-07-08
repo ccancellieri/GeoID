@@ -28,7 +28,7 @@ DGGS services:
 All collaborators are mocked; no database is touched.
 """
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -92,11 +92,18 @@ async def test_get_first_item_returns_dict_from_pydantic_model():
             return {"id": "it1", "_kwargs": kwargs}
 
     svc = _Svc()
-    catalogs = AsyncMock()
-    catalogs.search_items = AsyncMock(return_value=[_Feature()])
-    svc._get_catalogs_service = AsyncMock(return_value=catalogs)
 
-    result = await svc._get_first_item("cat", "col")
+    class _Driver:
+        def read_entities(self, catalog_id, collection_id, **kwargs):
+            async def _items():
+                yield _Feature()
+
+            return _items()
+
+    with patch("dynastore.modules.storage.router.get_driver", AsyncMock(return_value=_Driver())) as get_driver:
+        result = await svc._get_first_item("cat", "col")
+
+    get_driver.assert_awaited_once()
 
     assert result["id"] == "it1"
     # Same model_dump kwargs the original per-service helpers used.
@@ -106,22 +113,51 @@ async def test_get_first_item_returns_dict_from_pydantic_model():
 @pytest.mark.asyncio
 async def test_get_first_item_coerces_plain_dict_feature():
     svc = _Svc()
-    catalogs = AsyncMock()
-    catalogs.search_items = AsyncMock(return_value=[{"id": "raw"}])
-    svc._get_catalogs_service = AsyncMock(return_value=catalogs)
 
-    result = await svc._get_first_item("cat", "col")
+    class _Driver:
+        def read_entities(self, catalog_id, collection_id, **kwargs):
+            async def _items():
+                yield {"id": "raw"}
+
+            return _items()
+
+    with patch("dynastore.modules.storage.router.get_driver", AsyncMock(return_value=_Driver())):
+        result = await svc._get_first_item("cat", "col")
+
     assert result == {"id": "raw"}
 
 
 @pytest.mark.asyncio
 async def test_get_first_item_none_on_empty_collection():
     svc = _Svc()
+
+    class _Driver:
+        def read_entities(self, catalog_id, collection_id, **kwargs):
+            async def _items():
+                if False:
+                    yield {}
+
+            return _items()
+
+    with patch("dynastore.modules.storage.router.get_driver", AsyncMock(return_value=_Driver())):
+        assert await svc._get_first_item("cat", "col") is None
+
+
+@pytest.mark.asyncio
+async def test_get_first_item_falls_back_to_catalog_search_when_routed_read_fails():
+    class _Feature:
+        def model_dump(self, **kwargs):
+            return {"id": "fallback", "_kwargs": kwargs}
+
+    svc = _Svc()
     catalogs = AsyncMock()
-    catalogs.search_items = AsyncMock(return_value=[])
+    catalogs.search_items = AsyncMock(return_value=[_Feature()])
     svc._get_catalogs_service = AsyncMock(return_value=catalogs)
 
-    assert await svc._get_first_item("cat", "col") is None
+    with patch("dynastore.modules.storage.router.get_driver", AsyncMock(side_effect=RuntimeError("no routed driver"))):
+        result = await svc._get_first_item("cat", "col")
+
+    assert result["id"] == "fallback"
 
 
 @pytest.mark.asyncio

@@ -1,11 +1,12 @@
 # The Tiles Extension
 
-The `tiles` extension provides **OGC API – Tiles** (vector tile serving) for
-DynaStore. It generates Mapbox Vector Tiles (MVT / PBF) on-the-fly from
-PostGIS, with a two-level cache (L1 in-process LRU, L2 GCS or PostGIS bucket)
-and full CQL2 filtering.
+The `tiles` extension provides **OGC API – Tiles** for DynaStore. It generates
+Mapbox Vector Tiles (MVT / PBF) on-the-fly from PostGIS and also serves
+TMS-aligned raster map tiles for raster collections. Vector tiles use a
+two-level cache (L1 in-process LRU, L2 GCS or PostGIS bucket) and full CQL2
+filtering; rendered raster tiles use the shared tile storage provider.
 
-For **raster tile** serving see [maps.md](maps.md).  
+For arbitrary-bbox raster maps see [maps.md](maps.md).
 For **PMTiles** (planned) see the PMTiles section of [maps.md](maps.md).
 
 ---
@@ -20,6 +21,8 @@ For **PMTiles** (planned) see the PMTiles section of [maps.md](maps.md).
 /tiles/catalogs/{dataset}/tiles/{z}/{x}/{y}.mvt           catalog-centric, default TMS
 /tiles/{dataset}/tiles/{tmsId}/{z}/{x}/{y}.{format}       vector tile with explicit TMS
 /tiles/catalogs/{dataset}/tiles/{tmsId}/{z}/{x}/{y}.{fmt} catalog-centric with TMS
+/tiles/catalogs/{dataset}/collections/{collection}/map/tiles/{tmsId}/{z}/{x}/{y}.png
+/tiles/catalogs/{dataset}/collections/{collection}/styles/{style}/map/tiles/{tmsId}/{z}/{x}/{y}.png
 /tiles/{dataset}/tiles/cache                              invalidate tile cache (DELETE)
 ```
 
@@ -95,6 +98,15 @@ Configured via `TilesPreseedConfig.storage_priority` (default `["bucket",
 | `pg` | PostGIS tile table | Direct byte fetch |
 
 Cache is populated asynchronously via `background_tasks.add_task(provider.save_tile, ...)` after every L2 miss.
+
+Raster map-tile routes render COG-backed collections through rio-tiler and then
+write rendered bytes through the same `TileStorageProtocol`. The COG source is
+resolved through routed item storage first; if a raster collection has no item
+row available to the renderer, collection-level `assets` or `item_assets` with a
+`data` or `coverage` href can provide the raster source. A requested
+`style-url=<http-or-https SLD URL>` or a preserved source `rel=sld` link
+participates in the render cache key, so changing the stylesheet URL produces a
+separate cached tile set.
 
 ### L2 bucket layout — `TilesCachingConfig`
 

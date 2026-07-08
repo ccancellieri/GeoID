@@ -168,6 +168,7 @@ async def test_preset_apply_maps_all_params() -> None:
         max_items=100,
         with_assets=False,
         skip_empty_collections=True,
+        kind="RASTER",
         drivers="pg_es",
     )
 
@@ -182,6 +183,7 @@ async def test_preset_apply_maps_all_params() -> None:
     assert inp["max_items"] == 100
     assert inp["with_assets"] is False
     assert inp["skip_empty_collections"] is True
+    assert inp["kind"] == "RASTER"
     assert inp["drivers"] == "pg_es"
 
 
@@ -718,15 +720,20 @@ def test_map_collection_preserves_existing_extent() -> None:
     assert result["extent"] == custom_extent
 
 
-def test_map_item_sets_collection_and_strips_links() -> None:
-    """map_item rewrites collection reference and drops navigation links."""
+def test_map_item_sets_collection_and_preserves_provider_links() -> None:
+    """map_item rewrites collection, drops nav links, keeps provider links."""
     from dynastore.tasks.stac_harvest.task import map_item
 
     raw = {
         "id": "item-001",
         "type": "Feature",
         "collection": "original-collection",
-        "links": [{"rel": "self", "href": "https://example.test/item-001"}],
+        "links": [
+            {"rel": "self", "href": "https://example.test/item-001"},
+            {"rel": "collection", "href": "https://example.test/collections/c1"},
+            {"rel": "sld", "href": "https://example.test/styles/item-001/sld"},
+            {"rel": "legend", "href": "https://example.test/styles/item-001/legend"},
+        ],
         "geometry": {"type": "Point", "coordinates": [12.0, 41.0]},
         "properties": {"datetime": "2024-01-01T00:00:00Z"},
         "assets": {
@@ -737,10 +744,59 @@ def test_map_item_sets_collection_and_strips_links() -> None:
 
     assert result["type"] == "Feature"
     assert result["collection"] == "target-collection", "collection must be rewritten"
-    assert "links" not in result, "links must be stripped"
+    assert result["links"] == [
+        {"rel": "sld", "href": "https://example.test/styles/item-001/sld"},
+        {"rel": "legend", "href": "https://example.test/styles/item-001/legend"},
+    ]
     # Assets are preserved on items.
     assert "assets" in result
     assert result["id"] == "item-001"
+
+
+def test_infer_collection_kind_explicit_wins() -> None:
+    from dynastore.tasks.stac_harvest.task import infer_collection_kind
+
+    assert infer_collection_kind({}, explicit_kind="RASTER") == "RASTER"
+
+
+def test_infer_collection_kind_from_raster_extension() -> None:
+    from dynastore.tasks.stac_harvest.task import infer_collection_kind
+
+    source_coll = {
+        "stac_extensions": [
+            "https://stac-extensions.github.io/raster/v1.1.0/schema.json"
+        ]
+    }
+
+    assert infer_collection_kind(source_coll) == "RASTER"
+
+
+def test_infer_collection_kind_from_first_item_cog_asset() -> None:
+    from dynastore.tasks.stac_harvest.task import infer_collection_kind
+
+    first_item = {
+        "assets": {
+            "cog": {
+                "href": "https://example.test/cog.tif",
+                "type": "image/tiff; application=geotiff",
+                "roles": ["data"],
+            }
+        }
+    }
+
+    assert infer_collection_kind({}, first_item=first_item) == "RASTER"
+
+
+def test_infer_collection_kind_ignores_projection_extension_only() -> None:
+    from dynastore.tasks.stac_harvest.task import infer_collection_kind
+
+    source_coll = {
+        "stac_extensions": [
+            "https://stac-extensions.github.io/projection/v2.0.0/schema.json"
+        ]
+    }
+
+    assert infer_collection_kind(source_coll) is None
 
 
 def test_virtual_assets_for_yields_raster_asset() -> None:

@@ -375,9 +375,17 @@ async def test_resolve_raster_cog_href_data_key(monkeypatch):
         def model_dump(self, **kwargs):
             return item
 
-    catalogs_mock = AsyncMock()
-    catalogs_mock.search_items = AsyncMock(return_value=[_FakeItem()])
-    monkeypatch.setattr(ms, "get_protocol", lambda _proto: catalogs_mock)
+    class _Driver:
+        def read_entities(self, catalog_id, collection_id, **kwargs):
+            async def _items():
+                yield _FakeItem()
+
+            return _items()
+
+    monkeypatch.setattr(
+        "dynastore.modules.storage.router.get_driver",
+        AsyncMock(return_value=_Driver()),
+    )
 
     result = await ms._resolve_raster_cog_href("cat", "coll")
     assert result == "gs://b/file.tif"
@@ -387,9 +395,17 @@ async def test_resolve_raster_cog_href_data_key(monkeypatch):
 async def test_resolve_raster_cog_href_fallback_to_any(monkeypatch):
     item = {"assets": {"thumbnail": {"href": "https://host/img.tif"}}}
 
-    catalogs_mock = AsyncMock()
-    catalogs_mock.search_items = AsyncMock(return_value=[item])
-    monkeypatch.setattr(ms, "get_protocol", lambda _proto: catalogs_mock)
+    class _Driver:
+        def read_entities(self, catalog_id, collection_id, **kwargs):
+            async def _items():
+                yield item
+
+            return _items()
+
+    monkeypatch.setattr(
+        "dynastore.modules.storage.router.get_driver",
+        AsyncMock(return_value=_Driver()),
+    )
 
     result = await ms._resolve_raster_cog_href("cat", "coll")
     assert result == "https://host/img.tif"
@@ -397,9 +413,22 @@ async def test_resolve_raster_cog_href_fallback_to_any(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_resolve_raster_cog_href_none_on_empty(monkeypatch):
+    class _Driver:
+        def read_entities(self, catalog_id, collection_id, **kwargs):
+            async def _items():
+                if False:
+                    yield {}
+
+            return _items()
+
     catalogs_mock = AsyncMock()
     catalogs_mock.search_items = AsyncMock(return_value=[])
+    catalogs_mock.get_collection = AsyncMock(return_value=None)
     monkeypatch.setattr(ms, "get_protocol", lambda _proto: catalogs_mock)
+    monkeypatch.setattr(
+        "dynastore.modules.storage.router.get_driver",
+        AsyncMock(return_value=_Driver()),
+    )
 
     result = await ms._resolve_raster_cog_href("cat", "coll")
     assert result is None
@@ -408,8 +437,46 @@ async def test_resolve_raster_cog_href_none_on_empty(monkeypatch):
 @pytest.mark.asyncio
 async def test_resolve_raster_cog_href_none_when_no_protocol(monkeypatch):
     monkeypatch.setattr(ms, "get_protocol", lambda _proto: None)
+    monkeypatch.setattr(
+        "dynastore.modules.storage.router.get_driver",
+        AsyncMock(side_effect=RuntimeError("no routed driver")),
+    )
     result = await ms._resolve_raster_cog_href("cat", "coll")
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_raster_cog_href_falls_back_to_collection_assets(monkeypatch):
+    class _Driver:
+        def read_entities(self, catalog_id, collection_id, **kwargs):
+            async def _items():
+                if False:
+                    yield {}
+
+            return _items()
+
+    class _Collection:
+        def model_dump(self, **kwargs):
+            return {
+                "assets": {
+                    "data": {
+                        "href": "gs://bucket/collection-data.tif",
+                        "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+                    }
+                }
+            }
+
+    catalogs_mock = AsyncMock()
+    catalogs_mock.search_items = AsyncMock(return_value=[])
+    catalogs_mock.get_collection = AsyncMock(return_value=_Collection())
+    monkeypatch.setattr(ms, "get_protocol", lambda _proto: catalogs_mock)
+    monkeypatch.setattr(
+        "dynastore.modules.storage.router.get_driver",
+        AsyncMock(return_value=_Driver()),
+    )
+
+    result = await ms._resolve_raster_cog_href("cat", "coll")
+    assert result == "gs://bucket/collection-data.tif"
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +561,7 @@ async def test_render_raster_map_happy_path(monkeypatch):
         width=256,
         height=256,
         style_name=None,
+        style_url=None,
         fmt="png",
         request=_mock_request(),
     )
@@ -517,6 +585,7 @@ async def test_render_raster_map_hidden_collection_returns_404(monkeypatch):
             width=64,
             height=64,
             style_name=None,
+            style_url=None,
             fmt="png",
             request=_mock_request(),
         )
@@ -547,6 +616,7 @@ async def test_render_raster_map_no_items_returns_404(monkeypatch):
             width=32,
             height=32,
             style_name=None,
+            style_url=None,
             fmt="png",
             request=_mock_request(),
         )
@@ -569,6 +639,7 @@ async def test_render_raster_map_rio_tiler_unavailable_returns_422(monkeypatch):
             width=32,
             height=32,
             style_name=None,
+            style_url=None,
             fmt="png",
             request=_mock_request(),
         )
@@ -603,6 +674,7 @@ async def test_render_raster_map_format_jpeg(monkeypatch):
         width=128,
         height=128,
         style_name=None,
+        style_url=None,
         fmt="jpeg",
         request=_mock_request(),
     )
@@ -658,6 +730,7 @@ async def test_render_raster_map_uses_internal_id_for_item_lookup(monkeypatch):
         width=64,
         height=64,
         style_name=None,
+        style_url=None,
         fmt="png",
         request=_mock_request(),
     )

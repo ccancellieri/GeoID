@@ -395,10 +395,37 @@ class OGCServiceMixin:
         """Return the first item in a collection as a plain dict, or None."""
         from dynastore.models.query_builder import QueryRequest
 
+        query = QueryRequest(limit=1)
+        try:
+            from dynastore.modules.storage.hints import Hint
+            from dynastore.modules.storage.router import get_driver
+            from dynastore.modules.storage.routing_config import Operation
+
+            driver = await get_driver(
+                Operation.READ,
+                catalog_id,
+                collection_id,
+                hints=frozenset({Hint.GEOMETRY_EXACT}),
+            )
+            async for first in driver.read_entities(
+                catalog_id, collection_id, request=query, limit=1
+            ):
+                if hasattr(first, "model_dump"):
+                    return first.model_dump(by_alias=True, exclude_none=True)
+                return dict(first)
+            return None
+        except Exception:
+            logger.debug(
+                "OGC first-item routed read failed for %s/%s; falling back to CatalogsProtocol",
+                catalog_id,
+                collection_id,
+                exc_info=True,
+            )
+
         catalogs = await self._get_catalogs_service()
         try:
             features = await catalogs.search_items(
-                catalog_id, collection_id, QueryRequest(limit=1)
+                catalog_id, collection_id, query
             )
         except Exception:
             return None
