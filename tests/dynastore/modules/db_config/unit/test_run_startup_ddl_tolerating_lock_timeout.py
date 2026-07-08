@@ -104,6 +104,42 @@ async def test_lock_timeout_falls_back_to_unlocked_ddl_instead_of_raising(
 
 
 @pytest.mark.asyncio
+async def test_lock_timeout_inside_unlocked_fallback_is_tolerated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second lock-timeout while replaying fallback DDL must not abort startup."""
+    monkeypatch.setattr(
+        locking_tools,
+        "acquire_startup_lock",
+        _make_raising_acquire_startup_lock(
+            LockNotAvailableError("canceling statement due to lock timeout")
+        ),
+    )
+
+    fake_conn = object()
+
+    @asynccontextmanager
+    async def _fake_managed_transaction(engine: Any):
+        yield fake_conn
+
+    monkeypatch.setattr(locking_tools, "managed_transaction", _fake_managed_transaction)
+
+    seen_conns = []
+
+    async def _ddl_body(conn: Any) -> None:
+        seen_conns.append(conn)
+        raise LockNotAvailableError("canceling statement due to lock timeout")
+
+    await locking_tools.run_startup_ddl_tolerating_lock_timeout(
+        engine=object(),
+        lock_key="some_module_storage_init",
+        ddl_body=_ddl_body,
+    )
+
+    assert seen_conns == [fake_conn]
+
+
+@pytest.mark.asyncio
 async def test_inner_ddl_advisory_wait_is_skipped_inside_startup_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

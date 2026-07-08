@@ -27,6 +27,13 @@ table. All DDL is issued as `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT
 EXISTS` and is idempotent on re-entry. Schema is established at module startup
 or at provision time.
 
+Startup DDL helpers use advisory locks to reduce concurrent bootstrap work.
+When a lock wait times out during process startup, the helper replays the same
+idempotent DDL without the startup lock rather than failing the service boot. If
+the replay also sees a PostgreSQL lock timeout, startup continues to the
+caller's explicit readiness or post-condition checks; non-lock errors still
+propagate.
+
 ### Platform tables (`configs` schema)
 
 `PlatformConfigService.initialize_storage` (called from `ensure_init_db` during

@@ -1003,7 +1003,11 @@ async def run_startup_ddl_tolerating_lock_timeout(
     unlocked: idempotent ``CREATE ... IF NOT EXISTS`` DDL already tolerates
     the resulting concurrent-DDL "already exists" races. So on a lock-timeout
     we log a WARNING and run the same idempotent DDL on a fresh, unlocked
-    transaction instead of aborting startup.
+    transaction instead of aborting startup. If that unlocked replay also hits
+    a lock-timeout, a peer or hot relation is still applying equivalent
+    idempotent DDL; we log and continue so startup can reach the caller's
+    explicit readiness/post-condition checks instead of failing inside the
+    contention window.
 
     Any other exception (a genuine connectivity failure, a bug in the DDL
     itself, etc.) is NOT swallowed — it propagates as before.
@@ -1037,9 +1041,19 @@ async def run_startup_ddl_tolerating_lock_timeout(
         startup_ddl_unlocked_fallback_scope,
     )
 
-    async with managed_transaction(engine) as unlocked_conn:
-        with startup_ddl_unlocked_fallback_scope():
-            await ddl_body(unlocked_conn)
+    try:
+        async with managed_transaction(engine) as unlocked_conn:
+            with startup_ddl_unlocked_fallback_scope():
+                await ddl_body(unlocked_conn)
+    except Exception as exc:
+        if not is_lock_not_available_error(exc):
+            raise
+        logger.warning(
+            "Startup DDL %r still hit a lock timeout while replaying unlocked; "
+            "assuming a peer or hot relation is applying equivalent idempotent "
+            "DDL and continuing startup: %s",
+            lock_key, exc,
+        )
 
 
 @asynccontextmanager
