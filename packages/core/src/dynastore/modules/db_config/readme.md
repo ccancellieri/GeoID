@@ -115,6 +115,17 @@ applies at all levels and is enforced by design; no migration runner bypasses it
 
 ---
 
+## Startup DDL Peer Races
+
+`DDLQuery` wraps idempotent startup DDL with advisory-lock coordination plus an
+existence re-check. If a concurrent worker wins a catalog race, PostgreSQL may
+raise either a duplicate-object SQLSTATE or the internal `tuple concurrently
+updated` catalog error for `CREATE OR REPLACE` statements. Those errors are
+treated as success only when the inferred existence check confirms the object is
+now present; unrelated internal database errors still propagate.
+
+---
+
 ## AsyncPG Pooler Safety
 
 Async SQLAlchemy engines that run through PgBouncer-style or AlloyDB connection

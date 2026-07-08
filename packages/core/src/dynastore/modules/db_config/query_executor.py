@@ -312,6 +312,10 @@ _DUPLICATE_OBJECT_PGCODES = frozenset({
     "42710",  # duplicate_object (general — types, functions, etc.)
     "23505",  # unique_violation (catches pg_namespace_nspname_index races)
 })
+_DDL_PEER_RACE_INTERNAL_PGCODE = "XX000"
+_DDL_PEER_RACE_MESSAGE_FRAGMENTS = frozenset({
+    "tuple concurrently updated",
+})
 
 
 def _is_duplicate_object_error(exc: Optional[BaseException]) -> bool:
@@ -328,6 +332,10 @@ def _is_duplicate_object_error(exc: Optional[BaseException]) -> bool:
         pgcode = getattr(candidate, "pgcode", None) or getattr(candidate, "sqlstate", None)
         if pgcode in _DUPLICATE_OBJECT_PGCODES:
             return True
+        if pgcode == _DDL_PEER_RACE_INTERNAL_PGCODE:
+            msg = str(candidate).lower()
+            if any(fragment in msg for fragment in _DDL_PEER_RACE_MESSAGE_FRAGMENTS):
+                return True
         candidate = getattr(candidate, "orig", None) or getattr(candidate, "__cause__", None)
     return False
 

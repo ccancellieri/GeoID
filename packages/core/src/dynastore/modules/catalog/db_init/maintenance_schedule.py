@@ -119,12 +119,12 @@ _RECLAIM_STALE_JOBS = DQLQuery(
         last_error    = 'reclaimed: running_since stale',
         last_rows     = 0
     WHERE running_since IS NOT NULL
-      AND running_since < :now - (
+      AND running_since < :now - make_interval(secs => (
           LEAST(
               :max_stale_after_seconds,
               GREATEST(:min_stale_after_seconds, interval_seconds * :stale_multiplier)
-          ) * INTERVAL '1 second'
-      )
+          )
+      ))
     """,
     result_handler=ResultHandler.ROWCOUNT,
 )

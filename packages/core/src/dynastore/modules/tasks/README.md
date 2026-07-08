@@ -145,7 +145,8 @@ On startup `TasksModule` (priority=15, before `CatalogModule` at 20):
 1. Acquires an advisory lock for the duration of all DDL — prevents concurrent-revision
    races on rolling deploys. If that outer startup lock times out, the module
    replays idempotent startup DDL in a scoped fallback that skips only the nested
-   per-query advisory wait; ordinary DDL errors still fail startup.
+   per-query advisory wait. Verified idempotent peer races are tolerated after a
+   successful existence re-check; ordinary DDL errors still fail startup.
 2. Creates the `tasks` table, indexes, pg_notify triggers, and the DEFAULT
    partition if absent. Warm starts also repair `tasks.tasks_default` with a
    separate `to_regclass` check so the sentinel-skipped DDL batch cannot leave
@@ -159,7 +160,8 @@ Periodic task maintenance is driven by `tasks.maintenance_schedule`; it is the
 single scheduler table for the in-process maintenance supervisor. Each row has a
 `job_name`, cadence (`interval_seconds`), the latest run outcome, and
 `running_since` while a leader is executing it. The supervisor reclaims stale
-`running_since` values with a row-derived threshold:
+`running_since` values by comparing them to `now - make_interval(...)` with a
+row-derived threshold:
 `min(600s, max(180s, interval_seconds * 3))`. Short-cadence jobs such as
 `task_reaper` recover after about three minutes; daily jobs still recover within
 ten minutes.

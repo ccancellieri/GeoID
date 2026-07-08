@@ -60,8 +60,13 @@ from dynastore.modules.db_config.query_executor import (
 class _PgErr(Exception):
     """Test-only stand-in for asyncpg.PostgresError carrying ``pgcode``."""
 
-    def __init__(self, pgcode: str | None = None, sqlstate: str | None = None):
-        super().__init__(f"pg error pgcode={pgcode} sqlstate={sqlstate}")
+    def __init__(
+        self,
+        pgcode: str | None = None,
+        sqlstate: str | None = None,
+        message: str | None = None,
+    ):
+        super().__init__(message or f"pg error pgcode={pgcode} sqlstate={sqlstate}")
         if pgcode is not None:
             self.pgcode = pgcode
         if sqlstate is not None:
@@ -95,6 +100,21 @@ def test_is_duplicate_object_error_walks_cause_chain() -> None:
 
 def test_is_duplicate_object_error_false_for_unrelated_pgcode() -> None:
     inner = _PgErr(pgcode="42501")  # permission denied
+    outer = Exception("wrapped")
+    setattr(outer, "orig", inner)
+    assert not _is_duplicate_object_error(outer)
+
+
+def test_is_duplicate_object_error_detects_tuple_concurrently_updated_race() -> None:
+    """PostgreSQL may surface concurrent CREATE OR REPLACE FUNCTION as XX000."""
+    inner = _PgErr(pgcode="XX000", message="tuple concurrently updated")
+    outer = Exception("wrapped")
+    setattr(outer, "orig", inner)
+    assert _is_duplicate_object_error(outer)
+
+
+def test_is_duplicate_object_error_false_for_unrelated_internal_error() -> None:
+    inner = _PgErr(pgcode="XX000", message="cache lookup failed for function 123")
     outer = Exception("wrapped")
     setattr(outer, "orig", inner)
     assert not _is_duplicate_object_error(outer)
@@ -142,6 +162,21 @@ async def test_async_recovery_returns_true_when_peer_wins() -> None:
 
     assert result is True
     existence_mock.assert_awaited_once_with(conn, {})
+
+
+@pytest.mark.asyncio
+async def test_async_recovery_accepts_tuple_concurrently_updated_peer_race() -> None:
+    existence_mock = AsyncMock(return_value=True)
+    existence_mock._needs_raw_params = False
+    executor = _make_executor(existence_mock)
+
+    inner = _PgErr(pgcode="XX000", message="tuple concurrently updated")
+    exc = Exception("wrapped")
+    setattr(exc, "orig", inner)
+
+    result = await executor._try_peer_race_recovery_async(MagicMock(), {}, exc)
+
+    assert result is True
 
 
 @pytest.mark.asyncio
