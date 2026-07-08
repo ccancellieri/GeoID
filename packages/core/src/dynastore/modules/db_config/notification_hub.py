@@ -59,6 +59,7 @@ async def run_notification_hub(
     engine,
     shutdown_event: asyncio.Event,
     poll_timeout: float = 30.0,
+    db_config=None,
 ) -> None:
     """Run the single shared LISTEN bridge for all registered channels.
 
@@ -74,18 +75,42 @@ async def run_notification_hub(
     the set grows, rather than snapshotting once and missing late registrants.
     Rebuilds are rare (only as new modules boot) and cheap (one reconnect).
     """
+    from dynastore.modules.db_config.db_timeout_config import (
+        create_listen_engine,
+        is_transaction_pooler,
+    )
     from dynastore.modules.db_config.query_executor import is_async_resource
 
-    if not is_async_resource(engine):
+    listen_engine = create_listen_engine(db_config) if db_config is not None else None
+    bridge_engine = listen_engine or engine
+    pooler_without_direct_listener = (
+        db_config is not None
+        and is_transaction_pooler(db_config)
+        and listen_engine is None
+    )
+
+    async def _run_periodic_signal_mode(reason: str) -> None:
         # Sync engine (e.g. tests / sync-only jobs): no asyncpg add_listener.
         # Emit periodic wakes for whatever is registered so health-beat-driven
         # consumers still converge.
-        logger.info("NotificationHub: sync engine — periodic signal mode.")
+        logger.info("NotificationHub: %s — periodic signal mode.", reason)
         while not shutdown_event.is_set():
             await asyncio.sleep(poll_timeout)
             for ch in registered_listen_channels():
                 await signal_bus.emit(ch)
         logger.info("NotificationHub: stopped.")
+
+    if pooler_without_direct_listener:
+        logger.warning(
+            "NotificationHub: DB_POOLING_MODE=transaction_pooler but "
+            "DB_LISTEN_DATABASE_URL is not set; LISTEN/NOTIFY cannot use a "
+            "transaction-pooled session, so falling back to periodic signals."
+        )
+        await _run_periodic_signal_mode("transaction pooler without direct listener")
+        return
+
+    if not is_async_resource(bridge_engine):
+        await _run_periodic_signal_mode("sync engine")
         return
 
     active_channels: list[str] = []
@@ -118,7 +143,7 @@ async def run_notification_hub(
                     transform=build_registry_transform(),
                 )
                 bridge_task = asyncio.create_task(
-                    bridge.run(engine), name="pg_listen_bridge"
+                    bridge.run(bridge_engine), name="pg_listen_bridge"
                 )
                 logger.info(
                     "NotificationHub: LISTEN bridge (re)started for %s.",
@@ -135,6 +160,8 @@ async def run_notification_hub(
         logger.info("NotificationHub: cancelled.")
     finally:
         await _stop_bridge()
+        if listen_engine is not None:
+            await listen_engine.dispose()
 
     logger.info("NotificationHub: stopped.")
 
@@ -147,10 +174,14 @@ class NotificationHubService:
     pod_policy = PodPolicy.SKIP_EPHEMERAL
     lock_key: Optional[Union[int, str]] = None
 
-    def __init__(self, *, poll_timeout: float = 30.0) -> None:
+    def __init__(self, *, poll_timeout: float = 30.0, db_config=None) -> None:
         self._poll_timeout = poll_timeout
+        self._db_config = db_config
 
     async def run(self, ctx: ServiceContext) -> None:
         await run_notification_hub(
-            ctx.engine, ctx.shutdown, poll_timeout=self._poll_timeout,
+            ctx.engine,
+            ctx.shutdown,
+            poll_timeout=self._poll_timeout,
+            db_config=self._db_config,
         )

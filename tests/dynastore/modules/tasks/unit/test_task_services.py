@@ -101,18 +101,48 @@ class TestNotificationHubService:
 
         calls: list = []
 
-        async def _fake_hub(engine, shutdown, poll_timeout):
-            calls.append({"engine": engine, "poll_timeout": poll_timeout})
+        async def _fake_hub(engine, shutdown, poll_timeout, db_config=None):
+            calls.append(
+                {
+                    "engine": engine,
+                    "poll_timeout": poll_timeout,
+                    "db_config": db_config,
+                }
+            )
 
         monkeypatch.setattr(hub_mod, "run_notification_hub", _fake_hub)
 
-        svc = NotificationHubService(poll_timeout=7.5)
+        db_config = object()
+        svc = NotificationHubService(poll_timeout=7.5, db_config=db_config)
         ctx = _ctx()
         await svc.run(ctx)
 
         assert len(calls) == 1
         assert calls[0]["engine"] is ctx.engine
         assert calls[0]["poll_timeout"] == 7.5
+        assert calls[0]["db_config"] is db_config
+
+    @pytest.mark.asyncio
+    async def test_transaction_pooler_without_listen_url_uses_periodic_mode(
+        self, caplog
+    ):
+        from dynastore.modules.db_config.notification_hub import run_notification_hub
+
+        class C:
+            db_pooling_mode = "transaction_pooler"
+            listen_database_url = ""
+
+        shutdown = asyncio.Event()
+        shutdown.set()
+
+        await run_notification_hub(
+            object(),
+            shutdown,
+            poll_timeout=0.01,
+            db_config=C,
+        )
+
+        assert "DB_LISTEN_DATABASE_URL is not set" in caplog.text
 
 
 # ---------------------------------------------------------------------------

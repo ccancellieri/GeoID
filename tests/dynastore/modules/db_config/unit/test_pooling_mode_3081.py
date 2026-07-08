@@ -236,3 +236,49 @@ def test_task_connect_args_disable_asyncpg_statement_caches_in_all_modes():
         assert connect_args["prepared_statement_cache_size"] == 0
         assert connect_args["statement_cache_size"] == 0
         assert callable(connect_args["prepared_statement_name_func"])
+
+
+# --------------------------------------------------------------------------- #
+# LISTEN engine for transaction-pooler deployments                            #
+# --------------------------------------------------------------------------- #
+def test_create_listen_engine_returns_none_without_direct_url():
+    assert t.create_listen_engine(_pooler()) is None
+
+
+def test_create_listen_engine_uses_direct_url_and_pooler_safe_args(monkeypatch):
+    import sqlalchemy.ext.asyncio as sa_async
+    import dynastore.modules.db.db_service as db_service
+
+    class C(_Cfg):
+        db_pooling_mode = "transaction_pooler"
+        listen_database_url = "postgresql://u:p@direct-host:5432/db"
+        connect_timeout = 7
+
+    sentinel = object()
+    captured: dict = {}
+
+    def _fake_create_async_engine(url, **kwargs):  # noqa: ANN001
+        captured["url"] = str(url)
+        captured["kwargs"] = kwargs
+        return sentinel
+
+    armed: list = []
+
+    monkeypatch.setattr(sa_async, "create_async_engine", _fake_create_async_engine)
+    monkeypatch.setattr(
+        db_service,
+        "_arm_client_socket_keepalive",
+        lambda engine, cfg: armed.append((engine, cfg)),
+    )
+
+    assert t.create_listen_engine(C) is sentinel
+    assert armed == [(sentinel, C)]
+    assert captured["url"] == "postgresql+asyncpg://u:p@direct-host:5432/db"
+    assert captured["kwargs"]["poolclass"].__name__ == "NullPool"
+
+    connect_args = captured["kwargs"]["connect_args"]
+    assert connect_args["timeout"] == 7
+    assert connect_args["prepared_statement_cache_size"] == 0
+    assert connect_args["statement_cache_size"] == 0
+    assert callable(connect_args["prepared_statement_name_func"])
+    assert list(connect_args["server_settings"].keys()) == ["application_name"]

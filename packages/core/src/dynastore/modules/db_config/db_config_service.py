@@ -175,7 +175,10 @@ class DBConfigModule(ModuleProtocol):
         # channel registry and (re)builds the bridge as later modules register
         # their channels at their own lifespan priorities.
         supervisor.register(
-            NotificationHubService(poll_timeout=reload_interval_seconds)
+            NotificationHubService(
+                poll_timeout=reload_interval_seconds,
+                db_config=app_state.db_config,
+            )
         )
 
         engine = (

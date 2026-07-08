@@ -122,6 +122,15 @@ remains the default for direct PostgreSQL/AlloyDB connections, while
 `transaction_pooler` enables the transaction-pooler startup-parameter behavior.
 Sync psycopg/libpq engines do not use asyncpg statement-cache settings.
 
+The shared notification hub has one extra rule: PostgreSQL `LISTEN` is
+session-scoped, so it must not borrow a transaction-pooled serving connection.
+When `DB_POOLING_MODE=transaction_pooler`, set `DB_LISTEN_DATABASE_URL` to a
+direct PostgreSQL/AlloyDB DSN if sub-second cross-pod wakeups are required. If
+that value is unset, the hub logs a warning and falls back to its periodic
+health-beat signals; request/task DB traffic still uses `DATABASE_URL` normally.
+In `direct` mode, the existing serving engine remains valid for LISTEN unless a
+dedicated listener URL is configured.
+
 ---
 
 ## See Also

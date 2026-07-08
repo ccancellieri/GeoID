@@ -356,6 +356,13 @@ class DBConfig:
     #     keepalives are still armed client-side). Set this on the deployed
     #     dev/review/prod services whose DATABASE_URL points at the pooler port.
     db_pooling_mode: str = _cfg_str("DB_POOLING_MODE", "direct")
+    # Optional direct PostgreSQL/AlloyDB DSN used only by the long-lived
+    # LISTEN/NOTIFY bridge. Transaction-mode poolers do not preserve LISTEN
+    # session state across transactions, so deployments whose DATABASE_URL
+    # points at a transaction pooler should set this to a direct backend URL if
+    # sub-second cross-pod wakeups are required. When unset, the bridge falls
+    # back to its health-beat polling path instead of using the pooler.
+    listen_database_url: str = _cfg_str("DB_LISTEN_DATABASE_URL", "")
 
     def validate_pool_sizing(self) -> None:
         """Make a dangerously-small pool LOUD and SAFE at startup.

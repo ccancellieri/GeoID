@@ -359,3 +359,44 @@ def create_task_engine(db_config) -> Any:
 
     _arm_client_socket_keepalive(engine, db_config)
     return engine
+
+
+def create_listen_engine(db_config) -> Optional[Any]:
+    """Build the optional direct, ``NullPool`` async engine used only for
+    PostgreSQL LISTEN/NOTIFY.
+
+    Transaction-mode poolers multiplex server sessions per transaction and do
+    not preserve the session-level ``LISTEN`` state the bridge needs. When
+    ``DB_LISTEN_DATABASE_URL`` is configured, the notification hub uses this
+    one-connection direct engine for LISTEN while normal request traffic can
+    keep using ``DATABASE_URL`` through the pooler. When it is unset, callers
+    should fall back to periodic health-beat signalling.
+    """
+    listen_url = str(getattr(db_config, "listen_database_url", "") or "").strip()
+    if not listen_url:
+        return None
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from dynastore.modules.db_config.instance import get_stamped_application_name
+    from dynastore.modules.db_config.tools import normalize_db_url
+
+    engine = create_async_engine(
+        normalize_db_url(listen_url, is_async=True),
+        poolclass=NullPool,
+        connect_args={
+            "timeout": db_config.connect_timeout,
+            "prepared_statement_cache_size": 0,
+            "statement_cache_size": 0,
+            "prepared_statement_name_func": lambda: f"__asyncpg_{uuid4()}__",
+            "server_settings": {
+                "application_name": get_stamped_application_name(),
+            },
+        },
+    )
+    # Local import avoids a module-load cycle (db_service imports this module).
+    from dynastore.modules.db.db_service import _arm_client_socket_keepalive
+
+    _arm_client_socket_keepalive(engine, db_config)
+    return engine

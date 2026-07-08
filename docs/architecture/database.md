@@ -53,6 +53,15 @@ DynaStore runs two **independent** database stacks. They share configuration (vi
 - **I/O-bound streaming workers.** Cloud Run Jobs whose hot path is server-side cursor streaming (export_features, dwh_join) use `task_base_async` instead of `task_base`. This installs `asyncpg` (via `module_db`) and `psycopg3` (via `module_events` for LISTEN/NOTIFY), but not `psycopg2-binary`: `db_sync`/`module_datastore` are excluded, `module_storage_postgresql` is an empty marker, and neither `pyiceberg[sql-postgres]` nor any other dep in these extras pulls psycopg2. `DatastoreModule` (psycopg2-backed) is absent from the image; discovery silently skips it via the same ImportError guard as async-only test runs. `AsyncConnection.stream()` works natively without `asyncio.to_thread` workarounds.
 - **CPU-bound workers.** Cloud Run Jobs where compute dominates (ingestion/GDAL, gdal, tiles_preseed/morecantile, dimensions_materialize) use `psycopg2` only. A job is a one-shot, single-threaded process; a second async pool gives no concurrency win and doubles pool footprint per execution. **These jobs intentionally do not install `asyncpg`.**
 
+When an async service points `DATABASE_URL` at a transaction-mode pooler, set
+`DB_POOLING_MODE=transaction_pooler`. That mode keeps asyncpg startup parameters
+pooler-safe and reapplies lock-safety timeouts at transaction start. PostgreSQL
+`LISTEN` is different because it is session-scoped: if low-latency cross-pod
+notifications are required through the shared notification hub, configure
+`DB_LISTEN_DATABASE_URL` with a direct backend DSN. Without it, the hub uses its
+periodic health-beat fallback instead of attaching LISTEN to a transaction
+pooler session.
+
 ### Import-time isolation (load-bearing invariant)
 
 The two stacks are isolated at *import time*, not only at runtime. The shared `db_config` module loads in **both** environments and is responsible for populating `app_state.db_config`, which the sync `DatastoreModule` reads on lifespan startup. Therefore:
