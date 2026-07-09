@@ -33,6 +33,7 @@ from dynastore.modules import (
     discover_modules,
     instantiate_modules,
     get_protocol,
+    get_protocols,
 )
 from dynastore.extensions.lifespan import lifespan as extensions_lifespan
 from dynastore._version import VERSION, get_build_info
@@ -577,13 +578,26 @@ async def readiness_check():
     # --- PostgreSQL ---
     try:
         from dynastore.models.protocols.database import DatabaseProtocol
-        db = get_protocol(DatabaseProtocol)
-        if db is None or db.async_engine is None:
+
+        # Providers are sorted ascending by `priority`, so the first one does
+        # not necessarily hold the async engine: on services that load the sync
+        # DatastoreModule (priority 7) it precedes DBService (priority 10) and
+        # always reports `async_engine` as None. Probing only that leader would
+        # report "disabled" — which leaves the status code at 200 — and a dead
+        # database would be announced as ready. Walk the providers for the async
+        # engine, as protocol_helpers.get_engine() does for the same reason.
+        async_engine = None
+        for provider in get_protocols(DatabaseProtocol):
+            async_engine = provider.async_engine
+            if async_engine is not None:
+                break
+
+        if async_engine is None:
             deps["postgres"] = {"status": "disabled"}
         else:
             from sqlalchemy import text as sa_text
             async with asyncio.timeout(2):
-                async with db.async_engine.connect() as conn:
+                async with async_engine.connect() as conn:
                     await conn.execute(sa_text("SELECT 1"))
             deps["postgres"] = {"status": "ok"}
     except TimeoutError as exc:

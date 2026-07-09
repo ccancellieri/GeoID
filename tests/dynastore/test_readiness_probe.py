@@ -45,7 +45,7 @@ async def test_ready_503_when_pg_raises():
     mock_db.async_engine = mock_engine
 
     with (
-        patch("dynastore.main.get_protocol", return_value=mock_db),
+        patch("dynastore.main.get_protocols", return_value=[mock_db]),
         patch("dynastore.modules.elasticsearch.client.get_client", return_value=None),
         patch("dynastore.tools.cache_valkey._CACHE_DEPS_OK", False),
     ):
@@ -72,7 +72,7 @@ async def test_ready_200_when_pg_ok():
     mock_db.async_engine = mock_engine
 
     with (
-        patch("dynastore.main.get_protocol", return_value=mock_db),
+        patch("dynastore.main.get_protocols", return_value=[mock_db]),
         patch("dynastore.modules.elasticsearch.client.get_client", return_value=None),
         patch("dynastore.tools.cache_valkey._CACHE_DEPS_OK", False),
     ):
@@ -90,7 +90,7 @@ async def test_ready_200_when_pg_ok():
 async def test_ready_postgres_disabled_when_no_db_protocol():
     """postgres reported as disabled when DatabaseProtocol returns None."""
     with (
-        patch("dynastore.main.get_protocol", return_value=None),
+        patch("dynastore.main.get_protocols", return_value=[]),
         patch("dynastore.modules.elasticsearch.client.get_client", return_value=None),
         patch("dynastore.tools.cache_valkey._CACHE_DEPS_OK", False),
     ):
@@ -100,6 +100,70 @@ async def test_ready_postgres_disabled_when_no_db_protocol():
     body = json.loads(resp.body)
     assert body["dependencies"]["postgres"]["status"] == "disabled"
     assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_ready_probes_the_provider_that_owns_the_async_engine():
+    """The sync provider sorting first must not mask the async engine.
+
+    Several modules implement DatabaseProtocol and `get_protocols` sorts them
+    ascending by `priority`. On services that load DatastoreModule (priority 7)
+    it precedes DBService (priority 10) and reports `async_engine is None`, so
+    probing only the first provider reports postgres as "disabled" — and, since
+    "disabled" leaves the status code at 200, a genuinely dead database would
+    still be announced as ready.
+    """
+    sync_only = MagicMock()          # DatastoreModule: priority 7, sync engine only
+    sync_only.async_engine = None
+
+    mock_conn = AsyncMock()
+    mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_conn.__aexit__ = AsyncMock(return_value=False)
+    mock_conn.execute = AsyncMock(return_value=None)
+
+    mock_engine = MagicMock()
+    mock_engine.connect.return_value = mock_conn
+
+    async_capable = MagicMock()      # DBService: priority 10, owns the async engine
+    async_capable.async_engine = mock_engine
+
+    with (
+        patch("dynastore.main.get_protocols", return_value=[sync_only, async_capable]),
+        patch("dynastore.modules.elasticsearch.client.get_client", return_value=None),
+        patch("dynastore.tools.cache_valkey._CACHE_DEPS_OK", False),
+    ):
+        resp = await _call_readiness()
+
+    import json
+    body = json.loads(resp.body)
+    assert body["dependencies"]["postgres"]["status"] == "ok"
+    assert resp.status_code == 200
+    mock_engine.connect.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_ready_503_when_async_provider_is_down_behind_a_sync_provider():
+    """A dead database must surface as 503 even when a sync-only provider leads."""
+    sync_only = MagicMock()
+    sync_only.async_engine = None
+
+    dead_engine = MagicMock()
+    dead_engine.connect.side_effect = ConnectionRefusedError("PG unreachable")
+
+    async_capable = MagicMock()
+    async_capable.async_engine = dead_engine
+
+    with (
+        patch("dynastore.main.get_protocols", return_value=[sync_only, async_capable]),
+        patch("dynastore.modules.elasticsearch.client.get_client", return_value=None),
+        patch("dynastore.tools.cache_valkey._CACHE_DEPS_OK", False),
+    ):
+        resp = await _call_readiness()
+
+    assert resp.status_code == 503
+    import json
+    body = json.loads(resp.body)
+    assert body["dependencies"]["postgres"]["status"] == "failed"
 
 
 # ── Elasticsearch ─────────────────────────────────────────────────────────────
@@ -122,7 +186,7 @@ async def test_ready_503_when_es_raises():
     mock_db.async_engine = mock_engine
 
     with (
-        patch("dynastore.main.get_protocol", return_value=mock_db),
+        patch("dynastore.main.get_protocols", return_value=[mock_db]),
         patch(
             "dynastore.modules.elasticsearch.client.get_client",
             return_value=mock_es,
@@ -161,7 +225,7 @@ async def test_ready_200_all_deps_ok():
     mock_manager.get_async_backend.return_value = mock_valkey
 
     with (
-        patch("dynastore.main.get_protocol", return_value=mock_db),
+        patch("dynastore.main.get_protocols", return_value=[mock_db]),
         patch(
             "dynastore.modules.elasticsearch.client.get_client",
             return_value=mock_es,
@@ -195,7 +259,7 @@ async def test_ready_503_when_draining():
     set_draining()
     try:
         with (
-            patch("dynastore.main.get_protocol", return_value=None),
+            patch("dynastore.main.get_protocols", return_value=[]),
             patch("dynastore.modules.elasticsearch.client.get_client", return_value=None),
             patch("dynastore.tools.cache_valkey._CACHE_DEPS_OK", False),
         ):
