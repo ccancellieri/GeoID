@@ -189,3 +189,85 @@ async def test_reset_hook_skips_execute_when_reset_query_is_empty() -> None:
     conn = _FakeAsyncpgConnection(reset_query="")
     await reset_hook(conn)
     assert conn.executed == []
+
+
+# --------------------------------------------------------------------------- #
+# #3143 -- lock-safety net for transaction-pooler mode: a ``connection_class``#
+# subclass injects the #3081 ``SET LOCAL`` guard inside every transaction    #
+# (this raw asyncpg pool has no SQLAlchemy begin-listener to hang it off of, #
+# and session state applied outside a transaction is not guaranteed to       #
+# follow the caller across statements on a transaction pooler).              #
+# --------------------------------------------------------------------------- #
+async def test_engine_init_uses_default_connection_class_in_direct_mode() -> None:
+    """Direct mode: the timeouts already rode the startup packet's
+    ``server_settings``, so no per-transaction guard is wired and the pool
+    keeps asyncpg's default connection class."""
+    cfg = PostgresqlEngineConfig()
+    with patch(
+        "dynastore.modules.db_config.db_config.DBConfig.db_pooling_mode",
+        "direct",
+    ), patch(
+        "asyncpg.create_pool", new_callable=AsyncMock
+    ) as mock_create_pool:
+        await cfg.engine_init()
+
+    assert "connection_class" not in mock_create_pool.call_args.kwargs
+
+
+async def test_engine_init_wires_lock_guarded_connection_class_in_pooler_mode() -> None:
+    """Transaction-pooler mode: the lock-safety GUCs were dropped from
+    ``server_settings`` (the pooler rejects them as startup params), so every
+    transaction on this pool must re-apply them via ``SET LOCAL`` after
+    ``BEGIN`` -- wired through a dedicated ``connection_class``."""
+    import asyncpg
+
+    cfg = PostgresqlEngineConfig()
+    with patch(
+        "dynastore.modules.db_config.db_config.DBConfig.db_pooling_mode",
+        "transaction_pooler",
+    ), patch(
+        "asyncpg.create_pool", new_callable=AsyncMock
+    ) as mock_create_pool:
+        await cfg.engine_init()
+
+    conn_cls = mock_create_pool.call_args.kwargs["connection_class"]
+    assert issubclass(conn_cls, asyncpg.Connection)
+    assert conn_cls is not asyncpg.Connection
+
+
+async def test_guarded_transaction_applies_set_local_inside_the_transaction() -> None:
+    """The guard must execute AFTER ``BEGIN`` (inside the transaction it
+    protects) and carry transaction scope -- ``set_config(..., true)`` -- so
+    it rides whichever backend the pooler assigned to that transaction. Both
+    the ``async with`` and the manual ``start()`` entry paths are guarded;
+    ``__aexit__`` delegates to the wrapped transaction untouched."""
+    from dynastore.modules.db_config.engine_config import _LockGuardedTransaction
+
+    events: list[str] = []
+
+    class _FakeInnerTransaction:
+        async def start(self) -> None:
+            events.append("begin")
+
+        async def __aenter__(self):
+            events.append("begin")
+            return self
+
+        async def __aexit__(self, *exc):
+            events.append("exit")
+            return False
+
+    class _FakeConn:
+        async def execute(self, sql: str) -> None:
+            events.append(f"execute:{sql}")
+
+    sql = f"SELECT set_config('lock_timeout', '{DBConfig.lock_timeout}', true)"
+
+    async with _LockGuardedTransaction(_FakeInnerTransaction(), _FakeConn(), sql):
+        events.append("body")
+    assert events == ["begin", f"execute:{sql}", "body", "exit"]
+    assert ", true)" in events[1]  # transaction-scoped SET LOCAL, never session SET
+
+    events.clear()
+    await _LockGuardedTransaction(_FakeInnerTransaction(), _FakeConn(), sql).start()
+    assert events == ["begin", f"execute:{sql}"]

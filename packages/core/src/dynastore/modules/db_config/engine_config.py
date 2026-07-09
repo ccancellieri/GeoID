@@ -87,6 +87,68 @@ def _make_pool_reset_hook(pool_label: str) -> Any:
     return _reset
 
 
+class _LockGuardedTransaction:
+    """Wrap an asyncpg transaction so the #3081 lock-safety timeouts are
+    re-applied via ``SET LOCAL`` immediately after ``BEGIN``, inside the
+    transaction they protect (#3143).
+
+    Behind a transaction pooler the backend session can be reassigned between
+    any two top-level statements on the same client connection, so session
+    state applied outside a transaction (e.g. on pool acquire) is not
+    guaranteed to reach the backend that runs the caller's next transaction —
+    and worse, it lingers on whichever backend happened to serve it. The
+    timeouts must ride the transaction itself, exactly like the SQLAlchemy
+    engines' begin-listener (``register_pooler_timeout_guard``). A nested
+    ``transaction()`` (savepoint) re-applies the guard redundantly; that is
+    harmless — ``SET LOCAL`` scope stays bounded by the top-level transaction.
+    """
+
+    __slots__ = ("_inner", "_conn", "_set_local_sql")
+
+    def __init__(self, inner: Any, conn: Any, set_local_sql: str) -> None:
+        self._inner = inner
+        self._conn = conn
+        self._set_local_sql = set_local_sql
+
+    async def start(self) -> None:
+        await self._inner.start()
+        await self._conn.execute(self._set_local_sql)
+
+    async def __aenter__(self) -> Any:
+        entered = await self._inner.__aenter__()
+        await self._conn.execute(self._set_local_sql)
+        return entered
+
+    async def __aexit__(self, *exc: Any) -> Any:
+        return await self._inner.__aexit__(*exc)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _make_lock_guarded_connection_class(set_local_sql: str) -> Any:
+    """Build an ``asyncpg.create_pool(connection_class=...)`` whose
+    ``transaction()`` wraps every transaction with the #3081 ``SET LOCAL``
+    lock-safety guard (#3143).
+
+    This raw pool has no SQLAlchemy layer to hang a begin-listener off, and
+    asyncpg's ``__slots__`` block per-instance monkeypatching of
+    ``Connection.transaction`` — subclassing via ``connection_class`` is the
+    supported seam.
+    """
+    import asyncpg  # local import: db_config must stay asyncpg-free at import time
+
+    class _LockGuardedConnection(asyncpg.Connection):  # type: ignore[misc]
+        __slots__ = ()
+
+        def transaction(self, **kwargs: Any) -> Any:
+            return _LockGuardedTransaction(
+                super().transaction(**kwargs), self, set_local_sql
+            )
+
+    return _LockGuardedConnection
+
+
 class EngineLifecycleConfig(BaseModel):
     """Lifecycle policy attached to a platform engine.
 
@@ -295,7 +357,10 @@ class PostgresqlEngineConfig(EngineConfig):
         (``modules/db/db_service.py``, #2906) — without them a per-catalog
         engine has zero server-side timeouts, so a stuck query or a leaked
         transaction can hold a connection (and its locks) indefinitely
-        (#2898).
+        (#2898). Behind a transaction pooler those GUCs cannot ride the
+        startup packet, so a ``connection_class`` subclass re-applies them
+        via ``SET LOCAL`` inside every transaction instead (#3081, #3143) —
+        see ``_make_lock_guarded_connection_class``.
         """
         import asyncpg  # local import: keeps F.1 import light
 
@@ -303,6 +368,7 @@ class PostgresqlEngineConfig(EngineConfig):
         from dynastore.modules.db_config.db_timeout_config import (
             build_connection_server_settings,
             clamp_serving_statement_timeout,
+            pooler_timeout_set_local_sql,
             resolve_timeout_settings,
         )
         from dynastore.modules.db_config.instance import get_stamped_application_name
@@ -324,18 +390,37 @@ class PostgresqlEngineConfig(EngineConfig):
         # tell dead-instance sessions from live ones. Mode-aware (#3081):
         # behind a transaction pooler this returns application_name only, so
         # the per-catalog pool CONNECTS instead of being rejected on the
-        # lock-safety/keepalive startup params. NOTE: this raw asyncpg pool has
-        # no SQLAlchemy begin-listener, so in pooler mode it does not yet
-        # re-apply the lock-safety timeouts per transaction the way the serving
-        # and task engines do — per-catalog per-transaction re-enforcement is a
-        # scoped #3081 follow-up; until then a pooled per-catalog connection
-        # relies on the pooler/server-side limits for those bounds.
+        # lock-safety/keepalive startup params.
         server_settings = build_connection_server_settings(
             DBConfig,
             application_name=get_stamped_application_name(),
             lock_timeout=lock_timeout,
             idle_in_transaction_session_timeout=idle_in_transaction_session_timeout,
             statement_timeout=statement_timeout,
+        )
+        # Lock-safety net for transaction-pooler mode (#3143): this raw
+        # asyncpg pool has no SQLAlchemy layer to hang a begin-listener off
+        # of (the mechanism every other engine uses, #3081), so the same
+        # per-transaction ``SET LOCAL`` is injected by a Connection subclass
+        # whose ``transaction()`` wraps BEGIN — the timeouts ride inside each
+        # transaction, on whichever backend the pooler assigns it. Session
+        # state applied outside a transaction is NOT guaranteed to follow the
+        # caller across statements on a transaction pooler (see
+        # docs/architecture/database.md), which is why an acquire-time
+        # session SET would be unsound here. ``None`` in direct mode, where
+        # the timeouts already rode the startup packet above.
+        set_local_sql = pooler_timeout_set_local_sql(
+            DBConfig,
+            lock_timeout=lock_timeout,
+            idle_in_transaction_session_timeout=idle_in_transaction_session_timeout,
+            statement_timeout=statement_timeout,
+        )
+        # Direct mode passes no connection_class at all — asyncpg's default
+        # Connection is used and the pool kwargs stay exactly as before.
+        guard_kwargs: dict = (
+            {"connection_class": _make_lock_guarded_connection_class(set_local_sql)}
+            if set_local_sql
+            else {}
         )
         return await asyncpg.create_pool(
             dsn=dsn,
@@ -344,6 +429,7 @@ class PostgresqlEngineConfig(EngineConfig):
             timeout=self.pool_timeout_sec,
             statement_cache_size=0,
             server_settings=server_settings,
+            **guard_kwargs,
             # Discard (rather than recycle) a connection whose protocol
             # state was corrupted by a cancelled operation — this pool has
             # no SQLAlchemy layer, so it needs its own release-time guard
