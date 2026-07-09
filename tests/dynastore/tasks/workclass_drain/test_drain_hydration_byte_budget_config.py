@@ -83,7 +83,7 @@ async def test_drain_once_threads_hydration_byte_budget_to_processing():
             {
                 "day": "2026-01-01", "op_id": "11111111-1111-1111-1111-111111111111",
                 "driver_id": "es_driver", "catalog_id": "cat", "collection_id": "coll",
-                "op": "upsert", "entity_id": "e1", "op_payload": {"legacy": True},
+                "op": "upsert", "entity_id": "e1",
                 "idempotency_key": "ik", "attempts": 0, "claim_version": 1,
                 "claimed_by": "owner",
             },

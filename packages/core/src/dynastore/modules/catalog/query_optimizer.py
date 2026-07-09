@@ -42,6 +42,13 @@ from dynastore.models.protocols.items import ItemsProtocol
 
 logger = logging.getLogger(__name__)
 
+_HUB_QUERY_FIELDS: frozenset[str] = frozenset({
+    "geoid",
+    "deleted_at",
+    "transaction_time",
+    "write_id",
+})
+
 
 def _extract_alias(sql_fragment: str) -> str:
     """Return the logical output column name from a SELECT-list SQL fragment.
@@ -303,7 +310,7 @@ class QueryOptimizer:
 
             if sel.field not in self.field_index:
                 # Allow special Hub fields
-                if sel.field in ["geoid", "deleted_at", "transaction_time"]:
+                if sel.field in _HUB_QUERY_FIELDS:
                     continue
 
                 # Try to resolve dynamically
@@ -341,7 +348,7 @@ class QueryOptimizer:
         for filt in query.filters:
             if filt.field not in self.field_index:
                 # Allow special Hub fields
-                if filt.field in ["geoid", "deleted_at", "transaction_time"]:
+                if filt.field in _HUB_QUERY_FIELDS:
                     continue
 
                 # #974: ``validity`` is special. On a collection with no
@@ -387,7 +394,7 @@ class QueryOptimizer:
             for sort in query.sort:
                 if sort.field not in self.field_index:
                     # Allow special Hub fields
-                    if sort.field in ["geoid", "deleted_at", "transaction_time"]:
+                    if sort.field in _HUB_QUERY_FIELDS:
                         continue
 
                     # Try to resolve dynamically
@@ -419,7 +426,7 @@ class QueryOptimizer:
             for field in query.group_by:
                 if field not in self.field_index:
                     # Allow special Hub fields
-                    if field in ["geoid", "deleted_at", "transaction_time"]:
+                    if field in _HUB_QUERY_FIELDS:
                         continue
 
                     # Try to resolve dynamically
@@ -829,8 +836,8 @@ class QueryOptimizer:
                     # builds SQL without validating first.
                     continue
 
-                if sel.field == "geoid":
-                    select_fields.append("h.geoid")
+                if sel.field in _HUB_QUERY_FIELDS:
+                    select_fields.append(f"h.{sel.field}")
                     continue
 
                 sidecar, field_def = self.field_index[sel.field]
@@ -885,8 +892,8 @@ class QueryOptimizer:
             for gb_field in query.group_by:
                 if gb_field in already_selected:
                     continue
-                if gb_field == "geoid":
-                    select_fields.append("h.geoid")
+                if gb_field in _HUB_QUERY_FIELDS:
+                    select_fields.append(f"h.{gb_field}")
                 elif gb_field in self.field_index:
                     _, gb_field_def = self.field_index[gb_field]
                     select_fields.append(
@@ -903,7 +910,7 @@ class QueryOptimizer:
 
         for i, filt in enumerate(query.filters):
             # Special handling for Hub fields
-            if filt.field in ["geoid", "deleted_at", "transaction_time"]:
+            if filt.field in _HUB_QUERY_FIELDS:
                 expr = f"h.{filt.field}"
             elif filt.field == "validity":
                 # #974: validity is no longer present on the hub by default
@@ -1183,7 +1190,7 @@ class QueryOptimizer:
         if query.group_by:
             group_fields = []
             for field in query.group_by:
-                if field in ["geoid", "deleted_at"]:
+                if field in _HUB_QUERY_FIELDS:
                     group_fields.append(f"h.{field}")
                 else:
                     _, field_def = self.field_index[field]
@@ -1194,7 +1201,7 @@ class QueryOptimizer:
             group_fields = []
             for sel in query.select:
                 if not sel.aggregation and sel.field != "*":
-                    if sel.field in ["geoid", "deleted_at"]:
+                    if sel.field in _HUB_QUERY_FIELDS:
                         group_fields.append(f"h.{sel.field}")
                     else:
                         _, field_def = self.field_index[sel.field]
@@ -1207,7 +1214,7 @@ class QueryOptimizer:
         if query.sort:
             order_fields = []
             for sort in query.sort:
-                if sort.field in ["geoid", "deleted_at"]:
+                if sort.field in _HUB_QUERY_FIELDS:
                     order_fields.append(f"h.{sort.field} {sort.direction}")
                 else:
                     _, field_def = self.field_index[sort.field]

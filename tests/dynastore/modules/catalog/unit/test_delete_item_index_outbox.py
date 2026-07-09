@@ -16,7 +16,7 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Unit tests for delete index-propagation symmetry.
+"""Unit tests for delete async-write ledger symmetry.
 
 Background: ``ItemQueryMixin.delete_item`` previously dispatched a delete
 ``IndexOp`` keyed by the *external* path id through the index dispatcher,
@@ -25,11 +25,10 @@ while ``ItemService.upsert_bulk`` indexes the ES document under the
 ``OutboxRecord``. The two paths derived the ES ``_id`` independently, so a
 delete targeted a non-existent ``_id`` and never purged the document.
 
-These tests pin the fixed contract: delete enqueues one
-``OutboxRecord(op="delete")`` per soft-deleted geoid, keyed by the geoid,
-through the same async-OUTBOX path the upsert uses — so the drain (which
-keys ES ``_id`` on ``idempotency_key``) removes the same document the
-upsert wrote.
+These tests pin the fixed contract: delete enqueues one lightweight
+``WriteIdOutboxRecord(op="delete")`` per async target, keyed by the same
+logical write id stamped on the tombstoned hub rows. The drain then reads
+tombstoned geoids by write id and removes the same documents the upsert wrote.
 """
 from __future__ import annotations
 
@@ -47,7 +46,17 @@ from dynastore.modules.storage.routing_config import (
 )
 
 # Where the delete path imports the storage-emit function (patched per test).
-_ENQUEUE = "dynastore.modules.storage.storage_emit.enqueue_storage_op"
+_ENQUEUE = "dynastore.modules.storage.storage_emit.enqueue_storage_op_write_id"
+
+
+class _CapableDriver:
+    """Minimal stub exposing the #3116 primary-driver write-id read
+    capability (``read_indexable_write_batch``) — without it,
+    ``_enqueue_index_deletes``'s capability guard skips the async delete
+    enqueue entirely (see ``driver_supports_write_id_reads``)."""
+
+    async def read_indexable_write_batch(self, **kwargs: Any) -> List[Any]:
+        return []
 
 
 def _service_with(routing_entries: List[OperationDriverEntry]) -> ItemService:
@@ -55,15 +64,21 @@ def _service_with(routing_entries: List[OperationDriverEntry]) -> ItemService:
 
     ``__new__`` skips ``__init__`` — ``_enqueue_index_deletes`` only reads the
     routing resolver plus module-level imports, so no engine/state is needed.
-    The enqueue goes through ``enqueue_storage_op`` (#1807 P4), which the tests
-    patch, so no outbox-store seam is needed.
+    The enqueue goes through ``enqueue_storage_op_write_id``, which the tests
+    patch, so no live tasks table is needed. The driver registry seam always
+    resolves to a write-id-capable stub so the #3116 guard never silently
+    skips the enqueue in these tests.
     """
     svc = ItemService.__new__(ItemService)
 
     async def _resolver(_catalog_id: str, _collection_id: str):
         return SimpleNamespace(operations={Operation.WRITE: list(routing_entries)})
 
+    async def _registry(_driver_ref: str) -> _CapableDriver:
+        return _CapableDriver()
+
     svc._test_routing_resolver = _resolver  # type: ignore[attr-defined]
+    svc._test_driver_registry = _registry  # type: ignore[attr-defined]
     return svc
 
 
@@ -76,10 +91,8 @@ def _async_es_entry() -> OperationDriverEntry:
     )
 
 
-def test_delete_enqueues_one_record_per_geoid_keyed_by_geoid():
-    """Each soft-deleted geoid yields one delete OutboxRecord whose
-    ``idempotency_key`` (the ES ``_id``) is that geoid — never the
-    external/path id."""
+def test_delete_enqueues_one_write_id_record_per_async_target():
+    """A delete batch yields one lightweight ledger row per async target."""
     svc = _service_with([_async_es_entry()])
     geoids = [
         "11111111-1111-7111-8111-111111111111",
@@ -94,21 +107,21 @@ def test_delete_enqueues_one_record_per_geoid_keyed_by_geoid():
         captured["rows"] = list(rows)
 
     with patch(_ENQUEUE, _fake_enqueue):
-        asyncio.run(svc._enqueue_index_deletes(conn, "cat-x", "col-y", geoids))
+        asyncio.run(
+            svc._enqueue_index_deletes(
+                conn, "cat-x", "col-y", geoids, write_id="w-delete-1",
+            ),
+        )
 
     assert captured["conn"] is conn, "must enqueue on the caller's TX conn (atomicity)"
     assert captured["catalog_id"] == "cat-x"
-    assert len(captured["rows"]) == len(geoids)
-    for rec, gid in zip(captured["rows"], geoids, strict=True):
+    assert len(captured["rows"]) == 1
+    for rec in captured["rows"]:
         assert rec.op == "delete"
-        assert rec.idempotency_key == gid, (
-            "ES _id must be the geoid the upsert indexed under, not the "
-            f"external id; got {rec.idempotency_key!r}"
-        )
-        assert rec.item_id == gid
+        assert rec.write_id == "w-delete-1"
+        assert rec.idempotency_key == "w-delete-1"
         assert rec.collection_id == "col-y"
         assert rec.driver_id == "items_elasticsearch_driver"
-        assert rec.payload == {}, "delete actions carry no source document"
 
 
 def test_delete_is_noop_when_no_geoids_resolved():
@@ -117,7 +130,9 @@ def test_delete_is_noop_when_no_geoids_resolved():
     svc = _service_with([_async_es_entry()])
     enqueue = AsyncMock()
     with patch(_ENQUEUE, enqueue):
-        asyncio.run(svc._enqueue_index_deletes(object(), "c", "k", []))
+        asyncio.run(
+            svc._enqueue_index_deletes(object(), "c", "k", [], write_id="w-empty"),
+        )
     enqueue.assert_not_awaited()
 
 
@@ -132,5 +147,7 @@ def test_delete_skips_non_async_outbox_index_entries():
     svc = _service_with([sync_entry])
     enqueue = AsyncMock()
     with patch(_ENQUEUE, enqueue):
-        asyncio.run(svc._enqueue_index_deletes(object(), "c", "k", ["g1"]))
+        asyncio.run(
+            svc._enqueue_index_deletes(object(), "c", "k", ["g1"], write_id="w-sync"),
+        )
     enqueue.assert_not_awaited()

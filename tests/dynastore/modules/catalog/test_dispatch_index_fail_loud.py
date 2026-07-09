@@ -114,6 +114,43 @@ async def test_dispatch_index_upsert_returns_dict():
 
 
 @pytest.mark.asyncio
+async def test_dispatch_index_upsert_threads_write_id_to_ops():
+    """A PG-primary write batch id must ride every IndexOp so the generic
+    async writer can enqueue one grouped ledger row instead of per-item payloads.
+    """
+    from dynastore.modules.catalog.item_service import ItemService
+
+    expected = {"items_elasticsearch_driver": BulkResult(total=2, succeeded=2)}
+    features = _make_features(2)
+    captured_ops = []
+
+    async def _capture_dispatch(
+        dispatcher, catalog_id, collection_id, ops, *, pg_conn, tx_factory=None
+    ):
+        captured_ops.extend(ops)
+        return expected
+
+    svc = ItemService()
+    with patch.object(svc, "_do_dispatch", new=_capture_dispatch):
+        with patch.object(
+            svc,
+            "_resolve_index_stamp_context",
+            new=AsyncMock(return_value=MagicMock()),
+        ):
+            result = await svc._dispatch_index_upsert(
+                "cat1",
+                "col1",
+                features,
+                db_resource=None,
+                processing_context={"write_id": "w-batch-1"},
+            )
+
+    assert result == expected
+    assert captured_ops
+    assert {getattr(op, "write_id", None) for op in captured_ops} == {"w-batch-1"}
+
+
+@pytest.mark.asyncio
 async def test_do_dispatch_noop_bulk_result_not_masked():
     """A silent no-op from fan_out_bulk (total>0, succeeded=0, failed=0) must be
     returned to the caller, not silently discarded.

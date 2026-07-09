@@ -33,14 +33,15 @@ Scenarios covered:
    in_flight is not.
 5. Retry backoff: mark_retry sets status='ready', bumps attempts,
    pushes ready_at into the future.
-6. Drain trigger: enqueue_storage_op inserts exactly ONE pending storage_drain
-   task row on the same conn (dedup) and rolls back with the outer
-   transaction.
+6. Drain trigger: enqueue_storage_op_id_only inserts exactly ONE pending
+   storage_drain task row on the same conn (dedup) and rolls back with the
+   outer transaction.
 """
 from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 from uuid import uuid4
 
@@ -79,7 +80,7 @@ CREATE TABLE IF NOT EXISTS "{schema}".storage (
     op              TEXT            NOT NULL,
     status          TEXT            NOT NULL DEFAULT 'ready',
     ready_at        TIMESTAMPTZ     NOT NULL DEFAULT now(),
-    op_payload      JSONB           NOT NULL DEFAULT '{{}}'::jsonb,
+    write_id        TEXT,
     idempotency_key TEXT,
     claim_version   INTEGER         NOT NULL DEFAULT 0,
     claimed_by      TEXT,
@@ -201,12 +202,14 @@ async def _seed_rows(
 ) -> List[str]:
     """Insert N rows into storage; return list of op_id strings.
 
-    Payload-carrying (``op_payload={"legacy": True}``) so the generic
+    Seeded as ``op='delete'`` with ``entity_id`` set to the row's own
+    ``op_id`` — the direct-append path in
+    ``StorageDrainTask._process_driver_rows`` (an id is all the indexer
+    needs; no canonical re-read is attempted), so the generic
     claim/fence/retry/dedup mechanics exercised by most of this file are
-    unaffected by the #2494 P1 id-only re-read path, which keys off the
-    explicit ``STORAGE_PLANE_ID_ONLY_MARKER_KEY`` sentinel on an
-    ``op='upsert'`` row's ``op_payload`` — use :func:`_seed_id_only_row`
-    to seed that shape instead.
+    unaffected by the #2494 P1 id-only re-read path. Use
+    :func:`_seed_id_only_row` to seed an upsert row that DOES exercise the
+    canonical re-read path.
     """
     from dynastore.modules.db_config.query_executor import (
         DQLQuery, ResultHandler, managed_transaction,
@@ -218,14 +221,13 @@ async def _seed_rows(
         if claimed_at_offset is not None:
             claimed_at_expr = f"now() {claimed_at_offset}"
 
-        payload_expr = "'{\"legacy\": true}'::jsonb"
         sql = (
             f"INSERT INTO {task_schema}.storage"
-            f" (op_id, day, driver_id, catalog_id, op, status,"
-            f"  claimed_by, claimed_at, claim_version, op_payload)"
+            f" (op_id, day, driver_id, catalog_id, entity_id, op, status,"
+            f"  claimed_by, claimed_at, claim_version)"
             f" VALUES (:op_id, CURRENT_DATE, :driver_id,"
-            f"         :catalog_id, 'upsert', :status,"
-            f"         :claimed_by, {claimed_at_expr}, :claim_version, {payload_expr})"
+            f"         :catalog_id, :entity_id, 'delete', :status,"
+            f"         :claimed_by, {claimed_at_expr}, :claim_version)"
         )
         async with managed_transaction(engine) as conn:
             await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
@@ -233,6 +235,7 @@ async def _seed_rows(
                 op_id=op_id,
                 driver_id=driver_id,
                 catalog_id=catalog_id,
+                entity_id=op_id,
                 status=status,
                 claimed_by=claimed_by,
                 claim_version=claim_version,
@@ -538,11 +541,11 @@ async def test_retry_backoff_bumps_attempts_and_delays_ready_at(drain_env):
 
 @pytest.mark.asyncio
 async def test_drain_trigger_inserts_one_pending_task_row(drain_env):
-    """enqueue_storage_op inserts exactly one storage_drain task row via the
-    co-transactional drain trigger.
+    """enqueue_storage_op_id_only inserts exactly one storage_drain task row
+    via the co-transactional drain trigger.
     """
     from dynastore.modules.db_config.query_executor import managed_transaction
-    from dynastore.modules.storage.storage_emit import enqueue_storage_op
+    from dynastore.modules.storage.storage_emit import enqueue_storage_op_id_only
     from dynastore.models.protocols.indexing import OutboxRecord
 
     task_schema, engine = drain_env
@@ -555,13 +558,12 @@ async def test_drain_trigger_inserts_one_pending_task_row(drain_env):
             collection_id="coll",
             op="upsert",
             item_id="item_1",
-            payload={"x": 1},
             idempotency_key="ik_1",
         ),
     ]
 
     async with managed_transaction(engine) as conn:
-        await enqueue_storage_op(conn, catalog_id=task_schema, rows=rows)
+        await enqueue_storage_op_id_only(conn, catalog_id=task_schema, rows=rows)
 
     count = await _count_tasks(engine, task_schema)
     assert count == 1, f"expected 1 pending drain task; got {count}"
@@ -573,7 +575,7 @@ async def test_drain_trigger_dedup_multiple_writes_one_row(drain_env):
     task due to the dedup WHERE NOT EXISTS guard.
     """
     from dynastore.modules.db_config.query_executor import managed_transaction
-    from dynastore.modules.storage.storage_emit import enqueue_storage_op
+    from dynastore.modules.storage.storage_emit import enqueue_storage_op_id_only
     from dynastore.models.protocols.indexing import OutboxRecord
 
     task_schema, engine = drain_env
@@ -586,14 +588,15 @@ async def test_drain_trigger_dedup_multiple_writes_one_row(drain_env):
             collection_id="coll",
             op="upsert",
             item_id=item_id,
-            payload={},
             idempotency_key=f"ik_{item_id}",
         )
 
     # Three separate writes — each calls _enqueue_drain_trigger.
     for i in range(3):
         async with managed_transaction(engine) as conn:
-            await enqueue_storage_op(conn, catalog_id=task_schema, rows=[_row(f"item_{i}")])
+            await enqueue_storage_op_id_only(
+                conn, catalog_id=task_schema, rows=[_row(f"item_{i}")],
+            )
 
     count = await _count_tasks(engine, task_schema)
     assert count == 1, f"dedup should coalesce to 1 pending task; got {count}"
@@ -603,7 +606,7 @@ async def test_drain_trigger_dedup_multiple_writes_one_row(drain_env):
 async def test_drain_trigger_rolls_back_with_outer_transaction(drain_env):
     """An aborted outer transaction leaves no task row in tasks."""
     from dynastore.modules.db_config.query_executor import managed_transaction
-    from dynastore.modules.storage.storage_emit import enqueue_storage_op
+    from dynastore.modules.storage.storage_emit import enqueue_storage_op_id_only
     from dynastore.models.protocols.indexing import OutboxRecord
 
     task_schema, engine = drain_env
@@ -616,14 +619,13 @@ async def test_drain_trigger_rolls_back_with_outer_transaction(drain_env):
             collection_id="coll",
             op="upsert",
             item_id="item_rollback",
-            payload={},
             idempotency_key="ik_rb",
         ),
     ]
 
     with pytest.raises(RuntimeError, match="simulated abort"):
         async with managed_transaction(engine) as conn:
-            await enqueue_storage_op(conn, catalog_id=task_schema, rows=rows)
+            await enqueue_storage_op_id_only(conn, catalog_id=task_schema, rows=rows)
             raise RuntimeError("simulated abort")
 
     count = await _count_tasks(engine, task_schema)
@@ -862,8 +864,10 @@ async def _seed_id_only_row(
     collection_id: str = "coll_a",
     entity_id: str,
 ) -> str:
-    """Insert one id-only row (explicit id-only sentinel payload,
-    explicit collection/entity)."""
+    """Insert one id-only row (``entity_id`` set, no ``write_id``) — the
+    structural shape that drives the canonical-re-read classification in
+    ``StorageDrainTask._process_driver_rows`` for ``op='upsert'`` (and the
+    direct-append path for ``op='delete'``)."""
     from dynastore.modules.db_config.query_executor import (
         DQLQuery, ResultHandler, managed_transaction,
     )
@@ -872,10 +876,9 @@ async def _seed_id_only_row(
     sql = (
         f"INSERT INTO {task_schema}.storage"
         f" (op_id, day, driver_id, catalog_id, collection_id, entity_id,"
-        f"  op, status, op_payload)"
+        f"  op, status)"
         f" VALUES (:op_id, CURRENT_DATE, :driver_id, :catalog_id,"
-        f"         :collection_id, :entity_id, :op, 'ready',"
-        f"         '{{\"_id_only\": true}}'::jsonb)"
+        f"         :collection_id, :entity_id, :op, 'ready')"
     )
     async with managed_transaction(engine) as conn:
         await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
@@ -886,42 +889,6 @@ async def _seed_id_only_row(
             collection_id=collection_id,
             entity_id=entity_id,
             op=op,
-        )
-    return op_id
-
-
-async def _seed_empty_payload_upsert_row(
-    engine: Any,
-    task_schema: str,
-    *,
-    driver_id: str = "es_driver",
-    catalog_id: str = "tenant_a",
-    collection_id: str = "coll_a",
-    entity_id: str,
-) -> str:
-    """Insert one upsert row with a genuinely EMPTY ``op_payload`` (no
-    id-only marker) — the DDL-default shape, distinct from an id-only row.
-    """
-    from dynastore.modules.db_config.query_executor import (
-        DQLQuery, ResultHandler, managed_transaction,
-    )
-
-    op_id = str(uuid4())
-    sql = (
-        f"INSERT INTO {task_schema}.storage"
-        f" (op_id, day, driver_id, catalog_id, collection_id, entity_id,"
-        f"  op, status, op_payload)"
-        f" VALUES (:op_id, CURRENT_DATE, :driver_id, :catalog_id,"
-        f"         :collection_id, :entity_id, 'upsert', 'ready', '{{}}'::jsonb)"
-    )
-    async with managed_transaction(engine) as conn:
-        await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
-            conn,
-            op_id=op_id,
-            driver_id=driver_id,
-            catalog_id=catalog_id,
-            collection_id=collection_id,
-            entity_id=entity_id,
         )
     return op_id
 
@@ -1041,8 +1008,8 @@ async def test_id_only_upsert_missing_row_skipped_as_success(
 
 @pytest.mark.asyncio
 async def test_id_only_delete_bypasses_reread(drain_env, monkeypatch):
-    """A delete row (even with empty op_payload — the normal shape for a
-    delete) goes straight to the indexer; no canonical re-read is attempted."""
+    """A delete row (entity_id set, no write_id) goes straight to the
+    indexer; no canonical re-read is attempted."""
     from dynastore.models.protocols.indexing import BulkIndexResult
 
     task_schema, engine = drain_env
@@ -1142,80 +1109,278 @@ async def test_id_only_reread_failure_funnels_group_to_retry(drain_env, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_payload_carrying_rows_unaffected_by_id_only_path(drain_env, monkeypatch):
-    """A payload-carrying row (non-empty op_payload) goes straight to the
-    indexer exactly as before #2494 — no canonical re-read attempted."""
-    from dynastore.models.protocols.indexing import BulkIndexResult
+async def test_write_id_row_hydrates_via_primary_batch_reader(monkeypatch):
+    from dynastore.models.protocols.indexing import BulkIndexResult, IndexableOp
+    from dynastore.tasks.workclass_drain.storage_drain_task import StorageDrainTask
 
-    task_schema, engine = drain_env
-    # Default _seed_rows now carries a non-empty payload.
-    await _seed_rows(engine, task_schema, n=2)
-
-    task = _make_task(engine, task_schema)
-    reread_calls = _patch_canonical_reread(monkeypatch, task, present=set())
-
+    task = StorageDrainTask()
+    row = {
+        "op_id": str(uuid4()),
+        "driver_id": "items_elasticsearch_driver",
+        "catalog_id": "tenant_a",
+        "collection_id": "coll_a",
+        "op": "upsert",
+        "entity_id": None,
+        "write_id": "w-123",
+        "claim_version": 1,
+        "claimed_by": "owner-1",
+    }
+    hydrated_ops = [
+        IndexableOp(
+            op_id=uuid4(),
+            op="upsert",
+            catalog_id="tenant_a",
+            collection_id="coll_a",
+            driver_instance_id="pg-primary",
+            item_id="item-1",
+            payload={"id": "item-1"},
+            idempotency_key="ik-1",
+        ),
+        IndexableOp(
+            op_id=uuid4(),
+            op="upsert",
+            catalog_id="tenant_a",
+            collection_id="coll_a",
+            driver_instance_id="pg-primary",
+            item_id="item-2",
+            payload={"id": "item-2"},
+            idempotency_key="ik-2",
+        ),
+    ]
     fake = _FakeBulkIndexer(
-        lambda ops: BulkIndexResult(passed=[op.op_id for op in ops], transient=[], poison=[])
+        lambda ops: BulkIndexResult(
+            passed=[op.op_id for op in ops], transient=[], poison=[],
+        ),
+    )
+    seen: Dict[str, Any] = {}
+    marks: List[tuple] = []
+
+    async def _fake_read_primary_write_batch(**kwargs):
+        seen.update(kwargs)
+        return hydrated_ops
+
+    async def _fake_mark_done(*, engine, task_schema, row, owner_id):
+        marks.append(("done", str(row["op_id"]), owner_id))
+
+    async def _unexpected(*args, **kwargs):
+        pytest.fail("write-id hydration should complete without retry/dead")
+
+    monkeypatch.setattr(task, "_read_primary_write_batch", _fake_read_primary_write_batch)
+    monkeypatch.setattr(task, "_mark_done", _fake_mark_done)
+    monkeypatch.setattr(task, "_mark_retry", _unexpected)
+    monkeypatch.setattr(task, "_mark_dead", _unexpected)
+
+    engine = object()
+    counts = await task._process_driver_rows(
+        engine=engine,
+        task_schema="tasks",
+        driver_id="items_elasticsearch_driver",
+        indexer=fake,
+        driver_rows=[row],
+        owner_id="owner-1",
+        byte_budget=1024,
     )
 
-    async def _resolve(driver_id: str) -> Any:
-        return fake
-
-    monkeypatch.setattr(task, "_resolve_indexer", _resolve)
-
-    owner_id = f"owner:{uuid4()}"
-    count = await task.drain_once(engine=engine, owner_id=owner_id)
-    assert count == 2
-
-    assert reread_calls == [], "payload-carrying rows must never trigger a re-read"
+    assert seen == {
+        "catalog_id": "tenant_a",
+        "collection_id": "coll_a",
+        "driver_id": "items_elasticsearch_driver",
+        "write_id": "w-123",
+        "op": "upsert",
+        "engine": engine,
+    }
     assert len(fake.calls) == 1
-    assert len(fake.calls[0]) == 2
-    assert all(op.payload == {"legacy": True} for op in fake.calls[0])
+    assert [op.item_id for op in fake.calls[0]] == ["item-1", "item-2"]
+    assert marks == [("done", row["op_id"], "owner-1")]
+    assert counts["indexed"] == 1
+    assert counts["retried"] == 0
+    assert counts["auto_done"] == 0
+    assert counts["bytes"] > 0
 
 
 @pytest.mark.asyncio
-async def test_empty_payload_without_marker_does_not_trigger_reread(
-    drain_env, monkeypatch, caplog,
-):
-    """An upsert row with a genuinely EMPTY op_payload (the DDL default,
-    no id-only marker) must NOT be classified as id-only — it falls
-    through to the legacy path (built and sent to the indexer as-is,
-    same as pre-#2494), with a WARNING logged for the anomaly."""
-    import logging as _logging
+async def test_write_id_row_without_primary_batch_reader_retries(monkeypatch):
+    from dynastore.tasks.workclass_drain.storage_drain_task import StorageDrainTask
 
-    from dynastore.models.protocols.indexing import BulkIndexResult
+    task = StorageDrainTask()
+    row = {
+        "op_id": str(uuid4()),
+        "driver_id": "items_elasticsearch_driver",
+        "catalog_id": "tenant_a",
+        "collection_id": "coll_a",
+        "op": "upsert",
+        "entity_id": None,
+        "write_id": "w-404",
+        "claim_version": 1,
+        "claimed_by": "owner-1",
+    }
+    marks: List[tuple] = []
+    fake = _FakeBulkIndexer(lambda ops: pytest.fail("indexer must not be called"))
 
-    task_schema, engine = drain_env
-    await _seed_empty_payload_upsert_row(engine, task_schema, entity_id="geoid-empty")
+    async def _missing_reader(**kwargs):
+        raise LookupError("primary driver does not expose read_indexable_write_batch")
 
-    task = _make_task(engine, task_schema)
-    reread_calls = _patch_canonical_reread(monkeypatch, task, present={"geoid-empty"})
+    async def _fake_mark_retry(*, engine, task_schema, row, owner_id, error):
+        marks.append(("retry", str(row["op_id"]), owner_id, error))
 
-    fake = _FakeBulkIndexer(
-        lambda ops: BulkIndexResult(passed=[op.op_id for op in ops], transient=[], poison=[])
+    async def _unexpected(*args, **kwargs):
+        pytest.fail("missing primary batch reader should only retry")
+
+    monkeypatch.setattr(task, "_read_primary_write_batch", _missing_reader)
+    monkeypatch.setattr(task, "_mark_retry", _fake_mark_retry)
+    monkeypatch.setattr(task, "_mark_done", _unexpected)
+    monkeypatch.setattr(task, "_mark_dead", _unexpected)
+
+    counts = await task._process_driver_rows(
+        engine=object(),
+        task_schema="tasks",
+        driver_id="items_elasticsearch_driver",
+        indexer=fake,
+        driver_rows=[row],
+        owner_id="owner-1",
+        byte_budget=1024,
     )
 
-    async def _resolve(driver_id: str) -> Any:
-        return fake
+    assert len(marks) == 1
+    assert marks[0][0] == "retry"
+    assert "write_id_hydration_failed" in marks[0][3]
+    assert counts["indexed"] == 0
+    assert counts["retried"] == 1
 
-    monkeypatch.setattr(task, "_resolve_indexer", _resolve)
 
-    owner_id = f"owner:{uuid4()}"
-    with caplog.at_level(_logging.WARNING):
-        count = await task.drain_once(engine=engine, owner_id=owner_id)
-    assert count == 1
+@pytest.mark.asyncio
+async def test_primary_write_batch_hydrates_from_pg_write_id_chunk_protocol(monkeypatch):
+    from dynastore.tasks.workclass_drain.storage_drain_task import StorageDrainTask
 
-    assert reread_calls == [], "an unmarked empty payload must not trigger a re-read"
-    assert len(fake.calls) == 1
-    assert len(fake.calls[0]) == 1
-    assert fake.calls[0][0].payload == {}
-    assert any(
-        "EMPTY op_payload and no id-only marker" in r.getMessage()
-        for r in caplog.records
-    ), "an unmarked empty payload must log the anomaly warning"
+    class _Primary:
+        def __init__(self) -> None:
+            self.active_calls: List[Dict[str, Any]] = []
 
-    rows = await _fetch_rows(engine, task_schema)
-    assert rows[0]["status"] == "done"
+        async def read_active_rows_by_write_id(
+            self,
+            catalog_id: str,
+            collection_id: str,
+            *,
+            write_id: str,
+            limit: int,
+            after_geoid: Optional[str] = None,
+            db_resource: Optional[Any] = None,
+        ):
+            self.active_calls.append({
+                "catalog_id": catalog_id,
+                "collection_id": collection_id,
+                "write_id": write_id,
+                "limit": limit,
+                "after_geoid": after_geoid,
+                "db_resource": db_resource,
+            })
+            if after_geoid is None:
+                return [{"geoid": "g1"}, {"geoid": "g2"}], None
+            return [], None
+
+    primary = _Primary()
+
+    async def _fake_get_write_drivers(catalog_id, collection_id):
+        return [SimpleNamespace(driver=primary)]
+
+    monkeypatch.setattr(
+        "dynastore.modules.storage.router.get_write_drivers",
+        _fake_get_write_drivers,
+    )
+
+    task = StorageDrainTask()
+
+    engine = object()
+
+    async def _fake_read_canonical_inputs(*, engine, catalog_id, collection_id, geoids):
+        assert engine is engine_ref
+        return {
+            geoid: SimpleNamespace(row={"geoid": geoid})
+            for geoid in geoids
+        }
+
+    engine_ref = engine
+
+    async def _fake_build_canonical_doc(*, catalog_id, collection_id, ci):
+        return {"id": ci.row["geoid"], "collection": collection_id}
+
+    monkeypatch.setattr(task, "_read_canonical_inputs", _fake_read_canonical_inputs)
+    monkeypatch.setattr(task, "_build_canonical_doc", _fake_build_canonical_doc)
+
+    ops = await task._read_primary_write_batch(
+        catalog_id="tenant_a",
+        collection_id="coll_a",
+        driver_id="items_elasticsearch_driver",
+        write_id="w-123",
+        op="upsert",
+        engine=engine,
+    )
+
+    assert [op.item_id for op in ops] == ["g1", "g2"]
+    assert [op.payload for op in ops] == [
+        {"id": "g1", "collection": "coll_a"},
+        {"id": "g2", "collection": "coll_a"},
+    ]
+    assert {op.op for op in ops} == {"upsert"}
+    assert primary.active_calls[0]["after_geoid"] is None
+    assert primary.active_calls[0]["db_resource"] is engine
+
+
+@pytest.mark.asyncio
+async def test_primary_write_batch_hydrates_delete_ids_from_pg_write_id_chunk_protocol(
+    monkeypatch,
+):
+    from dynastore.tasks.workclass_drain.storage_drain_task import StorageDrainTask
+
+    class _Primary:
+        def __init__(self) -> None:
+            self.tombstone_calls: List[Dict[str, Any]] = []
+
+        async def read_tombstoned_ids_by_write_id(
+            self,
+            catalog_id: str,
+            collection_id: str,
+            *,
+            write_id: str,
+            limit: int,
+            after_geoid: Optional[str] = None,
+            db_resource: Optional[Any] = None,
+        ):
+            self.tombstone_calls.append({
+                "catalog_id": catalog_id,
+                "collection_id": collection_id,
+                "write_id": write_id,
+                "limit": limit,
+                "after_geoid": after_geoid,
+                "db_resource": db_resource,
+            })
+            return ["g1", "g2"], None
+
+    primary = _Primary()
+    engine = object()
+
+    async def _fake_get_write_drivers(catalog_id, collection_id):
+        return [SimpleNamespace(driver=primary)]
+
+    monkeypatch.setattr(
+        "dynastore.modules.storage.router.get_write_drivers",
+        _fake_get_write_drivers,
+    )
+
+    task = StorageDrainTask()
+    ops = await task._read_primary_write_batch(
+        catalog_id="tenant_a",
+        collection_id="coll_a",
+        driver_id="items_elasticsearch_driver",
+        write_id="w-del",
+        op="delete",
+        engine=engine,
+    )
+
+    assert [op.item_id for op in ops] == ["g1", "g2"]
+    assert [op.payload for op in ops] == [{}, {}]
+    assert {op.op for op in ops} == {"delete"}
+    assert primary.tombstone_calls[0]["db_resource"] is engine
 
 
 # ---------------------------------------------------------------------------
@@ -1621,7 +1786,7 @@ async def test_handoff_to_offload_job_inserts_distinct_dedup_key_row(drain_env):
     its own dedup_key — independent of (never blocked by, never blocking) a
     live storage_drain trigger for the same outbox."""
     from dynastore.modules.db_config.query_executor import managed_transaction
-    from dynastore.modules.storage.storage_emit import enqueue_storage_op
+    from dynastore.modules.storage.storage_emit import enqueue_storage_op_id_only
     from dynastore.models.protocols.indexing import OutboxRecord
 
     task_schema, engine = drain_env
@@ -1632,11 +1797,11 @@ async def test_handoff_to_offload_job_inserts_distinct_dedup_key_row(drain_env):
         OutboxRecord(
             op_id=uuid4(), driver_id="es_driver", driver_instance_id="di",
             collection_id="coll", op="upsert", item_id="item_1",
-            payload={"x": 1}, idempotency_key="ik_1",
+            idempotency_key="ik_1",
         ),
     ]
     async with managed_transaction(engine) as conn:
-        await enqueue_storage_op(conn, catalog_id=task_schema, rows=rows)
+        await enqueue_storage_op_id_only(conn, catalog_id=task_schema, rows=rows)
     assert await _count_tasks(engine, task_schema, task_type="storage_drain") == 1
 
     task = _make_task(engine, task_schema)

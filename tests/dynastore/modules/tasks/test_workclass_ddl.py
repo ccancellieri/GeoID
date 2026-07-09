@@ -157,6 +157,20 @@ def test_storage_claim_version_column():
     assert "DEFAULT 0" in sql
 
 
+def test_storage_write_id_column():
+    sql = _render(STORAGE_TABLE_DDL)
+    assert "write_id" in sql
+    assert "TEXT" in sql
+
+
+def test_storage_table_has_no_op_payload_column():
+    """``tasks.storage`` carries no payload column — a row is classified
+    structurally by ``entity_id`` / ``write_id`` (async write-id outbox
+    slice, #3116)."""
+    sql = _render(STORAGE_TABLE_DDL)
+    assert "op_payload" not in sql
+
+
 def test_storage_fairness_index_leads_catalog_id():
     """Fairness partial index must lead with catalog_id and be WHERE status='ready'."""
     sql = _render(STORAGE_INDEXES_DDL)
@@ -857,8 +871,8 @@ async def test_live_pg_storage_table_structure(workclass_async_conn):
         expected = {
             "op_id", "day", "catalog_id", "driver_id", "collection_id",
             "entity_kind", "entity_id", "op", "status", "ready_at",
-            "op_payload", "idempotency_key", "claim_version", "claimed_by",
-            "claimed_at", "attempts", "created_at", "finished_at",
+            "write_id", "idempotency_key", "claim_version",
+            "claimed_by", "claimed_at", "attempts", "created_at", "finished_at",
         }
         assert expected.issubset(col_names), (
             f"Missing columns: {expected - col_names}"

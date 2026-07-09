@@ -441,41 +441,28 @@ class StoragePlaneOutboxWriter:
             )
             return
 
-        from dynastore.models.protocols.indexing import OutboxRecord
-        from dynastore.modules.storage.driver_instance_id import (
-            compute_driver_instance_id,
-        )
         from dynastore.modules.storage.storage_emit import (
             enqueue_storage_op_id_only,
+            enqueue_storage_op_write_id,
         )
-        from dynastore.tools.identifiers import generate_uuidv7
 
-        collection_id = ctx.collection or ""
-        records = [
-            OutboxRecord(
-                op_id=generate_uuidv7(),
-                driver_id=indexer_id,
-                driver_instance_id=compute_driver_instance_id(
-                    indexer_id, ctx.catalog, collection_id,
-                ),
-                collection_id=collection_id,
-                op=cast(Any, op.op_type),
-                item_id=op.entity_id,
-                payload={},
-                idempotency_key=op.entity_id,
-            )
-            for op in ops
-        ]
+        grouped_records, id_only_records = _build_storage_plane_records(
+            driver_id=indexer_id, ctx=ctx, ops=ops,
+            write_id_supported=await _primary_supports_write_id_reads(
+                ctx.catalog, ctx.collection,
+            ),
+        )
+        total_records = len(grouped_records) + len(id_only_records)
         logger.info(
             "index_chunk_emitted indexer=%s source=storage_plane_outbox "
             "catalog=%s collection=%s chunk_size=%d",
-            indexer_id, ctx.catalog, ctx.collection, len(records),
+            indexer_id, ctx.catalog, ctx.collection, total_records,
         )
         if last_error:
             logger.warning(
                 "StoragePlaneOutboxWriter: enqueueing %d op(s) for indexer "
                 "'%s' (catalog=%s collection=%s) after inline failure: %s",
-                len(records), indexer_id, ctx.catalog, ctx.collection,
+                total_records, indexer_id, ctx.catalog, ctx.collection,
                 last_error,
             )
         _log_dispatch_path(
@@ -483,11 +470,16 @@ class StoragePlaneOutboxWriter:
             indexer_id=indexer_id,
             catalog=ctx.catalog,
             collection=ctx.collection,
-            chunk_size=len(records),
+            chunk_size=total_records,
         )
-        await enqueue_storage_op_id_only(
-            ctx.pg_conn, catalog_id=ctx.catalog, rows=records,
-        )
+        if grouped_records:
+            await enqueue_storage_op_write_id(
+                ctx.pg_conn, catalog_id=ctx.catalog, rows=grouped_records,
+            )
+        if id_only_records:
+            await enqueue_storage_op_id_only(
+                ctx.pg_conn, catalog_id=ctx.catalog, rows=id_only_records,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1683,7 +1675,7 @@ class IndexDispatcher:
         *,
         tx_factory: Optional[Callable[[], Any]] = None,
     ) -> int:
-        """Enqueue id-only ``tasks.storage`` obligations (#2494 P1).
+        """Enqueue ``tasks.storage`` obligations for the storage plane.
 
         Used for item-tier ASYNC secondary-index entries when
         ``TasksPluginConfig.items_secondary_via_storage_plane`` is enabled.
@@ -1698,44 +1690,32 @@ class IndexDispatcher:
         """
         if not ops:
             return 0
-        from dynastore.models.protocols.indexing import OutboxRecord
-        from dynastore.modules.storage.driver_instance_id import (
-            compute_driver_instance_id,
-        )
         from dynastore.modules.storage.storage_emit import (
             enqueue_storage_op_id_only,
+            enqueue_storage_op_write_id,
         )
-        from dynastore.tools.identifiers import generate_uuidv7
-
-        collection_id = ctx.collection or ""
-        records = [
-            OutboxRecord(
-                op_id=generate_uuidv7(),
-                driver_id=entry.driver_ref,
-                driver_instance_id=compute_driver_instance_id(
-                    entry.driver_ref, ctx.catalog, collection_id,
-                ),
-                collection_id=collection_id,
-                op=cast(Any, _op_kind(op)),
-                item_id=_op_entity_id(op),
-                # Ignored downstream: enqueue_storage_op_id_only always
-                # forces the explicit id-only sentinel onto op_payload
-                # (storage_emit.py) regardless of what's set here.
-                payload={},
-                idempotency_key=_op_entity_id(op),
-            )
-            for op in ops
-        ]
+        grouped_records, id_only_records = _build_storage_plane_records(
+            driver_id=entry.driver_ref, ctx=ctx, ops=ops,
+            write_id_supported=await _primary_supports_write_id_reads(
+                ctx.catalog, ctx.collection,
+            ),
+        )
+        total_records = len(grouped_records) + len(id_only_records)
 
         if ctx.pg_conn is not None:
             try:
-                await enqueue_storage_op_id_only(
-                    ctx.pg_conn, catalog_id=ctx.catalog, rows=records,
-                )
-                return len(records)
+                if grouped_records:
+                    await enqueue_storage_op_write_id(
+                        ctx.pg_conn, catalog_id=ctx.catalog, rows=grouped_records,
+                    )
+                if id_only_records:
+                    await enqueue_storage_op_id_only(
+                        ctx.pg_conn, catalog_id=ctx.catalog, rows=id_only_records,
+                    )
+                return total_records
             except Exception as exc:  # noqa: BLE001 — degrade like _enqueue_or_warn
                 logger.error(
-                    "IndexDispatcher: storage-plane id-only enqueue failed "
+                    "IndexDispatcher: storage-plane enqueue failed "
                     "for indexer '%s' (catalog=%s collection=%s): %s",
                     entry.driver_ref, ctx.catalog, ctx.collection, exc,
                 )
@@ -1744,13 +1724,18 @@ class IndexDispatcher:
         if tx_factory is not None:
             try:
                 async with tx_factory() as conn:
-                    await enqueue_storage_op_id_only(
-                        conn, catalog_id=ctx.catalog, rows=records,
-                    )
-                return len(records)
+                    if grouped_records:
+                        await enqueue_storage_op_write_id(
+                            conn, catalog_id=ctx.catalog, rows=grouped_records,
+                        )
+                    if id_only_records:
+                        await enqueue_storage_op_id_only(
+                            conn, catalog_id=ctx.catalog, rows=id_only_records,
+                        )
+                return total_records
             except Exception as exc:  # noqa: BLE001 — degrade like _enqueue_or_warn
                 logger.error(
-                    "IndexDispatcher: storage-plane id-only enqueue (short "
+                    "IndexDispatcher: storage-plane enqueue (short "
                     "TX) failed for indexer '%s' (catalog=%s collection=%s): "
                     "%s",
                     entry.driver_ref, ctx.catalog, ctx.collection, exc,
@@ -1758,16 +1743,98 @@ class IndexDispatcher:
                 return 0
 
         logger.warning(
-            "IndexDispatcher: cannot enqueue %d storage-plane id-only op(s) "
+            "IndexDispatcher: cannot enqueue %d storage-plane op(s) "
             "for indexer '%s' — no open PG connection and no tx_factory "
             "supplied. Caller must supply one for durable enqueue.",
-            len(records), entry.driver_ref,
+            total_records, entry.driver_ref,
         )
         return 0
 
 
 def _op_payload(op: "DispatchableOp") -> Any:
     return op.payload if hasattr(op, "payload") else None
+
+
+def _op_write_id(op: "DispatchableOp") -> Optional[str]:
+    write_id = getattr(op, "write_id", None)
+    return write_id if isinstance(write_id, str) and write_id else None
+
+
+async def _primary_supports_write_id_reads(
+    catalog_id: str,
+    collection_id: Optional[str],
+) -> bool:
+    """True when the collection's primary WRITE driver can hydrate
+    write-id ledger rows (#3116 routing guard).
+
+    Mirrors ``StorageDrainTask._resolve_primary_write_source`` — the drain
+    hydrates from the FIRST resolved WRITE driver, so write-id rows must
+    only be enqueued when that driver exposes the write-id chunk-read
+    capability. Any resolution failure counts as unsupported: the caller
+    falls back to id-only rows, which re-read canonical PG state and are
+    always hydratable.
+    """
+    from dynastore.modules.storage.router import get_write_drivers
+    from dynastore.modules.storage.storage_emit import (
+        driver_supports_write_id_reads,
+    )
+
+    try:
+        resolved = await get_write_drivers(catalog_id, collection_id)
+    except Exception:  # noqa: BLE001 — resolution failure = no capability
+        return False
+    if not resolved:
+        return False
+    return driver_supports_write_id_reads(getattr(resolved[0], "driver", None))
+
+
+def _build_storage_plane_records(
+    *,
+    driver_id: str,
+    ctx: IndexContext,
+    ops: Sequence[DispatchableOp],
+    write_id_supported: bool = True,
+) -> Tuple[List[Any], List[Any]]:
+    from dynastore.models.protocols.indexing import OutboxRecord, WriteIdOutboxRecord
+    from dynastore.modules.storage.driver_instance_id import (
+        compute_driver_instance_id,
+    )
+    from dynastore.tools.identifiers import generate_uuidv7
+
+    collection_id = ctx.collection or ""
+    driver_instance_id = compute_driver_instance_id(
+        driver_id, ctx.catalog, collection_id,
+    )
+    grouped_records: List[WriteIdOutboxRecord] = []
+    id_only_records: List[OutboxRecord] = []
+    for op in ops:
+        write_id = _op_write_id(op) if write_id_supported else None
+        if write_id is not None:
+            grouped_records.append(
+                WriteIdOutboxRecord(
+                    op_id=generate_uuidv7(),
+                    driver_id=driver_id,
+                    driver_instance_id=driver_instance_id,
+                    collection_id=collection_id,
+                    op=cast(Any, _op_kind(op)),
+                    write_id=write_id,
+                    idempotency_key=write_id,
+                ),
+            )
+            continue
+        entity_id = _op_entity_id(op)
+        id_only_records.append(
+            OutboxRecord(
+                op_id=generate_uuidv7(),
+                driver_id=driver_id,
+                driver_instance_id=driver_instance_id,
+                collection_id=collection_id,
+                op=cast(Any, _op_kind(op)),
+                item_id=entity_id,
+                idempotency_key=entity_id,
+            ),
+        )
+    return grouped_records, id_only_records
 
 
 def _op_entity_id(op: "DispatchableOp") -> str:

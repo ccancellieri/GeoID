@@ -83,6 +83,7 @@ HUB_INTERNAL_COLUMNS: frozenset = frozenset({
     "geoid",
     "transaction_time",
     "deleted_at",
+    "write_id",
     "catalog_id",
     "collection_id",
     "geometry_hash",

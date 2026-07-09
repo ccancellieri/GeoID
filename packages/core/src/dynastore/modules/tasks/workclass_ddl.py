@@ -150,7 +150,7 @@ CREATE TABLE IF NOT EXISTS {schema}.storage (
     op              TEXT            NOT NULL,
     status          TEXT            NOT NULL DEFAULT 'ready',
     ready_at        TIMESTAMPTZ     NOT NULL DEFAULT now(),
-    op_payload      JSONB           NOT NULL DEFAULT '{}'::jsonb,
+    write_id        TEXT,
     idempotency_key TEXT,
     claim_version   INTEGER         NOT NULL DEFAULT 0,
     claimed_by      TEXT,

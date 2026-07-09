@@ -657,6 +657,7 @@ SYSTEM_FIELD_KEYS: tuple[str, ...] = (
     "validity",
     "transaction_time",
     "deleted_at",
+    "write_id",
 )
 
 # The three identity axes live flat at the document root in the canonical ES envelope.

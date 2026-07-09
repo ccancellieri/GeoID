@@ -540,7 +540,7 @@ class _StubEs:
 
     async def bulk(self, *, body, params=None, **kwargs):
         self.bulk_calls.append({"body": body, "params": params, "kwargs": kwargs})
-        return {"items": []}
+        return getattr(self, "bulk_result", {"items": []})
 
     async def index(self, *, index, id, body, params=None, **kwargs):
         self.index_calls.append({"index": index, "id": id, "body": body, "params": params})
@@ -700,14 +700,47 @@ class TestDeleteEntitiesUsesRouting:
             return_value="dynastore",
         ):
             driver = ItemsElasticsearchDriver()
-            n = await driver.delete_entities("cat1", "col1", ["a", "b"])
+            n = await driver.delete_entities("cat1", "col1", ["a"])
 
-        assert n == 2
+        assert n == 1
         assert es.delete_calls == [
             {"index": "dynastore-cat1-items", "id": "a",
              "params": {"routing": "col1", "ignore": "404"}},
-            {"index": "dynastore-cat1-items", "id": "b",
-             "params": {"routing": "col1", "ignore": "404"}},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_multi_id_delete_chunk_uses_single_bulk_call(self):
+        es = _StubEs(exists=True)
+        es.bulk_result = {
+            "errors": False,
+            "items": [
+                {"delete": {"_id": "a", "status": 200}},
+                {"delete": {"_id": "b", "status": 200}},
+            ],
+        }
+        with patch(
+            "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+        ), patch(
+            "dynastore.modules.elasticsearch.client.get_index_prefix",
+            return_value="dynastore",
+        ):
+            driver = ItemsElasticsearchDriver()
+            n = await driver.delete_entities("cat1", "col1", ["a", "b"])
+
+        assert n == 2
+        assert es.delete_calls == []
+        assert len(es.bulk_calls) == 1
+        assert es.bulk_calls[0]["body"] == [
+            {"delete": {
+                "_index": "dynastore-cat1-items",
+                "_id": "a",
+                "routing": "col1",
+            }},
+            {"delete": {
+                "_index": "dynastore-cat1-items",
+                "_id": "b",
+                "routing": "col1",
+            }},
         ]
 
 

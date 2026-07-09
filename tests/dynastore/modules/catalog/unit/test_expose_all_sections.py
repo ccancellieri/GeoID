@@ -152,6 +152,7 @@ class TestExposeAllOn:
             "external_id": "ABC",
             "geometry_hash": "9f",
             "deleted_at": None,  # None → omitted from system
+            "write_id": "w-upsert-1",
             "area": 1234.0,
             "perimeter": 56.0,
         }
@@ -166,6 +167,7 @@ class TestExposeAllOn:
             "geoid": "geoid-123",
             "external_id": "ABC",
             "geometry_hash": "9f",
+            "write_id": "w-upsert-1",
         }
         assert "deleted_at" not in dumped["system"]
         # stats: producible computed values, excluding system keys

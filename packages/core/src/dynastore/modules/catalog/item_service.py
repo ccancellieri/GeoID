@@ -61,6 +61,28 @@ from dynastore.modules.catalog.item_distributed import ItemDistributedMixin
 
 logger = logging.getLogger(__name__)
 
+_WRITE_ID_CONTEXT_KEY = "write_id"
+
+
+def _context_write_id(processing_context: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not processing_context:
+        return None
+    write_id = processing_context.get(_WRITE_ID_CONTEXT_KEY)
+    return write_id if isinstance(write_id, str) and write_id else None
+
+
+def _ensure_write_id_context(
+    processing_context: Optional[Dict[str, Any]],
+) -> tuple[str, Dict[str, Any]]:
+    write_id = _context_write_id(processing_context)
+    if write_id is None:
+        from dynastore.tools.identifiers import generate_uuidv7
+
+        write_id = str(generate_uuidv7())
+    merged = dict(processing_context or {})
+    merged[_WRITE_ID_CONTEXT_KEY] = write_id
+    return write_id, merged
+
 
 async def _run_query(conn, stmt, params=None):
     """Run a statement on either sync or async connection."""
@@ -244,7 +266,7 @@ async def _storage_resolves_columnar_async(
 
 
 soft_delete_item_query = DQLQuery(
-    "UPDATE {catalog_id}.{collection_id} SET deleted_at = NOW() WHERE geoid = :geoid AND deleted_at IS NULL;",
+    "UPDATE {catalog_id}.{collection_id} SET deleted_at = NOW(), write_id = :write_id WHERE geoid = :geoid AND deleted_at IS NULL;",
     result_handler=ResultHandler.ROWCOUNT,
 )
 
@@ -1330,6 +1352,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
 
         engine = db_resource or self.engine
         from dynastore.tools.identifiers import generate_geoid
+        write_id, processing_context = _ensure_write_id_context(processing_context)
 
         # Phase 1 — config + sidecars + physical table
         async with managed_transaction(engine) as conn:
@@ -1567,6 +1590,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                         item_context["external_id"] = _ext
                 hub_payload: Dict[str, Any] = {
                     "geoid": geoid,
+                    "write_id": write_id,
                     "transaction_time": datetime.now(timezone.utc),
                     "deleted_at": None,
                 }
@@ -2251,6 +2275,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 entity_type="item",
                 entity_id=str(r.id),
                 payload=payload,
+                write_id=_context_write_id(processing_context),
             ))
         if not ops:
             return {}
@@ -2488,7 +2513,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         the module-level ``enqueue_storage_op`` (#1807 P4), which tests patch
         directly — there is no separate outbox-store seam.
         """
-        from dynastore.models.protocols.indexing import OutboxRecord
+        from dynastore.models.protocols.indexing import WriteIdOutboxRecord
         from dynastore.modules.storage.driver_instance_id import (
             compute_driver_instance_id,
         )
@@ -2499,6 +2524,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
 
         if not items:
             return []
+        write_id, write_context = _ensure_write_id_context(processing_context)
 
         # ── Coalesce same-item ops (latest wins) ──────────────────────
         coalesced: Dict[str, Dict[str, Any]] = {}
@@ -2592,79 +2618,99 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                     )
                 await driver.write_entities(
                     catalog_id, collection_id, deduped,
+                    context=write_context,
                     db_resource=conn,
                 )
 
-            # ASYNC OUTBOX entries: build OutboxRecords + enqueue on the
+            # ASYNC OUTBOX entries: build lightweight write-id rows + enqueue on the
             # SAME conn. Failure here rolls back the PG write above — the
             # atomicity guarantee that closes the drift hole.
+            #
+            # Write-id rows are only hydratable when the primary WRITE
+            # driver exposes the write-id chunk-read capability (#3116) —
+            # the drain hydrates from the first resolved WRITE driver, so
+            # enqueueing a row it cannot serve would retry forever.
+            write_id_supported = True
             if async_outbox_entries:
-                # Resolve the identity + access-envelope stamping inputs once
-                # for this collection (#1287). Applied to a per-record copy
-                # below so the inline FATAL primary write above keeps the
-                # unstamped items.
-                stamp_ctx = await self._resolve_index_stamp_context(
-                    catalog_id, collection_id, processing_context,
+                from dynastore.modules.storage.storage_emit import (
+                    driver_supports_write_id_reads,
                 )
-                # Resolve the write policy once for per-item external_id
-                # resolution. When no policy is configured, this is None and
-                # per-item resolution below is skipped. Failure is intentionally
-                # swallowed — missing write-policy means no external_id stamp,
-                # not a crash.
-                _write_policy = None
-                try:
-                    _bulk_configs = get_protocol(ConfigsProtocol)
-                    if _bulk_configs is not None:
-                        _write_policy = await _bulk_configs.get_config(
-                            ItemsWritePolicy,
-                            catalog_id=catalog_id,
-                            collection_id=collection_id,
-                        )
-                except Exception:
-                    _write_policy = None
-                records: List[OutboxRecord] = []
+
+                primary_driver = (
+                    await _resolve_driver(write_entries[0].driver_ref)
+                    if write_entries else None
+                )
+                write_id_supported = driver_supports_write_id_reads(primary_driver)
+                if not write_id_supported:
+                    logger.warning(
+                        "upsert_bulk: primary WRITE driver %r for %s/%s does "
+                        "not support write-id chunk reads — falling back to "
+                        "per-entity id-only outbox rows for %d target(s) "
+                        "(see #3116).",
+                        write_entries[0].driver_ref if write_entries else None,
+                        catalog_id, collection_id, len(async_outbox_entries),
+                    )
+            if async_outbox_entries and write_id_supported:
+                records: List[WriteIdOutboxRecord] = []
+                for entry in async_outbox_entries:
+                    inst = compute_driver_instance_id(
+                        entry.driver_ref, catalog_id, collection_id,
+                    )
+                    records.append(WriteIdOutboxRecord(
+                        op_id=generate_uuidv7(),
+                        driver_id=entry.driver_ref,
+                        driver_instance_id=inst,
+                        collection_id=collection_id,
+                        op="upsert",
+                        write_id=write_id,
+                        idempotency_key=write_id,
+                    ))
+                if records:
+                    # Enqueue storage rows and drain trigger co-transactionally
+                    # on the caller's conn so a primary-write rollback leaves no
+                    # rows in tasks.storage either.
+                    from dynastore.modules.storage.storage_emit import (
+                        enqueue_storage_op_write_id,
+                    )
+                    await enqueue_storage_op_write_id(
+                        conn,
+                        catalog_id=catalog_id,
+                        rows=records,
+                    )
+            elif async_outbox_entries:
+                # Primary lacks write-id chunk reads: fall back to
+                # per-entity id-only rows (one per coalesced item per
+                # secondary target) — the drain re-reads canonical state
+                # for these instead of hydrating by write_id.
+                from dynastore.models.protocols.indexing import OutboxRecord
+                from dynastore.modules.storage.storage_emit import (
+                    enqueue_storage_op_id_only,
+                )
+
+                id_only_records: List[OutboxRecord] = []
                 for entry in async_outbox_entries:
                     inst = compute_driver_instance_id(
                         entry.driver_ref, catalog_id, collection_id,
                     )
                     for it in deduped:
                         item_id = it.get("id") if isinstance(it, dict) else None
-                        item_id_str = str(item_id) if item_id is not None else None
-                        payload_copy = dict(it)
-                        # Per-item external_id resolution: inject _external_id
-                        # from the inbound item so every OUTBOX record carries
-                        # the correct identity even when stamp_ctx.external_id
-                        # is None (batch-level context has no per-item value)
-                        # and stamp_ctx.external_id_path is None (no path
-                        # configured). When stamp_ctx already resolved a value
-                        # via ctx.external_id or path extraction, _apply_index_stamp
-                        # will overwrite this — the per-item pre-set only fills
-                        # the gap for the no-path case.
-                        if _write_policy is not None:
-                            _item_ext = _write_policy.resolve_external_id(payload_copy)
-                            if _item_ext is not None and "_external_id" not in payload_copy:
-                                payload_copy["_external_id"] = _item_ext
-                        records.append(OutboxRecord(
+                        if item_id is None:
+                            continue
+                        item_id = str(item_id)
+                        id_only_records.append(OutboxRecord(
                             op_id=generate_uuidv7(),
                             driver_id=entry.driver_ref,
                             driver_instance_id=inst,
                             collection_id=collection_id,
                             op="upsert",
-                            payload=self._apply_index_stamp(payload_copy, stamp_ctx),
-                            item_id=item_id_str,
-                            idempotency_key=item_id_str or str(generate_uuidv7()),
+                            item_id=item_id,
+                            idempotency_key=item_id,
                         ))
-                if records:
-                    # Enqueue storage rows and drain trigger co-transactionally
-                    # on the caller's conn so a primary-write rollback leaves no
-                    # rows in tasks.storage either.
-                    from dynastore.modules.storage.storage_emit import (
-                        enqueue_storage_op,
-                    )
-                    await enqueue_storage_op(
+                if id_only_records:
+                    await enqueue_storage_op_id_only(
                         conn,
                         catalog_id=catalog_id,
-                        rows=records,
+                        rows=id_only_records,
                     )
 
         return deduped
@@ -3254,4 +3300,3 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             return sql, {"asset_id": asset_id}
 
         return DQLQuery.from_builder(_builder, result_handler=ResultHandler.ALL_DICTS)
-

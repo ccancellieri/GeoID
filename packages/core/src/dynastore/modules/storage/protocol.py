@@ -27,6 +27,7 @@ from dynastore.models.protocols.storage_driver import (
     Capability,
     CollectionItemsStore,
     ReadOnlyDriverMixin,
+    WriteIdChunkReadablePrimary,
 )
 from dynastore.modules.storage.storage_location import StorageLocation
 
@@ -35,4 +36,5 @@ __all__ = [
     "CollectionItemsStore",
     "ReadOnlyDriverMixin",
     "StorageLocation",
+    "WriteIdChunkReadablePrimary",
 ]

@@ -20,6 +20,48 @@ tasks.tasks  PARTITION BY RANGE (timestamp)
 A single global dispatcher claims tasks across all tenants via `FOR UPDATE SKIP LOCKED`.
 Runners receive the `schema_name` so they can operate in the correct tenant context.
 
+## Storage Outbox (`tasks.storage`)
+
+A second global partitioned table (`{DYNASTORE_TASK_SCHEMA}.storage`, default
+`tasks.storage`), RANGE-partitioned by `day`, carries async storage
+obligations (secondary-index writes and similar) enqueued by the storage
+module (see [`../storage/README.md`](../storage/README.md)) and drained by
+`StorageDrainTask` (`dynastore.tasks.workclass_drain.storage_drain_task`):
+
+```
+tasks.storage  PARTITION BY RANGE (day)
+  ├─ op_id           UUID      row identifier
+  ├─ catalog_id      TEXT      tenant discriminator
+  ├─ driver_id       TEXT      target secondary driver
+  ├─ collection_id   TEXT
+  ├─ entity_id       TEXT      set on an id-only row; NULL on a write-id row
+  ├─ write_id        TEXT      set on a write-id row; NULL on an id-only row
+  ├─ op              TEXT      upsert | delete
+  ├─ idempotency_key TEXT
+  └─ ...
+```
+
+There is no `op_payload` column — the ledger carries identifiers only, never
+a payload snapshot. `StorageDrainTask` classifies each claimed row
+structurally:
+
+- **write-id row** — `write_id` set, `entity_id` NULL, `idempotency_key =
+  write_id`; one row per `(write_id, driver_id, collection_id, op)`. The
+  drain hydrates current state from the collection's primary WRITE driver's
+  hub by `write_id`, via keyset-paged chunk reads (`read_indexable_write_batch`,
+  or the `read_active_rows_by_write_id` / `read_tombstoned_ids_by_write_id`
+  pair).
+- **id-only row** — `entity_id` set, `write_id` NULL. The drain re-reads
+  canonical PG state for that id at replay time instead of indexing a
+  payload frozen at enqueue time.
+- A row with **neither** `write_id` nor `entity_id` can never hydrate and is
+  marked `dead`.
+
+A write-id row is only produced when the collection's primary WRITE driver
+exposes the write-id chunk-read capability; otherwise the producer falls
+back to an id-only row (#3116 guard — see the storage module's README for
+the producer-side detail).
+
 ## Key Components
 
 | File | Purpose |

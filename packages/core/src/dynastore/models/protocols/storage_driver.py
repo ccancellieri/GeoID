@@ -149,6 +149,11 @@ class Capability:
     # Driver supports a fast-path bulk ingest channel (e.g. COPY for PG,
     # append for Iceberg).  Callers check this before invoking bulk_copy().
 
+    # --- Canonical write-id replay ---
+    WRITE_ID_CHUNK_READ = "write_id_chunk_read"
+    # Driver can page canonical primary rows by ``system.write_id`` so async
+    # secondary-write drains can rehydrate one logical write chunk at a time.
+
     # --- Tenant isolation ---
     TENANT_ISOLATED = "tenant_isolated"
     # Driver maintains a per-catalog physical storage unit (ES index,
@@ -535,6 +540,37 @@ class CollectionItemsStore(Protocol):
             and ``display_label`` populated from this driver's config for the
             given catalog/collection.
         """
+        ...
+
+
+@runtime_checkable
+class WriteIdChunkReadablePrimary(Protocol):
+    """Optional primary-driver capability for write-id chunk replays."""
+
+    async def read_active_rows_by_write_id(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        write_id: str,
+        limit: int,
+        after_geoid: Optional[str] = None,
+        db_resource: Optional[Any] = None,
+    ) -> tuple[List[Dict[str, Any]], Optional[str]]:
+        """Return one active-row page for ``write_id`` ordered by geoid."""
+        ...
+
+    async def read_tombstoned_ids_by_write_id(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        write_id: str,
+        limit: int,
+        after_geoid: Optional[str] = None,
+        db_resource: Optional[Any] = None,
+    ) -> tuple[List[str], Optional[str]]:
+        """Return one tombstoned-geoid page for ``write_id`` ordered by geoid."""
         ...
 
 

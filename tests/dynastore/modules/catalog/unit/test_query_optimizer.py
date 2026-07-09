@@ -23,6 +23,7 @@ from dynastore.models.query_builder import (
     QueryRequest,
     FieldSelection,
     FilterCondition,
+    FilterOperator,
     SortOrder,
 )
 from dynastore.modules.storage.drivers.pg_sidecars.base import FieldDefinition, FieldCapability
@@ -615,6 +616,33 @@ def test_validate_query_whitelists_geoid_select_when_columnar(mock_col_config, m
     )
     errors = optimizer.validate_query(req)
     assert "Unknown field: geoid" not in errors
+
+
+def test_query_optimizer_treats_write_id_as_hub_field():
+    """``write_id`` is a hub/system column, not a sidecar/user field."""
+    optimizer = QueryOptimizer(ItemsPostgresqlDriverConfig(sidecars=[]))
+    req = QueryRequest(
+        select=[FieldSelection(field="write_id")],
+        filters=[
+            FilterCondition(
+                field="write_id",
+                operator=FilterOperator.EQ,
+                value="w-123",
+            )
+        ],
+        sort=[SortOrder(field="write_id", direction="DESC")],
+        group_by=["write_id"],
+        include_total_count=False,
+    )
+
+    assert optimizer.validate_query(req) == []
+    sql, params = optimizer.build_optimized_query(req, "schema", "items_hub")
+
+    assert "h.write_id" in sql
+    assert "WHERE h.deleted_at IS NULL AND h.write_id = :filter_0" in sql
+    assert "GROUP BY h.write_id" in sql
+    assert "ORDER BY h.write_id DESC" in sql
+    assert params["filter_0"] == "w-123"
 
 
 def test_raw_where_resolved_columnar_expr_not_double_qualified(mock_col_config, mock_registry):

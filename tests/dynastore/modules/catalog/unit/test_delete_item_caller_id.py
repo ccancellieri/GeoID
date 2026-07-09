@@ -108,6 +108,7 @@ async def test_delete_item_forwards_caller_id_to_invalidation() -> None:
     )
     fake_self._resolve_physical_schema = AsyncMock(return_value="s_abc")
     fake_self._resolve_physical_table = AsyncMock(return_value="items_t")
+    fake_self.resolve_external_id_by_geoid = AsyncMock(return_value=None)
     fake_self._enqueue_index_deletes = AsyncMock(return_value=None)
 
     fake_conn = MagicMock()
@@ -174,6 +175,7 @@ async def test_delete_item_default_caller_id_is_none() -> None:
     )
     fake_self._resolve_physical_schema = AsyncMock(return_value="s_abc")
     fake_self._resolve_physical_table = AsyncMock(return_value="items_t")
+    fake_self.resolve_external_id_by_geoid = AsyncMock(return_value=None)
     fake_self._enqueue_index_deletes = AsyncMock(return_value=None)
 
     fake_conn = MagicMock()

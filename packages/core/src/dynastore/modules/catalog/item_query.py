@@ -1339,6 +1339,15 @@ class ItemQueryMixin:
         db_resource = ctx.db_resource if ctx else None
         validate_sql_identifier(catalog_id)
         validate_sql_identifier(collection_id)
+        write_id = None
+        if ctx is not None and isinstance(getattr(ctx, "extensions", None), dict):
+            candidate = ctx.extensions.get("write_id")
+            if isinstance(candidate, str) and candidate:
+                write_id = candidate
+        if write_id is None:
+            from dynastore.tools.identifiers import generate_uuidv7
+
+            write_id = str(generate_uuidv7())
 
         # Phase 2 tile-cache (#1297): capture the item's current extent BEFORE
         # the soft-delete so the invalidate task can drop the tiles it used to
@@ -1393,14 +1402,14 @@ class ItemQueryMixin:
                         deleted_geoids = [
                             str(g) for g in await DQLQuery(
                                 f'UPDATE {qualify_table(phys_schema, phys_table)} h '
-                                f"SET deleted_at = NOW() "
+                                f"SET deleted_at = NOW(), write_id = :write_id "
                                 f'FROM {qualify_table(phys_schema, sc_table)} s '
                                 f"WHERE s.{fid_col} = :ext_id "
                                 f"AND h.deleted_at IS NULL "
                                 f"AND h.geoid = s.geoid "
                                 f"RETURNING h.geoid",
                                 result_handler=ResultHandler.ALL_SCALARS,
-                            ).execute(conn, ext_id=str(item_id))
+                            ).execute(conn, ext_id=str(item_id), write_id=write_id)
                         ]
                         rows = len(deleted_geoids)
                         break
@@ -1436,6 +1445,7 @@ class ItemQueryMixin:
                     catalog_id=phys_schema,
                     collection_id=phys_table,
                     geoid=item_id,
+                    write_id=write_id,
                 )
                 # Here ``item_id`` is itself the geoid (UUID-validated above),
                 # so a non-zero rowcount means that geoid was soft-deleted.
@@ -1445,14 +1455,13 @@ class ItemQueryMixin:
             if rows > 0:
                 await recalculate_and_update_extents(conn, catalog_id, collection_id)
 
-                # Propagate the delete to async-OUTBOX index drivers
-                # (e.g. public ES) symmetrically with ``upsert_bulk``: one
-                # delete row per soft-deleted geoid, enqueued on THIS TX
-                # conn and keyed by the geoid — the same ES ``_id`` the
-                # upsert path indexed under. A failed enqueue rolls back
-                # the soft-delete, so PG and the index can't drift apart.
+                # Propagate the delete to async WRITE drivers symmetrically
+                # with ``upsert_bulk``: one lightweight write-id ledger row
+                # per async target, enqueued on THIS TX conn. The drain reads
+                # tombstoned geoids for the write id from the primary PG hub.
                 await self._enqueue_index_deletes(
                     conn, catalog_id, collection_id, deleted_geoids,
+                    write_id=write_id,
                 )
 
                 # Emit event for non-indexer subscribers (audit, telemetry).
@@ -1503,27 +1512,28 @@ class ItemQueryMixin:
         catalog_id: str,
         collection_id: str,
         geoids: List[str],
+        *,
+        write_id: str,
     ) -> None:
-        """Enqueue one ES-delete OUTBOX row per soft-deleted geoid.
+        """Enqueue a lightweight write-id delete row per async index target.
 
         Symmetric counterpart to ``ItemService.upsert_bulk``'s async-OUTBOX
         enqueue: resolve the secondary-index ``WRITE`` entries
         (``secondary_index=True``) in ``ItemsRoutingConfig.operations[WRITE]``
         that are ``write_mode=ASYNC`` + ``on_failure=OUTBOX`` and write one
-        ``OutboxRecord(op="delete")`` per (entry, geoid) onto the caller's
-        transaction, keyed by the geoid. The drain's delete branch keys the
-        ES ``_id`` on ``idempotency_key`` (the geoid), the same value the
-        upsert path indexed under, so the document is actually purged.
+        ``WriteIdOutboxRecord(op="delete")`` per target onto the caller's
+        transaction. The drain reads tombstoned hub ids by ``write_id``.
 
-        Honours the ``_test_routing_resolver`` seam (as ``upsert_bulk`` does)
-        so this can be unit-tested without a live ConfigsProtocol; the enqueue
-        itself goes through the module-level ``enqueue_storage_op`` (#1807 P4),
-        which tests patch directly.
+        Honours the ``_test_routing_resolver`` / ``_test_driver_registry``
+        seams (as ``upsert_bulk`` does) so this can be unit-tested without a
+        live ConfigsProtocol; the enqueue itself goes through the
+        module-level ``enqueue_storage_op_write_id`` (#1807 P4), which tests
+        patch directly.
         """
         if not geoids:
             return
 
-        from dynastore.models.protocols.indexing import OutboxRecord
+        from dynastore.models.protocols.indexing import WriteIdOutboxRecord
         from dynastore.modules.storage.driver_instance_id import (
             compute_driver_instance_id,
         )
@@ -1547,6 +1557,7 @@ class ItemQueryMixin:
 
         ops_map = getattr(routing, "operations", {}) or {}
         from dynastore.modules.storage.routing_config import (
+            Operation,
             secondary_index_entries,
         )
         async_outbox_entries = secondary_index_entries(
@@ -1555,33 +1566,89 @@ class ItemQueryMixin:
         if not async_outbox_entries:
             return
 
-        records: List[OutboxRecord] = []
+        # Write-id rows are only hydratable when the primary WRITE driver
+        # exposes the write-id chunk-read capability (#3116) — the drain
+        # hydrates tombstoned ids from the first resolved WRITE driver, so
+        # enqueueing a row it cannot serve would retry forever.
+        from dynastore.modules.storage.storage_emit import (
+            driver_supports_write_id_reads,
+        )
+
+        write_entries = list(ops_map.get(Operation.WRITE, []))
+        registry = getattr(self, "_test_driver_registry", None)
+        primary_driver = None
+        if write_entries:
+            if registry is not None:
+                primary_driver = await registry(write_entries[0].driver_ref)
+            else:
+                from dynastore.modules.storage.driver_registry import (
+                    DriverRegistry,
+                )
+                primary_driver = DriverRegistry.get_collection(
+                    write_entries[0].driver_ref,
+                )
+        if not driver_supports_write_id_reads(primary_driver):
+            # Primary lacks write-id chunk reads: fall back to per-entity
+            # id-only delete rows (one per geoid per secondary target) —
+            # the drain direct-appends these tombstones without rereading
+            # canonical state, so no capability is required to hydrate them.
+            logger.warning(
+                "_enqueue_index_deletes: primary WRITE driver %r for %s/%s "
+                "does not support write-id chunk reads — falling back to "
+                "per-entity id-only outbox rows for %d target(s) "
+                "(see #3116).",
+                write_entries[0].driver_ref if write_entries else None,
+                catalog_id, collection_id, len(async_outbox_entries),
+            )
+            from dynastore.models.protocols.indexing import OutboxRecord
+            from dynastore.modules.storage.storage_emit import (
+                enqueue_storage_op_id_only,
+            )
+
+            id_only_records: List[OutboxRecord] = []
+            for entry in async_outbox_entries:
+                inst = compute_driver_instance_id(
+                    entry.driver_ref, catalog_id, collection_id,
+                )
+                for geoid in geoids:
+                    id_only_records.append(OutboxRecord(
+                        op_id=generate_uuidv7(),
+                        driver_id=entry.driver_ref,
+                        driver_instance_id=inst,
+                        collection_id=collection_id,
+                        op="delete",
+                        item_id=geoid,
+                        idempotency_key=geoid,
+                    ))
+            if id_only_records:
+                await enqueue_storage_op_id_only(
+                    conn,
+                    catalog_id=catalog_id,
+                    rows=id_only_records,
+                )
+            return
+
+        records: List[WriteIdOutboxRecord] = []
         for entry in async_outbox_entries:
             inst = compute_driver_instance_id(
                 entry.driver_ref, catalog_id, collection_id,
             )
-            for geoid in geoids:
-                gid = str(geoid)
-                records.append(OutboxRecord(
-                    op_id=generate_uuidv7(),
-                    driver_id=entry.driver_ref,
-                    driver_instance_id=inst,
-                    collection_id=collection_id,
-                    op="delete",
-                    item_id=gid,
-                    # Delete actions carry no source document; the drain's
-                    # delete branch ignores ``payload`` and keys ES on
-                    # ``idempotency_key``.
-                    payload={},
-                    idempotency_key=gid,
-                ))
+            records.append(WriteIdOutboxRecord(
+                op_id=generate_uuidv7(),
+                driver_id=entry.driver_ref,
+                driver_instance_id=inst,
+                collection_id=collection_id,
+                op="delete",
+                write_id=write_id,
+                idempotency_key=write_id,
+            ))
         if records:
             # Enqueue storage rows and drain trigger co-transactionally on the
             # caller's conn (delete twin of ItemService.upsert_bulk).
             from dynastore.modules.storage.storage_emit import (
-                enqueue_storage_op,
+                enqueue_storage_op_write_id,
             )
-            await enqueue_storage_op(
+            await enqueue_storage_op_write_id(
                 conn,
                 catalog_id=catalog_id,
                 rows=records,

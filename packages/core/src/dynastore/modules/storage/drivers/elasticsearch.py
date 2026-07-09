@@ -2231,6 +2231,39 @@ class ItemsElasticsearchDriver(
         es = _es_client_required()
         index_name = self._items_index_name(catalog_id)
         deleted = 0
+        if len(entity_ids) > 1:
+            body = [
+                {"delete": {
+                    "_index": index_name,
+                    "_id": eid,
+                    "routing": collection_id,
+                }}
+                for eid in entity_ids
+            ]
+            try:
+                resp = await es.bulk(body=body)
+            except Exception as exc:
+                logger.warning(
+                    "ItemsElasticsearchDriver: bulk delete failed for %s/%s "
+                    "(%d ids): %s",
+                    catalog_id, collection_id, len(entity_ids), exc,
+                )
+                return 0
+
+            for eid, item in zip(entity_ids, resp.get("items", []) or []):
+                result = item.get("delete", {}) if isinstance(item, dict) else {}
+                error = result.get("error") if isinstance(result, dict) else None
+                status = result.get("status") if isinstance(result, dict) else None
+                if error and status != 404:
+                    logger.warning(
+                        "ItemsElasticsearchDriver: failed to delete item "
+                        "id=%s catalog=%s collection=%s: %s",
+                        eid, catalog_id, collection_id, error,
+                    )
+                    continue
+                deleted += 1
+            return deleted
+
         for eid in entity_ids:
             try:
                 await es.delete(
@@ -3309,4 +3342,3 @@ class AssetElasticsearchDriver(
             identifiers={"index": index_name, "prefix": prefix, "catalog_id": catalog_id},
             display_label=index_name,
         )
-

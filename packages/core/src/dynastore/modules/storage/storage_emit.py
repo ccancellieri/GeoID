@@ -40,13 +40,12 @@ The ``task_schema`` is read from :func:`get_task_schema()` (backed by the
 ``DYNASTORE_TASK_SCHEMA`` env-var, default ``"tasks"``).  It is
 schema-qualified in identifier position and validated before use.
 """
-import json
 import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from dynastore.models.protocols.indexing import (
-    STORAGE_PLANE_ID_ONLY_MARKER_KEY,
     OutboxRecord,
+    WriteIdOutboxRecord,
 )
 from dynastore.tools.db import validate_sql_identifier
 from dynastore.tools.identifiers import generate_uuidv7
@@ -54,56 +53,25 @@ from dynastore.tools.identifiers import generate_uuidv7
 logger = logging.getLogger(__name__)
 
 
-async def _enqueue_storage(
-    conn: Any,
-    *,
-    catalog_id: str,
-    rows: Sequence[OutboxRecord],
-) -> None:
-    """Insert outbox records into the global ``tasks.storage`` on ``conn``.
+def driver_supports_write_id_reads(driver: Any) -> bool:
+    """True when ``driver`` can hydrate write-id ledger rows (#3116 guard).
 
-    Runs a schema-qualified parameterised ``INSERT`` per row on the caller's
-    open SQLAlchemy transaction.  ``catalog_id`` is the tenant's logical
-    identifier; it is bound as a column VALUE, never interpolated into SQL.
-    ``day`` is ``CURRENT_DATE`` so the row lands in today's daily leaf (or
-    the DEFAULT partition on a gap day).
-
-    The ``entity_kind`` defaults to ``'item'`` for the current items tier.
-    ``entity_id`` carries the item identifier (``r.item_id``).
-    # TODO(#1807 P1.3): branch on entity_kind for collection/catalog/asset tiers.
+    ``StorageDrainTask`` hydrates a write-id row from the collection's
+    primary WRITE driver via ``read_indexable_write_batch`` or the
+    ``read_active_rows_by_write_id`` / ``read_tombstoned_ids_by_write_id``
+    chunk-read pair. A producer must only enqueue a write-id row when the
+    primary exposes one of those — otherwise the row can never hydrate and
+    would retry forever. Callers fall back to id-only rows (which re-read
+    canonical PG state) or skip with a warning.
     """
-    if not rows:
-        return
-    from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
-    from dynastore.modules.tasks.tasks_module import get_task_schema
-
-    task_schema = get_task_schema()
-    # Defence-in-depth: the schema name comes from a trusted env default but is
-    # placed in identifier position, so validate it like every other qualifier.
-    validate_sql_identifier(task_schema)
-    insert_sql = (
-        f"INSERT INTO {task_schema}.storage ("
-        "    op_id, day, catalog_id, driver_id, collection_id,"
-        "    entity_kind, entity_id, op, op_payload, idempotency_key"
-        ") VALUES ("
-        "    :op_id, CURRENT_DATE, :catalog_id, :driver_id,"
-        "    :collection_id, 'item', :entity_id,"
-        "    :op, CAST(:op_payload AS jsonb), :idempotency_key"
-        ")"
+    if driver is None:
+        return False
+    if getattr(driver, "read_indexable_write_batch", None) is not None:
+        return True
+    return (
+        getattr(driver, "read_active_rows_by_write_id", None) is not None
+        and getattr(driver, "read_tombstoned_ids_by_write_id", None) is not None
     )
-    query = DQLQuery(insert_sql, result_handler=ResultHandler.NONE)
-    for r in rows:
-        await query.execute(
-            conn,
-            op_id=str(r.op_id),
-            catalog_id=catalog_id,
-            driver_id=r.driver_id,
-            collection_id=r.collection_id,
-            entity_id=r.item_id,
-            op=r.op,
-            op_payload=json.dumps(r.payload),
-            idempotency_key=r.idempotency_key,
-        )
 
 
 async def _enqueue_drain_trigger(
@@ -246,17 +214,15 @@ async def _enqueue_storage_id_only(
 ) -> None:
     """Insert id-only obligations into ``tasks.storage`` (#2494 P1).
 
-    Same INSERT shape as :func:`_enqueue_storage`, except ``op_payload`` is
-    always the explicit sentinel ``{STORAGE_PLANE_ID_ONLY_MARKER_KEY: true}``
-    regardless of ``r.payload`` — the drain (``StorageDrainTask``) re-reads
-    canonical PG state for these rows at replay time instead of indexing a
-    payload snapshot taken at enqueue time (see ``storage_drain_task.py``).
+    An id-only row carries ONLY the entity identifier — the drain
+    (``StorageDrainTask``) re-reads canonical PG state for these rows at
+    replay time instead of indexing a payload snapshot taken at enqueue
+    time (see ``storage_drain_task.py``). ``tasks.storage`` has no payload
+    column: a row is classified structurally — ``write_id`` set means a
+    write-id batch reference, ``entity_id`` set means id-only.
 
-    The marker is an explicit key, not a bare ``{}``: the ``tasks.storage``
-    DDL default for ``op_payload`` is ALSO ``'{}'::jsonb``, so a genuinely
-    empty payload (any producer that omits it) is indistinguishable from an
-    id-only row on emptiness alone. The drain keys off the marker key, not
-    payload emptiness (review finding, #2494).
+    ``entity_kind`` defaults to ``'item'`` for the current items tier.
+    # TODO(#1807 P1.3): branch on entity_kind for collection/catalog/asset tiers.
     """
     if not rows:
         return
@@ -268,14 +234,13 @@ async def _enqueue_storage_id_only(
     insert_sql = (
         f"INSERT INTO {task_schema}.storage ("
         "    op_id, day, catalog_id, driver_id, collection_id,"
-        "    entity_kind, entity_id, op, op_payload, idempotency_key"
+        "    entity_kind, entity_id, op, idempotency_key"
         ") VALUES ("
         "    :op_id, CURRENT_DATE, :catalog_id, :driver_id,"
         "    :collection_id, 'item', :entity_id,"
-        "    :op, CAST(:op_payload AS jsonb), :idempotency_key"
+        "    :op, :idempotency_key"
         ")"
     )
-    id_only_payload = json.dumps({STORAGE_PLANE_ID_ONLY_MARKER_KEY: True})
     query = DQLQuery(insert_sql, result_handler=ResultHandler.NONE)
     for r in rows:
         await query.execute(
@@ -286,7 +251,50 @@ async def _enqueue_storage_id_only(
             collection_id=r.collection_id,
             entity_id=r.item_id,
             op=r.op,
-            op_payload=id_only_payload,
+            idempotency_key=r.idempotency_key,
+        )
+
+
+async def _enqueue_storage_write_id(
+    conn: Any,
+    *,
+    catalog_id: str,
+    rows: Sequence[WriteIdOutboxRecord],
+) -> None:
+    """Insert write-id ledger rows into ``tasks.storage``.
+
+    These rows represent a logical primary write batch for one secondary
+    target, not a payload copy.  ``write_id`` is a first-class ledger column;
+    ``entity_id`` stays NULL — the drain hydrates the batch from the primary
+    driver by ``write_id``.
+    """
+    if not rows:
+        return
+    from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
+    from dynastore.modules.tasks.tasks_module import get_task_schema
+
+    task_schema = get_task_schema()
+    validate_sql_identifier(task_schema)
+    insert_sql = (
+        f"INSERT INTO {task_schema}.storage ("
+        "    op_id, day, catalog_id, driver_id, collection_id,"
+        "    entity_kind, entity_id, op, write_id, idempotency_key"
+        ") VALUES ("
+        "    :op_id, CURRENT_DATE, :catalog_id, :driver_id,"
+        "    :collection_id, 'item', NULL,"
+        "    :op, :write_id, :idempotency_key"
+        ")"
+    )
+    query = DQLQuery(insert_sql, result_handler=ResultHandler.NONE)
+    for r in rows:
+        await query.execute(
+            conn,
+            op_id=str(r.op_id),
+            catalog_id=catalog_id,
+            driver_id=r.driver_id,
+            collection_id=r.collection_id,
+            op=r.op,
+            write_id=r.write_id,
             idempotency_key=r.idempotency_key,
         )
 
@@ -315,24 +323,21 @@ async def enqueue_storage_op_id_only(
 ) -> None:
     """Write id-only obligations into ``tasks.storage`` and enqueue the drain trigger.
 
-    The storage-plane counterpart of :func:`enqueue_storage_op` used by the
+    Used by the
     :class:`~dynastore.modules.storage.index_dispatcher.IndexDispatcher` for
     ASYNC secondary-index ``WRITE`` entries when
     ``TasksPluginConfig.items_secondary_via_storage_plane`` is enabled
-    (#2494 P1). Every row's ``op_payload`` is forced to the explicit
-    ``{STORAGE_PLANE_ID_ONLY_MARKER_KEY: true}`` sentinel — the drain
-    re-reads the canonical PG row for each id at replay time instead of
-    replaying a payload snapshot, so the queued obligation can never go
-    stale.
+    (#2494 P1). Each row carries only the entity id — the drain re-reads
+    the canonical PG row for each id at replay time instead of replaying
+    a payload snapshot, so the queued obligation can never go stale.
 
     Rows are coalesced within this call via :func:`_coalesce_id_only_rows`
     before the INSERT; cross-call duplicates are NOT deduplicated (there is
     no DB unique index on ``tasks.storage``) — the re-read-canonical-state
     drain design makes a duplicate a harmless repeat of the same read.
 
-    Rides ``conn`` (the caller's open transaction) for the same atomicity
-    guarantee as :func:`enqueue_storage_op`: a primary-write rollback
-    leaves no rows in either ``tasks.storage`` or ``tasks.tasks``.
+    Rides ``conn`` (the caller's open transaction) so a primary-write
+    rollback leaves no rows in either ``tasks.storage`` or ``tasks.tasks``.
     """
     coalesced = _coalesce_id_only_rows(rows)
     if not coalesced:
@@ -341,28 +346,30 @@ async def enqueue_storage_op_id_only(
     await _enqueue_drain_trigger(conn)
 
 
-async def enqueue_storage_op(
+def _coalesce_write_id_rows(
+    rows: Sequence[WriteIdOutboxRecord],
+) -> List[WriteIdOutboxRecord]:
+    """Coalesce write-id rows by ``(driver_id, collection_id, op, write_id)``."""
+    coalesced: Dict[Tuple[str, Optional[str], str, str], WriteIdOutboxRecord] = {}
+    for r in rows:
+        coalesced[(r.driver_id, r.collection_id, r.op, r.write_id)] = r
+    return list(coalesced.values())
+
+
+async def enqueue_storage_op_write_id(
     conn: Any,
     *,
     catalog_id: str,
-    rows: Sequence[OutboxRecord],
+    rows: Sequence[WriteIdOutboxRecord],
 ) -> None:
-    """Write storage rows into ``tasks.storage`` and enqueue the drain trigger.
+    """Write lightweight write-id obligations into ``tasks.storage``.
 
-    The single dispatch point for the storage-plane write, shared by the
-    upsert seam (``ItemService.upsert_bulk``) and the delete twin
-    (``ItemService._enqueue_index_deletes``). Both writes ride ``conn`` (the
-    caller's open item-write transaction), so a failure rolls back the
-    primary write atomically.
-
-    ``catalog_id`` is the tenant's logical identifier; it is stored as a
-    column value in ``tasks.storage``, providing tenancy without requiring a
-    per-tenant table.
-
-    A dedup'd ``storage_drain`` PENDING task row is also inserted on the same
-    ``conn`` so the drain is triggered co-transactionally with the work rows.
+    One row can represent a whole PG-primary write batch for one secondary
+    target, collection and op.  The drain rehydrates by ``write_id`` from the
+    primary driver, so no feature payloads are copied into ``tasks.storage``.
     """
-    if not rows:
+    coalesced = _coalesce_write_id_rows(rows)
+    if not coalesced:
         return
-    await _enqueue_storage(conn, catalog_id=catalog_id, rows=rows)
+    await _enqueue_storage_write_id(conn, catalog_id=catalog_id, rows=coalesced)
     await _enqueue_drain_trigger(conn)

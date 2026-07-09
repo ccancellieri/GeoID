@@ -146,6 +146,10 @@ async def test_item_deletion_event_uses_external_id_when_resolved() -> None:
     assert emitted.get("payload", {}).get("original_id") == GEOID, (
         "original_id in payload must still be the geoid for audit purposes"
     )
+    soft_delete_kwargs = patches[1].new.execute.await_args.kwargs
+    assert soft_delete_kwargs["write_id"]
+    delete_enqueue_kwargs = fake_self._enqueue_index_deletes.await_args.kwargs
+    assert delete_enqueue_kwargs["write_id"] == soft_delete_kwargs["write_id"]
     # Verify resolve_external_id_by_geoid was called with the right args
     fake_self.resolve_external_id_by_geoid.assert_awaited_once_with(
         "cat1", "col1", GEOID, None,

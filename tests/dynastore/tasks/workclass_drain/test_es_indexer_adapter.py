@@ -101,6 +101,30 @@ async def test_index_bulk_calls_client_with_body_kwarg() -> None:
 
 
 @pytest.mark.asyncio
+async def test_index_bulk_delete_chunk_uses_single_bulk_call() -> None:
+    client = _FakeAsyncClient()
+    indexer = ESBulkIndexer(_FakeDriver(client))
+    ops = [_op("delete"), _op("delete")]
+
+    result = await indexer.index_bulk(ops)
+
+    assert len(client.calls) == 1
+    assert client.calls[0] == [
+        {"delete": {
+            "_index": "test-cat1-items",
+            "_id": ops[0].idempotency_key,
+            "routing": "col1",
+        }},
+        {"delete": {
+            "_index": "test-cat1-items",
+            "_id": ops[1].idempotency_key,
+            "routing": "col1",
+        }},
+    ]
+    assert result.passed == [op.op_id for op in ops]
+
+
+@pytest.mark.asyncio
 async def test_index_bulk_whole_batch_failure_is_transient_and_logged(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

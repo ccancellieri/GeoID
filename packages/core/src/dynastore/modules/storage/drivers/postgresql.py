@@ -27,7 +27,7 @@ to the existing PG-based service layer.
 
 import logging
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, FrozenSet, List, Optional, Union
+from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, FrozenSet, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from dynastore.modules.storage.storage_location import StorageLocation
@@ -126,6 +126,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         Capability.SOFT_DELETE_ATOMIC,
         Capability.QUERY_FALLBACK_SOURCE,
         Capability.BULK_COPY,
+        Capability.WRITE_ID_CHUNK_READ,
     })
     preferred_for: FrozenSet[Hint] = frozenset({Hint.FEATURES, Hint.WRITE, Hint.GEOMETRY_EXACT})
     supported_hints: FrozenSet[Hint] = frozenset({
@@ -261,7 +262,11 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
     ) -> List[Feature]:
         items_svc = self._get_crud_protocol()
         result = await items_svc.upsert(
-            catalog_id, collection_id, entities, ctx=DriverContext(db_resource=db_resource) if db_resource else None
+            catalog_id,
+            collection_id,
+            entities,
+            ctx=DriverContext(db_resource=db_resource) if db_resource else None,
+            processing_context=context,
         )
         if isinstance(result, list):
             return result
@@ -300,6 +305,129 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
 
         async for feature in response.items:
             yield feature
+
+    async def _resolve_write_id_hub(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        db_resource: Optional[Any] = None,
+    ) -> Tuple[str, str]:
+        schema = await self._resolve_schema(catalog_id, db_resource=db_resource)
+        table = await self.resolve_physical_table(
+            catalog_id, collection_id, db_resource=db_resource,
+        )
+        if not table:
+            raise ValueError(
+                f"No physical table found for {catalog_id}:{collection_id}"
+            )
+        return schema, table
+
+    async def read_active_rows_by_write_id(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        write_id: str,
+        limit: int,
+        after_geoid: Optional[str] = None,
+        db_resource: Optional[Any] = None,
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        from dynastore.modules.db_config.query_executor import (
+            DQLQuery, ResultHandler, managed_transaction,
+        )
+
+        if limit <= 0:
+            return [], None
+
+        schema, table = await self._resolve_write_id_hub(
+            catalog_id, collection_id, db_resource=db_resource,
+        )
+        keyset_sql = ""
+        params: Dict[str, Any] = {"write_id": write_id, "limit": limit + 1}
+        if after_geoid is not None:
+            keyset_sql = ' AND "geoid" > CAST(:after_geoid AS uuid)'
+            params["after_geoid"] = after_geoid
+
+        sql = (
+            f'SELECT * FROM "{schema}"."{table}" '
+            'WHERE "write_id" = :write_id AND "deleted_at" IS NULL'
+            f"{keyset_sql} "
+            'ORDER BY "geoid" ASC LIMIT :limit'
+        )
+        async def _query(conn: Any) -> List[Dict[str, Any]]:
+            return await DQLQuery(
+                sql, result_handler=ResultHandler.ALL_DICTS,
+            ).execute(conn, **params) or []
+
+        if db_resource is not None:
+            rows = await _query(db_resource)
+        else:
+            from dynastore.models.protocols.database import DatabaseProtocol
+            from dynastore.tools.discovery import get_protocol
+
+            db_proto = get_protocol(DatabaseProtocol)
+            if not db_proto:
+                return [], None
+            async with managed_transaction(db_proto.engine) as conn:
+                rows = await _query(conn)
+        page = rows[:limit]
+        next_after_geoid = (
+            str(page[-1]["geoid"]) if len(rows) > limit and page else None
+        )
+        return page, next_after_geoid
+
+    async def read_tombstoned_ids_by_write_id(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        write_id: str,
+        limit: int,
+        after_geoid: Optional[str] = None,
+        db_resource: Optional[Any] = None,
+    ) -> Tuple[List[str], Optional[str]]:
+        from dynastore.modules.db_config.query_executor import (
+            DQLQuery, ResultHandler, managed_transaction,
+        )
+
+        if limit <= 0:
+            return [], None
+
+        schema, table = await self._resolve_write_id_hub(
+            catalog_id, collection_id, db_resource=db_resource,
+        )
+        keyset_sql = ""
+        params: Dict[str, Any] = {"write_id": write_id, "limit": limit + 1}
+        if after_geoid is not None:
+            keyset_sql = ' AND "geoid" > CAST(:after_geoid AS uuid)'
+            params["after_geoid"] = after_geoid
+
+        sql = (
+            f'SELECT "geoid" FROM "{schema}"."{table}" '
+            'WHERE "write_id" = :write_id AND "deleted_at" IS NOT NULL'
+            f"{keyset_sql} "
+            'ORDER BY "geoid" ASC LIMIT :limit'
+        )
+        async def _query(conn: Any) -> List[Dict[str, Any]]:
+            return await DQLQuery(
+                sql, result_handler=ResultHandler.ALL_DICTS,
+            ).execute(conn, **params) or []
+
+        if db_resource is not None:
+            rows = await _query(db_resource)
+        else:
+            from dynastore.models.protocols.database import DatabaseProtocol
+            from dynastore.tools.discovery import get_protocol
+
+            db_proto = get_protocol(DatabaseProtocol)
+            if not db_proto:
+                return [], None
+            async with managed_transaction(db_proto.engine) as conn:
+                rows = await _query(conn)
+        page = [str(row["geoid"]) for row in rows[:limit]]
+        next_after_geoid = page[-1] if len(rows) > limit and page else None
+        return page, next_after_geoid
 
     async def delete_entities(
         self,
@@ -731,6 +859,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
 
         # --- Build hub table DDL ---
         hub_cols_map = col_config.get_column_definitions()
+        hub_cols_map.setdefault("write_id", "TEXT")
         for key in partition_keys:
             if key not in hub_cols_map:
                 col_type = partition_key_types.get(key, "TEXT")
@@ -759,6 +888,16 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
             f'CREATE TABLE IF NOT EXISTS "{schema}"."{physical_table}" '
             f'({", ".join(hub_columns_ddl)}){partition_clause};'
         )
+        create_write_id_active_idx_sql = (
+            f'CREATE INDEX IF NOT EXISTS "{physical_table}_write_id_active_idx" '
+            f'ON "{schema}"."{physical_table}" ("write_id", "geoid") '
+            f'WHERE "write_id" IS NOT NULL AND "deleted_at" IS NULL;'
+        )
+        create_write_id_deleted_idx_sql = (
+            f'CREATE INDEX IF NOT EXISTS "{physical_table}_write_id_deleted_idx" '
+            f'ON "{schema}"."{physical_table}" ("write_id", "geoid") '
+            f'WHERE "write_id" IS NOT NULL AND "deleted_at" IS NOT NULL;'
+        )
 
         # Hub + every sidecar DDL must run on a SHARED connection so
         # the FK references emitted by ``sidecar_impl.get_ddl(...)``
@@ -778,6 +917,8 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         reconciled_sidecars: List[Any] = []
         async with managed_transaction(db_resource) as conn:
             await DDLQuery(create_hub_sql).execute(conn)
+            await DDLQuery(create_write_id_active_idx_sql).execute(conn)
+            await DDLQuery(create_write_id_deleted_idx_sql).execute(conn)
 
             # --- Create sidecar tables ---
             # ``sidecar_config.validity_column`` is already policy-aligned
@@ -1785,5 +1926,3 @@ async def _pg_driver_init_collection(
         "(fields: %s)",
         catalog_id, collection_id, sorted(explicit_fields),
     )
-
-

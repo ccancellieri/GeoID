@@ -32,6 +32,7 @@ import pytest
 from dynastore.models.protocols.indexer import (
     BulkResult, IndexContext, IndexOp,
 )
+from dynastore.models.protocols.indexing import IndexableOp
 from dynastore.modules.storage.index_dispatcher import (
     INLINE_DISPATCH_CHUNK_SIZE, IndexDispatcher, IndexerFatal,
     StoragePlaneOutboxWriter, TaskTableOutboxWriter, get_index_dispatcher,
@@ -805,6 +806,33 @@ async def test_storage_plane_outbox_writer_maps_delete_op_to_delete_row(
     row = calls[0]["rows"][0]
     assert row.op == "delete"
     assert row.item_id == "item-1"
+
+
+@pytest.mark.asyncio
+async def test_storage_plane_outbox_writer_enqueues_grouped_write_id_rows(
+    monkeypatch,
+):
+    _patch_write_id_capable_primary(monkeypatch)
+    calls = _patch_storage_emit_recorders(monkeypatch)
+    writer = StoragePlaneOutboxWriter()
+    ctx = IndexContext(
+        catalog="cat-x", collection="col-y", correlation_id="cid-1",
+        pg_conn=object(),
+    )
+    await writer.enqueue(
+        indexer_id="items_elasticsearch_driver",
+        ctx=ctx,
+        ops=[
+            _write_id_op(write_id="w-123", entity_id="item-1"),
+            _write_id_op(write_id="w-123", entity_id="item-2"),
+        ],
+        last_error="ES timeout",
+    )
+    assert calls["id_only"] == []
+    assert len(calls["write_id"]) == 1
+    rows = calls["write_id"][0]["rows"]
+    assert len(rows) == 2
+    assert {r.write_id for r in rows} == {"w-123"}
 
 
 @pytest.mark.asyncio
@@ -1648,6 +1676,69 @@ def _patch_storage_emit_recorder(monkeypatch) -> List[dict]:
     return calls
 
 
+def _patch_storage_emit_recorders(monkeypatch) -> dict[str, List[dict]]:
+    import dynastore.modules.storage.storage_emit as storage_emit_mod
+
+    calls = {"id_only": [], "write_id": []}
+
+    async def _fake_id_only(conn, *, catalog_id, rows):
+        calls["id_only"].append(
+            {"conn": conn, "catalog_id": catalog_id, "rows": list(rows)},
+        )
+
+    async def _fake_write_id(conn, *, catalog_id, rows):
+        calls["write_id"].append(
+            {"conn": conn, "catalog_id": catalog_id, "rows": list(rows)},
+        )
+
+    monkeypatch.setattr(storage_emit_mod, "enqueue_storage_op_id_only", _fake_id_only)
+    monkeypatch.setattr(storage_emit_mod, "enqueue_storage_op_write_id", _fake_write_id)
+    return calls
+
+
+def _write_id_op(
+    *,
+    write_id: str,
+    op: str = "upsert",
+    entity_id: str = "item-1",
+) -> IndexableOp:
+    from uuid import uuid4
+
+    indexable = IndexableOp(
+        op_id=uuid4(),
+        op=op,
+        catalog_id="cat-x",
+        collection_id="col-y",
+        driver_instance_id="primary-di",
+        item_id=entity_id,
+        payload={"foo": "bar"} if op == "upsert" else {},
+        idempotency_key=f"{write_id}:{entity_id}",
+    )
+    object.__setattr__(indexable, "write_id", write_id)
+    return indexable
+
+
+def _patch_write_id_capable_primary(monkeypatch) -> None:
+    """Resolve the primary WRITE driver to a stub exposing
+    ``read_indexable_write_batch`` (#3116) — without this, grouped write-id
+    rows can never be produced: ``_primary_supports_write_id_reads`` fails
+    open to ``False`` when ``get_write_drivers`` isn't wired, forcing every
+    op down the id-only fallback path regardless of ``op.write_id``.
+    """
+    from types import SimpleNamespace
+
+    import dynastore.modules.storage.router as router_mod
+
+    class _CapablePrimary:
+        async def read_indexable_write_batch(self, **kwargs):
+            return []
+
+    async def _fake_get_write_drivers(catalog_id, collection_id):
+        return [SimpleNamespace(driver=_CapablePrimary())]
+
+    monkeypatch.setattr(router_mod, "get_write_drivers", _fake_get_write_drivers)
+
+
 @pytest.mark.asyncio
 async def test_storage_plane_flag_on_item_async_enqueues_id_only_not_in_task_run(monkeypatch):
     """Flag ON + item-tier ASYNC entry, outside a task run: id-only rows are
@@ -1669,7 +1760,7 @@ async def test_storage_plane_flag_on_item_async_enqueues_id_only_not_in_task_run
     assert calls[0]["catalog_id"] == "cat-x"
     row_ids = {r.item_id for r in calls[0]["rows"]}
     assert row_ids == {"i1", "i2"}
-    assert all(r.payload == {} for r in calls[0]["rows"]), "rows must be id-only"
+    assert all(r.op == "upsert" for r in calls[0]["rows"]), "rows must be id-only"
     assert results["a"].succeeded == 2
     assert results["a"].failed == 0
 
@@ -1696,6 +1787,32 @@ async def test_storage_plane_flag_on_item_async_enqueues_id_only_in_task_run(mon
     )
     assert len(calls) == 1
     assert results["a"].succeeded == 2
+
+
+@pytest.mark.asyncio
+async def test_storage_plane_flag_on_item_async_enqueues_grouped_write_id_row(monkeypatch):
+    _patch_storage_plane_flag(monkeypatch, enabled=True)
+    _patch_write_id_capable_primary(monkeypatch)
+    calls = _patch_storage_emit_recorders(monkeypatch)
+
+    a = _StubIndexer("a")
+    dispatcher = _make_dispatcher(
+        entries=[_async_entry("a")], indexers={"a": a},
+    )
+    ops = [
+        _write_id_op(write_id="w-123", entity_id="i1"),
+        _write_id_op(write_id="w-123", entity_id="i2"),
+    ]
+    results = await dispatcher.fan_out_bulk(_item_ctx(), ops)
+
+    assert a.bulk_calls == []
+    assert calls["id_only"] == []
+    assert len(calls["write_id"]) == 1
+    rows = calls["write_id"][0]["rows"]
+    assert len(rows) == 2
+    assert {r.write_id for r in rows} == {"w-123"}
+    assert results["a"].succeeded == 2
+    assert results["a"].failed == 0
 
 
 @pytest.mark.asyncio

@@ -80,6 +80,10 @@ class IndexOp(BaseModel):
         default=None,
         description="Document body for upsert; ``None`` for delete.",
     )
+    write_id: Optional[str] = Field(
+        default=None,
+        description="Logical primary write operation id, when available.",
+    )
 
     model_config = {"frozen": True}
 

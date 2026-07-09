@@ -83,6 +83,143 @@ class TestWriteEntities:
             assert isinstance(result, list)
             assert len(result) == 2
 
+    @pytest.mark.asyncio
+    async def test_write_entities_forwards_context_to_item_service(self):
+        driver = ItemsPostgresqlDriver()
+        mock_crud = AsyncMock()
+        mock_crud.upsert = AsyncMock(return_value=[MagicMock(spec=Feature)])
+
+        with patch.object(driver, "_get_crud_protocol", return_value=mock_crud):
+            await driver.write_entities(
+                "cat1",
+                "col1",
+                [MagicMock(spec=Feature)],
+                context={"write_id": "w-123"},
+            )
+
+        assert mock_crud.upsert.await_args.kwargs["processing_context"] == {
+            "write_id": "w-123",
+        }
+
+
+class TestWriteIdChunkReads:
+    @pytest.mark.asyncio
+    async def test_read_active_rows_by_write_id_uses_keyset_paging(self, monkeypatch):
+        driver = ItemsPostgresqlDriver()
+        captured: list[dict[str, Any]] = []
+        returned_rows = [
+            {"geoid": "00000000-0000-0000-0000-000000000001", "write_id": "w-123"},
+            {"geoid": "00000000-0000-0000-0000-000000000002", "write_id": "w-123"},
+            {"geoid": "00000000-0000-0000-0000-000000000003", "write_id": "w-123"},
+        ]
+
+        class _FakeResultHandler:
+            ALL_DICTS = object()
+
+        class _FakeDQLQuery:
+            def __init__(self, sql, *, result_handler):
+                captured.append({"sql": sql, "result_handler": result_handler})
+
+            async def execute(self, conn, **params):
+                captured[-1]["params"] = params
+                return returned_rows
+
+        monkeypatch.setattr(
+            "dynastore.modules.db_config.query_executor.DQLQuery", _FakeDQLQuery,
+        )
+        monkeypatch.setattr(
+            "dynastore.modules.db_config.query_executor.ResultHandler",
+            _FakeResultHandler,
+        )
+
+        with (
+            patch.object(
+                driver, "_resolve_schema", new_callable=AsyncMock, return_value="cat_schema",
+            ),
+            patch.object(
+                driver, "resolve_physical_table", new_callable=AsyncMock, return_value="items_hub",
+            ),
+        ):
+            rows, next_after_geoid = await driver.read_active_rows_by_write_id(
+                "cat1",
+                "col1",
+                write_id="w-123",
+                limit=2,
+                after_geoid="00000000-0000-0000-0000-000000000000",
+                db_resource=object(),
+            )
+
+        assert [row["geoid"] for row in rows] == [
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+        ]
+        assert next_after_geoid == "00000000-0000-0000-0000-000000000002"
+        assert captured[0]["result_handler"] is _FakeResultHandler.ALL_DICTS
+        assert captured[0]["params"] == {
+            "write_id": "w-123",
+            "after_geoid": "00000000-0000-0000-0000-000000000000",
+            "limit": 3,
+        }
+        assert 'FROM "cat_schema"."items_hub"' in captured[0]["sql"]
+        assert '"write_id" = :write_id' in captured[0]["sql"]
+        assert '"deleted_at" IS NULL' in captured[0]["sql"]
+        assert '"geoid" > CAST(:after_geoid AS uuid)' in captured[0]["sql"]
+        assert 'ORDER BY "geoid" ASC' in captured[0]["sql"]
+
+    @pytest.mark.asyncio
+    async def test_read_tombstoned_ids_by_write_id_returns_page(self, monkeypatch):
+        driver = ItemsPostgresqlDriver()
+        captured: list[dict[str, Any]] = []
+        returned_rows = [
+            {"geoid": "00000000-0000-0000-0000-00000000000a"},
+            {"geoid": "00000000-0000-0000-0000-00000000000b"},
+        ]
+
+        class _FakeResultHandler:
+            ALL_DICTS = object()
+
+        class _FakeDQLQuery:
+            def __init__(self, sql, *, result_handler):
+                captured.append({"sql": sql, "result_handler": result_handler})
+
+            async def execute(self, conn, **params):
+                captured[-1]["params"] = params
+                return returned_rows
+
+        monkeypatch.setattr(
+            "dynastore.modules.db_config.query_executor.DQLQuery", _FakeDQLQuery,
+        )
+        monkeypatch.setattr(
+            "dynastore.modules.db_config.query_executor.ResultHandler",
+            _FakeResultHandler,
+        )
+
+        with (
+            patch.object(
+                driver, "_resolve_schema", new_callable=AsyncMock, return_value="cat_schema",
+            ),
+            patch.object(
+                driver, "resolve_physical_table", new_callable=AsyncMock, return_value="items_hub",
+            ),
+        ):
+            ids, next_after_geoid = await driver.read_tombstoned_ids_by_write_id(
+                "cat1",
+                "col1",
+                write_id="w-del",
+                limit=5,
+                db_resource=object(),
+            )
+
+        assert ids == [
+            "00000000-0000-0000-0000-00000000000a",
+            "00000000-0000-0000-0000-00000000000b",
+        ]
+        assert next_after_geoid is None
+        assert captured[0]["result_handler"] is _FakeResultHandler.ALL_DICTS
+        assert captured[0]["params"] == {"write_id": "w-del", "limit": 6}
+        assert '"deleted_at" IS NOT NULL' in captured[0]["sql"]
+        assert 'ORDER BY "geoid" ASC' in captured[0]["sql"]
+
 
 class TestReadEntities:
     @pytest.mark.asyncio
@@ -190,6 +327,86 @@ class TestDeleteEntities:
 
 
 class TestLifecycleMethods:
+    @pytest.mark.asyncio
+    async def test_ensure_storage_hub_ddl_includes_write_id_column_and_index(self):
+        driver = ItemsPostgresqlDriver()
+        executed_sql: list[str] = []
+        write_policy = MagicMock()
+        write_policy.find_compute.return_value = None
+        write_policy.track_asset_id = False
+        write_policy.compute = []
+
+        class _FakeDDLQuery:
+            def __init__(self, sql):
+                self.sql = sql
+
+            async def execute(self, conn, **kwargs):
+                executed_sql.append(self.sql)
+
+        class _FakeManagedTransaction:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class _FakeSidecarRegistry:
+            @staticmethod
+            def get_sidecar(config):
+                return None
+
+        with (
+            patch.object(
+                driver, "_resolve_schema", new_callable=AsyncMock, return_value="cat_schema",
+            ),
+            patch.object(
+                driver, "get_driver_config", new_callable=AsyncMock,
+                return_value=ItemsPostgresqlDriverConfig(),
+            ),
+            patch(
+                "dynastore.tools.discovery.get_protocol",
+                return_value=None,
+            ),
+            patch(
+                "dynastore.modules.catalog.catalog_service.generate_physical_name",
+                return_value="items_hub",
+            ),
+            patch(
+                "dynastore.modules.db_config.query_executor.DDLQuery",
+                _FakeDDLQuery,
+            ),
+            patch(
+                "dynastore.modules.db_config.query_executor.managed_transaction",
+                return_value=_FakeManagedTransaction(),
+            ),
+            patch(
+                "dynastore.modules.storage.drivers.pg_sidecars.registry.SidecarRegistry",
+                _FakeSidecarRegistry,
+            ),
+            patch.object(
+                driver, "_resolve_write_policy", new_callable=AsyncMock, return_value=write_policy,
+            ),
+            patch.object(
+                driver, "set_physical_table", new_callable=AsyncMock,
+            ),
+        ):
+            await driver.ensure_storage("cat1", "col1", db_resource=object())
+
+        assert executed_sql, "expected hub DDL to execute"
+        assert '"write_id" TEXT' in executed_sql[0]
+        assert any(
+            'CREATE INDEX IF NOT EXISTS "items_hub_write_id_active_idx"' in sql
+            and 'ON "cat_schema"."items_hub" ("write_id", "geoid")' in sql
+            and 'WHERE "write_id" IS NOT NULL AND "deleted_at" IS NULL' in sql
+            for sql in executed_sql
+        )
+        assert any(
+            'CREATE INDEX IF NOT EXISTS "items_hub_write_id_deleted_idx"' in sql
+            and 'ON "cat_schema"."items_hub" ("write_id", "geoid")' in sql
+            and 'WHERE "write_id" IS NOT NULL AND "deleted_at" IS NOT NULL' in sql
+            for sql in executed_sql
+        )
+
     @pytest.mark.asyncio
     async def test_ensure_storage_noop_without_collection(self):
         """ensure_storage with no collection_id is a no-op."""

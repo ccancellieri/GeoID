@@ -276,6 +276,50 @@ async def test_g1_no_envelope_when_collection_not_access_aware(
     )
 
 
+async def test_pg_primary_upsert_persists_write_id_in_hub_payload(
+    monkeypatch: Any,
+) -> None:
+    """PG-primary item writes stamp the canonical batch write id on hub rows."""
+
+    svc = ItemService()
+
+    async def _no_envelope(cat: str, col: str, pc: Any, feature: Any = None) -> None:
+        return None
+
+    monkeypatch.setattr(svc, "_resolve_access_envelope", _no_envelope)
+    _patch_branch_b(monkeypatch, svc, [])
+
+    captured_hub_payloads: List[Dict[str, Any]] = []
+
+    async def _capture_insert(
+        conn: Any,
+        cat: str,
+        col: str,
+        hub_payload: Dict[str, Any],
+        sidecar_payloads: Any,
+        **_kw: Any,
+    ) -> Dict[str, Any]:
+        captured_hub_payloads.append(dict(hub_payload))
+        return {"geoid": hub_payload["geoid"]}
+
+    async def _noop(*_a: Any, **_kw: Any) -> None:
+        pass
+
+    monkeypatch.setattr(svc, "insert_or_update_distributed", _capture_insert)
+    monkeypatch.setattr(svc, "_dispatch_index_upsert", _noop)
+
+    items = [{"type": "Feature", "id": "item3", "geometry": None, "properties": {}}]
+    await svc.upsert(
+        "cat1",
+        "col1",
+        items,
+        processing_context={"write_id": "w-upsert-1"},
+    )
+
+    assert captured_hub_payloads
+    assert {p.get("write_id") for p in captured_hub_payloads} == {"w-upsert-1"}
+
+
 # ---------------------------------------------------------------------------
 # Branch B infrastructure helpers
 # ---------------------------------------------------------------------------

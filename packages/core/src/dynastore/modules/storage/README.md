@@ -69,6 +69,33 @@ ReindexWorker — see the async ES driver in the `WRITE` list below.
 `driver_ref` is always `_to_snake(cls.__name__)` (post-PR-1e). Operator API is at
 `/configs/.../plugins/{plugin_id}` where `plugin_id` is the snake_case `class_key`.
 
+## Storage-Plane Outbox (`tasks.storage`)
+
+An `ASYNC` secondary-index `WRITE` entry persists its obligation into the
+global `tasks.storage` table — co-transactionally with the upstream write —
+via `storage_emit.py`'s `enqueue_storage_op_write_id` / `enqueue_storage_op_id_only`,
+then drained by `StorageDrainTask`. The ledger stores identifiers only; there
+is no payload column.
+
+- `enqueue_storage_op_write_id` writes one row per `(write_id, driver,
+  collection, op)` representing a whole primary write batch; the drain
+  hydrates it from the primary WRITE driver's hub by `write_id`
+  (keyset-paged chunk reads).
+- `enqueue_storage_op_id_only` writes one row per entity id; the drain
+  re-reads canonical PG state for that id at replay time instead of
+  indexing a payload frozen at enqueue time.
+
+`IndexDispatcher` only groups ops by `write_id` when the collection's primary
+WRITE driver exposes the write-id chunk-read capability —
+`read_indexable_write_batch`, or the `read_active_rows_by_write_id` /
+`read_tombstoned_ids_by_write_id` pair (`driver_supports_write_id_reads` in
+`storage_emit.py`, checked per collection via `_primary_supports_write_id_reads`
+in `index_dispatcher.py`, #3116). A driver that doesn't expose the capability
+falls back to id-only rows instead.
+
+Full row-shape/classification contract and the drain side are documented in
+[`../tasks/README.md`](../tasks/README.md).
+
 ## Drivers (summary)
 
 ### `items_postgresql_driver` (`ItemsPostgresqlDriver`)

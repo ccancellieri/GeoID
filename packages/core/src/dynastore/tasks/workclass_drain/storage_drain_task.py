@@ -69,7 +69,6 @@ from typing import Any, ClassVar, Dict, Iterator, List, Optional, Sequence, Tupl
 from uuid import UUID, uuid4
 
 from dynastore.models.protocols.indexing import (
-    STORAGE_PLANE_ID_ONLY_MARKER_KEY,
     BulkIndexer,
     BulkIndexResult,
     IndexableOp,
@@ -228,9 +227,6 @@ class StorageDrainTask(TaskProtocol):
         # (#2494 P1 canonical re-read — shared by every id-only group under
         # the same catalog).
         self._known_fields_cache: Dict[str, Any] = {}
-        # driver_ids that have already logged the "empty payload, no
-        # id-only marker" anomaly warning this run (#2494 P1 dedup).
-        self._empty_payload_warned: set = set()
         # Split completion counters for this run (#2731): 'indexed' rows went
         # through a BulkIndexer and were reported passed; 'auto_done' rows were
         # resolved as done WITHOUT the indexer (canonical row verifiably absent
@@ -623,7 +619,7 @@ class StorageDrainTask(TaskProtocol):
             f" FROM claimed"
             f" WHERE w.day = claimed.day AND w.op_id = claimed.op_id"
             f" RETURNING w.day, w.op_id, w.driver_id, w.catalog_id, w.collection_id,"
-            f"           w.op, w.entity_id, w.op_payload, w.idempotency_key,"
+            f"           w.op, w.entity_id, w.write_id, w.idempotency_key,"
             f"           w.attempts, w.claim_version, w.claimed_by"
         )
 
@@ -768,7 +764,7 @@ class StorageDrainTask(TaskProtocol):
                 driver_id, catalog_id, collection_id,
             ),
             item_id=row.get("entity_id"),  # entity_id column → IndexableOp.item_id
-            payload=dict(row.get("op_payload") or {}),
+            payload={},  # tasks.storage carries no payloads — ids only
             idempotency_key=row.get("idempotency_key") or "",
         )
 
@@ -790,10 +786,11 @@ class StorageDrainTask(TaskProtocol):
         """Hydrate and dispatch one driver's claimed rows in byte-budgeted
         sub-chunks (#2723).
 
-        Streams rather than batch-building: every row is converted to an
-        ``IndexableOp`` (payload-carrying rows directly; id-only rows via
-        the canonical re-read + doc build below, #2494 P1) and appended to
-        a pending sub-chunk. As soon as the pending sub-chunk's estimated
+        Streams rather than batch-building: every row is hydrated to one or
+        more ``IndexableOp``\\s (delete rows directly; id-only upsert rows
+        via the canonical re-read + doc build below, #2494 P1; write-id
+        rows via primary-driver chunk reads) and appended to a pending
+        sub-chunk. As soon as the pending sub-chunk's estimated
         JSON-encoded size reaches ``byte_budget``, it is dispatched to
         ``indexer.index_bulk`` and its outcomes applied immediately —
         BEFORE any further row in this driver's claimed batch is hydrated.
@@ -802,19 +799,21 @@ class StorageDrainTask(TaskProtocol):
         (``storage_drain_batch_size``, #2726 — row count only) or how many
         MB-scale documents (e.g. GAUL polygons) they hydrate to.
 
-        Delete rows and payload-carrying upsert rows convert to
-        ``IndexableOp`` unchanged (:meth:`_row_to_op`) — their payload is
-        already resident from the claim SELECT, so this is cheap. Id-only
-        upsert rows — ``op='upsert'`` whose ``op_payload`` carries the
-        explicit ``{STORAGE_PLANE_ID_ONLY_MARKER_KEY: true}`` sentinel,
-        written by ``IndexDispatcher._enqueue_storage_plane_ids`` when
-        ``TasksPluginConfig.items_secondary_via_storage_plane`` is enabled
-        — are grouped by ``(catalog_id, collection_id)``. Each group's
-        canonical re-read (:func:`read_canonical_index_inputs`) stays
-        batched, but in fixed ``_ID_ONLY_READ_CHUNK_ROWS``-sized read
-        chunks rather than the whole group at once, so a single PG round
-        trip never materializes an unbounded number of raw (pre-JSON)
-        geometry rows either:
+        ``tasks.storage`` carries no payloads, so classification is
+        structural: a row with ``write_id`` set references a whole primary
+        write batch (hydrated via the primary driver's write-id chunk
+        reads); otherwise ``entity_id`` must be set — ``op='delete'`` rows
+        convert to ``IndexableOp`` directly (:meth:`_row_to_op`; an id is
+        all the indexer needs), and ``op='upsert'`` rows are id-only
+        obligations written by ``IndexDispatcher._enqueue_storage_plane_ids``
+        when ``TasksPluginConfig.items_secondary_via_storage_plane`` is
+        enabled, grouped by ``(catalog_id, collection_id)``. A row with
+        neither ``write_id`` nor ``entity_id`` can never hydrate and is
+        marked dead. Each id-only group's canonical re-read
+        (:func:`read_canonical_index_inputs`) stays batched, but in fixed
+        ``_ID_ONLY_READ_CHUNK_ROWS``-sized read chunks rather than the
+        whole group at once, so a single PG round trip never materializes
+        an unbounded number of raw (pre-JSON) geometry rows either:
 
         * a resolved geoid becomes an ``IndexableOp`` carrying the
           freshly-built canonical document;
@@ -825,14 +824,6 @@ class StorageDrainTask(TaskProtocol):
           row in that chunk to retry (a transient infra failure, not a
           poison classification — the geoid's existence is simply
           unknown).
-
-        Detection keys off the explicit marker, NOT payload emptiness: the
-        ``tasks.storage`` DDL default for ``op_payload`` is ALSO
-        ``'{}'::jsonb``, so a genuinely empty (unmarked) upsert payload is
-        legacy shape, not an id-only obligation — it falls through to the
-        normal ``_row_to_op`` conversion below, same as any other
-        payload-carrying row, with a one-time-per-driver WARNING since an
-        unmarked empty payload is unusual post-#2494 (review finding).
 
         Crash/partial-failure safety: a sub-chunk that fails
         ``index_bulk`` funnels only ITS rows to retry; rows in a sub-chunk
@@ -896,29 +887,156 @@ class StorageDrainTask(TaskProtocol):
                 await _flush()
 
         id_only_by_group: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        write_id_by_group: Dict[Tuple[str, str, str, str], List[Dict[str, Any]]] = {}
         for row in driver_rows:
-            payload = row.get("op_payload") or {}
-            is_id_only = (
-                row["op"] == "upsert"
-                and isinstance(payload, dict)
-                and payload.get(STORAGE_PLANE_ID_ONLY_MARKER_KEY) is True
-            )
-            if is_id_only:
+            # Structural classification — ``tasks.storage`` carries no
+            # payloads. ``write_id`` set means a write-id batch reference;
+            # otherwise ``entity_id`` must be set (id-only upsert re-read,
+            # or a direct delete). A row with neither can never hydrate.
+            write_id = row.get("write_id")
+            if (
+                row["op"] in {"upsert", "delete"}
+                and isinstance(write_id, str)
+                and write_id
+            ):
+                key = (
+                    row["catalog_id"],
+                    row.get("collection_id") or "",
+                    row["op"],
+                    write_id,
+                )
+                write_id_by_group.setdefault(key, []).append(row)
+                continue
+            if not row.get("entity_id"):
+                logger.warning(
+                    "StorageDrainTask: driver_id=%r row op_id=%s (%s) has "
+                    "neither write_id nor entity_id — unhydratable, marking "
+                    "dead.",
+                    driver_id, row.get("op_id"), row["op"],
+                )
+                await self._mark_dead(
+                    engine=engine,
+                    task_schema=task_schema,
+                    row=row,
+                    owner_id=owner_id,
+                )
+                continue
+            if row["op"] == "upsert":
                 key = (row["catalog_id"], row.get("collection_id") or "")
                 id_only_by_group.setdefault(key, []).append(row)
                 continue
-            if row["op"] == "upsert" and not payload:
-                if driver_id not in self._empty_payload_warned:
-                    self._empty_payload_warned.add(driver_id)
-                    logger.warning(
-                        "StorageDrainTask: driver_id=%r has an upsert row "
-                        "with an EMPTY op_payload and no id-only marker — "
-                        "treating as a legacy payload-carrying row (empty "
-                        "body). Future occurrences for this driver_id are "
-                        "suppressed this run.",
-                        driver_id,
+            # Delete rows replay directly — an id is all the indexer needs.
+            await _append(self._row_to_op(row), row, {})
+
+        for (catalog_id, collection_id, op, write_id), group_rows in write_id_by_group.items():
+            ledger_row = group_rows[-1]
+            try:
+                hydrated_ops = list(
+                    await self._read_primary_write_batch(
+                        catalog_id=catalog_id,
+                        collection_id=collection_id,
+                        driver_id=driver_id,
+                        write_id=write_id,
+                        op=op,
+                        engine=engine,
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 — missing protocol / lookup errors retry
+                logger.warning(
+                    "StorageDrainTask: write-id hydration failed for %s/%s "
+                    "(driver=%s write_id=%s): %s — funnelling row to retry.",
+                    catalog_id, collection_id, driver_id, write_id, exc,
+                )
+                await self._mark_retry(
+                    engine=engine,
+                    task_schema=task_schema,
+                    row=ledger_row,
+                    owner_id=owner_id,
+                    error=f"write_id_hydration_failed: {exc}",
+                )
+                counts["retried"] += 1
+                continue
+
+            if not hydrated_ops:
+                await self._mark_done(
+                    engine=engine,
+                    task_schema=task_schema,
+                    row=ledger_row,
+                    owner_id=owner_id,
+                )
+                counts["auto_done"] += 1
+                continue
+
+            pending_chunk: List[IndexableOp] = []
+            pending_chunk_bytes = 0
+
+            async def _flush_write_id_chunk() -> tuple[bool, Optional[str], Optional[str]]:
+                nonlocal pending_chunk, pending_chunk_bytes
+                if not pending_chunk:
+                    return True, None, None
+                ops_chunk = pending_chunk
+                pending_chunk, pending_chunk_bytes = [], 0
+                try:
+                    result = await indexer.index_bulk(ops_chunk)
+                except Exception as exc:  # noqa: BLE001 — retry whole ledger row
+                    return False, "retry", str(exc)
+                if result.transient:
+                    return False, "retry", result.transient[0][1]
+                if result.poison:
+                    return False, "dead", result.poison[0][1]
+                if len(result.passed) != len(ops_chunk):
+                    return False, "retry", (
+                        "indexer omitted op_id from grouped write_id batch"
                     )
-            await _append(self._row_to_op(row), row, payload)
+                return True, None, None
+
+            outcome: tuple[str, Optional[str]] = ("done", None)
+            for op_row in hydrated_ops:
+                doc_bytes = _estimate_doc_bytes(op_row.payload)
+                counts["bytes"] += doc_bytes
+                pending_chunk.append(op_row)
+                pending_chunk_bytes += doc_bytes
+                if pending_chunk_bytes >= byte_budget:
+                    ok, action, reason = await _flush_write_id_chunk()
+                    if not ok:
+                        outcome = (cast(str, action), reason)
+                        break
+            else:
+                ok, action, reason = await _flush_write_id_chunk()
+                if not ok:
+                    outcome = (cast(str, action), reason)
+
+            if outcome[0] == "done":
+                await self._mark_done(
+                    engine=engine,
+                    task_schema=task_schema,
+                    row=ledger_row,
+                    owner_id=owner_id,
+                )
+                counts["indexed"] += 1
+            elif outcome[0] == "dead":
+                logger.error(
+                    "StorageDrainTask: write-id batch poison failure for "
+                    "%s/%s (driver=%s write_id=%s): %s — marking ledger row "
+                    "dead.",
+                    catalog_id, collection_id, driver_id, write_id,
+                    outcome[1] or "unclassified poison failure",
+                )
+                await self._mark_dead(
+                    engine=engine,
+                    task_schema=task_schema,
+                    row=ledger_row,
+                    owner_id=owner_id,
+                )
+            else:
+                await self._mark_retry(
+                    engine=engine,
+                    task_schema=task_schema,
+                    row=ledger_row,
+                    owner_id=owner_id,
+                    error=outcome[1] or "grouped write-id batch failed",
+                )
+                counts["retried"] += 1
 
         for (catalog_id, collection_id), group_rows in id_only_by_group.items():
             group_auto_done = 0
@@ -1046,6 +1164,150 @@ class StorageDrainTask(TaskProtocol):
             access=ci.access,
             stac_reserved_members=ci.stac_reserved_members,
         )
+
+    async def _read_primary_write_batch(
+        self,
+        *,
+        catalog_id: str,
+        collection_id: str,
+        driver_id: str,
+        write_id: str,
+        op: str,
+        engine: Optional[Any] = None,
+    ) -> Sequence[IndexableOp]:
+        primary = await self._resolve_primary_write_source(
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+        )
+        if primary is None:
+            raise LookupError("primary driver does not expose write-id chunk reads")
+        reader: Any = getattr(primary, "read_indexable_write_batch", None)
+        if reader is not None:
+            return await reader(
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+                write_id=write_id,
+                target_driver_id=driver_id,
+                op=op,
+            )
+
+        from dynastore.modules.storage.driver_instance_id import (
+            compute_driver_instance_id,
+        )
+
+        driver_instance_id = compute_driver_instance_id(
+            driver_id, catalog_id, collection_id,
+        )
+        ops: List[IndexableOp] = []
+        after_geoid: Optional[str] = None
+
+        if op == "upsert":
+            active_reader: Any = getattr(primary, "read_active_rows_by_write_id", None)
+            if active_reader is None:
+                raise LookupError(
+                    "primary driver does not expose read_active_rows_by_write_id"
+                )
+            while True:
+                rows, next_after = await active_reader(
+                    catalog_id,
+                    collection_id,
+                    write_id=write_id,
+                    limit=_ID_ONLY_READ_CHUNK_ROWS,
+                    after_geoid=after_geoid,
+                    db_resource=engine,
+                )
+                geoids = [str(row["geoid"]) for row in rows if row.get("geoid")]
+                if geoids:
+                    inputs = await self._read_canonical_inputs(
+                        engine=engine,
+                        catalog_id=catalog_id,
+                        collection_id=collection_id,
+                        geoids=geoids,
+                    )
+                    for geoid in geoids:
+                        ci = inputs.get(geoid)
+                        if ci is None:
+                            raise LookupError(
+                                f"canonical row missing for write_id={write_id} geoid={geoid}"
+                            )
+                        doc = await self._build_canonical_doc(
+                            catalog_id=catalog_id,
+                            collection_id=collection_id,
+                            ci=ci,
+                        )
+                        ops.append(IndexableOp(
+                            op_id=uuid4(),
+                            op="upsert",
+                            catalog_id=catalog_id,
+                            collection_id=collection_id,
+                            driver_instance_id=driver_instance_id,
+                            item_id=geoid,
+                            payload=doc,
+                            idempotency_key=geoid,
+                        ))
+                if next_after is None:
+                    break
+                after_geoid = next_after
+            return ops
+
+        if op == "delete":
+            tombstone_reader: Any = getattr(
+                primary, "read_tombstoned_ids_by_write_id", None,
+            )
+            if tombstone_reader is None:
+                raise LookupError(
+                    "primary driver does not expose read_tombstoned_ids_by_write_id"
+                )
+            while True:
+                ids, next_after = await tombstone_reader(
+                    catalog_id,
+                    collection_id,
+                    write_id=write_id,
+                    limit=_ID_ONLY_READ_CHUNK_ROWS,
+                    after_geoid=after_geoid,
+                    db_resource=engine,
+                )
+                for geoid in ids:
+                    gid = str(geoid)
+                    ops.append(IndexableOp(
+                        op_id=uuid4(),
+                        op="delete",
+                        catalog_id=catalog_id,
+                        collection_id=collection_id,
+                        driver_instance_id=driver_instance_id,
+                        item_id=gid,
+                        payload={},
+                        idempotency_key=gid,
+                    ))
+                if next_after is None:
+                    break
+                after_geoid = next_after
+            return ops
+
+        raise ValueError(f"unsupported write-id op: {op}")
+
+    async def _resolve_primary_write_source(
+        self,
+        *,
+        catalog_id: str,
+        collection_id: str,
+    ) -> Optional[Any]:
+        from dynastore.modules.storage.router import get_write_drivers
+
+        try:
+            resolved = await get_write_drivers(catalog_id, collection_id)
+        except Exception as exc:  # noqa: BLE001 — routing unavailability retries the row
+            logger.debug(
+                "StorageDrainTask: primary-driver lookup failed for %s/%s: %s",
+                catalog_id, collection_id, exc,
+            )
+            return None
+        if not resolved:
+            return None
+        primary = getattr(resolved[0], "driver", None)
+        if primary is None:
+            return None
+        return primary
 
     # ------------------------------------------------------------------
     # Outcome application
