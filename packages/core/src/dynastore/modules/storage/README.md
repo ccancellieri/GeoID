@@ -90,8 +90,61 @@ WRITE driver exposes the write-id chunk-read capability —
 `read_indexable_write_batch`, or the `read_active_rows_by_write_id` /
 `read_tombstoned_ids_by_write_id` pair (`driver_supports_write_id_reads` in
 `storage_emit.py`, checked per collection via `_primary_supports_write_id_reads`
-in `index_dispatcher.py`, #3116). A driver that doesn't expose the capability
+in `index_dispatcher.py`). A driver that doesn't expose the capability
 falls back to id-only rows instead.
+
+### Write-ID Read-Capability Contract
+
+A driver is eligible to serve **payload-free write-id ledger reads** — i.e.
+to let the drain hydrate a whole batch of a collection's rows by `write_id`
+instead of re-reading each entity individually — only if it implements one
+of:
+
+- `read_indexable_write_batch` (a single call returning both active and
+  tombstoned rows for a `write_id`, keyset-paged), or
+- both `read_active_rows_by_write_id` **and** `read_tombstoned_ids_by_write_id`
+  (the split active/tombstoned chunk-read pair, also keyset-paged).
+
+`driver_supports_write_id_reads` (`storage_emit.py`) is the single gate every
+producer consults before grouping ops into a write-id row. The check is
+structural (plain `getattr`, no protocol subclassing required) and
+all-or-nothing: a driver implementing only one half of the reader pair is
+treated as not capable, the same as a driver implementing neither — a
+partially-hydratable row is exactly as useless to the drain as one it can't
+read at all.
+
+**Current state.** `ItemsPostgresqlDriver` is the only driver in this
+package that implements the pair. Every shipped routing preset also lists a
+PostgreSQL driver first in each tier's `WRITE` operation list with
+`on_failure=FailurePolicy.FATAL` (the durability primary), with
+Elasticsearch — which does not implement either reader — listed second as an
+`ASYNC` / `OUTBOX` secondary sink. So in the shipped configuration there is
+no gap between "drivers that can serve write-id reads" and "drivers that are
+ever a resolved WRITE primary": the one driver that needs the capability has
+it. `WRITE` ordering is operator-configurable, though (routing is a regular
+`ConfigsProtocol` waterfall, not a hard-coded invariant) — the guarantee
+holds for the defaults this package ships, not as a runtime constraint
+enforced anywhere else.
+
+**Contract for driver authors.** To make a new driver eligible as a
+collection's WRITE primary *without losing write-id batching* when async
+secondary indexing is configured behind it, implement
+`read_indexable_write_batch` (or the by-write-id reader pair) against your
+driver's durable row store, keyed on the `write_id` stamped at write time. If
+you skip this, your driver still works correctly as a WRITE primary — see
+the degradation guarantee below — it just loses the batching optimization
+and every async secondary-index write pays the cost of one outbox row per
+entity instead of one per batch.
+
+**Degradation guarantee.** When the resolved WRITE primary lacks the
+capability, every producer (bulk upsert, delete, and the index dispatcher's
+outbox writer) falls back to one id-only outbox row per entity instead of a
+single grouped write-id row. The enqueue itself is never skipped — lacking
+the capability changes *how* the secondary-index obligation is recorded,
+never *whether* it is recorded. Id-only rows are always hydratable, because
+the drain re-reads canonical state by id rather than replaying a write-id
+batch, so the fallback is always correct — only less efficient than a
+grouped write-id row.
 
 Full row-shape/classification contract and the drain side are documented in
 [`../tasks/README.md`](../tasks/README.md).
