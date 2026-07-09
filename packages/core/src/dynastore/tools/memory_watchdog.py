@@ -240,11 +240,14 @@ class MemoryWatchdogService(PeriodicService):
         # hot-reload kill-switches).
         self._started_at = time.monotonic()
         self._last_recycle_attempt: Optional[float] = None
-        # Diagnostic (geoid#3121) bookkeeping: throttle tracemalloc snapshots
-        # and remember whether THIS service started tracing (so it can stop it
-        # again when the flag is turned back off).
+        # Diagnostic (geoid#3121) bookkeeping: throttle tracemalloc snapshots,
+        # remember whether THIS service started tracing (so it can stop it
+        # again when the flag is turned back off), and hold the previous
+        # snapshot each growth report is diffed against (captured on the
+        # arming tick, rolled forward on every report).
         self._last_diag_snapshot: Optional[float] = None
         self._diag_started = False
+        self._diag_baseline: Optional[tracemalloc.Snapshot] = None
 
     def _effective_limit_bytes(
         self, config: "MemoryWatchdogConfig"
@@ -321,18 +324,32 @@ class MemoryWatchdogService(PeriodicService):
         rss_bytes: int,
         limit_bytes: int,
     ) -> None:
-        """Diagnostic (geoid#3121): log the top RSS allocation sites as a worker
+        """Diagnostic (geoid#3121): log which allocation sites GREW as a worker
         climbs toward its budget.
 
         A kernel OOM kill is a bare SIGKILL between watchdog polls — no handler
         runs, so the allocation that spiked RSS is otherwise invisible. When
-        ``diagnostic_tracemalloc_enabled`` is on, this lazily starts tracemalloc
-        (see below) and logs the top Python allocation sites once RSS crosses
-        ``diagnostic_ratio``. That threshold sits deliberately below the OOM
-        point so the snapshot's own allocation has headroom and the *climb*
-        toward the kill is captured. Snapshots are throttled to
-        ``diagnostic_min_interval_seconds`` so a sustained climb does not log
-        every tick. Off by default — tracemalloc adds per-allocation overhead.
+        ``diagnostic_tracemalloc_enabled`` is on, this lazily starts tracemalloc,
+        captures a baseline snapshot on that same arming tick, and from the next
+        qualifying tick on logs ``snapshot.compare_to(baseline, "lineno")`` —
+        the sites whose footprint grew since the previous report — rather than
+        an absolute top-N, which is dominated by legitimate steady-state
+        allocations (SQLAlchemy metadata, client buffers) and never names the
+        *growing* site. The baseline rolls forward after every report, so
+        one-time warm-up allocations appear once and disappear while a genuine
+        leak dominates every subsequent report, with a per-interval growth rate.
+
+        Every report also logs tracemalloc's own traced total next to RSS: a
+        large RSS-vs-traced gap (or a report with no Python-level growth while
+        RSS keeps climbing) means the growth is happening outside CPython's
+        allocator — native/C-extension memory tracemalloc cannot see — and the
+        next tool is a native profiler, not more Python-side reading.
+
+        ``diagnostic_ratio`` sits deliberately below the OOM point so the
+        snapshot's own allocation has headroom and the *climb* toward the kill
+        is captured. Reports are throttled to
+        ``diagnostic_min_interval_seconds``. Off by default — tracemalloc adds
+        per-allocation overhead.
 
         The flag is read live here (per tick), not at service-build time: the
         watchdog is built before the platform config store is reachable (see
@@ -348,18 +365,24 @@ class MemoryWatchdogService(PeriodicService):
             if self._diag_started and tracemalloc.is_tracing():
                 tracemalloc.stop()
             self._diag_started = False
+            self._diag_baseline = None
             return
         if ratio < config.diagnostic_ratio:
             return
         if not tracemalloc.is_tracing():
-            # Lazy start: arm tracing now and snapshot on the next qualifying
-            # tick (a snapshot taken the same instant tracing starts is empty).
+            # Lazy start: arm tracing and capture the baseline on THIS tick (a
+            # snapshot taken the instant tracing starts is near-empty and
+            # cheap), so the very next qualifying tick already emits a
+            # meaningful growth diff — a worker OOM-killed shortly after
+            # arming still leaves one report behind.
             tracemalloc.start(_TRACEMALLOC_FRAMES)
             self._diag_started = True
+            self._diag_baseline = tracemalloc.take_snapshot()
             logger.warning(
                 "memory_watchdog: diagnostic_tracemalloc_enabled — started "
-                "tracemalloc (%d frame) on %s; allocation snapshots begin on "
-                "the next tick above diagnostic_ratio.",
+                "tracemalloc (%d frame) and captured the baseline snapshot on "
+                "%s; allocation-growth reports begin on the next tick above "
+                "diagnostic_ratio.",
                 _TRACEMALLOC_FRAMES,
                 ctx.name,
             )
@@ -372,24 +395,82 @@ class MemoryWatchdogService(PeriodicService):
             < config.diagnostic_min_interval_seconds
         ):
             return
+        interval = (
+            now - self._last_diag_snapshot
+            if self._last_diag_snapshot is not None
+            else None
+        )
         self._last_diag_snapshot = now
 
         snapshot = tracemalloc.take_snapshot()
-        stats = snapshot.statistics("lineno")
-        top = stats[: max(1, config.diagnostic_top_n)]
+        traced_bytes, _ = tracemalloc.get_traced_memory()
+        top_n = max(1, config.diagnostic_top_n)
+
+        if self._diag_baseline is None:
+            # Tracing was already on before this service saw the flag (e.g. a
+            # PYTHONTRACEMALLOC boot or another component armed it), so there
+            # is no arming-tick baseline. Report the absolute top sites once —
+            # this is the baseline report — and diff from here on.
+            self._diag_baseline = snapshot
+            stats = snapshot.statistics("lineno")
+            top = stats[:top_n]
+            lines = "\n".join(
+                f"  {i + 1}. {s.size / (1024 * 1024):.1f}MiB in {s.count} blocks: "
+                f"{s.traceback}"
+                for i, s in enumerate(top)
+            )
+            logger.error(
+                "memory_watchdog[diagnostic]: RSS %.0fMiB (%.0f%% of %.0fMiB "
+                "budget) on %s; tracemalloc traced total %.1fMiB — baseline "
+                "report, top %d Python allocation sites by size (growth diffs "
+                "follow from the next report):\n%s",
+                rss_bytes / (1024 * 1024),
+                ratio * 100,
+                limit_bytes / (1024 * 1024),
+                ctx.name,
+                traced_bytes / (1024 * 1024),
+                len(top),
+                lines,
+            )
+            return
+
+        diffs = snapshot.compare_to(self._diag_baseline, "lineno")
+        self._diag_baseline = snapshot
+        since = f"{interval:.0f}s ago" if interval is not None else "arming"
+        grown = [d for d in diffs if d.size_diff > 0][:top_n]
+        if not grown:
+            logger.error(
+                "memory_watchdog[diagnostic]: RSS %.0fMiB (%.0f%% of %.0fMiB "
+                "budget) on %s; tracemalloc traced total %.1fMiB — NO "
+                "Python-level allocation growth since the previous snapshot "
+                "(%s). If RSS keeps climbing, the growth is outside CPython's "
+                "allocator (native/C-extension memory tracemalloc cannot see).",
+                rss_bytes / (1024 * 1024),
+                ratio * 100,
+                limit_bytes / (1024 * 1024),
+                ctx.name,
+                traced_bytes / (1024 * 1024),
+                since,
+            )
+            return
+
         lines = "\n".join(
-            f"  {i + 1}. {s.size / (1024 * 1024):.1f}MiB in {s.count} blocks: "
-            f"{s.traceback}"
-            for i, s in enumerate(top)
+            f"  {i + 1}. +{d.size_diff / (1024 * 1024):.1f}MiB "
+            f"(+{d.count_diff} blocks, total {d.size / (1024 * 1024):.1f}MiB): "
+            f"{d.traceback}"
+            for i, d in enumerate(grown)
         )
         logger.error(
             "memory_watchdog[diagnostic]: RSS %.0fMiB (%.0f%% of %.0fMiB budget) "
-            "on %s — top %d Python allocation sites by size:\n%s",
+            "on %s; tracemalloc traced total %.1fMiB — top %d Python allocation "
+            "sites by growth since the previous snapshot (%s):\n%s",
             rss_bytes / (1024 * 1024),
             ratio * 100,
             limit_bytes / (1024 * 1024),
             ctx.name,
-            len(top),
+            traced_bytes / (1024 * 1024),
+            len(grown),
+            since,
             lines,
         )
 

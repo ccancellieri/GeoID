@@ -825,8 +825,9 @@ async def test_diagnostic_off_by_default_takes_no_snapshot(
 async def test_diagnostic_logs_top_allocations_above_ratio(
     monkeypatch, caplog, _stop_tracemalloc
 ) -> None:
-    """When enabled and RSS is above diagnostic_ratio, a tracemalloc snapshot of
-    the top allocation sites is logged (naming the between-poll spike)."""
+    """Tracing already on but no arming-tick baseline (e.g. a PYTHONTRACEMALLOC
+    boot): the first qualifying tick logs the absolute top sites once, as the
+    baseline report; growth diffs follow from the next report."""
     import tracemalloc
 
     tracemalloc.start(1)  # pre-armed so this tick exercises the snapshot path
@@ -851,7 +852,7 @@ async def test_diagnostic_logs_top_allocations_above_ratio(
         await svc.tick(_make_ctx())
     diag = [r for r in caplog.records if "diagnostic" in r.getMessage()]
     assert len(diag) == 1
-    assert "top" in diag[0].getMessage()
+    assert "baseline report" in diag[0].getMessage()
     assert "allocation sites" in diag[0].getMessage()
     assert len(big) == 8  # keep the allocation alive until after the snapshot
 
@@ -894,9 +895,9 @@ async def test_diagnostic_lazy_starts_tracing_then_snapshots(
     monkeypatch, caplog, _stop_tracemalloc
 ) -> None:
     """Enabled while tracemalloc is off: the first qualifying tick lazily arms
-    tracing (no snapshot yet), and a later tick emits the snapshot. The flag is
-    read live, so the diagnostic can be switched on through the config store with
-    no restart."""
+    tracing AND captures the baseline snapshot, and a later tick emits the
+    growth report diffed against it. The flag is read live, so the diagnostic
+    can be switched on through the config store with no restart."""
     import tracemalloc
 
     if tracemalloc.is_tracing():
@@ -918,13 +919,111 @@ async def test_diagnostic_lazy_starts_tracing_then_snapshots(
     )
     ctx = _make_ctx()
     with caplog.at_level(logging.WARNING, logger="dynastore.tools.memory_watchdog"):
-        await svc.tick(ctx)  # arms tracing, no snapshot on this tick
+        await svc.tick(ctx)  # arms tracing + captures the baseline
         assert tracemalloc.is_tracing()
+        assert svc._diag_baseline is not None
         assert any("started tracemalloc" in r.getMessage() for r in caplog.records)
         assert not any("[diagnostic]" in r.getMessage() for r in caplog.records)
-        await svc.tick(ctx)  # now snapshots
+        await svc.tick(ctx)  # now reports growth against the baseline
     diag = [r for r in caplog.records if "[diagnostic]" in r.getMessage()]
     assert len(diag) == 1
+    assert "previous snapshot" in diag[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_reports_growth_since_previous_snapshot(
+    monkeypatch, caplog, _stop_tracemalloc
+) -> None:
+    """The report names sites that GREW between snapshots (compare_to against
+    the rolled-forward baseline), with an explicit +size diff — not the absolute
+    top-N, which steady-state allocations would dominate."""
+    import tracemalloc
+
+    if tracemalloc.is_tracing():
+        tracemalloc.stop()
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            diagnostic_ratio=0.50,
+            diagnostic_min_interval_seconds=0.0,
+            self_recycle_enabled=False,
+        ),
+    )
+    svc = MemoryWatchdogService(
+        limit_bytes=1000,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: 700,
+    )
+    ctx = _make_ctx()
+    with caplog.at_level(logging.ERROR, logger="dynastore.tools.memory_watchdog"):
+        await svc.tick(ctx)  # arming tick: baseline only, no report
+        # Allocate AFTER the baseline so this site shows up as growth.
+        big = [bytearray(1024 * 512) for _ in range(8)]  # ~4MiB
+        await svc.tick(ctx)
+    diag = [r for r in caplog.records if "[diagnostic]" in r.getMessage()]
+    assert len(diag) == 1
+    message = diag[0].getMessage()
+    assert "by growth since the previous snapshot" in message
+    assert "+" in message  # sites are reported as +N.NMiB deltas
+    assert "test_memory_watchdog" in message  # this file is the growing site
+    assert len(big) == 8  # keep the allocation alive until after the snapshot
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_no_python_growth_points_at_native_memory(
+    monkeypatch, caplog, _stop_tracemalloc
+) -> None:
+    """When the diff comes back empty while RSS is high, the report says so
+    explicitly and points at native/C-extension memory — the decisive signal
+    that tracemalloc is the wrong tool and a native profiler is next."""
+    import dynastore.tools.memory_watchdog as mw
+
+    class _FakeSnapshot:
+        def compare_to(self, _baseline, _key):
+            return []
+
+        def statistics(self, _key):
+            return []
+
+    class _FakeTracemalloc:
+        @staticmethod
+        def is_tracing() -> bool:
+            return True
+
+        @staticmethod
+        def take_snapshot() -> "_FakeSnapshot":
+            return _FakeSnapshot()
+
+        @staticmethod
+        def get_traced_memory():
+            return (42 * 1024 * 1024, 64 * 1024 * 1024)
+
+    monkeypatch.setattr(mw, "tracemalloc", _FakeTracemalloc())
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            diagnostic_ratio=0.50,
+            diagnostic_min_interval_seconds=0.0,
+            self_recycle_enabled=False,
+        ),
+    )
+    svc = MemoryWatchdogService(
+        limit_bytes=1000,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: 700,
+    )
+    svc._diag_baseline = _FakeSnapshot()  # type: ignore[assignment]  # as if armed earlier
+    with caplog.at_level(logging.ERROR, logger="dynastore.tools.memory_watchdog"):
+        await svc.tick(_make_ctx())
+    diag = [r for r in caplog.records if "[diagnostic]" in r.getMessage()]
+    assert len(diag) == 1
+    message = diag[0].getMessage()
+    assert "NO Python-level allocation growth" in message
+    assert "native/C-extension" in message
 
 
 @pytest.mark.asyncio
