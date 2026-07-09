@@ -22,6 +22,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from contextlib import asynccontextmanager
 from dynastore.modules.db_config.db_config import DBConfig
+from dynastore.modules.db_config.db_timeout_config import (
+    pooler_timeout_set_local_sql,
+    register_pooler_timeout_guard,
+    resolve_timeout_settings,
+)
 from dynastore.modules.db_config.tools import (
     get_config,
     ensure_init_db,
@@ -128,7 +133,13 @@ class DatastoreModule(ModuleProtocol, DatabaseProtocol):
                     normalize_db_url(db_config.database_url, is_async=False),
                     pool_size=db_config.pool_min_size,
                     max_overflow=db_config.pool_max_overflow,
-                    pool_timeout=db_config.pool_command_timeout,
+                    # pool_timeout = max seconds to wait for a free QueuePool
+                    # slot before raising sqlalchemy.exc.TimeoutError
+                    # (fail-fast; not the statement/command execution budget).
+                    # pool_command_timeout (60s) was the wrong semantic here —
+                    # same #1894 bug the async engine was fixed for, never
+                    # ported to this engine. See DBConfig.pool_acquire_timeout.
+                    pool_timeout=db_config.pool_acquire_timeout,
                     # Pool hygiene parity with the async engine
                     # (db_service.py): recycle stale slots and pre-ping so a
                     # NAT/AlloyDB-dropped idle connection is replaced rather
@@ -147,6 +158,36 @@ class DatastoreModule(ModuleProtocol, DatabaseProtocol):
                     },
                 )
                 logger.info("SQLAlchemy SyncEngine established successfully.")
+
+                # Lock-safety net (#3081-style), never wired for this engine:
+                # unlike every other engine in this codebase, its connect_args
+                # carry no lock_timeout / idle_in_transaction_session_timeout
+                # in either pooling mode. Registered unconditionally (not
+                # gated on db_pooling_mode) via SET LOCAL rather than as a
+                # psycopg2 ``options`` startup connect_arg, for two reasons:
+                # it works identically in direct and transaction-pooler mode
+                # with one code path, and it avoids adding a new startup
+                # parameter a transaction pooler in front of this engine
+                # could reject. The one-extra-round-trip-per-transaction cost
+                # is the same trade the async serving engine already makes
+                # behind a pooler. statement_timeout is intentionally left
+                # out: this engine also runs ensure_init_db's bootstrap DDL
+                # below, which task/utility engines exempt from the serving
+                # statement_timeout clamp for the same reason (#2837).
+                lock_timeout, _statement_timeout, idle_in_transaction_session_timeout = (
+                    resolve_timeout_settings(db_config)
+                )
+                register_pooler_timeout_guard(
+                    app_state.sync_engine,
+                    pooler_timeout_set_local_sql(
+                        db_config,
+                        lock_timeout=lock_timeout,
+                        idle_in_transaction_session_timeout=(
+                            idle_in_transaction_session_timeout
+                        ),
+                        force=True,
+                    ),
+                )
 
                 # Run initialization (extension bootstrap) using the shared
                 # maintenance tool; it handles sync engines from an async

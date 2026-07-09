@@ -37,6 +37,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import create_engine
 
 # Warm ``models.protocols`` before importing the service modules.
 #
@@ -144,7 +145,7 @@ async def test_sync_engine_has_pool_pre_ping_and_recycle():
 
     with patch(
         "dynastore.modules.datastore.datastore_service.create_engine",
-        return_value=MagicMock(),
+        return_value=create_engine("sqlite://"),
     ) as mk, patch(
         "dynastore.modules.datastore.datastore_service.ensure_init_db",
         new=AsyncMock(),
@@ -165,7 +166,7 @@ async def test_sync_engine_sets_libpq_tcp_keepalives():
 
     with patch(
         "dynastore.modules.datastore.datastore_service.create_engine",
-        return_value=MagicMock(),
+        return_value=create_engine("sqlite://"),
     ) as mk, patch(
         "dynastore.modules.datastore.datastore_service.ensure_init_db",
         new=AsyncMock(),
@@ -181,3 +182,85 @@ async def test_sync_engine_sets_libpq_tcp_keepalives():
     assert connect_args["keepalives_count"] == 5
     # The #702 application_name tag must survive alongside the new keys.
     assert "application_name" in connect_args
+
+
+# --------------------------------------------------------------------------
+# Sync engine (psycopg2) — pool-acquire timeout + lock-safety net (#3121)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sync_engine_uses_pool_acquire_timeout_not_command_timeout():
+    """#1894's fix never reached this engine: it fed pool_command_timeout (60s,
+    a statement budget) to pool_timeout (the pool-acquire wait), so a saturated
+    pool blocked callers up to 60s instead of failing fast."""
+    app_state = SimpleNamespace(db_config=DBConfig())
+
+    with patch(
+        "dynastore.modules.datastore.datastore_service.create_engine",
+        return_value=create_engine("sqlite://"),
+    ) as mk, patch(
+        "dynastore.modules.datastore.datastore_service.ensure_init_db",
+        new=AsyncMock(),
+    ):
+        async with DatastoreModule(app_state).lifespan(app_state):
+            pass
+
+    kwargs = mk.call_args.kwargs
+    assert kwargs["pool_timeout"] == app_state.db_config.pool_acquire_timeout == 30
+    assert kwargs["pool_timeout"] != app_state.db_config.pool_command_timeout
+
+
+@pytest.mark.asyncio
+async def test_sync_engine_registers_pooler_timeout_guard():
+    """Unlike every other engine, this one carried no lock_timeout /
+    idle_in_transaction_session_timeout protection in connect_args in any
+    pooling mode. The SET LOCAL guard must be registered unconditionally
+    (direct AND transaction-pooler mode) since it is the only place those
+    GUCs are applied for this engine."""
+    app_state = SimpleNamespace(db_config=DBConfig())
+
+    with patch(
+        "dynastore.modules.datastore.datastore_service.create_engine",
+        return_value=create_engine("sqlite://"),
+    ), patch(
+        "dynastore.modules.datastore.datastore_service.ensure_init_db",
+        new=AsyncMock(),
+    ):
+        async with DatastoreModule(app_state).lifespan(app_state):
+            engine = app_state.sync_engine
+            # The registered guard fires on real Postgres transactions (its
+            # SQL uses set_config(), a Postgres-only function); here we only
+            # assert the "begin" listener attached, not that it can run
+            # against sqlite.
+            assert bool(engine.dispatch.begin), (
+                "expected a 'begin' listener registered on the sync engine"
+            )
+
+
+@pytest.mark.asyncio
+async def test_sync_engine_guard_uses_serving_lock_safety_values():
+    """The guard must carry the same lock_timeout / idle_in_transaction budget
+    the async serving engine resolves from DBConfig — not the task-tier
+    idle budget, and not an invented new config key."""
+    app_state = SimpleNamespace(db_config=DBConfig())
+
+    with patch(
+        "dynastore.modules.datastore.datastore_service.create_engine",
+        return_value=create_engine("sqlite://"),
+    ), patch(
+        "dynastore.modules.datastore.datastore_service.ensure_init_db",
+        new=AsyncMock(),
+    ), patch(
+        "dynastore.modules.datastore.datastore_service.pooler_timeout_set_local_sql"
+    ) as mk_sql:
+        async with DatastoreModule(app_state).lifespan(app_state):
+            pass
+
+    call_kwargs = mk_sql.call_args.kwargs
+    assert call_kwargs["lock_timeout"] == app_state.db_config.lock_timeout
+    assert (
+        call_kwargs["idle_in_transaction_session_timeout"]
+        == app_state.db_config.idle_in_transaction_session_timeout
+    )
+    assert call_kwargs["force"] is True

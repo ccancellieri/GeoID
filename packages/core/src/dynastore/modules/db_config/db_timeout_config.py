@@ -265,6 +265,7 @@ def pooler_timeout_set_local_sql(
     lock_timeout: str,
     idle_in_transaction_session_timeout: str,
     statement_timeout: Optional[str] = None,
+    force: bool = False,
 ) -> Optional[str]:
     """A single SQL statement that re-applies the lock-safety timeouts inside a
     transaction, or ``None`` in direct mode (#3081).
@@ -277,8 +278,15 @@ def pooler_timeout_set_local_sql(
     LOCAL`` statements) so it is a single round-trip that also survives asyncpg's
     extended-query protocol, which rejects multi-statement strings.
     ``statement_timeout`` is included only when enabled (a non-"0" value).
+
+    ``force=True`` skips the transaction-pooler check and always returns the
+    SQL. Needed by an engine whose ``connect_args`` never carry these GUCs as
+    startup ``server_settings`` in the first place (psycopg2's sync engine —
+    see ``datastore_service.py``): for that engine the SET LOCAL guard is the
+    *only* place the lock-safety net is applied, in both direct and pooler
+    mode, so it cannot be gated on ``db_pooling_mode``.
     """
-    if not is_transaction_pooler(db_config):
+    if not force and not is_transaction_pooler(db_config):
         return None
     calls = [
         f"set_config('lock_timeout', '{lock_timeout}', true)",
