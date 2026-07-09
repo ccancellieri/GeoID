@@ -42,6 +42,8 @@ class _Cfg:
     idle_in_transaction_session_timeout = "10s"
     task_idle_in_transaction_session_timeout = "300s"
     db_pooling_mode = "direct"
+    pool_recycle = 111
+    database_url = "postgresql://u:p@host:5432/db"
 
 
 def _direct():
@@ -282,3 +284,76 @@ def test_create_listen_engine_uses_direct_url_and_pooler_safe_args(monkeypatch):
     assert connect_args["statement_cache_size"] == 0
     assert callable(connect_args["prepared_statement_name_func"])
     assert list(connect_args["server_settings"].keys()) == ["application_name"]
+
+
+# --------------------------------------------------------------------------- #
+# create_task_engine bounded pool (#3145)                                     #
+# --------------------------------------------------------------------------- #
+def test_create_task_engine_uses_bounded_pool_not_nullpool(monkeypatch):
+    """A drain run reuses one warm connection across its several
+    ``managed_transaction`` blocks instead of reconnecting through the
+    transaction pooler each time -- while staying small enough it never
+    competes with the shared serving pool for capacity."""
+    import sqlalchemy.ext.asyncio as sa_async
+    import dynastore.modules.db.db_service as db_service
+
+    sentinel = object()
+    captured: dict = {}
+
+    def _fake_create_async_engine(url, **kwargs):  # noqa: ANN001
+        captured["url"] = str(url)
+        captured["kwargs"] = kwargs
+        return sentinel
+
+    armed: list = []
+
+    monkeypatch.setattr(sa_async, "create_async_engine", _fake_create_async_engine)
+    monkeypatch.setattr(
+        db_service,
+        "_arm_client_socket_keepalive",
+        lambda engine, cfg: armed.append((engine, cfg)),
+    )
+
+    cfg = _direct()
+    assert t.create_task_engine(cfg) is sentinel
+    assert armed == [(sentinel, cfg)]
+
+    kwargs = captured["kwargs"]
+    assert "poolclass" not in kwargs, (
+        "create_task_engine must no longer force NullPool -- a small warm "
+        "pool (pool_size/max_overflow) replaces it (#3145)"
+    )
+    assert kwargs["pool_size"] == t.TASK_ENGINE_POOL_SIZE == 1
+    assert kwargs["max_overflow"] == t.TASK_ENGINE_POOL_MAX_OVERFLOW == 1
+    assert kwargs["pool_recycle"] == cfg.pool_recycle
+    assert kwargs["pool_pre_ping"] is True
+
+
+def test_create_task_engine_bounded_pool_also_applies_behind_pooler(monkeypatch):
+    """The bounded-pool sizing is not gated on db_pooling_mode -- same as how
+    the shared serving engine applies pool_pre_ping/pool_recycle in both
+    modes (#3081); only the startup connect_args differ behind a pooler."""
+    import sqlalchemy.ext.asyncio as sa_async
+    import dynastore.modules.db.db_service as db_service
+
+    captured: dict = {}
+    # A real (sqlite) engine, not a bare sentinel: create_task_engine also
+    # registers register_pooler_timeout_guard()'s begin-listener in pooler
+    # mode, which requires a genuine SQLAlchemy event target.
+    fake_engine = create_engine("sqlite://")
+
+    def _fake_create_async_engine(url, **kwargs):  # noqa: ANN001
+        captured["kwargs"] = kwargs
+        return fake_engine
+
+    monkeypatch.setattr(sa_async, "create_async_engine", _fake_create_async_engine)
+    monkeypatch.setattr(
+        db_service, "_arm_client_socket_keepalive", lambda engine, cfg: None
+    )
+
+    t.create_task_engine(_pooler())
+
+    kwargs = captured["kwargs"]
+    assert kwargs["pool_size"] == 1
+    assert kwargs["max_overflow"] == 1
+    assert kwargs["pool_pre_ping"] is True
