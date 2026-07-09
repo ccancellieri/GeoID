@@ -545,6 +545,25 @@ async def test_tick_config_limit_picked_up_live_no_latch(monkeypatch, tmp_path) 
 
 
 @pytest.mark.asyncio
+async def test_tick_applies_config_cadence_live(monkeypatch) -> None:
+    """A cadence_seconds set through the config store takes effect on the next
+    tick. PeriodicService.run() reads self.cadence_seconds before every sleep,
+    but the service is always BUILT with the code default (the config store is
+    unreachable at lifespan start), so shortening the sampling window — e.g. to
+    catch an OOM spike that completes between two 15s ticks — must work
+    without a redeploy."""
+    monkeypatch.setenv("RAM", "1Gi")
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog.load_memory_watchdog_config",
+        _fake_config(MemoryWatchdogConfig(cadence_seconds=2.0)),
+    )
+    svc = MemoryWatchdogService(get_rss_bytes=lambda: 100)
+    assert svc.cadence_seconds == pytest.approx(15.0)
+    await svc.tick(_make_ctx())
+    assert svc.cadence_seconds == pytest.approx(2.0)
+
+
+@pytest.mark.asyncio
 async def test_tick_inert_and_warns_once_when_no_budget(monkeypatch, tmp_path, caplog) -> None:
     monkeypatch.setattr(
         "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH",

@@ -270,6 +270,16 @@ class MemoryWatchdogService(PeriodicService):
         config = await load_memory_watchdog_config()
         limit_bytes = self._effective_limit_bytes(config)
 
+        # Apply the configured cadence live: PeriodicService.run() reads
+        # self.cadence_seconds before every sleep, but the service is built
+        # before the config store is reachable, so the constructor only ever
+        # sees the code default (15s). An OOM spike that completes between two
+        # 15s ticks is invisible to the diagnostic; operators need to be able
+        # to shorten the sampling window through the config store without a
+        # redeploy.
+        if config.cadence_seconds > 0:
+            self.cadence_seconds = config.cadence_seconds
+
         rss_bytes = self._get_rss_bytes()
         if rss_bytes is None or limit_bytes is None:
             if limit_bytes is None and not self._inert_warned:
