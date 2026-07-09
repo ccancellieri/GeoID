@@ -46,11 +46,14 @@ import contextvars
 import functools
 import hashlib
 import inspect
+import itertools
 import json
 import logging
 import random
+import sys
 import threading
 import time
+import weakref
 from datetime import timedelta
 from typing import (
     Annotated,
@@ -260,20 +263,395 @@ def _make_cache_key(
 
 class _CacheEntry:
     """Internal record stored in the local cache backends."""
-    __slots__ = ("value", "expires_at", "priority")
+    __slots__ = ("value", "expires_at", "priority", "size_bytes", "hits")
 
     def __init__(
         self,
         value: Any,
         expires_at: Optional[float],
         priority: int = CacheItemPriority.NORMAL,
+        size_bytes: int = 0,
     ):
         self.value = value
         self.expires_at = expires_at
         self.priority = priority
+        self.size_bytes = size_bytes
+        self.hits = 0
 
     def is_expired(self) -> bool:
         return self.expires_at is not None and time.monotonic() > self.expires_at
+
+
+# ---------------------------------------------------------------------------
+#  L1 memory budget — process-wide byte accounting for local backends
+# ---------------------------------------------------------------------------
+
+# Built-in defaults for the CachePluginConfig L1 knobs, active until the
+# config is loaded (pull path: _load_cache_plugin_config_values; push path:
+# set_l1_runtime_config called by CacheModule's apply handler).
+_DEFAULT_L1_TTL_SECONDS: float = 30.0
+_DEFAULT_L1_MEMORY_PERCENT: float = 10.0
+_l1_default_ttl_value: float = _DEFAULT_L1_TTL_SECONDS
+_l1_memory_percent_value: float = _DEFAULT_L1_MEMORY_PERCENT
+
+_L1_SIZING_MAX_DEPTH = 6
+_L1_SIZING_MAX_ITEMS = 64
+# Entries whose deep size cannot be measured at all are charged this nominal
+# figure so they still participate in budget accounting.
+_L1_OPAQUE_SIZE_BYTES = 64
+# How many LRU-oldest candidates the byte-budget eviction scores per pass
+# (see _L1MemoryBudget.enforce).
+_L1_EVICTION_SAMPLE = 8
+# A single value larger than this fraction of the byte budget is not admitted
+# to L1 at all: evicting most of the working set to hold one entry is never a
+# win, and the budget scan considers the newest (MRU) entry last, so an
+# oversized insert would otherwise strip every older entry before touching
+# the offender. Tiered callers still write the value to the distributed tier.
+_L1_ADMISSION_MAX_FRACTION = 0.25
+
+
+def _approx_deep_size(obj: Any, _depth: int = 0, _seen: Optional[Set[int]] = None) -> int:
+    """Approximate deep size of ``obj`` in bytes, bounded to stay O(small).
+
+    Recursion is capped at ``_L1_SIZING_MAX_DEPTH`` levels and
+    ``_L1_SIZING_MAX_ITEMS`` sampled items per container (the sampled sum is
+    scaled up by the container's true length), so sizing a large cached value
+    costs a bounded number of ``sys.getsizeof`` calls rather than a full
+    graph walk. The result is an estimate used only for relative budget
+    accounting — never for exact RSS math.
+    """
+    try:
+        size = sys.getsizeof(obj)
+    except Exception:
+        return _L1_OPAQUE_SIZE_BYTES
+    if obj is None or isinstance(obj, (str, bytes, bytearray, int, float, bool)):
+        return size
+    if _depth >= _L1_SIZING_MAX_DEPTH:
+        return size
+    if _seen is None:
+        _seen = set()
+    oid = id(obj)
+    if oid in _seen:
+        return 0
+    _seen.add(oid)
+    try:
+        if isinstance(obj, dict):
+            sampled_n = 0
+            sampled = 0
+            for k, v in itertools.islice(obj.items(), _L1_SIZING_MAX_ITEMS):
+                sampled += _approx_deep_size(k, _depth + 1, _seen)
+                sampled += _approx_deep_size(v, _depth + 1, _seen)
+                sampled_n += 1
+            if sampled_n and len(obj) > sampled_n:
+                sampled = int(sampled * len(obj) / sampled_n)
+            return size + sampled
+        if isinstance(obj, (list, tuple, set, frozenset)):
+            sampled_n = 0
+            sampled = 0
+            for v in itertools.islice(obj, _L1_SIZING_MAX_ITEMS):
+                sampled += _approx_deep_size(v, _depth + 1, _seen)
+                sampled_n += 1
+            if sampled_n and len(obj) > sampled_n:
+                sampled = int(sampled * len(obj) / sampled_n)
+            return size + sampled
+        attrs = getattr(obj, "__dict__", None)
+        if attrs is not None:
+            return size + _approx_deep_size(attrs, _depth + 1, _seen)
+        slots = getattr(obj, "__slots__", None)
+        if slots:
+            return size + sum(
+                _approx_deep_size(getattr(obj, s), _depth + 1, _seen)
+                for s in slots
+                if isinstance(s, str) and hasattr(obj, s)
+            )
+        return size
+    except Exception:
+        return size
+
+
+class _L1MemoryBudget:
+    """Process-wide byte budget shared by every local (L1) cache backend.
+
+    Every ``LocalAsyncCacheBackend`` / ``LocalSyncCacheBackend`` registers
+    itself here at construction (weakly — a dropped backend leaves the
+    registry on GC) and keeps a running ``_bytes`` total of its entries'
+    approximate deep sizes. After each insert the writing backend calls
+    :meth:`enforce`; while the process-wide total exceeds the budget, the
+    backend currently holding the most bytes evicts its lowest
+    **value-per-byte** entry (GDSF-lite: among its LRU-oldest
+    ``_L1_EVICTION_SAMPLE`` evictable entries, the one with the smallest
+    ``(hits + 1) / size_bytes`` score goes first — large, rarely-hit, least
+    recently used entries before small hot ones). ``NEVER_REMOVE`` entries
+    are exempt.
+
+    Budget = per-worker memory share (container memory / GUNICORN_WORKERS,
+    via ``memory_watchdog.resolve_watchdog_budget_mb`` — each gunicorn worker
+    is its own process with its own L1s) × ``l1_memory_percent`` / 100. The
+    percent is read live so a CachePluginConfig PATCH applies immediately;
+    when no memory base is resolvable (e.g. local macOS dev) or the percent
+    is 0, byte-budget eviction is disabled and only per-site entry-count
+    caps apply.
+
+    Thread-safety: a single ``threading.Lock`` serializes enforcement. Async
+    backends mutate only from the event-loop thread; the sync backend calls
+    ``enforce(sync_caller=True)`` after releasing its own lock and
+    ``_evict_one_for_budget`` re-takes it, so lock order is always
+    manager → backend, never the reverse. Sync-thread enforcement never
+    evicts from async backends (their stores have no thread lock); see
+    :meth:`enforce`.
+    """
+
+    def __init__(self) -> None:
+        self._backends: "weakref.WeakSet[Any]" = weakref.WeakSet()
+        self._lock = threading.Lock()
+        self._base_bytes: Optional[int] = None
+        self._base_resolved = False
+        # Lock-free approximate process-wide total, maintained by
+        # backend._charge() via notify(). Races may skew it slightly, but
+        # enforce() resyncs it from the exact per-backend sums whenever it
+        # actually runs, so drift is bounded to one enforcement window. Its
+        # job is to let the under-budget fast path skip the lock entirely.
+        self._approx_total = 0
+
+    def register(self, backend: Any) -> None:
+        with self._lock:
+            self._backends.add(backend)
+
+    def notify(self, delta: int) -> None:
+        """Record a byte-count change from a backend (see ``_approx_total``)."""
+        self._approx_total += delta
+
+    def budget_bytes(self) -> Optional[int]:
+        """Current byte budget, or ``None`` when byte eviction is disabled."""
+        pct = _l1_memory_percent_value
+        if pct <= 0:
+            return None
+        if not self._base_resolved:
+            # Deferred import: memory_watchdog imports tools modules that may
+            # themselves import this module at startup.
+            try:
+                from dynastore.tools.memory_watchdog import resolve_watchdog_budget_mb
+
+                base_mb = resolve_watchdog_budget_mb()
+                self._base_bytes = (
+                    base_mb * 1024 * 1024 if base_mb is not None else None
+                )
+                if self._base_bytes is None:
+                    logger.info(
+                        "L1 byte budget: no memory base resolvable — "
+                        "byte-budget eviction disabled for this process"
+                    )
+                else:
+                    logger.info(
+                        "L1 byte budget: base %s MB per worker", base_mb
+                    )
+            except Exception as e:
+                self._base_bytes = None
+                logger.warning(
+                    "L1 byte budget: base resolution failed (%s) — "
+                    "byte-budget eviction disabled for this process", e
+                )
+            # Env-derived base is static per process — resolve once.
+            self._base_resolved = True
+        if self._base_bytes is None:
+            return None
+        return int(self._base_bytes * (pct / 100.0))
+
+    def total_bytes(self) -> int:
+        return sum(b._bytes for b in list(self._backends))
+
+    def enforce(self, *, sync_caller: bool = False) -> None:
+        budget = self.budget_bytes()
+        if budget is None:
+            return
+        # Under-budget fast path: no lock, no backend scan. _approx_total is
+        # resynced to the exact total below whenever enforcement runs.
+        if self._approx_total <= budget:
+            return
+        with self._lock:
+            # sync_caller: enforcement is running on an arbitrary worker
+            # thread (a sync backend's set()). Async backends' stores have no
+            # thread lock — they are only ever mutated from the event-loop
+            # thread — so only thread-safe (sync) backends are eligible
+            # victims here; async-side pressure is trimmed by the next
+            # event-loop write.
+            candidates = [
+                b
+                for b in self._backends
+                if b._bytes > 0 and (not sync_caller or b._evict_thread_safe)
+            ]
+            total = sum(b._bytes for b in self._backends)
+            while total > budget and candidates:
+                victim = max(candidates, key=lambda b: b._bytes)
+                freed = victim._evict_one_for_budget()
+                if freed <= 0:
+                    # Nothing evictable in this backend (all NEVER_REMOVE);
+                    # leave it alone and keep trimming the others.
+                    candidates.remove(victim)
+                    continue
+                total -= freed
+                if victim._bytes <= 0:
+                    candidates.remove(victim)
+            self._approx_total = total
+
+
+_l1_budget = _L1MemoryBudget()
+
+
+def set_l1_runtime_config(
+    *,
+    l1_default_ttl_seconds: Optional[float] = None,
+    l1_memory_percent: Optional[float] = None,
+) -> None:
+    """Push live ``CachePluginConfig`` L1 knobs into this layer.
+
+    Called by ``CacheModule._on_cache_plugin_config_change`` so a config
+    PATCH applies immediately (mirrors how ``circuit_breaker_threshold`` is
+    pushed onto the live Valkey backend); the pull path in
+    :func:`_load_cache_plugin_config_values` picks up seeded values on the
+    normal refresh window.
+    """
+    global _l1_default_ttl_value, _l1_memory_percent_value
+    if l1_default_ttl_seconds is not None:
+        _l1_default_ttl_value = float(l1_default_ttl_seconds)
+    if l1_memory_percent is not None:
+        _l1_memory_percent_value = float(l1_memory_percent)
+
+
+# ---------------------------------------------------------------------------
+#  Shared local-store helpers
+# ---------------------------------------------------------------------------
+# LocalAsyncCacheBackend and LocalSyncCacheBackend have identical storage
+# semantics (OrderedDict of _CacheEntry + byte accounting via _charge). These
+# helpers hold the single copy of that logic so eviction scoring and byte
+# accounting cannot drift between the two. Callers own the locking: the sync
+# backend invokes them under self._lock, the async backend only from the
+# event-loop thread.
+
+
+def _local_drop_nolock(backend: Any, key: str) -> bool:
+    """Remove one entry, keeping byte accounting and stats consistent."""
+    entry = backend._store.pop(key, None)
+    if entry is None:
+        return False
+    backend._charge(-entry.size_bytes)
+    backend._stats.size = len(backend._store)
+    return True
+
+
+def _local_evict_one_for_budget_nolock(backend: Any) -> int:
+    """Evict the backend's lowest value-per-byte entry; return freed bytes.
+
+    Called under memory pressure by ``_l1_budget.enforce()``. Scores the
+    LRU-oldest ``_L1_EVICTION_SAMPLE`` evictable entries by
+    ``(hits + 1) / size_bytes`` and evicts the smallest score, so large
+    entries that are rarely re-read go before small hot ones (GDSF-lite).
+    ``NEVER_REMOVE`` entries are skipped; returns 0 when nothing is
+    evictable.
+    """
+    evict_key = None
+    best_score = None
+    sampled = 0
+    for k, entry in backend._store.items():
+        if entry.priority >= CacheItemPriority.NEVER_REMOVE:
+            continue
+        score = (entry.hits + 1) / max(1, entry.size_bytes)
+        if best_score is None or score < best_score:
+            best_score = score
+            evict_key = k
+        sampled += 1
+        if sampled >= _L1_EVICTION_SAMPLE:
+            break
+    if evict_key is None:
+        return 0
+    entry = backend._store.pop(evict_key)
+    backend._charge(-entry.size_bytes)
+    backend._stats.size = len(backend._store)
+    backend._stats.evictions += 1
+    return entry.size_bytes
+
+
+def _local_evict_if_needed_nolock(backend: Any) -> None:
+    """Entry-count (max_size) LRU eviction, independent of the byte budget."""
+    while len(backend._store) >= backend._max_size:
+        evict_key = None
+        for k, entry in backend._store.items():
+            if entry.priority < CacheItemPriority.NEVER_REMOVE:
+                evict_key = k
+                break
+        if evict_key is None:
+            # All entries are NEVER_REMOVE, evict oldest anyway
+            evict_key = next(iter(backend._store))
+        entry = backend._store.pop(evict_key)
+        backend._charge(-entry.size_bytes)
+        backend._stats.evictions += 1
+
+
+def _local_set_nolock(
+    backend: Any,
+    key: str,
+    value: Any,
+    ttl: Optional[float],
+    exist: Optional[bool],
+) -> bool:
+    """Insert/replace one entry: sizing, admission cap, byte accounting."""
+    store = backend._store
+    has_key = key in store
+    if exist is True and not has_key:
+        return False
+    if exist is False and has_key:
+        return False
+
+    budget = _l1_budget.budget_bytes()
+    # Sizing is only paid when the byte budget is active. Disabled-budget
+    # entries are charged 0; if the budget is enabled later they stay
+    # uncharged until rewritten, which their TTL bounds.
+    size = _approx_deep_size(value) if budget is not None else 0
+
+    if (
+        exist is None
+        and budget is not None
+        and size > budget * _L1_ADMISSION_MAX_FRACTION
+    ):
+        # Admission cap (see _L1_ADMISSION_MAX_FRACTION): report success but
+        # keep the value out of L1 — tiered callers still write it to the
+        # distributed tier, direct callers recompute. Conditional writes
+        # (exist=True/False) bypass the cap: their callers rely on the
+        # stored-or-not outcome, not on cache economics.
+        if has_key:
+            _local_drop_nolock(backend, key)
+        return True
+
+    expires_at = (time.monotonic() + ttl) if ttl is not None else None
+    entry = _CacheEntry(value=value, expires_at=expires_at, size_bytes=size)
+
+    if has_key:
+        old = store[key]
+        # Carry hit history over so periodically-refreshed hot keys don't
+        # score as cold in the GDSF eviction.
+        entry.hits = old.hits
+        backend._charge(size - old.size_bytes)
+        store[key] = entry
+        store.move_to_end(key)
+    else:
+        _local_evict_if_needed_nolock(backend)
+        store[key] = entry
+        backend._charge(size)
+
+    backend._stats.size = len(store)
+    return True
+
+
+def _local_clear_all_nolock(backend: Any) -> bool:
+    """Drop every entry (and per-key locks), zeroing byte accounting."""
+    had_items = len(backend._store) > 0
+    backend._store.clear()
+    locks = getattr(backend, "_locks", None)
+    if locks is not None:
+        locks.clear()
+    backend._charge(-backend._bytes)
+    backend._stats.size = 0
+    return had_items
 
 
 # ---------------------------------------------------------------------------
@@ -290,11 +668,17 @@ class LocalAsyncCacheBackend:
     - priority = 1000
     """
 
+    # Async stores have no thread lock — budget eviction from a foreign
+    # (non-event-loop) thread is unsafe. See _L1MemoryBudget.enforce.
+    _evict_thread_safe = False
+
     def __init__(self, max_size: int = 4096) -> None:
         self._store: collections.OrderedDict[str, _CacheEntry] = collections.OrderedDict()
         self._max_size = max_size
         self._locks: Dict[str, asyncio.Lock] = {}
         self._stats = CacheStats(maxsize=max_size)
+        self._bytes = 0
+        _l1_budget.register(self)
 
     @property
     def name(self) -> str:
@@ -304,13 +688,25 @@ class LocalAsyncCacheBackend:
     def priority(self) -> int:
         return 1000
 
+    def _charge(self, delta: int) -> None:
+        """Single mutation point for byte accounting (backend + budget)."""
+        self._bytes += delta
+        _l1_budget.notify(delta)
+
+    def _drop_entry(self, key: str) -> bool:
+        return _local_drop_nolock(self, key)
+
+    def _evict_one_for_budget(self) -> int:
+        return _local_evict_one_for_budget_nolock(self)
+
     async def get(self, key: str) -> Optional[bytes]:
         entry = self._store.get(key)
         if entry is None:
             return None
         if entry.is_expired():
-            del self._store[key]
+            self._drop_entry(key)
             return None
+        entry.hits += 1
         self._store.move_to_end(key)
         return entry.value
 
@@ -322,24 +718,10 @@ class LocalAsyncCacheBackend:
         ttl: Optional[float] = None,
         exist: Optional[bool] = None,
     ) -> bool:
-        has_key = key in self._store
-        if exist is True and not has_key:
-            return False
-        if exist is False and has_key:
-            return False
-
-        expires_at = (time.monotonic() + ttl) if ttl is not None else None
-        entry = _CacheEntry(value=value, expires_at=expires_at)
-
-        if has_key:
-            self._store[key] = entry
-            self._store.move_to_end(key)
-        else:
-            self._evict_if_needed()
-            self._store[key] = entry
-
-        self._stats.size = len(self._store)
-        return True
+        ok = _local_set_nolock(self, key, value, ttl, exist)
+        if ok:
+            _l1_budget.enforce()
+        return ok
 
     async def clear(
         self,
@@ -349,18 +731,13 @@ class LocalAsyncCacheBackend:
         tags: Optional[List[str]] = None,
     ) -> bool:
         if key is not None:
-            if key in self._store:
-                del self._store[key]
-                self._stats.size = len(self._store)
-                return True
-            return False
+            return self._drop_entry(key)
 
         if namespace is not None:
             prefix = namespace + ":"
             to_delete = [k for k in self._store if k.startswith(prefix)]
             for k in to_delete:
-                del self._store[k]
-            self._stats.size = len(self._store)
+                self._drop_entry(k)
             return len(to_delete) > 0
 
         # tags: not supported in local backend (no tag index)
@@ -368,38 +745,22 @@ class LocalAsyncCacheBackend:
             return False
 
         # Clear everything
-        had_items = len(self._store) > 0
-        self._store.clear()
-        self._locks.clear()
-        self._stats.size = 0
-        return had_items
+        return _local_clear_all_nolock(self)
 
     async def exists(self, key: str) -> bool:
         entry = self._store.get(key)
         if entry is None:
             return False
         if entry.is_expired():
-            del self._store[key]
+            self._drop_entry(key)
             return False
         return True
 
     async def close(self) -> None:
-        self._store.clear()
-        self._locks.clear()
+        _local_clear_all_nolock(self)
 
     def _evict_if_needed(self) -> None:
-        while len(self._store) >= self._max_size:
-            # Find lowest-priority entry to evict (skip NEVER_REMOVE)
-            evict_key = None
-            for k, entry in self._store.items():
-                if entry.priority < CacheItemPriority.NEVER_REMOVE:
-                    evict_key = k
-                    break
-            if evict_key is None:
-                # All entries are NEVER_REMOVE, evict oldest anyway
-                evict_key = next(iter(self._store))
-            del self._store[evict_key]
-            self._stats.evictions += 1
+        _local_evict_if_needed_nolock(self)
 
     async def get_lock(self, key: str) -> asyncio.Lock:
         # asyncio is single-threaded and cooperative — no concurrent access to
@@ -561,6 +922,16 @@ async def _load_cache_plugin_config_values() -> None:
             if cfg is not None:
                 _slow_path_timeout_value = cfg.slow_path_timeout_seconds
                 _max_concurrent_rebuilds_value = cfg.max_concurrent_detached_rebuilds
+                # L1 knobs share the same config row — refresh them on the
+                # same fetch so seeded (non-default) values are picked up
+                # even if no config PATCH ever fires (see
+                # set_l1_runtime_config for the push path).
+                set_l1_runtime_config(
+                    l1_default_ttl_seconds=getattr(
+                        cfg, "l1_default_ttl_seconds", None
+                    ),
+                    l1_memory_percent=getattr(cfg, "l1_memory_percent", None),
+                )
     except Exception as e:
         logger.debug(
             "cache: CachePluginConfig load failed (%s), using cached/default values", e
@@ -762,7 +1133,7 @@ class TieredAsyncBackend:
     Implements ``get_lock`` by delegating to the first tier that supports it.
     """
 
-    DEFAULT_L1_TTL_CAP: float = 60.0
+    DEFAULT_L1_TTL_CAP: float = _DEFAULT_L1_TTL_SECONDS
     DEFAULT_L2_RETRY_ATTEMPTS: int = 3
     DEFAULT_L2_RETRY_BACKOFF: float = 0.1
 
@@ -777,7 +1148,10 @@ class TieredAsyncBackend:
 
         Args:
             backends: Ordered list of backends (L1, L2, ...).
-            l1_ttl_cap: Bounds TTL for L1 tier. Defaults to 60s.
+            l1_ttl_cap: Bounds TTL for L1 tier. ``None`` (the default) means
+                "use ``CachePluginConfig.l1_default_ttl_seconds``", read live
+                on every L1 write (default 30s) so a config PATCH applies
+                without rebuilding the backend.
             l2_retry_attempts: Max attempts for L2+ background writes.
                 Defaults to 3. Set to 0 to skip background writes entirely
                 (no task is scheduled, no warning is emitted).
@@ -789,8 +1163,8 @@ class TieredAsyncBackend:
         self._backends = backends
         self._name = "-".join(b.name for b in backends)
         self._priority = min(b.priority for b in backends)
-        self._l1_ttl_cap = (
-            self.DEFAULT_L1_TTL_CAP if l1_ttl_cap is None else float(l1_ttl_cap)
+        self._l1_ttl_cap_explicit: Optional[float] = (
+            None if l1_ttl_cap is None else float(l1_ttl_cap)
         )
         self._l2_retry_attempts = (
             self.DEFAULT_L2_RETRY_ATTEMPTS
@@ -815,6 +1189,14 @@ class TieredAsyncBackend:
     @property
     def priority(self) -> int:
         return self._priority
+
+    def _effective_l1_ttl_cap(self) -> float:
+        """L1 TTL cap: per-site override, else the live config default."""
+        return (
+            self._l1_ttl_cap_explicit
+            if self._l1_ttl_cap_explicit is not None
+            else _l1_default_ttl_value
+        )
 
     async def get(self, key: str) -> Optional[Any]:
         """L2-authoritative versioned read.
@@ -865,14 +1247,14 @@ class TieredAsyncBackend:
                     await self._backends[0].set(
                         key,
                         _ENVELOPE_SERIALIZER.dumps(_ev_tombstone(l2_ver)),
-                        ttl=self._l1_ttl_cap,
+                        ttl=self._effective_l1_ttl_cap(),
                     )
                 return None
             # Refresh L1 from L2 (version-guarded write).
             await self._backends[0].set(
                 key,
                 _ENVELOPE_SERIALIZER.dumps(_ev_wrap(l2_val, l2_ver)),
-                ttl=self._l1_ttl_cap,
+                ttl=self._effective_l1_ttl_cap(),
             )
             return l2_val
 
@@ -902,9 +1284,8 @@ class TieredAsyncBackend:
         ver = time.time_ns()
         envelope = _ENVELOPE_SERIALIZER.dumps(_ev_wrap(value, ver))
 
-        l1_ttl: Optional[float] = (
-            min(ttl, self._l1_ttl_cap) if ttl is not None else self._l1_ttl_cap
-        )
+        l1_cap = self._effective_l1_ttl_cap()
+        l1_ttl: Optional[float] = min(ttl, l1_cap) if ttl is not None else l1_cap
         l1_ok = await self._backends[0].set(key, envelope, ttl=l1_ttl, exist=exist)
         if not l1_ok:
             # Conditional write precondition rejected by L1; skip L2.
@@ -947,17 +1328,18 @@ class TieredAsyncBackend:
         if key is not None:
             ver = time.time_ns()
             tombstone = _ENVELOPE_SERIALIZER.dumps(_ev_tombstone(ver))
+            l1_cap = self._effective_l1_ttl_cap()
             # L1 tombstone — synchronous, always fast.
-            await self._backends[0].set(key, tombstone, ttl=self._l1_ttl_cap)
+            await self._backends[0].set(key, tombstone, ttl=l1_cap)
             # L2+ tombstone — synchronous so other instances see it immediately.
             for i, backend in enumerate(self._backends[1:], start=2):
                 try:
-                    await backend.set(key, tombstone, ttl=self._l1_ttl_cap)
+                    await backend.set(key, tombstone, ttl=l1_cap)
                 except Exception as e:
                     logger.warning(
                         "L%d cache clear tombstone write failed (key=%s): %s — "
                         "L1 tombstone guards local reads for %.0fs",
-                        i, key, e, self._l1_ttl_cap,
+                        i, key, e, l1_cap,
                     )
             return True
 
@@ -1038,11 +1420,17 @@ class LocalSyncCacheBackend:
     - priority = 1000
     """
 
+    # _evict_one_for_budget takes self._lock, so budget eviction is safe
+    # from any thread. See _L1MemoryBudget.enforce.
+    _evict_thread_safe = True
+
     def __init__(self, max_size: int = 4096) -> None:
         self._store: collections.OrderedDict[str, _CacheEntry] = collections.OrderedDict()
         self._max_size = max_size
         self._lock = threading.Lock()
         self._stats = CacheStats(maxsize=max_size)
+        self._bytes = 0
+        _l1_budget.register(self)
 
     @property
     def name(self) -> str:
@@ -1052,14 +1440,34 @@ class LocalSyncCacheBackend:
     def priority(self) -> int:
         return 1000
 
+    def _charge(self, delta: int) -> None:
+        """Single mutation point for byte accounting (backend + budget)."""
+        self._bytes += delta
+        _l1_budget.notify(delta)
+
+    def _drop_entry_nolock(self, key: str) -> bool:
+        """Remove one entry (caller holds ``self._lock``)."""
+        return _local_drop_nolock(self, key)
+
+    def _evict_one_for_budget(self) -> int:
+        """Byte-budget eviction — same GDSF-lite scoring as the async backend.
+
+        Takes ``self._lock`` itself: only ever called by ``_l1_budget.enforce()``,
+        which this backend invokes strictly AFTER releasing its own lock, so
+        lock order stays manager → backend.
+        """
+        with self._lock:
+            return _local_evict_one_for_budget_nolock(self)
+
     def get(self, key: str) -> Optional[bytes]:
         with self._lock:
             entry = self._store.get(key)
             if entry is None:
                 return None
             if entry.is_expired():
-                del self._store[key]
+                self._drop_entry_nolock(key)
                 return None
+            entry.hits += 1
             self._store.move_to_end(key)
             return entry.value
 
@@ -1072,24 +1480,14 @@ class LocalSyncCacheBackend:
         exist: Optional[bool] = None,
     ) -> bool:
         with self._lock:
-            has_key = key in self._store
-            if exist is True and not has_key:
-                return False
-            if exist is False and has_key:
-                return False
-
-            expires_at = (time.monotonic() + ttl) if ttl is not None else None
-            entry = _CacheEntry(value=value, expires_at=expires_at)
-
-            if has_key:
-                self._store[key] = entry
-                self._store.move_to_end(key)
-            else:
-                self._evict_if_needed()
-                self._store[key] = entry
-
-            self._stats.size = len(self._store)
-            return True
+            ok = _local_set_nolock(self, key, value, ttl, exist)
+        # Outside self._lock: enforce() may call back into
+        # _evict_one_for_budget, which re-takes it (threading.Lock is not
+        # reentrant). sync_caller: this may run on any thread, so only
+        # thread-safe backends are eligible eviction victims.
+        if ok:
+            _l1_budget.enforce(sync_caller=True)
+        return ok
 
     def clear(
         self,
@@ -1100,27 +1498,19 @@ class LocalSyncCacheBackend:
     ) -> bool:
         with self._lock:
             if key is not None:
-                if key in self._store:
-                    del self._store[key]
-                    self._stats.size = len(self._store)
-                    return True
-                return False
+                return self._drop_entry_nolock(key)
 
             if namespace is not None:
                 prefix = namespace + ":"
                 to_delete = [k for k in self._store if k.startswith(prefix)]
                 for k in to_delete:
-                    del self._store[k]
-                self._stats.size = len(self._store)
+                    self._drop_entry_nolock(k)
                 return len(to_delete) > 0
 
             if tags is not None:
                 return False
 
-            had_items = len(self._store) > 0
-            self._store.clear()
-            self._stats.size = 0
-            return had_items
+            return _local_clear_all_nolock(self)
 
     def exists(self, key: str) -> bool:
         with self._lock:
@@ -1128,25 +1518,16 @@ class LocalSyncCacheBackend:
             if entry is None:
                 return False
             if entry.is_expired():
-                del self._store[key]
+                self._drop_entry_nolock(key)
                 return False
             return True
 
     def close(self) -> None:
         with self._lock:
-            self._store.clear()
+            _local_clear_all_nolock(self)
 
     def _evict_if_needed(self) -> None:
-        while len(self._store) >= self._max_size:
-            evict_key = None
-            for k, entry in self._store.items():
-                if entry.priority < CacheItemPriority.NEVER_REMOVE:
-                    evict_key = k
-                    break
-            if evict_key is None:
-                evict_key = next(iter(self._store))
-            del self._store[evict_key]
-            self._stats.evictions += 1
+        _local_evict_if_needed_nolock(self)
 
 
 # ---------------------------------------------------------------------------
@@ -1568,7 +1949,8 @@ def cached(
             of registered distributed backends. Use for non-serializable return
             types (driver instances, singletons).
         l1_ttl: Override the L1 (in-process) TTL cap when a tiered backend is in
-            play. Defaults to ``TieredAsyncBackend.DEFAULT_L1_TTL_CAP`` (60s).
+            play. Defaults to ``CachePluginConfig.l1_default_ttl_seconds``
+            (30s), read live so a config PATCH applies without a restart.
             Set a small value (e.g. 2s) for correctness-critical caches where
             post-PUT staleness across sibling Cloud Run processes must converge
             quickly (#930). Ignored when ``distributed=False`` or when no
@@ -1801,9 +2183,7 @@ def cached(
                     return
                 cache_key = _build_key(args, kwargs)
                 if isinstance(_backend, LocalAsyncCacheBackend):
-                    if cache_key in _backend._store:
-                        del _backend._store[cache_key]
-                        _backend._stats.size = len(_backend._store)
+                    _backend._drop_entry(cache_key)
                 else:
                     # Distributed backend: schedule async clear (fire-and-forget)
                     try:
@@ -1817,9 +2197,7 @@ def cached(
                 if _backend is None:
                     return
                 if isinstance(_backend, LocalAsyncCacheBackend):
-                    _backend._store.clear()
-                    _backend._locks.clear()
-                    _backend._stats.size = 0
+                    _local_clear_all_nolock(_backend)
                 else:
                     # Distributed backend: schedule async namespace clear
                     try:
@@ -1858,8 +2236,7 @@ def cached(
                     # Direct in-process scan — no separator ambiguity.
                     to_delete = [k for k in list(_backend._store.keys()) if k.startswith(key_prefix)]
                     for k in to_delete:
-                        del _backend._store[k]
-                    _backend._stats.size = len(_backend._store)
+                        _backend._drop_entry(k)
                 else:
                     # Distributed or tiered: Valkey's clear(namespace=X) scans
                     # "ds:{X}|*" which matches the @cached key format.

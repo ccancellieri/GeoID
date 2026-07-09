@@ -750,6 +750,10 @@ async def _on_cache_plugin_config_change(
     * ``oracle_inner_timeout_seconds`` — hot-read per dispatch in
       ``modules/tasks/dispatcher.py`` (calls ``configs_proto.get_config
       (CachePluginConfig)`` each time), no live update needed.
+    * ``l1_default_ttl_seconds`` / ``l1_memory_percent`` — live-applied to
+      the tools L1 layer below, BEFORE the no-backend early return: the L1
+      knobs govern the in-process caches, which exist even when the cache
+      is degraded to local-only.
 
     So this handler pushes runtime flags onto the live
     backend.  Safe to no-op when ``_current_backend`` is ``None``
@@ -757,6 +761,18 @@ async def _on_cache_plugin_config_change(
     up the new value via ``_load_cache_config()``.
     """
     global _current_backend
+
+    try:
+        from dynastore.tools.cache import set_l1_runtime_config
+
+        set_l1_runtime_config(
+            l1_default_ttl_seconds=getattr(config, "l1_default_ttl_seconds", None),
+            l1_memory_percent=getattr(config, "l1_memory_percent", None),
+        )
+    except Exception:
+        logger.exception(
+            "CachePluginConfig apply handler: failed to live-apply L1 settings"
+        )
 
     backend = _current_backend
     if backend is None:

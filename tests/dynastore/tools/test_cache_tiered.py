@@ -323,21 +323,45 @@ class TestTieredAsyncBackend:
 class TestTieredAsyncBackendL1TtlCap:
     """L1 TTL cap configurability (#930).
 
-    Default cap (60s) bounds the per-process staleness window after a
-    cross-process cache invalidate (process A invalidates Valkey L2;
-    process B's L1 only converges once its local entry expires). For
-    correctness-critical caches (config tiers, storage router) the cap
-    is lowered to 2s so post-PUT staleness converges quickly.
+    The default cap (CachePluginConfig.l1_default_ttl_seconds, 30s, read
+    live) bounds the per-process staleness window after a cross-process
+    cache invalidate (process A invalidates Valkey L2; process B's L1 only
+    converges once its local entry expires). For correctness-critical
+    caches (config tiers, storage router) the cap is lowered to 2s so
+    post-PUT staleness converges quickly.
     """
 
     @pytest.mark.asyncio
-    async def test_default_l1_cap_is_60s(self):
+    async def test_default_l1_cap_is_live_config_default(self):
         l1 = FakeCacheBackend("l1", 1000)
         l2 = FakeCacheBackend("l2", 100)
         tiered = TieredAsyncBackend([l1, l2])
 
-        assert tiered._l1_ttl_cap == 60.0
-        assert tiered._l1_ttl_cap == TieredAsyncBackend.DEFAULT_L1_TTL_CAP
+        assert tiered._effective_l1_ttl_cap() == 30.0
+        assert tiered._effective_l1_ttl_cap() == TieredAsyncBackend.DEFAULT_L1_TTL_CAP
+
+    @pytest.mark.asyncio
+    async def test_default_l1_cap_follows_live_config(self, monkeypatch):
+        """With no per-site override, the cap tracks the live config value;
+        an explicit l1_ttl_cap pins the site regardless of the global."""
+        from dynastore.tools import cache as cache_mod
+
+        l1 = FakeCacheBackend("l1", 1000)
+        l2 = FakeCacheBackend("l2", 100)
+        tiered = TieredAsyncBackend([l1, l2])
+        pinned = TieredAsyncBackend(
+            [FakeCacheBackend("l1", 1000), FakeCacheBackend("l2", 100)],
+            l1_ttl_cap=2.0,
+        )
+
+        monkeypatch.setattr(cache_mod, "_l1_default_ttl_value", 5.0)
+        assert tiered._effective_l1_ttl_cap() == 5.0
+        assert pinned._effective_l1_ttl_cap() == 2.0
+
+        await tiered.set("k", b"v", ttl=300)
+        await tiered.close()
+        l1_set = [op for op in l1._ops if op[0] == "set"]
+        assert l1_set[0][2] == 5.0
 
     @pytest.mark.asyncio
     async def test_custom_l1_cap_used_on_set(self):

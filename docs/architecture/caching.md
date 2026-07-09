@@ -97,6 +97,31 @@ In-memory async backend using `collections.OrderedDict`:
 
 Same semantics but with `threading.Lock` for sync contexts.
 
+### L1 memory budget
+
+All local (L1) backends in a process share one byte budget:
+`CachePluginConfig.l1_memory_percent` (default 10%) of the worker's memory
+share — the container memory divided by the gunicorn worker count, the same
+per-worker base the memory watchdog uses. Each entry is charged an
+approximate deep size at insert; when the process-wide total exceeds the
+budget, the backend holding the most bytes evicts its lowest
+**value-per-byte** entry: among its least-recently-used candidates, the one
+with the smallest `(hits + 1) / size_bytes` score goes first, so large,
+rarely-hit entries are dropped before small hot ones. `NEVER_REMOVE`
+entries are exempt, and the per-site `maxsize` entry-count cap still
+applies independently. A single value larger than a fixed fraction of the
+budget is not admitted to L1 at all — the write still succeeds (and still
+reaches the distributed tier in tiered setups), since evicting the working
+set to hold one oversized entry is never a win. When no memory base can be resolved (e.g. local
+dev without a container limit) or the percent is 0, byte-budget eviction
+is disabled and only the entry-count caps bound the caches.
+
+When a distributed backend is registered, tiered caches trust L1 for at
+most `CachePluginConfig.l1_default_ttl_seconds` (default 30s) before the
+next read reconciles with the distributed tier; a per-site
+`@cached(l1_ttl=...)` still overrides this. Both settings are
+hot-reloadable through the cache config plugin.
+
 ### CacheManager
 
 Central registry of backends, discoverable via `get_protocol(CacheManagerProtocol)`:

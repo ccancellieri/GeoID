@@ -136,6 +136,37 @@ def test_handler_is_noop_when_no_live_backend():
     )
 
 
+def test_handler_pushes_l1_settings_even_without_live_backend():
+    """``l1_default_ttl_seconds`` / ``l1_memory_percent`` govern the
+    in-process L1 layer, which exists even when the cache is degraded to
+    local-only — so the handler must push them into ``tools.cache``
+    BEFORE the no-backend early return."""
+    from dynastore.modules.cache import cache_module
+    from dynastore.tools import cache as tools_cache
+
+    cache_module._current_backend = None
+    old_ttl = tools_cache._l1_default_ttl_value
+    old_pct = tools_cache._l1_memory_percent_value
+
+    class _FakeCfg:
+        circuit_breaker_threshold = 3
+        l1_default_ttl_seconds = 12.5
+        l1_memory_percent = 33.0
+
+    try:
+        asyncio.run(
+            cache_module._on_cache_plugin_config_change(
+                _FakeCfg(), None, None, None
+            )
+        )
+        assert tools_cache._l1_default_ttl_value == 12.5
+        assert tools_cache._l1_memory_percent_value == 33.0
+    finally:
+        tools_cache.set_l1_runtime_config(
+            l1_default_ttl_seconds=old_ttl, l1_memory_percent=old_pct
+        )
+
+
 def test_lifespan_registers_and_unregisters_handler():
     """Source-level pin: lifespan must register and unregister the
     handler so the platform config service routes apply calls through

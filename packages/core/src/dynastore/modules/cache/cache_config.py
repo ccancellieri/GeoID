@@ -115,6 +115,39 @@ class CachePluginConfig(PluginConfig):
         ),
     )
 
+    l1_default_ttl_seconds: Mutable[float] = Field(
+        default=30.0,
+        ge=0.5,
+        le=600,
+        description=(
+            "Default L1 (in-process) TTL cap in seconds for tiered caches. "
+            "An L1 entry is trusted for at most this long before the next "
+            "read reconciles with L2 (Valkey), which bounds cross-worker/"
+            "cross-pod staleness for every @cached site that does not pin "
+            "its own l1_ttl. Sites with an explicit @cached(l1_ttl=...) are "
+            "unaffected. Hot-reloadable — applies to the next L1 write, no "
+            "restart needed."
+        ),
+    )
+
+    l1_memory_percent: Mutable[float] = Field(
+        default=10.0,
+        ge=0,
+        le=90,
+        description=(
+            "Process-wide L1 cache memory budget as a percent of this "
+            "worker's memory share (container memory / GUNICORN_WORKERS — "
+            "the same per-worker base the memory watchdog uses). All "
+            "in-process cache backends count their entries' approximate "
+            "deep size against one shared budget; when it is exceeded, "
+            "entries with the worst value-per-byte (large, rarely hit, "
+            "least recently used) are evicted first. 0 disables byte-budget "
+            "eviction (per-site entry-count caps still apply, as does the "
+            "no-budget case where neither the RAM env var nor a cgroup "
+            "limit is available). Hot-reloadable."
+        ),
+    )
+
     max_concurrent_detached_rebuilds: Mutable[int] = Field(
         default=4,
         ge=1,
