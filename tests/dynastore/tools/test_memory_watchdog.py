@@ -30,9 +30,11 @@ from dynastore.tools.background_service import BackgroundSupervisor, ServiceCont
 from dynastore.tools.memory_watchdog import (
     MemoryWatchdogConfig,
     MemoryWatchdogService,
+    _rss_breakdown_suffix,
     build_memory_watchdog_service,
     detect_cgroup_memory_limit_mb,
     parse_memory_to_mb,
+    read_process_rss_breakdown_bytes,
     read_process_rss_bytes,
     resolve_watchdog_budget_mb,
 )
@@ -97,6 +99,59 @@ def test_read_process_rss_bytes_returns_none_when_line_missing(tmp_path, monkeyp
         "dynastore.tools.memory_watchdog._PROC_STATUS_PATH", str(status_file)
     )
     assert read_process_rss_bytes() is None
+
+
+# ---------------------------------------------------------------------------
+# read_process_rss_breakdown_bytes
+# ---------------------------------------------------------------------------
+
+
+def _write_status(tmp_path, monkeypatch, text: str) -> None:
+    status_file = tmp_path / "status"
+    status_file.write_text(text)
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._PROC_STATUS_PATH", str(status_file)
+    )
+
+
+def test_read_process_rss_breakdown_parses_anon_and_file(tmp_path, monkeypatch) -> None:
+    _write_status(
+        tmp_path,
+        monkeypatch,
+        "VmRSS:\t 2000 kB\nRssAnon:\t  500 kB\nRssFile:\t 1500 kB\nThreads:\t2\n",
+    )
+    assert read_process_rss_breakdown_bytes() == (500 * 1024, 1500 * 1024)
+
+
+def test_read_process_rss_breakdown_is_none_when_fields_absent(tmp_path, monkeypatch) -> None:
+    # Linux < 4.5 exposes VmRSS but neither RssAnon nor RssFile.
+    _write_status(tmp_path, monkeypatch, "VmRSS:\t 2000 kB\nThreads:\t2\n")
+    assert read_process_rss_breakdown_bytes() is None
+
+
+def test_read_process_rss_breakdown_is_none_when_file_missing(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._PROC_STATUS_PATH",
+        str(tmp_path / "does-not-exist"),
+    )
+    assert read_process_rss_breakdown_bytes() is None
+
+
+def test_rss_breakdown_suffix_renders_both_components(tmp_path, monkeypatch) -> None:
+    _write_status(
+        tmp_path,
+        monkeypatch,
+        "RssAnon:\t 1048576 kB\nRssFile:\t 2097152 kB\n",
+    )
+    assert _rss_breakdown_suffix() == " [anon 1024MiB, file 2048MiB]"
+
+
+def test_rss_breakdown_suffix_is_empty_when_unavailable(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "dynastore.tools.memory_watchdog._PROC_STATUS_PATH",
+        str(tmp_path / "does-not-exist"),
+    )
+    assert _rss_breakdown_suffix() == ""
 
 
 def test_read_process_rss_bytes_returns_none_on_malformed_line(tmp_path, monkeypatch) -> None:
@@ -256,20 +311,20 @@ def test_detect_cgroup_v2_limit(tmp_path, monkeypatch) -> None:
     v2_file = tmp_path / "memory.max"
     v2_file.write_text("536870912\n")  # 512 MiB
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH", str(v2_file)
+        "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH", str(v2_file)
     )
     assert detect_cgroup_memory_limit_mb() == 512
 
 
 def test_detect_cgroup_v1_fallback_when_v2_absent(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
+        "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH",
         str(tmp_path / "does-not-exist"),
     )
     v1_file = tmp_path / "memory.limit_in_bytes"
     v1_file.write_text("268435456\n")  # 256 MiB
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH", str(v1_file)
+        "dynastore.tools.memory_units._CGROUP_V1_MEMORY_LIMIT_PATH", str(v1_file)
     )
     assert detect_cgroup_memory_limit_mb() == 256
 
@@ -278,10 +333,10 @@ def test_detect_cgroup_v2_max_sentinel_is_unlimited(tmp_path, monkeypatch) -> No
     v2_file = tmp_path / "memory.max"
     v2_file.write_text("max\n")
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH", str(v2_file)
+        "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH", str(v2_file)
     )
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH",
+        "dynastore.tools.memory_units._CGROUP_V1_MEMORY_LIMIT_PATH",
         str(tmp_path / "does-not-exist"),
     )
     assert detect_cgroup_memory_limit_mb() is None
@@ -289,24 +344,24 @@ def test_detect_cgroup_v2_max_sentinel_is_unlimited(tmp_path, monkeypatch) -> No
 
 def test_detect_cgroup_v1_huge_sentinel_is_unlimited(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
+        "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH",
         str(tmp_path / "does-not-exist"),
     )
     v1_file = tmp_path / "memory.limit_in_bytes"
     v1_file.write_text("9223372036854771712\n")
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH", str(v1_file)
+        "dynastore.tools.memory_units._CGROUP_V1_MEMORY_LIMIT_PATH", str(v1_file)
     )
     assert detect_cgroup_memory_limit_mb() is None
 
 
 def test_detect_cgroup_none_when_neither_file_present(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
+        "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH",
         str(tmp_path / "does-not-exist-v2"),
     )
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH",
+        "dynastore.tools.memory_units._CGROUP_V1_MEMORY_LIMIT_PATH",
         str(tmp_path / "does-not-exist-v1"),
     )
     assert detect_cgroup_memory_limit_mb() is None
@@ -329,11 +384,11 @@ async def test_build_service_never_none_merely_for_unresolved_limit(monkeypatch,
     resolved yet (no RAM env, no cgroup) — it stays inert until a budget
     appears (an operator limit_mb, read live) rather than refusing to start."""
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
+        "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH",
         str(tmp_path / "does-not-exist-v2"),
     )
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH",
+        "dynastore.tools.memory_units._CGROUP_V1_MEMORY_LIMIT_PATH",
         str(tmp_path / "does-not-exist-v1"),
     )
     svc = await build_memory_watchdog_service(MemoryWatchdogConfig())
@@ -359,7 +414,7 @@ async def test_build_service_auto_detects_budget_from_cgroup_at_init(monkeypatch
     v2_file = tmp_path / "memory.max"
     v2_file.write_text("536870912\n")  # 512 MiB
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH", str(v2_file)
+        "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH", str(v2_file)
     )
 
     svc = await build_memory_watchdog_service(MemoryWatchdogConfig())
@@ -407,11 +462,11 @@ def test_resolve_budget_defaults_workers_to_one(monkeypatch) -> None:
 
 def test_resolve_budget_none_when_no_source(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
+        "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH",
         str(tmp_path / "nope-v2"),
     )
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH",
+        "dynastore.tools.memory_units._CGROUP_V1_MEMORY_LIMIT_PATH",
         str(tmp_path / "nope-v1"),
     )
     assert resolve_watchdog_budget_mb() is None
@@ -465,11 +520,11 @@ async def test_tick_config_limit_picked_up_live_no_latch(monkeypatch, tmp_path) 
     loadable on a LATER tick — the old design latched 'inert' on the first
     tick and never recovered."""
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
+        "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH",
         str(tmp_path / "nope-v2"),
     )
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH",
+        "dynastore.tools.memory_units._CGROUP_V1_MEMORY_LIMIT_PATH",
         str(tmp_path / "nope-v1"),
     )
     # First tick: config store 'unreachable' -> default config (no limit_mb).
@@ -492,11 +547,11 @@ async def test_tick_config_limit_picked_up_live_no_latch(monkeypatch, tmp_path) 
 @pytest.mark.asyncio
 async def test_tick_inert_and_warns_once_when_no_budget(monkeypatch, tmp_path, caplog) -> None:
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V2_MEMORY_MAX_PATH",
+        "dynastore.tools.memory_units._CGROUP_V2_MEMORY_MAX_PATH",
         str(tmp_path / "does-not-exist-v2"),
     )
     monkeypatch.setattr(
-        "dynastore.tools.memory_watchdog._CGROUP_V1_MEMORY_LIMIT_PATH",
+        "dynastore.tools.memory_units._CGROUP_V1_MEMORY_LIMIT_PATH",
         str(tmp_path / "does-not-exist-v1"),
     )
     monkeypatch.setattr(

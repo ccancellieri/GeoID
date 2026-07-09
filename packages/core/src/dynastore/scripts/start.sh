@@ -27,7 +27,9 @@ set -e
 # --- Default Configuration ---
 : "${APP:=dynastore}"
 : "${APP_DIR:=/${APP}}"
-: "${GUNICORN_WORKERS:=4}"
+# GUNICORN_WORKERS is intentionally left unset here: api mode derives it from
+# the container's own RAM/CPU (see scripts/worker_sizing.py). Setting it in the
+# deploy env still overrides that.
 : "${GUNICORN_THREADS:=1}"
 : "${GUNICORN_TIMEOUT:=30}"
 # Shutdown drain budget (#2925 / #2924): Cloud Run gives a container
@@ -85,6 +87,30 @@ shift || true
 
 case "$MODE" in
     api)
+        # An explicit GUNICORN_WORKERS always wins. Otherwise derive it from the
+        # memory and CPU this container actually has, so overriding RAM per
+        # environment resizes the fleet with it rather than silently shrinking
+        # each worker's share of it (GeoID #3121). Export it either way: the
+        # workers' memory watchdog reads it to compute its per-worker budget.
+        # Treat anything that is not a positive integer as "not set". The deploy
+        # renders this env var from a template, so when no explicit count is
+        # configured the container can receive an empty value or an
+        # unsubstituted "${GUNICORN_WORKERS}" — neither must reach gunicorn.
+        case "${GUNICORN_WORKERS:-}" in
+            ''|*[!0-9]*|0) GUNICORN_WORKERS="" ;;
+        esac
+
+        if [ -z "$GUNICORN_WORKERS" ]; then
+            GUNICORN_WORKERS="$(python -m dynastore.scripts.worker_sizing 2>/dev/null || true)"
+            case "$GUNICORN_WORKERS" in
+                ''|*[!0-9]*|0)
+                    echo "Worker sizing unavailable; falling back to 1 worker."
+                    GUNICORN_WORKERS=1
+                    ;;
+            esac
+        fi
+        export GUNICORN_WORKERS
+
         echo "Starting API (Gunicorn/Uvicorn, ${GUNICORN_WORKERS} workers)..."
 
         if [ "$ACCESS_LOG" != "-" ] && [ -n "$ACCESS_LOG" ]; then

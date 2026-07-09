@@ -38,6 +38,7 @@ from typing import ClassVar, Tuple
 from pydantic import Field
 
 from dynastore.models.mutability import Mutable
+from dynastore.tools.memory_units import DEFAULT_L1_MEMORY_PERCENT
 from dynastore.models.plugin_config import PluginConfig
 
 
@@ -131,7 +132,7 @@ class CachePluginConfig(PluginConfig):
     )
 
     l1_memory_percent: Mutable[float] = Field(
-        default=10.0,
+        default=DEFAULT_L1_MEMORY_PERCENT,
         ge=0,
         le=90,
         description=(

@@ -85,6 +85,7 @@ from dynastore.models.protocols.cache import (
     CacheStats,
     SyncCacheBackend,
 )
+from dynastore.tools.memory_units import DEFAULT_L1_MEMORY_PERCENT
 
 logger = logging.getLogger(__name__)
 
@@ -290,7 +291,7 @@ class _CacheEntry:
 # config is loaded (pull path: _load_cache_plugin_config_values; push path:
 # set_l1_runtime_config called by CacheModule's apply handler).
 _DEFAULT_L1_TTL_SECONDS: float = 30.0
-_DEFAULT_L1_MEMORY_PERCENT: float = 10.0
+_DEFAULT_L1_MEMORY_PERCENT: float = DEFAULT_L1_MEMORY_PERCENT
 _l1_default_ttl_value: float = _DEFAULT_L1_TTL_SECONDS
 _l1_memory_percent_value: float = _DEFAULT_L1_MEMORY_PERCENT
 

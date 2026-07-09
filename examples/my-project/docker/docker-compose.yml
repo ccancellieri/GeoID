@@ -24,7 +24,12 @@ services:
     environment:
       APP: my_project
       TCP_PORT: 80
-      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-4}
+      # Left unset on purpose: the entrypoint derives the worker count from the
+      # memory and CPU this container is actually given. Constrain the container
+      # (compose `mem_limit` / `cpus`, or `docker run --memory --cpus`) and the
+      # count follows those limits; leave it unconstrained and it follows the
+      # host's capacity. Uncomment to pin the count and override the derivation.
+      # GUNICORN_WORKERS: ${GUNICORN_WORKERS:-4}
     ports:
       - "${HOST_PORT_API:-80}:80"
     depends_on:

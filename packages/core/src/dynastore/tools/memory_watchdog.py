@@ -95,40 +95,20 @@ from dynastore.tools.background_service import (
     PodPolicy,
     ServiceContext,
 )
+from dynastore.tools.memory_units import (
+    detect_cgroup_memory_limit_mb,
+    detect_container_memory_mb,
+    parse_memory_to_mb,
+)
 from dynastore.tools.serving_state import clear_draining, set_draining
 
 logger = logging.getLogger(__name__)
 
 _PROC_STATUS_PATH = "/proc/self/status"
 
-_CGROUP_V2_MEMORY_MAX_PATH = "/sys/fs/cgroup/memory.max"
-_CGROUP_V1_MEMORY_LIMIT_PATH = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
-
-# Deploy-injected env vars used to derive the per-worker memory budget on
-# Cloud Run, where cgroup memory files are absent. ``RAM`` is the container
-# memory size (e.g. "8Gi"); ``GUNICORN_WORKERS`` is the process count sharing
-# it. See ``resolve_watchdog_budget_mb``.
-_RAM_ENV = "RAM"
+# The process count sharing the container's memory; each worker's budget is
+# the total divided by this. See ``resolve_watchdog_budget_mb``.
 _WORKERS_ENV = "GUNICORN_WORKERS"
-
-# Kubernetes/Cloud-Run memory-quantity suffix factors (binary vs decimal).
-_MEM_SUFFIX_FACTORS = {
-    "k": 1000,
-    "ki": 1024,
-    "m": 1000**2,
-    "mi": 1024**2,
-    "g": 1000**3,
-    "gi": 1024**3,
-    "t": 1000**4,
-    "ti": 1024**4,
-}
-
-# Cgroup v1 reports "no limit" as a huge sentinel (commonly
-# 9223372036854771712, close to but not exactly int64-max, since the kernel
-# rounds it to a page boundary). Anything at or above this threshold is
-# treated as unlimited rather than a real memory budget — no real container
-# or host has anywhere near this much RAM.
-_UNLIMITED_THRESHOLD_BYTES = 1 << 62
 
 # Number of stack frames tracemalloc keeps per allocation for the diagnostic
 # (geoid#3121). One frame (the allocation site) is enough to pin the culprit
@@ -156,6 +136,49 @@ def read_process_rss_bytes() -> Optional[int]:
     except (OSError, ValueError):
         return None
     return None
+
+
+def read_process_rss_breakdown_bytes() -> Optional[Tuple[int, int]]:
+    """Return this process's ``(RssAnon, RssFile)`` in bytes.
+
+    ``VmRSS`` — what :func:`read_process_rss_bytes` returns — is the sum of
+    private anonymous pages, resident file-backed pages and shared memory.
+    Only ``RssAnon`` is private to this worker and therefore additive across
+    the gunicorn fleet; file-backed pages (shared-library text, mmap'd data)
+    are counted in full by *every* process that maps them, so ``VmRSS`` can
+    overstate a worker's own share of the container. How much it overstates is
+    a property of the service, not a constant: dev catalog measured ``anon
+    1976MiB, file 116MiB``, so there its ``VmRSS`` was very nearly all private.
+    Log both rather than assuming either.
+
+    Returns ``None`` when the fields are absent (Linux < 4.5, or non-Linux),
+    so callers degrade to reporting ``VmRSS`` alone rather than raising.
+    """
+    anon: Optional[int] = None
+    file_backed: Optional[int] = None
+    try:
+        with open(_PROC_STATUS_PATH, "r", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("RssAnon:"):
+                    anon = int(line.split()[1]) * 1024
+                elif line.startswith("RssFile:"):
+                    file_backed = int(line.split()[1]) * 1024
+                if anon is not None and file_backed is not None:
+                    return anon, file_backed
+    except (OSError, IndexError, ValueError):
+        return None
+    return None
+
+
+def _rss_breakdown_suffix() -> str:
+    """Render ``" [anon NMiB, file NMiB]"`` for the watchdog log lines, or ``""``."""
+    breakdown = read_process_rss_breakdown_bytes()
+    if breakdown is None:
+        return ""
+    anon, file_backed = breakdown
+    return " [anon {:.0f}MiB, file {:.0f}MiB]".format(
+        anon / (1024 * 1024), file_backed / (1024 * 1024)
+    )
 
 
 class MemoryWatchdogService(PeriodicService):
@@ -260,10 +283,11 @@ class MemoryWatchdogService(PeriodicService):
         ratio = rss_bytes / limit_bytes
         if ratio >= self._critical_ratio:
             logger.error(
-                "memory_watchdog: RSS %.0fMiB is %.0f%% of the %.0fMiB budget "
+                "memory_watchdog: RSS %.0fMiB%s is %.0f%% of the %.0fMiB budget "
                 "(>= critical %.0f%%) on %s; instance is at high risk of an "
                 "imminent OOM kill.",
                 rss_bytes / (1024 * 1024),
+                _rss_breakdown_suffix(),
                 ratio * 100,
                 limit_bytes / (1024 * 1024),
                 self._critical_ratio * 100,
@@ -273,9 +297,10 @@ class MemoryWatchdogService(PeriodicService):
         elif ratio >= self._warn_ratio:
             if not self._warned:
                 logger.warning(
-                    "memory_watchdog: RSS %.0fMiB is %.0f%% of the %.0fMiB budget "
+                    "memory_watchdog: RSS %.0fMiB%s is %.0f%% of the %.0fMiB budget "
                     "(>= warn %.0f%%) on %s.",
                     rss_bytes / (1024 * 1024),
+                    _rss_breakdown_suffix(),
                     ratio * 100,
                     limit_bytes / (1024 * 1024),
                     self._warn_ratio * 100,
@@ -422,9 +447,10 @@ class MemoryWatchdogService(PeriodicService):
 
         pid = os.getpid()
         logger.warning(
-            "self-recycle: RSS %.0f%%>=%.0f%%, SIGTERM worker pid %d to "
+            "self-recycle: RSS %.0f%%>=%.0f%%%s, SIGTERM worker pid %d to "
             "drain before OOM (uptime=%.0fs) on %s.",
-            recheck_ratio * 100, config.recycle_ratio * 100, pid, uptime, ctx.name,
+            recheck_ratio * 100, config.recycle_ratio * 100,
+            _rss_breakdown_suffix(), pid, uptime, ctx.name,
         )
         os.kill(pid, signal.SIGTERM)
 
@@ -612,86 +638,8 @@ class MemoryWatchdogConfig(PluginConfig):
         return self
 
 
-def _read_cgroup_memory_limit_bytes(path: str) -> Optional[int]:
-    """Read and parse one cgroup memory-limit file.
-
-    Returns ``None`` if the file is absent, unreadable, reports the cgroup
-    v2 "max" sentinel, or reports a value at/above ``_UNLIMITED_THRESHOLD_BYTES``
-    (the cgroup v1 "no limit" sentinel).
-    """
-    try:
-        with open(path, "r", encoding="ascii") as fh:
-            raw = fh.read().strip()
-    except OSError:
-        return None
-    if raw == "max":
-        return None
-    try:
-        value = int(raw)
-    except ValueError:
-        return None
-    if value <= 0 or value >= _UNLIMITED_THRESHOLD_BYTES:
-        return None
-    return value
 
 
-def detect_cgroup_memory_limit_mb() -> Optional[int]:
-    """Best-effort auto-detection of the container's memory budget, in MB.
-
-    Tries cgroup v2 (``memory.max``) first, then cgroup v1
-    (``memory.limit_in_bytes``). Returns ``None`` when neither file exists
-    or both report "no limit" — e.g. local dev on macOS, or a container run
-    without a memory limit.
-    """
-    limit_bytes = _read_cgroup_memory_limit_bytes(_CGROUP_V2_MEMORY_MAX_PATH)
-    if limit_bytes is None:
-        limit_bytes = _read_cgroup_memory_limit_bytes(_CGROUP_V1_MEMORY_LIMIT_PATH)
-    if limit_bytes is None:
-        return None
-    return limit_bytes // (1024 * 1024)
-
-
-def parse_memory_to_mb(raw: Optional[str]) -> Optional[int]:
-    """Parse a Kubernetes/Cloud-Run memory quantity into whole MB.
-
-    Accepts values like ``"8Gi"``, ``"2G"``, ``"512Mi"`` or a bare byte count.
-    Binary suffixes (``Ki``/``Mi``/``Gi``/``Ti``) use 1024; decimal suffixes
-    (``K``/``M``/``G``/``T``) use 1000, per the Kubernetes quantity spec.
-    Returns ``None`` for empty or unparseable input.
-    """
-    if not raw:
-        return None
-    text = raw.strip()
-    if not text:
-        return None
-    lowered = text.lower()
-    # Longest suffix first so "gi" matches before "g".
-    for suffix in ("ki", "mi", "gi", "ti", "k", "m", "g", "t"):
-        if lowered.endswith(suffix):
-            number = text[: -len(suffix)].strip()
-            factor = _MEM_SUFFIX_FACTORS[suffix]
-            break
-    else:
-        number, factor = text, 1
-    try:
-        value_bytes = float(number) * factor
-    except ValueError:
-        return None
-    if value_bytes <= 0:
-        return None
-    return int(value_bytes) // (1024 * 1024)
-
-
-def _detect_total_container_mb() -> Optional[int]:
-    """Total container memory budget (MB) from the deploy env, then cgroup.
-
-    Cloud Run (gen2) does not expose a readable ``/sys/fs/cgroup`` (see the
-    module docstring), so cgroup auto-detection returns ``None`` there. The
-    deploy does inject the container memory size as the ``RAM`` env var, so we
-    read that first and fall back to cgroup for platforms that expose it
-    (GKE / on-prem). ``None`` when neither yields a value (e.g. local dev).
-    """
-    return parse_memory_to_mb(os.environ.get(_RAM_ENV)) or detect_cgroup_memory_limit_mb()
 
 
 def resolve_watchdog_budget_mb() -> Optional[int]:
@@ -704,7 +652,7 @@ def resolve_watchdog_budget_mb() -> Optional[int]:
     available from the very first tick, even before that store is reachable.
     Returns ``None`` when no total-memory source is available.
     """
-    total_mb = _detect_total_container_mb()
+    total_mb = detect_container_memory_mb()
     if total_mb is None:
         return None
     try:
@@ -777,5 +725,6 @@ __all__ = [
     "load_memory_watchdog_config",
     "parse_memory_to_mb",
     "read_process_rss_bytes",
+    "read_process_rss_breakdown_bytes",
     "resolve_watchdog_budget_mb",
 ]
