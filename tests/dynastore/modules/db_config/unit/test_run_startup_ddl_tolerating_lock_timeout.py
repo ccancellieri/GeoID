@@ -49,6 +49,23 @@ class LockNotAvailableError(Exception):
     pgcode = "55P03"
 
 
+class QueryCanceledError(Exception):
+    """Stand-in for asyncpg's real exception class of the same name.
+
+    ``is_statement_timeout_error`` matches on this exact class name (57014,
+    "canceling statement due to statement timeout") -- the error a boot herd
+    of peers re-running the same startup DDL can hit under #3121.
+    """
+
+    pgcode = "57014"
+
+
+class UndefinedTableError(Exception):
+    """Stand-in for an unrelated PG error (42P01, undefined_table)."""
+
+    pgcode = "42P01"
+
+
 def _make_raising_acquire_startup_lock(exc: BaseException):
     """Build a fake ``acquire_startup_lock`` that raises *exc* before yielding
     -- matching real behaviour when the advisory-lock wait fails.
@@ -277,3 +294,119 @@ async def test_happy_path_runs_ddl_under_the_lock_exactly_once(
     )
 
     assert seen_conns == [locked_conn]
+
+
+
+# ---------------------------------------------------------------------------
+# Statement-timeout cancellation (57014) -- #3121
+# ---------------------------------------------------------------------------
+#
+# A boot herd (catalog + async-writer re-running startup DDL simultaneously
+# after a shared-cause restart) can push a DDL statement past
+# ``_DDL_STATEMENT_TIMEOUT`` even once its advisory lock is held. Mirrors
+# the 55P03 cases above.
+
+
+@pytest.mark.asyncio
+async def test_statement_timeout_falls_back_to_unlocked_ddl_instead_of_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A statement-timeout cancellation must not propagate: the DDL runs
+    once, unlocked."""
+    monkeypatch.setattr(
+        locking_tools,
+        "acquire_startup_lock",
+        _make_raising_acquire_startup_lock(
+            QueryCanceledError("canceling statement due to statement timeout")
+        ),
+    )
+
+    fake_conn = object()
+
+    @asynccontextmanager
+    async def _fake_managed_transaction(engine: Any):
+        yield fake_conn
+
+    monkeypatch.setattr(locking_tools, "managed_transaction", _fake_managed_transaction)
+
+    seen_conns = []
+
+    async def _ddl_body(conn: Any) -> None:
+        from dynastore.modules.db_config import query_executor
+
+        assert query_executor.startup_ddl_fallback_active() is True
+        seen_conns.append(conn)
+
+    await locking_tools.run_startup_ddl_tolerating_lock_timeout(
+        engine=object(),
+        lock_key="some_module_storage_init",
+        ddl_body=_ddl_body,
+    )
+
+    assert seen_conns == [fake_conn]
+
+
+@pytest.mark.asyncio
+async def test_statement_timeout_inside_unlocked_fallback_is_tolerated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second statement-timeout while replaying fallback DDL must not
+    abort startup."""
+    monkeypatch.setattr(
+        locking_tools,
+        "acquire_startup_lock",
+        _make_raising_acquire_startup_lock(
+            QueryCanceledError("canceling statement due to statement timeout")
+        ),
+    )
+
+    fake_conn = object()
+
+    @asynccontextmanager
+    async def _fake_managed_transaction(engine: Any):
+        yield fake_conn
+
+    monkeypatch.setattr(locking_tools, "managed_transaction", _fake_managed_transaction)
+
+    seen_conns = []
+
+    async def _ddl_body(conn: Any) -> None:
+        seen_conns.append(conn)
+        raise QueryCanceledError("canceling statement due to statement timeout")
+
+    await locking_tools.run_startup_ddl_tolerating_lock_timeout(
+        engine=object(),
+        lock_key="some_module_storage_init",
+        ddl_body=_ddl_body,
+    )
+
+    assert seen_conns == [fake_conn]
+
+
+@pytest.mark.asyncio
+async def test_unrelated_pg_error_still_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuine, unrelated PG error (42P01, undefined_table) must still
+    abort startup -- this helper only tolerates lock-timeout and
+    statement-timeout, not arbitrary DDL failures."""
+    monkeypatch.setattr(
+        locking_tools,
+        "acquire_startup_lock",
+        _make_raising_acquire_startup_lock(
+            UndefinedTableError("relation \"consys.systems\" does not exist")
+        ),
+    )
+
+    async def _ddl_body(conn: Any) -> None:
+        raise AssertionError(
+            "ddl_body must not run when the error is neither a lock timeout "
+            "nor a statement timeout"
+        )
+
+    with pytest.raises(UndefinedTableError):
+        await locking_tools.run_startup_ddl_tolerating_lock_timeout(
+            engine=object(),
+            lock_key="some_module_storage_init",
+            ddl_body=_ddl_body,
+        )

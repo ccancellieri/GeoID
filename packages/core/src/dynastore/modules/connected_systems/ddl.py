@@ -29,6 +29,7 @@ from contextlib import asynccontextmanager
 from dynastore.models.protocols import DatabaseProtocol
 from dynastore.modules import ModuleProtocol, get_protocol
 from dynastore.modules.db_config import maintenance_tools
+from dynastore.modules.db_config.locking_tools import check_constraint_exists
 from dynastore.modules.db_config.query_executor import DDLQuery, DbResource
 
 logger = logging.getLogger(__name__)
@@ -190,6 +191,15 @@ class ConnectedSystemsModule(ModuleProtocol):
 
         logger.info("ConnectedSystemsModule: initialising schema...")
 
+        def _check_fk_datastream_system(conn):
+            return check_constraint_exists(conn, "fk_datastream_system")
+
+        def _check_fk_observation_datastream(conn):
+            return check_constraint_exists(conn, "fk_observation_datastream")
+
+        def _check_fk_deployment_system(conn):
+            return check_constraint_exists(conn, "fk_deployment_system")
+
         async def _init_consys_storage(conn: DbResource) -> None:
             await maintenance_tools.ensure_schema_exists(conn, "consys")
             await DDLQuery(CONSYS_SYSTEMS_DDL).execute(conn)
@@ -199,9 +209,24 @@ class ConnectedSystemsModule(ModuleProtocol):
             await DDLQuery(CONSYS_OBSERVATIONS_IDX_DDL).execute(conn)
             await DDLQuery(CONSYS_SYSTEMS_GEOM_IDX_DDL).execute(conn)
             await DDLQuery(CONSYS_DEPLOYMENTS_GEOM_IDX_DDL).execute(conn)
-            await DDLQuery(CONSYS_FK_DATASTREAM_SYSTEM_DDL).execute(conn)
-            await DDLQuery(CONSYS_FK_OBSERVATION_DATASTREAM_DDL).execute(conn)
-            await DDLQuery(CONSYS_FK_DEPLOYMENT_SYSTEM_DDL).execute(conn)
+            # These DO-block DDLQuery statements are invisible to
+            # ddl_inference._infer_existence_check (it only recognizes
+            # statements starting with CREATE), so without an explicit
+            # check_query the peer-race recovery in
+            # DDLExecutor._try_peer_race_recovery_async never fires for a
+            # concurrent-DDL duplicate_object (42710) on these constraints.
+            await DDLQuery(
+                CONSYS_FK_DATASTREAM_SYSTEM_DDL,
+                check_query=_check_fk_datastream_system,
+            ).execute(conn)
+            await DDLQuery(
+                CONSYS_FK_OBSERVATION_DATASTREAM_DDL,
+                check_query=_check_fk_observation_datastream,
+            ).execute(conn)
+            await DDLQuery(
+                CONSYS_FK_DEPLOYMENT_SYSTEM_DDL,
+                check_query=_check_fk_deployment_system,
+            ).execute(conn)
 
         try:
             await maintenance_tools.run_startup_ddl_tolerating_lock_timeout(

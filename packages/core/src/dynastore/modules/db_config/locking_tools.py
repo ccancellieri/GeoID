@@ -47,6 +47,7 @@ from dynastore.modules.db_config.query_executor import (
     sync_managed_transaction,
     retry_on_transient_connect,
     is_lock_not_available_error,
+    is_statement_timeout_error,
     _read_live_lease_pool_acquire_timeout,
 )
 
@@ -990,24 +991,34 @@ async def run_startup_ddl_tolerating_lock_timeout(
     ddl_body: Callable[[DbResource], Awaitable[None]],
 ) -> None:
     """Run *ddl_body* under the ``lock_key`` startup advisory lock, without
-    letting lock contention abort process startup (#2616).
+    letting lock contention or transient boot-herd cancellation abort process
+    startup (#2616, #3121).
 
     ``ddl_body`` MUST be idempotent (``CREATE ... IF NOT EXISTS`` / ``CREATE
-    OR REPLACE``) — required of every startup-DDL lifespan calling this
-    helper. When a peer pod is still holding the lock past
-    ``lock_acquire_timeout_seconds`` (e.g. because it is itself stalled on a
-    starved connection pool, #2333), :func:`acquire_startup_lock` raises a PG
-    lock-timeout error (55P03) instead of blocking forever. Left unhandled,
-    that propagates out of a foundational module's lifespan and crash-loops
-    the whole worker, even though the DDL the lock guards is safe to run
-    unlocked: idempotent ``CREATE ... IF NOT EXISTS`` DDL already tolerates
-    the resulting concurrent-DDL "already exists" races. So on a lock-timeout
-    we log a WARNING and run the same idempotent DDL on a fresh, unlocked
-    transaction instead of aborting startup. If that unlocked replay also hits
-    a lock-timeout, a peer or hot relation is still applying equivalent
-    idempotent DDL; we log and continue so startup can reach the caller's
-    explicit readiness/post-condition checks instead of failing inside the
-    contention window.
+    OR REPLACE``) and re-checked at runtime — required of every startup-DDL
+    lifespan calling this helper, since that is what makes tolerating a
+    transient failure here safe instead of leaving the schema half-applied.
+    Two distinct transient failures are tolerated the same way:
+
+    - A peer pod still holding the lock past
+      ``lock_acquire_timeout_seconds`` (e.g. because it is itself stalled on
+      a starved connection pool, #2333): :func:`acquire_startup_lock` raises
+      a PG lock-timeout error (55P03).
+    - A boot herd (several pods re-running this same startup DDL after a
+      shared-cause restart, e.g. an OOM) pushing a statement past the DDL
+      statement timeout: PG raises a statement-timeout cancellation (57014,
+      #3121).
+
+    Left unhandled, either propagates out of a foundational module's
+    lifespan and crash-loops the whole worker, even though the DDL the lock
+    guards is safe to run unlocked: idempotent ``CREATE ... IF NOT EXISTS``
+    DDL already tolerates the resulting concurrent-DDL "already exists"
+    races. So on either error we log a WARNING and run the same idempotent
+    DDL on a fresh, unlocked transaction instead of aborting startup. If that
+    unlocked replay also hits one of these two errors, a peer or hot relation
+    is still applying equivalent idempotent DDL; we log and continue so
+    startup can reach the caller's explicit readiness/post-condition checks
+    instead of failing inside the contention window.
 
     Any other exception (a genuine connectivity failure, a bug in the DDL
     itself, etc.) is NOT swallowed — it propagates as before.
@@ -1027,15 +1038,24 @@ async def run_startup_ddl_tolerating_lock_timeout(
             await ddl_body(locked_conn)
         return
     except Exception as exc:
-        if not is_lock_not_available_error(exc):
+        if is_lock_not_available_error(exc):
+            logger.warning(
+                "Startup lock %r timed out — a peer is likely still "
+                "initializing this schema (possibly pool-starved, see #2333). "
+                "Proceeding with the idempotent DDL unlocked instead of aborting "
+                "startup: %s",
+                lock_key, exc,
+            )
+        elif is_statement_timeout_error(exc):
+            logger.warning(
+                "Startup DDL %r hit a statement timeout — likely a boot herd "
+                "of peers applying the same idempotent DDL concurrently "
+                "(see #3121). Proceeding with the DDL unlocked instead of "
+                "aborting startup: %s",
+                lock_key, exc,
+            )
+        else:
             raise
-        logger.warning(
-            "Startup lock %r timed out — a peer is likely still "
-            "initializing this schema (possibly pool-starved, see #2333). "
-            "Proceeding with the idempotent DDL unlocked instead of aborting "
-            "startup: %s",
-            lock_key, exc,
-        )
 
     from dynastore.modules.db_config.query_executor import (
         startup_ddl_unlocked_fallback_scope,
@@ -1046,14 +1066,22 @@ async def run_startup_ddl_tolerating_lock_timeout(
             with startup_ddl_unlocked_fallback_scope():
                 await ddl_body(unlocked_conn)
     except Exception as exc:
-        if not is_lock_not_available_error(exc):
+        if is_lock_not_available_error(exc):
+            logger.warning(
+                "Startup DDL %r still hit a lock timeout while replaying unlocked; "
+                "assuming a peer or hot relation is applying equivalent idempotent "
+                "DDL and continuing startup: %s",
+                lock_key, exc,
+            )
+        elif is_statement_timeout_error(exc):
+            logger.warning(
+                "Startup DDL %r still hit a statement timeout while replaying "
+                "unlocked; assuming a peer or hot relation is applying "
+                "equivalent idempotent DDL and continuing startup: %s",
+                lock_key, exc,
+            )
+        else:
             raise
-        logger.warning(
-            "Startup DDL %r still hit a lock timeout while replaying unlocked; "
-            "assuming a peer or hot relation is applying equivalent idempotent "
-            "DDL and continuing startup: %s",
-            lock_key, exc,
-        )
 
 
 @asynccontextmanager
@@ -1232,6 +1260,27 @@ async def check_function_exists(
     )
     try:
         return await query.execute(conn, schema=schema, name=function_name) is not None
+    except Exception:
+        return False
+
+
+async def check_constraint_exists(conn: DbResource, constraint_name: str) -> bool:
+    """Checks if a named constraint (FK, unique, check, etc.) exists.
+
+    Constraint names in ``pg_constraint`` are unique per-relation, not
+    globally, but this mirrors the bare ``conname`` lookup the ``DO $$ ...
+    IF NOT EXISTS`` DDL blocks already perform inline -- kept unscoped so the
+    explicit ``existence_check`` passed to ``DDLQuery`` observes exactly the
+    same condition the DDL itself guards on.
+    """
+    from dynastore.modules.db_config.maintenance_tools import DQLQuery, ResultHandler
+
+    query = DQLQuery(
+        "SELECT 1 FROM pg_constraint WHERE conname = :name",
+        result_handler=ResultHandler.SCALAR,
+    )
+    try:
+        return await query.execute(conn, name=constraint_name) is not None
     except Exception:
         return False
 
