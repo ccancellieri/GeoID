@@ -62,7 +62,6 @@ degrades to an in-process ``background`` run when none does (e.g. onprem).
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from dataclasses import replace as _dataclass_replace
@@ -79,6 +78,10 @@ from dynastore.models.tasks import TaskPayload
 from dynastore.tasks.protocols import TaskProtocol
 from dynastore.tasks.report import TaskReport
 from dynastore.tasks.workclass_drain.single_flight import DrainSingleFlightGate
+from dynastore.tools.adaptive_chunk_sizing import (
+    estimate_doc_bytes as _shared_estimate_doc_bytes,
+    next_adaptive_chunk_rows as _next_id_only_chunk_rows,
+)
 from dynastore.tools.db import validate_sql_identifier
 from dynastore.tools.memory_trim import trim_malloc_arenas
 
@@ -165,37 +168,21 @@ def _backoff(attempts: int) -> int:
 def _estimate_doc_bytes(doc: Dict[str, Any]) -> int:
     """Estimate a hydrated doc's wire size via the same JSON encoding the ES
     bulk indexer will eventually produce. Used only to decide sub-chunk
-    flush boundaries (#2723) — not for exact accounting."""
-    try:
-        return len(json.dumps(doc, default=str).encode("utf-8"))
-    except Exception:  # noqa: BLE001 — an unestimable doc still forces a flush
-        return _UNESTIMATED_DOC_BYTES
+    flush boundaries (#2723) — not for exact accounting.
 
-
-def _next_id_only_chunk_rows(
-    *, chunk_bytes: int, rows_read: int, byte_budget: int, current: int,
-) -> int:
-    """Size the next id-only re-read chunk from the previous chunk's measured
-    hydrated byte cost (#3121).
-
-    The OOM burst this bounds: one canonical re-read SELECT materializes
-    every row's JSONB attributes and GeoJSON geometry through asyncpg's
-    ``json.loads`` codec at once, a decode transient roughly an order of
-    magnitude larger than the raw bytes — invisible to the hydration byte
-    budget, which only measures BUILT documents after the fact. Hydrated
-    document size tracks the decoded row size closely (same attributes, same
-    GeoJSON), so the measured per-row average from the last chunk is a good
-    predictor for the next: fit ``byte_budget`` worth of rows, floor 1 (an
-    oversized single row is fetched alone rather than split), ceiling
-    ``_ID_ONLY_READ_CHUNK_ROWS`` (the pre-#3121 fixed size).
-
-    A chunk with no measurable cost (every geoid absent, or nothing read)
-    carries ``current`` forward unchanged rather than guessing.
+    Thin wrapper over the shared estimator (:mod:`tools.adaptive_chunk_sizing`,
+    factored out for #3154 so ``ItemService.upsert()``'s write-chunk loop can
+    reuse the same mechanism) pinned to this module's fallback constant.
     """
-    if rows_read <= 0 or chunk_bytes <= 0:
-        return current
-    avg_row_bytes = max(1, chunk_bytes // rows_read)
-    return max(1, min(_ID_ONLY_READ_CHUNK_ROWS, byte_budget // avg_row_bytes))
+    return _shared_estimate_doc_bytes(doc, fallback_bytes=_UNESTIMATED_DOC_BYTES)
+
+
+# ``_next_id_only_chunk_rows`` — sizes the next id-only re-read chunk from the
+# previous chunk's measured hydrated byte cost (#3121). Imported above from
+# the shared ``tools.adaptive_chunk_sizing`` module (factored out for #3154);
+# call sites pass ``ceiling=_ID_ONLY_READ_CHUNK_ROWS`` (the pre-#3121 fixed
+# size) explicitly since the shared version takes the ceiling as a parameter
+# instead of reading this module's constant.
 
 
 # Per-event-loop storage-drain concurrency gates (#3121). Two storage_drain
@@ -1292,6 +1279,7 @@ class StorageDrainTask(TaskProtocol):
                     rows_read=len(row_chunk),
                     byte_budget=byte_budget,
                     current=chunk_rows,
+                    ceiling=_ID_ONLY_READ_CHUNK_ROWS,
                 )
 
             # Observability (#2731): auto_done is a legitimate outcome (the

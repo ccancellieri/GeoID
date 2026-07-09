@@ -43,10 +43,15 @@ from dynastore.modules.storage.driver_config import (
 from dynastore.models.ogc import Feature
 from dynastore.models.protocols import CatalogsProtocol, ConfigsProtocol
 from dynastore.models.protocols.items import ItemsProtocol
+from dynastore.tools.adaptive_chunk_sizing import (
+    estimate_doc_bytes,
+    next_adaptive_chunk_rows,
+)
 from dynastore.tools.discovery import get_protocol
 from dynastore.tools.execution_context import in_task_run
 from dynastore.tools.db import validate_sql_identifier
 from dynastore.tools.json import CustomJSONEncoder
+from dynastore.tools.memory_trim import trim_malloc_arenas
 from dynastore.modules.db_config import shared_queries
 from dynastore.modules.catalog.query_optimizer import QueryOptimizer
 from dynastore.modules.storage.drivers.pg_sidecars.base import FeaturePipelineContext
@@ -62,6 +67,20 @@ from dynastore.modules.catalog.item_distributed import ItemDistributedMixin
 logger = logging.getLogger(__name__)
 
 _WRITE_ID_CONTEXT_KEY = "write_id"
+
+# Byte budget for Phase 4's adaptive write-chunk sizing in ``upsert()``
+# (#3154). Mirrors StorageDrainTask's hydration byte budget (#3121/#2723):
+# bounds how much JSON-encoded hub+sidecar payload one write-transaction
+# chunk holds, independent of the row-count ceiling
+# (``CollectionPluginConfig.ingest_chunk_size``), so a deep bulk-ingest
+# backlog of multi-MB items can't materialize a full row-count chunk of them
+# per transaction regardless of size.
+_INGEST_CHUNK_BYTE_BUDGET: int = 16 * 1024 * 1024  # 16 MiB
+
+# First (probe) chunk size for the same adaptive sizing (#3154). Row sizes
+# are unknown until the first chunk is measured; mirrors
+# StorageDrainTask's ``_ID_ONLY_READ_PROBE_ROWS``.
+_INGEST_CHUNK_PROBE_ROWS: int = 1
 
 
 def _context_write_id(processing_context: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -1664,10 +1683,17 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
 
         # Phase 4 — chunked writes. Each chunk commits its own tx; row locks
         # are released between chunks instead of accumulating across the whole
-        # ingestion. Per-collection knob via `CollectionPluginConfig.ingest_chunk_size`
+        # ingestion. Rows-per-chunk are now byte-adaptive (#3154): a fixed
+        # chunk size applies the same row count to a chunk of lightweight
+        # items as it does to a chunk of multi-MB ones — the same gap #3121
+        # closed for StorageDrainTask's id-only re-read chunks. Chunk rows
+        # start at a 1-row probe and resize from the previous chunk's
+        # measured hub+sidecar payload bytes via the shared estimator, with
+        # `CollectionPluginConfig.ingest_chunk_size` retained as the ceiling
         # (default 50 — safe for geometry-heavy payloads; lightweight
         # attribute-only collections can raise it).
-        chunk_size = collection_config.ingest_chunk_size
+        ingest_chunk_ceiling = collection_config.ingest_chunk_size
+        chunk_rows = min(_INGEST_CHUNK_PROBE_ROWS, ingest_chunk_ceiling)
         write_results: List[Dict[str, Any]] = []
         # Per-item generated info for the ingestion audit report, built 1:1
         # with ``write_results`` (and therefore with the ``results`` read-back
@@ -1699,8 +1725,23 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             items_write_policy is not None
             and getattr(items_write_policy, "enable_batch_insert", False)
         )
-        for start in range(0, len(prepared), chunk_size):
-            chunk = prepared[start:start + chunk_size]
+        start = 0
+        while start < len(prepared):
+            chunk = prepared[start:start + chunk_rows]
+            chunk_start = start
+            start += len(chunk)
+            # Measured once per chunk (write-path-independent — both the
+            # batch and per-row paths below write the exact same `chunk`
+            # content) and reused to size the *next* chunk after whichever
+            # path runs.
+            chunk_bytes = sum(
+                estimate_doc_bytes(plan["hub_payload"])
+                + sum(
+                    estimate_doc_bytes(sc_payload)
+                    for sc_payload in plan["sidecar_payloads"].values()
+                )
+                for plan in chunk
+            )
 
             # ── Batch fast path ────────────────────────────────────────────
             # Attempt a multi-row INSERT when enable_batch_insert is True and
@@ -1749,9 +1790,14 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 except Exception as _batch_exc:
                     logger.warning(
                         "Batch insert fell back to per-row for chunk [%d:%d]: %s",
-                        start, start + chunk_size, _batch_exc,
+                        chunk_start, chunk_start + len(chunk), _batch_exc,
                     )
                 if _batch_ok:
+                    chunk_rows = next_adaptive_chunk_rows(
+                        chunk_bytes=chunk_bytes, rows_read=len(chunk),
+                        byte_budget=_INGEST_CHUNK_BYTE_BUDGET, current=chunk_rows,
+                        ceiling=ingest_chunk_ceiling,
+                    )
                     continue
 
             # ── Per-row path (unchanged) ───────────────────────────────────
@@ -1813,6 +1859,22 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                             plan["sidecar_payloads"], stat_names
                         ),
                     })
+
+            chunk_rows = next_adaptive_chunk_rows(
+                chunk_bytes=chunk_bytes, rows_read=len(chunk),
+                byte_budget=_INGEST_CHUNK_BYTE_BUDGET, current=chunk_rows,
+                ceiling=ingest_chunk_ceiling,
+            )
+
+        # Trim retained heap pages after a bulk-ingest burst (#3154):
+        # mirrors StorageDrainTask's post-run malloc_trim(0) (#3121) — glibc
+        # keeps pages freed by this chunk loop's decode/hydration transients
+        # cached in its arenas instead of returning them to the kernel, so
+        # RSS stays pinned at the burst peak. Single-item writes are not a
+        # burst and are left untouched to avoid paying a trim on every
+        # ordinary create/update request.
+        if not is_single:
+            trim_malloc_arenas()
 
         # Hand rejections to the caller via the typed DriverContext escape
         # hatch. The OGC mixin seeds an empty list before the call and drains
