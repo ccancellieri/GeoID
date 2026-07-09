@@ -84,3 +84,33 @@ def test_distinct_loops_get_distinct_semaphores() -> None:
     asyncio.run(_capture())
     # Each fresh loop lazily created its own underlying semaphore object.
     assert len(seen) == 2 and seen[0] != seen[1]
+
+
+def test_timeout_bounded_acquire_returns_true_when_a_slot_is_free() -> None:
+    async def _run() -> bool:
+        sem = LoopLocalSemaphore(1)
+        acquired = await sem.acquire(timeout=1.0)
+        sem.release()
+        return acquired
+
+    assert asyncio.run(_run()) is True
+
+
+def test_timeout_bounded_acquire_returns_false_and_holds_no_slot_on_timeout() -> None:
+    """A caller that times out must not hold a slot — a subsequent acquire
+    on the same (now-uncontended) semaphore must succeed immediately."""
+    async def _run() -> tuple[bool, bool]:
+        sem = LoopLocalSemaphore(1)
+        async with sem:
+            # Cap is 1 and already held above -> this must time out quickly.
+            timed_out_acquire = await sem.acquire(timeout=0.05)
+
+        # The timed-out attempt held nothing, so once the first holder
+        # releases (the `async with` above), the slot is free again.
+        second_acquire = await sem.acquire(timeout=1.0)
+        sem.release()
+        return timed_out_acquire, second_acquire
+
+    timed_out_acquire, second_acquire = asyncio.run(_run())
+    assert timed_out_acquire is False
+    assert second_acquire is True

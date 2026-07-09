@@ -24,7 +24,7 @@ import asyncio
 import hashlib
 import re
 import time
-from typing import Any, ClassVar, FrozenSet, Literal, Optional, Dict, List, Tuple
+from typing import Any, Awaitable, ClassVar, FrozenSet, Literal, Optional, Dict, List, Tuple
 from contextlib import asynccontextmanager
 from fastapi import (
     FastAPI,
@@ -56,6 +56,7 @@ from dynastore.modules.db_config.query_executor import (
     ResultHandler,
 )
 from dynastore.modules.db_config.exceptions import PoolSaturationError, QueryExecutionError
+from dynastore.tools.render_admission import RenderAdmissionGate, RenderAdmissionRejected
 from dynastore.extensions.tools.query import parse_hints_param, validate_filter_lang
 from dynastore.extensions.tools.resolvers import (
     resolve_internal_catalog_id_or_404,
@@ -213,6 +214,17 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
     # write instead of raising.
     _tile_cache_writer: Optional[TileCacheWriter] = None
 
+    # Per-worker render admission gate (geoid#3155) — caps concurrent MVT
+    # vector-tile and raster/vector map-tile renders against this worker's
+    # memory budget so a burst of heavy renders can no longer pin unbounded
+    # heap together (see tools/render_admission.py). A class-level default
+    # (construction is pure env/derived, no I/O) so tests that build a
+    # TilesService via ``object.__new__`` — bypassing ``__init__``, the same
+    # pattern already used for ``_tile_cache_writer`` above — still exercise
+    # real admission control instead of silently skipping it; ``__init__``
+    # replaces it with a fresh per-instance gate.
+    _render_gate: RenderAdmissionGate = RenderAdmissionGate()
+
     def get_web_pages(self):
         from dynastore.extensions.tools.web_collect import collect_web_pages
         return collect_web_pages(self)
@@ -255,6 +267,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         super().__init__()
         self.app = app
         self.router = APIRouter(tags=["OGC API - Tiles"], prefix="/tiles")
+        self._render_gate = RenderAdmissionGate()
         self._register_routes()
         logger.info("Tiles Service: Initializing.")
 
@@ -919,6 +932,13 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         """
         start_time = time.perf_counter()
         _conn: Optional[AsyncConnection] = None
+        # True while THIS coroutine owns the render-admission slot acquired
+        # below. Flipped to False the moment ownership moves to render_task
+        # (its own wrapper releases the slot when the render itself finishes,
+        # even if this request coroutine is later cancelled by a client
+        # disconnect and the render keeps running shielded) — mirrors how
+        # `_conn` is set to None on the same handoff a few lines down.
+        _render_admitted = False
 
         try:
             # 1. Validation & Configuration
@@ -1153,6 +1173,35 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                     _abort_reason, dataset, collections, z, x, y, start_time,
                 )
 
+            # Render admission gate (#3155): cap concurrent renders on this
+            # worker against its memory budget, queueing briefly then
+            # shedding rather than letting an unbounded burst race the
+            # worker's RSS budget — the failure mode that OOM-killed maps
+            # under a QGIS multi-tile viewport refresh. Resolved BEFORE the
+            # DB connection below so a render queued on the gate never holds
+            # a pool connection idle while it waits.
+            try:
+                await self._render_gate.acquire()
+            except RenderAdmissionRejected as exc:
+                logger.warning(
+                    "get_vector_tile: render admission rejected (%s) "
+                    "catalog=%s z=%s x=%s y=%s — attempting stale tile fallback",
+                    exc.reason, dataset, z, x, y,
+                )
+                stale = await self._try_stale_tile_fallback(
+                    effective_cache_enabled, dataset, requested_cols_list,
+                    collections, params_hash, tileMatrixSetId, z, x, y,
+                    format, start_time,
+                )
+                if stale:
+                    return stale
+                raise HTTPException(
+                    status_code=503,
+                    detail="Render capacity exhausted on this worker, try again shortly.",
+                    headers={"Retry-After": str(exc.retry_after_seconds)},
+                ) from exc
+            _render_admitted = True
+
             # Acquire DB connection with pool-saturation guard.
             # On timeout: try serving a stale cached tile before failing fast.
             # acquire_engine_connection_bounded gives this a live-configurable
@@ -1170,6 +1219,12 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                     get_async_engine(request), fg_timeout_s
                 )
             except PoolSaturationError as exc:
+                # The render never started — release the admission slot here
+                # rather than leaving it to the top-level `finally` (the same
+                # ownership discipline as `_conn` above: whoever fails to
+                # hand a resource off to the render task must release it).
+                self._render_gate.release()
+                _render_admitted = False
                 logger.warning(
                     "get_vector_tile: DB pool saturated (timeout=%.1fs) "
                     "catalog=%s z=%s x=%s y=%s — attempting stale tile fallback",
@@ -1220,23 +1275,31 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 # `SET LOCAL statement_timeout` just above still bounds how
                 # long it can run either way.
                 render_task = asyncio.ensure_future(
-                    tiles_engine.render_tile(
-                        conn,
-                        ctx,
-                        str(z),
-                        x,
-                        y,
-                        format=format,
-                        use_l1_cache=True,
-                        datetime_str=datetime,
-                        cql_filter=filter,
-                        filter_lang=filter_lang,
-                        filter_crs_srid=filter_crs_srid,
-                        subset_params=subset,  # type: ignore[arg-type]
-                        simplification=simplification,
-                        simplification_algorithm=simplification_algorithm,
+                    self._render_and_release_gate(
+                        tiles_engine.render_tile(
+                            conn,
+                            ctx,
+                            str(z),
+                            x,
+                            y,
+                            format=format,
+                            use_l1_cache=True,
+                            datetime_str=datetime,
+                            cql_filter=filter,
+                            filter_lang=filter_lang,
+                            filter_crs_srid=filter_crs_srid,
+                            subset_params=subset,  # type: ignore[arg-type]
+                            simplification=simplification,
+                            simplification_algorithm=simplification_algorithm,
+                        )
                     )
                 )
+                # Ownership of the admission slot moves to render_task's own
+                # wrapper from here — it releases when the render itself
+                # finishes, not when this coroutine does (see the
+                # CancelledError branch below, which shields render_task past
+                # a client disconnect).
+                _render_admitted = False
                 mvt_content = await asyncio.shield(render_task)
             except QueryExecutionError as exc:
                 pgcode = getattr(exc.original_exception, "pgcode", None)
@@ -1364,12 +1427,29 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         finally:
             if _conn is not None:
                 await _conn.close()
+            if _render_admitted:
+                self._render_gate.release()
 
     # --- Helper Private Methods ---
     #
     # MVT generation itself (with its L1 in-process cache) moved to
     # dynastore.modules.tiles.tiles_engine.render_tile — shared with the
     # preseed task rather than duplicated here.
+
+    async def _render_and_release_gate(
+        self, render_coro: Awaitable[Optional[bytes]]
+    ) -> Optional[bytes]:
+        """Await ``render_coro``, releasing the render-admission slot exactly
+        when the render itself finishes — success, failure, or eventual
+        cancellation — regardless of the awaiting request coroutine's own
+        lifetime (#3155). Pairs with the ``self._render_gate.acquire()`` in
+        ``get_vector_tile``, called right before the wrapped task is created;
+        see the ownership-handoff comment there.
+        """
+        try:
+            return await render_coro
+        finally:
+            self._render_gate.release()
 
     @staticmethod
     def _handle_render_aborted(
@@ -1966,6 +2046,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         check_invalid_expression: bool,
         provider: Optional[TileStorageProtocol],
         cfg,
+        render_gate: RenderAdmissionGate,
     ) -> Response:
         """Run a rio-tiler renderer off-thread and build its HTTP response.
 
@@ -1977,11 +2058,27 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         cache write-back, and the response construction are identical.
         ``check_invalid_expression`` is False for terrain-rgb, whose renderer
         never raises that exception type.
+
+        ``render_gate`` bounds concurrent renders on this worker (#3155) —
+        acquired around the actual off-thread render call, released before
+        this returns either way.
         """
         from dynastore.modules.concurrency import run_in_thread
 
         try:
-            tile_bytes = await run_in_thread(renderer, *renderer_args, **renderer_kwargs)
+            async with render_gate.admit():
+                tile_bytes = await run_in_thread(renderer, *renderer_args, **renderer_kwargs)
+        except RenderAdmissionRejected as exc:
+            logger.warning(
+                "map_tile: %s render admission rejected (%s) for %s/%s "
+                "z=%s x=%s y=%s",
+                log_tag, exc.reason, catalog_id, collection_id, z, x, y,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Render capacity exhausted on this worker, try again shortly.",
+                headers={"Retry-After": str(exc.retry_after_seconds)},
+            ) from exc
         except Exception as exc:
             exc_type = type(exc).__name__
             if check_invalid_expression and exc_type == "InvalidExpression":
@@ -2296,6 +2393,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             check_invalid_expression=True,
             provider=provider,
             cfg=cfg,
+            render_gate=self._render_gate,
         )
 
     async def _get_vector_map_tile(
@@ -2394,24 +2492,41 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 ),
             )
 
-        # Acquired last, once metadata resolution above is done — this is the
-        # only connection this handler ever needs to hold now.
+        # Render admission gate (#3155), resolved BEFORE the render
+        # connection so a render queued on the gate never holds a pool
+        # connection idle while it waits — same ordering as get_vector_tile.
         try:
-            conn = await engine.connect()
-        except Exception as exc:
-            logger.error(
-                "map_tile: failed to acquire DB connection for vector PNG render "
-                "catalog=%s collection=%s: %s",
-                internal_catalog_id, internal_collection_id, exc,
-            )
-            raise HTTPException(status_code=503, detail="Database unavailable.") from exc
+            async with self._render_gate.admit():
+                # Acquired last, once metadata resolution above is done —
+                # this is the only connection this handler ever needs to
+                # hold now.
+                try:
+                    conn = await engine.connect()
+                except Exception as exc:
+                    logger.error(
+                        "map_tile: failed to acquire DB connection for vector "
+                        "PNG render catalog=%s collection=%s: %s",
+                        internal_catalog_id, internal_collection_id, exc,
+                    )
+                    raise HTTPException(status_code=503, detail="Database unavailable.") from exc
 
-        try:
-            tile_bytes = await tiles_engine.render_tile(
-                conn, ctx, str(z), x, y, format="png", use_l1_cache=True,
+                try:
+                    tile_bytes = await tiles_engine.render_tile(
+                        conn, ctx, str(z), x, y, format="png", use_l1_cache=True,
+                    )
+                finally:
+                    await conn.close()
+        except RenderAdmissionRejected as exc:
+            logger.warning(
+                "map_tile: render admission rejected (%s) catalog=%s "
+                "collection=%s z=%s x=%s y=%s",
+                exc.reason, internal_catalog_id, internal_collection_id, z, x, y,
             )
-        finally:
-            await conn.close()
+            raise HTTPException(
+                status_code=503,
+                detail="Render capacity exhausted on this worker, try again shortly.",
+                headers={"Retry-After": str(exc.retry_after_seconds)},
+            ) from exc
 
         # Persist on `is not None` (not truthy) so a confirmed-empty render
         # (`b""` — zero features) is cached too; otherwise every empty tile
@@ -2635,6 +2750,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 check_invalid_expression=False,
                 provider=provider,
                 cfg=cfg,
+                render_gate=self._render_gate,
             )
 
         # ------------------------------------------------------------------
@@ -2709,6 +2825,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 check_invalid_expression=True,
                 provider=provider,
                 cfg=cfg,
+                render_gate=self._render_gate,
             )
 
         # ------------------------------------------------------------------
@@ -2744,6 +2861,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             check_invalid_expression=True,
             provider=provider,
             cfg=cfg,
+            render_gate=self._render_gate,
         )
 
     async def _invalidate_tile_cache_impl(self, catalog_id: str, collection_id: Optional[str]) -> dict:

@@ -149,14 +149,43 @@ class LoopLocalSemaphore:
             self._semaphores[loop] = sem
         return sem
 
+    async def acquire(self, timeout: Optional[float] = None) -> bool:
+        """Acquire one slot, waiting at most ``timeout`` seconds.
+
+        ``timeout=None`` (default) waits indefinitely, same as ``async
+        with``. With a ``timeout``, returns ``True`` once a slot is held or
+        ``False`` if it elapses first — on ``False`` no slot is held, so
+        there is nothing to :meth:`release`. Callers that need a bounded
+        wait (e.g. queueing briefly before shedding rather than blocking
+        forever) use this directly; ``async with`` stays the drop-in for
+        the common unbounded case.
+        """
+        sem = self._for_running_loop()
+        if timeout is None:
+            await sem.acquire()
+            return True
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    def release(self) -> None:
+        """Release a slot acquired via :meth:`acquire` (or ``async with``).
+
+        Must be called from the same running loop that acquired it — mirrors
+        ``__aexit__``.
+        """
+        self._for_running_loop().release()
+
     async def __aenter__(self) -> "LoopLocalSemaphore":
-        await self._for_running_loop().acquire()
+        await self.acquire()
         return self
 
     async def __aexit__(self, *exc_info: Any) -> None:
         # Same task/loop as ``__aenter__`` (``async with``), so this resolves to
         # the very semaphore that was acquired.
-        self._for_running_loop().release()
+        self.release()
 
 
 class AsyncBufferAggregator:
