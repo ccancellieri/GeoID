@@ -50,8 +50,10 @@ other.
 """
 from __future__ import annotations
 
+import inspect
 import logging
-from typing import Any, List, Protocol, runtime_checkable
+import time
+from typing import Any, Callable, List, Optional, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +88,18 @@ class ColdBootContributor(Protocol):
         protocol is available.
         """
         ...
+
+
+ColdBootProbe = Callable[
+    [str, ColdBootContributor, Optional[float], Optional[BaseException]],
+    Any,
+]
+"""Diagnostic hook called around each cold-boot contributor.
+
+Arguments are ``event`` (``"before"`` or ``"after"``), contributor,
+elapsed seconds for ``"after"`` events, and the contributor error if one
+was raised. Probe failures are swallowed so diagnostics never affect boot.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +139,34 @@ def get_cold_boot_contributors() -> List[ColdBootContributor]:
 # ---------------------------------------------------------------------------
 
 
-async def run_cold_boot(engine: Any) -> None:
+async def _notify_probe(
+    probe: Optional[ColdBootProbe],
+    event: str,
+    contributor: ColdBootContributor,
+    elapsed_seconds: Optional[float],
+    error: Optional[BaseException],
+) -> None:
+    if probe is None:
+        return
+    try:
+        result = probe(event, contributor, elapsed_seconds, error)
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        logger.warning(
+            "run_cold_boot: diagnostic probe failed for contributor %r "
+            "(event=%s); continuing.",
+            contributor.name,
+            event,
+            exc_info=True,
+        )
+
+
+async def run_cold_boot(
+    engine: Any,
+    *,
+    probe: Optional[ColdBootProbe] = None,
+) -> None:
     """Run all registered cold-boot contributors, highest priority first.
 
     Each contributor runs in its own ``try/except``.  A failure is logged at
@@ -141,6 +182,8 @@ async def run_cold_boot(engine: Any) -> None:
         return
 
     for contributor in contributors:
+        started_at = time.monotonic()
+        await _notify_probe(probe, "before", contributor, None, None)
         try:
             logger.info(
                 "run_cold_boot: applying contributor %r (priority=%d)",
@@ -148,11 +191,15 @@ async def run_cold_boot(engine: Any) -> None:
                 contributor.priority,
             )
             await contributor.run(engine)
+            elapsed = time.monotonic() - started_at
+            await _notify_probe(probe, "after", contributor, elapsed, None)
             logger.info(
                 "run_cold_boot: contributor %r completed.",
                 contributor.name,
             )
-        except Exception:
+        except Exception as exc:
+            elapsed = time.monotonic() - started_at
+            await _notify_probe(probe, "after", contributor, elapsed, exc)
             logger.error(
                 "run_cold_boot: contributor %r raised an unexpected error; "
                 "continuing with remaining contributors.",

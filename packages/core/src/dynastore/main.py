@@ -47,7 +47,12 @@ from dynastore.tools.background_service import (
     ServiceContext,
 )
 from dynastore.tools.correlation import _correlation_id_var, set_correlation_id
-from dynastore.tools.memory_watchdog import build_memory_watchdog_service
+from dynastore.tools.memory_watchdog import (
+    build_memory_watchdog_service,
+    load_memory_watchdog_config,
+    read_process_rss_bytes,
+    resolve_watchdog_budget_mb,
+)
 from dynastore.tools.serving_state import is_draining
 
 # Register the scaling PluginConfig at the composition root so its class_key is
@@ -168,7 +173,7 @@ class _ColdBootReconciliationService:
     async def run(self, ctx: ServiceContext) -> None:
         from dynastore.modules.presets.cold_boot import run_cold_boot
         try:
-            await run_cold_boot(self._engine)
+            await run_cold_boot(self._engine, probe=_ColdBootMemoryProbe())
         except Exception:
             # run_cold_boot is documented to never raise; this is a last-resort
             # guard so a future contributor's bug can't kill the task silently.
@@ -181,6 +186,96 @@ class _ColdBootReconciliationService:
             logger.info(
                 "--- [main.py] Cold-boot reconciliation complete (background). ---"
             )
+
+
+class _ColdBootMemoryProbe:
+    """Emit per-contributor RSS diagnostics when watchdog diagnostics are enabled."""
+
+    def __init__(self) -> None:
+        self._rss_before: dict[str, Optional[int]] = {}
+
+    async def __call__(
+        self,
+        event: str,
+        contributor: Any,
+        elapsed_seconds: Optional[float],
+        error: Optional[BaseException],
+    ) -> None:
+        name = getattr(contributor, "name", "<unknown>")
+        before = self._rss_before.pop(name, None) if event == "after" else None
+        try:
+            config = await load_memory_watchdog_config()
+        except Exception:
+            return
+        if not config.diagnostic_tracemalloc_enabled:
+            return
+
+        rss_bytes = read_process_rss_bytes()
+        if event == "before":
+            self._rss_before[name] = rss_bytes
+            logger.info(
+                "cold_boot[diagnostic]: contributor %r starting "
+                "(priority=%s, rss=%s)",
+                name,
+                getattr(contributor, "priority", "<unknown>"),
+                _format_mib(rss_bytes),
+            )
+            return
+
+        budget_bytes = _cold_boot_budget_bytes(config)
+        ratio = (rss_bytes / budget_bytes) if rss_bytes is not None and budget_bytes else None
+        delta = (
+            rss_bytes - before
+            if rss_bytes is not None and before is not None
+            else None
+        )
+        level = logging.WARNING
+        if error is not None or (
+            ratio is not None and ratio >= config.critical_ratio
+        ):
+            level = logging.ERROR
+
+        logger.log(
+            level,
+            "cold_boot[diagnostic]: contributor %r finished "
+            "elapsed=%.3fs rss_before=%s rss_after=%s delta=%s budget=%s "
+            "ratio=%s error=%s",
+            name,
+            elapsed_seconds if elapsed_seconds is not None else 0.0,
+            _format_mib(before),
+            _format_mib(rss_bytes),
+            _format_signed_mib(delta),
+            _format_mib(budget_bytes),
+            _format_ratio(ratio),
+            type(error).__name__ if error is not None else "none",
+        )
+
+
+def _cold_boot_budget_bytes(config: Any) -> Optional[int]:
+    if getattr(config, "limit_mb", None) is not None:
+        return int(config.limit_mb) * 1024 * 1024
+    budget_mb = resolve_watchdog_budget_mb()
+    if budget_mb is None:
+        return None
+    return budget_mb * 1024 * 1024
+
+
+def _format_mib(value: Optional[int]) -> str:
+    if value is None:
+        return "unknown"
+    return f"{value / (1024 * 1024):.0f}MiB"
+
+
+def _format_signed_mib(value: Optional[int]) -> str:
+    if value is None:
+        return "unknown"
+    return f"{value / (1024 * 1024):.0f}MiB"
+
+
+def _format_ratio(value: Optional[float]) -> str:
+    if value is None:
+        return "unknown"
+    return f"{value * 100:.0f}%"
 
 
 # --- Combined Application Lifecycle ---

@@ -146,6 +146,49 @@ async def test_run_cold_boot_calls_all_contributors_in_order():
 
 
 @pytest.mark.asyncio
+async def test_run_cold_boot_notifies_probe_around_each_contributor():
+    """A probe sees contributor start/end timing without changing execution."""
+    from dynastore.modules.presets.cold_boot import run_cold_boot
+
+    events: list[tuple[str, str, float | None, BaseException | None]] = []
+
+    def _probe(event: str, contributor: Any, elapsed: float | None, error: BaseException | None) -> None:
+        events.append((event, contributor.name, elapsed, error))
+
+    contributor = _make_contributor("diag", 10)
+
+    with patch("dynastore.modules.presets.cold_boot._REGISTRY", [contributor]):
+        await run_cold_boot(object(), probe=_probe)
+
+    assert events[0] == ("before", "diag", None, None)
+    assert events[1][0:2] == ("after", "diag")
+    assert events[1][2] is not None
+    assert events[1][2] >= 0
+    assert events[1][3] is None
+
+
+@pytest.mark.asyncio
+async def test_run_cold_boot_notifies_probe_after_failure():
+    """Probe failures are diagnostic only; contributor failures are still reported."""
+    from dynastore.modules.presets.cold_boot import run_cold_boot
+
+    events: list[tuple[str, str, BaseException | None]] = []
+
+    def _probe(event: str, contributor: Any, elapsed: float | None, error: BaseException | None) -> None:
+        events.append((event, contributor.name, error))
+
+    boom = _make_contributor("boom", 100)
+    boom.run = AsyncMock(side_effect=RuntimeError("cold-boot explosion"))
+
+    with patch("dynastore.modules.presets.cold_boot._REGISTRY", [boom]):
+        await run_cold_boot(None, probe=_probe)
+
+    assert events[0] == ("before", "boom", None)
+    assert events[1][0:2] == ("after", "boom")
+    assert isinstance(events[1][2], RuntimeError)
+
+
+@pytest.mark.asyncio
 async def test_run_cold_boot_continues_after_failure(caplog):
     """A contributor that raises must not prevent subsequent contributors from running."""
     from dynastore.modules.presets.cold_boot import run_cold_boot

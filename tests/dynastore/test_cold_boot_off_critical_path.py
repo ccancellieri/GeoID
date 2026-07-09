@@ -31,12 +31,16 @@ safety.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+import pytest
 
 import dynastore.modules.presets.cold_boot as cold_boot_module
-from dynastore.main import app
+from dynastore.main import app, _ColdBootMemoryProbe
+from dynastore.tools.memory_watchdog import MemoryWatchdogConfig
 
 
 def test_cold_boot_reconciliation_runs_after_startup_not_before(monkeypatch):
@@ -44,7 +48,8 @@ def test_cold_boot_reconciliation_runs_after_startup_not_before(monkeypatch):
     release = threading.Event()
     finished = threading.Event()
 
-    async def _blocking_run_cold_boot(engine):
+    async def _blocking_run_cold_boot(engine, *, probe=None):
+        assert probe is not None
         started.set()
         # Wait on a threading.Event via a worker thread so this coroutine
         # occupies the background task without ever touching the DB —
@@ -75,3 +80,39 @@ def test_cold_boot_reconciliation_runs_after_startup_not_before(monkeypatch):
 
         release.set()
         assert finished.wait(5), "reconciliation never completed after being released"
+
+
+@pytest.mark.asyncio
+async def test_cold_boot_memory_probe_logs_when_watchdog_diagnostic_enabled(
+    monkeypatch, caplog
+):
+    """The main-process probe turns memory_watchdog_config into cold-boot RSS logs."""
+    cfg = MemoryWatchdogConfig(
+        diagnostic_tracemalloc_enabled=True,
+        diagnostic_ratio=0.50,
+    )
+
+    async def _fake_config():
+        return cfg
+
+    rss_values = iter([60 * 1024 * 1024, 90 * 1024 * 1024])
+    monkeypatch.setattr("dynastore.main.load_memory_watchdog_config", _fake_config)
+    monkeypatch.setattr(
+        "dynastore.main.read_process_rss_bytes",
+        lambda: next(rss_values),
+    )
+    monkeypatch.setattr("dynastore.main.resolve_watchdog_budget_mb", lambda: 100)
+
+    contributor = SimpleNamespace(name="demo_data", priority=10)
+    probe = _ColdBootMemoryProbe()
+
+    with caplog.at_level(logging.WARNING, logger="dynastore.main"):
+        await probe("before", contributor, None, None)
+        await probe("after", contributor, 1.25, None)
+
+    assert any(
+        "cold_boot[diagnostic]" in rec.getMessage()
+        and "demo_data" in rec.getMessage()
+        and "delta=30MiB" in rec.getMessage()
+        for rec in caplog.records
+    )
