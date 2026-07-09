@@ -61,12 +61,14 @@ degrades to an in-process ``background`` run when none does (e.g. onprem).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
 from dataclasses import replace as _dataclass_replace
-from typing import Any, ClassVar, Dict, Iterator, List, Optional, Sequence, Tuple, cast
+from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple, cast
 from uuid import UUID, uuid4
+from weakref import WeakKeyDictionary
 
 from dynastore.models.protocols.indexing import (
     BulkIndexer,
@@ -77,6 +79,7 @@ from dynastore.models.tasks import TaskPayload
 from dynastore.tasks.protocols import TaskProtocol
 from dynastore.tasks.report import TaskReport
 from dynastore.tools.db import validate_sql_identifier
+from dynastore.tools.memory_trim import trim_malloc_arenas
 
 logger = logging.getLogger(__name__)
 
@@ -112,16 +115,25 @@ _UNESTIMATED_DOC_BYTES: int = 8 * 1024 * 1024  # 8 MiB
 # documents per _bulk call for reasonable ES throughput.
 _DEFAULT_HYDRATION_BYTE_BUDGET: int = 16 * 1024 * 1024
 
-# Row-count cap on a single canonical-re-read SELECT for one id-only group
-# (#2723): read_canonical_index_inputs batches ALL geoids handed to it into
-# one query, materializing every row's raw geometry at once. A group can
-# hold up to storage_drain_batch_size rows sharing one (catalog_id,
+# Row-count CEILING on a single canonical-re-read SELECT for one id-only
+# group (#2723): read_canonical_index_inputs batches ALL geoids handed to it
+# into one query, materializing every row's raw geometry at once. A group
+# can hold up to storage_drain_batch_size rows sharing one (catalog_id,
 # collection_id) — for MB-scale GAUL polygons that alone can spike memory
-# even though the group is already row-count-bounded. This fixed, small
-# sub-chunk keeps a single PG round trip's raw-row materialization bounded,
-# independent of the (adaptive) hydration byte budget, which governs the
-# BUILT-document dispatch below instead.
+# even though the group is already row-count-bounded. Chunk size within a
+# group is ADAPTIVE (#3121, see _next_id_only_chunk_rows below): it starts
+# at _ID_ONLY_READ_PROBE_ROWS and resizes from each chunk's measured
+# hydrated byte cost, with this constant as the upper bound, so a single PG
+# round trip's raw-row materialization — and asyncpg's json.loads decode
+# transient on it, roughly an order of magnitude larger than the raw bytes —
+# stays bounded regardless of per-row document size.
 _ID_ONLY_READ_CHUNK_ROWS: int = 50
+
+# First (probe) chunk size for an id-only group's adaptive re-read (#3121).
+# Row sizes are unknown until the first chunk is hydrated, so the probe is
+# kept small: even a pathological collection (multi-MB GAUL polygons) only
+# materializes a handful of rows before the measured average takes over.
+_ID_ONLY_READ_PROBE_ROWS: int = 5
 
 # Default in-process drain budget (#2732 step 4). Matches
 # TasksPluginConfig.storage_drain_inprocess_max_bytes: the cumulative
@@ -155,10 +167,56 @@ def _estimate_doc_bytes(doc: Dict[str, Any]) -> int:
         return _UNESTIMATED_DOC_BYTES
 
 
-def _chunked(items: List[Dict[str, Any]], size: int) -> Iterator[List[Dict[str, Any]]]:
-    """Yield ``items`` in fixed-size slices (last slice may be shorter)."""
-    for start in range(0, len(items), size):
-        yield items[start : start + size]
+def _next_id_only_chunk_rows(
+    *, chunk_bytes: int, rows_read: int, byte_budget: int, current: int,
+) -> int:
+    """Size the next id-only re-read chunk from the previous chunk's measured
+    hydrated byte cost (#3121).
+
+    The OOM burst this bounds: one canonical re-read SELECT materializes
+    every row's JSONB attributes and GeoJSON geometry through asyncpg's
+    ``json.loads`` codec at once, a decode transient roughly an order of
+    magnitude larger than the raw bytes — invisible to the hydration byte
+    budget, which only measures BUILT documents after the fact. Hydrated
+    document size tracks the decoded row size closely (same attributes, same
+    GeoJSON), so the measured per-row average from the last chunk is a good
+    predictor for the next: fit ``byte_budget`` worth of rows, floor 1 (an
+    oversized single row is fetched alone rather than split), ceiling
+    ``_ID_ONLY_READ_CHUNK_ROWS`` (the pre-#3121 fixed size).
+
+    A chunk with no measurable cost (every geoid absent, or nothing read)
+    carries ``current`` forward unchanged rather than guessing.
+    """
+    if rows_read <= 0 or chunk_bytes <= 0:
+        return current
+    avg_row_bytes = max(1, chunk_bytes // rows_read)
+    return max(1, min(_ID_ONLY_READ_CHUNK_ROWS, byte_budget // avg_row_bytes))
+
+
+# Per-event-loop storage-drain concurrency gates (#3121). Two storage_drain
+# runs claimed and dispatched onto the same worker each materialize their
+# own id-only decode transient; concurrent runs stack those spikes on one
+# gunicorn worker's budget (observed: flat ~13% RSS to kernel OOM inside a
+# single 60s metric sample while two drains ran). One gate per running loop
+# — a worker process runs a single loop, so this is the per-process gate in
+# production, shared by every task instance including
+# StorageDrainOffloadTask — created lazily because an asyncio.Semaphore
+# pins itself to the first loop that awaits it. Waiting runs are NOT lost
+# work: rows stay claimed/fenced and the gated run drains whatever is still
+# pending when it acquires.
+_DRAIN_RUN_GATES: "WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = (
+    WeakKeyDictionary()
+)
+
+
+def _drain_run_gate() -> asyncio.Semaphore:
+    """Return this event loop's drain gate, creating it on first use."""
+    loop = asyncio.get_running_loop()
+    gate = _DRAIN_RUN_GATES.get(loop)
+    if gate is None:
+        gate = asyncio.Semaphore(1)
+        _DRAIN_RUN_GATES[loop] = gate
+    return gate
 
 
 class StorageDrainTask(TaskProtocol):
@@ -242,6 +300,13 @@ class StorageDrainTask(TaskProtocol):
     async def run(self, payload: TaskPayload) -> TaskReport:
         """Drain ``tasks.storage``, then return.
 
+        Serialized per worker process on its event loop's drain gate
+        (``_drain_run_gate``, #3121): concurrent
+        drain runs on one worker stack their hydration/decode memory spikes,
+        which is what burst-OOMed the catalog pod. A run that arrives while
+        another is active simply waits — its rows stay claimed and fenced,
+        and it drains whatever is still pending once it acquires the gate.
+
         Loops ``drain_once()`` until it reports zero claimed rows (drain to
         empty) — the dispatcher re-enters via NOTIFY when new rows appear.
 
@@ -262,6 +327,17 @@ class StorageDrainTask(TaskProtocol):
         (#1807 P2).  ``drain_once`` retains its ``int`` return type so internal
         callers and existing tests are unaffected.
         """
+        gate = _drain_run_gate()
+        if gate.locked():
+            logger.info(
+                "StorageDrainTask: another storage drain run is active in "
+                "this process — waiting for it to finish."
+            )
+        async with gate:
+            return await self._run_drain(payload)
+
+    async def _run_drain(self, payload: TaskPayload) -> TaskReport:
+        """Gate-held body of :meth:`run` — see its docstring."""
         from dynastore.modules.db_config.db_config import DBConfig
         from dynastore.modules.db_config.db_timeout_config import create_task_engine
 
@@ -317,6 +393,10 @@ class StorageDrainTask(TaskProtocol):
                         break
         finally:
             await engine.dispose()
+            # The decode/hydration transients this run freed are retained in
+            # glibc's malloc arenas — RSS stays pinned at the burst peak and
+            # successive runs stack on top of it (#3121). Hand the pages back.
+            trim_malloc_arenas()
 
         # 'drained' stays the total claimed count for backward compat; the
         # split counters distinguish rows actually written to the index from
@@ -810,8 +890,9 @@ class StorageDrainTask(TaskProtocol):
         enabled, grouped by ``(catalog_id, collection_id)``. A row with
         neither ``write_id`` nor ``entity_id`` can never hydrate and is
         marked dead. Each id-only group's canonical re-read
-        (:func:`read_canonical_index_inputs`) stays batched, but in fixed
-        ``_ID_ONLY_READ_CHUNK_ROWS``-sized read chunks rather than the
+        (:func:`read_canonical_index_inputs`) stays batched, but in
+        byte-adaptive read chunks (#3121, ``_next_id_only_chunk_rows``;
+        row-count ceiling ``_ID_ONLY_READ_CHUNK_ROWS``) rather than the
         whole group at once, so a single PG round trip never materializes
         an unbounded number of raw (pre-JSON) geometry rows either:
 
@@ -1040,7 +1121,16 @@ class StorageDrainTask(TaskProtocol):
 
         for (catalog_id, collection_id), group_rows in id_only_by_group.items():
             group_auto_done = 0
-            for row_chunk in _chunked(group_rows, _ID_ONLY_READ_CHUNK_ROWS):
+            # Adaptive re-read chunking (#3121): start each group with a
+            # small probe, then let the measured hydrated byte cost of each
+            # chunk size the next via _next_id_only_chunk_rows — bounding the
+            # raw-row decode transient a single SELECT can materialize.
+            row_idx = 0
+            chunk_rows = min(_ID_ONLY_READ_PROBE_ROWS, _ID_ONLY_READ_CHUNK_ROWS)
+            while row_idx < len(group_rows):
+                row_chunk = group_rows[row_idx : row_idx + chunk_rows]
+                row_idx += len(row_chunk)
+                bytes_before_chunk = counts["bytes"]
                 geoids = [r["entity_id"] for r in row_chunk if r.get("entity_id")]
                 try:
                     inputs = await self._read_canonical_inputs(
@@ -1095,6 +1185,13 @@ class StorageDrainTask(TaskProtocol):
                         continue
                     op = _dataclass_replace(self._row_to_op(row), payload=doc)
                     await _append(op, row, doc)
+
+                chunk_rows = _next_id_only_chunk_rows(
+                    chunk_bytes=counts["bytes"] - bytes_before_chunk,
+                    rows_read=len(row_chunk),
+                    byte_budget=byte_budget,
+                    current=chunk_rows,
+                )
 
             # Observability (#2731): auto_done is a legitimate outcome (the
             # canonical row is verifiably absent, not merely unreadable), but
