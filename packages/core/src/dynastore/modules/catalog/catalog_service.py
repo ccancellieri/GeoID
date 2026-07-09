@@ -2553,7 +2553,13 @@ class CatalogService(CatalogsProtocol):
                 },
             )
 
-        # Post-transaction cleanup
+        # Post-transaction cleanup.  Evict the external_id → internal_id
+        # cache entry too — mirrors the soft-delete branch above.  Without
+        # this, a direct STAC/OGC GET issued between this tombstone and the
+        # deprovision task's own teardown invalidation (see
+        # ``_catalog_core_deprovision`` in catalog_module.py) can keep
+        # resolving the external_id off a stale mapping.
+        _invalidate_catalog_external_id_cache(external_id)
         _invalidate_catalog_model_cache(catalog_id)
         from dynastore.modules.catalog.config_service import (
             invalidate_catalog_config_caches,

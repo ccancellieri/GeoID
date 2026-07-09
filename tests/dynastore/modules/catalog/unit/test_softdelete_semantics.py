@@ -36,12 +36,14 @@ here; those are noted in the PR body as requiring a dev environment.
 from __future__ import annotations
 
 import datetime
+from contextlib import asynccontextmanager
 from typing import Optional
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from dynastore.models.shared_models import Catalog
+from dynastore.modules.catalog import catalog_service as catalog_service_mod
 from dynastore.modules.catalog.catalog_service import (
     CatalogService,
     _catalog_external_id_cache,
@@ -278,3 +280,74 @@ def test_soft_delete_source_invalidates_external_id_cache() -> None:
         "so that subsequent get_catalog_model tombstone probes see the external_id, "
         "not the stale internal_id mapping."
     )
+
+
+# ---------------------------------------------------------------------------
+# delete_catalog hard path — cache eviction contract (#3159)
+#
+# Hard-delete used to invalidate only the internal-id-keyed model cache,
+# leaving the external_id -> internal_id mapping cached until either its own
+# TTL expired or the async deprovision task's own teardown hook happened to
+# run.  A direct STAC/OGC GET issued in that window could keep resolving the
+# already-tombstoned external_id off the stale mapping.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_invalidates_external_id_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """delete_catalog(force=True) must evict both the model cache AND the
+    external_id -> internal_id cache, mirroring the soft-delete branch, so a
+    direct GET can't keep resolving a stale mapping for a hard-deleted
+    catalog (#3159).
+    """
+    conn = AsyncMock()
+
+    @asynccontextmanager
+    async def _txn(_engine):
+        yield conn
+
+    monkeypatch.setattr(catalog_service_mod, "managed_transaction", _txn)
+    monkeypatch.setattr(
+        catalog_service_mod, "get_catalog_engine", lambda *_a, **_kw: MagicMock()
+    )
+    monkeypatch.setattr(catalog_service_mod, "get_protocol", lambda *_a, **_kw: None)
+    monkeypatch.setattr(catalog_service_mod, "emit_event", AsyncMock())
+    monkeypatch.setattr(
+        catalog_service_mod,
+        "_soft_delete_catalog_query",
+        MagicMock(execute=AsyncMock(return_value=1)),
+    )
+    from dynastore.modules.catalog.provisioning_registry import (
+        provisioning_registry,
+    )
+
+    monkeypatch.setattr(
+        provisioning_registry, "build_checklist", AsyncMock(return_value={})
+    )
+    monkeypatch.setattr(
+        "dynastore.modules.catalog.config_service.invalidate_catalog_config_caches",
+        MagicMock(),
+    )
+
+    invalidate_external_id = MagicMock()
+    invalidate_model = MagicMock()
+    monkeypatch.setattr(
+        catalog_service_mod,
+        "_invalidate_catalog_external_id_cache",
+        invalidate_external_id,
+    )
+    monkeypatch.setattr(
+        catalog_service_mod, "_invalidate_catalog_model_cache", invalidate_model
+    )
+
+    svc = CatalogService(engine=MagicMock())
+    svc.resolve_catalog_id = AsyncMock(return_value="c_harddel001")
+    svc._purge_catalog_storage = AsyncMock(return_value="c_harddel001")
+
+    result = await svc.delete_catalog("provision_check_a", force=True)
+
+    assert result is True
+    invalidate_external_id.assert_called_once_with("provision_check_a")
+    invalidate_model.assert_called_once_with("c_harddel001")
