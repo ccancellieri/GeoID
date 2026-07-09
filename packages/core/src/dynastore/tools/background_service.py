@@ -227,6 +227,7 @@ class PeriodicService(ABC):
     leadership: Leadership = Leadership.RUN_EVERYWHERE
     pod_policy: PodPolicy = PodPolicy.ALL
     lock_key: Optional[Union[int, str]] = None
+    initial_delay_seconds: float = 0.0
     lease_renewal_mode: LeaseRenewalMode = LeaseRenewalMode.PER_TICK
     """Opt-in continuous-tenure heartbeat mode; see :class:`LeaseRenewalMode`.
     Every existing service keeps the default PER_TICK — set this to
@@ -341,6 +342,10 @@ class BackgroundSupervisor:
             else:
                 coro = self._leader_elected_coro(service, ctx)
 
+            initial_delay = float(getattr(service, "initial_delay_seconds", 0.0) or 0.0)
+            if initial_delay > 0:
+                coro = self._delayed_coro(service, ctx, coro, initial_delay)
+
             try:
                 task = self._executor.submit(coro, task_name=f"service:{service.name}")
             except Exception:
@@ -359,6 +364,26 @@ class BackgroundSupervisor:
                 eff.value,
                 service.pod_policy.value,
             )
+
+    async def _delayed_coro(
+        self,
+        service: BackgroundService,
+        ctx: ServiceContext,
+        coro: Coroutine[Any, Any, None],
+        delay_seconds: float,
+    ) -> None:
+        """Delay a service's first work without delaying supervisor startup."""
+        started = False
+        try:
+            if await ctx.sleep(delay_seconds):
+                coro.close()
+                return
+            started = True
+            await coro
+        except asyncio.CancelledError:
+            if not started:
+                coro.close()
+            raise
 
     def _leader_elected_coro(
         self, service: BackgroundService, ctx: ServiceContext

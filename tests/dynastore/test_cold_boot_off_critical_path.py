@@ -39,8 +39,15 @@ from fastapi.testclient import TestClient
 import pytest
 
 import dynastore.modules.presets.cold_boot as cold_boot_module
-from dynastore.main import app, _ColdBootMemoryProbe
+from dynastore.main import app, _ColdBootMemoryProbe, _ColdBootReconciliationService
+from dynastore.tools.background_service import Leadership
 from dynastore.tools.memory_watchdog import MemoryWatchdogConfig
+
+
+def test_cold_boot_reconciliation_is_delayed_leader_only():
+    assert _ColdBootReconciliationService.leadership is Leadership.LEADER_ONLY
+    assert _ColdBootReconciliationService.lock_key == "dynastore.cold_boot_reconciliation"
+    assert _ColdBootReconciliationService.initial_delay_seconds > 0
 
 
 def test_cold_boot_reconciliation_runs_after_startup_not_before(monkeypatch):
@@ -59,6 +66,7 @@ def test_cold_boot_reconciliation_runs_after_startup_not_before(monkeypatch):
         finished.set()
 
     monkeypatch.setattr(cold_boot_module, "run_cold_boot", _blocking_run_cold_boot)
+    monkeypatch.setattr(_ColdBootReconciliationService, "initial_delay_seconds", 0.0)
 
     # TestClient's context manager drives the ASGI lifespan startup to
     # completion before returning — if it returns, the app is ready to

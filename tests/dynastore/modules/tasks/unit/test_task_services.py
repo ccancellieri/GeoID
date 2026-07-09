@@ -158,6 +158,7 @@ class TestDispatcherService:
         assert svc.leadership is Leadership.RUN_EVERYWHERE
         assert svc.pod_policy is PodPolicy.SKIP_EPHEMERAL
         assert svc.lock_key is None
+        assert svc.initial_delay_seconds > 0
 
     @pytest.mark.asyncio
     async def test_run_delegates_to_run_dispatcher(self, monkeypatch):
@@ -251,12 +252,15 @@ class TestProactiveSweepService:
         assert svc.leadership is Leadership.RUN_EVERYWHERE
         assert svc.pod_policy is PodPolicy.SKIP_EPHEMERAL
         assert svc.lock_key is None
+        assert svc.initial_delay_seconds > 0
 
-    def test_cadence_seconds_set_from_interval_s(self):
+    def test_cadence_seconds_set_from_interval_s(self, monkeypatch):
         from dynastore.modules.tasks.tasks_module import ProactiveSweepService
 
+        monkeypatch.delenv("DYNASTORE_PROACTIVE_SWEEP_INITIAL_DELAY_SECONDS", raising=False)
         svc = ProactiveSweepService(schema="tasks", interval_s=120.0)
         assert svc.cadence_seconds == 120.0
+        assert svc.initial_delay_seconds == 120.0
 
     @pytest.mark.asyncio
     async def test_tick_calls_backstop_and_wedged_sweep(self, monkeypatch):

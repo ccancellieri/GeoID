@@ -153,8 +153,11 @@ redirects to the GCS archive.
 
 The render pool is owned by `MapsService` class-level state. If Maps is
 deployed alongside a high-concurrency Tiles workload, the pool competes for
-CPU. Consider extracting it into a shared rendering module so the pool is
-tunable globally.
+CPU. By default each Gunicorn worker creates at most
+`floor(process_cpu_count / GUNICORN_WORKERS)` render processes, with a minimum
+of one. Set `DYNASTORE_MAPS_PROCESS_POOL_WORKERS` to override that per-worker
+pool size. Consider extracting the pool into a shared rendering module if Maps
+and Tiles need one global render budget.
 
 ---
 

@@ -35,6 +35,12 @@ configuration afterwards via the Configs API (`platform_configs`, class key
 `idp_config`) — no restart and no env edit required. To re-seed from env on a
 fresh database, simply delete the `idp_config` row first.
 
+Cold-boot reconciliation is submitted after the app has reached its module and
+extension startup point, then delayed briefly before the first run. Only one
+leader pod runs it at a time. Set `DYNASTORE_COLD_BOOT_INITIAL_DELAY_SECONDS`
+(default `30`) to tune that initial delay if a deployment needs the IdP seed to
+start sooner or later relative to readiness.
+
 The minimum to cold-boot a working sysadmin on a fresh DB is therefore just
 `IDP_ISSUER_URL` (plus the `geoid.sysadmin` realm role on the operator's account,
 which `OidcRoleSyncConfig` maps to the internal `sysadmin` grant). `IDP_CLIENT_ID`

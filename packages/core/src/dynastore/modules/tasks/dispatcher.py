@@ -85,6 +85,17 @@ from dynastore.tools.async_utils import signal_bus
 logger = logging.getLogger(__name__)
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %.1f.", name, raw, default)
+        return default
+
+
 async def _load_oracle_inner_timeout() -> float:
     """Load oracle_inner_timeout_seconds from CachePluginConfig.
 
@@ -1145,6 +1156,7 @@ class DispatcherService:
     leadership = Leadership.RUN_EVERYWHERE
     pod_policy = PodPolicy.SKIP_EPHEMERAL
     lock_key: Optional[Union[int, str]] = None
+    initial_delay_seconds = _env_float("DYNASTORE_DISPATCHER_INITIAL_DELAY_SECONDS", 30.0)
 
     async def run(self, ctx: ServiceContext) -> None:
         await run_dispatcher(ctx.engine, None, ctx.shutdown)

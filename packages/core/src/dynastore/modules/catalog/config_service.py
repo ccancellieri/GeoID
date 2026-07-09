@@ -284,6 +284,10 @@ class ConfigService(ConfigsProtocol):
         self._catalog_manager = catalog_manager
         self._catalogs_service = catalog_manager
         self._platform_config_service = platform_config_manager
+        self._validated_config_cache: Dict[
+            Tuple[str, Optional[str], Optional[str]],
+            Tuple[PluginConfig, Optional[dict], Optional[dict], PluginConfig],
+        ] = {}
 
     @property
     def catalog_manager(self) -> CatalogsProtocol:
@@ -303,6 +307,9 @@ class ConfigService(ConfigsProtocol):
 
     def is_available(self) -> bool:
         return self.engine is not None
+
+    def _clear_validated_config_cache(self) -> None:
+        self._validated_config_cache.clear()
 
     def _get_catalog_manager(self) -> CatalogsProtocol:
         if self._catalogs_service is None:
@@ -341,6 +348,7 @@ class ConfigService(ConfigsProtocol):
         """
         cls, class_key = _resolve(config_cls)
         db_resource = ctx.db_resource if ctx else None
+        use_validated_cache = db_resource is None and config_snapshot is None
 
         # Tier 0: Snapshot (authoritative override)
         if config_snapshot is not None:
@@ -385,6 +393,8 @@ class ConfigService(ConfigsProtocol):
 
         # Collect per-tier deltas top-down.
         deltas: list[dict] = []
+        catalog_delta: Optional[dict] = None
+        collection_delta: Optional[dict] = None
 
         # Tier 2: Catalog delta
         if not db_resource:
@@ -440,6 +450,18 @@ class ConfigService(ConfigsProtocol):
         if not deltas:
             return base
 
+        cache_key: Optional[Tuple[str, Optional[str], Optional[str]]] = None
+        if use_validated_cache:
+            cache_key = (class_key, catalog_id, collection_id)
+            cached = self._validated_config_cache.get(cache_key)
+            if (
+                cached is not None
+                and cached[0] is base
+                and cached[1] is catalog_delta
+                and cached[2] is collection_delta
+            ):
+                return cached[3]
+
         # Merge base.model_dump() with deltas in order (catalog → collection).
         # mode="python" preserves native types for round-trip re-validation.
         # ``_validate_stored_config`` strips keys the live class schema no
@@ -450,7 +472,15 @@ class ConfigService(ConfigsProtocol):
         merged: Dict[str, Any] = base.model_dump(mode="python")
         for delta in deltas:
             merged.update(delta)
-        return _validate_stored_config(cls, merged)
+        resolved = _validate_stored_config(cls, merged)
+        if cache_key is not None:
+            self._validated_config_cache[cache_key] = (
+                base,
+                catalog_delta,
+                collection_delta,
+                resolved,
+            )
+        return resolved
 
     async def get_configs_batch(
         self,
@@ -748,6 +778,7 @@ class ConfigService(ConfigsProtocol):
         """
         cls, class_key = _resolve(config_cls)
         db_resource = ctx.db_resource if ctx else None
+        self._clear_validated_config_cache()
         if collection_id is not None:
             if catalog_id is None:
                 raise ValueError("catalog_id is required when collection_id is provided")
@@ -832,6 +863,7 @@ class ConfigService(ConfigsProtocol):
             await self._internal_catalog_id(catalog_id),
             SNAPSHOT_REF_KEY,
         )
+        self._clear_validated_config_cache()
 
     async def _enforce_first_write_against_inherited(
         self,
@@ -1396,6 +1428,7 @@ class ConfigService(ConfigsProtocol):
 
         db_resource = ctx.db_resource if ctx else None
         cls = type(config)
+        self._clear_validated_config_cache()
 
         if collection_id is not None:
             if catalog_id is None:
@@ -1589,6 +1622,7 @@ class ConfigService(ConfigsProtocol):
     ) -> bool:
         """Tier-local delete at ``(ref_key, scope)`` — see ConfigsProtocol."""
         db_resource = ctx.db_resource if ctx else None
+        self._clear_validated_config_cache()
 
         if collection_id is not None:
             if catalog_id is None:
@@ -1789,6 +1823,7 @@ class ConfigService(ConfigsProtocol):
     ) -> None:
         cls, class_key = _resolve(config_cls)
         db_resource = ctx.db_resource if ctx else None
+        self._clear_validated_config_cache()
         if collection_id is not None:
             if catalog_id is None:
                 raise ValueError("catalog_id is required when collection_id is provided")

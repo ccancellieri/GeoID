@@ -123,6 +123,55 @@ async def _fake_non_leader_acquirer():
 
 
 @pytest.mark.asyncio
+async def test_initial_delay_defers_run_without_blocking_supervisor_start() -> None:
+    """A service-level initial delay postpones first work, not task submission."""
+    ran = asyncio.Event()
+
+    async def _run(ctx: ServiceContext) -> None:
+        ran.set()
+        ctx.shutdown.set()
+
+    ctx = _make_ctx()
+    executor = _TrackingExecutor()
+    supervisor = BackgroundSupervisor(executor=executor)
+    service = _make_service(name="delayed-svc", run_fn=_run)
+    service.initial_delay_seconds = 0.05  # type: ignore[attr-defined]
+    supervisor.register(service)
+
+    supervisor.start(ctx)
+
+    assert executor.submitted == ["service:delayed-svc"]
+    await asyncio.sleep(0.01)
+    assert not ran.is_set()
+
+    await asyncio.wait_for(ran.wait(), timeout=0.3)
+    await supervisor.stop(timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_initial_delay_exits_without_running_after_shutdown() -> None:
+    """Shutdown during the delay window drains without calling service.run()."""
+    ran = asyncio.Event()
+
+    async def _run(ctx: ServiceContext) -> None:
+        ran.set()
+
+    ctx = _make_ctx()
+    ctx.shutdown.set()
+    executor = _TrackingExecutor()
+    supervisor = BackgroundSupervisor(executor=executor)
+    service = _make_service(name="delayed-shutdown-svc", run_fn=_run)
+    service.initial_delay_seconds = 60.0  # type: ignore[attr-defined]
+    supervisor.register(service)
+
+    supervisor.start(ctx)
+    await executor.gather()
+    await supervisor.stop(timeout=1.0)
+
+    assert not ran.is_set()
+
+
+@pytest.mark.asyncio
 async def test_leader_only_wraps_in_leader_loop_non_leader() -> None:
     """LEADER_ONLY with a non-leader acquirer: run() is never called."""
     tick_count = {"n": 0}

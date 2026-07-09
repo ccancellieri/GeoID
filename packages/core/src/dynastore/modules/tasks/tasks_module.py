@@ -99,6 +99,18 @@ def get_task_lookback() -> timedelta:
     days = int(os.getenv("DYNASTORE_TASK_LOOKBACK_DAYS", "30"))
     return timedelta(days=days)
 
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %.1f.", name, raw, default)
+        return default
+
+
 # --- DDL Definitions ---
 
 # --- Step 1: Table creation only (IF NOT EXISTS safe) ---
@@ -1228,9 +1240,9 @@ class ProactiveSweepService(PeriodicService):
     pg_try_advisory_xact_lock) is preserved — do NOT add loop-level
     LEADER_ONLY leadership here; the per-pass locking already deduplicates
     across pods for the backstop step. PeriodicService supplies the outer
-    loop and shutdown handling. Note that PeriodicService ticks IMMEDIATELY
-    on startup then on cadence (the old hand-rolled loop slept first); this
-    is safe because the min_age guard (min_age_s) filters freshly-enqueued rows.
+    loop and shutdown handling. The first pass is delayed by one cadence by
+    default so cold-start module registration can settle before the sweep
+    starts resolving task routing and collection config.
     """
 
     name = "proactive_capability_sweep"
@@ -1249,6 +1261,10 @@ class ProactiveSweepService(PeriodicService):
     ) -> None:
         self._schema = schema
         self.cadence_seconds = interval_s
+        self.initial_delay_seconds = _env_float(
+            "DYNASTORE_PROACTIVE_SWEEP_INITIAL_DELAY_SECONDS",
+            interval_s,
+        )
         self._min_age_s = min_age_s
         self._max_caps_per_pass = max_caps_per_pass
         self._capability_ttl_s = capability_ttl_s

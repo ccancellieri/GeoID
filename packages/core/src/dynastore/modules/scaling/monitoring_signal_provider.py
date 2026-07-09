@@ -102,6 +102,7 @@ class MonitoringSignalProvider(PeriodicService):
         # value used before that (registration time / tests constructing the
         # provider directly), matching MonitoringSignalConfig's own default.
         self.cadence_seconds = 60.0
+        self.initial_delay_seconds = self.cadence_seconds
         # metric -> (last normalized value, unix ts it was read). Empty until
         # this pod has run a leader tick and the backend answered at least
         # once — mirrors DbContentionMonitor's "nothing to report yet" state.

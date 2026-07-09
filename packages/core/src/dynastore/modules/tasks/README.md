@@ -196,6 +196,14 @@ On startup `TasksModule` (priority=15, before `CatalogModule` at 20):
 3. Ensures 12 monthly future partitions exist.
 4. Asserts the current-month partition is present before starting the dispatcher.
 
+The dispatcher is submitted to the background supervisor during startup, but its
+first claim/reconcile pass waits `DYNASTORE_DISPATCHER_INITIAL_DELAY_SECONDS`
+(default `30`) so later modules and extension drivers can finish registration
+before task routing is resolved. The proactive capability sweep also waits one
+sweep interval before its first pass by default; override with
+`DYNASTORE_PROACTIVE_SWEEP_INITIAL_DELAY_SECONDS` when a deployment needs a
+different cold-start delay.
+
 ## Maintenance Schedule
 
 Periodic task maintenance is driven by `tasks.maintenance_schedule`; it is the

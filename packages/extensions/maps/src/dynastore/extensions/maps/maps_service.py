@@ -64,6 +64,33 @@ import os
 
 logger = logging.getLogger(__name__)
 
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %d.", name, raw, default)
+        return default
+
+
+def _maps_process_pool_workers() -> int:
+    explicit = os.getenv("DYNASTORE_MAPS_PROCESS_POOL_WORKERS")
+    if explicit not in (None, ""):
+        return _positive_int_env("DYNASTORE_MAPS_PROCESS_POOL_WORKERS", 1)
+
+    process_cpu_count = getattr(os, "process_cpu_count", None)
+    if callable(process_cpu_count):
+        cpu_count = process_cpu_count()
+    else:
+        cpu_count = os.cpu_count()
+    cpu_count = max(1, int(cpu_count or 1))
+    gunicorn_workers = _positive_int_env("GUNICORN_WORKERS", 1)
+    return max(1, cpu_count // gunicorn_workers)
+
+
 # Slice 2: raster render imports — guarded so the maps extension can still
 # load in environments without rio-tiler (graceful degradation: raster
 # branch returns 422 when rio-tiler is absent rather than failing import).
@@ -633,7 +660,11 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         # for large temp files). "spawn" uses pipes only, and pool workers
         # persist, so the higher per-worker start cost is paid once.
         mp_context = multiprocessing.get_context("spawn")
-        MapsService.process_pool = ProcessPoolExecutor(mp_context=mp_context)
+        max_workers = _maps_process_pool_workers()
+        MapsService.process_pool = ProcessPoolExecutor(
+            max_workers=max_workers,
+            mp_context=mp_context,
+        )
         logger.info(
             "Maps Service startup: process pool started (executor=%s, "
             "mp_start_method=%s, max_workers=%s)",

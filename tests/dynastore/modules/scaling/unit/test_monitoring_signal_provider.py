@@ -76,6 +76,14 @@ def _ctx() -> ServiceContext:
     return ServiceContext(engine=None, shutdown=asyncio.Event(), is_ephemeral=False, name="test-host")
 
 
+def test_initial_poll_is_delayed_one_default_cadence():
+    backend = _FakeBackend({MetricKind.CPU_UTILIZATION: 0.7})
+    configs = _StubConfigs(MonitoringSignalConfig(enabled=True))
+    provider = MonitoringSignalProvider(backend, configs)
+
+    assert provider.initial_delay_seconds == 60.0
+
+
 @pytest.mark.asyncio
 async def test_disabled_by_default_never_calls_backend():
     backend = _FakeBackend({MetricKind.CPU_UTILIZATION: 0.7})

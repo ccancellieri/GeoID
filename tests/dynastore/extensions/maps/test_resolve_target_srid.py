@@ -91,6 +91,22 @@ if _we_installed_osgeo_stubs:
     _uninstall_osgeo_stubs()
 
 
+def test_maps_process_pool_workers_partition_cpu_by_gunicorn_workers(monkeypatch):
+    monkeypatch.delenv("DYNASTORE_MAPS_PROCESS_POOL_WORKERS", raising=False)
+    monkeypatch.setenv("GUNICORN_WORKERS", "4")
+    monkeypatch.setattr(ms.os, "process_cpu_count", lambda: 8, raising=False)
+
+    assert ms._maps_process_pool_workers() == 2
+
+
+def test_maps_process_pool_workers_honors_explicit_override(monkeypatch):
+    monkeypatch.setenv("DYNASTORE_MAPS_PROCESS_POOL_WORKERS", "3")
+    monkeypatch.setenv("GUNICORN_WORKERS", "4")
+    monkeypatch.setattr(ms.os, "process_cpu_count", lambda: 8, raising=False)
+
+    assert ms._maps_process_pool_workers() == 3
+
+
 def test_explicit_target_srid_read_from_geometries_sidecar():
     """A materialised collection with a geometries sidecar returns that
     sidecar's ``target_srid``, not the default."""

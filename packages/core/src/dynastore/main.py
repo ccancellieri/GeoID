@@ -142,6 +142,17 @@ for _lib in ("opensearch", "elasticsearch", "elastic_transport"):
 logger = logging.getLogger(__name__)
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %.1f.", name, raw, default)
+        return default
+
+
 class _ColdBootReconciliationService:
     """Runs the cold-boot contributor pipeline off the startup-probe path (#3002).
 
@@ -154,18 +165,21 @@ class _ColdBootReconciliationService:
     full-fleet deploy against a DB with many catalogs could grind past the
     Cloud Run startup-probe window entirely.
 
-    Submitted as a RUN_EVERYWHERE background task instead: every pod attempts
-    it independently, and single-flight safety comes from the advisory lock
-    each contributor already takes via ``acquire_startup_lock`` in
-    ``bootstrap_preset_if_absent`` — a pod that loses a given lock skips that
-    contributor, exactly as it did when this ran inline.
+    Submitted as a delayed leader-only background task instead: the process
+    reaches readiness before this work starts, and only one pod in the fleet
+    runs the pipeline at a time. The contributor-local advisory locks still
+    provide per-contributor single-flight safety.
     """
 
     name = "cold_boot_reconciliation"
-    leadership = Leadership.RUN_EVERYWHERE
+    leadership = Leadership.LEADER_ONLY
     pod_policy = PodPolicy.ALL
-    lock_key: Optional[Union[int, str]] = None
-    lease_renewal_mode = LeaseRenewalMode.PER_TICK  # unused under RUN_EVERYWHERE
+    lock_key: Optional[Union[int, str]] = "dynastore.cold_boot_reconciliation"
+    lease_renewal_mode = LeaseRenewalMode.PER_TICK
+    initial_delay_seconds = _env_float(
+        "DYNASTORE_COLD_BOOT_INITIAL_DELAY_SECONDS",
+        30.0,
+    )
 
     def __init__(self, engine: Any) -> None:
         self._engine = engine
