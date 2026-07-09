@@ -572,11 +572,17 @@ api_catalog = ["dynastore[api_open,auth_grp]"]
 # gcp_routes_grp, monitor_grp (stats/logs), dimensions, notebooks.
 # `processes` mounts the /processes router + FastAPIBackgroundRunner so the maps service
 # can run gdal synchronously in-process (Prefer: respond-sync).
-# `task_base` pulls module_tasks (dispatcher + capability-publisher) + extension_processes
-# WITHOUT extension_tasks, keeping the task REST surface off this no-auth service.
+# `task_base_async` pulls module_tasks (dispatcher + capability-publisher) + extension_processes
+# WITHOUT extension_tasks, keeping the task REST surface off this no-auth service. Uses
+# module_db (asyncpg) instead of db_sync: the SyncRunner in-process path that services
+# gdal's `Prefer: respond-sync` execution (packages/core/src/dynastore/modules/tasks/runners.py)
+# takes its engine from get_async_engine(request), i.e. the async engine, for every task
+# bookkeeping write (create_task/update_task/dead_letter_task/fail_task) — it never touches
+# the sync psycopg2 engine. module_db is already pulled in via `core` regardless, so this
+# swap drops db_sync/DatastoreModule (psycopg2) as a strict removal, not a functional change.
 # osgeo + the gdal task instance arrive via maps_grp → gdal → module_gdal (already in
 # maps_grp). No auth surface is added; maps stays a public-read service.
-api_maps_open = ["dynastore[core,catalog_data_grp,maps_grp,dwh_grp,tools_core_grp,module_catalog_elasticsearch,processes,task_base]"]
+api_maps_open = ["dynastore[core,catalog_data_grp,maps_grp,dwh_grp,tools_core_grp,module_catalog_elasticsearch,processes,task_base_async]"]
 # api_maps: same surface WITH auth (kept for reference / future use)
 api_maps = ["dynastore[api_maps_open,auth_grp]"]
 # api_features: lightweight local-dev service — OGC Features + STAC, no GCP/tools/index
