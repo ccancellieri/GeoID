@@ -1542,18 +1542,40 @@ async def test_hydration_sub_chunk_failure_isolates_retry_to_that_chunk(
 # ---------------------------------------------------------------------------
 
 
+def _make_fake_async_engine() -> Any:
+    """A stand-in for the object ``create_async_engine`` returns, for tests
+    that stub ``drain_once`` and only exercise ``run()``'s own control flow.
+
+    ``StorageDrainTask._run_drain`` builds its engine via ``create_task_engine``,
+    which unconditionally registers a SQLAlchemy ``connect`` event listener on
+    ``engine.sync_engine`` (``_arm_client_socket_keepalive``). A bare
+    ``MagicMock`` doesn't satisfy SQLAlchemy's event-target validation
+    (``InvalidRequestError: No such event 'connect' for target ...``), so
+    ``sync_engine`` here is a real, never-started sync ``Engine`` instead — a
+    valid event target. Nothing in these tests ever opens a connection through
+    it, so the listener itself is never invoked.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from sqlalchemy import create_engine
+
+    engine = MagicMock()
+    engine.sync_engine = create_engine("sqlite://")
+    engine.dispose = AsyncMock()
+    return engine
+
+
 @pytest.mark.asyncio
 async def test_run_reports_split_completion_metrics():
     """``run()``'s ``TaskReport.metrics`` splits indexed/auto_done/retried
     alongside the backward-compat ``drained`` total (#2731) — a drain can no
     longer describe auto_done/retried rows as uniformly "processed"."""
-    from unittest.mock import AsyncMock, MagicMock, patch
+    from unittest.mock import MagicMock, patch
 
     from dynastore.tasks.workclass_drain.storage_drain_task import StorageDrainTask
 
     task = StorageDrainTask()
-    fake_engine = MagicMock()
-    fake_engine.dispose = AsyncMock()
+    fake_engine = _make_fake_async_engine()
 
     calls = {"n": 0}
 
@@ -1582,13 +1604,12 @@ async def test_run_reports_split_completion_metrics():
 async def test_run_resets_split_metrics_between_runs():
     """A second ``run()`` call must not carry over the previous run's split
     counters (self._run_metrics is reset at the top of run())."""
-    from unittest.mock import AsyncMock, MagicMock, patch
+    from unittest.mock import MagicMock, patch
 
     from dynastore.tasks.workclass_drain.storage_drain_task import StorageDrainTask
 
     task = StorageDrainTask()
-    fake_engine = MagicMock()
-    fake_engine.dispose = AsyncMock()
+    fake_engine = _make_fake_async_engine()
 
     first_calls = {"n": 0}
 
@@ -1642,8 +1663,7 @@ async def test_run_hands_off_when_byte_budget_exceeded_with_backlog_remaining():
     from dynastore.tasks.workclass_drain.storage_drain_task import StorageDrainTask
 
     task = StorageDrainTask(inprocess_max_bytes=100, inprocess_max_seconds=999.0)
-    fake_engine = MagicMock()
-    fake_engine.dispose = AsyncMock()
+    fake_engine = _make_fake_async_engine()
 
     calls = {"n": 0}
 
@@ -1676,8 +1696,7 @@ async def test_run_hands_off_when_time_budget_exceeded_with_backlog_remaining():
     from dynastore.tasks.workclass_drain.storage_drain_task import StorageDrainTask
 
     task = StorageDrainTask(inprocess_max_bytes=0, inprocess_max_seconds=0.02)
-    fake_engine = MagicMock()
-    fake_engine.dispose = AsyncMock()
+    fake_engine = _make_fake_async_engine()
 
     calls = {"n": 0}
 
@@ -1708,8 +1727,7 @@ async def test_run_generous_budget_drains_to_empty_without_handoff():
     from dynastore.tasks.workclass_drain.storage_drain_task import StorageDrainTask
 
     task = StorageDrainTask(inprocess_max_bytes=10**9, inprocess_max_seconds=999.0)
-    fake_engine = MagicMock()
-    fake_engine.dispose = AsyncMock()
+    fake_engine = _make_fake_async_engine()
 
     calls = {"n": 0}
 
@@ -1749,8 +1767,7 @@ async def test_storage_drain_offload_task_ignores_budget_and_drains_to_empty():
     task = StorageDrainOffloadTask(inprocess_max_bytes=1, inprocess_max_seconds=0.001)
     assert task._inprocess_budget_enabled is False
 
-    fake_engine = MagicMock()
-    fake_engine.dispose = AsyncMock()
+    fake_engine = _make_fake_async_engine()
 
     calls = {"n": 0}
 

@@ -356,11 +356,15 @@ async def test_register_supervisor_jobs_includes_workclass_jobs():
     from unittest.mock import AsyncMock, MagicMock, patch
     from dynastore.modules.catalog.maintenance_supervisor import (
         register_supervisor_jobs,
+        JOB_TASK_REAPER,
+        JOB_TASK_PARTITION_CREATE,
         JOB_TASK_RETENTION,
         JOB_EVENTS_PARTITION_CREATE,
         JOB_EVENTS_RETENTION,
         JOB_STORAGE_PARTITION_CREATE,
         JOB_STORAGE_RETENTION,
+        JOB_HEALTH_ALERT,
+        JOB_CONTROL_PLANE_RETENTION,
         _CADENCE_EVENTS_PARTITION_CREATE,
         _CADENCE_EVENTS_RETENTION,
         _CADENCE_STORAGE_PARTITION_CREATE,
@@ -383,13 +387,18 @@ async def test_register_supervisor_jobs_includes_workclass_jobs():
 
     # The obsolete-row prune issues a raw DELETE via DQLQuery; capture its
     # bound params so we can assert it retires exactly the renamed jobs.
+    # register_supervisor_jobs also routes its availability probes (e.g.
+    # _iam_prune_available's per-table ``to_regclass`` checks) through the
+    # same patched DQLQuery, so only the prune DELETE itself is recorded here
+    # — otherwise those probe calls would inflate this list too.
     prune_calls: list[dict] = []
 
     def _dql_factory(sql, **_kw):
         inst = MagicMock()
 
         async def _exec(_conn, **params):
-            prune_calls.append({"sql": sql, **params})
+            if "DELETE FROM tasks.maintenance_schedule" in sql:
+                prune_calls.append({"sql": sql, **params})
             return 0
 
         inst.execute = AsyncMock(side_effect=_exec)
@@ -415,10 +424,24 @@ async def test_register_supervisor_jobs_includes_workclass_jobs():
 
     cadence_map = dict(upserted)
 
-    # 6 platform/task jobs (tenant+system logs prune, iam prune, task reaper,
-    # task partition-create, task retention) + 4 workclass (events/storage
-    # partition-create + retention) = 10 total.
-    assert len(cadence_map) == 10
+    # register_supervisor_jobs always registers the base platform/task jobs
+    # plus the 4 workclass jobs (events/storage partition-create +
+    # retention). IAM_PRUNE / ES_LOGS_RETENTION register conditionally on
+    # runtime availability so they're excluded from this floor. Asserting a
+    # subset rather than an exact count means a newly-added job doesn't
+    # require updating this test.
+    expected_jobs = {
+        JOB_TASK_REAPER,
+        JOB_TASK_PARTITION_CREATE,
+        JOB_TASK_RETENTION,
+        JOB_EVENTS_PARTITION_CREATE,
+        JOB_EVENTS_RETENTION,
+        JOB_STORAGE_PARTITION_CREATE,
+        JOB_STORAGE_RETENTION,
+        JOB_HEALTH_ALERT,
+        JOB_CONTROL_PLANE_RETENTION,
+    }
+    assert expected_jobs <= cadence_map.keys()
 
     # The tasks-table retention job must be registered — it is what runs the
     # monthly partition prune (the #2106 pre-flight-LOG path).
