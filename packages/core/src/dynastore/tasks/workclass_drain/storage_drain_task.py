@@ -78,6 +78,7 @@ from dynastore.models.protocols.indexing import (
 from dynastore.models.tasks import TaskPayload
 from dynastore.tasks.protocols import TaskProtocol
 from dynastore.tasks.report import TaskReport
+from dynastore.tasks.workclass_drain.single_flight import DrainSingleFlightGate
 from dynastore.tools.db import validate_sql_identifier
 from dynastore.tools.memory_trim import trim_malloc_arenas
 
@@ -370,10 +371,34 @@ class StorageDrainTask(TaskProtocol):
         # Reset the split counters for this run — drain_once accumulates
         # into self._run_metrics as it classifies each claimed batch (#2731).
         self._run_metrics = {"indexed": 0, "auto_done": 0, "retried": 0}
+        # Cross-pod single-flight (#3144): at most one in-process storage
+        # drain runs platform-wide, so a reclaim after lagging heartbeat
+        # writes can no longer make two pods pay the same hydration transient
+        # concurrently. Session-scoped advisory lock on a direct lane, held
+        # for the whole run; fails open when no trustworthy lane exists. The
+        # offload subclass never gates (``_inprocess_budget_enabled`` False).
+        cross_pod_gate = (
+            DrainSingleFlightGate("storage")
+            if self._inprocess_budget_enabled
+            else None
+        )
         total = 0
         cumulative_bytes = 0
         start_time = time.monotonic()
         try:
+            if cross_pod_gate is not None and not await cross_pod_gate.acquire():
+                logger.info(
+                    "StorageDrainTask: skipping in-process drain — another "
+                    "in-process storage drain run holds the single-flight gate.",
+                )
+                return TaskReport.completed(
+                    message=(
+                        "storage drain skipped: another in-process storage "
+                        "drain run is active"
+                    ),
+                    metrics={"drained": 0, **self._run_metrics},
+                    correlation={"owner_id": owner_id},
+                )
             # A live storage_drain_offload run already owns the backlog
             # (#3121): every byte this budgeted run would hydrate is a
             # redundant decode transient inside an API-serving container the
@@ -420,6 +445,8 @@ class StorageDrainTask(TaskProtocol):
                         await self._handoff_to_offload_job(engine)
                         break
         finally:
+            if cross_pod_gate is not None:
+                await cross_pod_gate.release()
             await engine.dispose()
             # The decode/hydration transients this run freed are retained in
             # glibc's malloc arenas — RSS stays pinned at the burst peak and

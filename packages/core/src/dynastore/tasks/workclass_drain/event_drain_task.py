@@ -105,6 +105,7 @@ from uuid import uuid4
 from dynastore.models.tasks import TaskPayload
 from dynastore.tasks.report import TaskReport
 from dynastore.tasks.workclass_drain import AsyncWriteDrainTaskProtocol
+from dynastore.tasks.workclass_drain.single_flight import DrainSingleFlightGate
 from dynastore.tools.db import validate_sql_identifier
 
 logger = logging.getLogger(__name__)
@@ -290,9 +291,30 @@ class EventDrainTask(AsyncWriteDrainTaskProtocol):
         inprocess_max_seconds, inprocess_max_rows = (
             await self._resolve_inprocess_budget() if budget_enabled else (0.0, 0)
         )
+        # Cross-pod single-flight (#3144): at most one in-process event drain
+        # runs platform-wide, so a reclaim after lagging heartbeat writes can
+        # no longer make two serving pods re-deliver the same backlog
+        # concurrently. Session-scoped advisory lock on a direct lane, held
+        # for the whole run; fails open when no trustworthy lane exists. The
+        # async-writer Cloud Run Job never gates (``budget_enabled`` False),
+        # mirroring how it skips the in-process budget.
+        cross_pod_gate = DrainSingleFlightGate("events") if budget_enabled else None
         total = 0
         start_time = time.monotonic()
         try:
+            if cross_pod_gate is not None and not await cross_pod_gate.acquire():
+                logger.info(
+                    "EventDrainTask: skipping in-process drain — another "
+                    "in-process event drain run holds the single-flight gate.",
+                )
+                return TaskReport.completed(
+                    message=(
+                        "event drain skipped: another in-process event drain "
+                        "run is active"
+                    ),
+                    metrics={"drained": 0},
+                    correlation={"owner_id": owner_id},
+                )
             while True:
                 n = await self.drain_once(engine=engine, owner_id=owner_id)
                 total += n
@@ -313,6 +335,8 @@ class EventDrainTask(AsyncWriteDrainTaskProtocol):
                     await self._handoff_to_offload_job(engine)
                     break
         finally:
+            if cross_pod_gate is not None:
+                await cross_pod_gate.release()
             await engine.dispose()
 
         report = TaskReport.completed(

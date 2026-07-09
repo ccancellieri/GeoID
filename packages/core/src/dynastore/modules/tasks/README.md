@@ -180,6 +180,22 @@ or extend that lease while work continues. The task reaper moves expired ACTIVE
 rows back to PENDING, or to DEAD_LETTER when retry limits are exhausted. It is a
 lease column, not a permanent ownership flag.
 
+Drain workclasses (`event_drain`, `storage_drain`, `storage_drain_offload`)
+get a reclaim grace: the reaper only resets their rows once `locked_until`
+has lapsed by more than two heartbeat visibility windows
+(`DRAIN_RECLAIM_GRACE_SECONDS` in `tasks_module.py`). Heartbeat writes can
+lag behind a congested pooler while the run itself is healthy — reclaiming
+instantly re-queues work a live run is still processing and can spawn a
+duplicate offload execution. A genuinely dead drain worker just recovers
+those minutes later.
+
+In-process drain runs are additionally single-flight platform-wide per
+workclass: a session-scoped advisory lock on a direct (non-pooled)
+connection, held for the whole run and failing open when no trustworthy
+direct lane is configured (`dynastore.tasks.workclass_drain.single_flight`).
+The offloaded job flavors never take the gate, so they can neither be fenced
+out nor fence each other.
+
 ## Initialization
 
 On startup `TasksModule` (priority=15, before `CatalogModule` at 20):

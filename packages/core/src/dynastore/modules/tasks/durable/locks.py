@@ -18,13 +18,16 @@
 
 """Stable advisory-lock ID derivations for PostgreSQL.
 
-This module provides exactly two derivation functions.  Both currently
+This module provides exactly two derivation functions.  Most call sites
 key transaction-scoped locks (``pg_try_advisory_xact_lock`` /
 ``pg_advisory_xact_lock``, released automatically when the surrounding
-transaction commits or rolls back) — there are no session-scoped
-advisory-lock call sites (``pg_advisory_lock`` / ``pg_try_advisory_lock``)
-in this codebase today. The two derivations are kept distinct because
-their call sites are independent and must not collide:
+transaction commits or rolls back); the drain single-flight gate
+(``dynastore.tasks.workclass_drain.single_flight``) keys a *session*-scoped
+``pg_try_advisory_lock`` held on a dedicated direct connection for the
+duration of a drain run.  Session and xact locks share one PostgreSQL lock
+space, so distinct derivation inputs are what keep call sites from
+colliding. The two derivations are kept distinct because their call sites
+are independent and must not collide:
 
 ``stable_lock_id_sha256``
     Leadership-election / config-lock callers (e.g. ``db_config``

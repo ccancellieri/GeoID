@@ -26,7 +26,7 @@ import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
-from typing import List, Optional, Any, Dict, AsyncGenerator, Union
+from typing import List, Optional, Any, Dict, AsyncGenerator, Tuple, Union
 from dynastore.tools.cache import cached
 from dynastore.models.driver_context import DriverContext
 from dynastore.modules import ModuleProtocol
@@ -291,8 +291,32 @@ GLOBAL_TASKS_DEFAULT_PARTITION_DDL = """
 CREATE TABLE IF NOT EXISTS {schema}.tasks_default PARTITION OF {schema}.tasks DEFAULT;
 """
 
-GLOBAL_TASKS_REAPER_DDL = """
-CREATE OR REPLACE FUNCTION {schema}.reap_stuck_tasks(
+# Drain workclasses get a reclaim grace (#3144 option A): their leases are
+# renewed by BatchedHeartbeat DB writes that can lag behind a congested
+# pooler while the run itself is healthy. Reaping the row the instant
+# ``locked_until`` lapses re-queues work a live run is still processing —
+# for the offloaded flavors that means the trigger can spawn a duplicate
+# Cloud Run execution. Two heartbeat visibility windows (the runner default
+# is 5 minutes — ``execution.py``) bound the reaper's aggressiveness for
+# every drain flavor; a genuinely dead worker just recovers those minutes
+# later, acceptable for a safety-valve path. The task_type list must match
+# the drain task classes' ``task_type`` ClassVars (asserted by unit test).
+DRAIN_WORKCLASS_TASK_TYPES: Tuple[str, ...] = (
+    "event_drain",
+    "storage_drain",
+    "storage_drain_offload",
+)
+DRAIN_RECLAIM_GRACE_SECONDS: int = 600
+
+_DRAIN_TYPES_SQL = ", ".join(f"'{t}'" for t in DRAIN_WORKCLASS_TASK_TYPES)
+
+# NOTE: the 2-arg signature is FROZEN. CREATE OR REPLACE with an added
+# parameter would create an *overload* (a second function identity), not a
+# replacement — during a mixed-revision rollout the old 2-arg body would
+# keep serving ``reap_stuck_tasks(3, N)`` calls indefinitely. Tunables land
+# in the body via the module constants above instead.
+GLOBAL_TASKS_REAPER_DDL = f"""
+CREATE OR REPLACE FUNCTION {{schema}}.reap_stuck_tasks(
     p_max_retries INT DEFAULT 3,
     p_hard_cap INT DEFAULT 5
 ) RETURNS INTEGER LANGUAGE plpgsql AS $func$
@@ -302,13 +326,17 @@ DECLARE
 BEGIN
     WITH stuck AS (
         SELECT timestamp, task_id, retry_count, max_retries
-        FROM {schema}.tasks
+        FROM {{schema}}.tasks
         WHERE status = 'ACTIVE'
-          AND locked_until < NOW()
+          AND locked_until < NOW() - CASE
+                WHEN task_type IN ({_DRAIN_TYPES_SQL})
+                    THEN make_interval(secs => {DRAIN_RECLAIM_GRACE_SECONDS})
+                ELSE INTERVAL '0 seconds'
+            END
         FOR UPDATE SKIP LOCKED
     ),
     reset AS (
-        UPDATE {schema}.tasks t
+        UPDATE {{schema}}.tasks t
         SET status = CASE
                 -- Per-row max_retries (typically 1 for Cloud Run jobs) wins
                 -- when reached. The platform-wide hard_cap is the circuit
@@ -336,7 +364,7 @@ BEGIN
             error_message     = CASE
                 WHEN s.retry_count + 1 >= p_hard_cap
                     THEN 'Reaped: hard retry cap (' || p_hard_cap || ') reached'
-                ELSE 'Reaped by {schema}.reap_stuck_tasks (heartbeat expired)'
+                ELSE 'Reaped by {{schema}}.reap_stuck_tasks (heartbeat expired)'
             END
         FROM stuck s
         WHERE t.timestamp = s.timestamp AND t.task_id = s.task_id
@@ -351,7 +379,7 @@ BEGIN
     SELECT n_reaped, n_dead INTO reaped, dead_lettered FROM counted;
 
     IF dead_lettered > 0 THEN
-        RAISE WARNING 'dynastore.task.hard_cap_hit: % task(s) moved to DEAD_LETTER in {schema} this pass', dead_lettered;
+        RAISE WARNING 'dynastore.task.hard_cap_hit: % task(s) moved to DEAD_LETTER in {{schema}} this pass', dead_lettered;
     END IF;
 
     IF reaped > 0 THEN
