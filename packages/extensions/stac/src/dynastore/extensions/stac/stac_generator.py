@@ -499,6 +499,19 @@ async def create_catalog(
     )
     if not catalog_metadata_model:
         return {}
+    if catalog_metadata_model.deleted_at is not None:
+        # get_catalog_model's tombstone fallback deliberately serves a
+        # 200+deleted-state model to internal/admin consumers so they can
+        # observe a reclaimable soft-delete (see
+        # _get_tombstoned_catalog_model_by_external_id_db). The public STAC
+        # catalog document must apply the same deleted_at IS NULL predicate
+        # the catalog listing and the task-scoped catalog route already
+        # enforce (#3159), or a deleted catalog stays readable at a stable
+        # URL indefinitely.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Catalog '{catalog_id}' not found.",
+        )
 
     # Localize metadata before using it in PySTAC
     meta_dict, available_langs = stac_localize(catalog_metadata_model, lang)
@@ -530,17 +543,6 @@ async def create_catalog(
         for k, v in extra.items():
             if k not in ["language", "languages"]:
                 catalog.extra_fields[k] = v
-
-    # Surface the deleted_at marker for soft-deleted catalogs. The field lives
-    # on the Catalog model (not in extra_metadata) so it must be copied
-    # explicitly to the pystac extra_fields. Active catalogs have deleted_at=None
-    # (excluded by exclude_none=True in localize()) so this branch is a no-op
-    # for the common case.
-    _deleted_at = meta_dict.get("deleted_at")
-    if _deleted_at is not None:
-        catalog.extra_fields["deleted_at"] = (
-            _deleted_at.isoformat() if hasattr(_deleted_at, "isoformat") else str(_deleted_at)
-        )
 
     # Use dynamic exclusion based on the model's protocol + STAC top level
     stac_top_level = {"stac_version", "stac_extensions", "links", "conformsTo", "id", "title", "description"}
