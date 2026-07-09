@@ -42,7 +42,9 @@ import pytest
 
 from dynastore.modules.db_config.db_config import DBConfig
 from dynastore.tasks.workclass_drain.event_drain_task import EventDrainTask
+from dynastore.tasks.workclass_drain.single_flight import DrainSingleFlightGate
 from dynastore.tasks.workclass_drain.storage_drain_task import StorageDrainTask
+from tests.dynastore.test_utils.engine_mocks import make_fake_async_engine
 
 
 class _ResolvedDatabaseUrl:
@@ -67,16 +69,21 @@ async def _capture_engine_url(task: Any) -> str:
     passed to ``create_async_engine``."""
     captured: Dict[str, str] = {}
 
-    fake_engine = MagicMock()
-    fake_engine.dispose = AsyncMock()
+    # A real, never-started sync_engine — create_task_engine registers event
+    # listeners on it and rejects a bare MagicMock as an event target.
+    fake_engine = make_fake_async_engine()
 
     def _spy(url: str, **_kwargs: Any) -> Any:
         captured["url"] = url
         return fake_engine
 
-    # The drain loop exits immediately (zero claimed rows) so no DB I/O occurs.
+    # The drain loop exits immediately (zero claimed rows) so no DB I/O
+    # occurs; the cross-pod single-flight gate is stubbed open so the unit
+    # test never attempts a real gate connection either.
     with patch("sqlalchemy.ext.asyncio.create_async_engine", side_effect=_spy), \
-        patch.object(task, "drain_once", new=AsyncMock(return_value=0)):
+        patch.object(task, "drain_once", new=AsyncMock(return_value=0)), \
+        patch.object(DrainSingleFlightGate, "acquire", new=AsyncMock(return_value=True)), \
+        patch.object(DrainSingleFlightGate, "release", new=AsyncMock()):
         await task.run(MagicMock())
 
     assert "url" in captured, "create_async_engine was never called"

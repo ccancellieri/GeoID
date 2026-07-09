@@ -1542,27 +1542,12 @@ async def test_hydration_sub_chunk_failure_isolates_retry_to_that_chunk(
 # ---------------------------------------------------------------------------
 
 
-def _make_fake_async_engine() -> Any:
-    """A stand-in for the object ``create_async_engine`` returns, for tests
-    that stub ``drain_once`` and only exercise ``run()``'s own control flow.
-
-    ``StorageDrainTask._run_drain`` builds its engine via ``create_task_engine``,
-    which unconditionally registers a SQLAlchemy ``connect`` event listener on
-    ``engine.sync_engine`` (``_arm_client_socket_keepalive``). A bare
-    ``MagicMock`` doesn't satisfy SQLAlchemy's event-target validation
-    (``InvalidRequestError: No such event 'connect' for target ...``), so
-    ``sync_engine`` here is a real, never-started sync ``Engine`` instead — a
-    valid event target. Nothing in these tests ever opens a connection through
-    it, so the listener itself is never invoked.
-    """
-    from unittest.mock import AsyncMock, MagicMock
-
-    from sqlalchemy import create_engine
-
-    engine = MagicMock()
-    engine.sync_engine = create_engine("sqlite://")
-    engine.dispose = AsyncMock()
-    return engine
+# Shared with the other run()-level drain tests — see the module docstring in
+# tests/dynastore/test_utils/engine_mocks.py for why sync_engine must be a
+# real, never-started Engine rather than a MagicMock.
+from tests.dynastore.test_utils.engine_mocks import (  # noqa: E402
+    make_fake_async_engine as _make_fake_async_engine,
+)
 
 
 @pytest.mark.asyncio
