@@ -154,6 +154,79 @@ class TestDrainRunGate:
         ) == "recovered"
 
 
+class TestOffloadActiveSkip:
+    """In-process drains stand down while a live offload run owns the backlog.
+
+    The dev catalog kept dying (#3121) while a healthy storage_drain_offload
+    execution was already grinding the same outbox at several times the
+    in-process throughput: every budgeted in-process run added a redundant
+    hydration/decode transient inside an API-serving container for zero
+    additional progress.
+    """
+
+    def _engine_factory(self, monkeypatch):
+        # _run_drain builds a real task engine before the gate can run;
+        # neither the engine nor a DB must be needed to SKIP.
+        from unittest.mock import AsyncMock
+
+        engine = MagicMock()
+        engine.dispose = AsyncMock()
+        import dynastore.modules.db_config.db_timeout_config as db_timeout_config
+
+        monkeypatch.setattr(
+            db_timeout_config, "create_task_engine", lambda cfg: engine,
+        )
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_skips_without_claiming_when_offload_active(self, monkeypatch):
+        self._engine_factory(monkeypatch)
+
+        async def _active(self, engine):
+            return True
+
+        async def _must_not_claim(self, **kwargs):
+            raise AssertionError("skip path must never claim rows")
+
+        monkeypatch.setattr(
+            StorageDrainTask, "_offload_drain_is_active", _active,
+        )
+        monkeypatch.setattr(StorageDrainTask, "_claim_batch", _must_not_claim)
+
+        report = await StorageDrainTask().run(MagicMock())
+        assert report.metrics["drained"] == 0
+
+    @pytest.mark.asyncio
+    async def test_offload_task_never_fences_itself(self, monkeypatch):
+        # The offload subclass must drain even while its own trigger row is
+        # ACTIVE — it IS the live run the gate defers to.
+        self._engine_factory(monkeypatch)
+        probed = False
+
+        async def _active(self, engine):
+            nonlocal probed
+            probed = True
+            return True
+
+        async def _empty(self, **kwargs):
+            return 0
+
+        monkeypatch.setattr(
+            StorageDrainTask, "_offload_drain_is_active", _active,
+        )
+        monkeypatch.setattr(StorageDrainOffloadTask, "drain_once", _empty)
+
+        report = await StorageDrainOffloadTask().run(MagicMock())
+        assert report.metrics["drained"] == 0
+        assert probed is False
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_fails_open(self):
+        # A garbage engine must read as "no live offload run" — the drain
+        # that was about to run proceeds, never raises.
+        assert await StorageDrainTask()._offload_drain_is_active(object()) is False
+
+
 def test_trim_malloc_arenas_is_safe_everywhere():
     # Linux/glibc releases pages; macOS and musl are documented no-ops.
     # Either way it must return a bool and never raise.

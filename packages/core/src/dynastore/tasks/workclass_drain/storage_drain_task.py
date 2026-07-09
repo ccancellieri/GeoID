@@ -130,10 +130,14 @@ _DEFAULT_HYDRATION_BYTE_BUDGET: int = 16 * 1024 * 1024
 _ID_ONLY_READ_CHUNK_ROWS: int = 50
 
 # First (probe) chunk size for an id-only group's adaptive re-read (#3121).
-# Row sizes are unknown until the first chunk is hydrated, so the probe is
-# kept small: even a pathological collection (multi-MB GAUL polygons) only
-# materializes a handful of rows before the measured average takes over.
-_ID_ONLY_READ_PROBE_ROWS: int = 5
+# Row sizes are unknown until the first chunk is hydrated, so the probe
+# materializes exactly ONE row before the measured average takes over: a
+# pathological row (a country-scale boundary's ST_AsGeoJSON output runs to
+# tens of MB, and its json.loads decode transient roughly 10x that) must
+# never be multiplied by a guessed row count the process cannot afford.
+# The cost is one extra PG round trip per id-only group; the rows are
+# hydrated either way.
+_ID_ONLY_READ_PROBE_ROWS: int = 1
 
 # Default in-process drain budget (#2732 step 4). Matches
 # TasksPluginConfig.storage_drain_inprocess_max_bytes: the cumulative
@@ -370,6 +374,30 @@ class StorageDrainTask(TaskProtocol):
         cumulative_bytes = 0
         start_time = time.monotonic()
         try:
+            # A live storage_drain_offload run already owns the backlog
+            # (#3121): every byte this budgeted run would hydrate is a
+            # redundant decode transient inside an API-serving container the
+            # offload runner is about to process anyway — at a fraction of
+            # this container's throughput. Skip without claiming a single
+            # row; the offload lease expiring (completion, crash, reap)
+            # re-opens the in-process fast path automatically. The offload
+            # subclass never checks this (``_inprocess_budget_enabled`` is
+            # False there), so the offload run can never fence itself out.
+            if self._inprocess_budget_enabled and await self._offload_drain_is_active(
+                engine
+            ):
+                logger.info(
+                    "StorageDrainTask: skipping in-process drain — a live "
+                    "storage_drain_offload run owns the backlog.",
+                )
+                return TaskReport.completed(
+                    message=(
+                        "storage drain skipped: a live storage_drain_offload "
+                        "run owns the backlog"
+                    ),
+                    metrics={"drained": 0, **self._run_metrics},
+                    correlation={"owner_id": owner_id},
+                )
             while True:
                 n = await self.drain_once(
                     engine=engine, owner_id=owner_id, batch_size=batch_size,
@@ -542,6 +570,52 @@ class StorageDrainTask(TaskProtocol):
             "backlog remaining — handed off remainder to the "
             "storage_drain_offload job.",
         )
+
+    async def _offload_drain_is_active(self, engine: Any) -> bool:
+        """True when a live ``storage_drain_offload`` run owns the backlog.
+
+        "Live" mirrors the wedge-tolerance rule in
+        ``storage_emit._enqueue_drain_trigger``: an ACTIVE trigger row whose
+        claim lease (``locked_until``) has not yet expired. A wedged row —
+        owner died mid-run, lease lapsed, reaper not yet caught up — does
+        NOT count, so a crashed offload run can never permanently fence out
+        the in-process path (#2715's lesson applied in reverse).
+
+        Fail-open: any error reads as False so the in-process drain proceeds
+        exactly as it did before this gate existed — environments without
+        the tasks table (storage-only test fixtures) or with a transiently
+        unreachable DB must not lose the drain that was about to run.
+        """
+        from dynastore.modules.db_config.query_executor import (
+            DQLQuery,
+            ResultHandler,
+            managed_transaction,
+        )
+        from dynastore.modules.tasks.tasks_module import get_task_schema
+
+        try:
+            task_schema = get_task_schema()
+            probe_sql = (
+                f"SELECT 1 FROM {task_schema}.tasks"
+                f" WHERE dedup_key = :dedup_key"
+                f"   AND catalog_id = 'platform'"
+                f"   AND status = 'ACTIVE'"
+                f"   AND locked_until > now()"
+                f" LIMIT 1"
+            )
+            async with managed_transaction(engine) as conn:
+                row = await DQLQuery(
+                    probe_sql,
+                    result_handler=ResultHandler.SCALAR,
+                ).execute(conn, dedup_key="storage_drain_offload")
+            return row is not None
+        except Exception:  # noqa: BLE001 — the gate is best-effort by design
+            logger.debug(
+                "StorageDrainTask: offload-liveness probe failed — "
+                "proceeding with the in-process drain.",
+                exc_info=True,
+            )
+            return False
 
     async def drain_once(
         self, *, engine: Any, owner_id: str, batch_size: Optional[int] = None,
