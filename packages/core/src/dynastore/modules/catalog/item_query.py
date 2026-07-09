@@ -24,9 +24,12 @@ Extracted from item_service.py to reduce file size.  All methods access
 inherits from this mixin.
 """
 
+import json
 import logging
 from contextlib import asynccontextmanager
-from typing import List, Optional, Any, Dict, Tuple, AsyncIterator, FrozenSet, TYPE_CHECKING
+from typing import (
+    List, Optional, Any, Dict, Tuple, AsyncIterator, Callable, FrozenSet, TYPE_CHECKING,
+)
 
 from sqlalchemy import literal_column, text
 
@@ -278,6 +281,96 @@ async def _apply_item_pipeline(
         if dropped:
             continue
         yield doc
+
+
+# ---------------------------------------------------------------------------
+# Bounded page buffer for feature_stream() (#3142)
+#
+# feature_stream() used to hold its pooled connection for the whole HTTP
+# response (managed_transaction opened once and kept alive across every
+# yield). A slow reader — or a client paginating a large collection — then
+# pins that pooled slot for the entire response, and a handful of them can
+# starve a small serving pool. Since /items pages are already
+# pagination-bounded (request.limit), the common case can eagerly drain the
+# whole page into memory INSIDE the transaction and release the connection
+# before yielding anything; only a page that overruns the buffer needs to
+# keep streaming from an open transaction, exactly like before.
+# ---------------------------------------------------------------------------
+
+# Row-count ceiling for the bounded page buffer (#3142). Mirrors the
+# ``max_limit`` clamp shared by every OGC listing endpoint that calls into
+# ``stream_items()`` (``FeaturesPluginConfig.max_limit``,
+# ``RecordsPluginConfig.max_limit``, the STAC search ``max_limit`` default —
+# all 1000): a page at or under that size is the common case this buffer
+# targets. ``item_query.py`` is protocol-agnostic (STAC/Features/Records/
+# exports all share it), so this stays a module constant instead of reading
+# any one extension's ``PluginConfig``.
+_STREAM_BUFFER_ROW_CAP: int = 1000
+
+# Approximate byte budget for the same buffer (#3142), sized like the
+# existing ``max_response_bytes`` byte budgets (``FeaturesPluginConfig``,
+# ``RecordsPluginConfig``, both default 10 MiB) that already bound
+# page-assembly memory downstream of this generator.
+_STREAM_BUFFER_BYTE_BUDGET: int = 10 * 1024 * 1024  # 10 MiB
+
+# Fallback byte cost for a feature whose size cannot be estimated (mirrors
+# ``_UNESTIMATED_DOC_BYTES`` in ``storage_drain_task.py``): large enough to
+# force a budget trip rather than accumulate an unmeasured object forever.
+_UNESTIMATED_FEATURE_BYTES: int = 8 * 1024 * 1024
+
+
+def _approx_feature_bytes(feature: Any) -> int:
+    """Approximate one mapped feature's in-memory footprint.
+
+    Used only to decide when :func:`_buffer_feature_page` has accumulated
+    enough to flush — NOT an exact prediction of the eventual HTTP response
+    size (the formatter's own ``max_response_bytes`` budget measures that
+    downstream, on the actual serialized bytes with a different encoder,
+    key order and whitespace). The budget this bounds is buffer memory, not
+    response size. A pydantic ``Feature``'s own JSON encoder is used when
+    available; anything else falls back to ``json.dumps(default=str)`` —
+    the same idiom as ``storage_drain_task._estimate_doc_bytes``.
+    """
+    dump = getattr(feature, "model_dump_json", None)
+    try:
+        if dump is not None:
+            return len(dump())
+        return len(json.dumps(feature, default=str))
+    except Exception:  # noqa: BLE001 — an unestimable feature still forces a flush
+        return _UNESTIMATED_FEATURE_BYTES
+
+
+async def _buffer_feature_page(
+    rows: AsyncIterator[Any],
+    map_row: Callable[[Any], Any],
+    *,
+    row_cap: int = _STREAM_BUFFER_ROW_CAP,
+    byte_budget: int = _STREAM_BUFFER_BYTE_BUDGET,
+) -> Tuple[List[Any], bool]:
+    """Eagerly drain ``rows`` into an in-memory buffer of mapped features.
+
+    Stops at whichever bound trips first: ``row_cap`` rows or
+    ``byte_budget`` approximate bytes (:func:`_approx_feature_bytes`).
+
+    Returns ``(buffered, budget_tripped)``:
+
+    - ``budget_tripped=False``: ``rows`` was exhausted within budget — the
+      common /items page case (#3142). The caller can release its DB
+      connection/transaction before yielding ``buffered``.
+    - ``budget_tripped=True``: a bound tripped with rows still pending in
+      ``rows``. The caller must keep consuming ``rows`` (inside the
+      still-open transaction) for the remainder — identical to the
+      pre-#3142 behaviour, no regression for pathological pages.
+    """
+    buffered: List[Any] = []
+    buffered_bytes = 0
+    async for row in rows:
+        feature = map_row(row)
+        buffered.append(feature)
+        buffered_bytes += _approx_feature_bytes(feature)
+        if len(buffered) >= row_cap or buffered_bytes >= byte_budget:
+            return buffered, True
+    return buffered, False
 
 
 class ItemQueryMixin:
@@ -1864,19 +1957,48 @@ class ItemQueryMixin:
                     "feature_stream requires async engine; configure `module_db` "
                     "in SCOPE — see #1420"
                 )
-            # Open a fresh connection/transaction for streaming to ensure isolation and avoid leaks
+
+            def _map_row(row: Any) -> Any:
+                feature_ctx = FeaturePipelineContext(
+                    lang=lang, consumer=consumer,
+                    requested_fields=_requested_fields,
+                )
+                return self.map_row_to_feature(
+                    dict(row._mapping), col_config, context=feature_ctx,
+                    read_policy=read_policy,
+                )
+
+            # Open a fresh connection/transaction for streaming to ensure
+            # isolation and avoid leaks. Bounded buffering (#3142): the
+            # connection is held only long enough to fill a page-sized
+            # buffer (row- and byte-bounded, _buffer_feature_page). A page
+            # that fits — the common case, since /items pages are already
+            # limit-bounded — is buffered fully and the connection is
+            # released BEFORE the first feature reaches the caller, so a
+            # slow HTTP reader no longer pins a pooled connection for the
+            # whole response. A page that overruns the buffer falls back to
+            # streaming the remainder inside the still-open transaction,
+            # unchanged from before #3142.
             async with managed_transaction(self.engine) as stream_conn:
                 # AsyncConnection.stream() yields rows server-side without buffering
                 stream = await stream_conn.stream(text(sql), params)  # type: ignore[union-attr]
-                async for row in stream:
-                    feature_ctx = FeaturePipelineContext(
-                        lang=lang, consumer=consumer,
-                        requested_fields=_requested_fields,
-                    )
-                    yield self.map_row_to_feature(
-                        dict(row._mapping), col_config, context=feature_ctx,
-                        read_policy=read_policy,
-                    )
+                buffered, budget_tripped = await _buffer_feature_page(
+                    stream,
+                    _map_row,
+                    row_cap=_STREAM_BUFFER_ROW_CAP,
+                    byte_budget=_STREAM_BUFFER_BYTE_BUDGET,
+                )
+                if budget_tripped:
+                    for feature in buffered:
+                        yield feature
+                    async for row in stream:
+                        yield _map_row(row)
+            if not budget_tripped:
+                # Stream exhausted within budget: managed_transaction above
+                # has already exited (connection returned to the pool)
+                # before any feature is yielded here.
+                for feature in buffered:
+                    yield feature
 
         return QueryResponse(
             items=_apply_item_pipeline(feature_stream(), catalog_id, collection_id),
