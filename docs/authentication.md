@@ -37,11 +37,12 @@ fresh database, simply delete the `idp_config` row first.
 
 Cold-boot reconciliation is submitted after the app has reached its module and
 extension startup point, then delayed briefly before the first run. Each process
-makes one fleet-level lease attempt; only the winner runs the cold-boot
-contributors, and followers return without retrying during that process
-lifetime. Set `DYNASTORE_COLD_BOOT_INITIAL_DELAY_SECONDS` (default `30`) to tune
-that initial delay if a deployment needs the IdP seed to start sooner or later
-relative to readiness.
+makes one fleet-level lease attempt, guarded by a service/revision marker in
+`catalog.shared_properties`; only the first winner for the current Cloud Run
+revision runs the cold-boot contributors, and later workers skip. Set
+`DYNASTORE_COLD_BOOT_INITIAL_DELAY_SECONDS` (default `30`) to tune that initial
+delay if a deployment needs the IdP seed to start sooner or later relative to
+readiness.
 
 The minimum to cold-boot a working sysadmin on a fresh DB is therefore just
 `IDP_ISSUER_URL` (plus the `geoid.sysadmin` realm role on the operator's account,

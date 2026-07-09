@@ -165,10 +165,11 @@ class _ColdBootReconciliationService:
     Cloud Run startup-probe window entirely.
 
     Submitted as a delayed one-shot background task instead: each process
-    reaches readiness before this work starts, then makes one fleet-level lease
-    attempt. Only the winner runs the pipeline, and followers return without
-    retrying. The contributor-local advisory locks still provide
-    per-contributor single-flight safety.
+    reaches readiness before this work starts, then checks a per-service /
+    per-revision shared-property marker and makes one fleet-level lease
+    attempt. Only the first winner for the current service revision runs the
+    pipeline; later workers see the marker and return. The contributor-local
+    advisory locks still provide per-contributor single-flight safety.
     """
 
     name = "cold_boot_reconciliation"
@@ -194,6 +195,14 @@ class _ColdBootReconciliationService:
             )
             return
 
+        marker_key = _cold_boot_revision_marker_key()
+        if marker_key and await _cold_boot_revision_completed(engine, marker_key):
+            logger.info(
+                "Cold-boot reconciliation skipped; revision marker %r already set.",
+                marker_key,
+            )
+            return
+
         try:
             async with lease_leadership(
                 engine,
@@ -206,7 +215,19 @@ class _ColdBootReconciliationService:
                         "holds the fleet lease."
                     )
                     return
+                if marker_key and await _cold_boot_revision_completed(
+                    engine,
+                    marker_key,
+                ):
+                    logger.info(
+                        "Cold-boot reconciliation skipped after lease; "
+                        "revision marker %r already set.",
+                        marker_key,
+                    )
+                    return
                 await run_cold_boot(engine, probe=_ColdBootMemoryProbe())
+                if marker_key:
+                    await _mark_cold_boot_revision_completed(engine, marker_key)
         except Exception:
             logger.error(
                 "Cold-boot reconciliation failed; some presets or IdP config "
@@ -217,6 +238,65 @@ class _ColdBootReconciliationService:
             logger.info(
                 "--- [main.py] Cold-boot reconciliation complete (background). ---"
             )
+
+
+def _cold_boot_revision_marker_key() -> Optional[str]:
+    """Return the shared-property key that makes cold boot once-per-revision.
+
+    Cloud Run provides ``K_SERVICE`` and ``K_REVISION``. Outside Cloud Run we do
+    not set a durable marker: without a revision identity, a DB marker could
+    incorrectly suppress cold-boot self-heal across ordinary local/on-prem
+    restarts.
+    """
+    service = os.getenv("K_SERVICE")
+    revision = os.getenv("K_REVISION")
+    if not service or not revision:
+        return None
+    return f"platform.cold_boot_reconciliation.completed.{service}.{revision}"
+
+
+async def _cold_boot_revision_completed(engine: Any, marker_key: str) -> bool:
+    from dynastore.modules.db_config.query_executor import (
+        DQLQuery,
+        ResultHandler,
+        managed_transaction,
+    )
+
+    try:
+        async with managed_transaction(engine) as conn:
+            value = await DQLQuery(
+                "SELECT key_value FROM catalog.shared_properties "
+                "WHERE key_name = :key_name",
+                result_handler=ResultHandler.SCALAR_ONE_OR_NONE,
+            ).execute(conn, key_name=marker_key)
+            return value == "true"
+    except Exception as exc:
+        logger.debug(
+            "Cold-boot revision marker read failed for %r (%s); proceeding.",
+            marker_key,
+            exc,
+        )
+        return False
+
+
+async def _mark_cold_boot_revision_completed(engine: Any, marker_key: str) -> None:
+    from dynastore.modules.db_config.query_executor import (
+        DQLQuery,
+        ResultHandler,
+        managed_transaction,
+    )
+
+    async with managed_transaction(engine) as conn:
+        await DQLQuery(
+            """
+            INSERT INTO catalog.shared_properties (key_name, key_value, owner_code)
+            VALUES (:key_name, 'true', 'cold_boot_reconciliation')
+            ON CONFLICT (key_name) DO UPDATE SET
+                key_value = EXCLUDED.key_value,
+                owner_code = EXCLUDED.owner_code;
+            """,
+            result_handler=ResultHandler.ROWCOUNT,
+        ).execute(conn, key_name=marker_key)
 
 
 class _ColdBootMemoryProbe:

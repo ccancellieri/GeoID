@@ -69,16 +69,42 @@ def _service_context(engine) -> ServiceContext:
     )
 
 
+def _set_revision_marker_key(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "dynastore.main._cold_boot_revision_marker_key",
+        lambda: "platform.cold_boot_reconciliation.completed.test.revision",
+    )
+
+
 @pytest.mark.asyncio
 async def test_cold_boot_reconciliation_runs_once_when_lease_acquired(monkeypatch):
     lease_calls = []
     run_calls = []
+    marker_calls = []
     engine = object()
 
     async def _fake_run_cold_boot(run_engine, *, probe=None):
         run_calls.append((run_engine, probe))
 
+    async def _marker_exists(run_engine, marker_key):
+        marker_calls.append(("exists", run_engine, marker_key))
+        return False
+
+    async def _mark_complete(run_engine, marker_key):
+        marker_calls.append(("mark", run_engine, marker_key))
+
+    _set_revision_marker_key(monkeypatch)
     monkeypatch.setattr(cold_boot_module, "run_cold_boot", _fake_run_cold_boot)
+    monkeypatch.setattr(
+        "dynastore.main._cold_boot_revision_completed",
+        _marker_exists,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "dynastore.main._mark_cold_boot_revision_completed",
+        _mark_complete,
+        raising=False,
+    )
     monkeypatch.setattr(
         "dynastore.modules.db_config.locking_tools.lease_leadership",
         _lease_leadership_stub(True, lease_calls),
@@ -93,18 +119,38 @@ async def test_cold_boot_reconciliation_runs_once_when_lease_acquired(monkeypatc
     assert len(run_calls) == 1
     assert run_calls[0][0] is engine
     assert isinstance(run_calls[0][1], _ColdBootMemoryProbe)
+    assert [call[0] for call in marker_calls] == ["exists", "exists", "mark"]
 
 
 @pytest.mark.asyncio
 async def test_cold_boot_reconciliation_skips_when_lease_not_acquired(monkeypatch):
     lease_calls = []
     run_calls = []
+    marker_calls = []
     engine = object()
 
     async def _fake_run_cold_boot(run_engine, *, probe=None):
         run_calls.append((run_engine, probe))
 
+    async def _marker_exists(run_engine, marker_key):
+        marker_calls.append(("exists", run_engine, marker_key))
+        return False
+
+    async def _mark_complete(run_engine, marker_key):
+        marker_calls.append(("mark", run_engine, marker_key))
+
+    _set_revision_marker_key(monkeypatch)
     monkeypatch.setattr(cold_boot_module, "run_cold_boot", _fake_run_cold_boot)
+    monkeypatch.setattr(
+        "dynastore.main._cold_boot_revision_completed",
+        _marker_exists,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "dynastore.main._mark_cold_boot_revision_completed",
+        _mark_complete,
+        raising=False,
+    )
     monkeypatch.setattr(
         "dynastore.modules.db_config.locking_tools.lease_leadership",
         _lease_leadership_stub(False, lease_calls),
@@ -115,6 +161,49 @@ async def test_cold_boot_reconciliation_skips_when_lease_not_acquired(monkeypatc
 
     assert len(lease_calls) == 1
     assert run_calls == []
+    assert [call[0] for call in marker_calls] == ["exists"]
+
+
+@pytest.mark.asyncio
+async def test_cold_boot_reconciliation_skips_when_revision_marker_exists(monkeypatch):
+    lease_calls = []
+    run_calls = []
+    marker_calls = []
+    engine = object()
+
+    async def _fake_run_cold_boot(run_engine, *, probe=None):
+        run_calls.append((run_engine, probe))
+
+    async def _marker_exists(run_engine, marker_key):
+        marker_calls.append(("exists", run_engine, marker_key))
+        return True
+
+    async def _mark_complete(run_engine, marker_key):
+        marker_calls.append(("mark", run_engine, marker_key))
+
+    _set_revision_marker_key(monkeypatch)
+    monkeypatch.setattr(cold_boot_module, "run_cold_boot", _fake_run_cold_boot)
+    monkeypatch.setattr(
+        "dynastore.main._cold_boot_revision_completed",
+        _marker_exists,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "dynastore.main._mark_cold_boot_revision_completed",
+        _mark_complete,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "dynastore.modules.db_config.locking_tools.lease_leadership",
+        _lease_leadership_stub(True, lease_calls),
+    )
+
+    service = _ColdBootReconciliationService(engine=engine)
+    await service.run(_service_context(engine))
+
+    assert lease_calls == []
+    assert run_calls == []
+    assert [call[0] for call in marker_calls] == ["exists"]
 
 
 def test_cold_boot_reconciliation_runs_after_startup_not_before(monkeypatch):
@@ -122,6 +211,7 @@ def test_cold_boot_reconciliation_runs_after_startup_not_before(monkeypatch):
     release = threading.Event()
     finished = threading.Event()
     lease_calls = []
+    marker_complete = False
 
     async def _blocking_run_cold_boot(engine, *, probe=None):
         assert probe is not None
@@ -133,7 +223,25 @@ def test_cold_boot_reconciliation_runs_after_startup_not_before(monkeypatch):
         await loop.run_in_executor(None, release.wait, 10)
         finished.set()
 
+    async def _marker_exists(run_engine, marker_key):
+        return marker_complete
+
+    async def _mark_complete(run_engine, marker_key):
+        nonlocal marker_complete
+        marker_complete = True
+
+    _set_revision_marker_key(monkeypatch)
     monkeypatch.setattr(cold_boot_module, "run_cold_boot", _blocking_run_cold_boot)
+    monkeypatch.setattr(
+        "dynastore.main._cold_boot_revision_completed",
+        _marker_exists,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "dynastore.main._mark_cold_boot_revision_completed",
+        _mark_complete,
+        raising=False,
+    )
     monkeypatch.setattr(
         "dynastore.modules.db_config.locking_tools.lease_leadership",
         _lease_leadership_stub(True, lease_calls),
