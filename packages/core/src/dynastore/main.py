@@ -19,7 +19,7 @@
 import logging
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any, Optional, Union
+from typing import Any, Optional
 import asyncio
 import json
 import uuid
@@ -42,7 +42,6 @@ from dynastore.modules.concurrency import set_concurrency_backend
 from dynastore.tools.background_service import (
     BackgroundSupervisor,
     Leadership,
-    LeaseRenewalMode,
     PodPolicy,
     ServiceContext,
 )
@@ -165,17 +164,17 @@ class _ColdBootReconciliationService:
     full-fleet deploy against a DB with many catalogs could grind past the
     Cloud Run startup-probe window entirely.
 
-    Submitted as a delayed leader-only background task instead: the process
-    reaches readiness before this work starts, and only one pod in the fleet
-    runs the pipeline at a time. The contributor-local advisory locks still
-    provide per-contributor single-flight safety.
+    Submitted as a delayed one-shot background task instead: each process
+    reaches readiness before this work starts, then makes one fleet-level lease
+    attempt. Only the winner runs the pipeline, and followers return without
+    retrying. The contributor-local advisory locks still provide
+    per-contributor single-flight safety.
     """
 
     name = "cold_boot_reconciliation"
-    leadership = Leadership.LEADER_ONLY
+    leadership = Leadership.RUN_EVERYWHERE
     pod_policy = PodPolicy.ALL
-    lock_key: Optional[Union[int, str]] = "dynastore.cold_boot_reconciliation"
-    lease_renewal_mode = LeaseRenewalMode.PER_TICK
+    lock_key: Optional[str] = None
     initial_delay_seconds = _env_float(
         "DYNASTORE_COLD_BOOT_INITIAL_DELAY_SECONDS",
         30.0,
@@ -185,15 +184,33 @@ class _ColdBootReconciliationService:
         self._engine = engine
 
     async def run(self, ctx: ServiceContext) -> None:
+        from dynastore.modules.db_config.locking_tools import lease_leadership
         from dynastore.modules.presets.cold_boot import run_cold_boot
+
+        engine = self._engine if self._engine is not None else ctx.engine
+        if engine is None:
+            logger.info(
+                "Cold-boot reconciliation skipped; no database engine is available."
+            )
+            return
+
         try:
-            await run_cold_boot(self._engine, probe=_ColdBootMemoryProbe())
+            async with lease_leadership(
+                engine,
+                "dynastore.cold_boot_reconciliation",
+                name=self.name,
+            ) as (is_leader, _lock_conn):
+                if not is_leader:
+                    logger.info(
+                        "Cold-boot reconciliation skipped; another process "
+                        "holds the fleet lease."
+                    )
+                    return
+                await run_cold_boot(engine, probe=_ColdBootMemoryProbe())
         except Exception:
-            # run_cold_boot is documented to never raise; this is a last-resort
-            # guard so a future contributor's bug can't kill the task silently.
             logger.error(
-                "Cold-boot reconciliation raised an unexpected error; some "
-                "presets or IdP config may not be seeded.",
+                "Cold-boot reconciliation failed; some presets or IdP config "
+                "may not be seeded.",
                 exc_info=True,
             )
         else:

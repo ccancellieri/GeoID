@@ -31,6 +31,7 @@ safety.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import logging
 import threading
 from types import SimpleNamespace
@@ -40,20 +41,87 @@ import pytest
 
 import dynastore.modules.presets.cold_boot as cold_boot_module
 from dynastore.main import app, _ColdBootMemoryProbe, _ColdBootReconciliationService
-from dynastore.tools.background_service import Leadership
+from dynastore.tools.background_service import Leadership, ServiceContext
 from dynastore.tools.memory_watchdog import MemoryWatchdogConfig
 
 
-def test_cold_boot_reconciliation_is_delayed_leader_only():
-    assert _ColdBootReconciliationService.leadership is Leadership.LEADER_ONLY
-    assert _ColdBootReconciliationService.lock_key == "dynastore.cold_boot_reconciliation"
+def test_cold_boot_reconciliation_is_delayed_one_shot():
+    assert _ColdBootReconciliationService.leadership is Leadership.RUN_EVERYWHERE
+    assert _ColdBootReconciliationService.lock_key is None
     assert _ColdBootReconciliationService.initial_delay_seconds > 0
+
+
+def _lease_leadership_stub(is_leader: bool, calls: list[tuple[tuple, dict]]):
+    @asynccontextmanager
+    async def _lease(*args, **kwargs):
+        calls.append((args, kwargs))
+        yield is_leader, None
+
+    return _lease
+
+
+def _service_context(engine) -> ServiceContext:
+    return ServiceContext(
+        engine=engine,
+        shutdown=asyncio.Event(),
+        is_ephemeral=False,
+        name="test",
+    )
+
+
+@pytest.mark.asyncio
+async def test_cold_boot_reconciliation_runs_once_when_lease_acquired(monkeypatch):
+    lease_calls = []
+    run_calls = []
+    engine = object()
+
+    async def _fake_run_cold_boot(run_engine, *, probe=None):
+        run_calls.append((run_engine, probe))
+
+    monkeypatch.setattr(cold_boot_module, "run_cold_boot", _fake_run_cold_boot)
+    monkeypatch.setattr(
+        "dynastore.modules.db_config.locking_tools.lease_leadership",
+        _lease_leadership_stub(True, lease_calls),
+    )
+
+    service = _ColdBootReconciliationService(engine=engine)
+    await service.run(_service_context(engine))
+
+    assert len(lease_calls) == 1
+    assert lease_calls[0][0][0] is engine
+    assert lease_calls[0][0][1] == "dynastore.cold_boot_reconciliation"
+    assert len(run_calls) == 1
+    assert run_calls[0][0] is engine
+    assert isinstance(run_calls[0][1], _ColdBootMemoryProbe)
+
+
+@pytest.mark.asyncio
+async def test_cold_boot_reconciliation_skips_when_lease_not_acquired(monkeypatch):
+    lease_calls = []
+    run_calls = []
+    engine = object()
+
+    async def _fake_run_cold_boot(run_engine, *, probe=None):
+        run_calls.append((run_engine, probe))
+
+    monkeypatch.setattr(cold_boot_module, "run_cold_boot", _fake_run_cold_boot)
+    monkeypatch.setattr(
+        "dynastore.modules.db_config.locking_tools.lease_leadership",
+        _lease_leadership_stub(False, lease_calls),
+    )
+
+    service = _ColdBootReconciliationService(engine=engine)
+    await service.run(_service_context(engine))
+
+    assert len(lease_calls) == 1
+    assert run_calls == []
 
 
 def test_cold_boot_reconciliation_runs_after_startup_not_before(monkeypatch):
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
+    lease_calls = []
 
     async def _blocking_run_cold_boot(engine, *, probe=None):
         assert probe is not None
@@ -66,6 +134,10 @@ def test_cold_boot_reconciliation_runs_after_startup_not_before(monkeypatch):
         finished.set()
 
     monkeypatch.setattr(cold_boot_module, "run_cold_boot", _blocking_run_cold_boot)
+    monkeypatch.setattr(
+        "dynastore.modules.db_config.locking_tools.lease_leadership",
+        _lease_leadership_stub(True, lease_calls),
+    )
     monkeypatch.setattr(_ColdBootReconciliationService, "initial_delay_seconds", 0.0)
 
     # TestClient's context manager drives the ASGI lifespan startup to
@@ -88,6 +160,7 @@ def test_cold_boot_reconciliation_runs_after_startup_not_before(monkeypatch):
 
         release.set()
         assert finished.wait(5), "reconciliation never completed after being released"
+        assert len(lease_calls) == 1
 
 
 @pytest.mark.asyncio
