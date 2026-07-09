@@ -6,7 +6,17 @@ name: Tag Version
 #
 # Triggers:
 #   - push to main (PR merges + direct commits)
-#   - workflow_dispatch (manual major/minor bump)
+#   - workflow_dispatch (manual major/minor bump; main only — guarded below)
+#
+# Branch policy: ONLY main is auto-tagged. Release branches (e.g. stable)
+# are tagged manually by their maintainer using the branch-prefixed form
+#   stable-v0.20.83, stable-v0.20.83.1, ...
+# Never put a bare v* tag on a release branch: the bump step finds the
+# latest version via `--match 'v[0-9]*'`, so a bare 4-component tag like
+# v0.20.83.1 would be picked up (and break MAJOR.MINOR.PATCH parsing) if
+# the branch is ever merged back into main. The stable-v prefix keeps
+# release-branch tags invisible to this workflow while setuptools-scm on
+# that branch still versions from the last reachable v* tag.
 on:
   push:
     branches: [main]
@@ -29,6 +39,18 @@ jobs:
     permissions:
       contents: write
     steps:
+      # workflow_dispatch checks out `ref: main` regardless of the branch the
+      # run was launched from, so a dispatch from stable would silently bump
+      # MAIN's version. Fail loudly instead of surprising the maintainer.
+      - name: Refuse dispatch from non-main branches
+        if: github.event_name == 'workflow_dispatch' && github.ref_name != 'main'
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          echo "::error::Tag Version only auto-tags main (dispatched from '$REF_NAME')." \
+               "Release branches are tagged manually, e.g. stable-v0.20.83.1 — see the header comment."
+          exit 1
+
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
