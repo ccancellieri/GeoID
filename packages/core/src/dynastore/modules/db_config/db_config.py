@@ -484,4 +484,6 @@ class DBConfig:
         return gap
 
     def __repr__(self) -> str:
-        return class_tools.__repr__(self, sensitive_attrs=["database_url"])
+        return class_tools.__repr__(
+            self, sensitive_attrs=["database_url", "listen_database_url"]
+        )

@@ -55,6 +55,7 @@ from dynastore.modules.db_config.tools import (
     get_config,
     normalize_db_url,
 )
+from dynastore.tools.redact import redact_for_log
 
 from dynastore.models.protocols import DatabaseProtocol
 
@@ -251,7 +252,8 @@ class DBService(ModuleProtocol, DatabaseProtocol):
             try:
                 if not existing_engine:
                     logger.info(
-                        f"DBService: Using DB configuration: {db_config.database_url}"
+                        "DBService: Using DB configuration: %s",
+                        redact_for_log(db_config.database_url, key="database_url"),
                     )
 
                     # Tag every wire-level connection with the logical service
@@ -429,7 +431,8 @@ class DBService(ModuleProtocol, DatabaseProtocol):
                         pg_pool_signal_provider = None
             except Exception as e:
                 logger.critical(
-                    f"DBService: FATAL: Failed to create database connection pool: {e}",
+                    "DBService: FATAL: Failed to create database connection pool: %s",
+                    redact_for_log(e),
                     exc_info=True,
                 )
                 raise
@@ -442,7 +445,8 @@ class DBService(ModuleProtocol, DatabaseProtocol):
                 # creation, so it must not be relabelled as a connection-pool
                 # creation failure (that misleads operators during shutdown).
                 logger.critical(
-                    f"DBService: Error during database service runtime or shutdown: {e}",
+                    "DBService: Error during database service runtime or shutdown: %s",
+                    redact_for_log(e),
                     exc_info=True,
                 )
                 raise

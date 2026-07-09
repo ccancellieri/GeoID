@@ -53,6 +53,7 @@ from dynastore.tools.memory_watchdog import (
     read_process_rss_bytes,
     resolve_watchdog_budget_mb,
 )
+from dynastore.tools.redact import RedactingLogFilter, redact_for_log
 from dynastore.tools.serving_state import is_draining
 
 # Register the scaling PluginConfig at the composition root so its class_key is
@@ -98,7 +99,16 @@ class _JsonFormatter(logging.Formatter):
             "correlation_id": getattr(record, "correlation_id", None),
         }
         if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
+            # A raw traceback isn't reached by RedactingLogFilter (it only
+            # rewrites record.msg/args before formatting) and its final
+            # line renders the exception's own str() — the same text a
+            # `raise ... from e` connection error can carry a DSN in.
+            # Scrub it the same way (URI-userinfo only; no key context is
+            # available in free-form traceback text) before it leaves the
+            # process (geoid#3132).
+            payload["exception"] = redact_for_log(
+                self.formatException(record.exc_info)
+            )
         return json.dumps(payload)
 
 
@@ -123,6 +133,12 @@ log_level = getattr(logging, log_level_name, logging.INFO)
 _handler = logging.StreamHandler(sys.stdout)
 _handler.setFormatter(_JsonFormatter())
 _handler.addFilter(_CorrelationFilter())
+# Second-layer credential redaction (geoid#3132): scrubs any record that
+# reaches this handler still carrying a raw connection-URI-class secret,
+# even if the emitting call site forgot to redact it before logging. See
+# dynastore.tools.redact for the full recursive helper call sites should
+# use proactively.
+_handler.addFilter(RedactingLogFilter())
 logging.root.setLevel(log_level)
 logging.root.handlers = [_handler]
 
