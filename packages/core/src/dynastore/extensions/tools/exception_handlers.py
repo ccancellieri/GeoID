@@ -340,6 +340,58 @@ class TimeoutErrorExceptionHandler(ExceptionHandler):
         )
 
 
+_LOCK_NOT_AVAILABLE_PGCODE = "55P03"
+
+
+class LockNotAvailableExceptionHandler(ExceptionHandler):
+    """Maps a PG lock-not-available error (pgcode 55P03) to HTTP 503 + Retry-After.
+
+    Caught live on dev during a geometry-stats backfill: the backfill's DDL
+    held a lock on the gaul geometries table and every uncached tile render
+    that queued behind it hit ``asyncpg.exceptions.LockNotAvailableError``
+    once its statement's ``lock_timeout`` (#3203 raised the render statement
+    timeout to 60s, well past the backfill window) elapsed. Wrapped by
+    ``query_executor._handle_db_exception`` as a plain ``QueryExecutionError``
+    (55P03 has no entry in ``PGCODE_EXCEPTION_MAP``), it fell through to the
+    generic ``DatabaseErrorHandler`` below as an opaque 500 -- read by
+    clients as a code bug rather than the transient lock contention it is
+    (DDL window, vacuum, backfill, lock queue).
+
+    A lock timeout is retryable by definition: the row/table will free up
+    once the blocking transaction commits or the DDL window closes. This
+    handler pulls it into the same transient-dependency 503 family as
+    ``PoolSaturationExceptionHandler`` and ``TimeoutErrorExceptionHandler``
+    instead of leaving it to the generic 500 fallback. Reuses
+    ``_extract_pgcode`` -- the same wrapped-exception-chain walk
+    ``DatabaseErrorHandler`` already uses for its pgcode log hint -- so no
+    new unwrap logic is introduced. Registered ahead of ``DatabaseErrorHandler``
+    so this more specific mapping wins.
+
+    Query execution itself is untouched here; only the exception's outcome
+    at the HTTP boundary changes.
+    """
+
+    def can_handle(self, exception: Exception) -> bool:
+        from dynastore.modules.db_config.exceptions import DatabaseError
+
+        if not isinstance(exception, DatabaseError):
+            return False
+        original = getattr(exception, "original_exception", None)
+        if type(original).__name__ == "LockNotAvailableError":
+            return True
+        return _extract_pgcode(exception) == _LOCK_NOT_AVAILABLE_PGCODE
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        logger.warning("Lock-not-available (55P03) reached the HTTP boundary: %s", exception)
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database lock contention, try again shortly.",
+            headers={"Retry-After": "5"},
+        )
+
+
 class DatabaseErrorHandler(ExceptionHandler):
     """Handles database errors with a sanitized HTTP response.
 
@@ -1080,6 +1132,7 @@ class ExceptionHandlerRegistry:
         self.register(TableNotFoundExceptionHandler())  # 404 — missing PG hub table, not a server error
         self.register(PoolSaturationExceptionHandler())  # 503 — bounded pool-acquire timeout (#1894)
         self.register(TimeoutErrorExceptionHandler())  # 503 — bare TimeoutError, starved dependency wait
+        self.register(LockNotAvailableExceptionHandler())  # 503 — PG lock-not-available (55P03), transient lock contention
         self.register(DatabaseErrorHandler())  # Surface original DB exception details for better debugging
         self.register(ValidationExceptionHandler())  # Generic - must be last
 
