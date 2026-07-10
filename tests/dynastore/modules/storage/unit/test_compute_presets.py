@@ -25,7 +25,6 @@ from dynastore.modules.storage.compute_presets import (
 from dynastore.modules.storage.computed_fields import (
     ComputedField,
     ComputedKind,
-    StatisticStorageMode,
 )
 
 
@@ -161,39 +160,3 @@ def test_list_of_computed_fields_passthrough():
         ComputedField(kind=ComputedKind.BBOX),
     ]
     assert _kinds(resolve_compute(fields)) == {ComputedKind.AREA, ComputedKind.BBOX}
-
-
-def test_geometry_density_is_columnar_indexed_vertex_count():
-    """geometry_density materialises vertex_count as its own indexed column.
-
-    Unlike the other presets, this one DOES set the storage shape: its whole
-    purpose is a filterable column for the tiles density ceiling
-    (TilesConfig.feature_density_column), which JSONB storage cannot serve.
-    """
-    fields = resolve_compute("geometry_density")
-    assert len(fields) == 1
-    (cf,) = fields
-    assert cf.kind == ComputedKind.VERTEX_COUNT
-    assert cf.storage_mode == StatisticStorageMode.COLUMNAR
-    assert cf.indexed is True
-    # The tiles config points feature_density_column at this exact name.
-    assert cf.resolved_name == "vertex_count"
-
-
-def test_geometry_density_composes_with_geometry_full():
-    """Appending geometry_density upgrades geometry_full's vertex_count in place.
-
-    Last-wins dedupe by resolved_name must leave exactly one vertex_count
-    entry — the columnar+indexed one — while every other geometry_full
-    derivation survives untouched.
-    """
-    fields = resolve_compute(["geometry_full", "geometry_density"])
-    vertex = [cf for cf in fields if cf.kind == ComputedKind.VERTEX_COUNT]
-    assert len(vertex) == 1
-    assert vertex[0].storage_mode == StatisticStorageMode.COLUMNAR
-    assert vertex[0].indexed is True
-    assert _kinds(fields) == _kinds(resolve_compute("geometry_full"))
-
-
-def test_geometry_density_registered():
-    assert "geometry_density" in list_compute_presets()

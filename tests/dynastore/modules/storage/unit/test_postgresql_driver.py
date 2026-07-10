@@ -22,9 +22,18 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from dynastore.modules.storage.drivers.postgresql import ItemsPostgresqlDriver
+from dynastore.modules.storage.drivers.postgresql import (
+    ItemsPostgresqlDriver,
+    _stored_stats_from_config,
+)
 from dynastore.models.ogc import Feature
+from dynastore.models.protocols.storage_driver import Capability, StoredStatsProvider
 from dynastore.models.query_builder import QueryRequest
+from dynastore.modules.storage.computed_fields import (
+    ComputedField,
+    ComputedKind,
+    StatisticStorageMode,
+)
 from dynastore.modules.storage.errors import SoftDeleteNotSupportedError
 from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
 
@@ -737,3 +746,97 @@ class TestLocation:
             mock_gp.side_effect = side_effect
             with pytest.raises(ValueError, match="No physical_table configured"):
                 await driver.location("cat1", "col1")
+
+
+class _StubSidecar:
+    """Minimal sidecar-config stand-in exposing only ``compute_fields_overlay``.
+
+    Deliberately not a ``GeometriesSidecarConfig``/``FeatureAttributeSidecarConfig``
+    instance — ``_stored_stats_from_config`` walks sidecars structurally
+    (``getattr``) so it works for either without importing their classes.
+    """
+
+    def __init__(self, compute_fields_overlay):
+        self.compute_fields_overlay = compute_fields_overlay
+
+
+class _StubDriverConfig:
+    """Minimal driver-config stand-in exposing only ``sidecars``."""
+
+    def __init__(self, sidecars):
+        self.sidecars = sidecars
+
+
+class TestStoredStatsFromConfig:
+    """``_stored_stats_from_config`` walks ``driver_cfg.sidecars`` ->
+    ``compute_fields_overlay``, keeping only storage-bearing entries."""
+
+    def test_filters_storage_mode_none_and_preserves_order(self):
+        vertex_count = ComputedField(
+            kind=ComputedKind.VERTEX_COUNT,
+            storage_mode=StatisticStorageMode.COLUMNAR,
+            indexed=True,
+        )
+        z_range = ComputedField(
+            kind=ComputedKind.Z_RANGE, storage_mode=StatisticStorageMode.COLUMNAR,
+        )
+        compute_only = ComputedField(kind=ComputedKind.AREA)  # storage_mode=None
+        geometries_sidecar = _StubSidecar([vertex_count, z_range, compute_only])
+
+        population = ComputedField(
+            kind=ComputedKind.ATTRIBUTE_STAT,
+            source="properties.population",
+            storage_mode=StatisticStorageMode.COLUMNAR,
+        )
+        attributes_sidecar = _StubSidecar([population])
+
+        driver_cfg = _StubDriverConfig([geometries_sidecar, attributes_sidecar])
+
+        assert _stored_stats_from_config(driver_cfg) == [vertex_count, z_range, population]
+
+    def test_no_sidecars_returns_empty(self):
+        assert _stored_stats_from_config(_StubDriverConfig([])) == []
+        assert _stored_stats_from_config(_StubDriverConfig(None)) == []
+
+    def test_sidecar_without_overlay_attribute_is_skipped(self):
+        driver_cfg = _StubDriverConfig([object()])
+        assert _stored_stats_from_config(driver_cfg) == []
+
+
+class TestStoredStats:
+    """``ItemsPostgresqlDriver.stored_stats`` — the async wrapper around
+    ``_stored_stats_from_config``."""
+
+    def test_declares_stored_stats_capability(self):
+        assert Capability.STORED_STATS in ItemsPostgresqlDriver().capabilities
+
+    def test_satisfies_stored_stats_provider_protocol(self):
+        assert isinstance(ItemsPostgresqlDriver(), StoredStatsProvider)
+
+    @pytest.mark.asyncio
+    async def test_stored_stats_delegates_to_helper(self):
+        driver = ItemsPostgresqlDriver()
+        vertex_count = ComputedField(
+            kind=ComputedKind.VERTEX_COUNT,
+            storage_mode=StatisticStorageMode.COLUMNAR,
+        )
+        driver_cfg = _StubDriverConfig([_StubSidecar([vertex_count])])
+
+        with patch.object(
+            driver, "_get_effective_driver_config",
+            new_callable=AsyncMock, return_value=driver_cfg,
+        ):
+            stats = await driver.stored_stats("cat1", "col1", db_resource=object())
+
+        assert stats == [vertex_count]
+
+    @pytest.mark.asyncio
+    async def test_stored_stats_returns_empty_on_config_error(self):
+        driver = ItemsPostgresqlDriver()
+        with patch.object(
+            driver, "_get_effective_driver_config",
+            new_callable=AsyncMock, side_effect=RuntimeError("boom"),
+        ):
+            stats = await driver.stored_stats("cat1", "col1")
+
+        assert stats == []

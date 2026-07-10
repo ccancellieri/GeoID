@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, ClassVar, Dict, FrozenSet,
 if TYPE_CHECKING:
     from dynastore.modules.storage.storage_location import StorageLocation
     from dynastore.modules.storage.driver_config import ItemsWritePolicy
+    from dynastore.modules.storage.computed_fields import ComputedField
 
 from dynastore.models.ogc import Feature, FeatureCollection
 from dynastore.models.driver_context import DriverContext
@@ -88,6 +89,24 @@ async def _resolve_stac_items_pg(
         return False
 
 
+def _stored_stats_from_config(driver_cfg: Any) -> "List[ComputedField]":
+    """Collect every storage-bearing statistic from a driver config's sidecars.
+
+    Walks ``driver_cfg.sidecars`` and, for each one, its
+    ``compute_fields_overlay`` — the same attribute name on both the
+    geometries and attributes sidecar configs — keeping only entries whose
+    ``storage_mode`` is set (materialised to a column/JSONB key rather than
+    compute-only). Order is preserved: sidecar order, then overlay order
+    within each sidecar.
+    """
+    stats: List["ComputedField"] = []
+    for sidecar in getattr(driver_cfg, "sidecars", None) or []:
+        for field in getattr(sidecar, "compute_fields_overlay", None) or []:
+            if field.storage_mode is not None:
+                stats.append(field)
+    return stats
+
+
 class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProtocol):
     """PostgreSQL storage driver — delegates to existing ItemsProtocol.
 
@@ -127,6 +146,7 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         Capability.QUERY_FALLBACK_SOURCE,
         Capability.BULK_COPY,
         Capability.WRITE_ID_CHUNK_READ,
+        Capability.STORED_STATS,
     })
     preferred_for: FrozenSet[Hint] = frozenset({Hint.FEATURES, Hint.WRITE, Hint.GEOMETRY_EXACT})
     supported_hints: FrozenSet[Hint] = frozenset({
@@ -1457,6 +1477,33 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
             return []
         async with managed_transaction(db_proto.engine) as conn:
             return await _query(conn)
+
+    async def stored_stats(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        *,
+        db_resource: Optional[Any] = None,
+    ) -> "List[ComputedField]":
+        """Enumerate the storage-bearing per-feature statistics for this
+        collection.
+
+        Resolves the effective driver config (geometry and attribute
+        sidecars alike) and delegates to ``_stored_stats_from_config``. A
+        discovery read must never raise: any failure resolving the config
+        is logged at debug and yields an empty list.
+        """
+        try:
+            driver_cfg = await self._get_effective_driver_config(
+                catalog_id, collection_id, db_resource=db_resource,
+            )
+            return _stored_stats_from_config(driver_cfg)
+        except Exception:
+            logger.debug(
+                "stored_stats: could not resolve driver config for %s/%s",
+                catalog_id, collection_id, exc_info=True,
+            )
+            return []
 
     async def get_entity_fields(
         self,

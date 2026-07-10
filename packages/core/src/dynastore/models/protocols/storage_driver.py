@@ -62,6 +62,7 @@ from dynastore.models.query_builder import QueryRequest
 
 if TYPE_CHECKING:
     from dynastore.models.protocols.field_definition import FieldDefinition
+    from dynastore.modules.storage.computed_fields import ComputedField
     from dynastore.modules.storage.hints import Hint
     from dynastore.modules.storage.storage_location import StorageLocation
 
@@ -126,6 +127,14 @@ class Capability:
 
     # --- Analytics & introspection ---
     INTROSPECTION = "introspection"  # schema discovery (field names, types)
+
+    # --- Stored statistics introspection ---
+    STORED_STATS = "stored_stats"
+    # Driver can enumerate the stored, query-addressable per-feature
+    # statistics it materialises for a collection, together with their
+    # physical field names. Backend-neutral discovery point for callers
+    # (e.g. tile rendering) that want to bind to a stored statistic
+    # without hardcoding any driver-specific column/table shape.
 
     # --- Storage location & addressing ---
     PHYSICAL_ADDRESSING = "physical_addressing"
@@ -571,6 +580,26 @@ class WriteIdChunkReadablePrimary(Protocol):
         db_resource: Optional[Any] = None,
     ) -> tuple[List[str], Optional[str]]:
         """Return one tombstoned-geoid page for ``write_id`` ordered by geoid."""
+        ...
+
+
+@runtime_checkable
+class StoredStatsProvider(Protocol):
+    """Optional capability for drivers that can enumerate the storage-bearing
+    per-feature statistics they materialise for a collection."""
+
+    async def stored_stats(
+        self, catalog_id: str, collection_id: str, *, db_resource: Any = None,
+    ) -> "List[ComputedField]":
+        """Return the stored, query-addressable per-feature statistics for
+        this collection.
+
+        Each entry is a geometry, JSON-FG place, or attribute statistic
+        materialised for the collection — ``kind`` identifies which
+        derivation, ``resolved_name`` is the physical field/column name,
+        ``storage_mode`` and ``indexed`` describe how it is stored. Empty
+        list when the collection stores none.
+        """
         ...
 
 

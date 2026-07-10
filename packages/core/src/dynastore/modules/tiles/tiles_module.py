@@ -61,6 +61,8 @@ from dynastore.modules.tiles.tiles_config import (
     TilesConfig,
 )
 from dynastore.models.protocols import CatalogsProtocol, DatabaseProtocol
+from dynastore.models.protocols.storage_driver import Capability, StoredStatsProvider
+from dynastore.modules.storage.computed_fields import ComputedKind, StatisticStorageMode
 
 logger = logging.getLogger(__name__)
 
@@ -1135,6 +1137,25 @@ async def get_collection_source_srid(
         return srid
 
 
+def _density_column_from_stats(stats) -> Optional[str]:
+    """Return the physical column name of the first columnar vertex-count stat.
+
+    Scans ``stats`` (as returned by ``StoredStatsProvider.stored_stats``) for
+    the first entry whose ``kind`` is ``ComputedKind.VERTEX_COUNT`` and
+    ``storage_mode`` is ``StatisticStorageMode.COLUMNAR`` — the only shape a
+    WHERE-clause density ceiling can filter on — and returns its
+    ``resolved_name``. Returns None when no such entry exists (e.g. a
+    JSONB-mode vertex_count, or a collection with no vertex_count stat).
+    """
+    for stat in stats:
+        if (
+            stat.kind == ComputedKind.VERTEX_COUNT
+            and stat.storage_mode == StatisticStorageMode.COLUMNAR
+        ):
+            return stat.resolved_name
+    return None
+
+
 @cached(maxsize=1024, ttl=120, jitter=15, namespace="tiles_resolution_params")
 async def get_tile_resolution_params(
     catalog_id: str, collection_id: str
@@ -1288,6 +1309,21 @@ async def get_tile_resolution_params(
             col_config = await driver.get_driver_config(
                 catalog_id, collection_id, db_resource=conn
             )
+
+        # 5. Auto-discover a density-ceiling column from the driver's stored
+        # statistics when the operator hasn't pointed feature_density_column
+        # at one explicitly — explicit config always wins. Backend-neutral:
+        # any driver that implements StoredStatsProvider and advertises
+        # Capability.STORED_STATS can serve this, not only PostgreSQL.
+        if (
+            feature_density_column is None
+            and Capability.STORED_STATS in getattr(driver, "capabilities", frozenset())
+            and isinstance(driver, StoredStatsProvider)
+        ):
+            stats = await driver.stored_stats(
+                catalog_id, collection_id, db_resource=conn,
+            )
+            feature_density_column = _density_column_from_stats(stats)
 
         return {
             "phys_schema": phys_schema,

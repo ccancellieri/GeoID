@@ -20,10 +20,8 @@
 
 A collection can request a common bundle of computed fields with a short
 string (e.g. ``"geometry_stats"``) instead of enumerating every
-:class:`ComputedField`. Preset factories generally leave ``storage_mode``
-unset (compute-only; a field is persisted only when its entry sets a
-store). The one deliberate exception is ``"geometry_density"``, whose
-whole point is the physical shape: a filterable ``vertex_count`` column.
+:class:`ComputedField`. Preset factories leave ``storage_mode`` unset
+(compute-only; a field is persisted only when its entry sets a store).
 
 Presets are extensible via :func:`register_compute_preset`. Use
 :func:`resolve_compute` to expand a spec (a preset name, a heterogeneous
@@ -35,7 +33,6 @@ from typing import Callable, List, Union
 from dynastore.modules.storage.computed_fields import (
     ComputedField,
     ComputedKind,
-    StatisticStorageMode,
 )
 
 # Default resolutions for spatial-cell presets. ~150 m geohash-7 / h3-7
@@ -82,25 +79,6 @@ def _geometry_full() -> List[ComputedField]:
     ]
 
 
-def _geometry_density() -> List[ComputedField]:
-    """A filterable per-feature density signal for the tile render path.
-
-    ``vertex_count`` as its own indexed INTEGER column — the shape
-    ``TilesConfig.feature_density_column`` needs (the WHERE-clause ceiling
-    can only reference a real column; a JSONB key is not indexable here).
-    Compose with the compute-only bundles to add the column on top:
-    ``compute: ["geometry_full", "geometry_density"]`` — last-wins dedupe
-    upgrades the ``vertex_count`` entry in place.
-    """
-    return [
-        ComputedField(
-            kind=ComputedKind.VERTEX_COUNT,
-            storage_mode=StatisticStorageMode.COLUMNAR,
-            indexed=True,
-        ),
-    ]
-
-
 def _spatial_cells() -> List[ComputedField]:
     return [
         ComputedField(kind=ComputedKind.GEOHASH, resolution=_DEFAULT_GEOHASH_RES),
@@ -124,7 +102,6 @@ def _all() -> List[ComputedField]:
 register_compute_preset("none", lambda: [])
 register_compute_preset("geometry_stats", _geometry_stats)
 register_compute_preset("geometry_full", _geometry_full)
-register_compute_preset("geometry_density", _geometry_density)
 register_compute_preset("spatial_cells", _spatial_cells)
 register_compute_preset("place_3d", _place_3d)
 register_compute_preset("all", _all)

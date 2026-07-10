@@ -279,11 +279,14 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
         default=None,
         description=(
             "Name of a stored (ideally indexed) numeric column measuring "
-            "per-feature geometry density/heaviness — the computed "
-            "vertex_count geometry stat is the intended use (the "
-            "geometry_density compute preset materialises it as an indexed "
-            "column). Used by max_feature_density_by_zoom as a pre-transform "
-            "ceiling. Default None = no density ceiling."
+            "per-feature geometry density/heaviness, used by "
+            "max_feature_density_by_zoom as a pre-transform ceiling. Unset "
+            "(default) auto-resolves from the collection's stored "
+            "statistics via the driver — the columnar vertex_count stat "
+            "when the collection materialises one. Set explicitly only to "
+            "point the ceiling at a different stored stat column. The "
+            "ceiling itself stays disabled until max_feature_density_by_zoom "
+            "is also configured."
         ),
     )
 
