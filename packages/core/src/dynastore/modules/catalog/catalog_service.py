@@ -990,6 +990,17 @@ class CatalogService(CatalogsProtocol):
         routing to the wrong schema (observed on dev where legacy rows carry
         ``c_…``-shaped external_ids).  Internal-first makes all callers — external
         path-param id or already-resolved internal id — correct.
+
+        Tombstone contract (#3230): every lookup query here filters on
+        ``deleted_at IS NULL``, so a soft-deleted catalog resolves exactly like
+        a missing one — ``allow_missing=False`` (the default) raises
+        ``ValueError``, ``allow_missing=True`` returns ``None``. This is the
+        mechanism collection-level read routes rely on for tombstoned-catalog
+        404s: ``CollectionService`` calls this with ``allow_missing=False``
+        (via its own ``_resolve_physical_schema`` wrapper), and
+        ``extensions.tools.resolvers.resolve_collection_or_404`` catches the
+        resulting ``ValueError`` and maps it to 404. Do not relax the
+        ``deleted_at`` filter without an equivalent guard at that resolver.
         """
         db_resource = ctx.db_resource if ctx else None
         if db_resource:

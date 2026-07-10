@@ -99,8 +99,40 @@ async def resolve_collection_or_404(
     ``.collections`` sub-resource — both expose a compatible
     ``get_collection(catalog_id, collection_id, **kwargs)``. ``**kwargs``
     forwards ``lang=``/``hints=``/``ctx=`` as the call site passes them.
+
+    Tombstoned-catalog contract (#3230): every collection-level read route
+    (OGC Features / STAC / EDR / Records / Volumes collection GET and items
+    listing) reaches its catalog/collection through this one resolver, so
+    it is the shared choke point for keeping a soft-deleted catalog's
+    collections invisible. ``get_collection`` resolves the physical schema
+    via ``resolve_physical_schema(allow_missing=False)``, which filters on
+    ``deleted_at IS NULL`` and raises ``ValueError`` for a tombstoned (or
+    genuinely missing) catalog — caught here and mapped to the same 404 a
+    missing collection gets, rather than left to propagate to the generic
+    ``ValueError``-message-sniffing exception handler. Do not let this
+    ``ValueError`` escape unmapped: a future call site that awaits
+    ``get_collection`` directly (bypassing this resolver) would silently
+    reopen the leak this closes.
+
+    Only a ``"not found"`` ``ValueError`` is treated as the tombstone/missing
+    signal. ``get_collection`` ends in ``Collection.model_validate(...)``, and
+    in Pydantic v2 ``pydantic.ValidationError`` is itself a ``ValueError``
+    subclass (raised by, e.g., a malformed ``Extent``/``SpatialExtent`` field
+    validator) — mapping *every* ``ValueError`` to 404 would mask a genuine
+    data-integrity failure as a missing resource. Mirrors the same
+    ``"not found"`` substring check ``ValidationExceptionHandler`` already
+    uses (``exception_handlers.py``) so a validation failure still surfaces
+    as a 422/500 via that generic handler instead of a misleading 404.
     """
-    collection = await catalogs_svc.get_collection(catalog_id, collection_id, **kwargs)
+    try:
+        collection = await catalogs_svc.get_collection(catalog_id, collection_id, **kwargs)
+    except ValueError as exc:
+        if "not found" not in str(exc).lower():
+            raise
+        raise HTTPException(
+            status_code=404,
+            detail=detail or str(exc),
+        ) from exc
     if not collection:
         raise HTTPException(
             status_code=404,
