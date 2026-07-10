@@ -85,10 +85,35 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
     _policy_service: Optional[PolicyService] = None
     _authorizer: Optional[IamAuthorizer] = None
     _listing_visibility: Optional[Any] = None
+    _identity_provider: Optional[Any] = None
     storage: Optional[AbstractIamStorage] = None
 
     @asynccontextmanager
     async def lifespan(self, app_state: object) -> AsyncGenerator[None, None]:
+        # Per-process OIDC identity-provider registration (#3199). The
+        # provider registry (`tools.discovery`'s in-memory plugin list) is
+        # process-local: every worker process of every instance must
+        # register the provider locally, or `IamMiddleware` sees an empty
+        # provider list and 401s every bearer-token request on that process
+        # regardless of what any other process — including the fleet-once
+        # cold-boot leader picked by `_ColdBootReconciliationService` in
+        # main.py — has done. Runs unconditionally and first, ahead of the
+        # heavier iam-schema / background-service bootstrap below, so a
+        # failure further down never blocks it. `_register_identity_provider`
+        # is idempotent per process (see its docstring), so the later
+        # self-heal call from `IamColdBootContributor` — which still runs
+        # only on the fleet-once leader, after `auth_bootstrap` seeds a
+        # fresh `IdpConfig` row — is safe to also call it.
+        try:
+            await self._register_identity_provider()
+        except Exception:
+            logger.error(
+                "IamModule: per-process OIDC identity provider registration "
+                "failed; token-authenticated requests on this process will "
+                "401 until it succeeds.",
+                exc_info=True,
+            )
+
         from .postgres_iam_storage import PostgresIamStorage
         from .postgres_policy_storage import PostgresPolicyStorage
         from dynastore.modules.db_config.query_executor import managed_transaction
@@ -241,6 +266,9 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
             if self._listing_visibility is not None:
                 unregister_plugin(self._listing_visibility)
                 self._listing_visibility = None
+            if self._identity_provider is not None:
+                unregister_plugin(self._identity_provider)
+                self._identity_provider = None
             # IamService stops via AsyncExitStack
         
         # Finally unregister self
@@ -254,6 +282,25 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
         registers the provider from it.  When no config is present or the config
         does not select a backend, no provider is registered and startup
         continues unauthenticated.
+
+        Idempotent per process: this module's own previously-registered
+        provider (if any) is replaced, so calling this more than once in the
+        same process — once unconditionally from ``lifespan`` and again as a
+        self-heal from ``IamColdBootContributor`` after the fleet-once
+        leader seeds a fresh ``IdpConfig`` row — never accumulates duplicate
+        entries in the process-local plugin registry (``tools.discovery``).
+
+        Make-before-break (geoid#3199 follow-up): the self-heal call runs on
+        the leader ~30s after startup, while it is already serving live
+        traffic. A previous version unregistered the old provider before
+        resolving the new one, which meant any request landing in that
+        window saw zero identity providers and 401'd — reproducing the very
+        bug this method exists to fix. The new provider is now registered
+        BEFORE the old one is unregistered, so there is at most a brief
+        window with two providers registered (harmless — authentication
+        iterates the list) and never a window with zero. A transient config
+        read failure leaves the previously-registered provider in place
+        rather than tearing it down.
         """
         from dynastore.models.protocols.platform_configs import (
             PlatformConfigsProtocol,
@@ -274,7 +321,17 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
                     else IdpConfig.model_validate(resolved)
                 )
             except Exception:
-                logger.debug("IdpConfig unavailable", exc_info=True)
+                # Transient failure: do NOT touch the registry. Tearing down
+                # the previously-registered provider here would turn a
+                # transient config-store blip into a real auth outage on
+                # this process until restart.
+                logger.warning(
+                    "IamModule: IdpConfig read failed; skipping identity "
+                    "provider self-heal and keeping the previously "
+                    "registered provider (if any) in place.",
+                    exc_info=True,
+                )
+                return
 
         if cfg is not None and cfg.is_configured:
             from .identity_providers.oidc_identity import OidcIdentityProvider
@@ -282,28 +339,40 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
             secret = cfg.client_secret.reveal() if cfg.client_secret else None
             logger.info("IdP: issuer_url=%s, client_id=%s, audience=%s, roles_claim_path=%s",
                 cfg.issuer_url, cfg.client_id, cfg.audience, cfg.roles_claim_path)
-            register_plugin(
-                OidcIdentityProvider(
-                    issuer_url=cast(str, cfg.issuer_url),
-                    client_id=cfg.client_id,
-                    client_secret=secret,
-                    audience=cfg.audience,
-                    public_url=cfg.public_url,
-                    roles_claim_path=cfg.roles_claim_path,
-                )
+            provider = OidcIdentityProvider(
+                issuer_url=cast(str, cfg.issuer_url),
+                client_id=cfg.client_id,
+                client_secret=secret,
+                audience=cfg.audience,
+                public_url=cfg.public_url,
+                roles_claim_path=cfg.roles_claim_path,
             )
+            old = self._identity_provider
+            register_plugin(provider)
+            self._identity_provider = provider
+            if old is not None and old is not provider:
+                unregister_plugin(old)
             logger.info(
                 "Registered OIDC identity provider from IdpConfig: %s",
                 cfg.issuer_url,
             )
             return
 
+        # cfg was resolved (no read failure) but selects no backend — either
+        # no PlatformConfigsProtocol is registered, no row exists, or the row
+        # does not select an implemented + addressed backend. This is an
+        # intentional "no provider configured" state, not a transient
+        # failure, so any previously-registered provider is removed.
+        if self._identity_provider is not None:
+            unregister_plugin(self._identity_provider)
+            self._identity_provider = None
+
         if cfg is not None and cfg.type == "saml2":
             logger.warning(
                 "IdpConfig.type=saml2 is not yet implemented; no IdP "
                 "registered. See modules/iam/identity_providers/README.md."
             )
-        
+
         if cfg is None:
             logger.warning("IdP: No IdpConfig found in database")
         elif not cfg.is_configured:

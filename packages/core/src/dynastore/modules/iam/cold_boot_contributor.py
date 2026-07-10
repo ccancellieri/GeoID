@@ -32,10 +32,20 @@ Execution order within ``run``:
 4. Apply ``default_roles_baseline`` (force=True, self-healing).
 5. Apply ``iam_baseline`` (force=True, self-healing).
 6. Apply ``public_access_baseline`` LAST (force=True; gates /health probe).
-7. Register the OIDC identity provider from the now-seeded IdpConfig.
+7. Re-register the OIDC identity provider as a self-heal, in case step 2
+   just seeded a fresh IdpConfig row this process had not seen yet.
 
 Each step runs in its own ``try/except`` so a failure in one does NOT abort
 the others — partial bootstrap beats a full abort.
+
+Fleet scope (geoid#3199): this whole sequence — including step 7 — only
+ever runs via ``run_cold_boot()``, which ``main.py``'s
+``_ColdBootReconciliationService`` gates to a single lease-winning process
+per service revision. Step 7 is therefore NOT the primary place identity
+providers get registered: ``IamModule.lifespan`` calls
+``_register_identity_provider`` unconditionally on every process first.
+Step 7 exists only so the fleet-once leader picks up a row it just seeded
+in step 2 without waiting for its own next per-process registration.
 """
 from __future__ import annotations
 
@@ -53,6 +63,8 @@ class IamColdBootContributor:
 
     Holds a reference to the owning :class:`IamModule` instance so it can
     call ``_register_identity_provider`` after IdpConfig has been seeded.
+    That call is idempotent per process (see the method's docstring), so it
+    is safe to also run unconditionally from ``IamModule.lifespan``.
     """
 
     name: str = "iam"
