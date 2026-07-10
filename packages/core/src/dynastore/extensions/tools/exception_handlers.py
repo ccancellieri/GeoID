@@ -297,6 +297,49 @@ class PoolSaturationExceptionHandler(ExceptionHandler):
         )
 
 
+class TimeoutErrorExceptionHandler(ExceptionHandler):
+    """Maps a bare ``TimeoutError`` to HTTP 503 + Retry-After.
+
+    On Python >=3.11 ``asyncio.TimeoutError`` is the builtin ``TimeoutError``,
+    so ``asyncio.wait_for`` raises it directly. ``tools/cache.py``'s
+    ``get_or_set`` slow path (``_await_shared_rebuild``) does exactly this
+    when a shared cache rebuild does not finish within
+    ``CachePluginConfig.slow_path_timeout_seconds`` — and on a cold instance
+    with no stale value to fall back on, the bare ``TimeoutError`` propagates
+    to the HTTP boundary untouched. Left unmapped it falls through the
+    registry to the generic 500 fallback, even though it signals the same
+    thing as ``PoolSaturationError``: a dependency this service needs is
+    momentarily starved, and the same request will likely succeed once the
+    in-flight rebuild finishes. The Retry-After value is a fixed, modest
+    hint (mirrors ``render_admission.py``'s ``retry_after_seconds`` default)
+    since a bare ``TimeoutError`` carries no configured wait like
+    ``PoolSaturationError.retry_after`` does.
+
+    ``asyncio.CancelledError`` is a ``BaseException`` subclass, not an
+    ``Exception`` and not a ``TimeoutError``, so it is never passed to
+    ``can_handle`` here — it propagates past every ``except Exception`` in
+    the handler chain instead.
+
+    Registered directly after ``PoolSaturationExceptionHandler``: the two
+    do not overlap (``PoolSaturationError`` derives from ``DatabaseError``,
+    not ``TimeoutError``), but grouping the transient-dependency 503
+    handlers together keeps the specific-to-generic ordering readable.
+    """
+
+    def can_handle(self, exception: Exception) -> bool:
+        return isinstance(exception, TimeoutError)
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        logger.warning("Bare TimeoutError reached the HTTP boundary: %s", exception)
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="A dependency this request needs is momentarily unavailable, try again shortly.",
+            headers={"Retry-After": "5"},
+        )
+
+
 class DatabaseErrorHandler(ExceptionHandler):
     """Handles database errors with a sanitized HTTP response.
 
@@ -1001,6 +1044,7 @@ class ExceptionHandlerRegistry:
         self.register(DatabaseInputExceptionHandler())  # Catch DB input errors (400)
         self.register(TableNotFoundExceptionHandler())  # 404 — missing PG hub table, not a server error
         self.register(PoolSaturationExceptionHandler())  # 503 — bounded pool-acquire timeout (#1894)
+        self.register(TimeoutErrorExceptionHandler())  # 503 — bare TimeoutError, starved dependency wait
         self.register(DatabaseErrorHandler())  # Surface original DB exception details for better debugging
         self.register(ValidationExceptionHandler())  # Generic - must be last
 

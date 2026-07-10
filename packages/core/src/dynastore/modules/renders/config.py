@@ -42,7 +42,11 @@ from dynastore.models.plugin_config import PluginConfig
 
 
 class RenderCachingConfig(PluginConfig):
-    """Operator-tunable knobs for the bucket-backed raster tile cache.
+    """Operator-tunable knobs for the bucket-backed raster tile cache, plus
+    the raster render wall-clock budget (``render_budget_seconds`` below —
+    not a caching knob, but kept here rather than a new config class since
+    this is the only live-reloadable config the raster render path already
+    fetches).
 
     Live edits via the configs API apply on the next render save / fetch
     — no rewrite of already-cached objects.  Changing ``key_prefix`` orphans
@@ -91,6 +95,20 @@ class RenderCachingConfig(PluginConfig):
             "``Cache-Control: public, max-age=<ttl_seconds>`` set on every "
             "render object written to the bucket. 0 disables browser/CDN "
             "caching (objects still persist server-side). Default is one year."
+        ),
+    )
+
+    # --- Render wall-clock budget ---
+    render_budget_seconds: Mutable[int] = Field(
+        default=55,
+        ge=1,
+        description=(
+            "Wall-clock budget for a raster ``/map`` render (ID/COG-href "
+            "resolution through encoded output bytes), kept below the 60s "
+            "load-balancer timeout so an abandoned render never outlives "
+            "the client's request. Exceeding it aborts the render and "
+            "returns 503 with ``Retry-After``, mirroring "
+            "``TilesConfig.render_budget_seconds`` for the vector tile path."
         ),
     )
 

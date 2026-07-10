@@ -36,7 +36,7 @@ from __future__ import annotations
 import sys
 import types
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -127,8 +127,10 @@ if _we_installed_stubs:
 _FAKE_PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
 
 
-def _mock_request() -> MagicMock:
-    return MagicMock(name="request")
+def _mock_request(*, disconnected: bool = False) -> MagicMock:
+    req = MagicMock(name="request")
+    req.is_disconnected = AsyncMock(return_value=disconnected)
+    return req
 
 
 # ---------------------------------------------------------------------------
@@ -741,4 +743,162 @@ async def test_render_raster_map_uses_internal_id_for_item_lookup(monkeypatch):
     )
     assert resolved_ids["collection"] == "coll_internal", (
         "Item lookup used external collection id instead of internal id"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 10. Render wall-clock budget + client-disconnect abort + bounded DB acquire
+#
+# Mirrors the vector tile path's own render-budget/disconnect/bounded-acquire
+# tests (tests/dynastore/extensions/tiles/unit/test_tile_render_budget.py,
+# test_tile_pool_failfast.py).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_render_raster_map_returns_503_when_render_budget_exceeded(monkeypatch):
+    """A render_budget_seconds of 1s, with wall-clock simulated past the
+    deadline, must abort with 503 + Retry-After before the CPU-bound render
+    — no real sleep needed, ``time.perf_counter`` is patched to report
+    elapsed time deterministically."""
+    _patch_raster_map_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        ms, "_load_render_caching_config",
+        AsyncMock(return_value=MagicMock(render_budget_seconds=1)),
+    )
+
+    render_calls = {"n": 0}
+    real_render = ms._RENDER_COG_MAP
+
+    def _counting_render(*args, **kwargs):
+        render_calls["n"] += 1
+        return real_render(*args, **kwargs)
+
+    monkeypatch.setattr(ms, "_RENDER_COG_MAP", _counting_render)
+
+    call_count = {"n": 0}
+
+    def _fake_perf_counter():
+        call_count["n"] += 1
+        # First call captures start_time (0.0); every call after simulates
+        # the 1s budget having elapsed (1000.0 >= 0.0 + 1).
+        return 0.0 if call_count["n"] == 1 else 1000.0
+
+    with patch("time.perf_counter", side_effect=_fake_perf_counter):
+        with pytest.raises(ms.HTTPException) as exc_info:
+            await ms._render_raster_map(
+                catalog_id="cat",
+                collection_id="coll",
+                bbox=[-180.0, -90.0, 180.0, 90.0],
+                width=256,
+                height=256,
+                style_name=None,
+                style_url=None,
+                fmt="png",
+                request=_mock_request(),
+            )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.headers is not None
+    assert exc_info.value.headers.get("Retry-After") == "5"
+    assert render_calls["n"] == 0, "render must not run once the budget is exceeded"
+
+
+@pytest.mark.asyncio
+async def test_render_raster_map_aborts_quietly_when_client_disconnected(monkeypatch):
+    """A request whose ``is_disconnected()`` reports True must stop before
+    the CPU-bound render without raising, and never invoke the renderer."""
+    _patch_raster_map_dependencies(monkeypatch)
+
+    render_calls = {"n": 0}
+    real_render = ms._RENDER_COG_MAP
+
+    def _counting_render(*args, **kwargs):
+        render_calls["n"] += 1
+        return real_render(*args, **kwargs)
+
+    monkeypatch.setattr(ms, "_RENDER_COG_MAP", _counting_render)
+
+    response = await ms._render_raster_map(
+        catalog_id="cat",
+        collection_id="coll",
+        bbox=[-180.0, -90.0, 180.0, 90.0],
+        width=256,
+        height=256,
+        style_name=None,
+        style_url=None,
+        fmt="png",
+        request=_mock_request(disconnected=True),
+    )
+
+    assert response.status_code == 499
+    assert render_calls["n"] == 0, "render must not run once the client disconnected"
+
+
+@pytest.mark.asyncio
+async def test_render_raster_map_healthy_render_still_returns_200(monkeypatch):
+    """A fast render with a connected client is unaffected by the budget or
+    disconnect checks — same happy path as before this hardening."""
+    _patch_raster_map_dependencies(monkeypatch)
+
+    response = await ms._render_raster_map(
+        catalog_id="cat",
+        collection_id="coll",
+        bbox=[-180.0, -90.0, 180.0, 90.0],
+        width=256,
+        height=256,
+        style_name=None,
+        style_url=None,
+        fmt="png",
+        request=_mock_request(disconnected=False),
+    )
+
+    assert response.status_code == 200
+    assert response.body == _FAKE_PNG
+
+
+@pytest.mark.asyncio
+async def test_render_raster_map_style_lookup_uses_bounded_acquire(monkeypatch):
+    """The style-colormap DB lookup must acquire its connection through
+    ``managed_transaction(..., acquire_timeout=...)`` — the same fail-fast
+    bounded-acquire discipline the vector tile path uses via
+    ``acquire_engine_connection_bounded`` — rather than an unbounded
+    ``engine.connect()`` that waits out the pool's own (much longer)
+    ``pool_timeout``.
+    """
+    _patch_raster_map_dependencies(monkeypatch)
+
+    recorded: dict[str, Any] = {}
+
+    class _FakeTxCM:
+        def __init__(self, engine, *, acquire_timeout=None, read_only=False):
+            recorded["acquire_timeout"] = acquire_timeout
+
+        async def __aenter__(self):
+            return MagicMock(name="conn")
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(ms, "managed_transaction", _FakeTxCM)
+    monkeypatch.setattr(ms, "get_async_engine", lambda _req: MagicMock(name="engine"))
+    monkeypatch.setattr(
+        ms, "_read_live_fg_acquire_timeout", AsyncMock(return_value=3.0)
+    )
+    monkeypatch.setattr(ms, "_resolve_raster_colormap", AsyncMock(return_value=None))
+
+    await ms._render_raster_map(
+        catalog_id="cat",
+        collection_id="coll",
+        bbox=[-180.0, -90.0, 180.0, 90.0],
+        width=256,
+        height=256,
+        style_name="my-style",
+        style_url=None,
+        fmt="png",
+        request=_mock_request(),
+    )
+
+    assert recorded.get("acquire_timeout") == 3.0, (
+        "Style DB lookup must be bounded via managed_transaction(acquire_timeout=...)"
     )

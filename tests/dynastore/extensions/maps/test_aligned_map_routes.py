@@ -119,6 +119,7 @@ def _mock_request() -> MagicMock:
     req.url = MagicMock()
     req.url.__str__ = lambda self: "http://testserver/maps/catalogs/cat/collections/coll"
     req.url_for = MagicMock(return_value="http://testserver/maps/")
+    req.is_disconnected = AsyncMock(return_value=False)
     return req
 
 

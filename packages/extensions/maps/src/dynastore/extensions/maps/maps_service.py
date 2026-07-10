@@ -20,6 +20,7 @@
 
 import logging
 import asyncio
+import time
 from typing import Any, List, Optional
 from concurrent.futures import ProcessPoolExecutor
 from fastapi import Depends, FastAPI, APIRouter, HTTPException, Response, Query, Request
@@ -29,7 +30,10 @@ from contextlib import asynccontextmanager
 from dynastore.modules.concurrency import run_in_thread
 
 from dynastore.extensions.tools.db import get_async_engine
-from dynastore.modules.db_config.query_executor import managed_transaction
+from dynastore.modules.db_config.query_executor import (
+    managed_transaction,
+    _read_live_fg_acquire_timeout,
+)
 from dynastore.models.driver_context import DriverContext
 from dynastore.extensions.maps.format_convert import (
     FORMAT_MEDIA_TYPES as _FORMAT_MEDIA_TYPES,
@@ -496,6 +500,59 @@ async def _is_raster_collection(catalog_id: str, collection_id: str) -> bool:
         return False
 
 
+async def _load_render_caching_config():  # type: ignore[return]
+    """Fetch live ``RenderCachingConfig`` (cache knobs + render budget);
+    fall back to defaults if unavailable. Mirrors
+    ``TilesService._load_render_caching_config`` in the tiles extension —
+    same config class, same fallback discipline.
+    """
+    if _RenderCachingConfig is None:
+        return None
+    from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+    mgr = get_protocol(PlatformConfigsProtocol)
+    if mgr is None:
+        return _RenderCachingConfig()
+    try:
+        cfg = await mgr.get_config(_RenderCachingConfig)
+    except Exception as exc:
+        logger.debug("RenderCachingConfig: get_config failed (%s); using defaults", exc)
+        return _RenderCachingConfig()
+    return cfg if isinstance(cfg, _RenderCachingConfig) else _RenderCachingConfig()
+
+
+def _handle_raster_render_aborted(
+    reason: str, catalog_id: str, collection_id: str, start_time: float,
+) -> Response:
+    """Handle a raster render aborted via ``_should_abort`` — mirrors
+    ``TilesService._handle_render_aborted`` for the vector tile path.
+
+    ``reason="budget"``: the render exceeded
+    ``RenderCachingConfig.render_budget_seconds`` — logged at WARNING and
+    returns 503 + ``Retry-After``, the same backoff signal a pool-
+    saturation fail-fast gives. ``reason="disconnected"``: the client
+    already gave up (LB timeout/retry) — logged at INFO since it's an
+    expected outcome, and the render stops quietly.
+    """
+    elapsed_s = time.perf_counter() - start_time
+    if reason == "budget":
+        logger.warning(
+            "maps/raster: render budget exceeded elapsed=%.1fs catalog=%s "
+            "collection=%s — aborting render",
+            elapsed_s, catalog_id, collection_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Raster map render exceeded its time budget, try again shortly.",
+            headers={"Retry-After": "5"},
+        )
+    logger.info(
+        "maps/raster: client disconnected elapsed=%.1fs catalog=%s "
+        "collection=%s — aborting render",
+        elapsed_s, catalog_id, collection_id,
+    )
+    return Response(status_code=499)
+
+
 async def _render_raster_map(
     *,
     catalog_id: str,
@@ -515,6 +572,10 @@ async def _render_raster_map(
     then renders via ``render_cog_map`` in a thread.  The DB connection is
     released before the CPU-bound render to satisfy GeoID #703.
 
+    Bounded by ``RenderCachingConfig.render_budget_seconds`` and a client-
+    disconnect check at the phase boundaries (style lookup, render), mirroring
+    the vector tile path's ``TilesConfig.render_budget_seconds`` handling.
+
     Args:
         catalog_id: External (public) catalog ID.
         collection_id: External (public) collection ID.
@@ -523,13 +584,28 @@ async def _render_raster_map(
         height: Output pixel height.
         style_name: Optional style identifier for SLD colormap lookup.
         fmt: Output format string (``"png"``, ``"jpeg"``, or ``"geotiff"``).
-        request: FastAPI ``Request`` (used to get the async DB engine).
+        request: FastAPI ``Request`` (used to get the async DB engine and to
+            detect client disconnects).
     """
     if _RENDER_COG_MAP is None:
         raise HTTPException(
             status_code=422,
             detail="Raster rendering is not available: rio-tiler is not installed.",
         )
+
+    start_time = time.perf_counter()
+    render_caching_cfg = await _load_render_caching_config()
+    budget_seconds = (
+        render_caching_cfg.render_budget_seconds if render_caching_cfg else 55
+    )
+    render_deadline = start_time + budget_seconds
+
+    async def _should_abort() -> Optional[str]:
+        if time.perf_counter() >= render_deadline:
+            return "budget"
+        if await request.is_disconnected():
+            return "disconnected"
+        return None
 
     # Resolve external → internal IDs at the request boundary so cache keys
     # and visibility checks use the immutable internal id.
@@ -561,32 +637,72 @@ async def _render_raster_map(
             detail=f"No COG asset found for collection '{collection_id}'.",
         )
 
+    # Budget/disconnect boundary ahead of the style DB lookup — the cheapest
+    # point at which aborting still saves the (bounded, but non-zero) DB
+    # round-trip below.
+    _abort_reason = await _should_abort()
+    if _abort_reason:
+        return _handle_raster_render_aborted(
+            _abort_reason, internal_catalog_id, internal_collection_id, start_time,
+        )
+
     # Resolve colormap from SLD style if requested (opens and closes a DB
     # connection for the style lookup, then releases before the render).
+    # Bounded by acquire_timeout (#2933 pattern) so a saturated pool fails
+    # fast with PoolSaturationError -> the registered 503 handler, instead
+    # of waiting out the engine's own (much longer) pool_timeout.
     colormap = None
-    effective_style_url = style_url
+    # Direct (programmatic/test) callers bypass FastAPI parameter binding,
+    # so style_name/style_url can arrive as the truthy Query(None) sentinel
+    # instead of None — treat non-strings as absent, the same guard the
+    # tiles endpoints use for style-url handling.
+    style_name = style_name if isinstance(style_name, str) else None
+    effective_style_url = style_url if isinstance(style_url, str) else None
     if not effective_style_url:
         effective_style_url = await _resolve_raster_style_url(
             internal_catalog_id, internal_collection_id, style_name
         )
     if style_name or effective_style_url:
         engine = get_async_engine(request)
-        async with managed_transaction(engine) as conn:
+        fg_timeout_s = await _read_live_fg_acquire_timeout()
+        async with managed_transaction(engine, acquire_timeout=fg_timeout_s) as conn:
             colormap = await _resolve_raster_colormap(
                 internal_catalog_id, internal_collection_id, style_name,
                 effective_style_url, conn
             )
 
+    # Render-budget/disconnect boundary ahead of the CPU-bound render — the
+    # last point where aborting still saves real work (mirrors
+    # get_vector_tile's placement ahead of its PostGIS statement).
+    _abort_reason = await _should_abort()
+    if _abort_reason:
+        return _handle_raster_render_aborted(
+            _abort_reason, internal_catalog_id, internal_collection_id, start_time,
+        )
+
     # Render via rio-tiler in a thread (no DB connection held during render).
+    # Bounded by the remaining render budget: asyncio.wait_for only stops
+    # this coroutine from waiting on the thread-pool future — the render
+    # thread itself keeps running to completion in the background (thread
+    # cancellation is not a thing), same non-kill contract the vector path
+    # uses around its process-pool submit.
+    remaining_s = max(render_deadline - time.perf_counter(), 0.001)
     try:
-        image_bytes: bytes = await run_in_thread(
-            _RENDER_COG_MAP,
-            cog_href,
-            bbox=bbox,
-            width=width,
-            height=height,
-            colormap=colormap,
-            output_format="PNG",
+        image_bytes: bytes = await asyncio.wait_for(
+            run_in_thread(
+                _RENDER_COG_MAP,
+                cog_href,
+                bbox=bbox,
+                width=width,
+                height=height,
+                colormap=colormap,
+                output_format="PNG",
+            ),
+            timeout=remaining_s,
+        )
+    except TimeoutError:
+        return _handle_raster_render_aborted(
+            "budget", internal_catalog_id, internal_collection_id, start_time,
         )
     except Exception as exc:
         logger.error(

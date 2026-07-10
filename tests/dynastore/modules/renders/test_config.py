@@ -81,6 +81,11 @@ class TestRenderCachingConfig:
         assert cfg.cache_enabled is True
         assert cfg.key_prefix == "renders/collections"
         assert cfg.ttl_seconds == 31536000
+        assert cfg.render_budget_seconds == 55
+
+    def test_render_budget_seconds_must_be_positive(self):
+        with pytest.raises(ValidationError):
+            RenderCachingConfig(render_budget_seconds=0)
 
     def test_invalid_key_prefix_too_short(self):
         with pytest.raises(ValidationError):

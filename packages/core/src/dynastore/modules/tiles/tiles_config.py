@@ -318,14 +318,20 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
 
     # --- Live-render hardening (#2813) ---
     live_tile_timeout_seconds: Mutable[int] = Field(
-        default=30,
+        default=60,
         ge=1,
         description=(
             "Per-request PostgreSQL statement timeout (``SET LOCAL "
             "statement_timeout``) applied while rendering an on-demand MVT "
-            "tile. A query that exceeds this is canceled server-side; "
-            "``get_vector_tile`` treats the cancellation as an empty tile "
-            "(204) instead of surfacing a 500. Mirrors "
+            "tile, aligned with the 60s load-balancer ceiling. On the live "
+            "path ``render_budget_seconds`` (55s) is the graceful wall-clock "
+            "cutoff and normally fires first (503 with ``Retry-After``); "
+            "this statement timeout is the server-side reclaim backstop "
+            "that frees the DB worker if a statement outlives that cutoff. "
+            "A query that exceeds this is canceled server-side (pgcode "
+            "57014); ``get_vector_tile`` then serves a stale cached tile "
+            "when one exists, or fails fast with 503 + ``Retry-After``. "
+            "Mirrors "
             "``TilesPreseedConfig.preseed_tile_timeout_seconds``."
         ),
     )
@@ -676,13 +682,16 @@ class TilesPreseedConfig(PluginConfig):
     )
 
     preseed_tile_timeout_seconds: Mutable[int] = Field(
-        default=30,
+        default=60,
         ge=1,
         description=(
             "Per-tile PostgreSQL statement timeout (``SET LOCAL "
             "statement_timeout``) applied for the duration of each per-zoom "
             "preseed transaction. A tile that exceeds this is counted in "
             "``results['skipped']`` and the run continues, instead of one "
-            "pathological tile stalling the whole job."
+            "pathological tile stalling the whole job. Preseed runs offline "
+            "with no load-balancer deadline, but renders the same heavy "
+            "statements as the live path, so it defaults to the same "
+            "ceiling as ``TilesConfig.live_tile_timeout_seconds``."
         ),
     )

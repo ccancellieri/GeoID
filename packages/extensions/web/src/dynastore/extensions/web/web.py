@@ -28,8 +28,8 @@ from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, cast
 
 from fastapi import APIRouter, FastAPI, Response, HTTPException, Request, Query, Depends
 
-from fastapi.middleware.gzip import GZipMiddleware
 from dynastore.extensions.web.cors_middleware import DynamicCORSMiddleware
+from dynastore.extensions.web.gzip_middleware import TileAwareGZipMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from dynastore.extensions.protocols import ExtensionProtocol
@@ -572,7 +572,10 @@ class Web(ExtensionProtocol, OGCServiceMixin):
     def configure_app(self, app: FastAPI):
         """Configures global settings like middleware and CORS."""
         app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
-        app.add_middleware(GZipMiddleware, minimum_size=1000)
+        # image/* (map/tile rasters) is already format-compressed and skipped;
+        # see TileAwareGZipMiddleware. compresslevel=6 instead of Starlette's
+        # default 9 -- near-identical ratio for JSON/MVT at far less CPU.
+        app.add_middleware(TileAwareGZipMiddleware, minimum_size=1000, compresslevel=6)
         app.add_middleware(DynamicCORSMiddleware)
 
         # Disable Starlette's built-in redirect_slashes: it generates absolute
