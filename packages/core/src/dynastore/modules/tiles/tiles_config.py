@@ -280,9 +280,10 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
         description=(
             "Name of a stored (ideally indexed) numeric column measuring "
             "per-feature geometry density/heaviness — the computed "
-            "vertex_count geometry stat is the intended use. Used by "
-            "max_feature_density_by_zoom as a pre-transform ceiling. "
-            "Default None = no density ceiling."
+            "vertex_count geometry stat is the intended use (the "
+            "geometry_density compute preset materialises it as an indexed "
+            "column). Used by max_feature_density_by_zoom as a pre-transform "
+            "ceiling. Default None = no density ceiling."
         ),
     )
 
