@@ -185,6 +185,20 @@ def test_storage_default_partition_ddl_idempotent():
     assert "DEFAULT" in sql
 
 
+def test_storage_obligation_sweep_lookup_indexes():
+    """#2688 lane 1: the obligation sweep's anti-join needs one partial
+    index per OR branch (write_id / entity_id), both scoped to
+    (catalog_id, driver_id, collection_id), so Postgres can satisfy the
+    query via a bitmap-or scan instead of a sequential scan."""
+    sql = _render(STORAGE_INDEXES_DDL)
+    assert "idx_storage_write_id_lookup" in sql
+    assert "(catalog_id, driver_id, collection_id, write_id)" in sql
+    assert "WHERE write_id IS NOT NULL" in sql
+    assert "idx_storage_entity_id_lookup" in sql
+    assert "(catalog_id, driver_id, collection_id, entity_id)" in sql
+    assert "WHERE entity_id IS NOT NULL" in sql
+
+
 # ---------------------------------------------------------------------------
 # Partition-function DDL content
 # ---------------------------------------------------------------------------

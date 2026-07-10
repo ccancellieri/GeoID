@@ -907,6 +907,20 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
             f'ON "{schema}"."{physical_table}" ("write_id", "geoid") '
             f'WHERE "write_id" IS NOT NULL AND "deleted_at" IS NOT NULL;'
         )
+        # #2688 lane 1: the obligation sweep range-scans transaction_time on
+        # every tick, and separately range-scans deleted_at to catch soft
+        # deletes (which stamp deleted_at without bumping transaction_time —
+        # see ItemService.soft_delete_item_query). Same CREATE-only rollout
+        # shape as the write_id indexes above.
+        create_transaction_time_idx_sql = (
+            f'CREATE INDEX IF NOT EXISTS "{physical_table}_transaction_time_idx" '
+            f'ON "{schema}"."{physical_table}" ("transaction_time");'
+        )
+        create_deleted_at_idx_sql = (
+            f'CREATE INDEX IF NOT EXISTS "{physical_table}_deleted_at_idx" '
+            f'ON "{schema}"."{physical_table}" ("deleted_at") '
+            f'WHERE "deleted_at" IS NOT NULL;'
+        )
 
         # Hub + every sidecar DDL must run on a SHARED connection so
         # the FK references emitted by ``sidecar_impl.get_ddl(...)``
@@ -928,6 +942,8 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
             await DDLQuery(create_hub_sql).execute(conn)
             await DDLQuery(create_write_id_active_idx_sql).execute(conn)
             await DDLQuery(create_write_id_deleted_idx_sql).execute(conn)
+            await DDLQuery(create_transaction_time_idx_sql).execute(conn)
+            await DDLQuery(create_deleted_at_idx_sql).execute(conn)
 
             # --- Create sidecar tables ---
             # ``sidecar_config.validity_column`` is already policy-aligned

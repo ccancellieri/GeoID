@@ -202,6 +202,7 @@ JOB_STORAGE_RETENTION = "storage_retention"
 JOB_HEALTH_ALERT = "health_alert"
 JOB_ES_LOGS_RETENTION = "es_logs_retention"
 JOB_CONTROL_PLANE_RETENTION = "control_plane_retention"
+JOB_OBLIGATION_SWEEP = "obligation_sweep"
 
 # Obsolete supervisor job names retired by #1807 renames. An environment that
 # booted a prior build holds these rows in tasks.maintenance_schedule;
@@ -258,6 +259,7 @@ _CADENCE_STORAGE_RETENTION = 86400           # daily
 _CADENCE_HEALTH_ALERT = 300                  # every 5 minutes
 _CADENCE_ES_LOGS_RETENTION = 86400           # daily
 _CADENCE_CONTROL_PLANE_RETENTION = 86400     # daily
+_CADENCE_OBLIGATION_SWEEP = 600               # every 10 minutes (#2688 lane 1)
 
 # Bounded-batch DELETE size — no single DELETE removes more than this many rows.
 _PRUNE_BATCH = 1000
@@ -878,6 +880,34 @@ async def _run_health_alert(conn: Any) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Missed storage-plane obligation sweep (#2688 lane 1)
+# ---------------------------------------------------------------------------
+
+
+async def _run_obligation_sweep(conn: Any) -> int:
+    """Re-enqueue ``tasks.storage`` obligations missing for recent PG writes.
+
+    Item-tier async secondary-index writes enqueue their ``tasks.storage``
+    obligation in a post-commit seam that runs after the primary PG hub
+    write already committed. If the process dies inside that seam, the hub
+    row exists with no obligation and the derived store (e.g.
+    Elasticsearch) silently diverges forever. This sweep re-examines a
+    bounded, recent window of hub rows and re-enqueues an id-only
+    obligation for any that have none — see
+    ``modules/storage/obligation_sweep.py`` for the full window/matching
+    contract. Duplicates are safe: the drain always re-reads canonical PG
+    state for an id-only row, so a duplicate just costs one wasted drain op.
+
+    Returns the number of obligations re-enqueued.
+    """
+    from dynastore.modules.storage.obligation_sweep import sweep_missing_obligations
+
+    return await sweep_missing_obligations(
+        conn, interval_seconds=_CADENCE_OBLIGATION_SWEEP,
+    )
+
+
+# ---------------------------------------------------------------------------
 # ES log index retention (#2797)
 # ---------------------------------------------------------------------------
 
@@ -946,6 +976,8 @@ async def _dispatch_job(
         return await _run_es_logs_retention()
     if job_name == JOB_CONTROL_PLANE_RETENTION:
         return await _run_control_plane_retention(conn)
+    if job_name == JOB_OBLIGATION_SWEEP:
+        return await _run_obligation_sweep(conn)
     raise ValueError(f"maintenance_supervisor: unknown job_name {job_name!r}")
 
 
@@ -1190,6 +1222,7 @@ async def register_supervisor_jobs(engine: Any) -> None:
         (JOB_STORAGE_RETENTION, _CADENCE_STORAGE_RETENTION),
         (JOB_HEALTH_ALERT, _CADENCE_HEALTH_ALERT),
         (JOB_CONTROL_PLANE_RETENTION, _CADENCE_CONTROL_PLANE_RETENTION),
+        (JOB_OBLIGATION_SWEEP, _CADENCE_OBLIGATION_SWEEP),
     ]
     async with managed_transaction(engine) as conn:
         jobs = list(base_jobs)

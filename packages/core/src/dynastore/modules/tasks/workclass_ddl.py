@@ -176,6 +176,17 @@ CREATE INDEX IF NOT EXISTS idx_storage_fairness
 -- Driver index: enables driver-affine workers to restrict their scan.
 CREATE INDEX IF NOT EXISTS idx_storage_driver
     ON {schema}.storage (driver_id, catalog_id, status, ready_at);
+-- Obligation-sweep lookup pair (#2688 lane 1): the sweep anti-joins hub
+-- rows against this table by write_id OR entity_id, scoped to
+-- (catalog_id, driver_id, collection_id). Split into two partial indexes,
+-- one per branch, so Postgres can satisfy the OR via a bitmap-or scan
+-- instead of a sequential scan of the day's partition.
+CREATE INDEX IF NOT EXISTS idx_storage_write_id_lookup
+    ON {schema}.storage (catalog_id, driver_id, collection_id, write_id)
+    WHERE write_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_storage_entity_id_lookup
+    ON {schema}.storage (catalog_id, driver_id, collection_id, entity_id)
+    WHERE entity_id IS NOT NULL;
 """
 
 # ---------------------------------------------------------------------------

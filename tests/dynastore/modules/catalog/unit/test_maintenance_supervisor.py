@@ -33,7 +33,8 @@ Covered:
 - Each job builds the correct SQL / predicate text (assert template + params)
 - Bounded-batch loop terminates at 0 rows
 - build_supervisor_config provides the task reaper hard_cap
-- register_supervisor_jobs upserts all 9 job names (iam + task + events/storage maintenance)
+- register_supervisor_jobs upserts all 10 job names (iam + task + events/storage
+  maintenance + obligation sweep)
 
 PG log persistence (and its iam_prune / system_logs_prune jobs) was
 removed entirely in #2749 — logs are Elasticsearch-only now, so those job
@@ -60,6 +61,7 @@ from dynastore.modules.catalog.maintenance_supervisor import (
     JOB_CONTROL_PLANE_RETENTION,
     JOB_ES_LOGS_RETENTION,
     JOB_IAM_PRUNE,
+    JOB_OBLIGATION_SWEEP,
     JOB_STORAGE_PARTITION_CREATE,
     JOB_STORAGE_RETENTION,
     JOB_TASK_PARTITION_CREATE,
@@ -72,6 +74,7 @@ from dynastore.modules.catalog.maintenance_supervisor import (
     _CADENCE_CONTROL_PLANE_RETENTION,
     _CADENCE_ES_LOGS_RETENTION,
     _CADENCE_IAM_PRUNE,
+    _CADENCE_OBLIGATION_SWEEP,
     _CADENCE_TASK_PARTITION_CREATE,
     _CADENCE_TASK_REAPER,
     _CADENCE_TASK_RETENTION,
@@ -85,6 +88,7 @@ from dynastore.modules.catalog.maintenance_supervisor import (
     _run_es_logs_retention,
     _run_health_alert,
     _run_iam_prune,
+    _run_obligation_sweep,
     build_supervisor_config,
     register_supervisor_jobs,
     HealthAlertConfig,
@@ -628,6 +632,7 @@ async def test_register_supervisor_jobs_upserts_all_expected_jobs():
             JOB_HEALTH_ALERT,
             JOB_ES_LOGS_RETENTION,
             JOB_CONTROL_PLANE_RETENTION,
+            JOB_OBLIGATION_SWEEP,
         ]
     )
 
@@ -638,6 +643,7 @@ async def test_register_supervisor_jobs_upserts_all_expected_jobs():
     assert cadence_map[JOB_TASK_REAPER] == _CADENCE_TASK_REAPER
     assert cadence_map[JOB_TASK_PARTITION_CREATE] == _CADENCE_TASK_PARTITION_CREATE
     assert cadence_map[JOB_TASK_RETENTION] == _CADENCE_TASK_RETENTION
+    assert cadence_map[JOB_OBLIGATION_SWEEP] == _CADENCE_OBLIGATION_SWEEP
 
 
 @pytest.mark.asyncio
@@ -1238,6 +1244,47 @@ async def test_dispatch_job_control_plane_retention_calls_retention_job():
 
     assert rows == 4
     mock_run.assert_awaited_once_with(conn)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_job_obligation_sweep_calls_run_obligation_sweep():
+    """_dispatch_job routes JOB_OBLIGATION_SWEEP to _run_obligation_sweep(conn)."""
+    conn = AsyncMock()
+    with patch(
+        "dynastore.modules.catalog.maintenance_supervisor._run_obligation_sweep",
+        new=AsyncMock(return_value=2),
+    ) as mock_run:
+        rows = await _dispatch_job(JOB_OBLIGATION_SWEEP, conn, {"hard_cap": 5})
+
+    assert rows == 2
+    mock_run.assert_awaited_once_with(conn)
+
+
+def test_obligation_sweep_job_registered_in_dispatch_table():
+    """JOB_OBLIGATION_SWEEP must be a known job name, not fall through to
+    the ValueError branch of _dispatch_job."""
+    assert JOB_OBLIGATION_SWEEP == "obligation_sweep"
+    assert _CADENCE_OBLIGATION_SWEEP == 600
+
+
+@pytest.mark.asyncio
+async def test_run_obligation_sweep_delegates_to_sweep_missing_obligations():
+    """_run_obligation_sweep is a thin wrapper: it forwards conn and the
+    job's own cadence as interval_seconds to the storage-module sweep."""
+    conn = AsyncMock()
+    fake_sweep = AsyncMock(return_value=7)
+    with patch.dict(
+        "sys.modules",
+        {
+            "dynastore.modules.storage.obligation_sweep": MagicMock(
+                sweep_missing_obligations=fake_sweep,
+            ),
+        },
+    ):
+        result = await _run_obligation_sweep(conn)
+
+    assert result == 7
+    fake_sweep.assert_awaited_once_with(conn, interval_seconds=_CADENCE_OBLIGATION_SWEEP)
 
 
 @pytest.mark.asyncio

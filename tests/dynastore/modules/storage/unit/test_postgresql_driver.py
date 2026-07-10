@@ -409,6 +409,20 @@ class TestLifecycleMethods:
             and 'WHERE "write_id" IS NOT NULL AND "deleted_at" IS NOT NULL' in sql
             for sql in executed_sql
         )
+        # #2688 lane 1: the obligation sweep range-scans transaction_time
+        # every tick and separately range-scans deleted_at to catch soft
+        # deletes (which don't bump transaction_time).
+        assert any(
+            'CREATE INDEX IF NOT EXISTS "items_hub_transaction_time_idx"' in sql
+            and 'ON "cat_schema"."items_hub" ("transaction_time")' in sql
+            for sql in executed_sql
+        )
+        assert any(
+            'CREATE INDEX IF NOT EXISTS "items_hub_deleted_at_idx"' in sql
+            and 'ON "cat_schema"."items_hub" ("deleted_at")' in sql
+            and 'WHERE "deleted_at" IS NOT NULL' in sql
+            for sql in executed_sql
+        )
 
     @pytest.mark.asyncio
     async def test_ensure_storage_noop_without_collection(self):
