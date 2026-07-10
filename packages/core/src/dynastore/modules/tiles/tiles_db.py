@@ -158,6 +158,8 @@ async def _build_collection_subquery(
     max_features: Optional[float] = None,
     rank_column: Optional[str] = None,
     min_rank: Optional[float] = None,
+    density_column: Optional[str] = None,
+    max_density: Optional[float] = None,
 ) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Builds the subquery for a single collection using ItemService.
@@ -166,6 +168,9 @@ async def _build_collection_subquery(
     feature reduction for scalable low-zoom rendering. They are pushed into the
     shared query builder via its ``limit`` / ``where`` hooks so the reduction
     happens BEFORE ST_AsMVTGeom (bounding transform cost), not after.
+    ``density_column`` / ``max_density`` are the symmetric ceiling: they
+    exclude features ABOVE a threshold instead of keeping features above a
+    floor, and compose with the rank filter in the same ``where`` clause.
     """
     from dynastore.models.protocols import ConfigsProtocol, ItemsProtocol
     from dynastore.tools.discovery import get_protocol
@@ -257,6 +262,12 @@ async def _build_collection_subquery(
     # cost, which the post-transform density predicates cannot.
     if max_features and max_features > 0:
         params["limit"] = int(max_features)
+    # Both the rank floor and the density ceiling below are pre-transform
+    # predicates on the same subquery, so they are collected into one list
+    # and ANDed together into a single ``where`` clause instead of one
+    # clobbering the other when both are configured.
+    where_clauses: List[str] = []
+    raw_params: Dict[str, Any] = {}
     if rank_column and min_rank is not None:
         # Importance-preserving, index-assisted decimation: keep only features
         # whose stored rank column (e.g. length_m) meets the per-zoom minimum.
@@ -264,8 +275,22 @@ async def _build_collection_subquery(
         # never user input; quote it as an identifier. The threshold is a bind
         # param. The builder suffixes both the SQL and bind name per collection,
         # so ``:feat_rank_min`` never collides across a multi-collection tile.
-        params["where"] = f'"{rank_column}" >= :feat_rank_min'
-        params["raw_params"] = {"feat_rank_min": min_rank}
+        where_clauses.append(f'"{rank_column}" >= :feat_rank_min')
+        raw_params["feat_rank_min"] = min_rank
+    if density_column and max_density is not None and max_density > 0:
+        # Symmetric to the rank floor: excludes features whose stored density
+        # column (e.g. the computed vertex_count geometry stat) exceeds the
+        # per-zoom ceiling, dropping overly heavy geometry before the
+        # transform instead of keeping the most important features above a
+        # floor. ``density_column`` is operator-configured
+        # (TilesConfig.feature_density_column), never user input; quote it as
+        # an identifier. ``:feat_density_max`` is suffixed per collection by
+        # the builder like ``:feat_rank_min`` above.
+        where_clauses.append(f'"{density_column}" <= :feat_density_max')
+        raw_params["feat_density_max"] = max_density
+    if where_clauses:
+        params["where"] = " AND ".join(where_clauses)
+        params["raw_params"] = raw_params
 
     # 3. Get Query from ItemService
     # We pass tile_wkb via params so GeometrySidecar can use it as bind param
@@ -368,6 +393,11 @@ async def get_features_as_mvt_filtered(
         if resolved_collections else None
     )
     min_rank = _bracket("min_feature_rank_by_zoom")
+    density_column = (
+        resolved_collections[0].get("feature_density_column")
+        if resolved_collections else None
+    )
+    max_density = _bracket("max_feature_density_by_zoom")
 
     # Self-tuning byte budget (#3155): shrink the bracket cap using the
     # measured bytes-per-feature of previous renders of this collection at
@@ -425,6 +455,8 @@ async def get_features_as_mvt_filtered(
             max_features=max_features,
             rank_column=rank_column,
             min_rank=min_rank,
+            density_column=density_column,
+            max_density=max_density,
         )
         if subq:
             union_queries.append(subq)

@@ -267,6 +267,48 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
         ),
     )
 
+    # Optional stored column used as a per-feature DENSITY CEILING — the
+    # inverse of feature_rank_column above. feature_rank_column/
+    # min_feature_rank_by_zoom keep features with rank >= floor ("higher is
+    # better"), which cannot express "drop overly dense/heavy geometry":
+    # e.g. the computed vertex_count geometry stat is an inverse signal,
+    # where MORE vertices means WORSE low-zoom render cost, not better. This
+    # column feeds max_feature_density_by_zoom instead, an upper bound rather
+    # than a lower one. Default None = no density ceiling.
+    feature_density_column: Mutable[Optional[str]] = Field(
+        default=None,
+        description=(
+            "Name of a stored (ideally indexed) numeric column measuring "
+            "per-feature geometry density/heaviness — the computed "
+            "vertex_count geometry stat is the intended use. Used by "
+            "max_feature_density_by_zoom as a pre-transform ceiling. "
+            "Default None = no density ceiling."
+        ),
+    )
+
+    # Zoom-aware maximum value of ``feature_density_column`` a feature may
+    # have to be included, evaluated BEFORE ST_AsMVTGeom. The symmetric
+    # counterpart of min_feature_rank_by_zoom: excludes features ABOVE the
+    # ceiling instead of keeping features above a floor. Requires
+    # ``feature_density_column``.
+    #   - Highest key ≤ current zoom wins (bracket resolution).
+    #   - Value is the inclusive ceiling: features with a density column
+    #     value strictly above it are excluded at that zoom.
+    #   - 0 in a bracket = no ceiling for that zoom and above, mirroring
+    #     max_features_per_tile_by_zoom's opt-out.
+    #   - Default None = disabled.
+    max_feature_density_by_zoom: Mutable[Optional[Dict[int, float]]] = Field(
+        default=None,
+        description=(
+            "Opt-in zoom-aware ceiling for feature_density_column (highest "
+            "key ≤ current zoom wins). Features whose value exceeds the "
+            "bracket's ceiling are excluded via a pre-transform WHERE, "
+            "index-assisted when the column is indexed. 0 in a bracket = no "
+            "ceiling for that zoom and above. Requires feature_density_column. "
+            "Default None = disabled."
+        ),
+    )
+
     # Caching
     cache_on_demand: Mutable[bool] = Field(
         default=True,

@@ -200,6 +200,8 @@ def _make_collection_meta(
     feature_rank_column=None,
     min_feature_rank_by_zoom=None,
     tile_byte_budget=None,
+    feature_density_column=None,
+    max_feature_density_by_zoom=None,
 ):
     """Return a minimal resolved-collection meta dict for tiles_db tests."""
     return {
@@ -214,6 +216,8 @@ def _make_collection_meta(
         "feature_rank_column": feature_rank_column,
         "min_feature_rank_by_zoom": min_feature_rank_by_zoom,
         "tile_byte_budget": tile_byte_budget,
+        "feature_density_column": feature_density_column,
+        "max_feature_density_by_zoom": max_feature_density_by_zoom,
     }
 
 
@@ -658,3 +662,105 @@ def test_feature_rank_config_overridable():
     )
     assert cfg.feature_rank_column == "length_m"
     assert cfg.min_feature_rank_by_zoom == {0: 20000.0, 6: 0.0}
+
+
+# ---------------------------------------------------------------------------
+# TilesConfig: per-feature density CEILING (opt-in, default disabled) — the
+# inverse of feature_rank_column/min_feature_rank_by_zoom above.
+# ---------------------------------------------------------------------------
+
+
+def test_feature_density_config_defaults_are_none():
+    from dynastore.modules.tiles.tiles_config import TilesConfig
+    cfg = TilesConfig()
+    assert cfg.feature_density_column is None
+    assert cfg.max_feature_density_by_zoom is None
+
+
+def test_feature_density_config_overridable():
+    from dynastore.modules.tiles.tiles_config import TilesConfig
+    cfg = TilesConfig(
+        feature_density_column="vertex_count",
+        max_feature_density_by_zoom={0: 500.0, 6: 0.0},
+    )
+    assert cfg.feature_density_column == "vertex_count"
+    assert cfg.max_feature_density_by_zoom == {0: 500.0, 6: 0.0}
+
+
+def test_feature_density_config_opt_out():
+    """{0: 0} is the documented opt-out: 0 resolves for every zoom and a
+    0-valued bracket pushes no ceiling, mirroring max_features_per_tile_by_zoom."""
+    from dynastore.modules.tiles.tiles_config import TilesConfig
+    cfg = TilesConfig(max_feature_density_by_zoom={0: 0})
+    assert cfg.max_feature_density_by_zoom == {0: 0}
+
+
+# ---------------------------------------------------------------------------
+# tiles_db: density ceiling pre-transform WHERE clause + composition with the
+# rank filter.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_density_ceiling_pushes_pretransform_where():
+    """feature_density_column + max_feature_density_by_zoom → indexed pre-transform WHERE."""
+    meta = _make_collection_meta(
+        feature_density_column="vertex_count",
+        max_feature_density_by_zoom={0: 500.0, 6: 0.0},
+    )
+    params = await _capture_builder_params(meta, z="2")  # z2 ≥ key 0 → 500.0
+    assert params.get("where") == '"vertex_count" <= :feat_density_max'
+    assert params.get("raw_params", {}).get("feat_density_max") == 500.0
+
+
+@pytest.mark.asyncio
+async def test_density_ceiling_absent_without_column():
+    """A max-density map alone (no density column) pushes no WHERE — needs the column."""
+    meta = _make_collection_meta(
+        feature_density_column=None,
+        max_feature_density_by_zoom={0: 500.0},
+    )
+    params = await _capture_builder_params(meta, z="2")
+    assert params.get("where") is None
+
+
+@pytest.mark.asyncio
+async def test_density_ceiling_zero_bracket_disables():
+    """A 0 value in the resolved bracket disables the ceiling for that zoom
+    and above — the per-zoom opt-out, mirroring max_features_per_tile_by_zoom."""
+    meta = _make_collection_meta(
+        feature_density_column="vertex_count",
+        max_feature_density_by_zoom={0: 500.0, 6: 0},
+    )
+    params = await _capture_builder_params(meta, z="6")  # z6 ≥ key 6 → 0 → disabled
+    assert params.get("where") is None
+
+
+@pytest.mark.asyncio
+async def test_rank_and_density_filters_compose():
+    """Rank floor and density ceiling are independent and AND-combined into a
+    single pre-transform WHERE, with both bind params present."""
+    meta = _make_collection_meta(
+        feature_rank_column="length_m",
+        min_feature_rank_by_zoom={0: 20000.0},
+        feature_density_column="vertex_count",
+        max_feature_density_by_zoom={0: 500.0},
+    )
+    params = await _capture_builder_params(meta, z="2")
+    assert params.get("where") == (
+        '"length_m" >= :feat_rank_min AND "vertex_count" <= :feat_density_max'
+    )
+    raw_params = params.get("raw_params", {})
+    assert raw_params.get("feat_rank_min") == 20000.0
+    assert raw_params.get("feat_density_max") == 500.0
+
+
+@pytest.mark.asyncio
+async def test_no_rank_or_density_filters_pushes_no_where():
+    """With neither filter configured, no where/raw_params keys reach the
+    builder params — the pre-transform query is unchanged from before either
+    filter existed."""
+    meta = _make_collection_meta()
+    params = await _capture_builder_params(meta, z="2")
+    assert "where" not in params
+    assert "raw_params" not in params
