@@ -498,10 +498,23 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
     async def lifespan(self, app: FastAPI):
         """Manages the Tiles Service configuration."""
         from dynastore.tools.discovery import register_plugin, unregister_plugin
-        from .stac_contributor import TilesStacContributor
 
-        contributor = TilesStacContributor()
-        register_plugin(contributor)
+        # The STAC links contributor imports the stac extension's shared
+        # tileability gate (dynastore.extensions.stac._map_tiles_gate).
+        # Scopes that ship tiles without the stac extension (scope_maps)
+        # cannot import it — they serve no STAC items either, so skip the
+        # contributor instead of failing the whole tiles lifespan (#3177).
+        contributor = None
+        try:
+            from .stac_contributor import TilesStacContributor
+        except ImportError:
+            logger.info(
+                "Tiles Service: stac extension not installed — skipping the "
+                "STAC map-tile links contributor."
+            )
+        else:
+            contributor = TilesStacContributor()
+            register_plugin(contributor)
         logger.info("Tiles Service startup.")
 
         # Register the tiles cold-boot contributor so run_cold_boot (called
@@ -537,7 +550,8 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             await self._tile_cache_writer.stop(
                 drain_timeout=_TILE_CACHE_WRITER_DRAIN_SECONDS
             )
-            unregister_plugin(contributor)
+            if contributor is not None:
+                unregister_plugin(contributor)
             logger.info("Tiles Service shutdown.")
 
     @expose_web_page(
