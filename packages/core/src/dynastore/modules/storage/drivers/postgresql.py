@@ -985,6 +985,24 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
                         catalog_id=catalog_id,
                         collection_id=collection_id,
                     )
+                    # Same guard for the statistics overlay stamped above: a
+                    # stat column introduced after the geometries/place table
+                    # was materialised never physically exists, and the write
+                    # path would emit it into every INSERT (42703). Prune the
+                    # overlay to physically-present columns so pre-existing
+                    # collections keep ingesting (stats unset) until the
+                    # columns are added out-of-band (#3155 backfill SQL or a
+                    # re-provision) — after which the next ensure_storage
+                    # re-stamps the full overlay and statistics resume.
+                    sidecar_config = await self._reconcile_geometry_stats_overlay(
+                        conn,
+                        schema=schema,
+                        physical_table=physical_table,
+                        sidecar_config=sidecar_config,
+                        sidecar_impl=sidecar_impl,
+                        catalog_id=catalog_id,
+                        collection_id=collection_id,
+                    )
                     reconciled_sidecars.append(sidecar_config)
                 except ValueError as e:
                     logger.warning("Skipping sidecar table creation: %s", e)
@@ -1099,6 +1117,107 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
             catalog_id, collection_id, len(dropped), attr_table, sorted(dropped),
         )
         return sidecar_config.model_copy(update={"attribute_schema": kept})
+
+    async def _reconcile_geometry_stats_overlay(
+        self,
+        conn: Any,
+        *,
+        schema: str,
+        physical_table: str,
+        sidecar_config: Any,
+        sidecar_impl: Any,
+        catalog_id: str,
+        collection_id: str,
+    ) -> Any:
+        """Drop stored statistics whose physical column is absent.
+
+        The statistics counterpart of
+        :meth:`_reconcile_columnar_attribute_schema`: ``ensure_storage``
+        stamps the policy's storage-bearing compute entries (now all
+        geometry/place statistics by default, #3155) onto
+        ``compute_fields_overlay``, but the sidecar DDL is ``CREATE TABLE IF
+        NOT EXISTS`` — a no-op on an already-materialised collection. Without
+        this guard every ingestion into such a collection emits the missing
+        stat columns into its INSERTs and fails with ``UndefinedColumnError``
+        (42703), making the out-of-band column backfill a hard deploy
+        prerequisite. With it, the backfill is optional: rows ingest with the
+        missing statistics unset, and since the overlay is re-stamped from the
+        live policy on every ``ensure_storage``, statistics resume
+        automatically once the columns exist (backfill SQL or re-provision —
+        the app never ``ALTER``\\ s an existing table).
+
+        Fails open: any introspection error leaves the config untouched.
+        """
+        from dynastore.modules.storage.drivers.pg_sidecars.geometries import (
+            GeometriesSidecar,
+        )
+
+        if not isinstance(sidecar_impl, GeometriesSidecar):
+            return sidecar_config
+        overlay = list(getattr(sidecar_config, "compute_fields_overlay", None) or [])
+        if not any(f.storage_mode is not None for f in overlay):
+            return sidecar_config
+
+        from dynastore.modules.db_config import shared_queries
+        from dynastore.modules.db_config.query_executor import DQLQuery, ResultHandler
+        from dynastore.modules.storage.computed_fields import (
+            _PLACE_TABLE_KINDS,
+            reconcile_storage_overlay_to_columns,
+        )
+
+        geom_table = f"{physical_table}_{sidecar_impl.sidecar_id}"
+
+        async def _columns_of(table: str) -> Optional[set]:
+            exists = await shared_queries.table_exists_query.execute(
+                conn, schema=schema, table=table
+            )
+            if not exists:
+                return None
+            rows = await DQLQuery(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = :schema AND table_name = :table",
+                result_handler=ResultHandler.ALL_DICTS,
+            ).execute(conn, schema=schema, table=table)
+            return {r["column_name"] for r in (rows or [])}
+
+        try:
+            geom_columns = await _columns_of(geom_table)
+            if geom_columns is None:
+                # Table was not created (e.g. a lenient skip above); nothing
+                # to diverge from.
+                return sidecar_config
+            place_columns: Optional[set] = None
+            if any(
+                f.storage_mode is not None and f.kind in _PLACE_TABLE_KINDS
+                for f in overlay
+            ):
+                place_columns = await _columns_of(f"{physical_table}_place")
+        except Exception as exc:  # introspection failure → fail open
+            logger.warning(
+                "Could not introspect '%s.%s' to reconcile the statistics "
+                "overlay for %s/%s (%s); leaving sidecar config unchanged.",
+                schema, geom_table, catalog_id, collection_id, exc,
+            )
+            return sidecar_config
+
+        kept, dropped = reconcile_storage_overlay_to_columns(
+            overlay, geom_columns, place_columns
+        )
+        if not dropped:
+            return sidecar_config
+        logger.warning(
+            "Collection %s/%s: %d stored statistic(s) in the write policy have "
+            "no physical column on the already-materialised sidecar tables "
+            "('%s' / '%s_place') and were dropped from the persisted overlay — "
+            "features ingest with these statistics unset instead of failing: "
+            "%s. Add the columns out-of-band (issue #3155 backfill SQL) or "
+            "re-provision the collection; statistics resume automatically on "
+            "the next ingestion once the columns exist — the app never ALTERs "
+            "an existing table.",
+            catalog_id, collection_id, len(dropped), geom_table, physical_table,
+            sorted(dropped),
+        )
+        return sidecar_config.model_copy(update={"compute_fields_overlay": kept})
 
     # Collection-metadata CRUD has moved to the domain-scoped drivers +
     # :mod:`dynastore.modules.catalog.collection_router`.  The

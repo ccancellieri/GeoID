@@ -686,6 +686,61 @@ def default_derive_spec() -> DeriveSpec:
     )
 
 
+def reconcile_storage_overlay_to_columns(
+    fields: Iterable["ComputedField"],
+    geometry_columns: set,
+    place_columns: Optional[set],
+) -> Tuple[List["ComputedField"], List[str]]:
+    """Drop stored-statistic overlay entries whose physical column is absent.
+
+    The statistics counterpart of
+    ``reconcile_attribute_schema_to_columns`` (#1491): ``ensure_storage``
+    stamps the policy's storage-bearing compute entries onto the geometries
+    sidecar's ``compute_fields_overlay``, but its ``CREATE TABLE IF NOT
+    EXISTS`` DDL is a no-op on an already-materialised collection — a stat
+    column introduced after the table was created never physically exists,
+    and every write/read that references it fails with
+    ``UndefinedColumnError``. This prunes the overlay down to what the
+    tables actually have, so a pre-existing collection keeps ingesting
+    (statistics unset) until the columns are added out-of-band.
+
+    ``geometry_columns`` are the physical columns of the ``_geometries``
+    table; ``place_columns`` those of the ``_place`` table, or ``None``
+    when that table does not exist. Rules per storage-bearing field:
+    place kinds need ``place_<name>`` (COLUMNAR) or ``place_stats``
+    (JSONB) on the place table; every other kind needs ``<name>``
+    (COLUMNAR) or ``geom_stats`` (JSONB) on the geometries table.
+    Non-storage entries (identity-only derivations) are kept untouched.
+
+    Returns ``(kept_fields, dropped_names)`` preserving order.
+    """
+    kept: List[ComputedField] = []
+    dropped: List[str] = []
+    for f in fields:
+        if f.storage_mode is None:
+            kept.append(f)
+            continue
+        if f.kind in _PLACE_TABLE_KINDS:
+            cols = place_columns
+            needed = (
+                "place_stats"
+                if f.storage_mode == StatisticStorageMode.JSONB
+                else f"place_{f.resolved_name}"
+            )
+        else:
+            cols = geometry_columns
+            needed = (
+                "geom_stats"
+                if f.storage_mode == StatisticStorageMode.JSONB
+                else f.resolved_name
+            )
+        if cols is not None and needed in cols:
+            kept.append(f)
+        else:
+            dropped.append(f.resolved_name)
+    return kept, dropped
+
+
 class IdentityRule(BaseModel):
     """One AND-composition over declared derivations for identity resolution.
 
@@ -947,6 +1002,7 @@ __all__ = [
     "_GEOMETRY_STAT_KINDS",
     "_PLACE_TABLE_KINDS",
     "_ATTRIBUTE_SIDECAR_KINDS",
+    "reconcile_storage_overlay_to_columns",
     # Container classification SSOT (refs #1800)
     "classify_container",
     "_IDENTITY_FIELD_NAMES",
