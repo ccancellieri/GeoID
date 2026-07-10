@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import signal
+import time
 
 import pytest
 
@@ -1030,11 +1031,14 @@ async def test_diagnostic_no_python_growth_points_at_native_memory(
             self_recycle_enabled=False,
         ),
     )
+    # Real bytes scale (unlike most tests above, which use abstract small
+    # numbers): 42MiB traced against 700MiB RSS is the minority-traced case
+    # the native disclaimer is for.
     svc = MemoryWatchdogService(
-        limit_bytes=1000,
+        limit_bytes=1000 * 1024 * 1024,
         warn_ratio=0.8,
         critical_ratio=0.9,
-        get_rss_bytes=lambda: 700,
+        get_rss_bytes=lambda: 700 * 1024 * 1024,
     )
     svc._diag_baseline = _FakeSnapshot()  # type: ignore[assignment]  # as if armed earlier
     with caplog.at_level(logging.ERROR, logger="dynastore.tools.memory_watchdog"):
@@ -1043,7 +1047,9 @@ async def test_diagnostic_no_python_growth_points_at_native_memory(
     assert len(diag) == 1
     message = diag[0].getMessage()
     assert "NO Python-level allocation growth" in message
+    assert "% traced" in message
     assert "native/C-extension" in message
+    assert "GEOS/GDAL" in message
 
 
 @pytest.mark.asyncio
@@ -1175,3 +1181,220 @@ async def test_growth_report_names_the_caller_not_just_the_leaf_frame(
         f"frame. Entry was:\n{decode_entries[0]}"
     )
     assert len(decoded) == 20000  # keep the allocation alive past the snapshot
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic coupled to threshold crossings (geoid#3191)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_crossing_warn_forces_diagnostic_below_diagnostic_ratio(
+    monkeypatch, caplog, _stop_tracemalloc
+) -> None:
+    """A tick that crosses INTO the warn band forces the diagnostic snapshot
+    on that same tick even though ``ratio`` has not reached ``diagnostic_ratio``
+    yet — a fast spike that crosses warn and kills the worker within one
+    cadence period must not wait for a later poll that happens to also clear
+    diagnostic_ratio."""
+    import tracemalloc
+
+    if tracemalloc.is_tracing():
+        tracemalloc.stop()
+    tracemalloc.start(1)
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            diagnostic_ratio=0.95,  # above warn_ratio: never reached in this test
+            diagnostic_min_interval_seconds=0.0,
+            self_recycle_enabled=False,
+        ),
+    )
+    rss = {"value": 500}
+    svc = MemoryWatchdogService(
+        limit_bytes=1000,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: rss["value"],
+    )
+    svc._diag_baseline = tracemalloc.take_snapshot()  # already armed
+    ctx = _make_ctx()
+
+    with caplog.at_level(logging.WARNING, logger="dynastore.tools.memory_watchdog"):
+        await svc.tick(ctx)  # ratio 0.5 — below warn, no diagnostic
+        caplog.clear()
+        rss["value"] = 850  # crosses warn (0.8) — ratio 0.85, still < diagnostic_ratio 0.95
+        await svc.tick(ctx)
+
+    diag = [r for r in caplog.records if "[diagnostic]" in r.getMessage()]
+    assert len(diag) == 1
+
+
+@pytest.mark.asyncio
+async def test_crossing_inside_min_interval_does_not_force_second_snapshot(
+    monkeypatch, caplog, _stop_tracemalloc
+) -> None:
+    """Crossing bypasses the diagnostic_ratio floor, but must NOT bypass the
+    min-interval throttle: a crossing that lands inside the window since the
+    previous snapshot does not force a second one."""
+    import tracemalloc
+
+    if tracemalloc.is_tracing():
+        tracemalloc.stop()
+    tracemalloc.start(1)
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            diagnostic_ratio=0.95,  # above both warn and critical in this test
+            diagnostic_min_interval_seconds=60.0,
+            self_recycle_enabled=False,
+        ),
+    )
+    rss = {"value": 500}
+    svc = MemoryWatchdogService(
+        limit_bytes=1000,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: rss["value"],
+    )
+    svc._diag_baseline = tracemalloc.take_snapshot()
+    svc._last_diag_snapshot = time.monotonic()  # a snapshot "just" landed
+    ctx = _make_ctx()
+
+    with caplog.at_level(logging.WARNING, logger="dynastore.tools.memory_watchdog"):
+        rss["value"] = 850  # crosses warn — still below diagnostic_ratio 0.95
+        await svc.tick(ctx)
+
+    diag = [r for r in caplog.records if "[diagnostic]" in r.getMessage()]
+    assert diag == []
+
+
+@pytest.mark.asyncio
+async def test_crossing_tick_logs_diagnostic_before_bare_rss_line(
+    monkeypatch, caplog, _stop_tracemalloc
+) -> None:
+    """On a crossing tick the diagnostic must land in the log BEFORE the bare
+    RSS warn line: if the spike kills the worker mid-tick, the last thing
+    flushed has to be the report that names the allocator, not the line that
+    only restates the number."""
+    import tracemalloc
+
+    if tracemalloc.is_tracing():
+        tracemalloc.stop()
+    tracemalloc.start(1)
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            diagnostic_ratio=0.95,
+            diagnostic_min_interval_seconds=0.0,
+            self_recycle_enabled=False,
+        ),
+    )
+    rss = {"value": 500}
+    svc = MemoryWatchdogService(
+        limit_bytes=1000,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: rss["value"],
+    )
+    svc._diag_baseline = tracemalloc.take_snapshot()
+    ctx = _make_ctx()
+
+    with caplog.at_level(logging.WARNING, logger="dynastore.tools.memory_watchdog"):
+        await svc.tick(ctx)  # ratio 0.5 — below warn
+        caplog.clear()
+        rss["value"] = 850  # crosses warn
+        await svc.tick(ctx)
+
+    messages = [r.getMessage() for r in caplog.records]
+    diag_idx = [i for i, m in enumerate(messages) if "[diagnostic]" in m]
+    warn_idx = [i for i, m in enumerate(messages) if "of the" in m and "budget" in m]
+    assert diag_idx and warn_idx
+    assert diag_idx[0] < warn_idx[0]
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_report_flags_native_growth_when_traced_is_minority(
+    monkeypatch, caplog, _stop_tracemalloc
+) -> None:
+    """The report always states the traced/RSS ratio, and when tracemalloc's
+    traced total covers only a small fraction of RSS, explicitly says the
+    untraced growth is native (GEOS/GDAL/driver-level) — the decisive signal
+    that no Python allocation site can name it."""
+    import tracemalloc
+
+    if tracemalloc.is_tracing():
+        tracemalloc.stop()
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            diagnostic_ratio=0.50,
+            diagnostic_min_interval_seconds=0.0,
+            self_recycle_enabled=False,
+        ),
+    )
+    # Real bytes scale: RSS ~700MiB against a handful of KB of tracemalloc-
+    # traced Python allocations — the overwhelming majority is untraced.
+    svc = MemoryWatchdogService(
+        limit_bytes=1000 * 1024 * 1024,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: 700 * 1024 * 1024,
+    )
+    ctx = _make_ctx()
+    with caplog.at_level(logging.ERROR, logger="dynastore.tools.memory_watchdog"):
+        await svc.tick(ctx)  # arming tick
+        small = [bytearray(1024) for _ in range(4)]  # a few KB — negligible vs RSS
+        await svc.tick(ctx)
+
+    diag = [r for r in caplog.records if "[diagnostic]" in r.getMessage()]
+    assert len(diag) == 1
+    message = diag[0].getMessage()
+    assert "% traced" in message
+    assert "native/C-extension" in message
+    assert "GEOS/GDAL" in message
+    assert len(small) == 4
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_report_omits_native_statement_when_traced_dominates(
+    monkeypatch, caplog, _stop_tracemalloc
+) -> None:
+    """When tracemalloc's traced heap covers most of RSS, the report still
+    states the ratio but does not claim the growth is native — the numbers
+    genuinely are explained by Python-level allocations."""
+    import tracemalloc
+
+    if tracemalloc.is_tracing():
+        tracemalloc.stop()
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            diagnostic_ratio=0.50,
+            diagnostic_min_interval_seconds=0.0,
+            self_recycle_enabled=False,
+        ),
+    )
+    svc = MemoryWatchdogService(
+        limit_bytes=4 * 1024 * 1024,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: 3 * 1024 * 1024,  # 75% — below warn, above diagnostic_ratio
+    )
+    ctx = _make_ctx()
+    with caplog.at_level(logging.ERROR, logger="dynastore.tools.memory_watchdog"):
+        await svc.tick(ctx)  # arms tracing — no traced allocation yet
+        big = [bytearray(1024 * 1024) for _ in range(2)]  # ~2MiB, traced after arming
+        await svc.tick(ctx)
+
+    diag = [r for r in caplog.records if "[diagnostic]" in r.getMessage()]
+    assert len(diag) == 1
+    message = diag[0].getMessage()
+    assert "% traced" in message
+    assert "native/C-extension" not in message
+    assert len(big) == 2

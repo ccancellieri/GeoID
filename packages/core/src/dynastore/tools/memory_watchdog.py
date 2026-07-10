@@ -137,6 +137,48 @@ def _format_alloc_site(traceback: "tracemalloc.Traceback") -> str:
     return "\n".join(f"       {frame}" for frame in frames)
 
 
+# Below this fraction of RSS being covered by tracemalloc's own traced total,
+# the process's memory is mostly untraced (geoid#3191). tracemalloc can only
+# ever see allocations that went through CPython's own allocator; GEOS/GDAL
+# buffers and other C-extension/driver memory (plausible on the tile-render
+# path) never do, so once traced covers only a minority of RSS the rest is
+# native by exclusion, not merely "not yet seen".
+_NATIVE_GROWTH_TRACED_RATIO = 0.5
+
+_NATIVE_GROWTH_EXPLANATION = (
+    "most of RSS is untraced native/C-extension memory (GEOS/GDAL/driver "
+    "buffers are plausible suspects on the tile-render path) that "
+    "Python-level attribution cannot name"
+)
+
+
+def _traced_vs_rss_summary(traced_bytes: int, rss_bytes: int) -> str:
+    """Render "tracemalloc traced total X.XMiB of YMiB RSS (Z.Z% traced)".
+
+    Every diagnostic report includes this so a reader sees, without doing the
+    division themselves, how much of the process's actual memory tracemalloc's
+    own accounting explains — the number that decides whether a Python
+    allocation site can even in principle name the growth.
+    """
+    if rss_bytes <= 0:
+        return f"tracemalloc traced total {traced_bytes / (1024 * 1024):.1f}MiB"
+    traced_ratio = traced_bytes / rss_bytes
+    return (
+        f"tracemalloc traced total {traced_bytes / (1024 * 1024):.1f}MiB of "
+        f"{rss_bytes / (1024 * 1024):.0f}MiB RSS ({traced_ratio * 100:.1f}% traced)"
+    )
+
+
+def _is_native_growth_dominant(traced_bytes: int, rss_bytes: int) -> bool:
+    """True when tracemalloc's traced heap covers only a minority of RSS.
+
+    See ``_NATIVE_GROWTH_TRACED_RATIO``.
+    """
+    if rss_bytes <= 0:
+        return False
+    return (traced_bytes / rss_bytes) < _NATIVE_GROWTH_TRACED_RATIO
+
+
 def read_process_rss_bytes() -> Optional[int]:
     """Return this process's current resident set size (RSS) in bytes.
 
@@ -269,6 +311,12 @@ class MemoryWatchdogService(PeriodicService):
         self._last_diag_snapshot: Optional[float] = None
         self._diag_started = False
         self._diag_baseline: Optional[tracemalloc.Snapshot] = None
+        # Threshold-crossing bookkeeping (geoid#3191): the ratio observed on
+        # the previous tick, so a tick can tell whether THIS observation is a
+        # fresh crossing into the warn/critical band (couples the diagnostic
+        # report to that crossing) or just another tick inside a plateau
+        # already reported on.
+        self._prev_ratio: Optional[float] = None
 
     def _effective_limit_bytes(
         self, config: "MemoryWatchdogConfig"
@@ -315,6 +363,30 @@ class MemoryWatchdogService(PeriodicService):
             return
         self._inert_warned = False
         ratio = rss_bytes / limit_bytes
+
+        # A crossing is a transition INTO the warn or critical band since the
+        # previous observation, not merely "ratio is high this tick" — it is
+        # what forces the diagnostic below to fire inline on the tick that
+        # crosses, instead of waiting for a later tick that happens to also
+        # clear diagnostic_ratio (geoid#3191). A worker with no prior
+        # observation (``_prev_ratio`` still ``None``) is treated as having
+        # been below both bands, so the very first tick that already lands
+        # in warn/critical territory also counts as a crossing.
+        prev_ratio = self._prev_ratio
+        self._prev_ratio = ratio
+        crossed_threshold = (
+            ratio >= self._warn_ratio and (prev_ratio is None or prev_ratio < self._warn_ratio)
+        ) or (
+            ratio >= self._critical_ratio and (prev_ratio is None or prev_ratio < self._critical_ratio)
+        )
+
+        # Diagnostic first: on a genuine crossing this is the very next thing
+        # logged, ahead of the bare RSS line below, so attributing a fast
+        # spike never has to wait for a later poll.
+        self._maybe_emit_tracemalloc(
+            ctx, config, ratio, rss_bytes, limit_bytes, crossed_threshold
+        )
+
         if ratio >= self._critical_ratio:
             logger.error(
                 "memory_watchdog: RSS %.0fMiB%s is %.0f%% of the %.0fMiB budget "
@@ -344,7 +416,6 @@ class MemoryWatchdogService(PeriodicService):
         else:
             self._warned = False
 
-        self._maybe_emit_tracemalloc(ctx, config, ratio, rss_bytes, limit_bytes)
         await self._maybe_self_recycle(ctx, config, ratio, limit_bytes)
 
     def _maybe_emit_tracemalloc(
@@ -354,6 +425,7 @@ class MemoryWatchdogService(PeriodicService):
         ratio: float,
         rss_bytes: int,
         limit_bytes: int,
+        crossed_threshold: bool,
     ) -> None:
         """Diagnostic (geoid#3121): log which allocation sites GREW as a worker
         climbs toward its budget.
@@ -373,11 +445,23 @@ class MemoryWatchdogService(PeriodicService):
         one-time warm-up allocations appear once and disappear while a genuine
         leak dominates every subsequent report, with a per-interval growth rate.
 
-        Every report also logs tracemalloc's own traced total next to RSS: a
-        large RSS-vs-traced gap (or a report with no Python-level growth while
-        RSS keeps climbing) means the growth is happening outside CPython's
-        allocator — native/C-extension memory tracemalloc cannot see — and the
-        next tool is a native profiler, not more Python-side reading.
+        ``crossed_threshold`` (geoid#3191) is True when THIS tick just crossed
+        into the warn or critical band (see ``tick``'s crossing check): it lets
+        a crossing force a snapshot even when ``ratio`` has not yet reached
+        ``diagnostic_ratio``, so the report the crossing deserves is not left
+        waiting for a later tick that happens to also clear that ratio — a fast
+        spike that kills the worker within one cadence period would otherwise
+        leave no report behind at all. It does NOT bypass the min-interval
+        throttle below: a crossing that lands inside that window still does
+        not force a second snapshot.
+
+        Every report also logs tracemalloc's own traced total against RSS and
+        their ratio (``_traced_vs_rss_summary``): once traced covers only a
+        minority of RSS, the rest is native/C-extension memory (GEOS/GDAL and
+        other driver buffers are plausible on the tile-render path) that
+        tracemalloc cannot see and Python-level attribution cannot name — the
+        report says so explicitly (``_is_native_growth_dominant``) so a reader
+        stops expecting a Python allocation site to explain it.
 
         ``diagnostic_ratio`` sits deliberately below the OOM point so the
         snapshot's own allocation has headroom and the *climb* toward the kill
@@ -401,7 +485,7 @@ class MemoryWatchdogService(PeriodicService):
             self._diag_started = False
             self._diag_baseline = None
             return
-        if ratio < config.diagnostic_ratio:
+        if ratio < config.diagnostic_ratio and not crossed_threshold:
             return
         if not tracemalloc.is_tracing():
             # Lazy start: arm tracing and capture the baseline on THIS tick (a
@@ -440,6 +524,10 @@ class MemoryWatchdogService(PeriodicService):
         traced_bytes, _ = tracemalloc.get_traced_memory()
         top_n = max(1, config.diagnostic_top_n)
 
+        traced_summary = _traced_vs_rss_summary(traced_bytes, rss_bytes)
+        if _is_native_growth_dominant(traced_bytes, rss_bytes):
+            traced_summary = f"{traced_summary}; {_NATIVE_GROWTH_EXPLANATION}"
+
         if self._diag_baseline is None:
             # Tracing was already on before this service saw the flag (e.g. a
             # PYTHONTRACEMALLOC boot or another component armed it), so there
@@ -455,14 +543,14 @@ class MemoryWatchdogService(PeriodicService):
             )
             logger.error(
                 "memory_watchdog[diagnostic]: RSS %.0fMiB (%.0f%% of %.0fMiB "
-                "budget) on %s; tracemalloc traced total %.1fMiB — baseline "
+                "budget) on %s; %s — baseline "
                 "report, top %d Python allocation sites by size (growth diffs "
                 "follow from the next report):\n%s",
                 rss_bytes / (1024 * 1024),
                 ratio * 100,
                 limit_bytes / (1024 * 1024),
                 ctx.name,
-                traced_bytes / (1024 * 1024),
+                traced_summary,
                 len(top),
                 lines,
             )
@@ -475,15 +563,14 @@ class MemoryWatchdogService(PeriodicService):
         if not grown:
             logger.error(
                 "memory_watchdog[diagnostic]: RSS %.0fMiB (%.0f%% of %.0fMiB "
-                "budget) on %s; tracemalloc traced total %.1fMiB — NO "
+                "budget) on %s; %s — NO "
                 "Python-level allocation growth since the previous snapshot "
-                "(%s). If RSS keeps climbing, the growth is outside CPython's "
-                "allocator (native/C-extension memory tracemalloc cannot see).",
+                "(%s).",
                 rss_bytes / (1024 * 1024),
                 ratio * 100,
                 limit_bytes / (1024 * 1024),
                 ctx.name,
-                traced_bytes / (1024 * 1024),
+                traced_summary,
                 since,
             )
             return
@@ -496,13 +583,13 @@ class MemoryWatchdogService(PeriodicService):
         )
         logger.error(
             "memory_watchdog[diagnostic]: RSS %.0fMiB (%.0f%% of %.0fMiB budget) "
-            "on %s; tracemalloc traced total %.1fMiB — top %d Python allocation "
+            "on %s; %s — top %d Python allocation "
             "sites by growth since the previous snapshot (%s):\n%s",
             rss_bytes / (1024 * 1024),
             ratio * 100,
             limit_bytes / (1024 * 1024),
             ctx.name,
-            traced_bytes / (1024 * 1024),
+            traced_summary,
             len(grown),
             since,
             lines,
