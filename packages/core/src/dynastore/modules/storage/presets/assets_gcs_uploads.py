@@ -66,7 +66,6 @@ def _build_gcs_asset_routing() -> Any:
         FailurePolicy,
         Operation,
         OperationDriverEntry,
-        WriteMode,
     )
 
     return AssetRoutingConfig(
@@ -75,7 +74,6 @@ def _build_gcs_asset_routing() -> Any:
                 OperationDriverEntry(
                     driver_ref="gcp_module",
                     on_failure=FailurePolicy.FATAL,
-                    write_mode=WriteMode.SYNC,
                     source="operator",
                 ),
             ],

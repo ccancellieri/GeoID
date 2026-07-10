@@ -25,10 +25,13 @@ Pins PG-only routing for all four resource tiers (catalog, collection, items,
 assets) under a specific catalog. No Elasticsearch at any level — not even a
 private items index.
 
-``Operation.SEARCH`` is explicitly set on catalog and collection tiers so
-the self-register helper cannot auto-append a discoverable ES store to a new
-SEARCH op (#1102 / #1047). Asset ``UPLOAD`` is intentionally omitted — it is
-auto-augmented from discovered ``AssetUploadProtocol`` impls.
+There is no configured SEARCH operation to guard any more (#1102 / #1047):
+search is derived from INDEX-then-READ, and the WRITE-lane pin below
+(default ``source="operator"``) already blocks
+``_self_register_indexers_into`` from auto-appending a discoverable ES
+store into the INDEX lane (it gates on WRITE's operator-managed status).
+Asset ``UPLOAD`` is intentionally omitted — it is auto-augmented from
+discovered ``AssetUploadProtocol`` impls.
 
 Use this preset to explicitly lock a catalog to PG routing, overriding any
 platform-level defaults that might include ES drivers.
@@ -67,11 +70,6 @@ def _pg_catalog_routing() -> CatalogRoutingConfig:
                     on_failure=FailurePolicy.FATAL,
                 ),
             ],
-            # Explicit SEARCH pin prevents _self_register_searchers_into from
-            # auto-appending any discoverable ES CatalogStore (#1102 / #1047).
-            Operation.SEARCH: [
-                OperationDriverEntry(driver_ref="catalog_postgresql_driver"),
-            ],
         },
     )
 
@@ -90,10 +88,6 @@ def _pg_collection_routing() -> CollectionRoutingConfig:
                     driver_ref="collection_postgresql_driver",
                     on_failure=FailurePolicy.FATAL,
                 ),
-            ],
-            # Explicit SEARCH pin — same rationale as catalog tier.
-            Operation.SEARCH: [
-                OperationDriverEntry(driver_ref="collection_postgresql_driver"),
             ],
         },
     )
@@ -140,9 +134,10 @@ class PgOnlyCatalogPreset(BundlePreset):
     """Catalog-tier PostgreSQL-only routing across all four resource tiers.
 
     Routes catalog, collection, items, and assets entirely through PG drivers
-    with no Elasticsearch involvement at any level. Explicitly pins
-    ``Operation.SEARCH`` on catalog and collection tiers so ES stores cannot
-    be auto-registered. Asset ``UPLOAD`` is left to auto-augmentation.
+    with no Elasticsearch involvement at any level. The WRITE-lane pin on
+    every tier (operator-managed by default) blocks ES auto-registration
+    into the INDEX lane, so no ES stores are ever pulled in. Asset
+    ``UPLOAD`` is left to auto-augmentation.
     """
 
     name = "pg_only_catalog"
@@ -155,9 +150,9 @@ class PgOnlyCatalogPreset(BundlePreset):
         "Catalog-tier PostgreSQL-only routing for all four resource tiers "
         "(catalog, collection, items, assets). No Elasticsearch at any level. "
         "Apply to explicitly lock a catalog to PG-only routing, overriding any "
-        "platform-level defaults that include ES drivers. "
-        "SEARCH is pinned PG-only on catalog and collection tiers to prevent "
-        "ES auto-registration."
+        "platform-level defaults that include ES drivers. The WRITE-lane pin "
+        "on every tier keeps the INDEX lane empty (ES auto-registration is "
+        "gated on WRITE's operator-managed status)."
     )
 
     examples: ClassVar[Tuple[PresetExample, ...]] = (
@@ -166,9 +161,9 @@ class PgOnlyCatalogPreset(BundlePreset):
             summary=(
                 "Lock a catalog to PostgreSQL-only routing on all four tiers "
                 "(catalog, collection, items, assets), overriding any platform "
-                "default that would inject Elasticsearch drivers. SEARCH is pinned "
-                "PG-only on the catalog and collection tiers so a discoverable ES "
-                "store cannot be auto-registered. Apply at catalog scope via "
+                "default that would inject Elasticsearch drivers. The WRITE-lane "
+                "pin on every tier keeps a discoverable ES store out of the INDEX "
+                "lane. Apply at catalog scope via "
                 "POST /admin/catalogs/{catalog_id}/presets/pg_only_catalog. Takes no "
                 "parameters."
             ),

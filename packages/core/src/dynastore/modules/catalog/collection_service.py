@@ -1605,18 +1605,18 @@ class CollectionService:
 
         db_resource = ctx.db_resource if ctx else None
 
-        # A filtered listing (free-text ``q``) must go through the SEARCH-
+        # A filtered listing (free-text ``q``) must go through a search-
         # capable driver, so keep the routing-driven path for that case: the
-        # collection-metadata router picks the configured SEARCH driver for the
+        # collection-metadata router picks the INDEX-lane driver for the
         # scope and returns COMPLETE collections.  The READ fallback covers a
-        # deploy whose SEARCH slice has no results yet.
+        # deploy whose INDEX lane has no results yet (or is empty).
         if q:
             from dynastore.modules.catalog.collection_router import (
                 search_collection_metadata as _route_search,
             )
             from dynastore.modules.storage.routing_config import Operation
 
-            for op in (Operation.SEARCH, Operation.READ):
+            for op in (Operation.INDEX, Operation.READ):
                 try:
                     rows, _ = await _route_search(
                         catalog_id, q=q, limit=limit, offset=offset,

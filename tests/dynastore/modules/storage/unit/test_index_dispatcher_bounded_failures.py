@@ -46,10 +46,8 @@ from dynastore.modules.storage.index_dispatcher import (
     IndexDispatcher,
 )
 from dynastore.modules.storage.routing_config import (
-    FailurePolicy,
     Operation,
     OperationDriverEntry,
-    WriteMode,
 )
 from dynastore.tools.execution_context import task_run_scope
 
@@ -73,13 +71,7 @@ class _AllFailIndexer:
 
 
 def _entry(driver_ref: str) -> OperationDriverEntry:
-    return OperationDriverEntry(
-        driver_ref=driver_ref,
-        on_failure=FailurePolicy.WARN,
-        write_mode=WriteMode.SYNC,
-        secondary_index=True,
-        source="auto",
-    )
+    return OperationDriverEntry(driver_ref=driver_ref, source="auto")
 
 
 def _ctx() -> IndexContext:
@@ -95,7 +87,7 @@ def _ops(n: int) -> List[IndexOp]:
 
 class _StubRouting:
     def __init__(self, entries):
-        self.operations = {Operation.WRITE: entries}
+        self.operations = {Operation.INDEX: entries}
 
 
 def _make_dispatcher(entries, indexers) -> IndexDispatcher:

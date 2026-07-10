@@ -38,7 +38,6 @@ from dynastore.modules.storage.routing_config import (
     OperationDriverEntry,
     TransformerEntry,
     FailurePolicy,
-    WriteMode,
 )
 
 
@@ -282,10 +281,10 @@ class TestCollectionMetadataRouting:
         cfg = ItemsRoutingConfig(operations={
             Operation.WRITE: [OperationDriverEntry(driver_ref="items_postgresql_driver")],
             Operation.READ: [OperationDriverEntry(driver_ref="items_elasticsearch_driver", hints={"search"})],
-            Operation.SEARCH: [OperationDriverEntry(driver_ref="items_elasticsearch_driver", hints={"search"})],
+            Operation.INDEX: [OperationDriverEntry(driver_ref="items_elasticsearch_driver", hints={"search"})],
         })
         assert len(cfg.operations) == 3
-        assert cfg.operations[Operation.SEARCH][0].driver_ref == "items_elasticsearch_driver"
+        assert cfg.operations[Operation.INDEX][0].driver_ref == "items_elasticsearch_driver"
 
     def test_failure_policy(self):
         entry = OperationDriverEntry(driver_ref="es", on_failure=FailurePolicy.WARN)
@@ -312,35 +311,33 @@ class TestCollectionMetadataRouting:
         """Default routing puts ES (public) at READ position 0 with the
         ``geometry_simplified`` hint; PG follows with ``geometry_exact``.
 
-        WRITE fans out to PG (sync, fatal — authoritative) and ES
-        (async, outbox — durable propagation): the dispatcher's sync
-        phase commits the PG write, in the same TX it enqueues an
-        outbox row for the ES sink, and a background drain task pumps
-        the row through with retry.  Replaces the legacy per-item
-        listener pattern, which lacked durability under restart.
+        WRITE is PG-only (sync, fatal — authoritative). The ES INDEX-lane
+        entry propagates asynchronously by lane definition: the dispatcher
+        enqueues a durable obligation row in the same TX as the PG write,
+        and a background drain task pumps it through with retry. Replaces
+        the legacy per-item listener pattern, which lacked durability
+        under restart.
         """
         cfg = ItemsRoutingConfig()
         write = cfg.operations[Operation.WRITE]
         read = cfg.operations[Operation.READ]
-        from dynastore.modules.storage.routing_config import WriteMode
-        assert [e.driver_ref for e in write] == [
-            "items_postgresql_driver", "items_elasticsearch_driver",
-        ]
+        index = cfg.operations[Operation.INDEX]
+        assert [e.driver_ref for e in write] == ["items_postgresql_driver"]
         assert write[0].on_failure == FailurePolicy.FATAL
-        assert write[0].write_mode == WriteMode.SYNC
-        assert write[1].on_failure == FailurePolicy.OUTBOX
-        assert write[1].write_mode == WriteMode.ASYNC
+        assert [e.driver_ref for e in index] == ["items_elasticsearch_driver"]
         assert [e.driver_ref for e in read] == [
             "items_elasticsearch_driver", "items_postgresql_driver",
         ]
         assert read[0].hints == {"geometry_simplified"}
         # PG's READ entry also pins Hint.TILES (added by #456 so tile
         # rendering routes through PG, which alone exposes schema/table
-        # identifiers) and Hint.JOIN (declared on the PG entries so join
-        # surfaces route to PG — see the READ/SEARCH hints in
-        # routing_config's default ItemsRoutingConfig).
+        # identifiers), Hint.JOIN, and Hint.GROUP_BY (both declared on the
+        # PG entry so join/group_by surfaces route to PG — Elasticsearch
+        # has no ST_Transform or GROUP BY, #2829).
         from dynastore.modules.storage.hints import Hint
-        assert read[1].hints == {Hint.GEOMETRY_EXACT, Hint.TILES, Hint.JOIN}
+        assert read[1].hints == {
+            Hint.GEOMETRY_EXACT, Hint.TILES, Hint.JOIN, Hint.GROUP_BY,
+        }
 
     def test_code_default_instance_has_empty_fields_set(self):
         """ItemsRoutingConfig() built from default_factory has no
@@ -385,32 +382,23 @@ class TestOperationEnum:
         assert not hasattr(Operation, "TRANSFORM")
 
     def test_all_operations(self):
-        ops = {Operation.WRITE, Operation.READ, Operation.SEARCH, Operation.UPLOAD}
+        ops = {Operation.WRITE, Operation.READ, Operation.INDEX, Operation.UPLOAD}
         assert len(ops) == 4
 
-
-class TestWriteMode:
-    def test_composition_modes_exist(self):
-        assert WriteMode.FIRST == "first"
-        assert WriteMode.FAN_OUT == "fan_out"
-
-    def test_chain_mode_retired(self):
-        # #990: CHAIN was only ever the TRANSFORM-op composition mode.
-        assert not hasattr(WriteMode, "CHAIN")
-
-    def test_execution_modes_still_exist(self):
-        assert WriteMode.SYNC == "sync"
-        assert WriteMode.ASYNC == "async"
+    def test_search_not_an_operation(self):
+        # #2494: SEARCH is derived from the INDEX/READ lanes, not configured.
+        assert not hasattr(Operation, "SEARCH")
 
 
 class TestMetadataRoutingConfig:
     def test_default_operations_shape(self):
         cfg = CollectionRoutingConfig()
         # #732 ships non-empty WRITE/READ defaults: the PG collection driver
-        # is the system of record for both. SEARCH may also be seeded
-        # (explicit default entry + Searcher auto-self-registration). The
-        # invariant that still holds: no transformer is seeded by default
-        # unless an EntityTransformProtocol implementer is discoverable.
+        # is the system of record for both. The INDEX lane may also be
+        # seeded via indexer auto-self-registration when an ES driver is
+        # discoverable (see _self_register_indexers_into). The invariant
+        # that still holds: no transformer is seeded by default unless an
+        # EntityTransformProtocol implementer is discoverable.
         assert cfg.transformers == [], (
             f"transformers unexpectedly seeded by default: {cfg.transformers}"
         )
@@ -424,7 +412,6 @@ class TestMetadataRoutingConfig:
         cfg = CollectionRoutingConfig(operations={
             Operation.READ: [OperationDriverEntry(
                 driver_ref="collection_elasticsearch_driver",
-                write_mode=WriteMode.FIRST,
             )],
         })
         assert len(cfg.operations[Operation.READ]) == 1

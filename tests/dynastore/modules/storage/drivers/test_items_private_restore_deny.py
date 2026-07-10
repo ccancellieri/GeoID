@@ -53,7 +53,6 @@ from dynastore.modules.storage.routing_config import (
     ItemsRoutingConfig,
     Operation,
     OperationDriverEntry,
-    WriteMode,
 )
 
 
@@ -73,10 +72,14 @@ def _items_private_routing() -> ItemsRoutingConfig:
         operations={
             Operation.WRITE: [
                 OperationDriverEntry(
+                    driver_ref="items_postgresql_driver",
+                    on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+            Operation.INDEX: [
+                OperationDriverEntry(
                     driver_ref="items_elasticsearch_private_driver",
-                    on_failure=FailurePolicy.OUTBOX,
-                    write_mode=WriteMode.ASYNC,
-                    secondary_index=True,
+                    source="auto",
                 ),
             ],
         },
@@ -112,12 +115,10 @@ def _private_items_delta() -> dict:
     persisted (string keys, plain dicts) pinning the private driver."""
     return {
         "operations": {
-            "write": [
+            "index": [
                 {
                     "driver_ref": "items_elasticsearch_private_driver",
-                    "on_failure": "outbox",
-                    "write_mode": "async",
-                    "secondary_index": True,
+                    "source": "auto",
                 },
             ],
         },

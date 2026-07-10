@@ -397,7 +397,7 @@ class ItemsElasticsearchEnvelopeDriver(
                     pass
             return
 
-        # --- structural search (routed via Operation.SEARCH) --------------
+        # --- structural search (derived: routed via the INDEX lane) -------
         # The envelope index is not sharded by collection, so reuse the shared
         # ``_build_read_search_body``. Passing ``self._envelope_fields`` scopes
         # via the canonical ``collection_id`` term, folds any pre-translated

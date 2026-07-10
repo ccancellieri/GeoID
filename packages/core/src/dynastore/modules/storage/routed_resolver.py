@@ -140,8 +140,13 @@ def _apply_hint_filter(
       is a SUPERSET of the requested hints.  Tie-break: longest effective
       surface first, then original entry order.
     * If no entry matches (e.g. hint not declared by any configured driver)
-      and the operation is READ or SEARCH → relax: return the full list in
-      original order so the request gets data rather than nothing.
+      and the operation is READ → relax: return the full list in original
+      order so the request gets data rather than nothing.  INDEX stays
+      strict (empty on no match) — mirrors ``storage/router.py``: the
+      derived-search callers need to distinguish "no INDEX entry satisfies
+      this hint" from "an INDEX entry matched" so they can fall back to the
+      READ lane with the same hints instead of silently relaxing within
+      INDEX.
 
     The ``operation`` string is used only for the relax-branch decision and
     the log line; it is not re-validated here.
@@ -167,7 +172,7 @@ def _apply_hint_filter(
         return [(e, d) for _, e, d, _eff in matched]
 
     from dynastore.modules.storage.routing_config import Operation
-    if operation in (Operation.READ, Operation.SEARCH):
+    if operation == Operation.READ:
         logger.info(
             "routed-resolve: no driver satisfies hints=%s for op=%s; "
             "relaxing to full driver list",
@@ -192,7 +197,7 @@ async def resolve_routed(
     effective hint surface (``entry.hints`` when populated, else the driver
     class's ``supported_hints``) is a SUPERSET of the requested hints.
     Best-overlap tie-break: longest effective surface first, then declared
-    entry order.  On no match for READ/SEARCH the full list is returned
+    entry order.  On no match for READ/INDEX the full list is returned
     (relax — preference, not hard filter).  Empty ``hints`` skips filtering
     entirely and preserves the original declared order.
 
@@ -230,13 +235,14 @@ async def resolve_routed(
     for entry in entries:
         driver = index.get(entry.driver_ref)
         if driver is None:
-            # FATAL entries are unexpected absences (the driver must be
-            # registered for the operation to succeed); warn so operators
-            # notice a misconfigured or missing driver.  Non-FATAL entries
-            # (WARN / IGNORE / OUTBOX) are legitimately absent in stacks
-            # that omit the optional driver (e.g. collection_elasticsearch_driver
-            # in a PG-only deployment) — demote to DEBUG to silence that
-            # structural noise.
+            # FATAL WRITE entries are unexpected absences (the driver must
+            # be registered for the operation to succeed); warn so operators
+            # notice a misconfigured or missing driver.  WARN entries (and
+            # READ/INDEX entries, whose ``on_failure`` is inert) are
+            # legitimately absent in stacks that omit the optional driver
+            # (e.g. collection_elasticsearch_driver in a PG-only
+            # deployment) — demote to DEBUG to silence that structural
+            # noise.
             if entry.on_failure is FailurePolicy.FATAL:
                 logger.warning(
                     "routed-resolve: driver_ref '%s' for %s op=%s on %s/%s is not "

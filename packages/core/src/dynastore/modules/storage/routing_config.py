@@ -17,24 +17,47 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 """
-Routing plugin configuration — operation-based driver composition.
+Routing plugin configuration — lane-based driver composition.
 
-Maps **operations** (WRITE, READ, SEARCH) to an ordered list of drivers,
-each with optional hints and a failure policy.
+Maps every entity tier's operations to three **lanes** plus UPLOAD:
+
+- **READ**  — mandatory, ordered, first-match (hint matcher + ``prefer:*``
+  pins).  ``READ[0]`` is the canonical source.
+- **WRITE** — optional; client writes; synchronous in-transaction fan-out.
+  An empty or absent WRITE lane is valid: it means the entity is
+  read-only, and client write endpoints reject at dispatch with a typed
+  405-style error rather than failing mid-dispatch.
+- **INDEX** — optional; async materialization into derived/search stores.
+  Item-tier obligations flow through the storage plane (id-only rows,
+  drain hydrates from canonical READ); catalog/collection/asset-tier
+  propagation is event-driven.  Reindex/backfill targets ARE the INDEX
+  lane.
+- **UPLOAD** — asset upload backend selection (unchanged).
+
+There is no configured SEARCH operation.  Search dispatch is *derived*:
+search-capable INDEX-lane entries first, then READ-lane entries; within
+the pool, entries hint-tagged ``Hint.SEARCH`` are preferred.  See
+:mod:`dynastore.modules.storage.router` (``get_items_search_driver`` /
+``get_asset_search_driver``) for the production resolution path.
 
 Key concepts:
 
-- **Operations** = what the caller wants (WRITE, READ, SEARCH) — defined here
-- **Capabilities** = how the driver performs it (SYNC, ASYNC, etc.) — in driver_config.py
+- **Operations** = what the caller wants (WRITE, READ, INDEX, UPLOAD) — defined here
+- **Capabilities** = how the driver performs it — in driver_config.py
 - **Hints** = caller-provided preferences to select a specific driver within an operation
-- **Failure policy** = per-driver behaviour on error: fatal, warn, or ignore
+- **Failure policy** = per-driver behaviour on error, WRITE-lane only: fatal or warn.
+  READ and INDEX entries carry no ``on_failure`` — INDEX-lane failure semantics
+  are structural (storage-plane legs retry via the drain; event-plane
+  subscribers always raise so redelivery retries).
 
 Resolution semantics:
 
 - **WRITE** (no hint): execute ALL drivers in list (fan-out), respecting ``on_failure``
 - **WRITE** (with hint): filter to matching drivers, execute those
-- **READ/SEARCH** (no hint): return first driver in list (primary by position)
-- **READ/SEARCH** (with hint): filter to matching, return first match
+- **READ** (no hint): return first driver in list (primary by position)
+- **READ** (with hint): filter to matching, return first match
+- **INDEX**: async fan-out target set; dispatched by the storage plane /
+  event-plane subscribers, never by a client request directly.
 """
 
 import logging
@@ -66,103 +89,63 @@ logger = logging.getLogger(__name__)
 
 
 class FailurePolicy(StrEnum):
-    """Per-driver failure behaviour within an operation.
+    """Per-driver failure behaviour — WRITE-lane entries only.
 
-    ``OUTBOX`` is the production-grade durability policy for secondary-index
-    WRITE entries: on synchronous failure (or when the per-indexer circuit breaker is
-    open) the dispatcher persists a ``tasks.storage`` row in the
-    same PG transaction as the upstream data write.  A background worker
-    drains it with exponential backoff.  PG TX commit guarantees neither
-    the data nor the obligation-to-index can ever be lost.  The value name
-    reflects the transactional-outbox PATTERN; the durable plane moved from
-    the per-tenant ``_meta.index_outbox`` table to the unified
-    ``tasks.storage`` table in #1807 (the enum value is unchanged — it is a
-    persisted config value).
+    READ and INDEX entries carry no ``on_failure``: a READ entry's
+    degrade path is hint-based relaxation (never a policy field), and
+    INDEX-lane failure handling is structural rather than a per-entry
+    choice — storage-plane obligations retry via the drain, and
+    event-plane subscribers (``ReindexWorker``, ``AssetEntitySyncSubscriber``)
+    always raise on failure so the durable event row is redelivered.
 
     Selection guide:
         ``FATAL``   — caller rolls back if this driver fails.  Use for
-                       indexers whose divergence from the source of truth
-                       is unacceptable (regulated audit, billing).
-        ``OUTBOX``  — eventual consistency, never lost.  Use for the
-                       common case of search-backend propagation.
-        ``WARN``    — best-effort; failures logged.  Use only for
-                       non-critical sinks (telemetry, analytics).
-        ``IGNORE``  — silent skip.  Reserved for opt-in development
-                       experiments.
+                       WRITE-lane drivers whose divergence from the source
+                       of truth is unacceptable.
+        ``WARN``    — best-effort; failures logged, fan-out continues.
     """
 
     FATAL = "fatal"      # operation fails if this driver fails
-    OUTBOX = "outbox"    # on failure, enqueue a tasks.storage row in same TX (outbox pattern)
     WARN = "warn"        # log warning, continue with other drivers
-    IGNORE = "ignore"    # silently skip on failure
 
 
 class Operation(StrEnum):
-    """Standard operations configured in routing configs.
+    """Lanes configured in routing configs.
 
     The four routing configs mirror the four entity tiers, each governing
     CRUD on its own entity row (catalog / collection / items / assets).
     No separate "metadata" routing — every entity has exactly one routing
     config that dispatches every operation on that entity's row.
 
-    Items routing (``ItemsRoutingConfig.operations``) — entity rows for
-    collection items / features:
-    - WRITE  : fan-out to all configured drivers (position 0 = primary)
-    - READ   : single-driver for browsing/pagination (streaming)
-    - SEARCH : single-driver for filtered queries (bbox, attributes, fulltext)
+    - ``READ``   — mandatory, ordered, first-match driver list.  ``READ[0]``
+      is the canonical source for the entity.
+    - ``WRITE``  — optional client-write fan-out, synchronous, in-transaction.
+      Empty or absent = the entity is read-only; client write endpoints
+      reject at dispatch (typed 405), never mid-dispatch.
+    - ``INDEX``  — optional async materialization target set (derived /
+      search stores).  Item-tier obligations are dispatched via the storage
+      plane; catalog/collection/asset-tier propagation is event-driven.
+      Reindex/backfill targets ARE the INDEX lane
+      (see :func:`index_entries`).
+    - ``UPLOAD`` — single-driver pick of the ``AssetUploadProtocol`` impl
+      that handles ``initiate_upload``/``get_upload_status`` (auto-augmented
+      from discoverable ``AssetUploadProtocol`` impls; operator config can
+      pin a specific backend).  Asset tier only.
 
-    Collection routing (``CollectionRoutingConfig.operations``) — collection
-    envelope rows:
-    - READ      : first-match driver (PG sidecar / ES wrapper / …).
-    - WRITE     : primary driver(s) committing in-transaction plus any
-                  secondary indexes. A secondary index is a WRITE entry whose
-                  driver implements the tier's Indexer role
-                  (``is_*_indexer``); it is propagated async (write_mode=async,
-                  on_failure=outbox) by the ReindexWorker. Role — not a
-                  distinct operation — distinguishes primary from index (see
-                  ``secondary_index_entries``).
+    There is no configured SEARCH operation — search dispatch is *derived*
+    from the INDEX and READ lanes (see the module docstring and
+    :mod:`dynastore.modules.storage.router`).
 
     Entity transformers are **not** an operation. They live in the
     sibling ``transformers`` registry (a tuple of
-    :class:`TransformerEntry`) and are attached to WRITE / SEARCH entries
+    :class:`TransformerEntry`) and are attached to WRITE / INDEX entries
     via their ``input_transformers`` / ``output_transformers`` refs.
-
-    Catalog routing (``CatalogRoutingConfig.operations``) — same shape on
-    catalog rows.
-
-    Asset routing (``AssetRoutingConfig.operations``) — asset rows:
-    - WRITE / READ : as above (single-primary + secondary indexes by role).
-    - UPLOAD : single-driver pick of the ``AssetUploadProtocol`` impl that
-               handles ``initiate_upload``/``get_upload_status`` (auto-
-               augmented from discoverable ``AssetUploadProtocol`` impls;
-               operator config can pin a specific backend).
     """
 
     WRITE = "WRITE"
     READ = "READ"
-    SEARCH = "SEARCH"
+    INDEX = "INDEX"
     UPLOAD = "UPLOAD"
-
-
-class WriteMode(StrEnum):
-    """Execution / composition mode for an operation entry.
-
-    Items-routing write semantics:
-    - ``sync``   : await result; participates in coordinated rollback
-                   (all sync writes run in parallel via ``asyncio.gather``)
-    - ``async``  : fire-and-forget after sync phase succeeds
-
-    Collection / catalog-routing composition semantics:
-    - ``first``    : return result from the first driver that succeeds
-                     (used with ``Operation.READ``)
-    - ``fan_out``  : call all drivers independently; merge results
-                     (used with ``Operation.WRITE``)
-    """
-
-    SYNC = "sync"
-    ASYNC = "async"
-    FIRST = "first"
-    FAN_OUT = "fan_out"
 
 
 # ---------------------------------------------------------------------------
@@ -177,10 +160,11 @@ def derive_supported_operations(capabilities: FrozenSet[str]) -> FrozenSet[str]:
     operations they can handle.  This is used by apply-handler validation and
     the driver discovery endpoint.
 
-    Role-based driver plan: a ``WRITE`` entry whose driver implements the
-    tier's Indexer marker is a secondary index (``secondary_index=True``),
-    propagated asynchronously — the role is derived from the driver, not a
-    distinct operation.
+    Lane model: a driver implementing the tier's Indexer marker is
+    eligible for the ``INDEX`` lane — that eligibility is driven by the
+    marker protocol (checked separately, see :func:`_self_register_indexers_into`),
+    not by ``Capability``.  There is no configured SEARCH operation to derive:
+    search dispatch is resolved from the INDEX and READ lanes at query time.
 
     Entity-transform participation is expressed by implementing
     :class:`EntityTransformProtocol`; transformers populate the routing
@@ -191,7 +175,7 @@ def derive_supported_operations(capabilities: FrozenSet[str]) -> FrozenSet[str]:
 
     mapping: Dict[str, Set[str]] = {
         Capability.WRITE: {Operation.WRITE},
-        Capability.READ: {Operation.READ, Operation.SEARCH},
+        Capability.READ: {Operation.READ},
     }
     ops: Set[str] = set()
     for cap in capabilities:
@@ -259,21 +243,13 @@ class OperationDriverEntry(BaseModel):
     )
     on_failure: FailurePolicy = Field(
         default=FailurePolicy.FATAL,
-        description="What happens if this driver fails: fatal, warn, or ignore.",
-    )
-    write_mode: WriteMode = Field(
-        default=WriteMode.SYNC,
         description=(
-            "Execution mode for WRITE operations.  "
-            "'sync' = await result (parallel with other sync drivers, participates "
-            "in coordinated rollback).  "
-            "'async' = fire-and-forget after sync phase succeeds.  "
-            "Not consulted for catalog-/asset-tier secondary-index WRITE "
-            "entries: those propagate through the durable ``tasks.events`` "
-            "plane (``ReindexWorker`` off ``catalog_metadata_changed`` / "
-            "``AssetEntitySyncSubscriber`` off ``ASSET_*``) and are "
-            "effectively always ASYNC regardless of the configured value — "
-            "see :class:`CatalogRoutingConfig` and :class:`AssetRoutingConfig`."
+            "What happens if this driver fails: fatal or warn.  WRITE-lane "
+            "only — a validator rejects a non-default value on READ/INDEX "
+            "entries.  INDEX-lane failure handling is structural, not a "
+            "per-entry policy: storage-plane obligations retry via the "
+            "drain; event-plane subscribers always raise so the durable "
+            "event row is redelivered."
         ),
     )
     sla: Optional[DriverSla] = Field(
@@ -283,37 +259,30 @@ class OperationDriverEntry(BaseModel):
             "class-level SLA (if declared)."
         ),
     )
-    secondary_index: bool = Field(
-        default=False,
-        description=(
-            "Derived role flag for WRITE entries: True iff the driver "
-            "implements the tier's Indexer marker "
-            "(``is_item_indexer``/``is_collection_indexer``/"
-            "``is_catalog_indexer``/``is_asset_indexer``).  A secondary "
-            "index is propagated by the ReindexWorker / index dispatcher "
-            "rather than committed as the primary store.  Stamped at "
-            "config-build time (preset / self-register / validation) from "
-            "the driver class, NOT operator-declared — it persists in the "
-            "config so a configured-but-not-locally-installed indexer is "
-            "still recognised (and OUTBOX-enqueued) in any SCOPE.  Role is "
-            "orthogonal to policy (``write_mode`` x ``on_failure``): a "
-            "secondary index may be sync/fatal or async/outbox."
-        ),
-    )
     source: Literal["operator", "auto"] = Field(
         default="operator",
         description=(
             "Provenance of this entry.  ``operator`` (default) means the "
             "entry was written by an operator via the configs API or "
             "constructed by hand.  ``auto`` means the entry was added by "
-            "the routing-config self-register helpers "
-            "(``_self_register_indexers_into`` / "
-            "``_self_register_searchers_into``) because a discoverable "
-            "driver matched the marker / capability gate.  Operators can "
-            "remove auto-added entries by writing an explicit operations "
-            "dict that omits the driver — the next read won't re-add it "
-            "as long as the operator-explicit list contains other entries "
-            "(self-register is set-default, never overwrite)."
+            "the routing-config self-register helper "
+            "(``_self_register_indexers_into``) because a discoverable "
+            "indexer driver matched the marker / opted into the INDEX lane. "
+            "\n\n"
+            "Absent-vs-empty INDEX is part of the config contract: "
+            "``_self_register_indexers_into`` seeds ``operations[INDEX]`` "
+            "only when the key is ABSENT, or PRESENT with every existing "
+            "entry ``source=\"auto\"`` (set-default, deduped by "
+            "``driver_ref`` — never overwrites, never duplicates). It is a "
+            "no-op the moment either lane carries explicit operator intent: "
+            "WRITE has any ``source=\"operator\"`` entry (existing gate — an "
+            "operator who owns WRITE is treated as owning the whole config), "
+            "INDEX itself has any ``source=\"operator\"`` entry, or INDEX is "
+            "PRESENT and EMPTY (``[]``) — an explicit opt-out an operator "
+            "writes when they want no materialization target at all.  An "
+            "empty list can never carry a ``source`` stamp itself, so the "
+            "empty-list case must be gated separately from the "
+            "operator-entry case."
         ),
     )
     input_transformers: Tuple[str, ...] = Field(
@@ -324,8 +293,8 @@ class OperationDriverEntry(BaseModel):
             "transformer receives the previous transformer's output. Every "
             "ref must also appear in the routing config's ``transformers`` "
             "registry — the validator rejects dangling references at "
-            "config-build time. Wired hops in this release: ``WRITE`` "
-            "(secondary-index propagation). Declaring this on other "
+            "config-build time. Wired hops in this release: ``INDEX`` "
+            "(materialization propagation). Declaring this on other "
             "operations emits a one-time WARN because the hop is not yet "
             "active."
         ),
@@ -337,8 +306,9 @@ class OperationDriverEntry(BaseModel):
             "OUT of this driver call. The inverse chain runs right-to-left "
             "so the output shape matches the client expectation. Same "
             "validation rule as ``input_transformers``. Wired hops in this "
-            "release: ``SEARCH``. Declaring this on other operations emits "
-            "a one-time WARN."
+            "release: ``INDEX`` and ``READ`` (whichever lane the resolved "
+            "search driver was found in). Declaring this on other "
+            "operations emits a one-time WARN."
         ),
     )
 
@@ -358,10 +328,10 @@ class TransformerEntry(BaseModel):
     """A member of a routing config's ``transformers`` registry.
 
     A transformer is **not** a dispatch operation: it carries no
-    ``write_mode`` / ``on_failure`` / ``secondary_index`` semantics.  It is a
-    named, ordered registry entry that WRITE / SEARCH operation entries
-    reference by ``driver_ref`` through their ``input_transformers`` /
-    ``output_transformers`` attachments.  The concrete driver must implement
+    ``on_failure`` semantics.  It is a named, ordered registry entry that
+    INDEX / READ operation entries reference by ``driver_ref`` through their
+    ``input_transformers`` / ``output_transformers`` attachments.  The
+    concrete driver must implement
     :class:`EntityTransformProtocol`; the chain runtime lives in
     ``modules/storage/transform_runtime.py``.
 
@@ -404,18 +374,19 @@ class TransformerEntry(BaseModel):
 # input_transformers / output_transformers on any other (operation, side)
 # pair logs a one-time WARN so operators see the silent-no-op early.
 #
-# INPUT (write-side ``apply_transform_chain``) is wired on ``WRITE`` for every
-# tier (secondary-index fan-out). OUTPUT (read-side ``restore_from_index``) is
-# wired on ``SEARCH`` for Elasticsearch read paths only — this is intentional
-# by design (geoid#1643). The four ES-backed tiers (items, collection, asset,
-# catalog) run the restore chain since geoid#1574. Non-ES ``read_entities``
+# INPUT (write-side ``apply_transform_chain``) is wired on ``INDEX`` for every
+# tier (materialization fan-out). OUTPUT (read-side ``restore_from_index``) is
+# wired on ``INDEX`` / ``READ`` for Elasticsearch read paths only — whichever
+# lane the resolved search driver was found in — this is intentional by design
+# (geoid#1643). The four ES-backed tiers (items, collection, asset, catalog)
+# run the restore chain since geoid#1574. Non-ES ``read_entities``
 # implementations (PostgreSQL, DuckDB, Iceberg, BigQuery) do not run the
 # restore chain; the per-tier flag
-# ``_RoutingConfigBase._wired_output_search_hop`` carries that distinction so a
-# SEARCH ``output_transformers`` declared against a non-ES driver warns instead
-# of silently never running. See geoid#1567, geoid#1574.
-_WIRED_INPUT_HOPS: FrozenSet[str] = frozenset({Operation.WRITE})
-_WIRED_OUTPUT_HOPS: FrozenSet[str] = frozenset({Operation.SEARCH})
+# ``_RoutingConfigBase._wired_output_search_hop`` carries that distinction so
+# an INDEX/READ ``output_transformers`` declared against a non-ES driver warns
+# instead of silently never running. See geoid#1567, geoid#1574.
+_WIRED_INPUT_HOPS: FrozenSet[str] = frozenset({Operation.INDEX})
+_WIRED_OUTPUT_HOPS: FrozenSet[str] = frozenset({Operation.INDEX, Operation.READ})
 _DEFERRED_HOP_WARNED: Set[Tuple[str, str, str, str]] = set()
 
 
@@ -429,13 +400,13 @@ def _warn_deferred_transformer_hops(
     transformer hop the runtime does not invoke, so the silent no-op surfaces
     at config-load instead of as a mysteriously inert transformer.
 
-    ``output_search_wired`` reflects whether *this tier*'s SEARCH path runs the
-    read-side restore chain. Read-side (output) transformers are honored only on
-    Elasticsearch read paths by design (geoid#1643): the four ES-backed tiers
-    (items, collection, asset, catalog) do since geoid#1574. An
-    ``output_transformers`` declaration on a SEARCH entry whose resolved driver
-    is not an ES read path will not fire; this warning is the signal that the
-    declaration is a no-op for the current driver.
+    ``output_search_wired`` reflects whether *this tier*'s derived-search path
+    runs the read-side restore chain. Read-side (output) transformers are
+    honored only on Elasticsearch read paths by design (geoid#1643): the four
+    ES-backed tiers (items, collection, asset, catalog) do since geoid#1574.
+    An ``output_transformers`` declaration on an INDEX/READ entry whose
+    resolved driver is not an ES read path will not fire; this warning is the
+    signal that the declaration is a no-op for the current driver.
     """
     for op_name, entries in operations.items():
         for entry in entries:
@@ -451,18 +422,16 @@ def _warn_deferred_transformer_hops(
                         config_label, op_name, entry.driver_ref, op_name,
                         sorted(_WIRED_INPUT_HOPS),
                     )
-            output_hop_wired = op_name in _WIRED_OUTPUT_HOPS and (
-                op_name != Operation.SEARCH or output_search_wired
-            )
+            output_hop_wired = op_name in _WIRED_OUTPUT_HOPS and output_search_wired
             if entry.output_transformers and not output_hop_wired:
                 key = (config_label, op_name, entry.driver_ref, "output")
                 if key not in _DEFERRED_HOP_WARNED:
                     _DEFERRED_HOP_WARNED.add(key)
-                    if op_name == Operation.SEARCH and not output_search_wired:
+                    if op_name in _WIRED_OUTPUT_HOPS and not output_search_wired:
                         reason = (
                             "read-side (output) transformers are honored only on "
                             "Elasticsearch read paths by design (geoid#1643) — "
-                            "this SEARCH entry resolves to a non-ES driver so the "
+                            "this entry resolves to a non-ES driver so the "
                             "restore chain will not fire"
                         )
                     else:
@@ -507,6 +476,61 @@ def _validate_transformer_attachment(
             f"``transformers`` registry. Register them as transformers "
             f"(or remove the attachment)."
         )
+
+
+def _validate_lane_shape(
+    operations: Dict[str, List["OperationDriverEntry"]],
+    config_label: str,
+) -> None:
+    """Structural lane-model invariants, enforced on every construction.
+
+    - Rejects a configured ``"SEARCH"`` operation key outright — SEARCH is
+      derived from the INDEX/READ lanes at query time (see the module
+      docstring), never configured directly.
+    - READ is mandatory and non-empty on every *fully-resolved* tier config:
+      every entity needs a canonical read source (``READ[0]``).  Enforced
+      here as "if the ``READ`` key is present, it must be non-empty" —
+      not "the key must be present" — because ``operations`` is a
+      ``Mutable`` field written incrementally across the platform / catalog
+      / collection waterfall (e.g. a catalog-scope preset that pins only
+      ``UPLOAD`` and leaves READ/WRITE to the platform default legitimately
+      omits the ``READ`` key on ITS row). A row that never resolves a READ
+      driver anywhere in the waterfall still 4xxs downstream, at
+      ``get_write_drivers`` / ``get_driver`` resolution time, with a
+      ``ConfigResolutionError`` naming the missing driver — this
+      construction-time check only catches the unambiguous mistake of an
+      explicit empty list. WRITE is optional — empty or absent means the
+      entity is read-only.
+    - ``on_failure`` is WRITE-lane only.  READ and INDEX entries have no
+      per-entry failure policy (INDEX failure handling is structural — see
+      :class:`FailurePolicy`); a ``warn`` value there is rejected.  ``fatal``
+      (the field default) is tolerated on READ/INDEX so an entry built
+      without an explicit ``on_failure`` still validates.
+    """
+    if "SEARCH" in operations:
+        raise ValueError(
+            f"{config_label}: 'SEARCH' is not a configurable operation. "
+            "Search dispatch is derived from the INDEX lane (preferred — "
+            "entries hint-tagged Hint.SEARCH win) falling back to the READ "
+            "lane — see dynastore.modules.storage.router."
+            "get_items_search_driver / get_asset_search_driver."
+        )
+    if Operation.READ in operations and not operations[Operation.READ]:
+        raise ValueError(
+            f"{config_label}: operations[READ] is present but empty — "
+            "every entity tier needs a canonical read source (READ[0]). "
+            "Omit the key entirely to inherit READ from a less-specific "
+            "waterfall tier, or supply at least one entry."
+        )
+    for op_name in (Operation.READ, Operation.INDEX):
+        for entry in operations.get(op_name, []):
+            if entry.on_failure == FailurePolicy.WARN:
+                raise ValueError(
+                    f"{config_label}: operations[{op_name}] driver "
+                    f"'{entry.driver_ref}' sets on_failure='warn', but "
+                    f"on_failure is WRITE-lane only — {op_name} entries "
+                    "carry no per-entry failure policy."
+                )
 
 
 class _RoutingConfigBase(PluginConfig):
@@ -556,7 +580,7 @@ class _RoutingConfigBase(PluginConfig):
         description=(
             "Registry of entity transformers available to this config. "
             "Auto-populated from discoverable EntityTransformProtocol "
-            "implementers; WRITE/SEARCH entries reference these by "
+            "implementers; INDEX/READ entries reference these by "
             "driver_ref via input_transformers/output_transformers."
         ),
     )
@@ -644,6 +668,7 @@ class _RoutingConfigBase(PluginConfig):
                 "%s: read-time self-register skipped (%s); apply-handler "
                 "will populate on next write.", label, exc,
             )
+        _validate_lane_shape(self.operations, label)
         _validate_transformer_attachment(self.operations, self.transformers, label)
         _warn_deferred_transformer_hops(
             self.operations, label,
@@ -659,10 +684,10 @@ class ItemsRoutingConfig(_RoutingConfigBase):
     Position in the list determines priority (first = primary).
 
     Items routing dispatches `CollectionItemsStore` drivers (PG, ES, BQ,
-    Iceberg, DuckDB) for entity-level operations: WRITE (including
-    secondary-index entries) / READ / SEARCH over collection items /
-    features. **Distinct from**
-    :class:`CollectionRoutingConfig` which dispatches
+    Iceberg, DuckDB) for entity-level operations: WRITE (client writes,
+    synchronous) / READ (mandatory canonical source) / INDEX (async
+    materialization — derived stores) over collection items / features.
+    **Distinct from** :class:`CollectionRoutingConfig` which dispatches
     ``CollectionStore`` drivers for collection-envelope metadata.
 
     Identity is the class itself; see ``class_key()`` in ``platform_config_service.py``.
@@ -675,29 +700,30 @@ class ItemsRoutingConfig(_RoutingConfigBase):
     _tiers: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection")
     # ItemsElasticsearchDriver.read_entities and the envelope/private siblings
     # invoke get_output_transformers_for_search + restore_transform_chain, so
-    # SEARCH output_transformers are now wired for this tier (geoid#1574).
+    # the derived-search output_transformers hop is wired for this tier
+    # (geoid#1574).
     _wired_output_search_hop: ClassVar[bool] = True
 
     operations: Mutable[Dict[str, List[OperationDriverEntry]]] = Field(
         default_factory=lambda: {
-            # PG is authoritative for WRITE (on_failure=fatal — must succeed,
-            # write_mode=sync — caller awaits the result).
+            # PG is the sole WRITE-lane entry — authoritative, synchronous,
+            # in-transaction (on_failure=fatal — must succeed).
             #
-            # ES is a secondary WRITE sink with ASYNC + OUTBOX semantics:
-            # the dispatcher's sync phase enqueues an outbox row in the same
-            # PG transaction as the data write, then a background drain
-            # task pumps the row through the ES driver with retry +
-            # exponential backoff.  PG TX commit guarantees neither the
-            # data nor the obligation-to-index can be lost.  Putting ES
-            # in WRITE with OUTBOX policy is the production-grade
-            # replacement for the legacy per-item listener
-            # (``_on_item_upsert``); the listener's ``_is_write_driver_for``
-            # guard now hits and the listener self-skips when ES is
-            # listed here, so there is no double-indexing.
+            # ES is an INDEX-lane entry: async materialization sourced from
+            # the READ path.  The dispatcher enqueues an id-only obligation
+            # row in the same PG transaction as the data write (storage
+            # plane), then a background drain pumps it through the ES driver
+            # with retry + exponential backoff.  PG TX commit guarantees
+            # neither the data nor the obligation-to-index can be lost.
+            # Putting ES in INDEX is the production-grade replacement for
+            # the legacy per-item listener (``_on_item_upsert``); the
+            # listener's ``_is_write_driver_for`` guard now hits and the
+            # listener self-skips when ES is listed here, so there is no
+            # double-indexing.
             #
             # See ``feedback_es_indexing_per_item_async_not_bulk.md`` for
             # the historical rationale that produced the listener; the
-            # outbox drain task supersedes it.
+            # storage-plane drain supersedes it.
             #
             # READ is **hint-selected**, not chained: ``get_driver``
             # returns the FIRST entry whose ``hints`` match the caller's
@@ -711,24 +737,16 @@ class ItemsRoutingConfig(_RoutingConfigBase):
             # with an empty stream). #914 surfaces the consequence: silent
             # upstream indexing failures are invisible at the read path.
             #
-            # SEARCH lists ES then PG, but ``get_driver`` still picks the
-            # first registered match. The PG entry is a bootstrap-time
-            # tie-breaker for when ES driver registration is missing
-            # (operator misconfigured deployment), NOT a runtime fallback
-            # for ES returning empty. Keeping the explicit pair pins
-            # driver order against the auto-discovery dispatch in
-            # ``_self_register_searchers_into``, which would otherwise
-            # register drivers in arbitrary order.
+            # SEARCH is not configured: it is derived from the INDEX lane
+            # first (ES — its declared ``supported_hints`` already includes
+            # Hint.SEARCH so it wins the search-pool preference), then the
+            # READ lane (PG) as fallback. Hint.JOIN / Hint.GROUP_BY on the PG
+            # READ entry route JOIN- and GROUP_BY-carrying requests to PG —
+            # Elasticsearch lacks ST_Transform and GROUP BY (#2829).
             Operation.WRITE: [
                 OperationDriverEntry(
                     driver_ref="items_postgresql_driver",
                     on_failure=FailurePolicy.FATAL,
-                    source="auto",
-                ),
-                OperationDriverEntry(
-                    driver_ref="items_elasticsearch_driver",
-                    write_mode=WriteMode.ASYNC,
-                    on_failure=FailurePolicy.OUTBOX,
                     source="auto",
                 ),
             ],
@@ -736,15 +754,14 @@ class ItemsRoutingConfig(_RoutingConfigBase):
                 OperationDriverEntry(
                     driver_ref="items_elasticsearch_driver",
                     hints={Hint.GEOMETRY_SIMPLIFIED},
-                    on_failure=FailurePolicy.WARN,
                     source="auto",
                 ),
                 OperationDriverEntry(
                     driver_ref="items_postgresql_driver",
-                    # Hint.GROUP_BY mirrors the SEARCH PG entry below: a plain
-                    # browse with a group_by (_pick_operation → READ, no
-                    # search-triggering filter) must resolve to PG the same
-                    # way a SEARCH-routed group_by request does — Elasticsearch
+                    # Hint.GROUP_BY mirrors the derived-search PG preference:
+                    # a plain browse with a group_by (_pick_operation → READ,
+                    # no search-triggering filter) must resolve to PG the same
+                    # way a search-routed group_by request does — Elasticsearch
                     # has no GROUP BY implementation (#2829).
                     hints={
                         Hint.GEOMETRY_EXACT, Hint.TILES, Hint.JOIN,
@@ -754,50 +771,9 @@ class ItemsRoutingConfig(_RoutingConfigBase):
                     source="auto",
                 ),
             ],
-            Operation.SEARCH: [
-                # SEARCH entries declare the search-flavour hints each driver
-                # serves, so a resolved config is self-documenting and the
-                # routing intent is explicit (mirrors the READ defaults and
-                # CollectionRoutingConfig SEARCH). Each set is the driver's
-                # ``supported_hints`` restricted to search-applicable flavours:
-                # operation-specific hints stay out (e.g. ``TILES`` is a READ
-                # concern and lives only on the PG READ entry, never here).
-                #
-                # Hint.JOIN is declared on the PG SEARCH entry so that JOIN
-                # requests carrying a CQL filter (_pick_operation → SEARCH)
-                # also resolve to PG, not ES. The DWH join and OGC Joins
-                # extension both request {Hint.JOIN}; without it on SEARCH the
-                # best-overlap matcher finds no match and the relaxation path
-                # returns ES first — wrong because ES lacks full-precision
-                # geometry and cannot run ST_Transform.
-                #
-                # Consequence of declaring these explicitly: the best-overlap
-                # matcher (router.py) now ranks by the DECLARED surface rather
-                # than the driver-class fallback, so a filtered/sorted search
-                # (``attribute_filter``/``spatial_filter``/``sort``) routes to
-                # ES first — the search engine — instead of PG (which only won
-                # before as an accident of PG's longer total ``supported_hints``
-                # surface). Unfiltered search is unaffected (the matcher is
-                # skipped on empty request-hints, so declared order ES→PG holds).
+            Operation.INDEX: [
                 OperationDriverEntry(
                     driver_ref="items_elasticsearch_driver",
-                    hints={
-                        Hint.SEARCH, Hint.FULLTEXT, Hint.GEOMETRY_SIMPLIFIED,
-                        Hint.SPATIAL_FILTER, Hint.ATTRIBUTE_FILTER, Hint.SORT,
-                        Hint.AGGREGATION, Hint.COUNT, Hint.STATISTICS,
-                    },
-                    on_failure=FailurePolicy.FATAL,
-                    source="auto",
-                ),
-                OperationDriverEntry(
-                    driver_ref="items_postgresql_driver",
-                    hints={
-                        Hint.JOIN, Hint.GEOMETRY_EXACT,
-                        Hint.SPATIAL_FILTER, Hint.ATTRIBUTE_FILTER, Hint.SORT,
-                        Hint.GROUP_BY, Hint.AGGREGATION, Hint.COUNT,
-                        Hint.STATISTICS,
-                    },
-                    on_failure=FailurePolicy.FATAL,
                     source="auto",
                 ),
             ],
@@ -805,29 +781,24 @@ class ItemsRoutingConfig(_RoutingConfigBase):
         description=(
             "Operation → ordered driver list for items dispatch.  "
             "Immutable: to change driver mapping, create a new config.  "
-            "Hints and on_failure within entries are mutable.  "
-            "operations[WRITE] is the source of truth for the items-tier "
-            "secondary-index hop on item upsert/delete (OGC ingest path "
-            "through item_service._dispatch_index_upsert -> IndexDispatcher, "
-            "and item_query soft-delete): index entries are WRITE entries "
-            "with secondary_index=True. Pinning a private indexer here is "
-            "what the privacy-cascade validator enforces; the entry-aware "
-            "default resolver picks this config for entity_type='item'. "
-            "See un-fao/GeoID#810 (Option B)."
+            "Hints within entries are mutable; on_failure is WRITE-lane "
+            "only.  operations[INDEX] is the source of truth for the "
+            "items-tier materialization hop on item upsert/delete (OGC "
+            "ingest path through item_service._dispatch_index_upsert -> "
+            "IndexDispatcher, and item_query soft-delete). Pinning a "
+            "private indexer here is what the privacy-cascade validator "
+            "enforces; the entry-aware default resolver picks this config "
+            "for entity_type='item'. See un-fao/GeoID#810 (Option B)."
         ),
     )
     def _self_register_drivers(self) -> None:
         """Fold discoverable :class:`ItemIndexer` drivers into
-        ``operations[WRITE]`` as secondary-index entries
-        (``secondary_index=True``) and SEARCH-capable
-        :class:`CollectionItemsStore` drivers into ``operations[SEARCH]`` — so
-        a deployed ``ItemsElasticsearchDriver`` shows up without operator PUT.
+        ``operations[INDEX]`` — so a deployed ``ItemsElasticsearchDriver``
+        shows up without operator PUT.
         """
         from dynastore.models.protocols.indexer import ItemIndexer
-        from dynastore.models.protocols.storage_driver import CollectionItemsStore
 
         _self_register_indexers_into(self.operations, ItemIndexer)
-        _self_register_searchers_into(self.operations, CollectionItemsStore)
 
 
 class CollectionRoutingConfig(_RoutingConfigBase):
@@ -840,29 +811,27 @@ class CollectionRoutingConfig(_RoutingConfigBase):
 
     Standard operation keys:
 
-    ``READ`` (``write_mode=first``):
-        ``CollectionStore`` backends for metadata persistence
-        and search.  First available driver wins.
-        Empty → auto-discovery fallback (ES if registered, otherwise PG).
+    ``READ`` (mandatory):
+        ``CollectionStore`` backends for metadata persistence and search.
+        First-match by hint, ``READ[0]`` is the canonical source.
 
-    ``WRITE`` (``write_mode=sync``):
-        Primary ``CollectionStore`` driver(s) committing in-transaction.  Empty →
-        defaults to the Primary PG driver.
+    ``WRITE`` (optional):
+        Primary ``CollectionStore`` driver(s) committing in-transaction.  Empty
+        or absent means the collection envelope is read-only.
 
     ``transformers`` registry (**lazy**):
         Entity transformers that enrich collection metadata.  These live in
-        the sibling ``transformers`` field — **not** an operation.  A WRITE /
-        SEARCH entry opts a transformer in via its ``input_transformers`` /
+        the sibling ``transformers`` field — **not** an operation.  An INDEX /
+        READ entry opts a transformer in via its ``input_transformers`` /
         ``output_transformers`` refs; the async reindex pipeline applies the
-        WRITE entry's ``input_transformers`` before dispatching to a
-        secondary-index sink.  Each transformer should carry an SLA.
+        INDEX entry's ``input_transformers`` before dispatching to a
+        derived-store sink.  Each transformer should carry an SLA.
 
-    ``WRITE`` secondary indexes (optional, typically async):
+    ``INDEX`` (optional, async):
         Post-write propagation targets for search-capable sinks (ES, Vertex AI,
-        vector DBs) live in ``WRITE`` with ``secondary_index=True`` — they are
-        not a separate operation.  An entry's ``input_transformers`` decide
-        whether the indexer receives a transformed envelope; with none it gets
-        the raw Primary envelope.
+        vector DBs).  An entry's ``input_transformers`` decide whether the
+        indexer receives a transformed envelope; with none it gets the raw
+        Primary envelope.
 
     Identity is the class itself; see ``class_key()`` in ``platform_config_service.py``.
     """
@@ -877,8 +846,9 @@ class CollectionRoutingConfig(_RoutingConfigBase):
     # immutability gate stays collection-scoped (``_freeze_at``).
     _tiers: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection")
     # CollectionElasticsearchDriver.get_metadata and search_metadata invoke
-    # get_output_transformers_for_search + restore_transform_chain, so
-    # SEARCH output_transformers are now wired for this tier (geoid#1574).
+    # get_output_transformers_for_search + restore_transform_chain, so the
+    # derived-search output_transformers hop is wired for this tier
+    # (geoid#1574).
     _wired_output_search_hop: ClassVar[bool] = True
 
     operations: Mutable[Dict[str, List[OperationDriverEntry]]] = Field(
@@ -887,21 +857,20 @@ class CollectionRoutingConfig(_RoutingConfigBase):
             # (collection_postgresql_driver — internally fans CRUD across
             # the collection_core + collection_stac sidecars) is the
             # system of record: primary for both WRITE and READ.
-            # Elasticsearch is the *index* — a secondary-index WRITE entry
-            # (secondary_index=True) populated asynchronously (OUTBOX-durable)
-            # and fronting SEARCH. PG is the SEARCH fallback so a deploy
+            # Elasticsearch is the *index* — an INDEX-lane entry populated
+            # asynchronously (storage-plane-durable) and preferred for the
+            # derived search pool. PG is the search fallback so a deploy
             # without ES still answers collection search from the
             # authoritative store.
             #
-            # The ES secondary-index entry is intentionally NOT hard-coded
-            # here: it is supplied by ``_self_register_indexers_into`` at
-            # validation time when a CollectionIndexer (ES) driver is
-            # registered, and by the routing presets (e.g. public_catalog)
-            # for explicit deployments. A PG-only deployment with no ES driver
-            # and no outbox-draining worker therefore gets no secondary-index
-            # entry, so a plain collection create does not enqueue an OUTBOX
-            # row into tasks.tasks that nothing would ever drain
-            # (#1069 / #1073).
+            # The ES INDEX entry is intentionally NOT hard-coded here: it
+            # is supplied by ``_self_register_indexers_into`` at validation
+            # time when a CollectionIndexer (ES) driver is registered, and
+            # by the routing presets (e.g. public_catalog) for explicit
+            # deployments. A PG-only deployment with no ES driver and no
+            # drain worker therefore gets no INDEX entry, so a plain
+            # collection create does not enqueue an obligation row into
+            # tasks.storage that nothing would ever drain (#1069 / #1073).
             Operation.WRITE: [
                 OperationDriverEntry(
                     driver_ref="collection_postgresql_driver",
@@ -923,57 +892,45 @@ class CollectionRoutingConfig(_RoutingConfigBase):
                 # the caller supplies an explicit hint (e.g. ?hints=prefer:es).
                 # There is no geometry at the metadata level so geometry hints
                 # do not apply here. The READ matcher keeps the unmatched PG
-                # entry as an ordered fallback tail, so an ES miss falls through
-                # to the PG system of record (WARN = best-effort, never fatal).
-                # A no-hint read never reaches ES because the no-hint READ
-                # filter drops hint-tagged entries when an untagged default
-                # exists.
+                # entry as an ordered fallback tail, so an ES miss falls
+                # through to the PG system of record. A no-hint read never
+                # reaches ES because the no-hint READ filter drops hint-tagged
+                # entries when an untagged default exists.
                 OperationDriverEntry(
                     driver_ref="collection_elasticsearch_driver",
                     hints={Hint.METADATA},
-                    on_failure=FailurePolicy.WARN,
                     source="auto",
                 ),
             ],
-            Operation.SEARCH: [
-                # ES is the primary search backend (fast, simplified
-                # geometry). PG is the fallback AND the exact-geometry
-                # path: a consumer needing full-precision geometry passes
-                # hints=frozenset({Hint.GEOMETRY_EXACT}) to route SEARCH to PG.
-                OperationDriverEntry(
-                    driver_ref="collection_elasticsearch_driver",
-                    hints={Hint.GEOMETRY_SIMPLIFIED},
-                    source="auto",
-                ),
-                OperationDriverEntry(
-                    driver_ref="collection_postgresql_driver",
-                    hints={Hint.GEOMETRY_EXACT},
-                    source="auto",
-                ),
-            ],
+            # Operation.INDEX is intentionally absent here — see the
+            # module-level comment above: the ES INDEX entry is supplied by
+            # ``_self_register_indexers_into`` at validation time (below)
+            # when a CollectionIndexer (ES) driver is registered, or by a
+            # routing preset. Hard-coding it here would resurrect #1069 /
+            # #1073 under the lane model: INDEX now doubles as the async
+            # materialization trigger (``collection_router._dispatch_
+            # collection_index`` fans out to every ``operations[INDEX]``
+            # entry), so an entry naming an unregistered driver enqueues an
+            # obligation row into ``tasks.storage`` that nothing will ever
+            # drain.
         },
         description=(
             "Operation -> ordered driver list for collection-tier routing. "
             "WRITE/READ = collection_postgresql_driver (system of record). "
-            "The ES secondary index is a WRITE entry (secondary_index=True) "
-            "with async OUTBOX-durable propagation, added by self-"
-            "registration when an ES CollectionIndexer is registered (or by "
-            "a routing preset) — not hard-coded, so a PG-only deployment "
-            "enqueues no undrainable outbox rows. "
-            "SEARCH = Elasticsearch primary (geometry_simplified), "
-            "PostgreSQL fallback (geometry_exact)."
+            "The ES INDEX entry propagates asynchronously (storage-plane-"
+            "durable), added by self-registration when an ES "
+            "CollectionIndexer is registered (or by a routing preset) — not "
+            "hard-coded, so a PG-only deployment enqueues no undrainable "
+            "obligation rows. Search is derived: INDEX (Elasticsearch, "
+            "geometry_simplified) preferred, READ (PostgreSQL, "
+            "geometry_exact) fallback."
         ),
     )
     def _self_register_drivers(self) -> None:
         """Fold discoverable :class:`CollectionIndexer` drivers into
-        ``operations[WRITE]`` as secondary-index entries
-        (``secondary_index=True``) and SEARCH-capable ``CollectionStore``
-        drivers into ``operations[SEARCH]``.
+        ``operations[INDEX]``.
         """
-        from dynastore.models.protocols.entity_store import CollectionStore
-
         _self_register_indexers_into(self.operations, CollectionIndexer)
-        _self_register_searchers_into(self.operations, CollectionStore)
 
 
 class AssetRoutingConfig(_RoutingConfigBase):
@@ -982,14 +939,12 @@ class AssetRoutingConfig(_RoutingConfigBase):
     Same structure as :class:`ItemsRoutingConfig` but scoped to
     asset-domain drivers.
 
-    Secondary-index ``WRITE`` entries on this config (``secondary_index=True``,
-    e.g. ``AssetElasticsearchDriver``) are consumed by
-    ``dynastore.modules.catalog.asset_sync.AssetEntitySyncSubscriber`` off the
-    ``CatalogEventType.ASSET_*`` event stream — mirrors the catalog-tier
+    INDEX-lane entries on this config (e.g. ``AssetElasticsearchDriver``) are
+    consumed by ``dynastore.modules.catalog.asset_sync.AssetEntitySyncSubscriber``
+    off the ``CatalogEventType.ASSET_*`` event stream — mirrors the catalog-tier
     trigger documented on :class:`CatalogRoutingConfig` (durable
-    ``tasks.events`` plane, not a direct call from ``AssetService``). Dispatch
-    is durable and effectively always async regardless of the entry's
-    ``write_mode``, which is not consulted for these entries today.
+    ``tasks.events`` plane, not a direct call from ``AssetService``).  INDEX
+    dispatch is always async by lane definition.
 
     Identity is the class itself; see ``class_key()`` in ``platform_config_service.py``.
     """
@@ -999,9 +954,10 @@ class AssetRoutingConfig(_RoutingConfigBase):
     # default must surface in the catalog view while the immutability gate
     # stays collection-scoped (``_freeze_at``).
     _tiers: ClassVar[Tuple[str, ...]] = ("platform", "catalog", "collection")
-    # The asset SEARCH driver (AssetElasticsearchDriver.search_assets) is the
-    # only path that invokes the read-side restore chain today, so SEARCH
-    # output_transformers actually fire on this tier. See geoid#1567.
+    # The asset search driver (AssetElasticsearchDriver.search_assets) is the
+    # only path that invokes the read-side restore chain today, so the
+    # derived-search output_transformers hop actually fires on this tier.
+    # See geoid#1567.
     _wired_output_search_hop: ClassVar[bool] = True
 
     operations: Mutable[Dict[str, List[OperationDriverEntry]]] = Field(
@@ -1031,24 +987,23 @@ class AssetRoutingConfig(_RoutingConfigBase):
         description=(
             "Operation → ordered driver list for asset drivers. "
             "Defaults wire PG only (FATAL primary on WRITE and READ); "
-            "the ES asset driver is not a default. ``operations[WRITE]`` "
+            "the ES asset driver is not a default. ``operations[INDEX]`` "
             "is auto-augmented at validation time with discoverable "
-            "AssetIndexer drivers (stamped secondary_index=True), so "
-            "operators that install an ES asset indexer still get async "
-            "fan-out; ``operations[UPLOAD]`` is auto-augmented with "
-            "discoverable AssetUploadProtocol impls."
+            "AssetIndexer drivers, so operators that install an ES asset "
+            "indexer still get async fan-out; ``operations[UPLOAD]`` is "
+            "auto-augmented with discoverable AssetUploadProtocol impls."
         ),
     )
     def _self_register_drivers(self) -> None:
-        """Augment WRITE secondary indexes + UPLOAD with discoverable drivers.
+        """Augment INDEX + UPLOAD with discoverable drivers.
 
-        SEARCH is resolvable on the asset tier but carries no hardcoded
-        default and is not auto-augmented: ``get_asset_search_driver``
-        resolves ``operations[SEARCH]`` first and falls back to
+        Search is resolvable on the asset tier but carries no hardcoded
+        default and is not separately configured: ``get_asset_search_driver``
+        resolves ``operations[INDEX]`` first and falls back to
         ``operations[READ]`` when an operator has not pinned a dedicated
         search backend (see ``modules/storage/router.py`` and #989). This
         keeps the zero-config default behaviour (PG-backed READ serves
-        filtered queries) while letting an operator route SEARCH to an
+        filtered queries) while letting an operator route search to an
         index driver (e.g. Elasticsearch) per catalog/collection without a
         code change.
         """
@@ -1073,17 +1028,17 @@ class CatalogRoutingConfig(_RoutingConfigBase):
     explicit platform config.
 
     ``operations`` supports the same keys as :class:`CollectionRoutingConfig`:
-    ``WRITE``, ``READ``, ``SEARCH`` (plus the sibling ``transformers``
+    ``WRITE``, ``READ``, ``INDEX`` (plus the sibling ``transformers``
     registry).
     See that class for per-key semantics, with one trigger difference:
-    secondary-index WRITE entries on this config are consumed by
+    INDEX-lane entries on this config are consumed by
     :class:`~dynastore.modules.catalog.reindex_worker.ReindexWorker` off
     the ``catalog_metadata_changed`` event stream — they are NOT
     invoked directly from ``catalog_router`` the way the collection
-    secondary-index entries are invoked from
+    INDEX-lane entries are invoked from
     ``collection_router._dispatch_collection_index``.  Both end at the
-    same Indexer drivers through OUTBOX-durable plumbing; the asymmetry
-    is in *how* the hop is triggered, not in what runs.  See the
+    same Indexer drivers through durable plumbing; the asymmetry is in
+    *how* the hop is triggered, not in what runs.  See the
     "Catalog secondary-index hop" section in
     ``modules/catalog/catalog_router.py``'s module docstring.
 
@@ -1097,8 +1052,9 @@ class CatalogRoutingConfig(_RoutingConfigBase):
     # at-collection rule.
     _tiers: ClassVar[Tuple[str, ...]] = ("platform", "catalog")
     # CatalogElasticsearchDriver.get_catalog_metadata invokes
-    # get_output_transformers_for_search + restore_transform_chain, so
-    # SEARCH output_transformers are now wired for this tier (geoid#1574).
+    # get_output_transformers_for_search + restore_transform_chain, so the
+    # derived-search output_transformers hop is wired for this tier
+    # (geoid#1574).
     _wired_output_search_hop: ClassVar[bool] = True
 
     operations: Mutable[Dict[str, List[OperationDriverEntry]]] = Field(
@@ -1106,16 +1062,15 @@ class CatalogRoutingConfig(_RoutingConfigBase):
             # catalog_postgresql_driver is the registered CatalogStore
             # composition wrapper — it fans CRUD across the catalog_core +
             # catalog_stac PG sidecars internally. It is the system of
-            # record (FATAL) for both WRITE and READ. The ES secondary
-            # index is a WRITE entry (secondary_index=True) propagating to
-            # Elasticsearch asynchronously (OUTBOX-durable). That entry is
-            # NOT hard-coded: it is auto-augmented at validation time with
-            # discoverable CatalogIndexer drivers (and supplied by routing
-            # presets for explicit deployments). A PG-only deployment with
-            # no ES driver and no outbox-draining worker therefore gets no
-            # secondary-index entry, so a plain catalog create does not
-            # enqueue an OUTBOX row into tasks.tasks that nothing would
-            # ever drain (#1069 / #1073).
+            # record (FATAL) for both WRITE and READ. The ES INDEX entry
+            # propagates to Elasticsearch asynchronously (storage-plane-
+            # durable). That entry is NOT hard-coded: it is auto-augmented
+            # at validation time with discoverable CatalogIndexer drivers
+            # (and supplied by routing presets for explicit deployments). A
+            # PG-only deployment with no ES driver and no drain worker
+            # therefore gets no INDEX entry, so a plain catalog create does
+            # not enqueue an obligation row into tasks.storage that nothing
+            # would ever drain (#1069 / #1073).
             Operation.WRITE: [
                 OperationDriverEntry(
                     driver_ref="catalog_postgresql_driver",
@@ -1137,15 +1092,13 @@ class CatalogRoutingConfig(_RoutingConfigBase):
                 # the caller supplies an explicit hint (e.g. ?hints=prefer:es).
                 # There is no geometry at the metadata level so geometry hints
                 # do not apply here. The READ matcher keeps the unmatched PG
-                # entry as an ordered fallback tail, so an ES miss falls through
-                # to the PG system of record (WARN = best-effort, never fatal).
-                # A no-hint read never reaches ES because the no-hint READ
-                # filter drops hint-tagged entries when an untagged default
-                # exists.
+                # entry as an ordered fallback tail, so an ES miss falls
+                # through to the PG system of record. A no-hint read never
+                # reaches ES because the no-hint READ filter drops hint-tagged
+                # entries when an untagged default exists.
                 OperationDriverEntry(
                     driver_ref="catalog_elasticsearch_driver",
                     hints={Hint.METADATA},
-                    on_failure=FailurePolicy.WARN,
                     source="auto",
                 ),
             ],
@@ -1153,31 +1106,25 @@ class CatalogRoutingConfig(_RoutingConfigBase):
         description=(
             "Operation -> ordered driver list for catalog-tier CatalogStore "
             "drivers. WRITE/READ = catalog_postgresql_driver (system of "
-            "record). The ES secondary index is a WRITE entry "
-            "(secondary_index=True) with async OUTBOX-durable propagation, "
-            "auto-augmented at validation time with every discoverable "
-            "CatalogIndexer (or supplied by a routing preset) — not hard-"
-            "coded, so a PG-only deployment enqueues no undrainable outbox "
-            "rows. Operator-explicit entries take precedence; auto-"
-            "augmentation is idempotent set-default."
+            "record). The ES INDEX entry propagates asynchronously "
+            "(storage-plane-durable), auto-augmented at validation time "
+            "with every discoverable CatalogIndexer (or supplied by a "
+            "routing preset) — not hard-coded, so a PG-only deployment "
+            "enqueues no undrainable obligation rows. Operator-explicit "
+            "entries take precedence; auto-augmentation is idempotent "
+            "set-default."
         ),
     )
     def _self_register_drivers(self) -> None:
-        """Fold discoverable CatalogIndexer (as secondary-index WRITE
-        entries, ``secondary_index=True``) + SEARCH-capable CatalogStore
-        drivers into ``operations[WRITE]`` and ``operations[SEARCH]``.
+        """Fold discoverable CatalogIndexer drivers into ``operations[INDEX]``.
 
         Closes the gap where the default-state config (no operator write)
-        shows neither a secondary-index WRITE entry nor SEARCH entries even
-        when an ES catalog driver is installed.  Mirrors the apply-handler
-        self-registration so default-state and apply-time configs converge —
-        ``_on_apply_catalog_routing_config`` calls the same helpers with the
-        same idempotent semantics.
+        shows no INDEX entry even when an ES catalog driver is installed.
+        Mirrors the apply-handler self-registration so default-state and
+        apply-time configs converge — ``_on_apply_catalog_routing_config``
+        calls the same helper with the same idempotent semantics.
         """
-        from dynastore.models.protocols.entity_store import CatalogStore
-
         _self_register_indexers_into(self.operations, CatalogIndexer)
-        _self_register_searchers_into(self.operations, CatalogStore)
 
 
 # ---------------------------------------------------------------------------
@@ -1195,10 +1142,12 @@ def _validate_routing_entries(
     Raises ``ValueError`` on:
     1. Unknown ``driver_ref``
     2. Hint not in ``driver.supported_hints``
-    3. Operation not supported (derived from driver capabilities)
-    4. ``write_mode=async`` on a driver without ``DriverCapability.ASYNC``
+    3. Operation not supported (derived from driver capabilities) — WRITE/READ only
+    4. An INDEX entry whose driver does not structurally provide the
+       drain's bulk write (``index_bulk`` — the :class:`Indexer` protocol
+       surface)
     """
-    from dynastore.modules.storage.driver_config import DriverCapability
+    from dynastore.models.protocols.indexer import Indexer
 
     for operation, entries in config.operations.items():
         for entry in entries:
@@ -1227,52 +1176,37 @@ def _validate_routing_entries(
                     f"Supported: {sorted(driver_hints)}"
                 )
 
-            # 3. Operation supported (derived from capabilities)
-            driver_caps = getattr(driver, "capabilities", frozenset())
-            supported_ops = derive_supported_operations(driver_caps)
-            if operation not in supported_ops:
+            # 3. Operation supported (derived from capabilities). INDEX is
+            # gated structurally (below), not via Capability — a driver's
+            # WRITE/READ capabilities say nothing about its eligibility as
+            # a materialization target.
+            if operation in (Operation.WRITE, Operation.READ):
+                driver_caps = getattr(driver, "capabilities", frozenset())
+                supported_ops = derive_supported_operations(driver_caps)
+                if operation not in supported_ops:
+                    raise ValueError(
+                        f"{label}: driver '{entry.driver_ref}' does not support "
+                        f"operation '{operation}'. "
+                        f"Supported operations: {sorted(supported_ops)} "
+                        f"(derived from capabilities: {sorted(driver_caps)})"
+                    )
+
+            # 4. INDEX entries must structurally provide index_bulk.
+            if operation == Operation.INDEX and not isinstance(driver, Indexer):
                 raise ValueError(
-                    f"{label}: driver '{entry.driver_ref}' does not support "
-                    f"operation '{operation}'. "
-                    f"Supported operations: {sorted(supported_ops)} "
-                    f"(derived from capabilities: {sorted(driver_caps)})"
+                    f"{label}: INDEX entry driver '{entry.driver_ref}' does "
+                    "not implement the Indexer protocol (index_bulk) — it "
+                    "cannot serve as a materialization target for the drain."
                 )
 
-            # 4. write_mode compatibility — check DriverCapability.ASYNC
-            if entry.write_mode == WriteMode.ASYNC:
-                # Resolve driver config via naming convention: snake_case
-                # ``<class_name>_config`` (matches PluginConfig.class_key()
-                # which snake-cases the bound config class name). Pre-PR-1e
-                # this used PascalCase ``ClassName + "Config"`` which silently
-                # missed the registry — masked by the broad except below.
-                try:
-                    from dynastore.models.plugin_config import resolve_config_class
-
-                    driver_config_key = _to_snake(type(driver).__name__ + "Config")
-                    driver_cls = resolve_config_class(driver_config_key)
-                    if driver_cls is not None:
-                        driver_config = driver_cls()
-                        config_caps = getattr(driver_config, "capabilities", frozenset())
-                        if DriverCapability.ASYNC not in config_caps:
-                            raise ValueError(
-                                f"{label}: write_mode='async' requires "
-                                f"DriverCapability.ASYNC on driver '{entry.driver_ref}'. "
-                                f"Driver capabilities: {sorted(config_caps)}"
-                            )
-                except ValueError:
-                    raise  # re-raise validation errors
-                except Exception:
-                    pass  # driver config may not exist — skip check
-
     # 5. Primary driver capability check
-    #    Position 0 in WRITE must support WRITE; position 0 in READ/SEARCH
-    #    must support READ.  Warn only — don't hard-fail for forward-compat.
+    #    Position 0 in WRITE must support WRITE; position 0 in READ must
+    #    support READ.  Warn only — don't hard-fail for forward-compat.
     from dynastore.models.protocols.storage_driver import Capability
 
     _op_required_cap: Dict[str, str] = {
         Operation.WRITE.value: Capability.WRITE,
         Operation.READ.value: Capability.READ,
-        Operation.SEARCH.value: Capability.READ,
     }
     for operation, entries in config.operations.items():
         if not entries:
@@ -1367,80 +1301,82 @@ def _self_register_indexers_into(
     marker_proto: type,
 ) -> None:
     """Auto-append every installed driver satisfying ``marker_proto`` to
-    ``target_ops[WRITE]`` with durable async defaults
-    (``write_mode=async``, ``on_failure=outbox``).
+    ``target_ops[INDEX]``.
 
-    Secondary indexes are not a distinct operation: an indexer is a WRITE
-    target whose driver implements the tier's Indexer marker protocol.  This
-    helper also stamps the derived ``secondary_index`` role flag on every
-    WRITE entry whose driver is a tier indexer (including operator-pinned
-    ones), so a single ``operations[WRITE]`` list carries both primary and
-    index entries and ``secondary_index_entries`` can split them by the
-    persisted flag — independent of whether the indexer is installed in the
-    reading SCOPE.  Stamping is upward-only (never clears a persisted flag),
-    so an indexer configured where it is installed stays classified as an
-    index in SCOPEs where it is not.
+    An indexer is not a WRITE-lane driver: it is an INDEX-lane
+    materialization target, async by lane definition.  This helper seeds
+    ``target_ops[INDEX]`` with every discoverable indexer that opts in —
+    role is lane membership, not a per-entry flag.
 
     Tier-scoped: caller passes the right marker (``CatalogIndexer`` →
     catalog routing, ``CollectionIndexer`` → collection routing,
-    ``AssetIndexer`` → asset routing).  Drivers indexing multiple tiers
-    opt in to multiple markers and self-register into each tier's
-    ``operations[WRITE]`` independently.
+    ``AssetIndexer`` → asset routing, ``ItemIndexer`` → items routing).
+    Drivers indexing multiple tiers opt in to multiple markers and
+    self-register into each tier's ``operations[INDEX]`` independently.
 
-    The ``OUTBOX`` default means a transient indexer failure enqueues a row
-    in ``tasks.storage`` (same PG transaction as the upstream write)
-    for the drain task to retry, instead of dropping the obligation with a
-    log line.  Operators who want a non-durable best-effort sink can
-    override per-entry to ``WARN``, or a strongly-consistent index with
-    ``write_mode=sync`` / ``on_failure=fatal``.
+    Seeds INDEX only when there is no explicit operator intent on either
+    lane — three independent no-op gates, all of which must clear:
 
-    Operator-override: a no-op when ``target_ops[WRITE]`` contains any
-    entry with ``source="operator"`` — operator-managed lists are
-    invariant under auto-augmentation (#792 / #889).
+    1. ``target_ops[WRITE]`` contains any entry with ``source="operator"``
+       — an operator who has taken explicit ownership of the WRITE lane
+       (the primary declaration for this entity) is treated as having
+       taken ownership of the whole routing config, so auto-augmentation
+       backs off from INDEX too.  This preserves every existing "PG-only"
+       preset's behaviour unchanged: those presets already pin WRITE
+       explicitly (implicit ``source="operator"`` field default) to keep
+       an installed-but-unwanted ES indexer out, and that same pin now
+       also keeps it out of INDEX without any additional per-preset change.
+    2. ``target_ops[INDEX]`` is PRESENT and contains any entry with
+       ``source="operator"`` — the operator has taken explicit ownership
+       of INDEX itself (e.g. pinning a private indexer), and a *different*
+       installed indexer must not be silently appended alongside it.
+    3. ``target_ops[INDEX]`` is PRESENT and EMPTY (``[]``) — a present-but-
+       empty list is an explicit opt-out ("no materialization target"),
+       distinct from an ABSENT key (no operator intent expressed, defers
+       to discovery).  An empty list carries no entries and therefore no
+       ``source`` stamp, so this case cannot be folded into gate 2 above —
+       it must be checked on its own.  Without this gate, an operator PUT
+       of an explicit ``INDEX: []`` would have the installed indexer
+       resurrected in the SAME request, before persistence (this helper
+       also runs pre-persist from the validate-phase handler).
+
+    Only an ABSENT INDEX key, or one holding exclusively ``source="auto"``
+    entries, defers to discovery.  When seeding does run, appends are
+    deduped by ``driver_ref`` against every entry already present (operator
+    or auto) — never appends a ref already listed, never duplicates on
+    repeated validation passes.
     """
     from dynastore.tools.discovery import get_protocols
 
-    # Stamp the derived secondary_index role on every existing WRITE entry
-    # whose driver is a tier indexer.  Runs before the operator-managed
-    # early-return so an operator who pins an indexer still gets the role
-    # persisted.  Upward-only: a previously-stamped index stays an index even
-    # when the driver is not installed in the reading SCOPE (discovery would
-    # not see it), preserving OUTBOX durability.
-    indexer_refs = {_to_snake(type(d).__name__) for d in get_protocols(marker_proto)}
-    write_entries = target_ops.get(Operation.WRITE)
-    if write_entries:
-        for i, entry in enumerate(write_entries):
-            if entry.driver_ref in indexer_refs and not entry.secondary_index:
-                write_entries[i] = entry.model_copy(update={"secondary_index": True})
-
     if _is_operator_managed(target_ops, Operation.WRITE):
         return
-    listed = {entry.driver_ref for entry in target_ops.get(Operation.WRITE, [])}
+    if Operation.INDEX in target_ops:
+        existing_index = target_ops[Operation.INDEX]
+        if not existing_index:
+            # Present-but-empty INDEX: explicit operator opt-out.
+            return
+        if any(entry.source == "operator" for entry in existing_index):
+            return
+    listed = {entry.driver_ref for entry in target_ops.get(Operation.INDEX, [])}
     for driver in get_protocols(marker_proto):
         # Single gate on the per-Operation auto-default set.  Drivers
         # explicitly declare which Operations they auto-default into via
         # ``auto_register_for_routing: ClassVar[FrozenSet[Operation]]``;
-        # ``Operation.WRITE`` membership opts the indexer in here.
+        # ``Operation.INDEX`` membership opts the indexer in here.
         # Empty (default) = explicit-pin only.
         opt_in: FrozenSet[str] = getattr(type(driver), "auto_register_for_routing", frozenset())
-        if Operation.WRITE not in opt_in:
+        if Operation.INDEX not in opt_in:
             continue
         driver_ref = _to_snake(type(driver).__name__)
         if driver_ref in listed:
             continue
-        target_ops.setdefault(Operation.WRITE, []).append(
-            OperationDriverEntry(
-                driver_ref=driver_ref,
-                on_failure=FailurePolicy.OUTBOX,
-                write_mode=WriteMode.ASYNC,
-                secondary_index=True,
-                source="auto",
-            )
+        target_ops.setdefault(Operation.INDEX, []).append(
+            OperationDriverEntry(driver_ref=driver_ref, source="auto")
         )
         listed.add(driver_ref)
         logger.debug(
             "Routing config self-registration: appended %s indexer '%s' "
-            "to operations[WRITE] (write_mode=async, on_failure=outbox, source=auto)",
+            "to operations[INDEX] (source=auto)",
             marker_proto.__name__, driver_ref,
         )
 
@@ -1450,8 +1386,7 @@ def _self_register_upload_into(
     marker_proto: type,
 ) -> None:
     """Auto-append every installed driver satisfying ``marker_proto`` to
-    ``target_ops[UPLOAD]`` with single-driver semantics
-    (``write_mode=sync``, ``on_failure=fatal``).
+    ``target_ops[UPLOAD]`` with single-driver semantics (``on_failure=fatal``).
 
     UPLOAD is single-driver per request — the first entry wins unless the
     caller passes a ``hint``.  Multiple registered backends (e.g. GCS +
@@ -1475,62 +1410,13 @@ def _self_register_upload_into(
             OperationDriverEntry(
                 driver_ref=driver_ref,
                 on_failure=FailurePolicy.FATAL,
-                write_mode=WriteMode.SYNC,
                 source="auto",
             )
         )
         listed.add(driver_ref)
         logger.debug(
             "Routing config self-registration: appended %s upload driver "
-            "'%s' to operations[UPLOAD] (write_mode=sync, on_failure=fatal, source=auto)",
-            marker_proto.__name__, driver_ref,
-        )
-
-
-def _self_register_searchers_into(
-    target_ops: Dict[str, List["OperationDriverEntry"]],
-    marker_proto: type,
-) -> None:
-    """Auto-append every installed driver opting into SEARCH to
-    ``target_ops[SEARCH]``.
-
-    Single gate on the per-Operation auto-default set: a driver is
-    auto-augmented into ``operations[SEARCH]`` only if its class
-    declares ``Operation.SEARCH`` in
-    ``auto_register_for_routing: ClassVar[FrozenSet[Operation]]``.
-    Capability-based gating (``FULLTEXT`` / ``SPATIAL_FILTER`` / …)
-    has been retired; capabilities are now structural facts only,
-    while which read-flavours a driver serves is expressed through
-    ``supported_hints``.
-
-    Tier-scoped via ``marker_proto`` — the structural Protocol to
-    discover against (``CatalogStore`` for catalog routing,
-    ``CollectionStore`` for collection-tier metadata routing,
-    ``CollectionItemsStore`` for items-tier routing).
-
-    Operator-override: a no-op when ``target_ops[SEARCH]`` contains any
-    entry with ``source="operator"`` — operator-managed lists are
-    invariant under auto-augmentation (#792 / #889).
-    """
-    from dynastore.tools.discovery import get_protocols
-
-    if _is_operator_managed(target_ops, Operation.SEARCH):
-        return
-    listed = {entry.driver_ref for entry in target_ops.get(Operation.SEARCH, [])}
-    for driver in get_protocols(marker_proto):
-        opt_in: FrozenSet[str] = getattr(type(driver), "auto_register_for_routing", frozenset())
-        if Operation.SEARCH not in opt_in:
-            continue
-        driver_ref = _to_snake(type(driver).__name__)
-        if driver_ref in listed:
-            continue
-        target_ops.setdefault(Operation.SEARCH, []).append(
-            OperationDriverEntry(driver_ref=driver_ref, source="auto")
-        )
-        listed.add(driver_ref)
-        logger.debug(
-            "Routing config self-registration: appended %s SEARCH "
-            "driver '%s' to operations[SEARCH] (source=auto)",
+            "'%s' to operations[UPLOAD] (on_failure=fatal, source=auto)",
             marker_proto.__name__, driver_ref,
         )
 
@@ -1594,9 +1480,9 @@ async def _validate_items_routing_config(
 ) -> None:
     """Validate-phase handler for items routing config (#738).
 
-    Validates driver_ref, hints, operations, write_mode for items dispatch
+    Validates driver_ref, hints, and operations for items dispatch
     entries (``CollectionItemsStore`` drivers) and auto-registers
-    discoverable ``ItemIndexer`` drivers and SEARCH-capable items drivers.
+    discoverable ``ItemIndexer`` drivers into the INDEX lane.
 
     Runs PRE-PERSIST: a failure here propagates as HTTP 4xx and the upsert
     is rolled back.  The ``_self_register_*`` calls mutate ``config.operations``
@@ -1611,13 +1497,11 @@ async def _validate_items_routing_config(
     driver_index = {_to_snake(type(d).__name__): d for d in get_protocols(CollectionItemsStore)}
     _validate_routing_entries(config, driver_index, "Items routing config")
 
-    # Items-tier: auto-register ItemIndexer drivers as secondary-index WRITE
-    # entries (gated on ``Operation.WRITE in driver.auto_register_for_routing``)
-    # + ``CollectionItemsStore`` drivers opting into ``Operation.SEARCH``
-    # — parity with the read-time model_validator so operator PUTs also
-    # pick up auto-augmentation.
+    # Items-tier: auto-register ItemIndexer drivers into operations[INDEX]
+    # (gated on ``Operation.INDEX in driver.auto_register_for_routing``) —
+    # parity with the read-time model_validator so operator PUTs also pick
+    # up auto-augmentation.
     _self_register_indexers_into(config.operations, ItemIndexer)
-    _self_register_searchers_into(config.operations, CollectionItemsStore)
 
 
 async def _on_apply_items_routing_config(
@@ -1730,8 +1614,7 @@ async def _validate_collection_routing_config(
 
     Validates entries against the ``CollectionStore`` registry and
     auto-registers installed metadata drivers (READ/WRITE) plus
-    discoverable ``CollectionIndexer`` and SEARCH-capable
-    ``CollectionStore`` drivers.  Runs PRE-PERSIST so the
+    discoverable ``CollectionIndexer`` drivers.  Runs PRE-PERSIST so the
     ``_self_register_*`` ``source="auto"`` entries persist and a bad
     driver_ref propagates as HTTP 4xx.
     """
@@ -1742,16 +1625,13 @@ async def _validate_collection_routing_config(
     driver_index = {_to_snake(type(d).__name__): d for d in get_protocols(CollectionItemsStore)}
     store_driver_index = {_to_snake(type(d).__name__): d for d in get_protocols(CollectionStore)}
     # Known CollectionIndexer driver_refs (e.g. the ES collection_elasticsearch_driver).
-    # An indexer is a write-only secondary-index sink, never a READ-capable
-    # CollectionStore. A routing config persisted before the ES-only collection
-    # routing fix could list the ES indexer as a READ/WRITE *primary*
-    # (``secondary_index`` unset) — an entry that can't serve metadata. The
-    # runtime router already relaxes READ to an available store (#2147) and
-    # skips any unregistered entry at dispatch, so skipping known indexers here
-    # (instead of hard-raising) keeps a stale catalog readable and lets it
-    # self-heal on the next apply — parity with operations[WRITE]
-    # (secondary-index skip, #2267) and the items/asset/catalog validators
-    # (``_validate_routing_entries`` warn-skips unregistered drivers).
+    # An indexer is an INDEX-lane materialization target, never a READ/WRITE-
+    # capable CollectionStore.  A WRITE/READ entry that happens to name a
+    # known indexer (operator mis-pin, not a persisted-shape concern — lane
+    # membership IS the role now) is warn-skipped, not raised — the runtime
+    # router skips any unregistered/wrong-role entry at dispatch, so
+    # skipping here keeps a misconfigured catalog readable and lets it
+    # self-heal on the next apply.
     indexer_refs = {_to_snake(type(d).__name__) for d in get_protocols(CollectionIndexer)}
 
     # Auto-register installed store drivers (WRITE/READ) so operators
@@ -1760,15 +1640,15 @@ async def _validate_collection_routing_config(
     _self_register_store_drivers(config, store_driver_index)
 
     # Validate operations[READ] (CollectionStore drivers). A known indexer
-    # mis-listed under READ (stale pre-fix config) is warn-skipped, not raised
-    # — it is not a CollectionStore and the runtime router relaxes READ past it.
+    # mis-listed under READ is warn-skipped, not raised — it is not a
+    # CollectionStore and the runtime router relaxes READ past it.
     for entry in config.operations.get(Operation.READ, []):
         if entry.driver_ref in store_driver_index:
             continue
-        if entry.secondary_index or entry.driver_ref in indexer_refs:
+        if entry.driver_ref in indexer_refs:
             logger.warning(
                 "Collection metadata routing config: operations[READ] driver "
-                "'%s' is a secondary-index sink, not a CollectionStore; skipping "
+                "'%s' is an INDEX-lane sink, not a CollectionStore; skipping "
                 "(runtime router relaxes READ to an available store).",
                 entry.driver_ref,
             )
@@ -1790,17 +1670,15 @@ async def _validate_collection_routing_config(
             )
 
     # Validate operations[WRITE] entries (CollectionStore drivers — the primary
-    # metadata store). Secondary-index sinks (``secondary_index=True``, e.g. the
-    # ES ``CollectionIndexer``) are WRITE targets distinguished by driver role,
-    # not a separate operation — and they are NOT ``CollectionStore`` drivers, so
-    # they must be skipped here. They are self-registered from the
-    # ``CollectionIndexer`` registry just below (and re-stamped on round-trip),
-    # and the runtime router skips any unregistered entry at dispatch. Validating
-    # them against the store registry is what rejected a legitimate
-    # ``collection_elasticsearch_driver`` secondary index and rolled back an
-    # ES-catalog routing preset apply, dropping the catalog to the PG+ES default.
+    # metadata store). A known indexer (e.g. the ES ``CollectionIndexer``) is
+    # not a distinct operation any more — it lives in operations[INDEX], never
+    # WRITE — and it is NOT a ``CollectionStore`` driver, so it must be
+    # skipped here if an operator mis-pinned one under WRITE. Validating it
+    # against the store registry is what rejected a legitimate
+    # ``collection_elasticsearch_driver`` INDEX entry and rolled back an
+    # ES-catalog routing preset apply in the pre-lane model.
     for entry in config.operations.get(Operation.WRITE, []):
-        if entry.secondary_index or entry.driver_ref in indexer_refs:
+        if entry.driver_ref in indexer_refs:
             continue
         if entry.driver_ref not in store_driver_index:
             raise ValueError(
@@ -1809,10 +1687,23 @@ async def _validate_collection_routing_config(
                 f"Available: {sorted(store_driver_index)}"
             )
 
-    # Auto-register discoverable indexers + searchers — parity with the
-    # read-time model_validator on CollectionRoutingConfig.
+    # Validate operations[INDEX]: driver must structurally provide index_bulk
+    # (the Indexer protocol) — the drain's bulk-write surface.
+    from dynastore.models.protocols.indexer import Indexer
+
+    for entry in config.operations.get(Operation.INDEX, []):
+        driver = store_driver_index.get(entry.driver_ref) or driver_index.get(entry.driver_ref)
+        if driver is not None and not isinstance(driver, Indexer):
+            raise ValueError(
+                f"Collection metadata routing config: INDEX entry driver "
+                f"'{entry.driver_ref}' does not implement the Indexer "
+                "protocol (index_bulk) — it cannot serve as a "
+                "materialization target for the drain."
+            )
+
+    # Auto-register discoverable indexers — parity with the read-time
+    # model_validator on CollectionRoutingConfig.
     _self_register_indexers_into(config.operations, CollectionIndexer)
-    _self_register_searchers_into(config.operations, CollectionStore)
 
     # Composition guard (#1047): a public-ES collection requires a public-ES
     # parent catalog. Cross-tier rule — needs the parent catalog's routing
@@ -1879,8 +1770,7 @@ async def _validate_asset_routing_config(
     driver_index = {_to_snake(type(d).__name__): d for d in get_protocols(AssetStore)}
     _validate_routing_entries(config, driver_index, "Asset routing config")
 
-    # Auto-register installed AssetIndexer drivers as secondary-index
-    # entries under operations[WRITE].
+    # Auto-register installed AssetIndexer drivers under operations[INDEX].
     _self_register_indexers_into(config.operations, AssetIndexer)
 
     # Auto-register installed AssetUploadProtocol impls under operations[UPLOAD].
@@ -1940,13 +1830,12 @@ async def _validate_catalog_routing_config(
 
     Validates ``driver_ref``, hints, and operation capability for every entry in
     ``config.operations`` against the ``CatalogStore`` driver registry, and
-    auto-registers installed store drivers + ``CatalogIndexer`` /
-    SEARCH-capable ``CatalogStore`` drivers.  Runs PRE-PERSIST.
+    auto-registers installed store drivers + ``CatalogIndexer`` drivers.
+    Runs PRE-PERSIST.
 
-    Secondary-index WRITE entries are validated against the same registry —
-    role is derived from the driver's Indexer marker
-    (``secondary_index``), not a distinct operation (see role-based driver
-    plan §Routing).
+    INDEX entries are validated against the same registry plus a structural
+    ``Indexer`` (``index_bulk``) check — role is lane membership, not a
+    distinct field (see the lane-model design).
 
     There is no catalog-tier apply handler: the catalog router is cache-free
     until ``catalog_router.py`` lands (M2), so once validation + self-register
@@ -1959,11 +1848,9 @@ async def _validate_catalog_routing_config(
     _self_register_store_drivers(config, driver_index)
     _validate_routing_entries(config, driver_index, "Catalog routing config")
 
-    # Auto-register installed CatalogIndexer drivers as secondary-index
-    # entries under operations[WRITE] and SEARCH-capable CatalogStore drivers
-    # under operations[SEARCH] for parity with the read-time validator.
+    # Auto-register installed CatalogIndexer drivers under operations[INDEX]
+    # for parity with the read-time validator.
     _self_register_indexers_into(config.operations, CatalogIndexer)
-    _self_register_searchers_into(config.operations, CatalogStore)
 
 
 # Register handlers on the config classes themselves (#738/#747 — the
@@ -1993,8 +1880,8 @@ CatalogRoutingConfig.register_validate_handler(cast(_HandlerSig, _validate_catal
 _PRIVATE_ITEMS_DRIVER_ID = "items_elasticsearch_private_driver"
 
 # Public ES envelope drivers — membership in a tier's global public index is
-# expressed by pinning these in ``operations[WRITE]`` (#1047 SSOT; post-#990
-# canonical shape where the ES indexer rides WRITE with ASYNC + OUTBOX, as the
+# expressed by pinning these in ``operations[INDEX]`` (#1047 SSOT; lane-model
+# canonical shape where the ES indexer rides the async INDEX lane, as the
 # items tier already does).  A collection is globally searchable when the
 # public collection ES driver is pinned; a catalog is globally navigable when
 # the public catalog ES driver is pinned.
@@ -2032,21 +1919,21 @@ def _operation_pins_driver(
 
 def _collection_routing_is_public(routing: "CollectionRoutingConfig") -> bool:
     """Return True iff the collection routing config pins the public
-    collection ES driver in ``operations[WRITE]`` — i.e. the collection
+    collection ES driver in ``operations[INDEX]`` — i.e. the collection
     envelope lands in the global ``{prefix}-collections`` index and is
     therefore globally searchable (#1047)."""
     return _operation_pins_driver(
-        routing, Operation.WRITE, _PUBLIC_COLLECTION_ES_DRIVER_ID,
+        routing, Operation.INDEX, _PUBLIC_COLLECTION_ES_DRIVER_ID,
     )
 
 
 def _catalog_routing_is_public(routing: "CatalogRoutingConfig") -> bool:
     """Return True iff the catalog routing config pins the public catalog ES
-    driver in ``operations[WRITE]`` — i.e. the catalog envelope lands in the
+    driver in ``operations[INDEX]`` — i.e. the catalog envelope lands in the
     global ``{prefix}-catalogs`` index and the catalog is globally navigable
     (#1047)."""
     return _operation_pins_driver(
-        routing, Operation.WRITE, _PUBLIC_CATALOG_ES_DRIVER_ID,
+        routing, Operation.INDEX, _PUBLIC_CATALOG_ES_DRIVER_ID,
     )
 
 
@@ -2079,15 +1966,15 @@ def _assert_public_collection_has_public_parent(
         return
     raise ValueError(
         "Composition guard: a public collection (CollectionRoutingConfig "
-        f"pins '{_PUBLIC_COLLECTION_ES_DRIVER_ID}' in operations[WRITE]) "
+        f"pins '{_PUBLIC_COLLECTION_ES_DRIVER_ID}' in operations[INDEX]) "
         "requires its parent catalog to be public (CatalogRoutingConfig "
-        f"must pin '{_PUBLIC_CATALOG_ES_DRIVER_ID}' in operations[WRITE]). "
+        f"must pin '{_PUBLIC_CATALOG_ES_DRIVER_ID}' in operations[INDEX]). "
         "A globally-searchable collection under a non-public catalog would "
         "leak the collection envelope into global search while the parent "
         "catalog is not navigable. Apply the 'public_catalog' preset (or "
         "pin the public catalog ES driver) on the parent catalog first, or "
         "keep this collection private (drop the public collection ES driver "
-        "from operations[WRITE])."
+        "from operations[INDEX])."
     )
 
 
@@ -2100,11 +1987,13 @@ def _assert_public_collection_has_public_parent(
 # (single SSOT) and apply the resolution semantics documented at the top
 # of this file:
 #
-#   - WRITE:     fan-out across every listed driver; secondary-index
-#                entries (secondary_index=True) propagate to search sinks.
-#   - SEARCH:    single-driver. Default = first; driver_hint overrides.
+#   - WRITE:  fan-out across every listed driver (empty/absent = read-only).
+#   - INDEX:  async materialization fan-out target set.
+#   - search: derived — not read from a configured operation.  See
+#             :func:`get_search_driver` and
+#             :mod:`dynastore.modules.storage.router`.
 #
-# Transformers are not an operation: WRITE/SEARCH entries attach them via
+# Transformers are not an operation: INDEX/READ entries attach them via
 # input_transformers/output_transformers refs into the ``transformers``
 # registry; the composition runtime in
 # modules/storage/transform_runtime.py applies the chain.
@@ -2184,47 +2073,21 @@ async def _resolve_entity_operations(
     return {}
 
 
-def secondary_index_entries(
+def index_entries(
     operations: Mapping[Any, Sequence["OperationDriverEntry"]],
-    *,
-    async_outbox_only: bool = False,
 ) -> List["OperationDriverEntry"]:
-    """The secondary-index entries of a write list — role-based (#990).
+    """The INDEX-lane entries — the async materialization target set.
 
-    A secondary index is not a distinct operation: it is a ``WRITE`` entry
-    whose ``secondary_index`` flag is set.  That flag is derived at
-    config-build time from the driver's Indexer marker
-    (``is_<tier>_indexer``) and persisted, so classification is independent
-    of whether the indexer is installed in the current SCOPE — a
-    configured-but-not-installed indexer is still recognised and routed to
-    the OUTBOX.
-
-    Role is orthogonal to policy: this preserves per-entry ``on_failure``
-    (fatal / warn / outbox) and ``write_mode`` (sync / async) — a secondary
-    index may be sync+fatal, which a ``write_mode==ASYNC`` proxy could not
-    express.
-
-    ``async_outbox_only`` restricts to the outbox-deferred subset
-    (``write_mode=ASYNC`` & ``on_failure=OUTBOX``) — used by the in-line
-    upsert/delete paths that enqueue outbox rows themselves, as opposed to
-    the dispatcher fan-out which handles every failure policy.
+    Lane membership IS the role: an INDEX entry is, by definition, a
+    materialization target (a configured-but-not-installed indexer is still
+    recognised and routed to the drain, independent of whether it is
+    installed in the current SCOPE).  Deduplicated by ``driver_ref``,
+    order-preserving.
     """
-    def _keep(entry: "OperationDriverEntry") -> bool:
-        if async_outbox_only:
-            return (
-                entry.write_mode == WriteMode.ASYNC
-                and entry.on_failure == FailurePolicy.OUTBOX
-            )
-        return True
-
     out: List["OperationDriverEntry"] = []
     seen: Set[str] = set()
-    for entry in operations.get(Operation.WRITE, []):
-        if (
-            entry.secondary_index
-            and entry.driver_ref not in seen
-            and _keep(entry)
-        ):
+    for entry in operations.get(Operation.INDEX, []):
+        if entry.driver_ref not in seen:
             seen.add(entry.driver_ref)
             out.append(entry)
     return out
@@ -2236,17 +2099,17 @@ async def get_active_indexers(
     entity: EntityKindLiteral,
     collection_id: Optional[str] = None,
 ) -> Set[str]:
-    """driver_ids of all secondary-index drivers for this entity.
+    """driver_ids of all INDEX-lane drivers for this entity.
 
     Multi-driver fan-out: write side has no merge ambiguity, every listed
-    indexer fires. Returns empty set when no secondary-index entries exist.
+    indexer fires. Returns empty set when the INDEX lane is empty.
     """
     ops = await _resolve_entity_operations(
         catalog_id, entity=entity, collection_id=collection_id,
     )
     return {
         entry.driver_ref
-        for entry in secondary_index_entries(ops)
+        for entry in index_entries(ops)
     }
 
 
@@ -2257,34 +2120,42 @@ async def get_search_driver(
     collection_id: Optional[str] = None,
     driver_hint: Optional[str] = None,
 ) -> Optional[str]:
-    """driver_ref of the driver to use for SEARCH on this entity.
+    """driver_ref of the driver to use for search on this entity.
 
-    Single-driver semantics: default = first entry in operations[SEARCH].
-    When ``driver_hint`` is given AND present in the routing list, returns
-    that driver. When the hint is given but NOT in the list, logs a
-    warning and falls back to the default.
+    Derived-pool semantics (see the module docstring): the INDEX lane is
+    tried first, then the READ lane as fallback.  ``driver_hint``, when
+    given AND present in either pool, overrides the default; when the hint
+    is given but not found, logs a warning and falls back to the default.
 
-    Returns ``None`` when no SEARCH entry is registered.
+    This entity-agnostic helper has no driver registry access, so it
+    cannot rank by ``Hint.SEARCH`` preference the way the production
+    resolution path does — see
+    :func:`dynastore.modules.storage.router.get_items_search_driver` /
+    :func:`~dynastore.modules.storage.router.get_asset_search_driver` for
+    the hint-aware, driver-registry-backed resolution used by real query
+    dispatch.
+
+    Returns ``None`` when neither lane has any entry.
     """
     ops = await _resolve_entity_operations(
         catalog_id, entity=entity, collection_id=collection_id,
     )
-    entries = ops.get(Operation.SEARCH, [])
-    if not entries:
+    pool = index_entries(ops) + list(ops.get(Operation.READ, []))
+    if not pool:
         return None
 
     if driver_hint:
-        listed = {e.driver_ref for e in entries}
+        listed = {e.driver_ref for e in pool}
         if driver_hint in listed:
             return driver_hint
         logger.warning(
-            "get_search_driver: driver_hint=%r not in operations[SEARCH] "
-            "for entity=%s catalog=%s collection=%s; falling back to default. "
-            "Available: %s",
+            "get_search_driver: driver_hint=%r not in the derived search "
+            "pool (INDEX + READ) for entity=%s catalog=%s collection=%s; "
+            "falling back to default. Available: %s",
             driver_hint, entity, catalog_id, collection_id, sorted(listed),
         )
 
-    return entries[0].driver_ref
+    return pool[0].driver_ref
 
 
 async def get_output_transformers_for_search(
@@ -2294,14 +2165,18 @@ async def get_output_transformers_for_search(
     collection_id: Optional[str] = None,
     driver_ref: str,
 ) -> List[Any]:
-    """Resolve the ``output_transformers`` declared on the SEARCH entry for
-    ``driver_ref`` into live :class:`EntityTransformProtocol` instances.
+    """Resolve the ``output_transformers`` declared on the derived-search
+    entry for ``driver_ref`` into live :class:`EntityTransformProtocol`
+    instances.
 
-    Used by SEARCH-side drivers to wrap each hit through
+    Used by search-side drivers to wrap each hit through
     :func:`restore_transform_chain` so the client-facing shape is the
-    inverse of what the indexer wrote. Returns an empty list when no
-    matching SEARCH entry exists or when none of its
-    ``output_transformers`` resolve to registered instances.
+    inverse of what the indexer wrote.  Checks the INDEX lane first (the
+    materialized/derived-search role), then the READ lane (a driver that
+    resolves as search via READ fallback, e.g. an ES-primary items
+    routing).  Returns an empty list when no matching entry exists in
+    either lane or when none of its ``output_transformers`` resolve to
+    registered instances.
     """
     from dynastore.models.protocols.entity_transform import EntityTransformProtocol
     from dynastore.tools.discovery import get_protocols
@@ -2309,9 +2184,8 @@ async def get_output_transformers_for_search(
     ops = await _resolve_entity_operations(
         catalog_id, entity=entity, collection_id=collection_id,
     )
-    search_entries = ops.get(Operation.SEARCH, [])
     target_refs: Tuple[str, ...] = ()
-    for entry in search_entries:
+    for entry in index_entries(ops) + list(ops.get(Operation.READ, [])):
         if entry.driver_ref == driver_ref:
             target_refs = entry.output_transformers
             break
@@ -2343,10 +2217,9 @@ def _self_register_transformers_into(
     """Auto-append every installed ``EntityTransformProtocol`` implementer to
     the ``transformers`` registry (in place).
 
-    Mirrors :func:`_self_register_indexers_into` and
-    :func:`_self_register_searchers_into`. Operator-override: a no-op when the
-    registry already contains any entry with ``source="operator"`` — an
-    operator-authored registry is invariant under auto-augmentation
+    Mirrors :func:`_self_register_indexers_into`. Operator-override: a no-op
+    when the registry already contains any entry with ``source="operator"``
+    — an operator-authored registry is invariant under auto-augmentation
     (#792 / #889).
 
     Discovery is purely structural: any driver implementing

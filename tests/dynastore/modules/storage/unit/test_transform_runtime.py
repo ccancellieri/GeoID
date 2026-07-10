@@ -275,9 +275,9 @@ class _Append:
 
 @pytest.mark.asyncio
 async def test_input_on_index_only_runs_at_index_hop_not_at_search():
-    """When only the WRITE secondary-index entry declares
-    input_transformers, the indexed doc is transformed; the SEARCH-side
-    restore does not fire (no output_transformers declared)."""
+    """When only the INDEX-lane entry declares input_transformers, the
+    indexed doc is transformed; the derived-search-side restore does not
+    fire (no output_transformers declared on either INDEX or READ)."""
     from dynastore.modules.storage.routing_config import (
         Operation,
         OperationDriverEntry,
@@ -287,18 +287,18 @@ async def test_input_on_index_only_runs_at_index_hop_not_at_search():
     index_entry = OperationDriverEntry(
         driver_ref="items_indexer",
         input_transformers=("payload_append_transformer",),
-        secondary_index=True,
     )
-    search_entry = OperationDriverEntry(driver_ref="items_indexer")
+    read_entry = OperationDriverEntry(driver_ref="items_indexer")
     ops = {
-        Operation.WRITE: [index_entry],
-        Operation.SEARCH: [search_entry],
+        Operation.INDEX: [index_entry],
+        Operation.READ: [read_entry],
     }
     assert index_entry.input_transformers == ("payload_append_transformer",)
-    assert search_entry.output_transformers == ()
+    assert read_entry.output_transformers == ()
 
     appender = PayloadAppendTransformer("X")
-    # SEARCH entry has no output_transformers → empty chain at SEARCH hop.
+    # Neither lane declares output_transformers → empty chain at the
+    # derived-search hop.
     with patch(
         "dynastore.modules.storage.routing_config._resolve_entity_operations",
         return_value=ops,
@@ -313,9 +313,9 @@ async def test_input_on_index_only_runs_at_index_hop_not_at_search():
 
 
 @pytest.mark.asyncio
-async def test_output_on_search_only_resolves_inverse_chain():
-    """SEARCH entry's output_transformers resolves to an instance chain
-    even when the INDEX entry carries no input_transformers."""
+async def test_output_on_index_only_resolves_inverse_chain():
+    """The INDEX entry's output_transformers resolves to an instance chain
+    even when it carries no input_transformers."""
     from dynastore.modules.storage.routing_config import (
         Operation,
         OperationDriverEntry,
@@ -323,7 +323,7 @@ async def test_output_on_search_only_resolves_inverse_chain():
     )
 
     ops = {
-        Operation.SEARCH: [
+        Operation.INDEX: [
             OperationDriverEntry(
                 driver_ref="items_indexer",
                 output_transformers=("payload_append_transformer",),
@@ -342,7 +342,7 @@ async def test_output_on_search_only_resolves_inverse_chain():
             "cat", entity="item", collection_id="col", driver_ref="items_indexer",
         )
     assert chain == [appender]
-    # Inverse strips the tag back out — what the SEARCH wrap would yield.
+    # Inverse strips the tag back out — what the derived-search wrap would yield.
     restored = await restore_transform_chain(
         {"tag": "X"}, chain, catalog_id="c", collection_id="col", entity_kind="item",
         ctx=_CTX,
@@ -397,11 +397,10 @@ def test_validator_rejects_dangling_input_transformer_ref():
     with pytest.raises(ValueError, match="dangling_ref"):
         AssetRoutingConfig(
             operations={
-                Operation.WRITE: [
+                Operation.INDEX: [
                     OperationDriverEntry(
                         driver_ref="asset_indexer",
                         input_transformers=("dangling_ref",),
-                        secondary_index=True,
                     ),
                 ],
             },
@@ -413,7 +412,7 @@ def test_deferred_hop_warns_once_for_read_input_transformers(caplog):
     until that hop is wired in a future PR. The config-load path emits
     exactly one WARN per (operation, driver, side) tuple.
 
-    WRITE is the wired input hop (secondary-index propagation), so it does
+    INDEX is the wired input hop (materialization propagation), so it does
     NOT warn — READ stands in here for the still-deferred case."""
     from dynastore.modules.storage.routing_config import (
         AssetRoutingConfig,
@@ -472,11 +471,11 @@ def test_deferred_hop_warns_once_for_read_input_transformers(caplog):
     assert matches == [], "Second load must not re-emit; dedupe failed"
 
 
-def test_search_output_transformers_silent_on_collection_tier(caplog):
+def test_index_output_transformers_silent_on_collection_tier(caplog):
     """geoid#1574: CollectionElasticsearchDriver.get_metadata and search_metadata
     now invoke the restore chain, so ``_wired_output_search_hop=True`` on
-    CollectionRoutingConfig. A SEARCH ``output_transformers`` declaration there
-    must NOT emit a deferred-hop WARN — it is fully wired."""
+    CollectionRoutingConfig. An INDEX ``output_transformers`` declaration
+    there must NOT emit a deferred-hop WARN — it is fully wired."""
     from dynastore.modules.storage.routing_config import (
         CollectionRoutingConfig,
         Operation,
@@ -491,7 +490,7 @@ def test_search_output_transformers_silent_on_collection_tier(caplog):
     ):
         CollectionRoutingConfig(
             operations={
-                Operation.SEARCH: [
+                Operation.INDEX: [
                     OperationDriverEntry(
                         driver_ref="es_collection_searcher",
                         output_transformers=("noop_attached_transformer",),
@@ -504,18 +503,19 @@ def test_search_output_transformers_silent_on_collection_tier(caplog):
         )
     matches = [
         rec for rec in caplog.records
-        if "output_transformers declared on operation 'SEARCH'" in rec.message
+        if "output_transformers declared on operation 'INDEX'" in rec.message
     ]
     assert matches == [], (
-        "Collection tier SEARCH output_transformers is wired (geoid#1574) — "
+        "Collection tier INDEX output_transformers is wired (geoid#1574) — "
         "must not warn; got %d WARN(s)" % len(matches)
     )
 
 
-def test_search_output_transformers_silent_on_asset_tier(caplog):
-    """geoid#1567: the asset tier's SEARCH path DOES invoke restore_from_index
-    (``_wired_output_search_hop=True``), so a SEARCH ``output_transformers``
-    declaration there is wired — it must NOT emit a deferred-hop WARN."""
+def test_index_output_transformers_silent_on_asset_tier(caplog):
+    """geoid#1567: the asset tier's derived-search path DOES invoke
+    restore_from_index (``_wired_output_search_hop=True``), so an INDEX
+    ``output_transformers`` declaration there is wired — it must NOT emit a
+    deferred-hop WARN."""
     from dynastore.modules.storage.routing_config import (
         AssetRoutingConfig,
         Operation,
@@ -530,7 +530,7 @@ def test_search_output_transformers_silent_on_asset_tier(caplog):
     ):
         AssetRoutingConfig(
             operations={
-                Operation.SEARCH: [
+                Operation.INDEX: [
                     OperationDriverEntry(
                         driver_ref="asset_es_searcher",
                         output_transformers=("noop_attached_transformer",),
@@ -543,10 +543,10 @@ def test_search_output_transformers_silent_on_asset_tier(caplog):
         )
     matches = [
         rec for rec in caplog.records
-        if "output_transformers declared on operation 'SEARCH'" in rec.message
+        if "output_transformers declared on operation 'INDEX'" in rec.message
     ]
     assert matches == [], (
-        "Asset tier SEARCH output_transformers is wired — must not warn; "
+        "Asset tier INDEX output_transformers is wired — must not warn; "
         "got %d WARN(s)" % len(matches)
     )
 
@@ -593,12 +593,11 @@ async def test_per_item_failure_isolation_with_transformer_at_index_hop():
     entry = OperationDriverEntry(
         driver_ref="stub_indexer",
         input_transformers=("selective_raise",),
-        secondary_index=True,
     )
 
     class _Routing:
         operations = {
-            Operation.WRITE: [entry],
+            Operation.INDEX: [entry],
         }
 
     indexer = _Indexer()
@@ -624,11 +623,14 @@ async def test_per_item_failure_isolation_with_transformer_at_index_hop():
         IndexOp(op_type="upsert", entity_type="item", entity_id="ok-2", payload={"id": "ok-2"}),
     ]
 
+    from dynastore.tools.execution_context import task_run_scope
+
     with patch(
         "dynastore.tools.discovery.get_protocols",
         return_value=[transformer],
     ):
-        results = await dispatcher.fan_out_bulk(ctx, ops)
+        with task_run_scope():
+            results = await dispatcher.fan_out_bulk(ctx, ops)
 
     result = results["stub_indexer"]
     assert result.total == 3

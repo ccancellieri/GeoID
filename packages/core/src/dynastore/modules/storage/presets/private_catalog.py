@@ -66,15 +66,13 @@ def _build_pg_only_catalog_routing() -> Any:
                     on_failure=FailurePolicy.FATAL,
                 ),
             ],
-            # SEARCH must be pinned PG-only and operator-sourced. Without an
-            # explicit SEARCH op, ``_self_register_searchers_into`` auto-appends
-            # any discoverable ES CatalogStore (it opts into SEARCH) to a new
-            # SEARCH op — routing private catalog-tier search at the public ES
-            # index. An operator entry makes the op operator-managed so
-            # auto-augmentation is a no-op (#1102 item 1 / #1047).
-            Operation.SEARCH: [
-                OperationDriverEntry(driver_ref="catalog_postgresql_driver"),
-            ],
+            # No configured search list to leak into any more (#1102 item 1
+            # / #1047): search is derived from INDEX-then-READ, and this
+            # config has no INDEX entry at all, so private catalog-tier
+            # search never reaches the public ES index. The WRITE-lane pin
+            # above (default ``source="operator"``) also blocks
+            # ``_self_register_indexers_into`` from auto-appending a
+            # discoverable ES CatalogStore into INDEX.
         },
     )
 
@@ -102,13 +100,8 @@ def _build_pg_only_collection_routing() -> Any:
                     on_failure=FailurePolicy.FATAL,
                 ),
             ],
-            # SEARCH pinned PG-only + operator-sourced — same rationale as the
-            # catalog tier: an absent SEARCH op lets the self-register helper
-            # auto-append a discoverable ES CollectionStore, leaking private
-            # collection-tier search to the public ES index (#1102 / #1047).
-            Operation.SEARCH: [
-                OperationDriverEntry(driver_ref="collection_postgresql_driver"),
-            ],
+            # No configured search list to leak into any more — same
+            # rationale as the catalog tier above (#1102 / #1047).
         },
     )
 

@@ -37,8 +37,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from dynastore.modules.storage.driver_registry import DriverRegistry
 from dynastore.modules.storage.hints import (
-    DRIVER_PREFER_ALIASES,
-    PREFER_PREFIX,
     Hint,
     parse_request_hints,
 )
@@ -273,15 +271,15 @@ async def test_prefer_pg_read_puts_pg_first():
 
 
 # ---------------------------------------------------------------------------
-# _resolve_driver_ids_cached: prefer SEARCH — matched-only, no tail
+# _resolve_driver_ids_cached: prefer on INDEX — matched-only, no tail
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_prefer_es_search_returns_es_only():
-    """prefer:es on SEARCH returns only ES (matched-only, no fallback tail)."""
+async def test_prefer_es_index_returns_es_only():
+    """prefer:es on INDEX returns only ES (matched-only, no fallback tail)."""
     routing = _make_routing({
-        Operation.SEARCH: [
+        Operation.INDEX: [
             ("collection_elasticsearch_driver", {Hint.GEOMETRY_SIMPLIFIED}),
             ("collection_postgresql_driver", {Hint.GEOMETRY_EXACT}),
         ],
@@ -296,7 +294,7 @@ async def test_prefer_es_search_returns_es_only():
         patch("dynastore.tools.discovery.get_protocols", return_value=[pg, es]),
     ):
         out = await _resolve_driver_ids_cached(
-            ItemsRoutingConfig, "cat1", "col1", Operation.SEARCH,
+            ItemsRoutingConfig, "cat1", "col1", Operation.INDEX,
             frozenset({"prefer:es"}),
         )
     DriverRegistry.clear()

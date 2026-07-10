@@ -160,10 +160,10 @@ async def test_resolve_drivers_logs_selection_at_debug(monkeypatch, caplog):
     from dynastore.modules.storage import router as router_mod
     from dynastore.modules.storage.routing_config import ItemsRoutingConfig, Operation
 
-    # Fake _resolve_driver_ids_cached: return one (driver_ref, on_failure, write_mode)
+    # Fake _resolve_driver_ids_cached: return one (driver_ref, on_failure)
     # tuple so resolve_drivers assembles a ResolvedDriver from the driver_index.
     async def _fake_ids(routing_plugin_cls, catalog_id, collection_id, operation, hint):
-        return [("items_postgresql_driver", "fatal", "sync")]
+        return [("items_postgresql_driver", "fatal")]
 
     class _FakePostgresDriver:
         pass

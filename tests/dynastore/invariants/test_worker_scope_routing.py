@@ -17,12 +17,18 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 """B6-style invariant — for every worker_task_* SCOPE in pyproject.toml,
-every WRITE/INDEX driver in the default routing config must be either:
+every WRITE-lane driver in the default routing config must be either:
   (a) installable from the SCOPE's transitive extras, or
-  (b) configured with on_failure=OUTBOX.
+  (b) configured with on_failure=WARN (best-effort, failure tolerated).
 
-This catches drift like 'ES driver in routing but worker_task_ingestion
-doesn't pull module_elasticsearch' before it ships.
+INDEX-lane drivers are exempt unconditionally: INDEX is async by lane
+definition (#2494) — an unresolvable INDEX driver durably enqueues via the
+storage plane and drains later, regardless of extras coverage in this
+SCOPE. WRITE has no such durability fallback, so it is the lane this
+invariant polices.
+
+This catches drift like 'PG driver required by WRITE but worker_task_x
+doesn't pull module_storage_postgresql' before it ships.
 """
 from __future__ import annotations
 
@@ -100,12 +106,12 @@ def test_worker_scope_covers_routing_or_uses_outbox(scope: str) -> None:
             continue
         if needed in aliases:
             continue
-        if entry.on_failure == FailurePolicy.OUTBOX:
+        if entry.on_failure == FailurePolicy.WARN:
             continue
         failures.append(
             f"  {entry.driver_ref} requires '{needed}' which is NOT in "
             f"{scope}'s transitive extras AND on_failure="
-            f"{entry.on_failure.name} (not OUTBOX)"
+            f"{entry.on_failure.name} (not WARN)"
         )
 
     assert not failures, (

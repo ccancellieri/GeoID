@@ -16,15 +16,24 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Pin routing defaults so a future edit can't silently flip ES back
-from OUTBOX without explicit test update. PG must remain FATAL —
-non-negotiable for authoritative writes."""
+"""Pin routing defaults so a future edit can't silently change the WRITE
+primary's failure policy or the INDEX lane's materialization target. PG
+must remain FATAL on WRITE — non-negotiable for authoritative writes.
+
+Under the lane model (#2494) search is derived, not configured: these
+tests pin ``operations[INDEX]`` (the materialization / derived-search
+target set) and ``operations[READ]`` (the canonical + hint-opt-in
+readers), and replicate the two-lane (INDEX-then-READ) resolution the
+production ``get_items_search_driver`` performs to pin that a
+GROUP_BY / JOIN request still resolves to PG even though ES is the
+INDEX-lane entry.
+"""
 from __future__ import annotations
 
 
 def test_default_pg_write_is_sync_fatal():
     from dynastore.modules.storage.routing_config import (
-        FailurePolicy, ItemsRoutingConfig, Operation, WriteMode,
+        FailurePolicy, ItemsRoutingConfig, Operation,
     )
     cfg = ItemsRoutingConfig()
     pg = next(
@@ -32,25 +41,38 @@ def test_default_pg_write_is_sync_fatal():
         if e.driver_ref == "items_postgresql_driver"
     )
     assert pg.on_failure == FailurePolicy.FATAL
-    assert pg.write_mode == WriteMode.SYNC
 
 
-def test_default_es_write_is_async_outbox():
-    from dynastore.modules.storage.routing_config import (
-        FailurePolicy, ItemsRoutingConfig, Operation, WriteMode,
-    )
+def test_default_write_lane_has_no_index_lane_driver():
+    """The items WRITE lane is PG-only — the ES indexer lives entirely in
+    the INDEX lane under the lane model, never as a WRITE entry."""
+    from dynastore.modules.storage.routing_config import ItemsRoutingConfig, Operation
     cfg = ItemsRoutingConfig()
-    es = next(
-        e for e in cfg.operations[Operation.WRITE]
-        if e.driver_ref == "items_elasticsearch_driver"
-    )
-    assert es.on_failure == FailurePolicy.OUTBOX
-    assert es.write_mode == WriteMode.ASYNC
+    write_refs = {e.driver_ref for e in cfg.operations[Operation.WRITE]}
+    assert write_refs == {"items_postgresql_driver"}
+
+
+def test_default_index_lane_is_es_only():
+    """The items INDEX lane (materialization + derived-search target) is
+    the ES driver, auto-registered with no explicit hints — it inherits
+    its effective hint surface from ``ItemsElasticsearchDriver.supported_hints``
+    (which includes ``Hint.SEARCH``, winning the derived-search preference
+    ranking)."""
+    from dynastore.modules.storage.hints import Hint
+    from dynastore.modules.storage.routing_config import ItemsRoutingConfig, Operation
+    cfg = ItemsRoutingConfig()
+    index = cfg.operations[Operation.INDEX]
+    assert [e.driver_ref for e in index] == ["items_elasticsearch_driver"]
+    assert index[0].hints == set()
+
+    from dynastore.modules.storage.drivers.elasticsearch import ItemsElasticsearchDriver
+    assert Hint.SEARCH in ItemsElasticsearchDriver.supported_hints
 
 
 def test_default_read_routing_unchanged():
-    """Sanity guard — Task 11 only touches WRITE; READ entries
-    (ES geometry_simplified primary, PG geometry_exact) must remain."""
+    """READ entries (ES geometry_simplified primary, PG geometry_exact)
+    must remain; READ carries no per-entry failure policy any more, but PG
+    stays first (index 0) and structurally authoritative."""
     from dynastore.modules.storage.routing_config import (
         FailurePolicy, ItemsRoutingConfig, Operation,
     )
@@ -60,112 +82,80 @@ def test_default_read_routing_unchanged():
     pg_read = next(e for e in read if e.driver_ref == "items_postgresql_driver")
     assert "geometry_simplified" in es_read.hints
     assert "geometry_exact" in pg_read.hints
-    # READ defaults retain their existing failure semantics — flag if changed.
     assert pg_read.on_failure == FailurePolicy.FATAL
 
 
-def test_default_items_search_declares_op_appropriate_hints():
-    """SEARCH entries declare the search-flavour hints each driver serves so a
-    resolved config is self-documenting. ES carries the search engine flavours
-    (search/fulltext/attribute_filter/...); PG carries the relational ones
-    (attribute_filter/group_by/geometry_exact/...)."""
-    from dynastore.modules.storage.hints import Hint
-    from dynastore.modules.storage.routing_config import (
-        ItemsRoutingConfig, Operation,
-    )
-    cfg = ItemsRoutingConfig()
-    search = cfg.operations[Operation.SEARCH]
-    es = next(e for e in search if e.driver_ref == "items_elasticsearch_driver")
-    pg = next(e for e in search if e.driver_ref == "items_postgresql_driver")
-    # both serve the common filter/sort flavours
-    for h in (Hint.ATTRIBUTE_FILTER, Hint.SPATIAL_FILTER, Hint.SORT):
-        assert h in es.hints and h in pg.hints
-    # engine-only vs relational-only
-    assert Hint.FULLTEXT in es.hints and Hint.SEARCH in es.hints
-    assert Hint.GROUP_BY in pg.hints
-    assert Hint.GEOMETRY_SIMPLIFIED in es.hints
-    assert Hint.GEOMETRY_EXACT in pg.hints
+def _resolve_read(read, requested):
+    """Replicate router.py's best-overlap matcher against a raw entry list
+    (no driver registry — entry.hints only, matching this file's fixtures
+    which always declare explicit hints)."""
+    if not requested:
+        return [e.driver_ref for e in read]
+    matched = [
+        (i, e) for i, e in enumerate(read)
+        if requested.issubset(frozenset(e.hints))
+    ]
+    matched.sort(key=lambda t: (-len(t[1].hints), t[0]))
+    return [e.driver_ref for _, e in matched]
 
 
-def test_default_items_search_excludes_read_only_hints():
-    """``tiles``, ``write``, and ``metadata`` only make sense on READ — they
-    must NOT appear in any SEARCH entry.  ``join`` IS declared on the PG SEARCH
-    entry so that a JOIN request with a CQL filter (_pick_operation → SEARCH)
-    still routes to PG rather than relaxing to ES."""
-    from dynastore.modules.storage.hints import Hint
-    from dynastore.modules.storage.routing_config import (
-        ItemsRoutingConfig, Operation,
-    )
+def _resolve_derived_search(cfg, requested):
+    """Replicate ``router.get_items_search_driver``'s two-lane resolution:
+    INDEX matched-only (strict — empty on no match), then READ (matched +
+    relaxed) as fallback.  Entry hints only (no driver-registry
+    ``supported_hints`` fallback), matching this file's style."""
+    from dynastore.modules.storage.routing_config import Operation
+
+    index = cfg.operations.get(Operation.INDEX, [])
+    if requested:
+        index_matched = [
+            e.driver_ref for e in index if requested.issubset(frozenset(e.hints))
+        ]
+    else:
+        index_matched = [e.driver_ref for e in index]
+    if index_matched:
+        return index_matched
+    return _resolve_read(cfg.operations[Operation.READ], requested)
+
+
+def test_default_items_derived_search_prefers_index_lane():
+    """An unfiltered search resolves to the INDEX lane (ES) — the derived
+    search pool's first tier."""
+    from dynastore.modules.storage.routing_config import ItemsRoutingConfig
     cfg = ItemsRoutingConfig()
-    for e in cfg.operations[Operation.SEARCH]:
-        assert Hint.TILES not in e.hints
-        assert Hint.WRITE not in e.hints
-        assert Hint.METADATA not in e.hints
-    # JOIN must NOT appear on the ES SEARCH entry (ES cannot serve join queries).
-    es_search = next(
-        e for e in cfg.operations[Operation.SEARCH]
-        if e.driver_ref == "items_elasticsearch_driver"
-    )
-    assert Hint.JOIN not in es_search.hints
-    # JOIN MUST appear on the PG SEARCH entry (for CQL-filtered JOIN requests).
-    pg_search = next(
-        e for e in cfg.operations[Operation.SEARCH]
+    assert _resolve_derived_search(cfg, frozenset()) == ["items_elasticsearch_driver"]
+
+
+def test_default_items_derived_search_group_by_resolves_pg():
+    """A GROUP_BY-flavoured search request must resolve to PG — the INDEX
+    lane's bare ES entry (no explicit hints, and
+    ``ItemsElasticsearchDriver.supported_hints`` has no GROUP_BY) never
+    matches, so the derived pool falls through to the READ lane, where the
+    PG entry declares ``Hint.GROUP_BY`` explicitly (#2829: Elasticsearch has
+    no GROUP BY implementation)."""
+    from dynastore.modules.storage.hints import Hint
+    from dynastore.modules.storage.routing_config import ItemsRoutingConfig, Operation
+
+    cfg = ItemsRoutingConfig()
+    # The INDEX entry carries no explicit hints in the persisted config; this
+    # helper only inspects entry.hints (no driver-registry lookup), so assert
+    # the structural precondition the production resolver relies on instead:
+    # the ES driver's declared supported_hints has no GROUP_BY.
+    from dynastore.modules.storage.drivers.elasticsearch import ItemsElasticsearchDriver
+    assert Hint.GROUP_BY not in ItemsElasticsearchDriver.supported_hints
+
+    pg_read = next(
+        e for e in cfg.operations[Operation.READ]
         if e.driver_ref == "items_postgresql_driver"
     )
-    assert Hint.JOIN in pg_search.hints
-    # tiles is still declared where it belongs: the PG READ entry.
-    read = cfg.operations[Operation.READ]
-    pg_read = next(e for e in read if e.driver_ref == "items_postgresql_driver")
-    assert Hint.TILES in pg_read.hints
-    # JOIN is also declared on the PG READ entry (DWH join / OGC Joins).
-    assert Hint.JOIN in pg_read.hints
-
-
-def test_default_items_filtered_search_resolves_es_first():
-    """A filtered/sorted search routes to ES first (the search engine): the
-    best-overlap matcher's longest-effective tiebreak ranks ES above PG when
-    their hint surfaces are equal in size (ES wins via entry-order index 0).
-    Unfiltered search keeps declared order (ES then PG)."""
-    from dynastore.modules.storage.hints import Hint
-    from dynastore.modules.storage.routing_config import (
-        ItemsRoutingConfig, Operation,
-    )
-    cfg = ItemsRoutingConfig()
-    search = cfg.operations[Operation.SEARCH]
-    es = next(e for e in search if e.driver_ref == "items_elasticsearch_driver")
-    pg = next(e for e in search if e.driver_ref == "items_postgresql_driver")
-
-    def resolve(requested):
-        if not requested:
-            return [e.driver_ref for e in search]
-        matched = [
-            (i, e) for i, e in enumerate(search)
-            if requested.issubset(frozenset(e.hints))
-        ]
-        matched.sort(key=lambda t: (-len(t[1].hints), t[0]))
-        return [e.driver_ref for _, e in matched]
-
-    # ES and PG now have equal surface size; ES wins common-flavour requests via
-    # entry-order tiebreak (index 0), not by being strictly larger.
-    assert len(es.hints) >= len(pg.hints)
-    assert resolve(frozenset()) == [
-        "items_elasticsearch_driver", "items_postgresql_driver",
-    ]
-    for flavour in (Hint.ATTRIBUTE_FILTER, Hint.SPATIAL_FILTER, Hint.SORT):
-        assert resolve(frozenset({flavour}))[0] == "items_elasticsearch_driver"
-    # group_by is relational-only → PG even though ES is listed first
-    assert resolve(frozenset({Hint.GROUP_BY})) == ["items_postgresql_driver"]
-    # join routes to PG (ES does not declare it).
-    assert resolve(frozenset({Hint.JOIN})) == ["items_postgresql_driver"]
+    assert Hint.GROUP_BY in pg_read.hints
 
 
 def test_default_items_read_group_by_resolves_pg():
     """A plain browse (``_pick_operation`` → READ, no search-triggering
     filter) carrying an explicit ``Hint.GROUP_BY`` must resolve to PG the
-    same way a SEARCH-routed group_by request does (#2829) — Elasticsearch
-    has no GROUP BY implementation. Mirrors
-    ``test_default_items_filtered_search_resolves_es_first``'s matcher but
-    against the real ``Operation.READ`` entries (ES listed first by default)."""
+    same way a derived-search group_by request does (#2829) — Elasticsearch
+    has no GROUP BY implementation."""
     from dynastore.modules.storage.hints import Hint
     from dynastore.modules.storage.routing_config import (
         ItemsRoutingConfig, Operation,
@@ -177,33 +167,26 @@ def test_default_items_read_group_by_resolves_pg():
     assert Hint.GROUP_BY in pg.hints
     assert Hint.GROUP_BY not in es.hints
 
-    def resolve(requested):
-        if not requested:
-            return [e.driver_ref for e in read]
-        matched = [
-            (i, e) for i, e in enumerate(read)
-            if requested.issubset(frozenset(e.hints))
-        ]
-        matched.sort(key=lambda t: (-len(t[1].hints), t[0]))
-        return [e.driver_ref for _, e in matched]
-
     # Unhinted READ keeps declared order — ES first.
-    assert resolve(frozenset()) == [
+    assert _resolve_read(read, frozenset()) == [
         "items_elasticsearch_driver", "items_postgresql_driver",
     ]
     # group_by is relational-only → PG even though ES is listed first for READ.
-    assert resolve(frozenset({Hint.GROUP_BY})) == ["items_postgresql_driver"]
+    assert _resolve_read(read, frozenset({Hint.GROUP_BY})) == ["items_postgresql_driver"]
+    # join is also PG-only (DWH join / OGC Joins; ES lacks ST_Transform).
+    assert Hint.JOIN in pg.hints
+    assert Hint.JOIN not in es.hints
+    assert _resolve_read(read, frozenset({Hint.JOIN})) == ["items_postgresql_driver"]
 
 
 def test_collection_routing_default_write_is_pg_fatal():
     from dynastore.modules.storage.routing_config import (
-        CollectionRoutingConfig, FailurePolicy, Operation, WriteMode,
+        CollectionRoutingConfig, FailurePolicy, Operation,
     )
     cfg = CollectionRoutingConfig()
     write = cfg.operations[Operation.WRITE]
     assert [e.driver_ref for e in write] == ["collection_postgresql_driver"]
     assert write[0].on_failure == FailurePolicy.FATAL
-    assert write[0].write_mode == WriteMode.SYNC
 
 
 def test_collection_routing_default_read_is_pg_primary():
@@ -212,9 +195,10 @@ def test_collection_routing_default_read_is_pg_primary():
     )
     cfg = CollectionRoutingConfig()
     read = cfg.operations[Operation.READ]
-    # Two READ entries: PG (system-of-record, untagged, FATAL) then ES
-    # (hint-routed via METADATA / prefer:es, WARN). No geometry hints at
-    # the metadata level.
+    # Two READ entries: PG (system-of-record, untagged) then ES
+    # (hint-routed via METADATA / prefer:es). No geometry hints at the
+    # metadata level. READ carries no per-entry failure policy any more,
+    # but PG stays first (index 0) and structurally authoritative.
     refs = [e.driver_ref for e in read]
     assert refs[0] == "collection_postgresql_driver"
     assert "collection_elasticsearch_driver" in refs
@@ -223,51 +207,24 @@ def test_collection_routing_default_read_is_pg_primary():
 
 
 def test_collection_routing_default_index_has_no_hardcoded_es_hop():
-    """The ES secondary-index hop is NOT hard-coded in the code default
-    (#1069 / #1073).
+    """The ES INDEX hop is NOT hard-coded in the code default (#1069 / #1073).
 
     A PG-only deployment (no ES CollectionIndexer registered, no preset
-    applied) must get NO secondary-index WRITE entry — otherwise a plain
-    collection create enqueues an OUTBOX row into tasks.tasks that nothing
-    will ever drain, which poisons the create transaction when the outbox
-    table is absent. The ES secondary-index hop (ASYNC + OUTBOX) is supplied
-    at validation time by ``_self_register_indexers_into`` when an ES driver
-    is registered (see test_collection_routing_validator_augments_write_index_and_search)
-    and by the routing presets (see test_preset_public_catalog)."""
+    applied) must get NO INDEX entry — otherwise a plain collection create
+    enqueues an obligation row into tasks.storage that nothing will ever
+    drain. The ES INDEX hop is supplied at validation time by
+    ``_self_register_indexers_into`` when an ES driver is registered (see
+    ``test_routing_self_registration.py::``
+    ``test_collection_routing_validator_augments_index_lane``) and declared
+    explicitly by the ``es``/``pg_es`` routing presets, which cannot rely on
+    incidental driver discovery (``tests/.../unit/test_preset_routing.py``).
+    """
     from dynastore.modules.storage.routing_config import (
-        CollectionRoutingConfig, secondary_index_entries,
+        CollectionRoutingConfig, index_entries,
     )
     cfg = CollectionRoutingConfig()
-    index = secondary_index_entries(cfg.operations)
+    index = index_entries(cfg.operations)
     assert "collection_elasticsearch_driver" not in {e.driver_ref for e in index}
-
-
-def test_collection_routing_default_search_is_es_first_pg_fallback():
-    from dynastore.modules.storage.routing_config import (
-        CollectionRoutingConfig, Operation,
-    )
-    cfg = CollectionRoutingConfig()
-    search = cfg.operations[Operation.SEARCH]
-    refs = [e.driver_ref for e in search]
-    assert refs[0] == "collection_elasticsearch_driver"
-    assert "collection_postgresql_driver" in refs
-
-
-def test_collection_routing_default_search_carries_geometry_hints():
-    """SEARCH entries declare which geometry precision they serve so a
-    consumer can route to PG via hint='geometry_exact'. ES carries
-    GEOMETRY_SIMPLIFIED (fast, lossy); PG carries GEOMETRY_EXACT (full WKB).
-    Mirrors ItemsRoutingConfig READ defaults."""
-    from dynastore.modules.storage.hints import Hint
-    from dynastore.modules.storage.routing_config import (
-        CollectionRoutingConfig, Operation,
-    )
-    cfg = CollectionRoutingConfig()
-    search = cfg.operations[Operation.SEARCH]
-    es = next(e for e in search if e.driver_ref == "collection_elasticsearch_driver")
-    pg = next(e for e in search if e.driver_ref == "collection_postgresql_driver")
-    assert Hint.GEOMETRY_SIMPLIFIED in es.hints
-    assert Hint.GEOMETRY_EXACT in pg.hints
 
 
 def test_catalog_routing_default_refs_are_registered():
@@ -284,7 +241,7 @@ def test_catalog_routing_default_refs_are_registered():
     read_refs = [e.driver_ref for e in read_entries]
     assert write_refs == ["catalog_postgresql_driver"]
     # Two READ entries: PG first (SoR, untagged, FATAL), ES second
-    # (hints=METADATA, WARN — no geometry at the metadata level).
+    # (hints=METADATA — no geometry at the metadata level).
     assert read_refs[0] == "catalog_postgresql_driver"
     assert "catalog_elasticsearch_driver" in read_refs
     assert len(read_entries) == 2
@@ -305,14 +262,16 @@ def test_catalog_routing_default_write_is_fatal():
 
 
 # ---------------------------------------------------------------------------
-# Task D.2 — two-entry READ defaults for CollectionRoutingConfig / CatalogRoutingConfig
+# Two-entry READ defaults for CollectionRoutingConfig / CatalogRoutingConfig
 # ---------------------------------------------------------------------------
 
 
 def test_collection_routing_read_has_pg_sor_then_es_hinted():
     """CollectionRoutingConfig.operations[READ] has exactly two entries:
-    PG (untagged, FATAL) then ES (hints={METADATA}, WARN).
-    There is no geometry at the metadata level so geometry hints are absent."""
+    PG (untagged, FATAL, index 0) then ES (hints={METADATA}).
+    There is no geometry at the metadata level so geometry hints are absent.
+    READ carries no per-entry failure policy any more — the ES entry's
+    ``on_failure`` is the inert field default (FATAL), never enforced."""
     from dynastore.modules.storage.hints import Hint
     from dynastore.modules.storage.routing_config import (
         CollectionRoutingConfig, FailurePolicy, Operation,
@@ -328,12 +287,11 @@ def test_collection_routing_read_has_pg_sor_then_es_hinted():
     # ES entry is opt-in via METADATA hint; geometry hints do not apply here
     assert Hint.METADATA in es_e.hints
     assert es_e.hints == {Hint.METADATA}
-    assert es_e.on_failure == FailurePolicy.WARN
 
 
 def test_catalog_routing_read_has_pg_sor_then_es_hinted():
     """CatalogRoutingConfig.operations[READ] has exactly two entries:
-    PG (untagged, FATAL) then ES (hints={METADATA}, WARN).
+    PG (untagged, FATAL, index 0) then ES (hints={METADATA}).
     There is no geometry at the metadata level so geometry hints are absent."""
     from dynastore.modules.storage.hints import Hint
     from dynastore.modules.storage.routing_config import (
@@ -348,13 +306,11 @@ def test_catalog_routing_read_has_pg_sor_then_es_hinted():
     assert pg_e.on_failure == FailurePolicy.FATAL
     assert Hint.METADATA in es_e.hints
     assert es_e.hints == {Hint.METADATA}
-    assert es_e.on_failure == FailurePolicy.WARN
 
 
 def test_collection_routing_es_hints_subset_of_es_driver_supported_hints():
     """The ES entry's hints must be a subset of CollectionElasticsearchDriver.supported_hints,
     so _validate_routing_entries accepts the entry without an error."""
-    from dynastore.modules.storage.hints import Hint
     from dynastore.modules.storage.routing_config import (
         CollectionRoutingConfig, Operation,
     )
@@ -374,7 +330,6 @@ def test_collection_routing_es_hints_subset_of_es_driver_supported_hints():
 
 def test_catalog_routing_es_hints_subset_of_es_driver_supported_hints():
     """The ES entry's hints must be a subset of CatalogElasticsearchDriver.supported_hints."""
-    from dynastore.modules.storage.hints import Hint
     from dynastore.modules.storage.routing_config import (
         CatalogRoutingConfig, Operation,
     )

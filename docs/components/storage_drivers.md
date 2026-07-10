@@ -129,23 +129,35 @@ class Capability(StrEnum):
 Each tier resolves its routing via the 4-level `ConfigsProtocol` waterfall (collection > catalog >
 platform > code defaults). The class key is the snake_case form (e.g. `items_routing_config`).
 
+Routing has three lanes plus the asset-only `UPLOAD`:
+
+- **`READ`** — mandatory, ordered, first-match by hint. `READ[0]` is the canonical source.
+- **`WRITE`** — optional client-write fan-out, synchronous, in-transaction. Empty or absent
+  means the entity is read-only; write endpoints reject at dispatch with a typed HTTP 405
+  rather than failing mid-fan-out.
+- **`INDEX`** — optional async materialization target set (derived/search stores). Lane
+  membership *is* the role: every `INDEX` entry is dispatched by `IndexDispatcher`, which is
+  inherently async — a durable `tasks.storage` obligation is enqueued up front outside a task
+  run, or the write is absorbed inline when the dispatch is already running inside one.
+
+There is no configured `SEARCH` operation. Search is derived at query time: `INDEX`-lane
+entries first (ranked so `Hint.SEARCH`-tagged drivers win), then `READ`-lane entries as
+fallback — see `router.get_items_search_driver` / `get_asset_search_driver`.
+
 ```jsonc
 // items_routing_config — entity-row dispatch
-// Defaults: PG fatal WRITE, PG READ, ES public WRITE async/outbox, ES public INDEX
+// Defaults: PG fatal WRITE, ES/PG READ (hint-routed), ES public INDEX
 {
   "operations": {
     "WRITE": [
-      {"driver_ref": "items_postgresql_driver", "on_failure": "fatal"},
-      {"driver_ref": "items_elasticsearch_driver",
-       "write_mode": "async", "on_failure": "outbox", "source": "auto"}
+      {"driver_ref": "items_postgresql_driver", "on_failure": "fatal"}
     ],
     "READ":  [
       {"driver_ref": "items_elasticsearch_driver", "hints": ["geometry_simplified"]},
       {"driver_ref": "items_postgresql_driver",     "hints": ["geometry_exact"]}
     ],
     "INDEX": [
-      {"driver_ref": "items_elasticsearch_driver",
-       "write_mode": "async", "on_failure": "outbox", "source": "auto"}
+      {"driver_ref": "items_elasticsearch_driver", "source": "auto"}
     ]
   }
 }
@@ -155,21 +167,17 @@ platform > code defaults). The class key is the snake_case form (e.g. `items_rou
   "operations": {
     "WRITE": [{"driver_ref": "collection_postgresql_driver", "on_failure": "fatal"}],
     "READ":  [{"driver_ref": "collection_postgresql_driver"}],
-    "INDEX": [{"driver_ref": "collection_elasticsearch_driver",
-               "write_mode": "async", "on_failure": "outbox", "source": "auto"}]
+    "INDEX": [{"driver_ref": "collection_elasticsearch_driver", "source": "auto"}]
   }
 }
 
 // Privacy-pinned items routing — pinning items_elasticsearch_private_driver
-// is itself the privacy switch. PG remains the durable WRITE target.
+// in INDEX is itself the privacy switch. PG remains the durable WRITE/READ target.
 {
   "operations": {
-    "WRITE": [
-      {"driver_ref": "items_postgresql_driver", "on_failure": "fatal"},
-      {"driver_ref": "items_elasticsearch_private_driver",
-       "write_mode": "async", "on_failure": "outbox"}
-    ],
-    "READ":  [{"driver_ref": "items_postgresql_driver"}]
+    "WRITE": [{"driver_ref": "items_postgresql_driver", "on_failure": "fatal"}],
+    "READ":  [{"driver_ref": "items_postgresql_driver"}],
+    "INDEX": [{"driver_ref": "items_elasticsearch_private_driver", "source": "auto"}]
   }
 }
 ```
@@ -180,8 +188,7 @@ platform > code defaults). The class key is the snake_case form (e.g. `items_rou
 |-------|------|---------|-------------|
 | `driver_ref` | `str` (snake_case) | required | Snake_case `_to_snake(cls.__name__)` of a registered driver |
 | `hints` | `List[Hint]` | `[]` | Selectivity tags — `Hint` is a closed `StrEnum` (see below) |
-| `on_failure` | `FailurePolicy` | `"fatal"` | `"fatal"` (raise — default), `"warn"` (log), `"outbox"` (defer to drain task), `"ignore"` |
-| `write_mode` | `WriteMode` | `"sync"` | `"sync"` or `"async"`; async writes go through the outbox |
+| `on_failure` | `FailurePolicy` | `"fatal"` | WRITE-lane only: `"fatal"` (raise — default) or `"warn"` (log, continue). READ/INDEX entries carry no per-entry failure policy — a validator rejects a non-default value there. |
 | `source` | `Literal["operator", "auto"]` | `"operator"` | `"auto"` marks self-registered entries from the apply handler |
 
 ### Apply-time auto-registration
@@ -190,10 +197,11 @@ Each routing config has an apply handler (`_on_apply_items_routing_config` etc.)
 
 1. Validates every `driver_ref` against the discovery registry for the tier's protocol
    (`CollectionItemsStore`, `CollectionStore`, `AssetStore`, `CatalogStore`).
-2. Auto-registers `*Indexer` drivers into `operations[WRITE]` as secondary-index entries
-   (`secondary_index=True`) and `*Store` drivers under
-   `operations[SEARCH]` when discoverable but missing from the persisted payload — with
-   `source="auto"` so operators can distinguish self-registered defaults from explicit pins.
+2. Auto-registers `*Indexer` drivers into `operations[INDEX]` when discoverable but missing
+   from the persisted payload — with `source="auto"` so operators can distinguish
+   self-registered defaults from explicit pins. Gated on the `WRITE` lane's operator-managed
+   status: a preset that pins `WRITE` explicitly (e.g. a PG-only collection) keeps an
+   installed-but-unwanted indexer out of `INDEX` too.
 3. Calls `ensure_storage(catalog_id, collection_id)` on every referenced driver (idempotent).
 4. Invalidates the per-tier router cache.
 
@@ -390,9 +398,10 @@ The items driver writes directly with `_routing=collection_id` and is enrolled i
 
 **Capabilities:** `STREAMING`, `SPATIAL_FILTER`, `FULLTEXT`, `SOFT_DELETE`.
 
-**Dispatch:** Driven by the secondary-index `WRITE` entries (`secondary_index=True`) in the corresponding routing config's `operations[WRITE]`. The
-`ReindexWorker` / `OutboxDrainTask` dispatches non-fatal entries asynchronously via the per-tenant
-`storage_outbox` table; `on_failure="outbox"` is the standard policy for the public ES secondary-index `WRITE` entry.
+**Dispatch:** Driven by the `INDEX`-lane entries in the corresponding routing config's
+`operations[INDEX]`. `IndexDispatcher` is async by lane definition — it durably enqueues a
+`tasks.storage` obligation up front (outside a task run) and the storage-plane drain pumps it
+through with retry.
 
 **Direct programmatic indexing:** `index_item()` / `delete_item()` (and per-tier equivalents)
 remain available for explicit ops calls.
@@ -773,7 +782,7 @@ src/dynastore/
 │   ├── protocol.py                      # Re-export convenience
 │   ├── routing_config.py                # ItemsRoutingConfig / CollectionRoutingConfig /
 │   │                                    # AssetRoutingConfig / CatalogRoutingConfig +
-│   │                                    # Operation, OperationDriverEntry, FailurePolicy, WriteMode
+│   │                                    # Operation, OperationDriverEntry, FailurePolicy
 │   ├── hints.py                         # Hint StrEnum (closed catalog)
 │   ├── driver_config.py                 # ItemsWritePolicy, ItemsSchema, *DriverConfig, ...
 │   ├── router.py                        # get_driver() with cached operation-based resolution

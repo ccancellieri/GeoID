@@ -149,8 +149,7 @@ async def _dispatch_collection_index(
     lifecycle_status: Optional[str] = None,
 ) -> None:
     """Fan a collection ``upsert`` / ``delete`` to every Indexer configured
-    as a secondary-index ``WRITE`` entry (``secondary_index=True``) in
-    ``CollectionRoutingConfig.operations[WRITE]``.
+    in ``CollectionRoutingConfig.operations[INDEX]``.
 
     Mirrors :meth:`item_service.ItemService._dispatch_index_upsert` at the
     collection-envelope tier — the single dispatch call site that replaces
@@ -160,22 +159,19 @@ async def _dispatch_collection_index(
     document so a deleted collection does not linger in
     ``dynastore-collections`` until the next full reindex.
 
-    Failure handling is governed by each routing entry's ``on_failure``
-    (OUTBOX enqueues a durable retry row, WARN logs, FATAL raises out so
-    the caller's TX rolls back).  Non-FATAL failures are absorbed here:
-    the PG mutation has already committed/queued and must stand.
-    ``IndexerFatal`` propagates.
+    INDEX entries carry no per-entry failure policy: a dispatch failure is
+    always absorbed here — the PG mutation has already committed/queued
+    and must stand; ES may be stale until the next reindex or drain pass.
 
     Asymmetry note: there is no ``_dispatch_catalog_index`` analogue in
     ``catalog_router``.  Catalog secondary indexing is event-driven —
     ``catalog_metadata_changed`` is emitted inside the WRITE transaction
     and ``ReindexWorker`` fans it out to ``CatalogRoutingConfig``'s
-    secondary-index ``WRITE`` entries (``secondary_index=True``).  Same
-    OUTBOX durability, different trigger.  See the "Catalog secondary-index
-    WRITE hop" section in ``catalog_router``'s module docstring.
+    INDEX-lane entries.  Same durability plumbing, different trigger.  See
+    the "Catalog secondary-index WRITE hop" section in ``catalog_router``'s
+    module docstring.
     """
     from dynastore.models.protocols.indexer import IndexContext, IndexOp
-    from dynastore.modules.storage.index_dispatcher import IndexerFatal
     from dynastore.tools.correlation import get_correlation_id
 
     dispatcher = _get_index_dispatcher()
@@ -197,10 +193,7 @@ async def _dispatch_collection_index(
     )
     try:
         await dispatcher.fan_out_bulk(ctx, ops)
-    except IndexerFatal:
-        # FATAL contract — propagate so the caller's TX rolls back.
-        raise
-    except Exception as exc:  # noqa: BLE001 — non-FATAL paths absorb
+    except Exception as exc:  # noqa: BLE001 — index dispatch never blocks a write
         logger.warning(
             "Collection secondary-index hop %s dispatch failed for %s/%s: "
             "%s — PG mutation stands; ES may be stale until reindex",
@@ -488,17 +481,18 @@ async def search_collection_metadata(
     context: Optional[Dict[str, Any]] = None,
     db_resource: Optional[Any] = None,
     drivers: Optional[List[CollectionStore]] = None,
-    operation: str = Operation.SEARCH,
+    operation: str = Operation.INDEX,
 ) -> Tuple[List[Dict[str, Any]], int]:
-    """Delegate SEARCH to the first driver capable of serving the query shape.
+    """Delegate search to the first driver capable of serving the query shape.
 
-    ``operation`` selects which routing slice supplies the candidate driver
-    list (default ``SEARCH``).  Callers pass ``Operation.READ`` to run the
-    same capability-matched delegation against the READ-routed drivers — the
-    routing-driven fallback the collection service uses when the SEARCH slice
-    is ES-only and the ES collection index has no rows for the catalog yet
-    (READ is PG-backed under every preset, so it always answers from the
-    system of record).
+    ``operation`` selects which routing lane supplies the candidate driver
+    list (default ``INDEX`` — the search-capable materialization lane).
+    Callers pass ``Operation.READ`` to run the same capability-matched
+    delegation against the READ-routed drivers — the routing-driven
+    fallback the collection service uses when the INDEX lane is ES-only
+    and the ES collection index has no rows for the catalog yet (READ is
+    PG-backed under every preset, so it always answers from the system of
+    record).
     """
     if drivers is None:
         routed = await _routed_drivers(

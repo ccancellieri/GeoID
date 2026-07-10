@@ -115,23 +115,20 @@ def test_contributor_seed_defer_provisioning_true() -> None:
     assert seed.defer_provisioning is True
 
 
-def test_contributor_seed_declares_es_secondary_routing() -> None:
-    """The seed carries an items routing with an Elasticsearch secondary WRITE
-    entry (source="auto"), so demo_collection items are searchable rather than
-    PG-only — regression cover for #2241."""
+def test_contributor_seed_declares_es_index_routing() -> None:
+    """The seed carries an items routing with an Elasticsearch INDEX-lane
+    entry (source="auto"), so demo_collection items are searchable rather
+    than PG-only — regression cover for #2241."""
     from dynastore.modules.storage.routing_config import Operation
 
     seed = list(_DemoDataContributor().get_data())[0]
     assert seed.items_routing is not None
-    write_entries = seed.items_routing.operations[Operation.WRITE]
-    es = [e for e in write_entries if e.driver_ref == "items_elasticsearch_driver"]
-    assert es, "demo seed must declare an ES secondary write entry"
-    assert es[0].secondary_index is True
+    index_entries = seed.items_routing.operations[Operation.INDEX]
+    es = [e for e in index_entries if e.driver_ref == "items_elasticsearch_driver"]
+    assert es, "demo seed must declare an ES INDEX-lane entry"
     assert es[0].source == "auto"
-    # A SEARCH entry routed to ES is what makes /stac/.../items return matches.
-    assert seed.items_routing.operations[Operation.SEARCH][0].driver_ref == (
-        "items_elasticsearch_driver"
-    )
+    # The same INDEX entry is what makes /stac/.../items return matches —
+    # search is derived from the INDEX lane, not separately configured.
 
 
 # ---------------------------------------------------------------------------

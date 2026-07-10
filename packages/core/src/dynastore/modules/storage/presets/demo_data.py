@@ -45,7 +45,6 @@ from dynastore.modules.storage.routing_config import (
     ItemsRoutingConfig,
     Operation,
     OperationDriverEntry,
-    WriteMode,
 )
 
 from .multi_contributor import MultiContributorPreset
@@ -130,13 +129,13 @@ _DEMO_VIRTUAL_ASSET_HREF = (
 # ---------------------------------------------------------------------------
 
 def _demo_items_routing() -> ItemsRoutingConfig:
-    """PG-primary + Elasticsearch-secondary routing for the demo collection.
+    """PG-primary + Elasticsearch-INDEX routing for the demo collection.
 
     Without this, demo_collection inherits the ambient (often PG-only) routing
     and its items never reach Elasticsearch, so the STAC view returns
-    ``numberMatched: 0`` (#2241). The ES WRITE entry is ``source="auto"`` so the
-    secondary indexer is self-registered rather than suppressed as
-    operator-managed, and ASYNC + OUTBOX keeps the write durable without blocking
+    ``numberMatched: 0`` (#2241). The ES INDEX entry is ``source="auto"`` so
+    the indexer is self-registered rather than suppressed as operator-managed;
+    INDEX is async by lane definition, so it stays durable without blocking
     the PG primary.
     """
     return ItemsRoutingConfig(
@@ -146,18 +145,11 @@ def _demo_items_routing() -> ItemsRoutingConfig:
                     driver_ref="items_postgresql_driver",
                     on_failure=FailurePolicy.FATAL,
                 ),
-                OperationDriverEntry(
-                    driver_ref="items_elasticsearch_driver",
-                    write_mode=WriteMode.ASYNC,
-                    on_failure=FailurePolicy.OUTBOX,
-                    secondary_index=True,
-                    source="auto",
-                ),
             ],
             Operation.READ: [
                 OperationDriverEntry(driver_ref="items_postgresql_driver"),
             ],
-            Operation.SEARCH: [
+            Operation.INDEX: [
                 OperationDriverEntry(
                     driver_ref="items_elasticsearch_driver",
                     source="auto",

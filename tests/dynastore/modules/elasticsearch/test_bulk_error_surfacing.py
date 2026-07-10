@@ -906,54 +906,57 @@ class TestEnvelopeDriverWriteEntities:
 
 
 # ---------------------------------------------------------------------------
-# Task 4 — circuit-breaker open → OUTBOX enqueue
+# Task 4 — circuit-breaker open → log and drop (no re-enqueue, #2494)
 # ---------------------------------------------------------------------------
 
 
-class TestCircuitBreakerOutboxEnqueue:
-    """When the breaker is open, _dispatch_bulk must call _handle_failure_bulk
-    so on_failure=OUTBOX still enqueues the batch."""
+class TestCircuitBreakerOpenDrops:
+    """When the breaker is open, ``_dispatch_bulk`` logs and drops the batch
+    — it never re-enqueues.  This path is only reachable via the in-task-run
+    inline-absorption leg (see ``index_dispatcher``'s module docstring);
+    outside a task run every INDEX-lane entry is proactively enqueued
+    before the breaker is ever consulted.  INDEX entries carry no per-entry
+    failure policy any more, so ``on_failure`` has no bearing on this
+    outcome — the item-tier obligation sweep (#2688) is the safety net for
+    this class of gap, not a retry from this call site."""
 
     @pytest.mark.asyncio
-    async def test_breaker_open_with_outbox_policy_calls_handle_failure_bulk(self):
+    async def test_breaker_open_drops_without_enqueuing_or_calling_indexer(self):
         from dynastore.models.protocols.indexer import IndexContext, IndexOp
         from dynastore.modules.storage.circuit_breaker import CircuitBreaker
         from dynastore.modules.storage.index_dispatcher import IndexDispatcher
         from dynastore.modules.storage.routing_config import (
-            FailurePolicy, Operation, OperationDriverEntry, WriteMode,
+            Operation, OperationDriverEntry,
         )
+        from dynastore.tools.execution_context import task_run_scope
 
         # Build a breaker that is already open for "es-driver".
         breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=9999)
-        # Force it open by recording one failure (threshold=1).
         breaker.record_failure("es-driver")
         assert breaker.is_open("es-driver")
 
         enqueued: list = []
+        indexer_calls: list = []
 
         class _FakeOutbox:
-            """Minimal outbox stub that implements the legacy enqueue() surface
-            (IndexOp shape) which _enqueue_or_warn calls for IndexOp batches.
-            """
             async def enqueue(self, *, indexer_id, ctx, ops, last_error=None):
                 enqueued.extend(ops)
 
-        entry = OperationDriverEntry(
-            driver_ref="es-driver",
-            on_failure=FailurePolicy.OUTBOX,
-            write_mode=WriteMode.SYNC,
-            secondary_index=True,
-            source="auto",
-        )
+        class _FakeIndexer:
+            async def index_bulk(self, ctx, ops):
+                indexer_calls.extend(ops)
+                raise AssertionError("breaker-open must skip the indexer call entirely")
+
+        entry = OperationDriverEntry(driver_ref="es-driver", source="auto")
 
         class _StubRouting:
-            operations = {Operation.WRITE: [entry]}
+            operations = {Operation.INDEX: [entry]}
 
         async def _routing(c, col):
             return _StubRouting()
 
         async def _registry(ref):
-            return None  # driver not actually needed — breaker fires first
+            return _FakeIndexer()
 
         dispatcher = IndexDispatcher(
             routing_resolver=_routing,
@@ -962,70 +965,16 @@ class TestCircuitBreakerOutboxEnqueue:
             breaker=breaker,
         )
 
-        # ``pg_conn`` must be a live handle for ``_enqueue_or_warn`` to
-        # actually enqueue (drop path (b), #2686): without one the durable
-        # write can't be made transactional with the caller's TX, so the
-        # dispatcher degrades to WARN instead of enqueuing.
         ctx = IndexContext(
             catalog="cat1", collection="col1", correlation_id="cid",
             pg_conn=object(),
         )
-        ops = [
-            IndexOp(op_type="upsert", entity_type="item", entity_id="i1"),
-        ]
-
-        await dispatcher.fan_out_bulk(ctx, ops)
-
-        # The OUTBOX handler must have been called.
-        assert enqueued, (
-            "Expected at least one outbox row when breaker is open with "
-            "on_failure=OUTBOX, but enqueued list is empty."
-        )
-
-    @pytest.mark.asyncio
-    async def test_breaker_open_with_warn_policy_does_not_enqueue(self):
-        from dynastore.models.protocols.indexer import IndexContext, IndexOp
-        from dynastore.modules.storage.circuit_breaker import CircuitBreaker
-        from dynastore.modules.storage.index_dispatcher import IndexDispatcher
-        from dynastore.modules.storage.routing_config import (
-            FailurePolicy, Operation, OperationDriverEntry, WriteMode,
-        )
-
-        breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=9999)
-        breaker.record_failure("es-warn")
-
-        enqueued: list = []
-
-        class _FakeOutbox:
-            async def enqueue(self, *, indexer_id, ctx, ops, last_error=None):
-                enqueued.extend(ops)
-
-        entry = OperationDriverEntry(
-            driver_ref="es-warn",
-            on_failure=FailurePolicy.WARN,
-            write_mode=WriteMode.SYNC,
-            secondary_index=True,
-            source="auto",
-        )
-
-        class _StubRouting:
-            operations = {Operation.WRITE: [entry]}
-
-        async def _routing(c, col):
-            return _StubRouting()
-
-        async def _registry(ref):
-            return None
-
-        dispatcher = IndexDispatcher(
-            routing_resolver=_routing,
-            indexer_registry=_registry,
-            outbox=_FakeOutbox(),  # type: ignore[arg-type]
-            breaker=breaker,
-        )
-
-        ctx = IndexContext(catalog="cat1", collection="col1", correlation_id="cid")
         ops = [IndexOp(op_type="upsert", entity_type="item", entity_id="i1")]
-        await dispatcher.fan_out_bulk(ctx, ops)
-        # WARN policy — nothing enqueued.
-        assert not enqueued
+
+        with task_run_scope():
+            results = await dispatcher.fan_out_bulk(ctx, ops)
+
+        assert indexer_calls == [], "breaker-open must never call the indexer"
+        assert enqueued == [], "breaker-open must not re-enqueue — no retry from this call site"
+        assert results["es-driver"].failed == 1
+        assert results["es-driver"].failures[0]["reason"] == "circuit_breaker_open"

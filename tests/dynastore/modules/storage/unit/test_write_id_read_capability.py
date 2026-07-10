@@ -143,16 +143,17 @@ def _delete_only_async_outbox_routing() -> Any:
         FailurePolicy,
         Operation,
         OperationDriverEntry,
-        WriteMode,
     )
 
-    entry = OperationDriverEntry(
-        driver_ref="items_elasticsearch_driver",
-        on_failure=FailurePolicy.OUTBOX,
-        write_mode=WriteMode.ASYNC,
-        secondary_index=True,
+    write_entry = OperationDriverEntry(
+        driver_ref="items_postgresql_driver",
+        on_failure=FailurePolicy.FATAL,
     )
-    return {Operation.WRITE: [entry]}
+    index_entry = OperationDriverEntry(
+        driver_ref="items_elasticsearch_driver",
+        source="auto",
+    )
+    return {Operation.WRITE: [write_entry], Operation.INDEX: [index_entry]}
 
 
 def test_enqueue_index_deletes_degrades_partially_capable_primary_to_id_only():

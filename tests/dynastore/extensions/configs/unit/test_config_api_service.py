@@ -665,7 +665,7 @@ def test_build_routing_refs_replaces_entries_with_slim_refs():
             "operations": {
                 "WRITE": [
                     {"driver_ref": "catalog_core_postgresql_driver",
-                     "on_failure": "fatal", "write_mode": "sync",
+                     "on_failure": "fatal",
                      "hints": [], "sla": {"foo": 1}},
                 ],
             },
@@ -703,7 +703,9 @@ def test_build_routing_refs_replaces_entries_with_slim_refs():
         }
     ]
     assert ref["on_failure"] == "fatal"
-    assert ref["write_mode"] == "sync"
+    # write_mode was retired by the #2494 lane cutover — DriverRef no
+    # longer carries it, even when a stale input dict still has the key.
+    assert "write_mode" not in ref
     # Cycle F.7d.3-fixup: hints + source surface on the slim ref so
     # operators can distinguish hint-gated entries that share the same
     # driver_ref under one operation.  #1016 — empty hints are stripped
@@ -724,14 +726,14 @@ def test_build_routing_refs_forwards_hints_and_source():
     by_class = {
         "items_routing_config": {
             "operations": {
-                "SEARCH": [
+                "READ": [
                     {"driver_ref": "items_elasticsearch_driver",
                      "hints": ["geometry_simplified"],
-                     "on_failure": "fatal", "write_mode": "sync",
+                     "on_failure": "fatal",
                      "source": "auto"},
                     {"driver_ref": "items_postgresql_driver",
                      "hints": ["geometry_exact"],
-                     "on_failure": "fatal", "write_mode": "sync",
+                     "on_failure": "fatal",
                      "source": "operator"},
                 ],
             },
@@ -747,7 +749,7 @@ def test_build_routing_refs_forwards_hints_and_source():
         ConfigApiService(config_service=MagicMock())._build_routing_refs(
             by_class, base_url="http://h/configs",
         )
-    [es, pg] = by_class["items_routing_config"]["operations"]["SEARCH"]
+    [es, pg] = by_class["items_routing_config"]["operations"]["READ"]
     assert es["hints"] == ["geometry_simplified"]
     assert es["_meta"]["source"] == "auto"
     assert es["_meta"]["tier"] == "platform"
@@ -771,7 +773,7 @@ def test_build_routing_refs_link_title_reflects_active_scope():
     for base_url, expected_scope in cases:
         local = {"items_routing_config": {"operations": {
             "WRITE": [{"driver_ref": "items_postgresql_driver",
-                       "on_failure": "fatal", "write_mode": "sync"}]
+                       "on_failure": "fatal"}]
         }}}
         with patch(
             "dynastore.extensions.configs.config_api_service.list_registered_configs",
@@ -800,7 +802,7 @@ def test_build_routing_refs_meta_tier_reflects_active_scope():
     for base_url, expected_tier in cases:
         local = {"items_routing_config": {"operations": {
             "WRITE": [{"driver_ref": "items_postgresql_driver",
-                       "on_failure": "fatal", "write_mode": "sync",
+                       "on_failure": "fatal",
                        "source": "auto"}]
         }}}
         with patch(
@@ -822,7 +824,7 @@ def test_build_routing_refs_meta_omits_source_when_missing():
     ``_meta`` block with only ``tier`` (no ``source`` key)."""
     local = {"items_routing_config": {"operations": {
         "WRITE": [{"driver_ref": "items_postgresql_driver",
-                   "on_failure": "fatal", "write_mode": "sync"}]
+                   "on_failure": "fatal"}]
     }}}
     with patch(
         "dynastore.extensions.configs.config_api_service.list_registered_configs",
@@ -846,19 +848,17 @@ def test_build_routing_refs_surfaces_transformer_attachments():
     by_class = {
         "items_routing_config": {
             "operations": {
-                "WRITE": [{
+                "INDEX": [{
                     "driver_ref": "items_elasticsearch_private_driver",
                     "input_transformers": ("private_entity_transformer",),
                     "output_transformers": (),
-                    "on_failure": "outbox", "write_mode": "sync",
-                    "secondary_index": True,
                     "source": "auto",
                 }],
-                "SEARCH": [{
+                "READ": [{
                     "driver_ref": "items_elasticsearch_private_driver",
                     "input_transformers": (),
                     "output_transformers": ("private_entity_transformer",),
-                    "on_failure": "fatal", "write_mode": "sync",
+                    "on_failure": "fatal",
                     "source": "auto",
                 }],
             },
@@ -873,8 +873,8 @@ def test_build_routing_refs_surfaces_transformer_attachments():
         ConfigApiService(config_service=MagicMock())._build_routing_refs(
             by_class, base_url="http://h/configs",
         )
-    [idx] = by_class["items_routing_config"]["operations"]["WRITE"]
-    [srch] = by_class["items_routing_config"]["operations"]["SEARCH"]
+    [idx] = by_class["items_routing_config"]["operations"]["INDEX"]
+    [srch] = by_class["items_routing_config"]["operations"]["READ"]
     # Non-empty transformer chains are surfaced verbatim.
     assert idx["input_transformers"] == ["private_entity_transformer"]
     assert srch["output_transformers"] == ["private_entity_transformer"]
@@ -893,7 +893,7 @@ def test_build_routing_refs_transformer_lists_dropped_when_empty():
     """
     local = {"items_routing_config": {"operations": {
         "WRITE": [{"driver_ref": "items_postgresql_driver",
-                   "on_failure": "fatal", "write_mode": "sync"}]
+                   "on_failure": "fatal"}]
     }}}
     with patch(
         "dynastore.extensions.configs.config_api_service.list_registered_configs",
@@ -918,7 +918,7 @@ def test_build_routing_refs_hints_dropped_when_empty():
     local = {"items_routing_config": {"operations": {
         "READ": [{"driver_ref": "items_postgresql_driver",
                   "hints": [],
-                  "on_failure": "fatal", "write_mode": "sync"}]
+                  "on_failure": "fatal"}]
     }}}
     with patch(
         "dynastore.extensions.configs.config_api_service.list_registered_configs",
@@ -931,7 +931,7 @@ def test_build_routing_refs_hints_dropped_when_empty():
     assert "hints" not in ref
     # Sanity: non-envelope keys still present.
     assert ref["driver_ref"] == "items_postgresql_driver"
-    assert ref["write_mode"] == "sync"
+    assert ref["on_failure"] == "fatal"
 
 
 def test_build_routing_refs_transformer_round_trip_safe():
@@ -944,7 +944,7 @@ def test_build_routing_refs_transformer_round_trip_safe():
 
     by_class = {"items_routing_config": {"operations": {
         "WRITE": [{"driver_ref": "items_postgresql_driver",
-                   "on_failure": "fatal", "write_mode": "sync"}]
+                   "on_failure": "fatal"}]
     }}}
     with patch(
         "dynastore.extensions.configs.config_api_service.list_registered_configs",
@@ -979,7 +979,7 @@ def test_build_routing_refs_unregistered_driver_emits_no_link():
         "catalog_routing_config": {
             "operations": {
                 "WRITE": [{"driver_ref": "UnknownDriver",
-                           "on_failure": "warn", "write_mode": "sync"}]
+                           "on_failure": "warn"}]
             },
         },
     }
@@ -1064,7 +1064,7 @@ def test_build_routing_refs_meta_none_omits_meta_block():
         "catalog_routing_config": {
             "operations": {
                 "WRITE": [{"driver_ref": "items_postgresql_driver",
-                           "on_failure": "fatal", "write_mode": "sync",
+                           "on_failure": "fatal",
                            "source": "operator"}]
             },
         },
@@ -1091,7 +1091,7 @@ def test_build_routing_refs_links_none_omits_driver_config_link():
         "catalog_routing_config": {
             "operations": {
                 "WRITE": [{"driver_ref": "items_postgresql_driver",
-                           "on_failure": "fatal", "write_mode": "sync"}]
+                           "on_failure": "fatal"}]
             },
         },
     }

@@ -21,8 +21,10 @@
 When an indexer (e.g. ES, vector DB) is down, every write op would otherwise
 hammer it and pile up in the dispatcher's hot path.  This breaker observes
 consecutive failures and short-circuits to OPEN when a threshold is crossed,
-letting the dispatcher route subsequent ops through ``FailurePolicy.OUTBOX``
-(or skip with WARN) without wasting RTT on the doomed call.
+letting the dispatcher log and drop the (rare) inline-dispatch attempt
+without wasting RTT on the doomed call — INDEX-lane obligations already
+enqueued up front are unaffected; only the in-task-run inline-absorption
+leg consults the breaker.
 
 State machine — per ``indexer_id``:
 

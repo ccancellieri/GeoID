@@ -22,8 +22,8 @@ Driver-role shared types — DriverSla.
 Per-driver SLA wrapper used mainly on TRANSFORM / INDEX / BACKUP driver
 entries.  Mandatory on TRANSFORM drivers so the hot path is never
 unboundedly delayed; optional on INDEX / BACKUP to govern async
-propagation timeouts.  Kept separate from ``WriteMode`` /
-``FailurePolicy`` so it can be attached per-entry rather than per-class.
+propagation timeouts.  Kept separate from ``FailurePolicy`` so it can be
+attached per-entry rather than per-class.
 
 Per-driver "which slice of the payload" identification was previously
 done via a ``MetadataDomain`` StrEnum + ``ClassVar`` ClassVar on each

@@ -73,7 +73,6 @@ from dynastore.modules.storage.routing_config import (
     ItemsRoutingConfig,
     Operation,
     OperationDriverEntry,
-    WriteMode,
 )
 
 from .preset import (
@@ -242,11 +241,11 @@ class VectorIngestParams(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _vector_items_routing() -> ItemsRoutingConfig:
-    """PG-primary + Elasticsearch-secondary routing for the demo collection.
+    """PG-primary + Elasticsearch-INDEX routing for the demo collection.
 
     Items written by the ingestion task land in Postgres first; the async
-    outbox fan-out indexes them in Elasticsearch so STAC search returns them.
-    Mirrors the demo_data routing pattern so the preset is immediately
+    INDEX-lane fan-out indexes them in Elasticsearch so STAC search returns
+    them. Mirrors the demo_data routing pattern so the preset is immediately
     searchable after the ingestion job completes.
     """
     return ItemsRoutingConfig(
@@ -256,18 +255,11 @@ def _vector_items_routing() -> ItemsRoutingConfig:
                     driver_ref="items_postgresql_driver",
                     on_failure=FailurePolicy.FATAL,
                 ),
-                OperationDriverEntry(
-                    driver_ref="items_elasticsearch_driver",
-                    write_mode=WriteMode.ASYNC,
-                    on_failure=FailurePolicy.OUTBOX,
-                    secondary_index=True,
-                    source="auto",
-                ),
             ],
             Operation.READ: [
                 OperationDriverEntry(driver_ref="items_postgresql_driver"),
             ],
-            Operation.SEARCH: [
+            Operation.INDEX: [
                 OperationDriverEntry(
                     driver_ref="items_elasticsearch_driver",
                     source="auto",

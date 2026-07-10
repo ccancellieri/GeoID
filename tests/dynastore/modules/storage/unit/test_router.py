@@ -19,10 +19,15 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from dynastore.modules.storage.errors import ReadOnlyCollectionError
 from dynastore.modules.storage.router import (
     ResolvedDriver,
     get_asset_driver,
+    get_asset_search_driver,
+    get_asset_write_drivers,
     get_driver,
+    get_items_search_driver,
+    get_write_drivers,
     resolve_drivers,
 )
 from dynastore.modules.storage.driver_registry import DriverRegistry
@@ -33,7 +38,6 @@ from dynastore.modules.storage.routing_config import (
     Operation,
     OperationDriverEntry,
     ItemsRoutingConfig,
-    WriteMode,
 )
 
 
@@ -59,14 +63,14 @@ def _mock_configs_protocol(routing_config):
     return mock
 
 
-def _mock_driver(driver_ref: str):
+def _mock_driver(driver_ref: str, supported_hints=frozenset()):
     """Create a mock driver whose class name equals ``driver_ref``.
 
     The router builds the driver index via ``type(driver).__name__`` after the
     ``driver_ref`` field was removed in favour of class-name routing keys, so
     mocks must carry that name in their type.
     """
-    cls = type(driver_ref, (MagicMock,), {})
+    cls = type(driver_ref, (MagicMock,), {"supported_hints": supported_hints})
     return cls()
 
 
@@ -163,7 +167,7 @@ class TestResolveDrivers:
             patch("dynastore.tools.discovery.get_protocol", return_value=mock_configs),
             patch.object(DriverRegistry, "collection_index", return_value={"postgresql": pg, "elasticsearch": es}),
             patch("dynastore.modules.storage.router._resolve_driver_ids_cached", new=AsyncMock(
-                return_value=[("postgresql", FailurePolicy.FATAL, WriteMode.SYNC), ("elasticsearch", FailurePolicy.FATAL, WriteMode.SYNC)])),
+                return_value=[("postgresql", FailurePolicy.FATAL), ("elasticsearch", FailurePolicy.FATAL)])),
         ):
             result = await resolve_drivers("WRITE", "cat1", "col1")
             assert len(result) == 2
@@ -178,7 +182,7 @@ class TestResolveDrivers:
         with (
             patch.object(DriverRegistry, "collection_index", return_value={"postgresql": pg}),
             patch("dynastore.modules.storage.router._resolve_driver_ids_cached", new=AsyncMock(
-                return_value=[("postgresql", FailurePolicy.FATAL, WriteMode.SYNC)])),
+                return_value=[("postgresql", FailurePolicy.FATAL)])),
         ):
             result = await resolve_drivers("READ", "cat1", "col1")
             assert len(result) == 1
@@ -191,7 +195,7 @@ class TestResolveDrivers:
         with (
             patch.object(DriverRegistry, "collection_index", return_value={"postgresql": pg}),
             patch("dynastore.modules.storage.router._resolve_driver_ids_cached", new=AsyncMock(
-                return_value=[("nonexistent", FailurePolicy.FATAL, WriteMode.SYNC), ("postgresql", FailurePolicy.FATAL, WriteMode.SYNC)])),
+                return_value=[("nonexistent", FailurePolicy.FATAL), ("postgresql", FailurePolicy.FATAL)])),
         ):
             result = await resolve_drivers("READ", "cat1")
             assert len(result) == 1
@@ -213,7 +217,7 @@ class TestResolveDrivers:
         with (
             patch.object(DriverRegistry, "asset_index", return_value={"postgresql": pg}),
             patch("dynastore.modules.storage.router._resolve_driver_ids_cached", new=AsyncMock(
-                return_value=[("postgresql", FailurePolicy.FATAL, WriteMode.SYNC)])),
+                return_value=[("postgresql", FailurePolicy.FATAL)])),
         ):
             result = await resolve_drivers(
                 "READ", "cat1", routing_plugin_cls=AssetRoutingConfig,
@@ -228,10 +232,26 @@ class TestResolveDrivers:
         with (
             patch.object(DriverRegistry, "collection_index", return_value={"postgresql": pg}),
             patch("dynastore.modules.storage.router._resolve_driver_ids_cached", new=AsyncMock(
-                return_value=[("postgresql", FailurePolicy.WARN, WriteMode.SYNC)])),
+                return_value=[("postgresql", FailurePolicy.WARN)])),
         ):
             result = await resolve_drivers("WRITE", "cat1")
             assert result[0].on_failure == FailurePolicy.WARN
+
+    @pytest.mark.asyncio
+    async def test_index_operation_resolves(self):
+        """INDEX is a plain operation key for resolve_drivers, same wiring as
+        WRITE/READ — the lane-level strict/relaxed distinction lives inside
+        ``_resolve_driver_ids_cached``, not in ``resolve_drivers`` itself."""
+        es = _mock_driver("elasticsearch")
+
+        with (
+            patch.object(DriverRegistry, "collection_index", return_value={"elasticsearch": es}),
+            patch("dynastore.modules.storage.router._resolve_driver_ids_cached", new=AsyncMock(
+                return_value=[("elasticsearch", FailurePolicy.FATAL)])),
+        ):
+            result = await resolve_drivers(Operation.INDEX, "cat1", "col1")
+            assert len(result) == 1
+            assert result[0].driver is es
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +267,7 @@ class TestGetDriver:
         with (
             patch.object(DriverRegistry, "collection_index", return_value={"postgresql": pg}),
             patch("dynastore.modules.storage.router._resolve_driver_ids_cached", new=AsyncMock(
-                return_value=[("postgresql", FailurePolicy.FATAL, WriteMode.SYNC)])),
+                return_value=[("postgresql", FailurePolicy.FATAL)])),
         ):
             result = await get_driver("READ", "cat1", "col1")
             assert result is pg
@@ -268,7 +288,7 @@ class TestGetDriver:
         with (
             patch.object(DriverRegistry, "collection_index", return_value={"postgresql": pg}),
             patch("dynastore.modules.storage.router._resolve_driver_ids_cached", new=AsyncMock(
-                return_value=[("postgresql", FailurePolicy.FATAL, WriteMode.SYNC)])),
+                return_value=[("postgresql", FailurePolicy.FATAL)])),
         ):
             result = await get_driver("WRITE", "cat1", "col1")
             assert result is pg
@@ -282,13 +302,15 @@ class TestGetAssetDriver:
         with (
             patch.object(DriverRegistry, "asset_index", return_value={"postgresql": pg}),
             patch("dynastore.modules.storage.router._resolve_driver_ids_cached", new=AsyncMock(
-                return_value=[("postgresql", FailurePolicy.FATAL, WriteMode.SYNC)])),
+                return_value=[("postgresql", FailurePolicy.FATAL)])),
         ):
             result = await get_asset_driver("READ", "cat1", "col1")
             assert result is pg
 
     @pytest.mark.asyncio
-    async def test_raises_on_empty_resolution(self):
+    async def test_raises_value_error_on_empty_read_resolution(self):
+        """A genuine misconfiguration (no READ driver at all) is a ValueError —
+        distinct from the read-only-WRITE case below, which is a typed 405."""
         with (
             patch.object(DriverRegistry, "asset_index", return_value={}),
             patch("dynastore.modules.storage.router._resolve_driver_ids_cached", new=AsyncMock(return_value=[])),
@@ -297,31 +319,161 @@ class TestGetAssetDriver:
                 await get_asset_driver("READ", "cat1", "col1")
 
     @pytest.mark.asyncio
+    async def test_raises_read_only_collection_error_on_empty_write_resolution(self):
+        """An empty WRITE lane means the asset tier is read-only — the typed
+        405 path, not a generic ValueError."""
+        with (
+            patch.object(DriverRegistry, "asset_index", return_value={}),
+            patch("dynastore.modules.storage.router._resolve_driver_ids_cached", new=AsyncMock(return_value=[])),
+        ):
+            with pytest.raises(ReadOnlyCollectionError):
+                await get_asset_driver("WRITE", "cat1", "col1")
+
+    @pytest.mark.asyncio
     async def test_write_operation(self):
         pg = _mock_driver("postgresql")
 
         with (
             patch.object(DriverRegistry, "asset_index", return_value={"postgresql": pg}),
             patch("dynastore.modules.storage.router._resolve_driver_ids_cached", new=AsyncMock(
-                return_value=[("postgresql", FailurePolicy.FATAL, WriteMode.SYNC)])),
+                return_value=[("postgresql", FailurePolicy.FATAL)])),
         ):
             result = await get_asset_driver("WRITE", "cat1", "col1")
             assert result is pg
 
+
+# ---------------------------------------------------------------------------
+# get_write_drivers / get_asset_write_drivers — empty is valid (read-only)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteDriversEmptyIsValid:
     @pytest.mark.asyncio
-    async def test_search_with_hint(self):
-        es = _mock_driver("elasticsearch")
+    async def test_get_write_drivers_returns_empty_list_not_raise(self):
+        """An empty WRITE lane is a valid read-only configuration — the
+        multi-driver fan-out helper never raises; callers reject at
+        dispatch (see ReadOnlyCollectionError in item_service.upsert)."""
+        with (
+            patch.object(DriverRegistry, "collection_index", return_value={}),
+            patch("dynastore.modules.storage.router._resolve_driver_ids_cached", new=AsyncMock(return_value=[])),
+        ):
+            result = await get_write_drivers("cat1", "col1")
+            assert result == []
+
+    @pytest.mark.asyncio
+    async def test_get_asset_write_drivers_returns_empty_list_not_raise(self):
+        with (
+            patch.object(DriverRegistry, "asset_index", return_value={}),
+            patch("dynastore.modules.storage.router._resolve_driver_ids_cached", new=AsyncMock(return_value=[])),
+        ):
+            result = await get_asset_write_drivers("cat1", "col1")
+            assert result == []
+
+    @pytest.mark.asyncio
+    async def test_get_write_drivers_returns_resolved_fan_out(self):
+        pg = _mock_driver("postgresql")
 
         with (
-            patch.object(DriverRegistry, "asset_index", return_value={"elasticsearch": es}),
+            patch.object(DriverRegistry, "collection_index", return_value={"postgresql": pg}),
             patch("dynastore.modules.storage.router._resolve_driver_ids_cached", new=AsyncMock(
-                return_value=[("elasticsearch", FailurePolicy.FATAL, WriteMode.SYNC)])),
+                return_value=[("postgresql", FailurePolicy.FATAL)])),
         ):
-            result = await get_asset_driver(
-                "SEARCH", "cat1", "col1",
-                hints=frozenset({Hint.SEARCH}),
-            )
+            result = await get_write_drivers("cat1", "col1")
+            assert len(result) == 1
+            assert result[0].driver is pg
+
+
+# ---------------------------------------------------------------------------
+# get_items_search_driver / get_asset_search_driver — derived search
+# ---------------------------------------------------------------------------
+
+
+class TestDerivedSearchDriver:
+    @pytest.mark.asyncio
+    async def test_items_search_prefers_index_lane(self):
+        es = _mock_driver("elasticsearch")
+
+        async def _fake_resolve(operation, *a, **kw):
+            if operation == Operation.INDEX:
+                return [ResolvedDriver(driver=es)]
+            return []
+
+        with patch(
+            "dynastore.modules.storage.router.resolve_drivers", new=AsyncMock(side_effect=_fake_resolve),
+        ):
+            resolved = await get_items_search_driver("cat1", "col1")
+            assert resolved.driver is es
+
+    @pytest.mark.asyncio
+    async def test_items_search_falls_back_to_read_when_index_empty(self):
+        pg = _mock_driver("postgresql")
+
+        async def _fake_resolve(operation, *a, **kw):
+            if operation == Operation.INDEX:
+                return []
+            if operation == Operation.READ:
+                return [ResolvedDriver(driver=pg)]
+            return []
+
+        with patch(
+            "dynastore.modules.storage.router.resolve_drivers", new=AsyncMock(side_effect=_fake_resolve),
+        ):
+            resolved = await get_items_search_driver("cat1", "col1")
+            assert resolved.driver is pg
+
+    @pytest.mark.asyncio
+    async def test_items_search_raises_when_both_lanes_empty(self):
+        with patch(
+            "dynastore.modules.storage.router.resolve_drivers", new=AsyncMock(return_value=[]),
+        ):
+            with pytest.raises(ValueError, match="No items search driver found"):
+                await get_items_search_driver("cat1", "col1")
+
+    @pytest.mark.asyncio
+    async def test_asset_search_prefers_index_lane_over_read(self):
+        es = _mock_driver("asset_elasticsearch_driver")
+        pg = _mock_driver("asset_postgresql_driver")
+
+        async def _fake_resolve(operation, *a, **kw):
+            if operation == Operation.INDEX:
+                return [ResolvedDriver(driver=es)]
+            if operation == Operation.READ:
+                return [ResolvedDriver(driver=pg)]
+            return []
+
+        with patch(
+            "dynastore.modules.storage.router.resolve_drivers", new=AsyncMock(side_effect=_fake_resolve),
+        ):
+            result = await get_asset_search_driver("cat1", "col1")
             assert result is es
+
+    @pytest.mark.asyncio
+    async def test_asset_search_raises_when_both_lanes_empty(self):
+        with patch(
+            "dynastore.modules.storage.router.resolve_drivers", new=AsyncMock(return_value=[]),
+        ):
+            with pytest.raises(ValueError, match="No asset search driver found"):
+                await get_asset_search_driver("cat1", "col1")
+
+
+class TestRankSearchPoolByHintSearch:
+    def test_search_tagged_driver_ranked_first(self):
+        from dynastore.modules.storage.router import _rank_search_pool_by_hint_search
+
+        plain = ResolvedDriver(driver=_mock_driver("postgresql", supported_hints=frozenset()))
+        searchable = ResolvedDriver(
+            driver=_mock_driver("elasticsearch", supported_hints=frozenset({Hint.SEARCH})),
+        )
+        ranked = _rank_search_pool_by_hint_search([plain, searchable])
+        assert ranked[0] is searchable
+        assert ranked[1] is plain
+
+    def test_stable_when_none_are_search_tagged(self):
+        from dynastore.modules.storage.router import _rank_search_pool_by_hint_search
+
+        a = ResolvedDriver(driver=_mock_driver("a"))
+        b = ResolvedDriver(driver=_mock_driver("b"))
+        assert _rank_search_pool_by_hint_search([a, b]) == [a, b]
 
 
 # ---------------------------------------------------------------------------

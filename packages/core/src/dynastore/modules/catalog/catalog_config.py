@@ -26,7 +26,6 @@ from pydantic import (
 from dynastore.models.mutability import Mutable
 from dynastore.models.plugin_config import PluginConfig
 from typing import Any, ClassVar, List, Optional, Tuple
-from dynastore.modules.storage.hints import Hint
 
 
 class CollectionKind(str, Enum):
@@ -186,7 +185,6 @@ def _build_private_items_routing() -> Any:
         ItemsRoutingConfig,
         Operation,
         OperationDriverEntry,
-        WriteMode,
     )
 
     return ItemsRoutingConfig(
@@ -195,43 +193,29 @@ def _build_private_items_routing() -> Any:
                 OperationDriverEntry(
                     driver_ref="items_postgresql_driver",
                     on_failure=FailurePolicy.FATAL,
-                    write_mode=WriteMode.SYNC
-                ),
-                OperationDriverEntry(
-                    driver_ref="items_elasticsearch_private_driver",
-                    write_mode=WriteMode.ASYNC,
-                    on_failure=FailurePolicy.OUTBOX,
-                    source="auto",
                 ),
             ],
             Operation.READ: [
                 OperationDriverEntry(driver_ref="items_postgresql_driver"),
             ],
 
-            # SEARCH is pinned operator-managed (#1336). With ``source="auto"``
-            # here, ``_self_register_searchers_into`` is not a no-op, and the
-            # public ``items_elasticsearch_driver`` (auto_register_for_routing ⊇
-            # {SEARCH}) gets appended to a private catalog's items SEARCH list —
-            # pointing it at the SHARED public items index instead of the
-            # per-tenant private index. Marking these entries operator-sourced
-            # makes ``_is_operator_managed(SEARCH)`` true so no public driver is
-            # appended, keeping private item search isolated to PG + private ES.
-            # This is the items-tier counterpart of the catalog/collection
-            # SEARCH pin (#1335) and is consistent with the private-isolation
-            # lock (#1047). Public catalogs use the default items routing where
-            # the ES re-merge (#1320/#1323) still applies — a separate path.
-            Operation.SEARCH: [
+            # INDEX carries the per-tenant private ES index. No configured
+            # search list exists to leak into (#1336/#1047): search is
+            # derived from INDEX-then-READ, and this INDEX list contains
+            # only the private driver, so a private catalog's search pool
+            # is isolated to PG + private ES by construction — there is no
+            # more self-register-into-SEARCH mechanism that could append
+            # the shared public items index the way the old SEARCH-pin
+            # comment here used to guard against. The WRITE-lane pin above
+            # (default ``source="operator"``) already blocks
+            # ``_self_register_indexers_into`` from auto-appending the
+            # public ``items_elasticsearch_driver`` into this INDEX list
+            # too (it gates on WRITE's operator-managed status).
+            Operation.INDEX: [
                 OperationDriverEntry(
                     driver_ref="items_elasticsearch_private_driver",
-                    hints={Hint.GEOMETRY_SIMPLIFIED},
-                    source="operator",
+                    source="auto",
                 ),
-                OperationDriverEntry(
-                    driver_ref="items_postgresql_driver",
-                    hints={Hint.GEOMETRY_EXACT},
-                    write_mode=WriteMode.SYNC,
-                    source="operator",
-                )
-            ]
+            ],
         },
     )

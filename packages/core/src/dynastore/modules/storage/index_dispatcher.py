@@ -36,15 +36,21 @@ Design properties
 * **In-process when possible** — when the dispatcher and the indexer run
   in the same pod the call is a direct ``await indexer.index(...)`` —
   no event/task hop.
-* **Durable on failure** — the ``OUTBOX`` failure policy persists a
-  ``tasks.storage`` row in the *same* PG transaction as the upstream
-  write.  PG TX commit guarantees neither the data nor the
-  obligation-to-index can be lost.  (The transactional-outbox PATTERN is
-  unchanged; #1807 moved the durable plane from the per-tenant
-  ``_meta.index_outbox`` table to the unified ``tasks.storage`` table.)
-* **Circuit-broken** — per-indexer-id breaker (Phase 3).  When open,
-  sync attempts short-circuit; ``OUTBOX`` policy still enqueues so the
-  worker drains when the breaker half-closes.
+* **Durable up front** — INDEX-lane entries are async by lane definition
+  (see ``modules/storage/routing_config.py``): the dispatcher persists a
+  ``tasks.storage`` obligation row in the *same* PG transaction as the
+  upstream write, ahead of any indexer call. PG TX commit guarantees
+  neither the data nor the obligation-to-index can be lost.  (The
+  transactional-outbox PATTERN is unchanged; #1807 moved the durable
+  plane from the per-tenant ``_meta.index_outbox`` table to the unified
+  ``tasks.storage`` table.)  INDEX entries carry no per-entry failure
+  policy — failure handling is structural: a genuinely inline attempt
+  (the in-task-run absorption exception below) that fails is logged and
+  dropped, since the durable obligation for every other path was already
+  written up front, independent of that attempt's outcome.
+* **Circuit-broken** — per-indexer-id breaker (Phase 3).  When open, an
+  inline attempt short-circuits to a logged drop rather than calling a
+  known-unhealthy indexer.
 
 Phases
 ------
@@ -72,11 +78,7 @@ from dynastore.models.protocols.indexer import (
     merge_bulk_results,
 )
 from dynastore.models.protocols.indexing import IndexableOp
-from dynastore.modules.storage.routing_config import (
-    FailurePolicy,
-    OperationDriverEntry,
-    WriteMode,
-)
+from dynastore.modules.storage.routing_config import OperationDriverEntry
 from dynastore.tools.execution_context import current_task_catalog, in_task_run
 
 
@@ -98,41 +100,6 @@ INLINE_DISPATCH_CHUNK_SIZE = 500
 # (#2494 instrumentation) so a burst of same-second log lines can still be
 # ordered and counted per process.
 _INDEX_BULK_SEQUENCE = itertools.count(1)
-
-
-# ---------------------------------------------------------------------------
-# Errors
-# ---------------------------------------------------------------------------
-
-
-class IndexerFatal(Exception):
-    """Raised by the dispatcher when an indexer with ``FailurePolicy.FATAL``
-    fails.  Propagates out of the dispatcher; the caller's PG transaction
-    rolls back, taking the upstream data write with it.
-    """
-
-    def __init__(
-        self,
-        indexer_id: str,
-        op: "Optional[DispatchableOp]",
-        original: BaseException,
-    ) -> None:
-        # Format depending on which op shape was passed — bulk dispatch
-        # accepts both legacy IndexOp and IndexableOp; either may be the
-        # FATAL target (or None when an upstream filter rejects the
-        # whole batch).
-        if op is None:
-            descriptor = "<empty batch>"
-        elif isinstance(op, IndexableOp):
-            descriptor = f"{op.op}/{op.collection_id}/{op.item_id}"
-        else:
-            descriptor = f"{op.op_type}/{op.entity_type}/{op.entity_id}"
-        super().__init__(
-            f"Fatal indexer failure: '{indexer_id}' on {descriptor}: {original}"
-        )
-        self.indexer_id = indexer_id
-        self.op = op
-        self.original = original
 
 
 # ---------------------------------------------------------------------------
@@ -373,9 +340,9 @@ def _make_default_routing_resolver():
       (``item_service._dispatch_index_upsert``) and item delete
       (``item_query``). Carries the privacy-cascade validator's contract
       into runtime: a private collection that pins
-      ``items_elasticsearch_private_driver`` as a secondary-index ``WRITE``
-      entry (``secondary_index=True``) in ``ItemsRoutingConfig.operations[WRITE]``
-      now fires on item upsert/delete via the OGC endpoints.
+      ``items_elasticsearch_private_driver`` in
+      ``ItemsRoutingConfig.operations[INDEX]`` now fires on item
+      upsert/delete via the OGC endpoints.
     * ``entity_type="collection"`` -> :class:`CollectionRoutingConfig` —
       collection metadata propagation (``_dispatch_collection_index``).
     * ``entity_type="catalog"`` -> :class:`CatalogRoutingConfig` — catalog
@@ -522,26 +489,25 @@ class IndexDispatcher:
     Parameters
     ----------
     routing_resolver
-        Async callable used to look up the secondary-index ``WRITE`` entries
-        (``secondary_index=True``) in ``operations[WRITE]``. The
-        production resolver accepts an ``entity_type`` keyword and returns
-        the matching ``*RoutingConfig`` per tier (items/collection/
-        catalog/asset). Legacy 2-arg ``(catalog, collection)`` stubs are
-        still accepted via :func:`_call_resolver`'s ``TypeError``
-        fallback so existing fixtures continue to work; pre-#810 callers
-        that don't set ``IndexContext.entity_type`` resolve to
-        ``CollectionRoutingConfig`` (back-compat default). Pluggable so
-        the dispatcher is testable without booting the full config
-        service.
+        Async callable used to look up the INDEX-lane entries in
+        ``operations[INDEX]``. The production resolver accepts an
+        ``entity_type`` keyword and returns the matching ``*RoutingConfig``
+        per tier (items/collection/catalog/asset). Legacy 2-arg
+        ``(catalog, collection)`` stubs are still accepted via
+        :func:`_call_resolver`'s ``TypeError`` fallback so existing
+        fixtures continue to work; pre-#810 callers that don't set
+        ``IndexContext.entity_type`` resolve to ``CollectionRoutingConfig``
+        (back-compat default). Pluggable so the dispatcher is testable
+        without booting the full config service.
     indexer_registry
         Async callable ``(indexer_id) -> Indexer | None`` resolving the
         runtime instance for a routing entry's ``driver_id``.
     outbox
-        Optional ``OutboxWriter`` (Phase 2) — when ``None``, ``OUTBOX``
-        failure policy degrades to ``WARN`` with a one-time log.
+        Optional ``OutboxWriter`` (Phase 2) — when ``None``, obligations
+        cannot be durably enqueued and degrade to a one-time WARN log.
     breaker
         Optional ``CircuitBreaker`` (Phase 3) — when ``None``, every
-        sync attempt is tried unconditionally.
+        inline attempt is tried unconditionally.
     """
 
     def __init__(
@@ -584,8 +550,9 @@ class IndexDispatcher:
 
         Returns per-indexer ``BulkResult`` so callers can surface partial
         failures (a 207-style report).  Per-op failures inside an indexer
-        are absorbed into ``BulkResult.failures``; an indexer raising
-        applies ``FailurePolicy`` to the whole batch.
+        are absorbed into ``BulkResult.failures``; an indexer raising on
+        the (rare) inline-dispatch leg logs and drops the whole batch —
+        see :meth:`_handle_failure_bulk`.
 
         ``tx_factory`` (in-task-run inline path only): a zero-arg callable
         returning an ``async with``-able transaction. When supplied, the
@@ -620,18 +587,17 @@ class IndexDispatcher:
             logger.warning(
                 "IndexDispatcher: %d op(s) submitted for catalog=%s "
                 "collection=%s entity_type=%s but routing returned NO "
-                "secondary-index entries — writes will not reach any indexer. "
-                "Check RoutingConfig.operations[WRITE] for secondary-index "
-                "entries (secondary_index=True) in this scope.",
+                "INDEX-lane entries — writes will not reach any indexer. "
+                "Check RoutingConfig.operations[INDEX] in this scope.",
                 len(ops), ctx.catalog, ctx.collection,
                 getattr(ctx, "entity_type", None),
             )
         for entry in entries:
             indexer = await self._resolve_indexer(entry.driver_ref)
             if indexer is None:
-                # Driver not registered locally — apply the routing
-                # entry's FailurePolicy per-op so observable behaviour
-                # matches the in-process "indexer raised" path.
+                # Driver not registered locally — durably enqueue per-op so
+                # a configured-but-not-installed indexer is still recognised
+                # and routed to the drain (see _handle_missing).
                 for op in ops:
                     await self._handle_missing(entry, ctx, op)
                 continue
@@ -643,16 +609,16 @@ class IndexDispatcher:
                     failures=rejected,
                 )
                 continue
-            # Honor write_mode=ASYNC: enqueue to the outbox and skip the
-            # inline indexer call entirely.  The outbox worker drains the
-            # row in the background; the write path is not blocked on ES.
-            # BulkResult is built from the ACTUAL count returned by
-            # _enqueue_or_warn — if any of the three drop paths fires (no
-            # outbox, no pg_conn, transient PG error) the returned 0 flows
-            # through as succeeded=0/failed=N so _check_index_health
-            # escalates to FAILED instead of silently claiming success.
+            # INDEX-lane entries are async by lane definition: enqueue a
+            # durable obligation and skip the inline indexer call entirely.
+            # The drain pumps the row in the background; the write path is
+            # not blocked on ES.  BulkResult is built from the ACTUAL count
+            # returned by the enqueue call — if it drops (no outbox, no
+            # pg_conn, transient PG error) the returned 0 flows through as
+            # succeeded=0/failed=N so _check_index_health escalates to
+            # FAILED instead of silently claiming success.
             # #2494 P1: when the storage-plane flag is on and this is an
-            # item-tier ASYNC entry, ALWAYS route to id-only ``tasks.storage``
+            # item-tier entry, ALWAYS route to id-only ``tasks.storage``
             # obligations — regardless of ``in_task_run()``. The drain
             # re-reads canonical PG state at replay time, so there is no
             # snapshot to go stale and no reason to ever absorb the write
@@ -675,12 +641,12 @@ class IndexDispatcher:
             # envelope recompute failed or came back empty. There is
             # therefore no longer a payload requirement that would force an
             # access-aware entry onto a different plane than any other
-            # item-tier ASYNC entry.
+            # item-tier entry.
             storage_plane_active = (
                 ctx.entity_type == "item"
                 and await _storage_plane_routing_enabled()
             )
-            if entry.write_mode == WriteMode.ASYNC and storage_plane_active:
+            if storage_plane_active:
                 actually_enqueued = await self._enqueue_storage_plane_ids(
                     entry, ctx, entry_ops, tx_factory=tx_factory,
                 )
@@ -722,12 +688,12 @@ class IndexDispatcher:
             # (``current_task_catalog() is None`` — e.g. the Cloud Run Job
             # entrypoint, which predates catalog-scoped ``task_run_scope``)
             # stays unrestricted, matching the original #2621 behaviour.
-            if entry.write_mode == WriteMode.ASYNC and not (
+            if not (
                 in_task_run()
                 and not storage_plane_active
                 and _task_run_absorption_allowed(ctx.catalog)
             ):
-                actually_enqueued = await self._enqueue_or_warn(entry, ctx, entry_ops)
+                actually_enqueued = await self._enqueue_obligation(entry, ctx, entry_ops)
                 enqueue_ok = actually_enqueued == len(entry_ops)
                 _log_dispatch_path(
                     mode="async_outbox_enqueued" if enqueue_ok else "async_enqueue_failed",
@@ -887,10 +853,9 @@ class IndexDispatcher:
             )
             return []
         ops_map = getattr(routing, "operations", {}) or {}
-        from dynastore.modules.storage.routing_config import (
-            secondary_index_entries,
-        )
-        return secondary_index_entries(ops_map)
+        from dynastore.modules.storage.routing_config import index_entries
+
+        return index_entries(ops_map)
 
     async def _handle_missing(
         self,
@@ -898,44 +863,29 @@ class IndexDispatcher:
         ctx: IndexContext,
         op: DispatchableOp,
     ) -> None:
-        """Apply ``entry.on_failure`` when the indexer is not locally
-        registered.  Mirrors the policy semantics already used for
-        resolved-but-failing indexers, so deployments don't see two
-        different behaviours for "ES is down" vs "ES isn't installed
-        in this SCOPE".
+        """Durably enqueue when an INDEX-lane indexer is not locally registered.
 
-        WARN dedupes per ``(driver_id, catalog, collection)`` so a
-        deliberately-omitted driver doesn't flood the log on every op.
-        OUTBOX path degrades through :meth:`_enqueue_or_warn` for both
-        :class:`IndexableOp` and legacy :class:`IndexOp` shapes — the
-        wired :class:`StoragePlaneOutboxWriter` accepts either shape, so
-        the batch (mixed or all-``IndexableOp``) reaches the durable
-        outbox unchanged.
+        A configured-but-not-locally-installed indexer is still recognised
+        and routed to the drain: this call site runs BEFORE the
+        proactive-enqueue branches in :meth:`fan_out_bulk` (the driver
+        lookup fails before an indexer instance even exists to dispatch
+        to), so no obligation has been written yet for this op — unlike the
+        failure-handling call sites below, dropping here would silently
+        lose the write forever instead of leaving it to drain on a replica
+        that does have the driver installed (or a future deploy).  Logs
+        once per ``(driver_id, catalog, collection)`` so a deliberately-
+        omitted driver doesn't flood the log on every op.
         """
-        policy = entry.on_failure
-        if policy == FailurePolicy.FATAL:
-            raise IndexerFatal(
-                entry.driver_ref, op,
-                RuntimeError(
-                    f"indexer '{entry.driver_ref}' not registered locally and "
-                    f"routing entry is FATAL"
-                ),
+        key = (entry.driver_ref, ctx.catalog, ctx.collection)
+        if key not in self._missing_warning_emitted:
+            self._missing_warning_emitted.add(key)
+            logger.warning(
+                "IndexDispatcher: indexer '%s' not registered locally "
+                "(catalog=%s, collection=%s) — enqueueing for the drain. "
+                "Future occurrences for this triple are suppressed.",
+                entry.driver_ref, ctx.catalog, ctx.collection,
             )
-        if policy == FailurePolicy.OUTBOX:
-            await self._enqueue_or_warn(entry, ctx, [op])
-            return
-        if policy == FailurePolicy.WARN:
-            key = (entry.driver_ref, ctx.catalog, ctx.collection)
-            if key not in self._missing_warning_emitted:
-                self._missing_warning_emitted.add(key)
-                logger.warning(
-                    "IndexDispatcher: indexer '%s' not registered locally "
-                    "(catalog=%s, collection=%s) — skipping per WARN policy. "
-                    "Future occurrences for this triple are suppressed.",
-                    entry.driver_ref, ctx.catalog, ctx.collection,
-                )
-            return
-        # IGNORE — silent.
+        await self._enqueue_obligation(entry, ctx, [op])
 
     async def _ensure_or_handle(
         self,
@@ -947,9 +897,7 @@ class IndexDispatcher:
         """Run ``ensure_indexer`` once per (indexer_id, catalog, collection).
 
         Returns True when the indexer is ready to receive ops, False when
-        the bootstrap failed and the dispatcher already routed the op
-        through its FailurePolicy (e.g. enqueued to outbox, logged WARN).
-        Raises :class:`IndexerFatal` when the policy is FATAL.
+        the bootstrap failed — logged and dropped (see :meth:`_handle_failure`).
         """
         key = (entry.driver_ref, ctx.catalog, ctx.collection)
         if key in self._ensured:
@@ -976,17 +924,20 @@ class IndexDispatcher:
         ops: Sequence[DispatchableOp],
     ) -> BulkResult:
         if self._breaker is not None and self._breaker.is_open(entry.driver_ref):
-            # Breaker is open — the indexer is not healthy enough to attempt a
-            # sync call.  We still MUST honour the entry's on_failure policy so
-            # that OUTBOX entries are enqueued (and drained later when the
-            # breaker half-closes) rather than being silently discarded.  This
-            # matches the design intent stated in the module docstring:
-            # "OUTBOX policy still enqueues so the worker drains when the
-            # breaker half-closes."
-            exc = RuntimeError(
-                f"circuit_breaker_open for indexer '{entry.driver_ref}'"
+            # Breaker is open — the indexer is not healthy enough to attempt
+            # an inline call.  This path is only reached via the in-task-run
+            # absorption exception (see the module docstring and
+            # ``fan_out_bulk``): the caller deliberately chose NOT to write a
+            # durable obligation up front for this op, so there is nothing to
+            # compensate for reactively here — log and drop.  The item-tier
+            # obligation sweep (#2688) is the safety net for exactly this
+            # class of gap; it does not depend on this dispatcher retrying.
+            logger.warning(
+                "IndexDispatcher: circuit breaker open for indexer '%s' "
+                "(catalog=%s collection=%s) — dropping %d op(s) inline; "
+                "relying on the obligation sweep for eventual consistency.",
+                entry.driver_ref, ctx.catalog, ctx.collection, len(ops),
             )
-            await self._handle_failure_bulk(entry, ctx, ops, exc)
             return BulkResult(total=len(ops), failed=len(ops), failures=[
                 {"reason": "circuit_breaker_open", "indexer": entry.driver_ref},
             ])
@@ -1039,17 +990,21 @@ class IndexDispatcher:
             # response shape the driver doesn't parse) was previously
             # indistinguishable from a real success in logs, leaving the
             # target index empty with no warning.  Pure upsert no-ops are
-            # converted to retryable failures so the batch routes through the
-            # durable outbox path (``_enqueue_or_warn``) and the
-            # storage-plane drain replays it post-commit.  Delete ops are
-            # unaffected — they have their own pass-through.
+            # converted to observable failures so the count is honest
+            # (``BulkResult.failed`` reflects reality); this inline path is
+            # only reached via the in-task-run absorption exception (see
+            # ``fan_out_bulk``), so — as with the breaker-open branch above —
+            # there is no pre-existing obligation to reactively re-enqueue.
+            # The item-tier obligation sweep (#2688) is the safety net for
+            # this class of gap.  Delete ops are unaffected — they have
+            # their own pass-through.
             if result.total > 0 and result.succeeded == 0 and result.failed == 0:
                 logger.warning(
                     "IndexDispatcher: indexer '%s' returned a silent no-op "
                     "(total=%d, succeeded=0, failed=0) for catalog=%s "
                     "collection=%s — index will be empty despite a "
                     "'successful' dispatch. Check the driver's bulk-response "
-                    "parser. Routing upsert ops to outbox for durable retry.",
+                    "parser.",
                     entry.driver_ref, result.total,
                     ctx.catalog, ctx.collection,
                 )
@@ -1062,7 +1017,6 @@ class IndexDispatcher:
                     )
                 ]
                 if noop_upserts:
-                    await self._enqueue_or_warn(entry, ctx, noop_upserts)
                     result = BulkResult(
                         total=result.total,
                         succeeded=result.succeeded,
@@ -1168,25 +1122,20 @@ class IndexDispatcher:
         *,
         bulk: bool = False,
     ) -> None:
-        policy = entry.on_failure
-        if policy == FailurePolicy.FATAL:
-            raise IndexerFatal(entry.driver_ref, op, exc) from exc
-        if policy == FailurePolicy.OUTBOX:
-            await self._enqueue_or_warn(entry, ctx, [op], original=exc)
-            return
-        if policy == FailurePolicy.WARN:
-            descriptor = _describe_op(op)
-            logger.warning(
-                "IndexDispatcher: indexer '%s' failed for %s "
-                "(policy=warn%s): %s",
-                entry.driver_ref, descriptor,
-                ", bulk" if bulk else "", exc,
-            )
-            return
-        # IGNORE — silent skip
-        logger.debug(
-            "IndexDispatcher: indexer '%s' failed (policy=ignore): %s",
-            entry.driver_ref, exc,
+        """Log and drop an inline-dispatch failure.
+
+        INDEX entries carry no per-entry failure policy.  This call site is
+        only reached via the in-task-run absorption exception (see the
+        module docstring), where the caller deliberately skipped the
+        proactive durable enqueue — there is nothing to compensate for
+        reactively, so failure handling belongs to the drain / the
+        item-tier obligation sweep (#2688), not to a retry attempt here.
+        """
+        descriptor = _describe_op(op)
+        logger.warning(
+            "IndexDispatcher: indexer '%s' failed for %s%s: %s",
+            entry.driver_ref, descriptor,
+            ", bulk" if bulk else "", exc,
         )
 
     async def _surface_partial_failures(
@@ -1267,30 +1216,17 @@ class IndexDispatcher:
         ops: Sequence[DispatchableOp],
         exc: BaseException,
     ) -> None:
-        """Apply ``entry.on_failure`` to a whole bulk batch in one call.
+        """Log and drop a whole failed bulk batch in one call.
 
-        FATAL still raises (preserves per-op semantics — the first op is
-        used as the IndexerFatal target). OUTBOX enqueues the batch as
-        chunked task rows. WARN/IGNORE log once at batch granularity
-        rather than per op so 500-item batches don't fan out logs.
+        Mirrors :meth:`_handle_failure`'s rationale — INDEX entries carry no
+        per-entry failure policy, and this call site is only reached via
+        the in-task-run absorption exception where nothing was proactively
+        enqueued to compensate for.  Logs once at batch granularity rather
+        than per op so 500-item batches don't fan out logs.
         """
-        policy = entry.on_failure
-        if policy == FailurePolicy.FATAL:
-            target = ops[0] if ops else None
-            raise IndexerFatal(entry.driver_ref, target, exc) from exc
-        if policy == FailurePolicy.OUTBOX:
-            await self._enqueue_or_warn(entry, ctx, ops, original=exc)
-            return
-        if policy == FailurePolicy.WARN:
-            logger.warning(
-                "IndexDispatcher: indexer '%s' failed for bulk batch of %d "
-                "(policy=warn): %s",
-                entry.driver_ref, len(ops), exc,
-            )
-            return
-        logger.debug(
-            "IndexDispatcher: indexer '%s' failed bulk (policy=ignore): %s",
-            entry.driver_ref, exc,
+        logger.warning(
+            "IndexDispatcher: indexer '%s' failed for bulk batch of %d: %s",
+            entry.driver_ref, len(ops), exc,
         )
 
     # Public diagnostic — operator-facing introspection of the routing
@@ -1304,8 +1240,7 @@ class IndexDispatcher:
             "indexers": [
                 {
                     "indexer_id": e.driver_ref,
-                    "write_mode": e.write_mode,
-                    "on_failure": e.on_failure,
+                    "lane": "INDEX",
                     "source": getattr(e, "source", None),
                     "registered": (await self._resolve_indexer(e.driver_ref)) is not None,
                 }
@@ -1313,62 +1248,39 @@ class IndexDispatcher:
             ],
         }
 
-    async def _enqueue_or_warn(
+    async def _enqueue_obligation(
         self,
         entry: OperationDriverEntry,
         ctx: IndexContext,
         ops: Sequence[DispatchableOp],
-        *,
-        original: Optional[BaseException] = None,
     ) -> int:
-        """Enqueue a batch of ops as chunked outbox rows when configured;
-        otherwise degrade to WARN.
+        """Durably enqueue a batch of ops via the wired :class:`OutboxWriterProtocol`.
 
-        Returns the count of ops actually handed to the outbox writer (0 on any
-        drop path).  Callers on the primary ASYNC path (``write_mode=ASYNC``)
-        must use this count to build ``BulkResult`` so that health-check logic
-        can distinguish "all accepted" from "silently dropped" — the three drop
-        paths below all return 0, which the ASYNC branch propagates as
-        ``failed=N`` rather than the false-success ``succeeded=N``.
+        The proactive (upfront) enqueue path for every INDEX-lane entry not
+        absorbed inline during a task run — see :meth:`fan_out_bulk` — and
+        the sole remaining caller of the generic outbox writer seam (the
+        item-tier storage-plane path enqueues directly via
+        :meth:`_enqueue_storage_plane_ids` instead).
 
-        Callers on the SYNC on_failure=OUTBOX path ignore the return value;
-        their best-effort behaviour is unchanged.
+        Returns the count of ops actually handed to the outbox writer (0 on
+        any drop path).  The caller uses this count to build ``BulkResult``
+        so health-check logic can distinguish "all accepted" from "silently
+        dropped".
 
-        Accepts a list so a 500-item bulk failure becomes one chunked
-        ``enqueue`` call rather than 500 per-row writes (see #500).
+        Accepts a list so a 500-item batch becomes one chunked ``enqueue``
+        call rather than 500 per-row writes (see #500).
         """
         if not ops:
             return 0
-        if in_task_run():
-            # #2494 instrumentation: with the storage-plane flag ON, item-tier
-            # ASYNC entries never reach this method (they route through
-            # ``_enqueue_storage_plane_ids`` instead) — this call firing while
-            # a task/job run is in progress should read ~0 once the flag is
-            # on. Non-item entries and SYNC on_failure=OUTBOX failures still
-            # legitimately land here regardless of the flag, so with the
-            # flag OFF this fires on every in-task-run ASYNC entry — DEBUG
-            # (review finding) so the default (flag-off) code path doesn't
-            # gain unconditional INFO volume.
-            logger.debug(
-                "index_dispatch_enqueue_or_warn_in_task_run indexer=%s "
-                "catalog=%s collection=%s op_count=%d",
-                entry.driver_ref, ctx.catalog, ctx.collection, len(ops),
-            )
         # Drop path (a): no outbox writer wired.
         if self._outbox is None:
             if entry.driver_ref not in self._outbox_warning_emitted:
                 self._outbox_warning_emitted.add(entry.driver_ref)
                 logger.warning(
-                    "IndexDispatcher: indexer '%s' has on_failure=outbox but "
-                    "no OutboxWriter is wired — failures degrade to WARN. "
-                    "Phase 2 will activate durable retry.",
+                    "IndexDispatcher: indexer '%s' is INDEX-lane but no "
+                    "OutboxWriter is wired — obligations cannot be "
+                    "durably enqueued.",
                     entry.driver_ref,
-                )
-            if original is not None:
-                logger.warning(
-                    "IndexDispatcher: indexer '%s' failed for %d ops "
-                    "(policy=outbox, degraded): %s",
-                    entry.driver_ref, len(ops), original,
                 )
             return 0
 
@@ -1386,8 +1298,8 @@ class IndexDispatcher:
             return 0
         # Drop path (b): caller has no open PG connection.
         # ``StoragePlaneOutboxWriter.enqueue`` checks this too but returns
-        # silently without raising — catch it here so the ASYNC caller
-        # receives the real failed count rather than a false success.
+        # silently without raising — catch it here so the caller receives
+        # the real failed count rather than a false success.
         if ctx.pg_conn is None:
             logger.warning(
                 "IndexDispatcher: cannot enqueue %d op(s) for indexer '%s' — "
@@ -1397,23 +1309,14 @@ class IndexDispatcher:
             )
             return 0
         try:
-            await enqueue(
-                indexer_id=entry.driver_ref,
-                ctx=ctx,
-                ops=ops,
-                last_error=str(original) if original else None,
-            )
+            await enqueue(indexer_id=entry.driver_ref, ctx=ctx, ops=ops)
             return len(ops)
         except Exception as enqueue_exc:
             # Drop path (c): transient PG error during enqueue.
-            # We do NOT escalate to FATAL here because the upstream caller has
-            # already chosen OUTBOX as a tolerant policy; surfacing this as
-            # fatal would surprise them.  The ASYNC caller converts 0 to
-            # failed=N so health-check can escalate via its own policy.
             logger.error(
-                "IndexDispatcher: outbox enqueue failed for indexer '%s' "
-                "on %d ops — original error: %s, enqueue error: %s",
-                entry.driver_ref, len(ops), original, enqueue_exc,
+                "IndexDispatcher: obligation enqueue failed for indexer "
+                "'%s' on %d ops: %s",
+                entry.driver_ref, len(ops), enqueue_exc,
             )
             return 0
 
@@ -1435,7 +1338,7 @@ class IndexDispatcher:
         call) so the enqueue is co-transactional with that TX; falls back to
         opening a short transaction via ``tx_factory`` for the in-task-run
         inline path. Returns the count of ops actually enqueued (0 on any
-        drop path), mirroring :meth:`_enqueue_or_warn`'s health-check
+        drop path), mirroring :meth:`_enqueue_obligation`'s health-check
         contract so ``BulkResult.succeeded`` reflects reality.
         """
         if not ops:
@@ -1463,7 +1366,7 @@ class IndexDispatcher:
                         ctx.pg_conn, catalog_id=ctx.catalog, rows=id_only_records,
                     )
                 return total_records
-            except Exception as exc:  # noqa: BLE001 — degrade like _enqueue_or_warn
+            except Exception as exc:  # noqa: BLE001 — degrade like _enqueue_obligation
                 logger.error(
                     "IndexDispatcher: storage-plane enqueue failed "
                     "for indexer '%s' (catalog=%s collection=%s): %s",
@@ -1483,7 +1386,7 @@ class IndexDispatcher:
                             conn, catalog_id=ctx.catalog, rows=id_only_records,
                         )
                 return total_records
-            except Exception as exc:  # noqa: BLE001 — degrade like _enqueue_or_warn
+            except Exception as exc:  # noqa: BLE001 — degrade like _enqueue_obligation
                 logger.error(
                     "IndexDispatcher: storage-plane enqueue (short "
                     "TX) failed for indexer '%s' (catalog=%s collection=%s): "

@@ -1226,18 +1226,29 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         # single point all writers cross.
         await self._enforce_strict_unknown_fields(catalog_id, collection_id, items_list)
 
+        # ── Read-only gate (#2494) ─────────────────────────────────────────
+        # An empty or absent WRITE lane is a valid configuration meaning
+        # "this collection is read-only" — reject at dispatch, before any
+        # driver call, with a clean typed 405 rather than an IndexError on
+        # an empty resolved-drivers list further down.
+        from dynastore.modules.storage.router import get_write_drivers
+        resolved_drivers = await get_write_drivers(catalog_id, collection_id)
+        if not resolved_drivers:
+            from dynastore.modules.storage.errors import ReadOnlyCollectionError
+
+            raise ReadOnlyCollectionError(
+                f"Collection '{catalog_id}/{collection_id}' is read-only — "
+                "operations[WRITE] is empty.",
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+                entity="item",
+            )
+
         # ── Branch A: non-PG primary write driver ─────────────────────────
         # When the primary WRITE driver is not postgresql, delegate the entire
         # write to that driver.  PG-specific logic (sidecars, hub table, sidecar
         # payloads, QueryOptimizer) is skipped — the driver owns its own write path.
         # Post-commit fan-out and event emission still run after this branch.
-        #
-        # Trust the waterfall: ItemsRoutingConfig.operations[WRITE] has a
-        # code-level default of [ItemsPostgresqlDriver], so this list is
-        # never empty in a correctly bootstrapped deploy. If it is empty, the
-        # resolver surfaces ConfigResolutionError → HTTP 500 ops alert.
-        from dynastore.modules.storage.router import get_write_drivers
-        resolved_drivers = await get_write_drivers(catalog_id, collection_id)
         primary = resolved_drivers[0]
 
         # Pre-write 10 MB geometry guard (#1248). Runs before BOTH the
@@ -2342,23 +2353,22 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         Single dispatcher call site for items, replacing the per-driver
         ``_on_item_upsert`` event listeners.  Driver-agnostic: ES public,
         ES private, vector DB, audit log — anything implementing the slim
-        :class:`Indexer` Protocol and pinned as a secondary-index
-        ``WRITE`` entry (``secondary_index=True``) in ``operations[WRITE]``.
+        :class:`Indexer` Protocol pinned in the INDEX lane
+        (``ItemsRoutingConfig.operations[INDEX]``).
 
-        Failure surfaces are decided by routing-config ``on_failure`` per
-        entry — ``OUTBOX`` enqueues a durable retry row, ``WARN`` logs,
-        ``FATAL`` raises out of this method.
+        INDEX entries carry no per-entry failure policy: obligations are
+        enqueued durably up front (see :meth:`IndexDispatcher.fan_out_bulk`);
+        a failure inside the dispatcher is logged and absorbed here, never
+        raised — this method never rolls back the caller's write.
 
-        Phase 2f atomic OUTBOX: when an engine is supplied, the dispatch
+        Phase 2f atomic enqueue: when an engine is supplied, the dispatch
         is wrapped in its own ``managed_transaction`` so ``ctx.pg_conn``
         is non-None.  ``StoragePlaneOutboxWriter.enqueue`` (via
         ``enqueue_storage_op_id_only`` / ``enqueue_storage_op_write_id``)
-        and the indexer attempt then live in the same TX — outbox writes
-        are durable instead of being skipped with a warning.  Cost: one
-        extra TX open/commit per dispatch call (cheap vs the indexer
-        round-trip).  Non-OUTBOX policies (FATAL, WARN, IGNORE) are
-        unaffected by the wrapping TX since they don't write to the outbox
-        table.
+        and the indexer attempt then live in the same TX — obligation
+        writes are durable instead of being skipped with a warning.  Cost:
+        one extra TX open/commit per dispatch call (cheap vs the indexer
+        round-trip).
 
         Identity tracking fields (``_external_id`` derived per-item from the
         write policy's ``external_id_path``; ``_asset_id`` from the ingestion
@@ -2483,10 +2493,10 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
 
         Returns the per-indexer :class:`BulkResult` dict from
         :meth:`~IndexDispatcher.fan_out_bulk` so callers can inspect
-        secondary-index health without additional round-trips.
+        index health without additional round-trips.  INDEX-lane failures
+        never propagate here — see :meth:`_dispatch_index_upsert`.
         """
         from dynastore.models.protocols.indexer import IndexContext
-        from dynastore.modules.storage.index_dispatcher import IndexerFatal
         from dynastore.tools.correlation import get_correlation_id
 
         ctx = IndexContext(
@@ -2498,12 +2508,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         )
         try:
             return await dispatcher.fan_out_bulk(ctx, ops, tx_factory=tx_factory)
-        except IndexerFatal:
-            # FATAL contract: a routing entry with on_failure=FATAL
-            # MUST propagate so the caller's TX rolls back.  Don't
-            # swallow.
-            raise
-        except Exception as e:  # noqa: BLE001 — non-FATAL paths absorb errors
+        except Exception as e:  # noqa: BLE001 — index dispatch never blocks a write
             logger.warning(
                 "Index dispatcher fan-out failed for %s/%s (%d items): %s",
                 catalog_id, collection_id, len(ops), e,
@@ -2616,50 +2621,47 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         db_resource: Optional[DbResource] = None,
         processing_context: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        """Atomic bulk upsert with same-item coalescing + outbox enqueue.
+        """Atomic bulk upsert with same-item coalescing + obligation enqueue.
 
         Opens ONE wrapping TX and performs three actions inside it:
 
         1. **Coalesce** input items by ``id`` (latest wins). Three ops on
-           the same id collapse to a single PG row + a single outbox row,
-           halving outbox volume on hot-update collections without losing
-           fidelity (a consumer applying the original ops in order would
-           converge on the same final state).
-        2. **Run FATAL routing entries inline** — every entry under
-           ``ItemsRoutingConfig.operations[WRITE]`` with
-           ``on_failure=FATAL`` and ``write_mode=SYNC`` writes through
+           the same id collapse to a single PG row + a single obligation
+           row, halving obligation volume on hot-update collections
+           without losing fidelity (a consumer applying the original ops
+           in order would converge on the same final state).
+        2. **Run FATAL WRITE-lane entries inline** — every
+           ``on_failure=FATAL`` entry under
+           ``ItemsRoutingConfig.operations[WRITE]`` writes through
            ``CollectionItemsStore.write_entities`` on the wrapping conn.
            Any driver failure raises out of the TX, rolling everything
-           back.
-        3. **Enqueue outbox rows for ASYNC OUTBOX entries** — every
-           secondary-index ``WRITE`` entry (``secondary_index=True``) in
-           ``operations[WRITE]`` with ``write_mode=ASYNC`` and
-           ``on_failure=OUTBOX`` gets one outbox row per coalesced item,
-           via ``OutboxStore.enqueue_bulk(conn, ...)`` on the SAME conn.
-           A failed enqueue rolls back the PG write — the central
-           guarantee that closes the PG/secondary-index drift hole.
+           back. A ``warn`` WRITE entry is out of scope for this bypass
+           path (unaffected — same as before the lane cutover).
+        3. **Enqueue obligation rows for the INDEX lane** — every
+           ``ItemsRoutingConfig.operations[INDEX]`` entry gets one
+           obligation row per coalesced item, via
+           ``enqueue_storage_op_write_id`` / ``enqueue_storage_op_id_only``
+           on the SAME conn. A failed enqueue rolls back the PG write —
+           the central guarantee that closes the PG/index drift hole.
 
-        Bypasses :class:`IndexDispatcher` for the OUTBOX-enqueue case
-        (we already have the routing in hand and want to share the conn);
-        the dispatcher's missing-indexer path remains the entry point for
-        per-call ops without explicit routing knowledge. ``WARN`` /
-        ``IGNORE`` secondary-index entries are not enqueued here — they're
-        tolerant by design and are still handled by the post-commit
-        dispatcher path on the legacy :meth:`upsert` flow.
+        Bypasses :class:`IndexDispatcher` for the enqueue case (we already
+        have the routing in hand and want to share the conn); the
+        dispatcher's missing-indexer path remains the entry point for
+        per-call ops without explicit routing knowledge.
 
-        Each OUTBOX record's payload carries the same canonical identity +
-        access-envelope stamping as the read-back dispatch path (#1287):
-        ``_external_id`` from the write policy's ``external_id_path``,
-        ``_asset_id`` from ``processing_context``, and — when the collection
-        routes WRITE to an access-aware driver — ``_visibility`` / ``_owner``.
-        Stamping is applied to a per-record copy, so the
-        inline FATAL ``write_entities`` (primary store) write still receives the
-        unstamped items.
+        Each obligation record's payload carries the same canonical
+        identity + access-envelope stamping as the read-back dispatch path
+        (#1287): ``_external_id`` from the write policy's
+        ``external_id_path``, ``_asset_id`` from ``processing_context``,
+        and — when the collection routes WRITE to an access-aware driver —
+        ``_visibility`` / ``_owner``. Stamping is applied to a per-record
+        copy, so the inline WRITE-lane (primary store) write still
+        receives the unstamped items.
 
         Test injection seams (set on the instance, not the constructor):
         ``_test_routing_resolver``, ``_test_driver_registry``,
         ``_test_managed_transaction``. When None, the method resolves through
-        the production helpers. The async-OUTBOX enqueue always goes through
+        the production helpers. The obligation enqueue always goes through
         the module-level ``enqueue_storage_op`` (#1807 P4), which tests patch
         directly — there is no separate outbox-store seam.
         """
@@ -2668,7 +2670,7 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             compute_driver_instance_id,
         )
         from dynastore.modules.storage.routing_config import (
-            FailurePolicy, Operation, WriteMode,
+            FailurePolicy, Operation,
         )
         from dynastore.tools.identifiers import generate_uuidv7
 
@@ -2705,19 +2707,15 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             )
 
         ops_map = getattr(routing, "operations", {}) or {}
-        from dynastore.modules.storage.routing_config import (
-            secondary_index_entries,
-        )
+        from dynastore.modules.storage.routing_config import index_entries
+
         write_entries = list(ops_map.get(Operation.WRITE, []))
 
         fatal_entries = [
             e for e in write_entries
             if e.on_failure == FailurePolicy.FATAL
-            and e.write_mode == WriteMode.SYNC
         ]
-        async_outbox_entries = secondary_index_entries(
-            ops_map, async_outbox_only=True,
-        )
+        async_outbox_entries = index_entries(ops_map)
 
         # ── Resolve driver registry (test seam first) ─────────────────
         registry = getattr(self, "_test_driver_registry", None)
@@ -2877,20 +2875,20 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         *,
         _primary_already_written: bool = True,
     ) -> None:
-        """Fan-out writes to secondary drivers after the primary commit.
+        """Fan-out writes to secondary WRITE-lane drivers after the primary commit.
 
         ``_primary_already_written=True`` (default) skips position 0 (primary)
         since it was already written by the caller (Branch A or B in ``upsert``).
 
-        Sync drivers run in parallel (``asyncio.gather``).  If any sync
-        driver fails, drivers that succeeded and declare
-        ``DriverCapability.TRANSACTIONAL`` are compensated (delete).
-
-        Async drivers fire after the sync phase succeeds (fire-and-forget).
+        WRITE is synchronous by lane definition: every secondary runs in
+        parallel (``asyncio.gather``).  If any driver with ``on_failure=fatal``
+        fails, drivers that succeeded and declare
+        ``DriverCapability.TRANSACTIONAL`` are compensated (delete) and the
+        failure propagates; a ``warn`` driver's failure is logged and
+        fan-out continues.
         """
-        from dynastore.modules.concurrency import run_in_background
         from dynastore.modules.storage.router import get_write_drivers, ResolvedDriver
-        from dynastore.modules.storage.routing_config import FailurePolicy, WriteMode
+        from dynastore.modules.storage.routing_config import FailurePolicy
 
         try:
             resolved = await get_write_drivers(catalog_id, collection_id)
@@ -2900,16 +2898,13 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         # Position 0 is the primary driver — already written by the caller.
         secondaries = resolved[1:] if _primary_already_written else resolved
         # Item-indexer drivers (the ES public/private drivers —
-        # ``is_item_indexer=True``, pinned as ``secondary_index=True`` WRITE
-        # entries) are owned by the index dispatcher
-        # (``_dispatch_index_upsert`` → ``index_bulk``), which stamps the
-        # canonical identity (``_external_id`` / ``_asset_id``) onto the index
-        # payload. Fanning them out here as storage drivers too would
-        # double-write the same index via ``write_entities`` — which rebuilds
-        # the tenant doc from the read-back Feature (no identity, no context)
-        # and races the dispatcher's stamped write (last-writer-wins drops the
-        # identity fields, #1289). The dispatcher is their single write path
-        # (role separation, #990); skip them here.
+        # ``is_item_indexer=True``) live in the INDEX lane, never WRITE, so
+        # ``get_write_drivers`` structurally cannot return one — this filter
+        # is a defensive no-op against a stale/misconfigured persisted
+        # config. The index dispatcher (``_dispatch_index_upsert`` →
+        # ``index_bulk``) is their single write path (role separation,
+        # #990); double-writing here would race its stamped identity fields
+        # (``_external_id`` / ``_asset_id``, #1289).
         secondaries = [
             r for r in secondaries
             if not getattr(type(r.driver), "is_item_indexer", False)
@@ -2917,75 +2912,36 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         if not secondaries:
             return
 
-        sync_drivers = [r for r in secondaries if r.write_mode == WriteMode.SYNC]
-        async_drivers = [r for r in secondaries if r.write_mode == WriteMode.ASYNC]
+        tasks = [
+            r.driver.write_entities(catalog_id, collection_id, features)
+            for r in secondaries
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # ── Sync phase: parallel writes ───────────────────────────────
-        if sync_drivers:
-            tasks = [
-                r.driver.write_entities(catalog_id, collection_id, features)
-                for r in sync_drivers
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+        succeeded: List[ResolvedDriver] = []
+        has_fatal = False
+        first_fatal_exc: Optional[Exception] = None
 
-            succeeded: List[ResolvedDriver] = []
-            has_fatal = False
-            first_fatal_exc: Optional[Exception] = None
-
-            for r, result in zip(sync_drivers, results):
-                if isinstance(result, BaseException):
-                    if r.on_failure == FailurePolicy.FATAL:
-                        has_fatal = True
-                        if first_fatal_exc is None:
-                            first_fatal_exc = result if isinstance(result, Exception) else RuntimeError(str(result))
-                    elif r.on_failure == FailurePolicy.WARN:
-                        logger.warning(
-                            "Secondary sync driver '%s' write failed for %s/%s: %s",
-                            r.driver_ref, catalog_id, collection_id, result,
-                        )
-                    # IGNORE: silent
+        for r, result in zip(secondaries, results):
+            if isinstance(result, BaseException):
+                if r.on_failure == FailurePolicy.FATAL:
+                    has_fatal = True
+                    if first_fatal_exc is None:
+                        first_fatal_exc = result if isinstance(result, Exception) else RuntimeError(str(result))
                 else:
-                    succeeded.append(r)
+                    logger.warning(
+                        "Secondary driver '%s' write failed for %s/%s: %s",
+                        r.driver_ref, catalog_id, collection_id, result,
+                    )
+            else:
+                succeeded.append(r)
 
-            if has_fatal:
-                # Compensate succeeded sync drivers that support rollback
-                await self._compensate_drivers(
-                    succeeded, catalog_id, collection_id, features
-                )
-                raise first_fatal_exc  # type: ignore[misc]
-
-        # ── Async phase: fire-and-forget ──────────────────────────────
-        # ``run_in_background`` holds a strong reference so the loop cannot
-        # GC the task mid-execution and silently drop the secondary write.
-        for r in async_drivers:
-            run_in_background(
-                self._async_secondary_write(r, catalog_id, collection_id, features),
-                name=f"item_secondary_write:{r.driver_ref}:{catalog_id}/{collection_id}",
+        if has_fatal:
+            # Compensate succeeded drivers that support rollback
+            await self._compensate_drivers(
+                succeeded, catalog_id, collection_id, features
             )
-
-    async def _async_secondary_write(
-        self,
-        resolved: "ResolvedDriver",
-        catalog_id: str,
-        collection_id: str,
-        features: List[Feature],
-    ) -> None:
-        """Fire-and-forget wrapper with logging on failure."""
-        from dynastore.modules.storage.routing_config import FailurePolicy
-
-        try:
-            await resolved.driver.write_entities(catalog_id, collection_id, features)
-        except Exception as err:
-            if resolved.on_failure == FailurePolicy.FATAL:
-                logger.error(
-                    "Async secondary driver '%s' FATAL write failed for %s/%s: %s",
-                    resolved.driver_ref, catalog_id, collection_id, err,
-                )
-            elif resolved.on_failure == FailurePolicy.WARN:
-                logger.warning(
-                    "Async secondary driver '%s' write failed for %s/%s: %s",
-                    resolved.driver_ref, catalog_id, collection_id, err,
-                )
+            raise first_fatal_exc  # type: ignore[misc]
 
     async def _compensate_drivers(
         self,

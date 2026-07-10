@@ -2129,14 +2129,14 @@ class TestIndexBulkResponseShapes:
 class TestIndexAndIndexBulkPgCanonicalDetection:
     """Follow-up to #2864/#2884: ``write_entities`` was fixed to skip the PG
     canonical read for ES-only routing, but ``index`` and ``index_bulk`` —
-    reached via the secondary-indexer dispatch fan-out for collections whose
-    single WRITE entry is both primary and ``secondary_index=True`` — called
+    reached via the index-dispatcher fan-out for collections whose only
+    materialization target is the ES driver — called
     ``read_canonical_index_inputs`` unconditionally. On a real ES-only
     collection this deterministically raised ``_fetch_raw_rows``'s "cannot
-    resolve physical table" RuntimeError as an ``IndexerFatal``, which
-    propagated out of ``ItemService.upsert`` even though the primary write
-    had already committed — surfacing as a stuck/looping harvest job that
-    never progressed."""
+    resolve physical table" RuntimeError, which propagated out of
+    ``ItemService.upsert`` even though the primary write had already
+    committed — surfacing as a stuck/looping harvest job that never
+    progressed."""
 
     @pytest.mark.asyncio
     async def test_index_bulk_skips_pg_read_and_builds_feature_derived_doc(self):

@@ -133,16 +133,16 @@ async def maybe_dispatch_items_to_search_driver(
     has_complex_filter: bool = False,
     request: Optional[Request] = None,
 ) -> Optional[QueryResponse]:
-    """Dispatch an OGC ``/items`` listing to the collection's routing-pinned
-    items SEARCH driver, when one is configured and search-capable.
+    """Dispatch an OGC ``/items`` listing to the collection's derived search
+    driver, when one is configured and search-capable.
 
     Used by the OGC API - Features and OGC API - Records ``/items`` endpoints
-    so they resolve the items SEARCH driver via routing
-    (:func:`router.get_items_search_driver` — ``Operation.SEARCH`` then a
+    so they resolve the items search driver via the derived-search pool
+    (:func:`router.get_items_search_driver` — INDEX lane preferred, then a
     ``READ`` fallback) and dispatch the structural query to **that driver**
     through its streaming ``read_entities`` + ``count_entities`` contract —
     exactly as STAC ``/search`` does. A public-ES catalog, a GEOID-style
-    catalog routing SEARCH to its tenant-private ES index, or any future
+    catalog routing search to its tenant-private ES index, or any future
     ES items driver are all served the same way, with no hardcoded driver
     class (#1047).
 

@@ -154,7 +154,9 @@ class TestPresetApplyAgainstRealConfigsService:
     ):
         """POST .../presets/public_catalog → 200, and the catalog +
         collection routing tiers are persisted at catalog scope with the
-        public ES drivers pinned in ``operations[WRITE]``.
+        public ES drivers pinned in ``operations[INDEX]`` (the #2494 lane
+        model — materialization/derived-search targets live in INDEX, not
+        WRITE).
 
         Reading back via ``get_persisted_config`` (tier-local, no
         waterfall) proves the rows were actually written at the catalog
@@ -187,13 +189,14 @@ class TestPresetApplyAgainstRealConfigsService:
             "catalog scope — apply bypassed set_config or wrote the wrong tier."
         )
         catalog_write_drivers = _write_drivers(catalog_row, "WRITE")
-        assert PUBLIC_CATALOG_ES_DRIVER in catalog_write_drivers, (
-            f"catalog routing WRITE drivers {sorted(catalog_write_drivers)} "
+        assert CATALOG_PG_DRIVER in catalog_write_drivers, (
+            "catalog routing WRITE must pin the PG primary store."
+        )
+        catalog_index_drivers = _write_drivers(catalog_row, "INDEX")
+        assert PUBLIC_CATALOG_ES_DRIVER in catalog_index_drivers, (
+            f"catalog routing INDEX drivers {sorted(catalog_index_drivers)} "
             f"must pin the public catalog ES driver — the preset is supposed "
             f"to make the catalog globally navigable."
-        )
-        assert CATALOG_PG_DRIVER in catalog_write_drivers, (
-            "catalog routing WRITE must still pin the PG primary store."
         )
 
         collection_row = await configs.get_persisted_config(
@@ -203,10 +206,10 @@ class TestPresetApplyAgainstRealConfigsService:
             "public_catalog apply did not persist a CollectionRoutingConfig "
             "template at catalog scope."
         )
-        collection_write_drivers = _write_drivers(collection_row, "WRITE")
-        assert PUBLIC_COLLECTION_ES_DRIVER in collection_write_drivers, (
-            f"collection template WRITE drivers "
-            f"{sorted(collection_write_drivers)} must pin the public "
+        collection_index_drivers = _write_drivers(collection_row, "INDEX")
+        assert PUBLIC_COLLECTION_ES_DRIVER in collection_index_drivers, (
+            f"collection template INDEX drivers "
+            f"{sorted(collection_index_drivers)} must pin the public "
             f"collection ES driver."
         )
 
@@ -240,13 +243,14 @@ class TestPresetApplyAgainstRealConfigsService:
         catalog_row = await configs.get_persisted_config(
             CatalogRoutingConfig, catalog_id=catalog_id
         )
-        assert PUBLIC_CATALOG_ES_DRIVER not in _write_drivers(catalog_row, "WRITE"), (
+        assert PUBLIC_CATALOG_ES_DRIVER not in _write_drivers(catalog_row, "INDEX"), (
             "private_catalog preset must leave the catalog non-public for the "
             "guard precondition to hold."
         )
 
         # 2. Attempt to write a PUBLIC collection routing config (pins the
-        #    public collection ES driver in WRITE) under the private parent.
+        #    public collection ES driver in INDEX — the #2494 lane-model
+        #    membership key) under the private parent.
         public_collection_routing = {
             "operations": {
                 "WRITE": [
@@ -255,13 +259,6 @@ class TestPresetApplyAgainstRealConfigsService:
                         "hints": [],
                         "on_failure": "fatal",
                     },
-                    {
-                        "driver_ref": PUBLIC_COLLECTION_ES_DRIVER,
-                        "hints": [],
-                        "on_failure": "outbox",
-                        "secondary_index": True,
-                        "source": "auto",
-                    },
                 ],
                 "READ": [
                     {
@@ -269,6 +266,13 @@ class TestPresetApplyAgainstRealConfigsService:
                         "hints": [],
                         "on_failure": "fatal",
                     }
+                ],
+                "INDEX": [
+                    {
+                        "driver_ref": PUBLIC_COLLECTION_ES_DRIVER,
+                        "hints": [],
+                        "source": "auto",
+                    },
                 ],
             }
         }

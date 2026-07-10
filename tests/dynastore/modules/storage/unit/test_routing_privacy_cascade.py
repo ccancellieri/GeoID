@@ -26,27 +26,22 @@ no longer exist.
 """
 from __future__ import annotations
 
-import pytest
-
 from dynastore.modules.storage.routing_config import (
     FailurePolicy,
     ItemsRoutingConfig,
     Operation,
     OperationDriverEntry,
-    WriteMode,
     _items_routing_has_private_driver,
 )
 
 
-def _items_routing_with_private(*, operation: str = Operation.WRITE) -> ItemsRoutingConfig:
+def _items_routing_with_private(*, operation: str = Operation.INDEX) -> ItemsRoutingConfig:
     return ItemsRoutingConfig(
         operations={
             operation: [
                 OperationDriverEntry(
                     driver_ref="items_elasticsearch_private_driver",
-                    on_failure=FailurePolicy.OUTBOX,
-                    write_mode=WriteMode.ASYNC,
-                    secondary_index=True,
+                    source="auto",
                 ),
             ],
         },
@@ -80,7 +75,7 @@ def test_items_has_private_driver_returns_false_when_absent():
 
 
 def test_items_has_private_driver_finds_entry_in_any_operation():
-    for op in (Operation.WRITE, Operation.READ, Operation.SEARCH):
+    for op in (Operation.WRITE, Operation.READ, Operation.INDEX):
         routing = _items_routing_with_private(operation=op)
         assert _items_routing_has_private_driver(routing) is True, (
             f"private driver in operations[{op}] must satisfy the cascade gate"

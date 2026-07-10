@@ -91,7 +91,6 @@ def _build_local_asset_routing() -> Any:
         FailurePolicy,
         Operation,
         OperationDriverEntry,
-        WriteMode,
     )
 
     return AssetRoutingConfig(
@@ -100,7 +99,6 @@ def _build_local_asset_routing() -> Any:
                 OperationDriverEntry(
                     driver_ref="local_upload_module",
                     on_failure=FailurePolicy.FATAL,
-                    write_mode=WriteMode.SYNC,
                     source="operator",
                 ),
             ],

@@ -85,16 +85,19 @@ def _pick_operation(request: Optional[QueryRequest]) -> str:
     """Choose the routing operation based on query content.
 
     Genuine search predicates (bbox/spatial, attribute filters, CQL2,
-    fulltext) → SEARCH operation. A plain browse → READ operation.
+    fulltext) → INDEX operation (the derived-search lane — see
+    :func:`_try_driver_dispatch` and
+    :func:`~dynastore.modules.storage.router.get_items_search_driver`).
+    A plain browse → READ operation.
 
     Temporal-validity conditions are NOT search predicates: every OGC
     features browse carries an implicit ``validity @> now()`` default
     (``parse_ogc_query_request`` appends it whenever no ``datetime`` is
     supplied), and an explicit ``?datetime=`` is the standard OGC browse
     parameter. Both are READ modifiers applied uniformly on the read
-    backend, so they must not flip a browse onto the SEARCH backend. Were
+    backend, so they must not flip a browse onto the search backend. Were
     they counted, ``request.filters`` would never be empty and every
-    ``/items`` browse would be misrouted to the SEARCH primary (ES),
+    ``/items`` browse would be misrouted to the search primary (ES),
     bypassing the operator's READ routing (PG/geometry-exact) and losing
     the total count.
     """
@@ -103,10 +106,10 @@ def _pick_operation(request: Optional[QueryRequest]) -> str:
     if request is None:
         return Operation.READ
     if getattr(request, "cql_filter", None):
-        return Operation.SEARCH
+        return Operation.INDEX
     filters = getattr(request, "filters", None) or []
     if any(getattr(fc, "field", None) != "validity" for fc in filters):
-        return Operation.SEARCH
+        return Operation.INDEX
     return Operation.READ
 
 
@@ -177,6 +180,13 @@ async def _try_driver_dispatch(
     - The resolved driver is ``postgresql`` (PG path is the correct path).
     - Driver resolution raises any exception.
 
+    ``operation=Operation.INDEX`` (set by :func:`_pick_operation` for genuine
+    search predicates) resolves through the derived search pool —
+    :func:`~dynastore.modules.storage.router.get_items_search_driver` tries
+    the INDEX lane first (ranked by ``Hint.SEARCH`` preference), falling
+    back to the READ lane — instead of the single-lane
+    :func:`~dynastore.modules.storage.router.get_driver`.
+
     ``hints`` are forwarded to driver resolution. A caller that needs the
     full-precision PG geometry path (e.g. the DWH join / feature export) passes
     ``{Hint.JOIN}`` (or ``{Hint.GEOMETRY_EXACT}``): the default READ routing
@@ -186,12 +196,18 @@ async def _try_driver_dispatch(
     default routing (ES-first) is preserved.
     """
     try:
-        from dynastore.modules.storage.router import get_driver
+        from dynastore.modules.storage.router import get_driver, get_items_search_driver
+        from dynastore.modules.storage.routing_config import Operation
     except ImportError:
         return None
 
     try:
-        resolved = await get_driver(operation, catalog_id, collection_id, hints=hints)
+        if operation == Operation.INDEX:
+            resolved = (
+                await get_items_search_driver(catalog_id, collection_id, hints=hints)
+            ).driver
+        else:
+            resolved = await get_driver(operation, catalog_id, collection_id, hints=hints)
     except Exception:
         return None
 
@@ -1608,14 +1624,13 @@ class ItemQueryMixin:
         *,
         write_id: str,
     ) -> None:
-        """Enqueue a lightweight write-id delete row per async index target.
+        """Enqueue a lightweight write-id delete row per INDEX-lane target.
 
-        Symmetric counterpart to ``ItemService.upsert_bulk``'s async-OUTBOX
-        enqueue: resolve the secondary-index ``WRITE`` entries
-        (``secondary_index=True``) in ``ItemsRoutingConfig.operations[WRITE]``
-        that are ``write_mode=ASYNC`` + ``on_failure=OUTBOX`` and write one
-        ``WriteIdOutboxRecord(op="delete")`` per target onto the caller's
-        transaction. The drain reads tombstoned hub ids by ``write_id``.
+        Symmetric counterpart to ``ItemService.upsert_bulk``'s obligation
+        enqueue: resolve ``ItemsRoutingConfig.operations[INDEX]`` and write
+        one ``WriteIdOutboxRecord(op="delete")`` per target onto the
+        caller's transaction. The drain reads tombstoned hub ids by
+        ``write_id``.
 
         Honours the ``_test_routing_resolver`` / ``_test_driver_registry``
         seams (as ``upsert_bulk`` does) so this can be unit-tested without a
@@ -1649,13 +1664,9 @@ class ItemQueryMixin:
             )
 
         ops_map = getattr(routing, "operations", {}) or {}
-        from dynastore.modules.storage.routing_config import (
-            Operation,
-            secondary_index_entries,
-        )
-        async_outbox_entries = secondary_index_entries(
-            ops_map, async_outbox_only=True,
-        )
+        from dynastore.modules.storage.routing_config import Operation, index_entries
+
+        async_outbox_entries = index_entries(ops_map)
         if not async_outbox_entries:
             return
 
@@ -2054,9 +2065,11 @@ class ItemQueryMixin:
         """
         Search and retrieve items using optimized query generation.
 
-        Dispatches to the SEARCH-capable storage driver first.  Falls back
-        to the PostgreSQL path when no routing config exists or when
-        ``postgresql`` is the configured driver.
+        Dispatches to the derived search-capable storage driver first (the
+        INDEX lane, falling back to READ — see
+        :func:`~dynastore.modules.storage.router.get_items_search_driver`).
+        Falls back to the PostgreSQL path when no routing config exists or
+        when ``postgresql`` is the configured driver.
 
         Note: returns a list for backwards compatibility.  Callers that need
         streaming should use ``stream_items()`` instead.
@@ -2067,7 +2080,7 @@ class ItemQueryMixin:
         limit = request.limit if request and request.limit else 100
         offset = request.offset if request and request.offset else 0
         driver_response = await _try_driver_dispatch(
-            catalog_id, collection_id, Operation.SEARCH, request, limit, offset,
+            catalog_id, collection_id, Operation.INDEX, request, limit, offset,
             hints=_derive_hints_from_request(request),
         )
         if driver_response is not None:

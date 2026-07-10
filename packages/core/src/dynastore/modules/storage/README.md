@@ -13,7 +13,7 @@ appropriate per-tier routing config (`ItemsRoutingConfig` / `CollectionRoutingCo
 
 | File | Purpose |
 |------|---------|
-| `routing_config.py` | `ItemsRoutingConfig` / `CollectionRoutingConfig` / `AssetRoutingConfig` / `CatalogRoutingConfig` — operation-based routing (post-PR-#261); `Operation`, `OperationDriverEntry`, `FailurePolicy`, `WriteMode` |
+| `routing_config.py` | `ItemsRoutingConfig` / `CollectionRoutingConfig` / `AssetRoutingConfig` / `CatalogRoutingConfig` — lane-based routing (#2494); `Operation` (`WRITE` / `READ` / `INDEX` / `UPLOAD`), `OperationDriverEntry`, `FailurePolicy` |
 | `hints.py` | `Hint` (closed `StrEnum`) — selectivity tags advertised by drivers and consumed by the router |
 | `driver_config.py` | `ItemsWritePolicy`, `ItemsSchema`, per-driver `*DriverConfig` classes (PluginConfig waterfall) |
 | `router.py` | `get_driver(operation, catalog_id, collection_id, hints=...)` — cached operation-based resolution |
@@ -46,22 +46,27 @@ written = await driver.write_entities(catalog_id, collection_id, feature_collect
 ## Configuration
 
 Routing is set via `ConfigsProtocol` at platform / catalog / collection level and resolved via the
-4-tier waterfall. **Operation-based** post-PR-#261: `operations: Dict[Operation, List[OperationDriverEntry]]`
-where each `Operation` (`WRITE` / `READ` / `SEARCH` / `UPLOAD`) maps to an
-ordered list of drivers with per-entry `on_failure` / `write_mode` / `hints` / `source`.
-Secondary indexes are not a distinct operation: a secondary index is a `WRITE` entry flagged
-`secondary_index=true` (typically `write_mode: async`, `on_failure: outbox`), propagated by the
-ReindexWorker — see the async ES driver in the `WRITE` list below.
+4-tier waterfall. **Lane-based** (#2494): `operations: Dict[Operation, List[OperationDriverEntry]]`
+where each lane maps to an ordered list of drivers with per-entry `hints` / `source` (`on_failure`
+is WRITE-lane only — `fatal` or `warn`):
+
+- `READ` — mandatory, ordered, first-match (hint-filtered).
+- `WRITE` — optional client-write fan-out, synchronous. Empty/absent means read-only.
+- `INDEX` — optional async materialization target set (search-capable sinks). Search is *derived*,
+  not configured: INDEX-lane entries first, then READ-lane fallback — see `router.get_items_search_driver`.
+- `UPLOAD` — asset upload backend selection.
 
 ```json
 {"operations": {
   "WRITE": [
-    {"driver_ref": "items_postgresql_driver", "on_failure": "fatal"},
-    {"driver_ref": "items_elasticsearch_driver", "write_mode": "async", "on_failure": "outbox"}
+    {"driver_ref": "items_postgresql_driver", "on_failure": "fatal"}
   ],
   "READ": [
     {"driver_ref": "items_elasticsearch_driver", "hints": ["geometry_simplified"]},
     {"driver_ref": "items_postgresql_driver", "hints": ["geometry_exact"]}
+  ],
+  "INDEX": [
+    {"driver_ref": "items_elasticsearch_driver"}
   ]
 }}
 ```
@@ -161,7 +166,8 @@ logic, query optimization, PostGIS, and streaming stay in this driver's service 
 
 Items-tier ES driver. Writes to per-tenant index `{prefix}-items-{catalog_id}` with
 `_routing=collection_id`, enrolled in the platform alias `{prefix}-items-public`. Driven by
-the secondary-index `WRITE` entries (`secondary_index=True`) in `ItemsRoutingConfig.operations[WRITE]` and dispatched async via the outbox.
+the `INDEX`-lane entries in `ItemsRoutingConfig.operations[INDEX]` and dispatched async by
+lane definition.
 
 ### `items_elasticsearch_private_driver` (`ItemsElasticsearchPrivateDriver`) — opt-in only
 

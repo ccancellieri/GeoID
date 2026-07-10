@@ -22,7 +22,9 @@ This module lives in ``core`` so that **both** the items storage drivers
 (``ItemsElasticsearchDriver`` and ``ItemsElasticsearchPrivateDriver``) and the
 search extension build the *same* ES query body. Routing-aware item search
 (issue #989) dispatches structural queries through whichever driver the
-catalog's ``ItemsRoutingConfig`` pins for ``Operation.SEARCH`` — public ES,
+derived search pool resolves for the catalog's ``ItemsRoutingConfig``
+(INDEX lane preferred, READ lane fallback — see
+``dynastore.modules.storage.router.get_items_search_driver``) — public ES,
 the tenant-scoped private ES index, or any future search-capable driver — so
 the query construction can no longer live inside one extension's service class.
 

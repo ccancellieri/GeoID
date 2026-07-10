@@ -226,7 +226,7 @@ async def _sweep_collection(
     from dynastore.modules.storage.routing_config import (
         ItemsRoutingConfig,
         Operation,
-        secondary_index_entries,
+        index_entries,
     )
 
     routing = await configs.get_config(
@@ -236,7 +236,7 @@ async def _sweep_collection(
         ctx=ctx,
     )
     ops_map = getattr(routing, "operations", {}) or {}
-    async_entries = secondary_index_entries(ops_map, async_outbox_only=True)
+    async_entries = index_entries(ops_map)
     if not async_entries:
         return 0, 0
 

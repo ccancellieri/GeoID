@@ -21,27 +21,25 @@ Asset entity sync — event-driven fan-out to AssetIndexer drivers.
 
 ``AssetEntitySyncSubscriber`` listens for ``CatalogEventType.ASSET_*`` events
 emitted by ``AssetService`` and dispatches the row write/delete to every
-driver pinned as a secondary-index ``WRITE`` entry (``secondary_index=True``)
-in ``AssetRoutingConfig.operations[WRITE]`` (auto-augmented with discoverable
-``AssetIndexer`` implementors such as ``AssetElasticsearchDriver``).
+driver in ``AssetRoutingConfig.operations[INDEX]`` (auto-augmented with
+discoverable ``AssetIndexer`` implementors such as ``AssetElasticsearchDriver``).
 
 This collapses the prior dual-write race where the ES driver received writes
 from both the routing-config fan-out and a private listener block: the row
-goes to the primary WRITE driver (``secondary_index=False``) synchronously
-inside ``AssetService``; secondary-index fan-out happens via this subscriber,
-fed by the events outbox so failures are replayable.
+goes to the WRITE-lane driver synchronously inside ``AssetService``;
+INDEX-lane fan-out happens via this subscriber, fed by the events outbox so
+failures are replayable.
 
 Failure propagation: this subscriber is invoked twice per event — once
 immediately in-process (``EventService.emit``'s fast path) and once more
 durably when ``EventDrainTask`` drains the corresponding ``tasks.events``
-row and calls ``EventService.dispatch_to_listeners``. Every per-indexer
-failure is logged; failures on entries whose ``on_failure`` policy is
-``FATAL`` or ``OUTBOX`` additionally raise a single chained exception after
-every entry has been attempted, so the durable leg's caller
-(``EventDrainTask``) retries the row. ``WARN`` (logged) and ``IGNORE``
-(silent, per its documented meaning) never trigger a retry. The immediate
-leg swallows the same exception at the ``emit`` dispatch site (see
-``event_service._invoke_listener_detached``) so it never surfaces as
+row and calls ``EventService.dispatch_to_listeners``. INDEX entries carry no
+per-entry failure policy: every per-indexer failure is logged (ERROR) and
+ALWAYS raises a single chained exception after every entry has been
+attempted, so the durable leg's caller (``EventDrainTask``) retries the row
+— an event-plane subscriber always raises on failure so redelivery retries.
+The immediate leg swallows the same exception at the ``emit`` dispatch site
+(see ``event_service._invoke_listener_detached``) so it never surfaces as
 unretrieved-task noise; the durable leg is the retry authority.
 """
 
@@ -68,17 +66,13 @@ async def _fan_out_and_raise(
 ) -> None:
     """Await *calls* (one per entry in *indexers*) in parallel.
 
-    Logs every per-indexer failure — ERROR for ``on_failure=FATAL``, WARNING
-    for ``OUTBOX``/``WARN``, DEBUG for ``IGNORE`` (its documented meaning is
-    silent skip, so it must not surface at WARNING). Once every entry has
-    been attempted, raises a single ``RuntimeError`` — chained from the first
-    such failure — summarizing every entry whose ``on_failure`` policy is
-    ``FATAL`` or ``OUTBOX``, so the durable events-outbox row retries.
-    ``WARN`` and ``IGNORE`` are tolerant: logged (or silently skipped for
-    ``IGNORE``) but never trigger a retry.
+    Logs every per-indexer failure at ERROR. Once every entry has been
+    attempted, raises a single ``RuntimeError`` — chained from the first
+    such failure — summarizing every failed indexer, so the durable
+    events-outbox row retries. INDEX entries carry no per-entry failure
+    policy: any failure is always retried (no WARN/IGNORE tolerance level —
+    that distinction died with the FailurePolicy shrink, #2494).
     """
-    from dynastore.modules.storage.routing_config import FailurePolicy
-
     results = await asyncio.gather(*calls, return_exceptions=True)
 
     first_failure: Optional[BaseException] = None
@@ -86,20 +80,13 @@ async def _fan_out_and_raise(
     for r, result in zip(indexers, results):
         if not isinstance(result, BaseException):
             continue
-        if r.on_failure == FailurePolicy.FATAL:
-            level = logger.error
-        elif r.on_failure == FailurePolicy.IGNORE:
-            level = logger.debug
-        else:
-            level = logger.warning
-        level(
+        logger.error(
             "AssetEntitySync: indexer '%s' %s failed for %s/%s: %s",
             r.driver_ref, action, catalog_id, asset_id, result,
         )
-        if r.on_failure in (FailurePolicy.FATAL, FailurePolicy.OUTBOX):
-            retry_refs.append(r.driver_ref)
-            if first_failure is None:
-                first_failure = result
+        retry_refs.append(r.driver_ref)
+        if first_failure is None:
+            first_failure = result
 
     if first_failure is not None:
         raise RuntimeError(

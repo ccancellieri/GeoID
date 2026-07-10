@@ -47,7 +47,7 @@ def test_bundle_writes_duckdb_config_with_asset_binding():
     assert cfg.id_column == "fid"
 
 
-def test_discoverable_routes_file_read_and_es_secondary():
+def test_discoverable_routes_file_read_and_es_index():
     slots = _by_slot(_bundle(asset_id="a", discoverable=True))
     routing = slots["items_routing"].instance
     ops = routing.operations
@@ -58,28 +58,29 @@ def test_discoverable_routes_file_read_and_es_secondary():
     from dynastore.modules.storage.hints import Hint
     assert Hint.GEOMETRY_EXACT in ops["READ"][0].hints
 
-    # WRITE has the ES secondary indexer so the file->ES reindex can run.
-    write = ops["WRITE"]
-    assert any(e.driver_ref == "items_elasticsearch_driver" and e.secondary_index for e in write)
+    # No WRITE lane at all — items are never client-writable (#2494).
+    assert "WRITE" not in ops
 
-    # SEARCH prefers ES, falls back to the file driver.
-    search_refs = [e.driver_ref for e in ops["SEARCH"]]
-    assert search_refs[0] == "items_elasticsearch_driver"
-    assert "items_duckdb_driver" in search_refs
+    # INDEX carries the ES materialization target so the file->ES reindex
+    # can run; derived search prefers it, falling back to the file driver
+    # (READ lane) when INDEX is empty.
+    index_refs = [e.driver_ref for e in ops["INDEX"]]
+    assert index_refs == ["items_elasticsearch_driver"]
 
     # Discoverable bundle requests geometry simplification for the global index.
     es_cfg = _by_slot(_bundle(asset_id="a", discoverable=True))["es_driver_config"].instance
     assert es_cfg.simplify_geometry is True
 
 
-def test_non_discoverable_has_no_es_and_no_write():
+def test_non_discoverable_has_no_es_and_no_index():
     bundle = _bundle(asset_id="a", discoverable=False)
     slots = _by_slot(bundle)
     assert "es_driver_config" not in slots
     ops = slots["items_routing"].instance.operations
-    assert "WRITE" not in ops or not ops["WRITE"]
-    # SEARCH falls back to the file driver only.
-    assert [e.driver_ref for e in ops["SEARCH"]] == ["items_duckdb_driver"]
+    assert "INDEX" not in ops or not ops["INDEX"]
+    # No configured SEARCH operation — with INDEX empty, derived search
+    # falls back to the READ lane (the file driver) only.
+    assert [e.driver_ref for e in ops["READ"]] == ["items_duckdb_driver"]
 
 
 def test_simplify_geometry_param_is_respected():

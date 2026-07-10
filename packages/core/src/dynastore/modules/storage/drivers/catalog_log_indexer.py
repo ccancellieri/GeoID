@@ -73,11 +73,11 @@ Protocol contract
 Routing-config default
 ----------------------
 
-NOT a default secondary-index entry in
-:class:`CatalogRoutingConfig.operations[WRITE]`.  Adding it by default
+NOT a default INDEX-lane entry in
+:class:`CatalogRoutingConfig.operations[INDEX]`.  Adding it by default
 would turn every write into an INFO log line — too noisy for
 production.  Operators opt in via a platform-level config override by
-pinning it as a secondary-index WRITE entry::
+pinning it into the INDEX lane::
 
     from dynastore.models.protocols.driver_roles import (
         OperationDriverEntry,
@@ -90,12 +90,9 @@ pinning it as a secondary-index WRITE entry::
     override = CatalogRoutingConfig(
         operations={
             **base.operations,
-            Operation.WRITE: [
-                *base.operations.get(Operation.WRITE, []),
-                OperationDriverEntry(
-                    driver_ref="LogCatalogIndexer",
-                    secondary_index=True,
-                ),
+            Operation.INDEX: [
+                *base.operations.get(Operation.INDEX, []),
+                OperationDriverEntry(driver_ref="LogCatalogIndexer"),
             ],
         },
     )

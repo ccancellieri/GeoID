@@ -22,12 +22,12 @@ parent catalog.
 The canonical ES index architecture (#1047 SSOT) keeps a single global
 ``{prefix}-catalogs`` index and a single global ``{prefix}-collections``
 index. Membership is expressed by pinning the public envelope ES driver in
-``operations[WRITE]`` (post-#990 canonical shape). The enforceable invariant
-is composition rule 1: a globally-searchable collection envelope
-("public collection") may only live under a globally-navigable catalog
-("public catalog"). A public collection under a private / PG-only catalog
-would leak the collection into global search while its parent is not
-navigable, so it is rejected.
+``operations[INDEX]`` (lane-model canonical shape, #2494 — the ES indexer
+rides the async INDEX lane). The enforceable invariant is composition rule
+1: a globally-searchable collection envelope ("public collection") may only
+live under a globally-navigable catalog ("public catalog"). A public
+collection under a private / PG-only catalog would leak the collection into
+global search while its parent is not navigable, so it is rejected.
 
 These tests pin the pure decision helpers; they do not exercise the
 DB-backed validate handler (that resolves the parent via the configs
@@ -45,7 +45,6 @@ from dynastore.modules.storage.routing_config import (
     FailurePolicy,
     Operation,
     OperationDriverEntry,
-    WriteMode,
     _assert_public_collection_has_public_parent,
     _catalog_routing_is_public,
     _collection_routing_is_public,
@@ -53,13 +52,13 @@ from dynastore.modules.storage.routing_config import (
 
 
 # ---------------------------------------------------------------------------
-# Builders — minimal routing configs at the WRITE tier
+# Builders — minimal routing configs at the WRITE / INDEX tiers
 # ---------------------------------------------------------------------------
 
 
 def _public_collection_routing() -> CollectionRoutingConfig:
-    """Collection routing that pins the public collection ES driver in WRITE
-    (the collection envelope is globally searchable)."""
+    """Collection routing that pins the public collection ES driver in
+    INDEX (the collection envelope is globally searchable)."""
     return CollectionRoutingConfig(
         operations={
             Operation.WRITE: [
@@ -67,18 +66,16 @@ def _public_collection_routing() -> CollectionRoutingConfig:
                     driver_ref="collection_postgresql_driver",
                     on_failure=FailurePolicy.FATAL,
                 ),
-                OperationDriverEntry(
-                    driver_ref="collection_elasticsearch_driver",
-                    write_mode=WriteMode.ASYNC,
-                    on_failure=FailurePolicy.OUTBOX,
-                ),
+            ],
+            Operation.INDEX: [
+                OperationDriverEntry(driver_ref="collection_elasticsearch_driver"),
             ],
         },
     )
 
 
 def _private_collection_routing() -> CollectionRoutingConfig:
-    """Collection routing with PG only in WRITE — no public ES pin, so the
+    """Collection routing with PG only — no public ES pin in INDEX, so the
     collection is not globally searchable (private)."""
     return CollectionRoutingConfig(
         operations={
@@ -93,7 +90,7 @@ def _private_collection_routing() -> CollectionRoutingConfig:
 
 
 def _public_catalog_routing() -> CatalogRoutingConfig:
-    """Catalog routing that pins the public catalog ES driver in WRITE (the
+    """Catalog routing that pins the public catalog ES driver in INDEX (the
     catalog envelope is globally navigable)."""
     return CatalogRoutingConfig(
         operations={
@@ -102,18 +99,16 @@ def _public_catalog_routing() -> CatalogRoutingConfig:
                     driver_ref="catalog_postgresql_driver",
                     on_failure=FailurePolicy.FATAL,
                 ),
-                OperationDriverEntry(
-                    driver_ref="catalog_elasticsearch_driver",
-                    write_mode=WriteMode.ASYNC,
-                    on_failure=FailurePolicy.OUTBOX,
-                ),
+            ],
+            Operation.INDEX: [
+                OperationDriverEntry(driver_ref="catalog_elasticsearch_driver"),
             ],
         },
     )
 
 
 def _private_catalog_routing() -> CatalogRoutingConfig:
-    """Catalog routing with PG only in WRITE — no public ES pin, so the
+    """Catalog routing with PG only — no public ES pin in INDEX, so the
     catalog is not globally navigable (private / PG-only)."""
     return CatalogRoutingConfig(
         operations={
@@ -132,7 +127,7 @@ def _private_catalog_routing() -> CatalogRoutingConfig:
 # ---------------------------------------------------------------------------
 
 
-def test_collection_routing_is_public_detects_es_write_pin():
+def test_collection_routing_is_public_detects_es_index_pin():
     assert _collection_routing_is_public(_public_collection_routing()) is True
 
 
@@ -140,9 +135,10 @@ def test_collection_routing_is_public_false_when_pg_only():
     assert _collection_routing_is_public(_private_collection_routing()) is False
 
 
-def test_collection_routing_is_public_false_when_es_only_in_search():
-    """Public ES driver in SEARCH/INDEX but NOT in WRITE does not count as
-    public for membership — WRITE is the membership key (#1047 SSOT)."""
+def test_collection_routing_is_public_false_when_es_only_in_read():
+    """Public ES driver in READ but NOT in INDEX does not count as public
+    for membership — INDEX is the membership key (#1047 SSOT, #2494 lane
+    model)."""
     routing = CollectionRoutingConfig(
         operations={
             Operation.WRITE: [
@@ -151,7 +147,7 @@ def test_collection_routing_is_public_false_when_es_only_in_search():
                     on_failure=FailurePolicy.FATAL,
                 ),
             ],
-            Operation.SEARCH: [
+            Operation.READ: [
                 OperationDriverEntry(driver_ref="collection_elasticsearch_driver"),
             ],
         },
@@ -159,7 +155,7 @@ def test_collection_routing_is_public_false_when_es_only_in_search():
     assert _collection_routing_is_public(routing) is False
 
 
-def test_catalog_routing_is_public_detects_es_write_pin():
+def test_catalog_routing_is_public_detects_es_index_pin():
     assert _catalog_routing_is_public(_public_catalog_routing()) is True
 
 

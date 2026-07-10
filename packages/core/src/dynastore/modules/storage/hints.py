@@ -121,14 +121,14 @@ class Hint(StrEnum):
     TILES = "tiles"
 
     # ── Search / read-variant flavours ────────────────────────────────
-    # These are flavours of ``Operation.SEARCH`` (or ``Operation.READ``).
-    # The caller asks for a specific shape; the dispatcher picks an
-    # entry whose ``hints`` (or driver class ``supported_hints``)
-    # contains the requested flavour.  Each member below was promoted
-    # from ``Capability`` once the read-variants stopped being treated
-    # as structural facts about the driver and became per-request
-    # preferences — callers route via
-    # ``get_driver(Operation.SEARCH, hints=frozenset({Hint.AGGREGATION}))``
+    # These are flavours of the derived search pool (INDEX lane preferred,
+    # READ lane fallback) or ``Operation.READ`` directly.  The caller asks
+    # for a specific shape; the dispatcher picks an entry whose ``hints``
+    # (or driver class ``supported_hints``) contains the requested flavour.
+    # Each member below was promoted from ``Capability`` once the
+    # read-variants stopped being treated as structural facts about the
+    # driver and became per-request preferences — callers route via
+    # ``get_items_search_driver(catalog_id, hints=frozenset({Hint.AGGREGATION}))``
     # and drivers self-declare which flavours they serve via
     # ``supported_hints``.
     SEARCH = "search"

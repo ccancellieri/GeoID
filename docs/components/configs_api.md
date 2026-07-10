@@ -301,7 +301,6 @@ GET /configs/catalogs/demo/collections/sample?resolved=true
                   "WRITE":  [{
                     "driver_ref": "items_postgresql_driver",
                     "on_failure": "fatal",
-                    "write_mode": "sync",
                     "_links": [{
                       "rel": "driver-config",
                       "href": "http://localhost:8080/configs/catalogs/demo/collections/sample/plugins/items_postgresql_driver",
@@ -309,7 +308,8 @@ GET /configs/catalogs/demo/collections/sample?resolved=true
                       "title": "PUT this driver's config at collection scope"
                     }]
                   }],
-                  "SEARCH": [/* … */]
+                  "READ":   [/* … */],
+                  "INDEX":  [/* … */]
                 }
               }
             },

@@ -20,7 +20,7 @@
 item-indexer drivers (#1289).
 
 An item-indexer driver (``is_item_indexer = True`` — the public/private ES
-drivers) is pinned in ``operations[WRITE]`` with ``secondary_index=True`` and
+drivers) lives in ``operations[INDEX]``, never ``operations[WRITE]``, and
 is propagated by the *index dispatcher* (``_dispatch_index_upsert`` →
 ``index_bulk``), which stamps the canonical identity fields
 (``_external_id`` / ``_asset_id``) onto the index payload.
@@ -42,7 +42,7 @@ import pytest
 
 from dynastore.modules.catalog.item_service import ItemService
 from dynastore.modules.storage.router import ResolvedDriver
-from dynastore.modules.storage.routing_config import FailurePolicy, WriteMode
+from dynastore.modules.storage.routing_config import FailurePolicy
 
 
 class _RecordingDriver:
@@ -79,9 +79,9 @@ async def test_fan_out_skips_item_indexer_secondary(monkeypatch):
     indexer_secondary = _SecondaryIndexerDriver()
 
     resolved = [
-        ResolvedDriver(driver=primary, on_failure=FailurePolicy.FATAL, write_mode=WriteMode.SYNC),
-        ResolvedDriver(driver=storage_secondary, on_failure=FailurePolicy.WARN, write_mode=WriteMode.SYNC),
-        ResolvedDriver(driver=indexer_secondary, on_failure=FailurePolicy.WARN, write_mode=WriteMode.SYNC),
+        ResolvedDriver(driver=primary, on_failure=FailurePolicy.FATAL),
+        ResolvedDriver(driver=storage_secondary, on_failure=FailurePolicy.WARN),
+        ResolvedDriver(driver=indexer_secondary, on_failure=FailurePolicy.WARN),
     ]
 
     async def _fake_get_write_drivers(catalog_id, collection_id=None, **kwargs):

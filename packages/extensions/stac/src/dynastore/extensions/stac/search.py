@@ -510,15 +510,15 @@ async def _maybe_dispatch_to_es_search(
     coll_ext_id_map: Optional[Dict[str, str]] = None,
     had_explicit_scope: bool = True,
 ) -> Optional[Tuple[list, int, Optional[Dict[str, Any]]]]:
-    """Dispatch a structural search to the catalog's routing-pinned items
-    SEARCH driver, when one is configured and search-capable.
+    """Dispatch a structural search to the catalog's derived search driver,
+    when one is configured and search-capable.
 
     Resolution is fully routing-driven (issue #989): each requested
-    collection's items SEARCH driver is resolved via
-    :func:`router.get_items_search_driver` (``Operation.SEARCH`` then a
+    collection's items search driver is resolved via
+    :func:`router.get_items_search_driver` (INDEX lane preferred, then a
     ``READ`` fallback). The structural query is then dispatched to **that
     driver** through its streaming ``read_entities`` + ``count_entities``
-    contract — so a public-ES catalog, a GEOID-style catalog routing SEARCH
+    contract — so a public-ES catalog, a GEOID-style catalog routing search
     to its tenant-private ES index, or any future ES items driver are all
     served the same way, with no hardcoded driver class.
 

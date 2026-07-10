@@ -33,7 +33,6 @@ from dynastore.modules.storage.routing_config import (
     ItemsRoutingConfig,
     Operation,
     OperationDriverEntry,
-    WriteMode,
 )
 
 from typing import ClassVar, Tuple
@@ -51,13 +50,6 @@ def _public_catalog_routing() -> CatalogRoutingConfig:
                     driver_ref="catalog_postgresql_driver",
                     on_failure=FailurePolicy.FATAL,
                 ),
-                OperationDriverEntry(
-                    driver_ref="catalog_elasticsearch_driver",
-                    write_mode=WriteMode.ASYNC,
-                    on_failure=FailurePolicy.OUTBOX,
-                    secondary_index=True,
-                    source="auto",
-                ),
             ],
             Operation.READ: [
                 OperationDriverEntry(
@@ -65,7 +57,7 @@ def _public_catalog_routing() -> CatalogRoutingConfig:
                     on_failure=FailurePolicy.FATAL,
                 ),
             ],
-            Operation.SEARCH: [
+            Operation.INDEX: [
                 OperationDriverEntry(
                     driver_ref="catalog_elasticsearch_driver",
                     source="auto",
@@ -83,13 +75,6 @@ def _public_collection_template() -> CollectionRoutingConfig:
                     driver_ref="collection_postgresql_driver",
                     on_failure=FailurePolicy.FATAL,
                 ),
-                OperationDriverEntry(
-                    driver_ref="collection_elasticsearch_driver",
-                    write_mode=WriteMode.ASYNC,
-                    on_failure=FailurePolicy.OUTBOX,
-                    secondary_index=True,
-                    source="auto",
-                ),
             ],
             Operation.READ: [
                 OperationDriverEntry(
@@ -97,7 +82,7 @@ def _public_collection_template() -> CollectionRoutingConfig:
                     on_failure=FailurePolicy.FATAL,
                 ),
             ],
-            Operation.SEARCH: [
+            Operation.INDEX: [
                 OperationDriverEntry(
                     driver_ref="collection_elasticsearch_driver",
                     source="auto",
@@ -115,18 +100,11 @@ def _public_items_template() -> ItemsRoutingConfig:
                     driver_ref="items_postgresql_driver",
                     on_failure=FailurePolicy.FATAL,
                 ),
-                OperationDriverEntry(
-                    driver_ref="items_elasticsearch_driver",
-                    write_mode=WriteMode.ASYNC,
-                    on_failure=FailurePolicy.OUTBOX,
-                    secondary_index=True,
-                    source="auto",
-                ),
             ],
             Operation.READ: [
                 OperationDriverEntry(driver_ref="items_postgresql_driver"),
             ],
-            Operation.SEARCH: [
+            Operation.INDEX: [
                 OperationDriverEntry(
                     driver_ref="items_elasticsearch_driver",
                     source="auto",

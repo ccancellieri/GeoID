@@ -30,9 +30,8 @@ Scope of M3.1 (this file)
 
 - **Batch dispatcher**: given a list of catalog_metadata_changed event
   dicts, hydrate each (via ``catalog_router.get_catalog_metadata``)
-  and fan out to every secondary-index driver configured as a
-  secondary-index ``WRITE`` entry (``secondary_index=True``) in
-  ``CatalogRoutingConfig.operations[WRITE]``.
+  and fan out to every indexer driver configured in
+  ``CatalogRoutingConfig.operations[INDEX]``.
 - **Per-driver SLA**: honours ``DriverSla.timeout_ms`` via
   ``asyncio.wait_for``.  On timeout / raise, applies the entry's
   ``on_timeout`` ∈ {"fail", "degrade", "skip"} policy.
@@ -69,8 +68,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from dynastore.models.protocols.driver_roles import DriverSla
 from dynastore.models.protocols.entity_store import CatalogStore
 from dynastore.modules.storage.routing_config import (
-    CatalogRoutingConfig, FailurePolicy, OperationDriverEntry,
-    secondary_index_entries,
+    CatalogRoutingConfig, OperationDriverEntry, index_entries,
 )
 from dynastore.tools.typed_store.base import _to_snake
 
@@ -313,9 +311,11 @@ class ReindexWorker:
             # before dispatch. ``input_transformers`` is the SSOT for which
             # transform chain runs on the way INTO an indexer (see
             # EntityTransformProtocol); this mirrors the items path in
-            # IndexDispatcher._apply_input_transformers. A transform failure
-            # is surfaced per the entry's on_failure policy rather than
-            # silently shipping an un-transformed doc.
+            # IndexDispatcher._apply_input_transformers. INDEX entries carry
+            # no per-entry failure policy: ReindexWorker is an event-plane
+            # subscriber, so a transform failure always NACKs (fatal) — the
+            # durable event row is redelivered rather than silently shipping
+            # an un-transformed doc or dropping the update.
             try:
                 entry_envelope = await self._transform_envelope_for_entry(
                     entry=entry, envelope=envelope, catalog_id=catalog_id,
@@ -328,10 +328,7 @@ class ReindexWorker:
                 logger.warning(
                     "ReindexWorker: %s (catalog_id=%s)", message, catalog_id,
                 )
-                if entry.on_failure == FailurePolicy.FATAL:
-                    fatal_errors.append(message)
-                else:
-                    degraded_errors.append(message)
+                fatal_errors.append(message)
                 continue
             outcome = await self._dispatch_one(
                 entry=entry,
@@ -524,7 +521,7 @@ def _apply_sla_policy(
 
 
 # ---------------------------------------------------------------------------
-# Indexer resolution — secondary-index WRITE entries on CatalogRoutingConfig
+# Indexer resolution — INDEX-lane entries on CatalogRoutingConfig
 # ---------------------------------------------------------------------------
 
 
@@ -532,11 +529,7 @@ async def _resolve_catalog_indexers(
     *,
     catalog_id: Optional[str] = None,
 ) -> List[Tuple[OperationDriverEntry, CatalogStore]]:
-    """Return the (entry, driver) pairs that are secondary indexes for catalogs.
-
-    Secondary indexes are not a distinct operation: they are the
-    ``WRITE`` entries flagged ``secondary_index=True`` (selected via
-    :func:`secondary_index_entries`).
+    """Return the (entry, driver) pairs in the catalog's INDEX lane.
 
     Resolution order mirrors the collection-tier router
     (:mod:`dynastore.modules.catalog.collection_router`):
@@ -544,13 +537,12 @@ async def _resolve_catalog_indexers(
     1. If ``ConfigsProtocol`` is registered, read
        ``CatalogRoutingConfig`` for the given ``catalog_id`` through the
        4-tier waterfall (collection > catalog > platform > code).  This
-       is the path operators use to add / override secondary-index
-       entries at runtime.
+       is the path operators use to add / override INDEX-lane entries at
+       runtime.
     2. On lookup failure (``ConfigsProtocol`` unavailable, config-service
        down, catalog_id absent), fall back to the code-level default
-       :class:`CatalogRoutingConfig()` — which today carries no
-       secondary-index entries, so the worker becomes a no-op rather than
-       crashing.
+       :class:`CatalogRoutingConfig()` — which today carries no INDEX
+       entries, so the worker becomes a no-op rather than crashing.
 
     Filters to driver_ids that are actually registered via
     ``get_protocols(CatalogStore)``; unregistered entries are
@@ -567,9 +559,7 @@ async def _resolve_catalog_indexers(
             routing_config = await configs.get_config(
                 CatalogRoutingConfig, catalog_id=catalog_id,
             )
-            entries = secondary_index_entries(
-                routing_config.operations,
-            )
+            entries = index_entries(routing_config.operations)
     except Exception as exc:  # noqa: BLE001 — diagnostic fallback
         logger.debug(
             "CatalogRoutingConfig platform-override lookup failed for "
@@ -578,9 +568,9 @@ async def _resolve_catalog_indexers(
         )
 
     if not entries:
-        # Fall back to the code-level default secondary-index entries.
+        # Fall back to the code-level default INDEX entries.
         cfg = CatalogRoutingConfig()
-        entries = secondary_index_entries(cfg.operations)
+        entries = index_entries(cfg.operations)
     if not entries:
         return []
 

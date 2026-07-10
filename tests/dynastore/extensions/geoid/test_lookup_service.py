@@ -320,7 +320,7 @@ async def test_resolve_lookup_driver_uses_search_driver(monkeypatch):
     monkeypatch.setattr(svc, "get_protocol", lambda _p: None)
 
     async def fake_get_items_search_driver(_catalog_id):
-        return SimpleNamespace(driver=search_driver, on_failure=None, write_mode=None)
+        return SimpleNamespace(driver=search_driver, on_failure=None)
 
     monkeypatch.setattr(router_mod, "get_items_search_driver", fake_get_items_search_driver)
 

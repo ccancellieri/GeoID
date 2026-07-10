@@ -40,7 +40,6 @@ from dynastore.modules.storage.routing_config import (
     Operation,
     OperationDriverEntry,
     ItemsRoutingConfig,
-    WriteMode,
 )
 
 
@@ -275,10 +274,15 @@ class TestBestOverlapMatcher:
         assert [t[0] for t in out] == ["elasticsearch"]
 
     @pytest.mark.asyncio
-    async def test_search_hint_unsatisfiable_relaxes_to_any_reader(self):
-        # SEARCH is relaxed the same way as READ.
+    async def test_index_hint_unsatisfiable_returns_empty_not_relaxed(self):
+        """INDEX is never relaxed (unlike READ): an unsatisfiable hint must
+        yield [] so the derived-search resolvers (``get_items_search_driver``)
+        can tell "no INDEX entry satisfies this hint" apart from "an INDEX
+        entry matched" and fall back to the READ lane with the SAME hints —
+        e.g. a Hint.GROUP_BY search must resolve to the PG READ entry, not
+        relax to an ES INDEX entry that doesn't support GROUP BY."""
         routing = _make_routing({
-            Operation.SEARCH: [
+            Operation.INDEX: [
                 ("elasticsearch", {Hint.GEOMETRY_SIMPLIFIED}),
             ],
         })
@@ -291,12 +295,12 @@ class TestBestOverlapMatcher:
             patch("dynastore.tools.discovery.get_protocols", return_value=[es]),
         ):
             out = await _resolve_driver_ids_cached(
-                ItemsRoutingConfig, "cat1", "col1", Operation.SEARCH,
+                ItemsRoutingConfig, "cat1", "col1", Operation.INDEX,
                 frozenset({Hint.GEOMETRY_EXACT}),
             )
         DriverRegistry.clear()
         _resolve_driver_ids_cached.cache_clear()
-        assert [t[0] for t in out] == ["elasticsearch"]
+        assert out == []
 
     @pytest.mark.asyncio
     async def test_write_hint_unsatisfiable_returns_empty(self):
@@ -340,7 +344,7 @@ class TestResolveDriversHintSet:
             patch.object(DriverRegistry, "collection_index", return_value={"postgresql": pg}),
             patch(
                 "dynastore.modules.storage.router._resolve_driver_ids_cached",
-                new=AsyncMock(return_value=[("postgresql", FailurePolicy.FATAL, WriteMode.SYNC)]),
+                new=AsyncMock(return_value=[("postgresql", FailurePolicy.FATAL)]),
             ),
         ):
             out = await resolve_drivers(
@@ -356,7 +360,7 @@ class TestResolveDriversHintSet:
             patch.object(DriverRegistry, "collection_index", return_value={"postgresql": pg}),
             patch(
                 "dynastore.modules.storage.router._resolve_driver_ids_cached",
-                new=AsyncMock(return_value=[("postgresql", FailurePolicy.FATAL, WriteMode.SYNC)]),
+                new=AsyncMock(return_value=[("postgresql", FailurePolicy.FATAL)]),
             ),
         ):
             out = await get_driver(
@@ -367,7 +371,7 @@ class TestResolveDriversHintSet:
 
 
 # ---------------------------------------------------------------------------
-# Task D.1 — READ fallback tail, SEARCH matched-only, WRITE strict empty
+# Task D.1 — READ fallback tail, INDEX matched-only, WRITE strict empty
 # ---------------------------------------------------------------------------
 
 
@@ -466,11 +470,13 @@ class TestReadFallbackTail:
         assert [t[0] for t in out] == ["elasticsearch", "postgresql"]
 
     @pytest.mark.asyncio
-    async def test_search_hinted_returns_matched_only_no_tail(self):
-        """SEARCH keeps matched-only (no unmatched fallback tail). A search picks
-        one backend; there is no SoR chain to fall through to."""
+    async def test_index_hinted_returns_matched_only_no_tail(self):
+        """INDEX keeps matched-only (no unmatched fallback tail) — same as
+        WRITE. A derived search picks one backend from this lane; there is
+        no SoR chain to fall through to within the lane itself (fallback to
+        READ happens one layer up, in ``get_items_search_driver``)."""
         routing = _make_routing({
-            Operation.SEARCH: [
+            Operation.INDEX: [
                 ("postgresql", set()),
                 ("elasticsearch", {Hint.GEOMETRY_SIMPLIFIED}),
             ],
@@ -485,12 +491,12 @@ class TestReadFallbackTail:
             patch("dynastore.tools.discovery.get_protocols", return_value=[pg, es]),
         ):
             out = await _resolve_driver_ids_cached(
-                ItemsRoutingConfig, "cat1", "col1", Operation.SEARCH,
+                ItemsRoutingConfig, "cat1", "col1", Operation.INDEX,
                 frozenset({Hint.GEOMETRY_SIMPLIFIED}),
             )
         DriverRegistry.clear()
         _resolve_driver_ids_cached.cache_clear()
-        # ES matched; PG did NOT match — SEARCH must NOT append PG as tail.
+        # ES matched; PG did NOT match — INDEX must NOT append PG as tail.
         assert [t[0] for t in out] == ["elasticsearch"]
 
     @pytest.mark.asyncio

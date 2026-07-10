@@ -671,6 +671,40 @@ class CollectionNotAliveExceptionHandler(ExceptionHandler):
         )
 
 
+class ReadOnlyCollectionExceptionHandler(ExceptionHandler):
+    """Maps ``ReadOnlyCollectionError`` to HTTP 405 Method Not Allowed.
+
+    Raised at write-dispatch time (before any driver call) when the
+    target entity's ``operations[WRITE]`` lane is empty or absent — a
+    valid lane-model configuration meaning "read-only", not a
+    misconfiguration (#2494).
+    """
+
+    def can_handle(self, exception: Exception) -> bool:
+        from dynastore.modules.storage.errors import ReadOnlyCollectionError
+
+        return isinstance(exception, ReadOnlyCollectionError)
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        from dynastore.modules.storage.errors import ReadOnlyCollectionError
+
+        assert isinstance(exception, ReadOnlyCollectionError)
+        return HTTPException(
+            status_code=status.HTTP_405_METHOD_NOT_ALLOWED,
+            detail={
+                "type": "https://docs.dynastore.io/errors/read-only-collection",
+                "title": "Entity is read-only — WRITE lane is empty",
+                "status": status.HTTP_405_METHOD_NOT_ALLOWED,
+                "catalog_id": exception.catalog_id,
+                "collection_id": exception.collection_id,
+                "entity": exception.entity,
+                "detail": str(exception),
+            },
+        )
+
+
 class JobLockedExceptionHandler(ExceptionHandler):
     """Maps ``JobLockedError`` to HTTP 423 Locked.
 
@@ -1027,6 +1061,7 @@ class ExceptionHandlerRegistry:
         self.register(IndexMappingMismatchExceptionHandler())
         self.register(AssetSidecarRejectedExceptionHandler())
         self.register(CollectionNotAliveExceptionHandler())  # 404/410/503 — write gate
+        self.register(ReadOnlyCollectionExceptionHandler())  # 405 — empty WRITE lane
         self.register(ImmutableConfigExceptionHandler())
         self.register(ConfigVersionConflictExceptionHandler())  # 409 — CAS write lost the race
         self.register(PluginNotFoundExceptionHandler())

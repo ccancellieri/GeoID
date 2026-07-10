@@ -47,7 +47,6 @@ from dynastore.modules.storage.routing_config import (
     ItemsRoutingConfig,
     Operation,
     OperationDriverEntry,
-    WriteMode,
 )
 
 from .multi_contributor import MultiContributorPreset
@@ -120,10 +119,10 @@ _DEMO_ITEMS = tuple(
 
 
 def _tiles_items_routing() -> ItemsRoutingConfig:
-    """PG-primary + Elasticsearch-secondary routing.
+    """PG-primary + Elasticsearch-INDEX routing.
 
     Mirrors demo_data routing so seeded items are searchable via STAC
-    search after the ES secondary write completes.
+    search after the ES INDEX-lane write completes.
     """
     return ItemsRoutingConfig(
         operations={
@@ -132,18 +131,11 @@ def _tiles_items_routing() -> ItemsRoutingConfig:
                     driver_ref="items_postgresql_driver",
                     on_failure=FailurePolicy.FATAL,
                 ),
-                OperationDriverEntry(
-                    driver_ref="items_elasticsearch_driver",
-                    write_mode=WriteMode.ASYNC,
-                    on_failure=FailurePolicy.OUTBOX,
-                    secondary_index=True,
-                    source="auto",
-                ),
             ],
             Operation.READ: [
                 OperationDriverEntry(driver_ref="items_postgresql_driver"),
             ],
-            Operation.SEARCH: [
+            Operation.INDEX: [
                 OperationDriverEntry(
                     driver_ref="items_elasticsearch_driver",
                     source="auto",

@@ -19,11 +19,13 @@
 """
 Storage Router — resolves drivers for a given operation + catalog/collection.
 
-Resolution is based on ``ItemsRoutingConfig`` (operation → ordered driver
-list) with optional hint-based filtering.
+Resolution is based on the tier's ``*RoutingConfig`` (READ / WRITE / INDEX
+lanes, see :mod:`dynastore.modules.storage.routing_config`) with optional
+hint-based filtering.
 
 For **WRITE**: all matching drivers execute (fan-out), each with its own
-``FailurePolicy``.
+``FailurePolicy``.  An empty or absent WRITE lane is valid — it means the
+entity is read-only; see :func:`get_write_drivers` / :func:`get_asset_write_drivers`.
 
 For **READ** (hinted): matched drivers are returned first (ordered by
 longest effective hint surface, then entry order), followed by the
@@ -32,15 +34,16 @@ driver (e.g. ES for ``geometry_simplified``) fall through to the
 system-of-record (PG) when it returns ``None``.  No-hint READ is
 unaffected (the ``if hints:`` block is bypassed entirely).
 
-For **SEARCH** (hinted): matched-only (no fallback tail appended).  A
-search picks the single best backend; there is no SoR chain to fall
-through to.
+There is no configured SEARCH operation.  Search dispatch is *derived*:
+:func:`get_items_search_driver` / :func:`get_asset_search_driver` build the
+pool from INDEX-lane entries first, then READ-lane entries as fallback;
+within the pool, entries hint-tagged ``Hint.SEARCH`` are preferred.
 
-For **READ/SEARCH** with a hint set that matches NO configured driver:
-the hint is treated as a preference and relaxed — the full unfiltered
-driver list is returned in its original order so a read still resolves
-a driver (e.g. exact geometry requested on an ES-only catalog falls
-back to the simplified-geometry driver).  WRITE is never relaxed.
+For **READ** with a hint set that matches NO configured driver: the hint
+is treated as a preference and relaxed — the full unfiltered driver list
+is returned in its original order so a read still resolves a driver (e.g.
+exact geometry requested on an ES-only catalog falls back to the
+simplified-geometry driver).  WRITE is never relaxed.
 
 Parametric ``prefer:<driver>`` override
 ----------------------------------------
@@ -80,7 +83,6 @@ from dynastore.modules.storage.routing_config import (
     FailurePolicy,
     Operation,
     ItemsRoutingConfig,
-    WriteMode,
 )
 from dynastore.modules.storage.driver_registry import DriverRegistry
 from dynastore.modules.storage.config_cache import get_request_driver_cache
@@ -96,11 +98,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ResolvedDriver(Generic[_D]):
-    """A driver resolved for a specific operation, with its failure policy and write mode."""
+    """A driver resolved for a specific operation, with its failure policy.
+
+    ``on_failure`` is meaningful for WRITE-lane resolutions (fan-out failure
+    handling); READ-lane resolutions carry the field's inert default.
+    """
 
     driver: _D
     on_failure: FailurePolicy = FailurePolicy.FATAL
-    write_mode: WriteMode = WriteMode.SYNC
 
     @property
     def driver_ref(self) -> str:
@@ -163,7 +168,12 @@ def _resolve_driver_preferences(hints, entries) -> list:
 @cached(
     maxsize=4096,
     ttl=DEFAULT_CONFIG_CACHE_TTL,
-    namespace="storage_router",
+    # v2 (#2494): the lane-model cutover shrank the cached per-entry tuple
+    # by one field. Bumping the namespace is a one-time rolling-deploy
+    # safety net so an old-shape cache entry from a pod still running the
+    # pre-cutover code can never be read back under the new tuple shape
+    # (or vice versa) during a mixed-version rollout.
+    namespace="storage_router_v2",
     distributed=True,
     l1_ttl=DEFAULT_CONFIG_CACHE_L1_TTL,
 )
@@ -174,7 +184,7 @@ async def _resolve_driver_ids_cached(
     operation: str,
     hints: FrozenSet[Hint],
 ) -> List[tuple]:
-    """Cached resolution: returns list of (driver_ref, on_failure, write_mode) tuples."""
+    """Cached resolution: returns list of (driver_ref, on_failure) tuples."""
     from dynastore.models.protocols.configs import ConfigsProtocol
     from dynastore.tools.discovery import get_protocol
 
@@ -230,17 +240,18 @@ async def _resolve_driver_ids_cached(
     # values still cache distinctly (no signature change needed).
     prefer_refs = _resolve_driver_preferences(hints, entries)
     hints = frozenset(h for h in hints if not str(h).startswith(PREFER_PREFIX))
-    if prefer_refs and operation in (Operation.READ, Operation.SEARCH):
+    if prefer_refs and operation in (Operation.READ, Operation.INDEX):
         preferred = [e for ref in prefer_refs for e in entries if e.driver_ref == ref]
         if preferred:
             if operation == Operation.READ:
                 rest = [e for e in entries if e.driver_ref not in prefer_refs]
                 entries = preferred + rest   # pinned driver first, others as fallback tail
             else:
-                entries = preferred          # SEARCH: matched-only
-            return [(e.driver_ref, e.on_failure, e.write_mode) for e in entries]
+                entries = preferred          # INDEX (derived search): matched-only
+            return [(e.driver_ref, e.on_failure) for e in entries]
     # WRITE is never redirected by prefer (operation guard above ensures it;
-    # prefer tokens are already stripped from hints so WRITE fan-out is unaffected).
+    # prefer tokens are already stripped from hints so WRITE fan-out is
+    # unaffected).
 
     if hints:
         # Best-overlap matcher: an entry matches iff the entry's effective
@@ -287,29 +298,34 @@ async def _resolve_driver_ids_cached(
                 # system-of-record (PG) reader rather than 404ing. Callers that
                 # take only resolved[0] (``get_driver``) are unaffected; only
                 # the metadata routers, which iterate first-non-None when hints
-                # were supplied, walk into the tail. SEARCH keeps the matched-
-                # only set (a search picks the single best backend — there is
-                # no SoR to chain to), and WRITE must never fan a write out to
-                # an unintended driver.
+                # were supplied, walk into the tail. WRITE/INDEX must never fan
+                # a write out to an unintended driver, so they keep the
+                # matched-only set.
                 matched_idx = {i for i, _e, _eff in matched}
                 tail = [e for i, e in enumerate(entries) if i not in matched_idx]
                 entries = matched_entries + tail
             else:
                 entries = matched_entries
-        elif operation in (Operation.READ, Operation.SEARCH):
+        elif operation == Operation.READ:
             # No configured driver satisfies the requested hints — e.g. a READ
             # asking for GEOMETRY_EXACT against a catalog whose only items
             # driver serves GEOMETRY_SIMPLIFIED (an Elasticsearch-only catalog
-            # with no PG exact-geometry driver registered). For read paths the
+            # with no PG exact-geometry driver registered). For READ the
             # hint is a *preference*, not a hard filter: relax it and fall back
             # to any available reader so the request returns data (simplified
             # geometry) instead of an empty result. This is what makes the OGC
             # API Features /items list non-empty on ES-only catalogs, where it
             # previously read the (absent) exact-geometry PG tier and returned
             # numberMatched=0. `entries` is left as the full unfiltered list in
-            # its original order. WRITE is never relaxed (and in practice never
-            # passes hints) — fanning a write to an unintended driver must stay
-            # impossible, so it keeps the strict empty-on-no-match semantics.
+            # its original order. WRITE/INDEX are never relaxed: WRITE in
+            # practice never passes hints (fanning a write to an unintended
+            # driver must stay impossible); INDEX must stay strict so the
+            # derived-search resolvers (``get_items_search_driver`` /
+            # ``get_asset_search_driver``) can tell "no INDEX entry satisfies
+            # this hint" (empty) apart from "an INDEX entry matched" and fall
+            # back to the READ lane with the SAME hints — e.g. a
+            # ``Hint.GROUP_BY`` search must resolve to the PG READ entry, not
+            # relax to an ES INDEX entry that doesn't support GROUP BY.
             logger.info(
                 "router-resolve: no driver satisfies hints=%s for op=%s "
                 "catalog=%s collection=%s; relaxing to any available reader",
@@ -338,7 +354,7 @@ async def _resolve_driver_ids_cached(
         if untagged:
             entries = untagged
 
-    return [(e.driver_ref, e.on_failure, e.write_mode) for e in entries]
+    return [(e.driver_ref, e.on_failure) for e in entries]
 
 
 async def resolve_drivers(
@@ -355,8 +371,16 @@ async def resolve_drivers(
     entries as a fallback tail (PG system-of-record).  Callers that want
     the first-non-None result walk the list; callers that take only
     ``resolved[0]`` are unaffected.
-    For **SEARCH** (hinted): returns matched-only (no tail).
     For **WRITE**: caller executes all (fan-out), respecting ``on_failure``.
+    Empty is a valid result for WRITE (read-only entity) — callers must
+    check for it and reject at dispatch, not raise here.
+    For **INDEX**: same shape as WRITE (matched-only, never relaxed); in
+    practice INDEX is read via
+    :func:`~dynastore.modules.storage.routing_config.index_entries`
+    directly rather than through this hint-aware path.
+
+    There is no SEARCH operation — search dispatch is derived (see
+    :func:`get_items_search_driver` / :func:`get_asset_search_driver`).
 
     Resolution layers (fast → slow):
     - **L4** per-request context var — zero-cost within a single request
@@ -365,25 +389,26 @@ async def resolve_drivers(
     - **L3** DB waterfall query — cold path, triggered on cache miss
 
     Args:
-        operation: Required. ``WRITE``, ``READ``, ``SEARCH``, etc.
+        operation: Required. ``WRITE``, ``READ``, ``INDEX``, ``UPLOAD``.
         catalog_id: Catalog context.
         collection_id: Optional collection context.
         hints: Optional set of preferences. An empty set selects all entries
             (preserves zero-config defaults). Non-empty: only entries whose
             effective hints are a SUPERSET of the request are kept, longest
-            effective set wins on tie, then entry order. For ``READ``/``SEARCH``
+            effective set wins on tie, then entry order. For ``READ``
             a non-empty hint set that matches NO configured driver is treated as
             a preference and relaxed — every available reader is returned in its
             original order — so a read still resolves a driver (e.g. exact
             geometry requested on an ES-only catalog falls back to the
-            simplified-geometry driver). ``WRITE`` is never relaxed.
+            simplified-geometry driver). ``WRITE``/``INDEX`` are never relaxed.
         routing_plugin_cls: PluginConfig class — ``ItemsRoutingConfig`` for
             collections, ``AssetRoutingConfig`` for assets.
 
     Returns:
-        Ordered list of :class:`ResolvedDriver`. Empty only when no driver is
-        configured for the operation at all (``WRITE`` with unsatisfiable hints
-        also yields empty; ``READ``/``SEARCH`` relax the hints instead).
+        Ordered list of :class:`ResolvedDriver`. Empty when no driver is
+        configured for the operation at all (``WRITE``/``INDEX`` with
+        unsatisfiable hints also yields empty; ``READ`` relaxes the hints
+        instead).
     """
     # L4 — per-request memoisation: if the same resolution was already performed
     # earlier in this request, return the cached result without touching L1/L2/L3.
@@ -402,10 +427,10 @@ async def resolve_drivers(
         driver_index = DriverRegistry.collection_index()
 
     result = []
-    for driver_ref, on_failure, write_mode in resolved_ids:
+    for driver_ref, on_failure in resolved_ids:
         driver = driver_index.get(driver_ref)
         if driver:
-            result.append(ResolvedDriver(driver=driver, on_failure=on_failure, write_mode=write_mode))
+            result.append(ResolvedDriver(driver=driver, on_failure=on_failure))
         else:
             logger.warning(
                 "Driver '%s' for operation '%s' is not registered. Skipping.",
@@ -433,6 +458,29 @@ async def resolve_drivers(
 # ---------------------------------------------------------------------------
 
 
+def _rank_search_pool_by_hint_search(
+    resolved: List[ResolvedDriver],
+) -> List[ResolvedDriver]:
+    """Stable-sort a resolved driver pool so entries whose driver declares
+    ``Hint.SEARCH`` in its ``supported_hints`` come first.
+
+    Used to rank the INDEX-lane half of the derived search pool (see the
+    module docstring): "entries hint-tagged Hint.SEARCH are preferred".
+    Ranking reads the resolved driver's class-level ``supported_hints``
+    (not the raw ``OperationDriverEntry.hints``) — the router's own
+    ``_effective_hints`` fallback already treats an entry with no explicit
+    hints as inheriting its driver's full declared surface, so checking the
+    driver directly here is equivalent for the common (no per-entry hint
+    override) case and needs no extra config lookup.
+    """
+    def _is_search_preferred(rd: ResolvedDriver) -> bool:
+        return Hint.SEARCH in getattr(type(rd.driver), "supported_hints", frozenset())
+
+    preferred = [rd for rd in resolved if _is_search_preferred(rd)]
+    rest = [rd for rd in resolved if not _is_search_preferred(rd)]
+    return preferred + rest
+
+
 async def get_driver(
     operation: str,
     catalog_id: str,
@@ -440,7 +488,7 @@ async def get_driver(
     *,
     hints: FrozenSet[Hint] = frozenset(),
 ) -> "CollectionItemsStore":
-    """Single-driver resolution for collection READ/SEARCH.
+    """Single-driver resolution for collection READ/WRITE/INDEX.
 
     Returns the first matching ``CollectionItemsStore`` or raises.
 
@@ -482,28 +530,31 @@ async def get_items_search_driver(
     *,
     hints: FrozenSet[Hint] = frozenset(),
 ) -> "ResolvedDriver[CollectionItemsStore]":
-    """Routing-aware single-driver resolution for items SEARCH.
+    """Routing-aware single-driver resolution for items search.
 
-    Resolution order, mirroring the asset tier
-    (:func:`get_asset_search_driver`) and the routing-aware lookup design
-    in issue #989:
+    Derived search pool (see the module docstring and the routing-aware
+    lookup design in issue #989): search is not a configured operation, so
+    this builds the pool at query time —
 
-    1. ``ItemsRoutingConfig.operations[SEARCH]`` — if an operator pinned a
-       search-optimised driver for this catalog/collection (e.g. an
-       Elasticsearch index, or the tenant-scoped private ES index), use it.
-    2. Fall back to ``ItemsRoutingConfig.operations[READ]`` when no SEARCH
-       entry resolves. Any READ-capable driver advertises SEARCH via
-       :func:`derive_supported_operations` (Capability.READ → {READ, SEARCH}),
-       so the read primary (PG by default) serves filtered queries when no
-       dedicated search backend is configured.
+    1. ``ItemsRoutingConfig.operations[INDEX]`` — search-capable
+       materialization targets (e.g. the public or tenant-scoped private ES
+       index), ranked so entries whose driver declares ``Hint.SEARCH`` in
+       ``supported_hints`` come first.
+    2. Fall back to ``ItemsRoutingConfig.operations[READ]`` when the INDEX
+       lane is empty. Any READ-capable driver serves filtered queries when
+       no dedicated search backend is configured (e.g. an ES-only items
+       routing where ES is the READ primary, not a separate INDEX entry).
 
     Unlike :func:`get_driver` this returns the full :class:`ResolvedDriver`
     so callers can inspect the driver instance (e.g. to decide between the
     index-backed path and the PG hub-scan fallback). Raises ``ValueError``
-    when neither operation resolves a registered driver.
+    (never a silent full scan) when neither lane resolves a registered
+    driver.
     """
-    resolved = await resolve_drivers(
-        Operation.SEARCH, catalog_id, collection_id, hints=hints,
+    resolved = _rank_search_pool_by_hint_search(
+        await resolve_drivers(
+            Operation.INDEX, catalog_id, collection_id, hints=hints,
+        )
     )
     if not resolved:
         resolved = await resolve_drivers(
@@ -511,8 +562,9 @@ async def get_items_search_driver(
         )
     if not resolved:
         raise ValueError(
-            f"No items SEARCH/READ driver found for "
-            f"hints={sorted(hints)}, catalog='{catalog_id}', collection='{collection_id}'"
+            f"No items search driver found (INDEX and READ lanes both "
+            f"empty/unresolved) for hints={sorted(hints)}, "
+            f"catalog='{catalog_id}', collection='{collection_id}'"
         )
     from dynastore.models.protocols.storage_driver import CollectionItemsStore as _CSDP
     return cast("ResolvedDriver[_CSDP]", resolved[0])
@@ -526,34 +578,17 @@ async def get_write_drivers(
 ) -> "List[ResolvedDriver[CollectionItemsStore]]":
     """Multi-driver resolution for collection WRITE fan-out.
 
-    Always returns ≥1 entry in a correctly bootstrapped deploy. The waterfall
-    has a code-level default (``ItemsRoutingConfig.operations[WRITE] =
-    [ItemsPostgresqlDriver]``), so an empty result indicates a deploy/ops
-    misconfiguration and is raised as :class:`ConfigResolutionError`.
+    An empty or absent WRITE lane is a **valid** configuration — it means
+    the collection is read-only.  This function returns an empty list in
+    that case; it is the caller's job to reject the client write at
+    dispatch (typed, e.g. HTTP 405) rather than treating an empty list as
+    a deploy/ops misconfiguration.  See
+    ``dynastore.modules.storage.errors.ReadOnlyCollectionError``.
     """
     from dynastore.models.protocols.storage_driver import CollectionItemsStore as _CSDP
     result = await resolve_drivers(
         Operation.WRITE, catalog_id, collection_id, hints=hints,
     )
-    if not result:
-        from dynastore.modules.db_config.exceptions import ConfigResolutionError
-
-        raise ConfigResolutionError(
-            (
-                f"No CollectionItemsStore resolved for WRITE on "
-                f"'{catalog_id}/{collection_id}'. Routing waterfall produced "
-                f"an empty list — neither ItemsRoutingConfig.operations[WRITE] "
-                f"nor its code default is supplying a registered, available driver."
-            ),
-            missing_key="ItemsRoutingConfig.operations[WRITE]",
-            required_fields=[],
-            scope_tried=["collection", "catalog", "platform", "code_default"],
-            hint=(
-                "Register a CollectionItemsStore driver (e.g. "
-                "ItemsPostgresqlDriver) or set "
-                "ItemsRoutingConfig.operations[WRITE] at platform scope."
-            ),
-        )
     return cast(List["ResolvedDriver[_CSDP]"], result)
 
 
@@ -569,9 +604,14 @@ async def get_asset_driver(
     *,
     hints: FrozenSet[Hint] = frozenset(),
 ):
-    """Single-driver resolution for asset READ/SEARCH.
+    """Single-driver resolution for asset READ/WRITE/INDEX.
 
-    Returns the first matching ``AssetStore`` or raises.
+    Returns the first matching ``AssetStore``.  For ``operation=WRITE`` an
+    empty resolution is a valid "read-only asset tier" configuration and
+    raises the typed :class:`~dynastore.modules.storage.errors.ReadOnlyCollectionError`
+    (mapped to HTTP 405) rather than a generic ``ValueError`` — see
+    :func:`get_write_drivers`.  Any other operation with no resolved driver
+    raises ``ValueError`` (genuine misconfiguration).
     """
     resolved = await resolve_drivers(
         operation,
@@ -581,6 +621,16 @@ async def get_asset_driver(
         routing_plugin_cls=AssetRoutingConfig,
     )
     if not resolved:
+        if operation == Operation.WRITE:
+            from dynastore.modules.storage.errors import ReadOnlyCollectionError
+
+            raise ReadOnlyCollectionError(
+                f"Asset tier '{catalog_id}/{collection_id}' is read-only — "
+                "operations[WRITE] is empty.",
+                catalog_id=catalog_id,
+                collection_id=collection_id,
+                entity="asset",
+            )
         raise ValueError(
             f"No asset driver found for operation='{operation}', "
             f"hints={sorted(hints)}, catalog='{catalog_id}', collection='{collection_id}'"
@@ -594,29 +644,31 @@ async def get_asset_search_driver(
     *,
     hints: FrozenSet[Hint] = frozenset(),
 ):
-    """Routing-aware single-driver resolution for asset SEARCH.
+    """Routing-aware single-driver resolution for asset search.
 
-    Resolution order, mirroring the collection tier (``collection_router``)
-    and the routing-aware lookup design in issue #989:
+    Derived search pool (see the module docstring), mirroring the
+    collection tier (:func:`get_items_search_driver`) and the routing-aware
+    lookup design in issue #989:
 
-    1. ``AssetRoutingConfig.operations[SEARCH]`` — if an operator pinned a
-       search-optimised driver for this catalog/collection (e.g. an
-       Elasticsearch index), use it.
-    2. Fall back to ``AssetRoutingConfig.operations[READ]`` when no SEARCH
-       entry resolves. Any READ-capable driver advertises SEARCH via
-       :func:`derive_supported_operations` (Capability.READ → {READ, SEARCH}),
-       so the read primary (PG by default) serves filtered queries when no
-       dedicated search backend is configured.
+    1. ``AssetRoutingConfig.operations[INDEX]`` — search-capable
+       materialization targets (e.g. an Elasticsearch index), ranked so
+       entries whose driver declares ``Hint.SEARCH`` in ``supported_hints``
+       come first.
+    2. Fall back to ``AssetRoutingConfig.operations[READ]`` when the INDEX
+       lane is empty. Any READ-capable driver serves filtered queries when
+       no dedicated search backend is configured.
 
-    Returns the first matching ``AssetStore`` or raises when neither
-    operation resolves a registered driver.
+    Returns the first matching ``AssetStore`` or raises (never a silent
+    full scan) when neither lane resolves a registered driver.
     """
-    resolved = await resolve_drivers(
-        Operation.SEARCH,
-        catalog_id,
-        collection_id,
-        hints=hints,
-        routing_plugin_cls=AssetRoutingConfig,
+    resolved = _rank_search_pool_by_hint_search(
+        await resolve_drivers(
+            Operation.INDEX,
+            catalog_id,
+            collection_id,
+            hints=hints,
+            routing_plugin_cls=AssetRoutingConfig,
+        )
     )
     if not resolved:
         resolved = await resolve_drivers(
@@ -628,8 +680,9 @@ async def get_asset_search_driver(
         )
     if not resolved:
         raise ValueError(
-            f"No asset SEARCH/READ driver found for "
-            f"hints={sorted(hints)}, catalog='{catalog_id}', collection='{collection_id}'"
+            f"No asset search driver found (INDEX and READ lanes both "
+            f"empty/unresolved) for hints={sorted(hints)}, "
+            f"catalog='{catalog_id}', collection='{collection_id}'"
         )
     return resolved[0].driver
 
@@ -640,7 +693,14 @@ async def get_asset_write_drivers(
     *,
     hints: FrozenSet[Hint] = frozenset(),
 ) -> "List[ResolvedDriver[AssetStore]]":
-    """Multi-driver resolution for asset WRITE fan-out."""
+    """Multi-driver resolution for asset WRITE fan-out.
+
+    An empty or absent WRITE lane is a **valid** configuration — it means
+    the asset tier is read-only for this catalog/collection.  Returns an
+    empty list in that case; the caller is responsible for rejecting a
+    client write at dispatch (typed, e.g. HTTP 405) rather than treating
+    an empty list as a misconfiguration.
+    """
     from dynastore.models.protocols.asset_driver import AssetStore as _ADP
     result = await resolve_drivers(
         Operation.WRITE,
@@ -658,26 +718,22 @@ async def get_asset_index_drivers(
     *,
     hints: FrozenSet[Hint] = frozenset(),
 ) -> "List[ResolvedDriver[AssetStore]]":
-    """Multi-driver resolution for asset secondary indexes.
+    """Multi-driver resolution for the asset INDEX lane.
 
-    A secondary index is not a distinct operation: it is a ``WRITE`` target
-    whose driver implements the ``AssetIndexer`` role (``is_asset_indexer``).
-    WRITE is auto-augmented at config-validation time with every discoverable
-    ``AssetIndexer`` driver — which is how ``AssetElasticsearchDriver`` gets
-    picked up without explicit operator config. This filters the resolved
-    WRITE fan-out down to the indexer-role drivers, used by reconcile/sync to
-    (re)propagate assets to their search sinks.
+    Every resolved entry IS a materialization target by lane membership —
+    no additional role filter needed.  Used by
+    ``AssetEntitySyncSubscriber`` to (re)propagate assets to their search
+    sinks (e.g. ``AssetElasticsearchDriver``).
     """
     from dynastore.models.protocols.asset_driver import AssetStore as _ADP
     result = await resolve_drivers(
-        Operation.WRITE,
+        Operation.INDEX,
         catalog_id,
         collection_id,
         hints=hints,
         routing_plugin_cls=AssetRoutingConfig,
     )
-    indexers = [rd for rd in result if getattr(rd.driver, "is_asset_indexer", False)]
-    return cast(List["ResolvedDriver[_ADP]"], indexers)
+    return cast(List["ResolvedDriver[_ADP]"], result)
 
 
 async def get_asset_upload_driver(
@@ -715,7 +771,7 @@ async def get_asset_upload_driver(
 
     from dynastore.tools.typed_store.base import _to_snake
     impls_by_class = {_to_snake(type(d).__name__): d for d in get_protocols(AssetUploadProtocol)}
-    for driver_ref, _on_failure, _write_mode in resolved_ids:
+    for driver_ref, _on_failure in resolved_ids:
         impl = impls_by_class.get(driver_ref)
         if impl is None:
             logger.warning(

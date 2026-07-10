@@ -27,11 +27,16 @@ Cover the entity-aware default routing resolver and the dispatcher's
 * :func:`_call_resolver` tolerates legacy 2-arg resolver stubs so
   pre-existing test fixtures continue to dispatch correctly.
 * :class:`IndexDispatcher` routes per-call via ``ctx.entity_type`` —
-  pinning a secondary-index driver in
-  :class:`ItemsRoutingConfig.operations[WRITE]` and dispatching with
+  pinning an INDEX-lane driver in
+  :class:`ItemsRoutingConfig.operations[INDEX]` and dispatching with
   ``entity_type='item'`` calls the indexer; pinning the same entry in
   :class:`CollectionRoutingConfig` and dispatching with
   ``entity_type='item'`` does NOT (the bug pre-#810).
+
+Dispatch calls below run inside ``task_run_scope()`` — the only path that
+calls an indexer inline (see ``test_index_dispatcher.py``'s module
+docstring); outside a task run every INDEX-lane entry is proactively
+enqueued instead, which these tests are not exercising.
 """
 
 from __future__ import annotations
@@ -50,12 +55,11 @@ from dynastore.modules.storage.index_dispatcher import (
 )
 from dynastore.modules.storage.routing_config import (
     CollectionRoutingConfig,
-    FailurePolicy,
     ItemsRoutingConfig,
     Operation,
     OperationDriverEntry,
-    WriteMode,
 )
+from dynastore.tools.execution_context import task_run_scope
 
 
 # ---------------------------------------------------------------------------
@@ -80,13 +84,7 @@ class _StubIndexer:
 
 
 def _entry(driver_ref: str) -> OperationDriverEntry:
-    return OperationDriverEntry(
-        driver_ref=driver_ref,
-        on_failure=FailurePolicy.WARN,
-        write_mode=WriteMode.SYNC,
-        secondary_index=True,
-        source="auto",
-    )
+    return OperationDriverEntry(driver_ref=driver_ref, source="auto")
 
 
 # ---------------------------------------------------------------------------
@@ -178,10 +176,10 @@ async def test_dispatcher_reads_items_routing_when_entity_type_is_item():
     collection_indexer = _StubIndexer("collection_indexer")
 
     items_routing = ItemsRoutingConfig(
-        operations={Operation.WRITE: [_entry("items_indexer")]},
+        operations={Operation.INDEX: [_entry("items_indexer")]},
     )
     collection_routing = CollectionRoutingConfig(
-        operations={Operation.WRITE: [_entry("collection_indexer")]},
+        operations={Operation.INDEX: [_entry("collection_indexer")]},
     )
 
     async def resolver(catalog, collection, *, entity_type=None):
@@ -204,11 +202,12 @@ async def test_dispatcher_reads_items_routing_when_entity_type_is_item():
     item_op = IndexOp(
         op_type="upsert", entity_type="item", entity_id="i-1", payload={"k": "v"},
     )
-    await dispatcher.fan_out_bulk(item_ctx, [item_op])
+    with task_run_scope():
+        await dispatcher.fan_out_bulk(item_ctx, [item_op])
 
     assert len(items_indexer.bulk_calls) == 1, (
         "items_indexer must fire when entity_type='item' picks "
-        "ItemsRoutingConfig.operations[WRITE] secondary index — the #810 contract"
+        "ItemsRoutingConfig.operations[INDEX] — the #810 contract"
     )
     assert items_indexer.bulk_calls[0][0].entity_id == "i-1"
     assert collection_indexer.bulk_calls == [], (
@@ -224,10 +223,10 @@ async def test_dispatcher_reads_collection_routing_when_entity_type_is_collectio
     collection_indexer = _StubIndexer("collection_indexer")
 
     items_routing = ItemsRoutingConfig(
-        operations={Operation.WRITE: [_entry("items_indexer")]},
+        operations={Operation.INDEX: [_entry("items_indexer")]},
     )
     collection_routing = CollectionRoutingConfig(
-        operations={Operation.WRITE: [_entry("collection_indexer")]},
+        operations={Operation.INDEX: [_entry("collection_indexer")]},
     )
 
     async def resolver(catalog, collection, *, entity_type=None):
@@ -251,7 +250,8 @@ async def test_dispatcher_reads_collection_routing_when_entity_type_is_collectio
         op_type="upsert", entity_type="collection", entity_id="col",
         payload={"k": "v"},
     )
-    await dispatcher.fan_out_bulk(coll_ctx, [coll_op])
+    with task_run_scope():
+        await dispatcher.fan_out_bulk(coll_ctx, [coll_op])
 
     assert len(collection_indexer.bulk_calls) == 1
     assert items_indexer.bulk_calls == []
@@ -266,10 +266,10 @@ async def test_dispatcher_back_compat_none_entity_type_reads_collection_routing(
     collection_indexer = _StubIndexer("collection_indexer")
 
     items_routing = ItemsRoutingConfig(
-        operations={Operation.WRITE: [_entry("items_indexer")]},
+        operations={Operation.INDEX: [_entry("items_indexer")]},
     )
     collection_routing = CollectionRoutingConfig(
-        operations={Operation.WRITE: [_entry("collection_indexer")]},
+        operations={Operation.INDEX: [_entry("collection_indexer")]},
     )
 
     async def resolver(catalog, collection, *, entity_type=None):
@@ -290,7 +290,8 @@ async def test_dispatcher_back_compat_none_entity_type_reads_collection_routing(
     op = IndexOp(
         op_type="upsert", entity_type="item", entity_id="i-1", payload={"k": "v"},
     )
-    await dispatcher.fan_out_bulk(ctx, [op])
+    with task_run_scope():
+        await dispatcher.fan_out_bulk(ctx, [op])
 
     assert len(collection_indexer.bulk_calls) == 1
     assert items_indexer.bulk_calls == []
@@ -304,7 +305,7 @@ async def test_dispatcher_works_with_legacy_two_arg_resolver_stub():
     indexer = _StubIndexer("a")
 
     routing = CollectionRoutingConfig(
-        operations={Operation.WRITE: [_entry("a")]},
+        operations={Operation.INDEX: [_entry("a")]},
     )
 
     async def legacy_resolver(catalog, collection):
@@ -324,7 +325,8 @@ async def test_dispatcher_works_with_legacy_two_arg_resolver_stub():
     op = IndexOp(
         op_type="upsert", entity_type="item", entity_id="i-1", payload={"k": "v"},
     )
-    await dispatcher.fan_out_bulk(ctx, [op])
+    with task_run_scope():
+        await dispatcher.fan_out_bulk(ctx, [op])
 
     assert len(indexer.bulk_calls) == 1
 

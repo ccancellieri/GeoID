@@ -63,14 +63,12 @@ def _make_upload_entry(driver_ref: str) -> "Dict[str, List]":
         FailurePolicy,
         Operation,
         OperationDriverEntry,
-        WriteMode,
     )
     return {
         str(Operation.UPLOAD): [
             OperationDriverEntry(
                 driver_ref=driver_ref,
                 on_failure=FailurePolicy.FATAL,
-                write_mode=WriteMode.SYNC,
                 source="operator",
             )
         ]

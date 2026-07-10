@@ -53,11 +53,9 @@ from dynastore.modules.storage.driver_config import (
 )
 from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.routing_config import (
-    FailurePolicy,
     ItemsRoutingConfig,
     Operation,
     OperationDriverEntry,
-    WriteMode,
 )
 
 from .bundle_preset import BundlePreset, _scope_to_kwargs
@@ -177,8 +175,13 @@ class FileBackedPresetParams(BaseModel):
 
 
 def _file_backed_routing(params: FileBackedPresetParams) -> ItemsRoutingConfig:
-    """Route reads to the file driver; when discoverable, fan a secondary ES
-    indexer on WRITE and prefer ES for SEARCH (file driver as fallback)."""
+    """Route reads to the file driver; when discoverable, materialize an ES
+    INDEX entry (search-preferred, file driver as READ-lane fallback).
+
+    No ``Operation.WRITE`` entry: this collection's items are never
+    client-writable — they are read directly from the attached file — so
+    the WRITE lane is empty by construction (read-only, #2494).
+    """
     # READ: the file is the exact source of truth — GEOMETRY_EXACT resolves the
     # DuckDB file driver (which advertises that hint).
     read = [
@@ -190,23 +193,17 @@ def _file_backed_routing(params: FileBackedPresetParams) -> ItemsRoutingConfig:
     operations: dict = {Operation.READ: read}
 
     if params.discoverable:
-        operations[Operation.WRITE] = [
-            OperationDriverEntry(
-                driver_ref="items_elasticsearch_driver",
-                write_mode=WriteMode.ASYNC,
-                on_failure=FailurePolicy.OUTBOX,
-                secondary_index=True,
-                source="auto",
-            ),
-        ]
-        operations[Operation.SEARCH] = [
+        # Hints left unset: the derived-search pool's ranking falls back to
+        # the driver's own ``supported_hints`` (which already includes
+        # ``Hint.SEARCH``) — an explicit narrow ``hints={Hint.SEARCH}`` here
+        # would REPLACE rather than union with the entry's effective hint
+        # surface, breaking request-level hint-overlap matching (e.g.
+        # ``?hints=fulltext``) against this same driver.
+        operations[Operation.INDEX] = [
             OperationDriverEntry(driver_ref="items_elasticsearch_driver", source="auto"),
-            OperationDriverEntry(driver_ref="items_duckdb_driver"),
         ]
-    else:
-        operations[Operation.SEARCH] = [
-            OperationDriverEntry(driver_ref="items_duckdb_driver"),
-        ]
+    # else: no INDEX entry — the derived-search pool falls back to the READ
+    # lane (the DuckDB file driver), matching the non-discoverable intent.
 
     return ItemsRoutingConfig(operations=operations)
 

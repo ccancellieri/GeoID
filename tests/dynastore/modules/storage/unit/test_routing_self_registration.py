@@ -20,6 +20,16 @@
 appears in ``operations[WRITE]`` / ``operations[READ]`` after the
 auto-append step fires — closes the "implicit fan-out invisible to
 operators" antipattern.
+
+Lane model (#2494): indexers self-register into ``operations[INDEX]``
+(never a distinct SEARCH operation — search is derived from INDEX-then-READ
+at query time).  ``_self_register_indexers_into`` gates on the WRITE lane's
+operator-managed status (not INDEX's own), so an operator who has taken
+explicit ownership of an entity's WRITE lane is treated as having taken
+ownership of the whole routing config — INDEX auto-augmentation backs off
+too.  This is what keeps every "PG-only" preset (which pins WRITE
+explicitly) free of a silently-injected ES indexer without each preset
+needing its own INDEX-lane lock.
 """
 
 from __future__ import annotations
@@ -237,31 +247,28 @@ def test_self_registration_skips_zero_drivers():
 
 
 # ---------------------------------------------------------------------------
-# Per-tier indexer marker self-registration
+# Per-tier indexer marker self-registration (INDEX lane, #2494)
 # ---------------------------------------------------------------------------
 
 
-def test_indexer_marker_lands_in_write_with_async_outbox_defaults():
+def test_indexer_marker_lands_in_index_lane():
     """A driver opting in to a tier indexer marker auto-registers under
-    operations[WRITE] as a secondary index (secondary_index=True) with
-    write_mode=async, on_failure=outbox — sourced from the per-tier
-    marker, not from generic capability discovery.  OUTBOX (not WARN) is
-    the default so transient indexer failures enqueue a durable retry row
-    instead of dropping silently.
+    ``operations[INDEX]`` — sourced from the per-tier marker, not from
+    generic capability discovery.  Lane membership IS the role: there is
+    no per-entry write_mode/on_failure/secondary_index flag any more.
     """
     from typing import ClassVar
     from unittest.mock import patch
 
     from dynastore.models.protocols.indexer import CollectionIndexer
     from dynastore.modules.storage.routing_config import (
-        WriteMode,
         _self_register_indexers_into,
-        secondary_index_entries,
+        index_entries,
     )
 
     class _CollectionES:
         is_collection_indexer: ClassVar[bool] = True
-        auto_register_for_routing: ClassVar = frozenset({Operation.WRITE})
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     class _NotAnIndexer:
         pass
@@ -275,12 +282,10 @@ def test_indexer_marker_lands_in_write_with_async_outbox_defaults():
     with patch("dynastore.tools.discovery.get_protocols", _fake_get_protocols):
         _self_register_indexers_into(target_ops, CollectionIndexer)
 
-    entries = secondary_index_entries(target_ops)
+    entries = index_entries(target_ops)
     assert len(entries) == 1
     assert entries[0].driver_ref == "_collection_es"
-    assert entries[0].on_failure == FailurePolicy.OUTBOX
-    assert entries[0].write_mode == WriteMode.ASYNC
-    assert entries[0].secondary_index is True
+    assert entries[0].source == "auto"
 
 
 def test_validate_handlers_invoke_indexer_self_registration():
@@ -306,8 +311,6 @@ def test_validate_handlers_invoke_indexer_self_registration():
     calls: list[type] = []
 
     def _spy(target_ops, marker_proto, **_kwargs):
-        # Accept arbitrary kwargs (e.g. ``search_caps`` on the searcher
-        # helper) so the spy works for both helper signatures.
         calls.append(marker_proto)
 
     # Empty operations so _validate_routing_entries has nothing to check
@@ -352,15 +355,14 @@ def test_validate_handlers_invoke_indexer_self_registration():
     assert calls == [ItemIndexer, CollectionIndexer, AssetIndexer, CatalogIndexer]
 
 
-def test_end_to_end_marker_to_write_index_entry_via_real_validate_handler():
+def test_end_to_end_marker_to_index_entry_via_real_validate_handler():
     """End-to-end: register a real driver opting in to ``CatalogIndexer``,
     invoke ``_validate_catalog_routing_config`` against a fresh
     ``CatalogRoutingConfig``, assert the driver lands in
-    ``operations[WRITE]`` as a secondary index with the marker's defaults
-    (async + outbox).
+    ``operations[INDEX]``.
 
     Validates the full chain: marker discovery → helper invocation →
-    entry with correct durable-retry policy.  Self-registration moved
+    entry landing in the INDEX lane.  Self-registration moved
     apply→validate in #738/#747.
     """
     import asyncio
@@ -368,15 +370,14 @@ def test_end_to_end_marker_to_write_index_entry_via_real_validate_handler():
 
     from dynastore.models.protocols.indexer import CatalogIndexer
     from dynastore.modules.storage.routing_config import (
-        WriteMode,
         _validate_catalog_routing_config,
-        secondary_index_entries,
+        index_entries,
     )
     from dynastore.tools.discovery import register_plugin, unregister_plugin
 
     class _DummyCatalogIndexer:
         is_catalog_indexer: ClassVar[bool] = True
-        auto_register_for_routing: ClassVar = frozenset({Operation.WRITE})
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
         # Minimal CatalogStore surface — enough for
         # _validate_routing_entries to accept it under operations[WRITE]
         # if it were referenced (it isn't pre-apply; the marker self-
@@ -394,13 +395,10 @@ def test_end_to_end_marker_to_write_index_entry_via_real_validate_handler():
             cfg, catalog_id=None, collection_id=None, db_resource=None,
         ))
 
-        index_entries = secondary_index_entries(cfg.operations)
+        entries = index_entries(cfg.operations)
         assert any(
-            e.driver_ref == "_dummy_catalog_indexer"
-            and e.on_failure == FailurePolicy.OUTBOX
-            and e.write_mode == WriteMode.ASYNC
-            for e in index_entries
-        ), f"_DummyCatalogIndexer not auto-registered: {index_entries!r}"
+            e.driver_ref == "_dummy_catalog_indexer" for e in entries
+        ), f"_DummyCatalogIndexer not auto-registered: {entries!r}"
     finally:
         unregister_plugin(instance)
         # Sanity: ensure cleanup so other tests don't see this stub.
@@ -411,9 +409,17 @@ def test_end_to_end_marker_to_write_index_entry_via_real_validate_handler():
         )
 
 
-def test_indexer_marker_skips_already_listed_driver():
-    """Operator-supplied WRITE secondary-index entry survives — only missing
-    drivers get appended."""
+def test_indexer_helper_blocked_when_write_lane_is_operator_managed():
+    """A discoverable indexer is NOT appended to INDEX when the entity's
+    WRITE lane already carries an operator-source entry.
+
+    ``_self_register_indexers_into`` gates on WRITE's operator-managed
+    status (not INDEX's own) — an operator who has taken explicit
+    ownership of WRITE is treated as having taken ownership of the whole
+    routing config.  This is what keeps a "PG-only" preset (which pins
+    WRITE explicitly, with no INDEX entry at all) free of a silently
+    injected ES indexer.
+    """
     from typing import ClassVar
     from unittest.mock import patch
 
@@ -422,126 +428,210 @@ def test_indexer_marker_skips_already_listed_driver():
 
     class _AssetES:
         is_asset_indexer: ClassVar[bool] = True
-        auto_register_for_routing: ClassVar = frozenset({Operation.WRITE})
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
-    operator_entry = OperationDriverEntry(
-        driver_ref="_asset_es", on_failure=FailurePolicy.FATAL,
-    )
-    target_ops: dict = {Operation.WRITE: [operator_entry]}
+    target_ops: dict = {
+        Operation.WRITE: [
+            OperationDriverEntry(
+                driver_ref="asset_postgresql_driver",
+                on_failure=FailurePolicy.FATAL,
+                source="operator",
+            ),
+        ],
+    }
 
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: [_AssetES()] if proto is AssetIndexer else []):
         _self_register_indexers_into(target_ops, AssetIndexer)
 
-    # No duplicate; operator-supplied on_failure=FATAL preserved. The
-    # discovered indexer marker stamps secondary_index=True upward.
-    assert len(target_ops[Operation.WRITE]) == 1
-    assert target_ops[Operation.WRITE][0].on_failure == FailurePolicy.FATAL
-    assert target_ops[Operation.WRITE][0].secondary_index is True
+    # WRITE is operator-managed → INDEX auto-registration is blocked.
+    assert target_ops.get(Operation.INDEX, []) == []
 
 
-# ---------------------------------------------------------------------------
-# SEARCH self-registration helper
-# ---------------------------------------------------------------------------
-
-
-def test_searcher_helper_picks_up_drivers_opting_into_search():
-    """Drivers declaring ``Operation.SEARCH`` in
-    ``auto_register_for_routing`` land in operations[SEARCH].  Drivers
-    that don't opt in stay out.
-
-    The previous cap-based gate (``EntityStoreCapability.SEARCH`` /
-    ``Capability.FULLTEXT`` / …) was retired alongside the migration to
-    the per-Operation auto-default set: capabilities are structural facts
-    only; per-request flavours (fulltext/aggregation/count) live in the
-    ``Hint`` catalogue.  Auto-augmentation gates purely on the Op-set.
-    """
+def test_indexer_helper_fires_when_write_lane_is_auto_sourced():
+    """Inverse of the above: a WRITE lane with only ``source="auto"``
+    entries (boot defaults) does not block INDEX auto-registration."""
     from typing import ClassVar
     from unittest.mock import patch
 
-    from dynastore.models.protocols.entity_store import CatalogStore
+    from dynastore.models.protocols.indexer import AssetIndexer
     from dynastore.modules.storage.routing_config import (
-        _self_register_searchers_into,
+        _self_register_indexers_into,
+        index_entries,
     )
 
-    class _ESCat:
-        auto_register_for_routing: ClassVar = frozenset({Operation.SEARCH})
+    class _AssetES:
+        is_asset_indexer: ClassVar[bool] = True
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
-    class _IndexerOnly:
-        # Opts into WRITE (secondary index) but not SEARCH — should NOT land
-        # in SEARCH.
-        auto_register_for_routing: ClassVar = frozenset({Operation.WRITE})
-
-    class _NotOptedIn:
-        # No declaration → defaults to frozenset() → not auto-augmented.
-        pass
-
-    target_ops: dict = {}
-    fake_pool = [_ESCat(), _IndexerOnly(), _NotOptedIn()]
+    target_ops: dict = {
+        Operation.WRITE: [
+            OperationDriverEntry(
+                driver_ref="asset_postgresql_driver",
+                on_failure=FailurePolicy.FATAL,
+                source="auto",
+            ),
+        ],
+    }
 
     with patch("dynastore.tools.discovery.get_protocols",
-               lambda proto: fake_pool):
-        _self_register_searchers_into(target_ops, CatalogStore)
+               lambda proto: [_AssetES()] if proto is AssetIndexer else []):
+        _self_register_indexers_into(target_ops, AssetIndexer)
 
-    ids = {e.driver_ref for e in target_ops.get(Operation.SEARCH, [])}
-    assert ids == {"_es_cat"}
-
-
-def test_searcher_helper_skips_drivers_without_search_optin():
-    """Driver without ``Operation.SEARCH`` in its Op-set is not added
-    to SEARCH, regardless of which capabilities it declares.
-
-    Capabilities are structural facts; they do not gate auto-augmentation
-    under the new model.
-    """
-    from unittest.mock import patch
-
-    from dynastore.models.protocols.entity_store import (
-        CatalogStore,
-        EntityStoreCapability,
-    )
-    from dynastore.modules.storage.routing_config import (
-        _self_register_searchers_into,
-    )
-
-    class _PgPrimary:
-        # Has lots of caps but no Op-set → no auto-default into SEARCH.
-        capabilities = frozenset({
-            EntityStoreCapability.READ, EntityStoreCapability.WRITE,
-            EntityStoreCapability.SEARCH,  # cap is no longer the gate
-        })
-
-    target_ops: dict = {}
-    with patch("dynastore.tools.discovery.get_protocols",
-               lambda proto: [_PgPrimary()]):
-        _self_register_searchers_into(target_ops, CatalogStore)
-    assert target_ops.get(Operation.SEARCH, []) == []
+    refs = {e.driver_ref for e in index_entries(target_ops)}
+    assert refs == {"_asset_es"}
 
 
-def test_searcher_helper_idempotent():
-    """Repeated calls don't add duplicates; operator-supplied entry survives."""
+def test_indexer_marker_skips_already_listed_driver():
+    """An indexer already present in operations[INDEX] is not duplicated;
+    only missing drivers get appended."""
     from typing import ClassVar
     from unittest.mock import patch
 
-    from dynastore.models.protocols.entity_store import CatalogStore
-    from dynastore.modules.storage.routing_config import (
-        _self_register_searchers_into,
-    )
+    from dynastore.models.protocols.indexer import AssetIndexer
+    from dynastore.modules.storage.routing_config import _self_register_indexers_into
 
-    class _ESCat:
-        auto_register_for_routing: ClassVar = frozenset({Operation.SEARCH})
+    class _AssetES:
+        is_asset_indexer: ClassVar[bool] = True
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
-    from dynastore.modules.storage.hints import Hint
-    op_entry = OperationDriverEntry(driver_ref="_es_cat", hints={Hint.METADATA})
-    target_ops: dict = {Operation.SEARCH: [op_entry]}
+    operator_entry = OperationDriverEntry(driver_ref="_asset_es", source="operator")
+    target_ops: dict = {Operation.INDEX: [operator_entry]}
 
     with patch("dynastore.tools.discovery.get_protocols",
-               lambda proto: [_ESCat()]):
-        _self_register_searchers_into(target_ops, CatalogStore)
-        _self_register_searchers_into(target_ops, CatalogStore)
+               lambda proto: [_AssetES()] if proto is AssetIndexer else []):
+        _self_register_indexers_into(target_ops, AssetIndexer)
 
-    assert len(target_ops[Operation.SEARCH]) == 1
-    assert target_ops[Operation.SEARCH][0].hints == {Hint.METADATA}
+    # No duplicate; operator-supplied entry preserved as-is.
+    assert len(target_ops[Operation.INDEX]) == 1
+    assert target_ops[Operation.INDEX][0].source == "operator"
+
+
+def test_indexer_helper_blocked_when_index_lane_has_operator_entry():
+    """An operator-sourced INDEX entry blocks ALL auto-append — not just a
+    dedup of the entry that happens to share its driver_ref. Two installed
+    indexers: one matches the existing operator entry's ref, one is a
+    genuinely different, not-yet-listed driver. Neither gets appended."""
+    from typing import ClassVar
+    from unittest.mock import patch
+
+    from dynastore.models.protocols.indexer import AssetIndexer
+    from dynastore.modules.storage.routing_config import _self_register_indexers_into
+
+    class _AssetEsPublic:
+        is_asset_indexer: ClassVar[bool] = True
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
+
+    class _AssetEsPrivate:
+        is_asset_indexer: ClassVar[bool] = True
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
+
+    operator_entry = OperationDriverEntry(driver_ref="_asset_es_public", source="operator")
+    target_ops: dict = {Operation.INDEX: [operator_entry]}
+
+    with patch(
+        "dynastore.tools.discovery.get_protocols",
+        lambda proto: [_AssetEsPublic(), _AssetEsPrivate()] if proto is AssetIndexer else [],
+    ):
+        _self_register_indexers_into(target_ops, AssetIndexer)
+
+    # Only the original operator entry — the second, distinct installed
+    # indexer must NOT be silently appended alongside it.
+    assert len(target_ops[Operation.INDEX]) == 1
+    assert target_ops[Operation.INDEX][0].driver_ref == "_asset_es_public"
+    assert target_ops[Operation.INDEX][0].source == "operator"
+
+
+def test_explicit_empty_index_survives_validate_round_trip():
+    """A PUT carrying an explicit ``INDEX: []`` (an operator opt-out — no
+    materialization target at all) must survive
+    ``_validate_items_routing_config`` untouched, even with an indexer
+    installed and discoverable in the SAME process. An empty list carries
+    no entry to stamp with ``source``, so this must be gated independently
+    of the operator-sourced-entry check (#3232 review)."""
+    import asyncio
+    from typing import ClassVar
+    from unittest.mock import patch
+
+    from dynastore.modules.storage.routing_config import (
+        _validate_items_routing_config,
+        index_entries,
+    )
+
+    class _ItemsES:
+        is_item_indexer: ClassVar[bool] = True
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
+
+    items = ItemsRoutingConfig(
+        operations={
+            Operation.WRITE: [
+                OperationDriverEntry(driver_ref="items_postgresql_driver", source="auto"),
+            ],
+            Operation.INDEX: [],
+        },
+    )
+
+    with patch("dynastore.tools.discovery.get_protocols", lambda proto: [_ItemsES()]):
+        asyncio.run(_validate_items_routing_config(
+            items, catalog_id=None, collection_id=None, db_resource=None,
+        ))
+
+    assert items.operations[Operation.INDEX] == []
+    assert index_entries(items.operations) == []
+
+
+def test_absent_index_key_still_seeds_on_fresh_config():
+    """Existing behavior pinned: an ABSENT INDEX key (no operator intent
+    expressed at all) still defers to discovery and seeds INDEX."""
+    from typing import ClassVar
+    from unittest.mock import patch
+
+    from dynastore.models.protocols.indexer import AssetIndexer
+    from dynastore.modules.storage.routing_config import _self_register_indexers_into
+
+    class _AssetES:
+        is_asset_indexer: ClassVar[bool] = True
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
+
+    target_ops: dict = {}  # INDEX key absent entirely
+
+    with patch(
+        "dynastore.tools.discovery.get_protocols",
+        lambda proto: [_AssetES()] if proto is AssetIndexer else [],
+    ):
+        _self_register_indexers_into(target_ops, AssetIndexer)
+
+    assert [e.driver_ref for e in target_ops[Operation.INDEX]] == ["_asset_es"]
+    assert target_ops[Operation.INDEX][0].source == "auto"
+
+
+def test_auto_only_index_entries_reregistration_is_idempotent():
+    """INDEX present with only ``source="auto"`` entries still defers to
+    discovery (gate 2/3 don't fire), and re-running self-registration
+    against the same discoverable set never duplicates."""
+    from typing import ClassVar
+    from unittest.mock import patch
+
+    from dynastore.models.protocols.indexer import AssetIndexer
+    from dynastore.modules.storage.routing_config import _self_register_indexers_into
+
+    class _AssetES:
+        is_asset_indexer: ClassVar[bool] = True
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
+
+    target_ops: dict = {
+        Operation.INDEX: [OperationDriverEntry(driver_ref="_asset_es", source="auto")],
+    }
+
+    with patch(
+        "dynastore.tools.discovery.get_protocols",
+        lambda proto: [_AssetES()] if proto is AssetIndexer else [],
+    ):
+        _self_register_indexers_into(target_ops, AssetIndexer)
+        _self_register_indexers_into(target_ops, AssetIndexer)
+
+    assert len(target_ops[Operation.INDEX]) == 1
+    assert target_ops[Operation.INDEX][0].source == "auto"
 
 
 # ---------------------------------------------------------------------------
@@ -549,175 +639,144 @@ def test_searcher_helper_idempotent():
 # ---------------------------------------------------------------------------
 
 
-def test_catalog_routing_validator_augments_write_index_and_search():
-    """Constructing a default CatalogRoutingConfig must fold in
-    discoverable CatalogIndexer (as a WRITE secondary index) + SEARCH-capable
-    drivers."""
+def test_catalog_routing_validator_augments_index_lane():
+    """Constructing a default CatalogRoutingConfig must fold in a
+    discoverable CatalogIndexer into the INDEX lane."""
     from typing import ClassVar
     from unittest.mock import patch
 
-    from dynastore.models.protocols.entity_store import EntityStoreCapability
-    from dynastore.modules.storage.routing_config import secondary_index_entries
+    from dynastore.modules.storage.routing_config import index_entries
 
     class _CatES:
         is_catalog_indexer: ClassVar[bool] = True
-        auto_register_for_routing: ClassVar = frozenset({Operation.WRITE, Operation.SEARCH})
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     instance = _CatES()
 
     def _fake_get_protocols(proto):
-        # Marker check + capability check both rely on isinstance —
-        # the fake instance has the right ClassVar + duck-typed
-        # `capabilities` set so it satisfies both runtime_checkable
-        # Protocols (CatalogIndexer + CatalogStore via
-        # the SEARCH cap predicate inside _self_register_searchers_into).
         return [instance]
 
     with patch("dynastore.tools.discovery.get_protocols", _fake_get_protocols):
         cfg = CatalogRoutingConfig()
 
-    index_ids = {e.driver_ref for e in secondary_index_entries(cfg.operations)}
-    search_ids = {e.driver_ref for e in cfg.operations.get(Operation.SEARCH, [])}
+    index_ids = {e.driver_ref for e in index_entries(cfg.operations)}
     assert "_cat_es" in index_ids
-    assert "_cat_es" in search_ids
     # Primary WRITE entry unchanged — the registered CatalogStore is the
     # ``catalog_postgresql_driver`` composition wrapper (#732), which fans
-    # CRUD across the catalog_core + catalog_stac sidecars internally. The
-    # discovered ES indexer joins the same WRITE list as a secondary index
-    # (role distinguished by ``secondary_index``), not as a primary store.
-    primary_write_ids = {
-        e.driver_ref for e in cfg.operations[Operation.WRITE]
-        if not e.secondary_index
-    }
-    assert primary_write_ids == {"catalog_postgresql_driver"}
+    # CRUD across the catalog_core + catalog_stac sidecars internally.
+    # Under the lane model an indexer can never appear in WRITE at all.
+    write_ids = {e.driver_ref for e in cfg.operations[Operation.WRITE]}
+    assert write_ids == {"catalog_postgresql_driver"}
 
 
 def test_catalog_routing_validator_no_op_when_no_indexers_discoverable():
-    """No discoverable indexer/searcher → operations stays at the
-    default-factory shape: primary WRITE+READ only. Secondary-index and
-    SEARCH are both discovery-driven, so with nothing discoverable the ES
-    secondary-index hop is NOT present (#1069 / #1073) — a PG-only deployment
-    must not pin an undrainable OUTBOX hop into tasks.tasks."""
+    """No discoverable indexer → operations stays at the default-factory
+    shape: primary WRITE+READ only. The INDEX lane is discovery-driven, so
+    with nothing discoverable the ES materialization hop is NOT present
+    (#1069 / #1073) — a PG-only deployment must not pin an undrainable
+    obligation into tasks.storage."""
     from unittest.mock import patch
 
-    from dynastore.modules.storage.routing_config import secondary_index_entries
+    from dynastore.modules.storage.routing_config import index_entries
 
     with patch("dynastore.tools.discovery.get_protocols", lambda proto: []):
         cfg = CatalogRoutingConfig()
 
-    # Nothing discoverable → no ES secondary-index hop folded in.
-    index_ids = {e.driver_ref for e in secondary_index_entries(cfg.operations)}
+    # Nothing discoverable → no ES INDEX entry folded in.
+    index_ids = {e.driver_ref for e in index_entries(cfg.operations)}
     assert "catalog_elasticsearch_driver" not in index_ids
-    # SEARCH is purely discovery-driven — empty when nothing is discoverable.
-    assert Operation.SEARCH not in cfg.operations or cfg.operations[Operation.SEARCH] == []
 
 
-def test_collection_routing_validator_augments_write_index_and_search():
-    """ItemsRoutingConfig validator augments metadata.operations
-    (not top-level operations)."""
+def test_collection_routing_validator_augments_index_lane():
+    """CollectionRoutingConfig validator augments operations[INDEX]."""
     from typing import ClassVar
     from unittest.mock import patch
 
-    from dynastore.models.protocols.entity_store import EntityStoreCapability
-    from dynastore.modules.storage.routing_config import secondary_index_entries
+    from dynastore.modules.storage.routing_config import index_entries
 
     class _ColES:
         is_collection_indexer: ClassVar[bool] = True
-        auto_register_for_routing: ClassVar = frozenset({Operation.WRITE, Operation.SEARCH})
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: [_ColES()]):
         cfg = CollectionRoutingConfig()
 
-    index_ids = {e.driver_ref for e in secondary_index_entries(cfg.operations)}
-    search_ids = {e.driver_ref for e in cfg.operations.get(Operation.SEARCH, [])}
+    index_ids = {e.driver_ref for e in index_entries(cfg.operations)}
     assert "_col_es" in index_ids
-    assert "_col_es" in search_ids
 
 
-def test_items_routing_validator_augments_write_index_and_search():
+def test_items_routing_validator_augments_index_lane():
     """The model_validator on ItemsRoutingConfig augments its `operations`
-    with discoverable ItemIndexer drivers (→ WRITE secondary index) and
-    CollectionItemsStore drivers declaring storage SEARCH-family caps
-    (FULLTEXT / SPATIAL_FILTER / ATTRIBUTE_FILTER) (→ SEARCH).
+    with discoverable ItemIndexer drivers into the INDEX lane.
     """
     from typing import ClassVar
     from unittest.mock import patch
 
-    from dynastore.models.protocols.storage_driver import Capability
-    from dynastore.modules.storage.routing_config import secondary_index_entries
+    from dynastore.modules.storage.routing_config import index_entries
 
     class _ItemsES:
         is_item_indexer: ClassVar[bool] = True
-        auto_register_for_routing: ClassVar = frozenset({Operation.WRITE, Operation.SEARCH})
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: [_ItemsES()]):
         cfg = ItemsRoutingConfig()
 
-    top_index = {e.driver_ref for e in secondary_index_entries(cfg.operations)}
-    top_search = {e.driver_ref for e in cfg.operations.get(Operation.SEARCH, [])}
+    top_index = {e.driver_ref for e in index_entries(cfg.operations)}
     assert "_items_es" in top_index
-    assert "_items_es" in top_search
-    # Primary PG WRITE entry retained; the indexer is appended as a
-    # secondary index alongside it.
+    # Primary PG WRITE entry retained; the indexer never lands in WRITE.
     write_ids = {e.driver_ref for e in cfg.operations[Operation.WRITE]}
-    assert write_ids == {"items_postgresql_driver", "_items_es"} or \
-           "items_postgresql_driver" in write_ids
+    assert write_ids == {"items_postgresql_driver"}
 
 
-def test_items_routing_search_optin_gate():
-    """ItemsRoutingConfig SEARCH gate is the per-Operation opt-in set.
-    The cap-based gate (storage ``Capability.{FULLTEXT, SPATIAL_FILTER,
-    ATTRIBUTE_FILTER}`` vs metadata ``EntityStoreCapability.SEARCH``)
-    was retired alongside PR #3a — capabilities are structural facts
-    only.  A driver lands in items SEARCH iff its class declares
-    ``Operation.SEARCH`` in ``auto_register_for_routing``.
+def test_items_routing_index_optin_gate():
+    """ItemsRoutingConfig INDEX gate is the per-Operation opt-in set.  A
+    driver lands in the items INDEX lane iff its class declares
+    ``Operation.INDEX`` in ``auto_register_for_routing`` AND it satisfies
+    the ``ItemIndexer`` marker discovery.
     """
     from typing import ClassVar
     from unittest.mock import patch
 
-    class _OptedInSearcher:
-        is_item_indexer: ClassVar[bool] = False
-        auto_register_for_routing: ClassVar = frozenset({Operation.SEARCH})
+    class _OptedInIndexer:
+        is_item_indexer: ClassVar[bool] = True
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
-    class _OptedOutSearcher:
-        # Capabilities are irrelevant under the new model — only the
-        # Op-set decides auto-augmentation.
-        is_item_indexer: ClassVar[bool] = False
+    class _OptedOutIndexer:
+        # Marker set but no Op-set declared → not auto-augmented.
+        is_item_indexer: ClassVar[bool] = True
 
     with patch("dynastore.tools.discovery.get_protocols",
-               lambda proto: [_OptedInSearcher(), _OptedOutSearcher()]):
+               lambda proto: [_OptedInIndexer(), _OptedOutIndexer()]):
         cfg = ItemsRoutingConfig()
 
-    top_search = {e.driver_ref for e in cfg.operations.get(Operation.SEARCH, [])}
-    assert "_opted_in_searcher" in top_search
-    assert "_opted_out_searcher" not in top_search
+    from dynastore.modules.storage.routing_config import index_entries
+    top_index = {e.driver_ref for e in index_entries(cfg.operations)}
+    assert "_opted_in_indexer" in top_index
+    assert "_opted_out_indexer" not in top_index
 
 
-def test_asset_routing_validator_augments_write_index_only():
-    """AssetRoutingConfig validator augments WRITE with a secondary index
-    but NOT SEARCH — assets aren't search-addressable the way collection
-    items are."""
+def test_asset_routing_validator_augments_index_lane():
+    """AssetRoutingConfig validator augments the INDEX lane."""
     from typing import ClassVar
     from unittest.mock import patch
 
     from dynastore.modules.storage.routing_config import (
         AssetRoutingConfig,
-        secondary_index_entries,
+        index_entries,
     )
 
     class _AssetES:
         is_asset_indexer: ClassVar[bool] = True
-        auto_register_for_routing: ClassVar = frozenset({Operation.WRITE})
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: [_AssetES()]):
         cfg = AssetRoutingConfig()
 
-    index_ids = {e.driver_ref for e in secondary_index_entries(cfg.operations)}
+    index_ids = {e.driver_ref for e in index_entries(cfg.operations)}
     assert "_asset_es" in index_ids
-    assert Operation.SEARCH not in cfg.operations or cfg.operations[Operation.SEARCH] == []
 
 
 def test_validator_failure_in_discovery_does_not_break_construction():
@@ -736,24 +795,16 @@ def test_validator_failure_in_discovery_does_not_break_construction():
     # ``catalog_postgresql_driver`` composition wrapper (#732).
     write_ids = {e.driver_ref for e in cfg.operations[Operation.WRITE]}
     assert write_ids == {"catalog_postgresql_driver"}
-    # Discovery augmentation was skipped, and the ES secondary-index hop is no
-    # longer hard-coded (#1069 / #1073) — so there is no ES secondary index;
-    # SEARCH is discovery-only, so it stays absent.
-    from dynastore.modules.storage.routing_config import secondary_index_entries
-    index_ids = {e.driver_ref for e in secondary_index_entries(cfg.operations)}
+    # Discovery augmentation was skipped, and the ES INDEX hop is no longer
+    # hard-coded (#1069 / #1073) — so there is no ES INDEX entry.
+    from dynastore.modules.storage.routing_config import index_entries
+    index_ids = {e.driver_ref for e in index_entries(cfg.operations)}
     assert "catalog_elasticsearch_driver" not in index_ids
-    assert Operation.SEARCH not in cfg.operations or cfg.operations[Operation.SEARCH] == []
 
 
 # ---------------------------------------------------------------------------
-# Apply-handler parity for SEARCH
+# Provenance ("source") field
 # ---------------------------------------------------------------------------
-
-
-# Imports needed for the source-provenance test block below.
-from dynastore.modules.storage.routing_config import (  # noqa: E402
-    _self_register_store_drivers,
-)
 
 
 def test_default_entry_source_is_operator():
@@ -778,38 +829,15 @@ def test_indexer_helper_marks_entries_as_auto():
 
     class _ColES:
         is_collection_indexer: ClassVar[bool] = True
-        auto_register_for_routing: ClassVar = frozenset({Operation.WRITE})
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     target_ops: dict = {}
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: [_ColES()]):
         _self_register_indexers_into(target_ops, CollectionIndexer)
 
-    assert len(target_ops[Operation.WRITE]) == 1
-    assert target_ops[Operation.WRITE][0].source == "auto"
-
-
-def test_searcher_helper_marks_entries_as_auto():
-    """Entries created by `_self_register_searchers_into` also carry
-    `source="auto"`."""
-    from typing import ClassVar
-    from unittest.mock import patch
-
-    from dynastore.models.protocols.entity_store import CatalogStore
-    from dynastore.modules.storage.routing_config import (
-        _self_register_searchers_into,
-    )
-
-    class _ESCat:
-        auto_register_for_routing: ClassVar = frozenset({Operation.SEARCH})
-
-    target_ops: dict = {}
-    with patch("dynastore.tools.discovery.get_protocols",
-               lambda proto: [_ESCat()]):
-        _self_register_searchers_into(target_ops, CatalogStore)
-
-    assert len(target_ops[Operation.SEARCH]) == 1
-    assert target_ops[Operation.SEARCH][0].source == "auto"
+    assert len(target_ops[Operation.INDEX]) == 1
+    assert target_ops[Operation.INDEX][0].source == "auto"
 
 
 def test_store_driver_helper_marks_entries_as_auto():
@@ -824,49 +852,6 @@ def test_store_driver_helper_marks_entries_as_auto():
         entries = cfg.operations[op]
         assert len(entries) == 1
         assert entries[0].source == "auto"
-
-
-def test_operator_managed_list_locks_out_auto_augment():
-    """Option A (#792 / #889): a single operator-source entry locks the
-    whole operation's list.  Discoverable drivers do NOT get auto-appended
-    onto the side of an operator-managed entry — that semantic gave rise
-    to #792 where deleted SEARCH/secondary-index drivers came back on every
-    read.
-
-    Inverse shape pin (do not collapse to a single assertion): the test
-    constructs the SAME mixed-discovery surface the old behaviour relied
-    on, then asserts only the operator entry survives — guarding against
-    a future "simplify" patch that drops the operator-managed gate.
-    """
-    from typing import ClassVar
-    from unittest.mock import patch
-
-    from dynastore.models.protocols.indexer import CollectionIndexer
-    from dynastore.modules.storage.routing_config import (
-        _self_register_indexers_into,
-    )
-
-    class _AutoDriver:
-        is_collection_indexer: ClassVar[bool] = True
-        auto_register_for_routing: ClassVar = frozenset({Operation.WRITE})
-
-    class _OpDriver:
-        is_collection_indexer: ClassVar[bool] = True
-        auto_register_for_routing: ClassVar = frozenset({Operation.WRITE})
-
-    operator_entry = OperationDriverEntry(
-        driver_ref="_op_driver", on_failure=FailurePolicy.FATAL,
-    )
-    target_ops: dict = {Operation.WRITE: [operator_entry]}
-
-    with patch("dynastore.tools.discovery.get_protocols",
-               lambda proto: [_AutoDriver(), _OpDriver()]):
-        _self_register_indexers_into(target_ops, CollectionIndexer)
-
-    by_id = {e.driver_ref: e for e in target_ops[Operation.WRITE]}
-    assert set(by_id) == {"_op_driver"}
-    assert by_id["_op_driver"].source == "operator"
-    assert by_id["_op_driver"].on_failure == FailurePolicy.FATAL
 
 
 def test_source_field_serialises_in_model_dump():
@@ -898,84 +883,13 @@ def test_source_field_rejects_invalid_value():
 
 
 # ---------------------------------------------------------------------------
-# Apply-handler parity for SEARCH (existing test below)
-# ---------------------------------------------------------------------------
-
-
-def test_validate_handlers_invoke_searcher_self_registration():
-    """The items-tier, collection-tier and catalog-tier validate handlers MUST
-    each call `_self_register_searchers_into` (asset tier doesn't, by design —
-    no SEARCH op for assets).  Self-registration moved apply→validate in
-    #738/#747."""
-    import asyncio
-    from unittest.mock import patch
-
-    from dynastore.modules.storage.routing_config import (
-        AssetRoutingConfig,
-        _validate_asset_routing_config,
-        _validate_catalog_routing_config,
-        _validate_collection_routing_config,
-        _validate_items_routing_config,
-    )
-
-    calls: list[type] = []
-
-    def _spy(target_ops, marker_proto, **_kwargs):
-        # Accept arbitrary kwargs (e.g. ``search_caps`` on the searcher
-        # helper) so the spy works for both helper signatures.
-        calls.append(marker_proto)
-
-    items = ItemsRoutingConfig()
-    items.operations.clear()
-    coll = CollectionRoutingConfig()
-    coll.operations.clear()
-    asset = AssetRoutingConfig()
-    asset.operations.clear()
-    cat = CatalogRoutingConfig()
-    cat.operations.clear()
-
-    with patch(
-        "dynastore.modules.storage.routing_config._self_register_searchers_into",
-        _spy,
-    ), patch(
-        "dynastore.tools.discovery.get_protocols",
-        lambda proto: [],
-    ):
-        asyncio.run(_validate_items_routing_config(
-            items, catalog_id=None, collection_id=None, db_resource=None,
-        ))
-        asyncio.run(_validate_collection_routing_config(
-            coll, catalog_id=None, collection_id=None, db_resource=None,
-        ))
-        asyncio.run(_validate_asset_routing_config(
-            asset, catalog_id=None, collection_id=None, db_resource=None,
-        ))
-        asyncio.run(_validate_catalog_routing_config(
-            cat, catalog_id=None, collection_id=None, db_resource=None,
-        ))
-
-    from dynastore.models.protocols.entity_store import (
-        CatalogStore,
-        CollectionStore,
-    )
-    from dynastore.models.protocols.storage_driver import CollectionItemsStore
-    # Each tier's validate handler invokes searcher registration once with its
-    # own marker Protocol. Order matches invocation order above.
-    assert calls == [
-        CollectionItemsStore,
-        CollectionStore,
-        CatalogStore,
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Transformer self-registration parity (sister to indexer / searcher helpers)
+# Transformer self-registration parity (sister to the indexer helper)
 # ---------------------------------------------------------------------------
 
 
 def test_transformer_helper_picks_up_entity_transform_protocol_implementers():
     """Any registered EntityTransformProtocol implementer lands in the
-    ``transformers`` registry keyed by class name (matching indexer/searcher
+    ``transformers`` registry keyed by class name (matching the indexer
     convention)."""
     from unittest.mock import patch
 
@@ -1056,68 +970,11 @@ def test_option_a_is_operator_managed_predicate_basic():
     op_entry = OperationDriverEntry(driver_ref="x", source="operator")
     au_entry = OperationDriverEntry(driver_ref="y", source="auto")
 
-    assert _is_operator_managed({Operation.SEARCH: [op_entry]}, Operation.SEARCH)
-    assert not _is_operator_managed({Operation.SEARCH: [au_entry]}, Operation.SEARCH)
-    assert _is_operator_managed({Operation.SEARCH: [au_entry, op_entry]}, Operation.SEARCH)
-    assert not _is_operator_managed({Operation.SEARCH: []}, Operation.SEARCH)
-    assert not _is_operator_managed({}, Operation.SEARCH)
-
-
-def test_option_a_indexer_helper_skips_operator_managed_list():
-    """Indexer self-register helper is a no-op for an operation whose
-    list contains any ``source='operator'`` entry (#792 / #889 — the
-    deletion-comes-back symptom)."""
-    from typing import ClassVar
-    from unittest.mock import patch
-
-    from dynastore.models.protocols.indexer import CollectionIndexer
-    from dynastore.modules.storage.routing_config import (
-        _self_register_indexers_into,
-    )
-
-    class _NewIndexer:
-        is_collection_indexer: ClassVar[bool] = True
-        auto_register_for_routing: ClassVar = frozenset({Operation.WRITE})
-
-    target_ops: dict = {
-        Operation.WRITE: [
-            OperationDriverEntry(
-                driver_ref="some_other_driver", source="operator",
-            ),
-        ],
-    }
-    with patch("dynastore.tools.discovery.get_protocols",
-               lambda proto: [_NewIndexer()]):
-        _self_register_indexers_into(target_ops, CollectionIndexer)
-
-    refs = {e.driver_ref for e in target_ops[Operation.WRITE]}
-    assert refs == {"some_other_driver"}
-
-
-def test_option_a_searcher_helper_skips_operator_managed_list():
-    """Searcher self-register helper: same lock-out shape."""
-    from typing import ClassVar
-    from unittest.mock import patch
-
-    from dynastore.models.protocols.entity_store import CatalogStore
-    from dynastore.modules.storage.routing_config import (
-        _self_register_searchers_into,
-    )
-
-    class _NewSearcher:
-        auto_register_for_routing: ClassVar = frozenset({Operation.SEARCH})
-
-    target_ops: dict = {
-        Operation.SEARCH: [
-            OperationDriverEntry(driver_ref="es_cat", source="operator"),
-        ],
-    }
-    with patch("dynastore.tools.discovery.get_protocols",
-               lambda proto: [_NewSearcher()]):
-        _self_register_searchers_into(target_ops, CatalogStore)
-
-    refs = {e.driver_ref for e in target_ops[Operation.SEARCH]}
-    assert refs == {"es_cat"}
+    assert _is_operator_managed({Operation.INDEX: [op_entry]}, Operation.INDEX)
+    assert not _is_operator_managed({Operation.INDEX: [au_entry]}, Operation.INDEX)
+    assert _is_operator_managed({Operation.INDEX: [au_entry, op_entry]}, Operation.INDEX)
+    assert not _is_operator_managed({Operation.INDEX: []}, Operation.INDEX)
+    assert not _is_operator_managed({}, Operation.INDEX)
 
 
 def test_option_a_store_drivers_helper_locks_per_operation():
@@ -1237,14 +1094,14 @@ def test_option_a_fresh_construct_still_auto_augments():
 
     class _DiscoverableIndexer:
         is_collection_indexer: ClassVar[bool] = True
-        auto_register_for_routing: ClassVar = frozenset({Operation.WRITE})
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: [_DiscoverableIndexer()]):
         cfg = CollectionRoutingConfig()
 
-    from dynastore.modules.storage.routing_config import secondary_index_entries
-    index_refs = {e.driver_ref for e in secondary_index_entries(cfg.operations)}
+    from dynastore.modules.storage.routing_config import index_entries
+    index_refs = {e.driver_ref for e in index_entries(cfg.operations)}
     assert "_discoverable_indexer" in index_refs
 
 
@@ -1257,12 +1114,9 @@ def _items_pg_only_body():
         "operations": {
             Operation.WRITE: [
                 {"driver_ref": "items_postgresql_driver", "source": "auto",
-                 "on_failure": "fatal", "write_mode": "sync"},
+                 "on_failure": "fatal"},
             ],
             Operation.READ: [
-                {"driver_ref": "items_postgresql_driver", "source": "auto"},
-            ],
-            Operation.SEARCH: [
                 {"driver_ref": "items_postgresql_driver", "source": "auto"},
             ],
         },
@@ -1288,38 +1142,41 @@ def test_external_write_context_stamps_operator_provenance():
     )
 
 
-def test_external_write_context_blocks_driver_reinjection_on_removal():
+def test_external_write_context_blocks_indexer_reinjection_on_removal():
     """End-to-end of the reported bug through the REAL deserialisation path.
 
-    With a discoverable ES indexer/searcher registered, an operator round-trips
-    a PG-only routing config (entries carry ``source='auto'`` from the GET):
+    With a discoverable ES indexer registered, an operator round-trips a
+    PG-only routing config (entries carry ``source='auto'`` from the GET):
 
-    * WITHOUT the external-write context the validator's self-register pass
-      re-appends ES — this is the bug, and the assertion proves the fixture
-      genuinely reproduces it.
-    * WITH the context the validator stamps the lists operator-authored BEFORE
-      self-registration, so ES is NOT re-appended — the operator's deletion
-      sticks.
+    * WITHOUT the external-write context, WRITE stays ``source='auto'`` —
+      not operator-managed — so the validator's self-register pass appends
+      ES to INDEX.  This is the bug-reproduction baseline: the assertion
+      proves the fixture genuinely exercises the gate.
+    * WITH the context the validator stamps every present list
+      operator-authored BEFORE self-registration, so WRITE becomes
+      operator-managed and INDEX auto-registration is blocked — the
+      operator's deletion sticks.
     """
     from typing import ClassVar
     from unittest.mock import patch
 
+    from dynastore.modules.storage.routing_config import index_entries
+
     class _ItemsES:
         is_item_indexer: ClassVar[bool] = True
-        auto_register_for_routing: ClassVar = frozenset(
-            {Operation.WRITE, Operation.SEARCH}
-        )
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
-    # Bug path: no external-write context -> ES is re-appended.
+    # Baseline: no external-write context -> WRITE stays auto-sourced ->
+    # INDEX auto-registration fires.
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: [_ItemsES()]):
         bug = ItemsRoutingConfig.model_validate(_items_pg_only_body())
-    bug_write = {e.driver_ref for e in bug.operations[Operation.WRITE]}
-    assert "_items_es" in bug_write, (
-        "fixture must reproduce the re-injection without the context flag"
+    bug_index = {e.driver_ref for e in index_entries(bug.operations)}
+    assert "_items_es" in bug_index, (
+        "fixture must reproduce INDEX auto-registration without the context flag"
     )
 
-    # Fix path: external-write context -> ES stays removed.
+    # Fix path: external-write context -> WRITE locked -> INDEX stays empty.
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: [_ItemsES()]):
         fixed = ItemsRoutingConfig.model_validate(
@@ -1327,9 +1184,9 @@ def test_external_write_context_blocks_driver_reinjection_on_removal():
             context={"dynastore_external_write": True},
         )
     fixed_write = {e.driver_ref for e in fixed.operations[Operation.WRITE]}
-    fixed_search = {e.driver_ref for e in fixed.operations[Operation.SEARCH]}
+    fixed_index = {e.driver_ref for e in index_entries(fixed.operations)}
     assert fixed_write == {"items_postgresql_driver"}
-    assert fixed_search == {"items_postgresql_driver"}
+    assert fixed_index == set()
 
 
 def test_internal_construct_without_context_still_auto_augments():
@@ -1339,19 +1196,17 @@ def test_internal_construct_without_context_still_auto_augments():
     from typing import ClassVar
     from unittest.mock import patch
 
-    from dynastore.modules.storage.routing_config import secondary_index_entries
+    from dynastore.modules.storage.routing_config import index_entries
 
     class _ItemsES:
         is_item_indexer: ClassVar[bool] = True
-        auto_register_for_routing: ClassVar = frozenset(
-            {Operation.WRITE, Operation.SEARCH}
-        )
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: [_ItemsES()]):
         cfg = ItemsRoutingConfig.model_validate(_items_pg_only_body())
 
-    index_refs = {e.driver_ref for e in secondary_index_entries(cfg.operations)}
+    index_refs = {e.driver_ref for e in index_entries(cfg.operations)}
     assert "_items_es" in index_refs
 
 
@@ -1416,11 +1271,11 @@ def test_1865_compute_changed_op_keys_detects_changes():
         Operation.READ: [
             {"driver_ref": "pg_driver"},
         ],
-        Operation.SEARCH: [
+        Operation.INDEX: [
             {"driver_ref": "pg_driver"},
         ],
     }
-    # Stored has WRITE with BOTH pg + es; READ and SEARCH identical to incoming.
+    # Stored has WRITE with BOTH pg + es; READ and INDEX identical to incoming.
     stored_raw = {
         "operations": {
             Operation.WRITE: [
@@ -1428,7 +1283,7 @@ def test_1865_compute_changed_op_keys_detects_changes():
                 {"driver_ref": "es_driver", "source": "auto"},
             ],
             Operation.READ: [{"driver_ref": "pg_driver", "source": "auto"}],
-            Operation.SEARCH: [{"driver_ref": "pg_driver", "source": "auto"}],
+            Operation.INDEX: [{"driver_ref": "pg_driver", "source": "auto"}],
         }
     }
     changed = _compute_changed_op_keys(incoming, stored_raw)
@@ -1453,7 +1308,7 @@ def test_1865_compute_changed_op_keys_new_op_key_is_changed():
 
     incoming = {
         Operation.WRITE: [{"driver_ref": "pg_driver"}],
-        Operation.SEARCH: [{"driver_ref": "es_driver"}],  # new — absent in stored
+        Operation.INDEX: [{"driver_ref": "es_driver"}],  # new — absent in stored
     }
     stored_raw = {
         "operations": {
@@ -1461,13 +1316,13 @@ def test_1865_compute_changed_op_keys_new_op_key_is_changed():
         }
     }
     changed = _compute_changed_op_keys(incoming, stored_raw)
-    assert Operation.SEARCH in changed
+    assert Operation.INDEX in changed
     assert Operation.WRITE not in changed
 
 
 def test_1865_stamp_scoped_to_changed_ops_only():
     """``_stamp_operator_provenance`` with ``changed_op_keys={WRITE}`` stamps
-    WRITE entries but leaves READ/SEARCH entries with their existing source."""
+    WRITE entries but leaves READ/INDEX entries with their existing source."""
     cfg = ItemsRoutingConfig.model_construct(
         operations={
             Operation.WRITE: [
@@ -1476,7 +1331,7 @@ def test_1865_stamp_scoped_to_changed_ops_only():
             Operation.READ: [
                 OperationDriverEntry(driver_ref="pg", source="auto"),
             ],
-            Operation.SEARCH: [
+            Operation.INDEX: [
                 OperationDriverEntry(driver_ref="pg", source="auto"),
             ],
         }
@@ -1485,7 +1340,7 @@ def test_1865_stamp_scoped_to_changed_ops_only():
 
     assert cfg.operations[Operation.WRITE][0].source == "operator"
     assert cfg.operations[Operation.READ][0].source == "auto"
-    assert cfg.operations[Operation.SEARCH][0].source == "auto"
+    assert cfg.operations[Operation.INDEX][0].source == "auto"
 
 
 def test_1865_stamp_with_none_changed_keys_stamps_all():
@@ -1503,45 +1358,41 @@ def test_1865_stamp_with_none_changed_keys_stamps_all():
     assert cfg.operations[Operation.READ][0].source == "operator"
 
 
-def test_1865_unchanged_op_allows_driver_auto_augmentation():
-    """End-to-end: operator PUT changes only WRITE (removes ES); READ and
-    SEARCH are unchanged.  After validation with the scoped context:
-
-    * WRITE is locked — ES stays removed.
-    * READ and SEARCH remain auto-managed — a newly discovered ES driver
-      would be auto-appended to those lists on the next write.
-
-    This is the core semantic of #1865: scope the provenance lock to the
-    lists the operator actually changed.
+def test_1865_write_lock_also_gates_index_auto_registration():
+    """Deviation from the pre-lane-model #1865 semantic (documented): since
+    indexers now self-register into a SEPARATE ``operations[INDEX]`` list,
+    ``_self_register_indexers_into`` cannot gate on INDEX's own
+    operator-managed status the way ``_self_register_store_drivers`` gates
+    WRITE vs READ independently — INDEX has no operator-authored anchor of
+    its own when a "PG-only" config never mentions it at all.  It gates on
+    WRITE instead, so locking WRITE (even when INDEX itself is untouched /
+    not in ``changed_op_keys``) also blocks INDEX auto-registration.  This
+    is the safe-by-default posture: an operator who explicitly manages
+    WRITE for an entity does not get a silently-injected ES indexer.
     """
     from typing import ClassVar
     from unittest.mock import patch
 
+    from dynastore.modules.storage.routing_config import index_entries
+
     class _ItemsES:
         is_item_indexer: ClassVar[bool] = True
-        auto_register_for_routing: ClassVar = frozenset(
-            {Operation.WRITE, Operation.SEARCH}
-        )
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
-    # The stored config has WRITE=[pg, es], READ=[pg], SEARCH=[pg, es].
-    # The operator sends WRITE=[pg] (removes es), READ=[pg], SEARCH=[pg, es].
-    # Only WRITE changed.
+    # Stored config has WRITE=[pg], READ=[pg]. Operator PUTs the same
+    # WRITE=[pg] (unchanged) plus READ=[pg] (unchanged) — only WRITE is
+    # in changed_op_keys per the scoping contract exercised here.
     incoming_body = {
         "operations": {
             Operation.WRITE: [
                 {"driver_ref": "items_postgresql_driver", "source": "auto",
-                 "on_failure": "fatal", "write_mode": "sync"},
+                 "on_failure": "fatal"},
             ],
             Operation.READ: [
                 {"driver_ref": "items_postgresql_driver", "source": "auto"},
             ],
-            Operation.SEARCH: [
-                {"driver_ref": "items_postgresql_driver", "source": "auto"},
-                {"driver_ref": "_items_es", "source": "auto"},
-            ],
         },
     }
-    # changed_op_keys = {WRITE} (only that list differs from stored)
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: [_ItemsES()]):
         cfg = ItemsRoutingConfig.model_validate(
@@ -1553,167 +1404,57 @@ def test_1865_unchanged_op_allows_driver_auto_augmentation():
         )
 
     write_refs = {e.driver_ref for e in cfg.operations[Operation.WRITE]}
-    read_refs = {e.driver_ref for e in cfg.operations[Operation.READ]}
-    search_refs = {e.driver_ref for e in cfg.operations[Operation.SEARCH]}
+    index_refs = {e.driver_ref for e in index_entries(cfg.operations)}
 
-    # WRITE locked: ES removed, stays removed even though ES is discoverable.
-    assert "_items_es" not in write_refs
-    assert "items_postgresql_driver" in write_refs
-    # WRITE entries have source=operator (locked).
-    assert all(
-        e.source == "operator"
-        for e in cfg.operations[Operation.WRITE]
-    )
-    # READ: still auto-managed — the validator did not stamp operator on READ.
-    # The existing [pg] auto entry survives; no additional es entry (discovery
-    # did not add one since READ was already present).
-    assert "items_postgresql_driver" in read_refs
-    assert all(
-        e.source == "auto"
-        for e in cfg.operations[Operation.READ]
-    )
-    # SEARCH: operator sent [pg, es] and it was NOT in changed_op_keys, so
-    # entries stay auto-sourced and are not locked.
-    assert "items_postgresql_driver" in search_refs
-    assert "_items_es" in search_refs
-    assert all(
-        e.source == "auto"
-        for e in cfg.operations[Operation.SEARCH]
-    )
+    assert write_refs == {"items_postgresql_driver"}
+    assert all(e.source == "operator" for e in cfg.operations[Operation.WRITE])
+    # INDEX stays empty — locked alongside WRITE even though INDEX itself
+    # carried no operator-source entry to lock on its own.
+    assert index_refs == set()
 
 
-def test_1865_write_lock_preserved_when_read_search_open():
-    """Guard: the #1863 guarantee is intact — when WRITE is in changed_op_keys
-    and the operator removes a driver from WRITE, that driver does NOT come
-    back even though READ/SEARCH are left open."""
-    from typing import ClassVar
-    from unittest.mock import patch
-
-    class _ItemsES:
-        is_item_indexer: ClassVar[bool] = True
-        auto_register_for_routing: ClassVar = frozenset(
-            {Operation.WRITE, Operation.SEARCH}
-        )
-
-    pg_only_write_body = {
-        "operations": {
-            Operation.WRITE: [
-                {"driver_ref": "items_postgresql_driver", "source": "auto",
-                 "on_failure": "fatal", "write_mode": "sync"},
-            ],
-            Operation.READ: [
-                {"driver_ref": "items_postgresql_driver", "source": "auto"},
-            ],
-        },
-    }
-    with patch("dynastore.tools.discovery.get_protocols",
-               lambda proto: [_ItemsES()]):
-        cfg = ItemsRoutingConfig.model_validate(
-            pg_only_write_body,
-            context={
-                "dynastore_external_write": True,
-                "dynastore_changed_operation_keys": {Operation.WRITE},
-            },
-        )
-
-    write_refs = {e.driver_ref for e in cfg.operations[Operation.WRITE]}
-    assert "_items_es" not in write_refs, (
-        "#1863 regression: removed ES driver re-appeared in WRITE despite lock"
-    )
-
-
-def test_option_a_792_reproducer_search_index_lock():
-    """End-to-end reproducer for #792: operator PUTs an explicit SEARCH
-    list (single entry, source='operator'), then a downstream code path
-    runs the search self-register helper — the missing driver MUST stay
-    missing (the symptom on #792 was the missing driver re-appearing).
-    """
-    from typing import ClassVar
-    from unittest.mock import patch
-
-    from dynastore.models.protocols.storage_driver import (
-        CollectionItemsStore,
-    )
-    from dynastore.modules.storage.routing_config import (
-        _self_register_searchers_into,
-    )
-
-    # Driver pool: ES is operator-pinned; PG offers SEARCH opt-in but is
-    # explicitly omitted from the operator's list.
-    class _ItemsES:
-        is_item_indexer: ClassVar[bool] = False
-        auto_register_for_routing: ClassVar = frozenset({Operation.SEARCH})
-
-    class _ItemsPG:
-        is_item_indexer: ClassVar[bool] = False
-        auto_register_for_routing: ClassVar = frozenset({Operation.SEARCH})
-
-    target_ops: dict = {
-        Operation.SEARCH: [
-            OperationDriverEntry(
-                driver_ref="items_elasticsearch_driver",
-                source="operator",
-            ),
-        ],
-    }
-    with patch("dynastore.tools.discovery.get_protocols",
-               lambda proto: [_ItemsES(), _ItemsPG()]):
-        _self_register_searchers_into(target_ops, CollectionItemsStore)
-
-    refs = {e.driver_ref for e in target_ops[Operation.SEARCH]}
-    # The exact #792 symptom — missing driver re-appearing — does not occur.
-    assert refs == {"items_elasticsearch_driver"}
-
-
-def test_validate_collection_routing_skips_secondary_index_write_entry():
-    """A ``secondary_index=True`` WRITE entry whose driver_ref is not a
-    registered ``CollectionStore`` must NOT fail collection routing validation.
+def test_validate_collection_routing_accepts_index_lane_entry_for_unregistered_driver():
+    """An INDEX-lane entry whose driver_ref is not currently registered must
+    NOT fail collection routing validation.
 
     Regression for the ES-catalog routing preset apply: the default
     ``CollectionRoutingConfig`` self-registers the ES ``CollectionIndexer``
-    into ``operations[WRITE]`` (``secondary_index=True``).  The ES driver is an
-    indexer, not a ``CollectionStore``, so validating it against the store
-    registry rejected it and rolled back the whole routing bundle, dropping an
-    ES catalog to the PG+ES default.  Secondary-index sinks are skipped here;
-    they are validated by their own discovery-driven self-registration and the
-    runtime router skips any unregistered entry at dispatch.
+    into ``operations[INDEX]``.  A deployment where the ES driver isn't
+    locally installed must not roll back the whole routing bundle — the
+    runtime router / drain skip any unregistered entry at dispatch.
     """
     import asyncio
     from unittest.mock import patch
 
     from dynastore.modules.storage.routing_config import (
-        WriteMode,
         _validate_collection_routing_config,
     )
 
     cfg = CollectionRoutingConfig()
     cfg.operations.clear()
-    cfg.operations[Operation.WRITE] = [
+    cfg.operations[Operation.INDEX] = [
         OperationDriverEntry(
             driver_ref="collection_elasticsearch_driver",
-            secondary_index=True,
-            write_mode=WriteMode.ASYNC,
-            on_failure=FailurePolicy.OUTBOX,
             source="auto",
         ),
     ]
     cfg.operations[Operation.READ] = []
 
-    # No collection drivers registered → store registry is empty.  Pre-fix this
-    # raised ValueError on the secondary-index ES entry; post-fix it is skipped.
+    # No collection drivers registered → store registry is empty. The
+    # unregistered INDEX entry must not raise.
     with patch("dynastore.tools.discovery.get_protocols", lambda proto: []):
         asyncio.run(_validate_collection_routing_config(
             cfg, catalog_id=None, collection_id=None, db_resource=None,
         ))
 
-    write_refs = {e.driver_ref for e in cfg.operations[Operation.WRITE]}
-    assert "collection_elasticsearch_driver" in write_refs
+    index_refs = {e.driver_ref for e in cfg.operations[Operation.INDEX]}
+    assert "collection_elasticsearch_driver" in index_refs
 
 
 def test_validate_collection_routing_still_rejects_unknown_primary_store():
-    """A non-secondary (primary) WRITE entry with an unregistered driver_ref
-    still hard-fails — the secondary-index skip must not weaken typo
-    protection for the primary metadata store.
+    """A primary WRITE entry with an unregistered driver_ref still hard-fails
+    — the INDEX-lane tolerance must not weaken typo protection for the
+    primary metadata store.
     """
     import asyncio
     from unittest.mock import patch
@@ -1740,13 +1481,12 @@ def test_validate_collection_routing_still_rejects_unknown_primary_store():
 
 def test_validate_collection_routing_skips_stale_indexer_in_read():
     """A routing config persisted before the ES-only collection routing fix could
-    list the ES ``collection_elasticsearch_driver`` as a READ *primary*
-    (``secondary_index`` unset).  The ES driver is a ``CollectionIndexer``, never
-    a READ-capable ``CollectionStore`` — validating it against the store registry
-    hard-raised ``operations[READ] driver ... is not registered`` and blocked the
-    catalog.  It must now be warn-skipped (the runtime router relaxes READ to an
-    available store), so a stale catalog stays readable and self-heals on the
-    next apply.  Parity with the operations[WRITE] secondary-index skip (#2267).
+    list the ES ``collection_elasticsearch_driver`` as a READ *primary*.  The ES
+    driver is a ``CollectionIndexer``, never a READ-capable ``CollectionStore``
+    — validating it against the store registry hard-raised
+    ``operations[READ] driver ... is not registered`` and blocked the catalog.
+    It must be warn-skipped (the runtime router relaxes READ to an available
+    store), so a stale catalog stays readable and self-heals on the next apply.
     """
     import asyncio
     from typing import ClassVar
@@ -1765,7 +1505,7 @@ def test_validate_collection_routing_skips_stale_indexer_in_read():
     class CollectionElasticsearchDriver:  # a CollectionIndexer, NOT a store
         is_collection_indexer: ClassVar[bool] = True
         auto_register_for_routing: ClassVar = frozenset(
-            {Operation.SEARCH, Operation.WRITE}
+            {Operation.INDEX, Operation.READ}
         )
 
     pg = CollectionPostgresqlDriver()
@@ -1784,7 +1524,7 @@ def test_validate_collection_routing_skips_stale_indexer_in_read():
         OperationDriverEntry(
             driver_ref="collection_postgresql_driver", source="auto",
         ),
-        # Stale ES-as-READ-primary entry (secondary_index unset).
+        # Stale ES-as-READ-primary entry.
         OperationDriverEntry(
             driver_ref="collection_elasticsearch_driver", source="auto",
         ),

@@ -23,6 +23,30 @@ class ReadOnlyDriverError(Exception):
     """Write attempted on a read-only driver."""
 
 
+class ReadOnlyCollectionError(Exception):
+    """Client write attempted against an entity whose WRITE lane is empty.
+
+    Under the lane model (#2494) an empty or absent ``operations[WRITE]``
+    is a valid configuration meaning "read-only" — not a misconfiguration.
+    Raised at dispatch time, before any driver call, so the rejection is a
+    clean typed error rather than a mid-dispatch failure (e.g. an
+    ``IndexError`` on an empty resolved-drivers list). Maps to HTTP 405.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        catalog_id: str | None = None,
+        collection_id: str | None = None,
+        entity: str = "item",
+    ) -> None:
+        super().__init__(message)
+        self.catalog_id = catalog_id
+        self.collection_id = collection_id
+        self.entity = entity
+
+
 class SoftDeleteNotSupportedError(Exception):
     """Soft delete requested but driver doesn't support it."""
 
@@ -138,9 +162,11 @@ class EsBulkWriteError(Exception):
     cluster (HTTP 200 response with ``"errors": true`` and per-doc
     ``status >= 300`` or ``"error"`` key).
 
-    Raised by every inline ES write path so the dispatcher's
-    ``on_failure`` policy can apply: ``OUTBOX`` enqueues for the drain
-    worker; ``FATAL`` rolls back the wrapping transaction.
+    Raised by every inline ES write path. On the WRITE lane (synchronous,
+    FATAL by default) this rolls back the wrapping transaction. On the
+    INDEX lane, ES is never called synchronously outside of a task run —
+    a transient bulk failure there is retried via the storage-plane drain
+    rather than raising this into a live request.
 
     Carries the list of per-item failures so callers can log structured
     diagnostics without re-parsing the raw ES response.

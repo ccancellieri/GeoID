@@ -22,10 +22,11 @@ The OGC features browse always carries an implicit ``validity @> now()``
 default (``parse_ogc_query_request`` appends it whenever no ``datetime`` is
 supplied). That temporal-validity condition is a READ modifier applied
 uniformly on the read backend — it must NOT flip a plain browse onto the
-SEARCH backend. Only genuine spatial/attribute predicates select SEARCH.
+derived-search (INDEX-lane) backend. Only genuine spatial/attribute
+predicates select INDEX.
 
 Regression guard for the bug where every ``/items`` browse was misrouted to
-Elasticsearch (SEARCH = [ES, PG]) because ``request.filters`` was never empty.
+Elasticsearch because ``request.filters`` was never empty.
 """
 from __future__ import annotations
 
@@ -80,12 +81,12 @@ def test_bbox_spatial_filter_is_search() -> None:
             ),
         ]
     )
-    assert _pick_operation(req) == Operation.SEARCH
+    assert _pick_operation(req) == Operation.INDEX
 
 
 def test_cql_filter_is_search() -> None:
     req = QueryRequest(filters=[_validity_now()], cql_filter="CODE = '325'")
-    assert _pick_operation(req) == Operation.SEARCH
+    assert _pick_operation(req) == Operation.INDEX
 
 
 def test_attribute_filter_condition_is_search() -> None:
@@ -95,4 +96,4 @@ def test_attribute_filter_condition_is_search() -> None:
             FilterCondition(field="CODE", operator="=", value="325"),
         ]
     )
-    assert _pick_operation(req) == Operation.SEARCH
+    assert _pick_operation(req) == Operation.INDEX

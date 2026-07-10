@@ -52,16 +52,17 @@ from dynastore.modules.storage.routing_config import (
 
 def test_private_items_builder_pins_private_driver_across_operations():
     """The demo's private-routing builder pins the private driver so the
-    collection is detected as private. The private driver rides WRITE (the
-    secondary-index hop) and fronts SEARCH; PG is the system of record."""
+    collection is detected as private. The private driver rides the INDEX
+    lane (materialization + derived search); PG is the system of record
+    for WRITE/READ."""
     routing = _build_private_items_routing()
 
     assert _items_routing_has_private_driver(routing) is True
 
     write_refs = [e.driver_ref for e in routing.operations[Operation.WRITE]]
-    search_refs = [e.driver_ref for e in routing.operations[Operation.SEARCH]]
-    assert _PRIVATE_ITEMS_DRIVER_ID in write_refs
-    assert _PRIVATE_ITEMS_DRIVER_ID in search_refs
+    index_refs = [e.driver_ref for e in routing.operations[Operation.INDEX]]
+    assert write_refs == ["items_postgresql_driver"]
+    assert _PRIVATE_ITEMS_DRIVER_ID in index_refs
 
 
 def test_items_es_private_preset_resolves_to_private_routing():

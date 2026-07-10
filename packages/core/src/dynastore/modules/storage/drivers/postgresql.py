@@ -43,7 +43,6 @@ from dynastore.models.query_builder import QueryRequest
 from dynastore.modules.protocols import ModuleProtocol
 from dynastore.modules.storage.errors import SoftDeleteNotSupportedError
 from dynastore.modules.storage.hints import Hint
-from dynastore.modules.storage.routing_config import Operation
 from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
 
 logger = logging.getLogger(__name__)
@@ -120,12 +119,14 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
     # re-drop it or a second DROP TABLE races the inline drop for the table lock.
     teardown_lane: ClassVar[TeardownLane] = TeardownLane.INLINE_TXN
 
-    # PG is the truth-source for items (WRITE primary in routing
-    # defaults) and the ``geometry_exact`` fallback for SEARCH.  WRITE +
-    # READ are pinned by explicit defaults in ``ItemsRoutingConfig``;
-    # auto-augment opts in only for SEARCH so PG appears in the SEARCH
-    # entry list as the precision-fallback backend.
-    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({Operation.SEARCH})
+    # PG is the truth-source for items (WRITE primary in routing defaults)
+    # and the ``geometry_exact`` READ/derived-search fallback. WRITE + READ
+    # are pinned by explicit defaults in ``ItemsRoutingConfig``; PG is not
+    # an INDEX-lane (materialization) driver, so it opts into no auto-
+    # registration set — its search-fallback role is already covered by
+    # the derived-search pool's READ-lane fallback tier (see
+    # ``dynastore.modules.storage.router.get_items_search_driver``).
+    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset()
 
     priority: int = 10
     preferred_chunk_size: int = 0

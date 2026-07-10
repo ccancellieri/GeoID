@@ -18,18 +18,19 @@
 
 """``routing`` — a single parametric storage-routing preset.
 
-Routing is *where data lives*: which drivers handle WRITE / READ / SEARCH at
-each tier.  This module owns the per-tier × per-backend routing builders and
+Routing is *where data lives*: which drivers handle WRITE / READ / INDEX at
+each tier (search is derived from INDEX-then-READ, never configured
+directly).  This module owns the per-tier × per-backend routing builders and
 exposes one preset, ``routing``, parametrised by a ``drivers`` combination:
 
 - ``pg``      — PostgreSQL only.
 - ``es``      — **items** in public Elasticsearch only.  Collection and catalog
   *metadata* always keep PG as the system of record (the ES collection/catalog
-  drivers are write-only secondary indexes, never READ stores), with a public ES
-  secondary index + SEARCH.  There is no ES-only metadata tier.
-- ``pg_es``   — PG primary (WRITE/READ) + public ES async secondary + SEARCH.
-- ``pg_pes``  — PG primary + **private** ES async secondary + SEARCH.  Private
-  ES is items-only (there is no private collection-tier index), so the
+  drivers are write-only INDEX-lane backends, never READ stores), with a
+  public ES INDEX entry.  There is no ES-only metadata tier.
+- ``pg_es``   — PG primary (WRITE/READ) + public ES async INDEX (materialization + search).
+- ``pg_pes``  — PG primary + **private** ES async INDEX (materialization + search).
+  Private ES is items-only (there is no private collection-tier index), so the
   collection tier stays PG.
 
 The preset is **scope-aware**, mirroring how a catalog contains collections
@@ -68,7 +69,6 @@ from dynastore.modules.storage.routing_config import (
     ItemsRoutingConfig,
     Operation,
     OperationDriverEntry,
-    WriteMode,
 )
 
 from .bundle_preset import BundlePreset
@@ -81,10 +81,10 @@ class RoutingDrivers(str, Enum):
 
     - ``PG``     — PostgreSQL only.
     - ``ES``     — items in public Elasticsearch only; collection/catalog metadata
-      stay PG system-of-record + public ES secondary index (no ES-only metadata).
-    - ``PG_ES``  — PG primary + public ES async secondary + SEARCH.
-    - ``PG_PES`` — PG primary + private ES async secondary + SEARCH (items only;
-      collection tier stays PG since private ES has no collection-tier index).
+      stay PG system-of-record + public ES INDEX entry (no ES-only metadata).
+    - ``PG_ES``  — PG primary + public ES async INDEX (materialization + search).
+    - ``PG_PES`` — PG primary + private ES async INDEX (items only; collection
+      tier stays PG since private ES has no collection-tier index).
     """
 
     PG = "pg"
@@ -102,8 +102,8 @@ class RoutingPresetParams(BaseModel):
             "Driver combination: ``pg`` (PostgreSQL only), ``es`` (items in "
             "public Elasticsearch only — collection/catalog metadata stay PG "
             "system-of-record + ES index), ``pg_es`` (PG primary + public ES "
-            "secondary and search), or ``pg_pes`` (PG primary + private ES "
-            "secondary and search; items only)."
+            "INDEX materialization and search), or ``pg_pes`` (PG primary + "
+            "private ES INDEX materialization and search; items only)."
         ),
     )
 
@@ -119,23 +119,45 @@ def _catalog_routing_es() -> CatalogRoutingConfig:
     """Catalog routing for an ES catalog — PG metadata + ES index, NOT ES-only.
 
     There is no "ES-only" catalog-metadata tier: ``catalog_elasticsearch_driver``
-    is a write-only secondary index + SEARCH backend, never a READ-capable
-    ``CatalogStore`` (the only registered ``CatalogStore`` is the PG driver).
-    Authoring ES as a READ/WRITE-primary driver fails routing validation.
-    Catalog metadata stays on PG as the system of record; the ES secondary
-    index + SEARCH are appended by routing self-registration at apply time.
-    Returns the platform default (PG WRITE/READ primary, ES secondary + SEARCH).
+    is a write-only INDEX-lane backend, never a READ-capable ``CatalogStore``
+    (the only registered ``CatalogStore`` is the PG driver). Authoring ES as
+    a READ/WRITE-primary driver fails routing validation. Catalog metadata
+    stays on PG as the system of record; the ES INDEX entry is declared
+    explicitly here rather than left to routing self-registration — an
+    operator who explicitly requested the ``es``/``pg_es`` driver combination
+    must get a deterministic INDEX entry regardless of what happens to be
+    discoverable in the running process at apply time.
     """
-    return CatalogRoutingConfig()
+    return CatalogRoutingConfig(
+        operations={
+            Operation.WRITE: [
+                OperationDriverEntry(
+                    driver_ref="catalog_postgresql_driver",
+                    on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+            Operation.READ: [
+                OperationDriverEntry(
+                    driver_ref="catalog_postgresql_driver",
+                    on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+            Operation.INDEX: [
+                OperationDriverEntry(
+                    driver_ref="catalog_elasticsearch_driver",
+                    source="auto",
+                ),
+            ],
+        },
+    )
 
 
 def _catalog_routing_es_pg() -> CatalogRoutingConfig:
     """ES_PG catalog routing — same as :func:`_catalog_routing_es` on this
-    platform: catalog metadata is always PG system-of-record with the ES
-    secondary index + SEARCH appended by self-registration.  Returns the
-    platform default.
+    platform: catalog metadata is always PG system-of-record with an
+    explicit ES INDEX entry.
     """
-    return CatalogRoutingConfig()
+    return _catalog_routing_es()
 
 
 def _catalog_routing_pg() -> CatalogRoutingConfig:
@@ -154,12 +176,6 @@ def _catalog_routing_pg() -> CatalogRoutingConfig:
                     on_failure=FailurePolicy.FATAL,
                 ),
             ],
-            Operation.SEARCH: [
-                OperationDriverEntry(
-                    driver_ref="catalog_postgresql_driver",
-                    source="operator",
-                ),
-            ],
         },
     )
 
@@ -168,25 +184,47 @@ def _collection_routing_es() -> CollectionRoutingConfig:
     """Collection routing for an ES-items catalog — PG metadata + ES index.
 
     There is no "ES-only" collection tier: ``CollectionElasticsearchDriver`` is
-    a write-only secondary index (``auto_register_for_routing={SEARCH, WRITE}``,
+    a write-only INDEX-lane backend (``auto_register_for_routing={INDEX, READ}``,
     ``is_collection_indexer=True``) — never a READ-capable ``CollectionStore``.
     Authoring it as a READ/WRITE-primary driver fails routing validation
     (``operations[READ] driver 'collection_elasticsearch_driver' is not
     registered``).  Collection metadata therefore stays on PG as the system of
-    record; the ES secondary index + SEARCH are appended by routing
-    self-registration at apply time.  Returns the platform default (PG WRITE/READ
-    primary, ES secondary index, ES+PG SEARCH).
+    record; the ES INDEX entry is declared explicitly here rather than left
+    to routing self-registration — an operator who explicitly requested the
+    ``es``/``pg_es`` driver combination must get a deterministic INDEX entry
+    regardless of what happens to be discoverable in the running process at
+    apply time.
     """
-    return CollectionRoutingConfig()
+    return CollectionRoutingConfig(
+        operations={
+            Operation.WRITE: [
+                OperationDriverEntry(
+                    driver_ref="collection_postgresql_driver",
+                    on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+            Operation.READ: [
+                OperationDriverEntry(
+                    driver_ref="collection_postgresql_driver",
+                    on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+            Operation.INDEX: [
+                OperationDriverEntry(
+                    driver_ref="collection_elasticsearch_driver",
+                    source="auto",
+                ),
+            ],
+        },
+    )
 
 
 def _collection_routing_es_pg() -> CollectionRoutingConfig:
     """ES_PG collection routing — same as :func:`_collection_routing_es` on this
-    platform: collection metadata is always PG system-of-record with the ES
-    secondary index + SEARCH appended by self-registration.  Returns the
-    platform default.
+    platform: collection metadata is always PG system-of-record with an
+    explicit ES INDEX entry.
     """
-    return CollectionRoutingConfig()
+    return _collection_routing_es()
 
 
 def _collection_routing_pg() -> CollectionRoutingConfig:
@@ -203,12 +241,6 @@ def _collection_routing_pg() -> CollectionRoutingConfig:
                 OperationDriverEntry(
                     driver_ref="collection_postgresql_driver",
                     on_failure=FailurePolicy.FATAL,
-                ),
-            ],
-            Operation.SEARCH: [
-                OperationDriverEntry(
-                    driver_ref="collection_postgresql_driver",
-                    source="operator",
                 ),
             ],
         },
@@ -231,18 +263,12 @@ def _items_routing_es() -> ItemsRoutingConfig:
                     on_failure=FailurePolicy.FATAL,
                 ),
             ],
-            Operation.SEARCH: [
-                OperationDriverEntry(
-                    driver_ref="items_elasticsearch_driver",
-                    source="operator",
-                ),
-            ],
         },
     )
 
 
 def _items_routing_es_pg() -> ItemsRoutingConfig:
-    """ES_PG items routing — PG preferred WRITE/READ, ES SEARCH + async."""
+    """ES_PG items routing — PG WRITE/READ primary, ES async INDEX."""
     return ItemsRoutingConfig(
         operations={
             Operation.WRITE: [
@@ -250,20 +276,13 @@ def _items_routing_es_pg() -> ItemsRoutingConfig:
                     driver_ref="items_postgresql_driver",
                     on_failure=FailurePolicy.FATAL,
                 ),
-                OperationDriverEntry(
-                    driver_ref="items_elasticsearch_driver",
-                    write_mode=WriteMode.ASYNC,
-                    on_failure=FailurePolicy.OUTBOX,
-                    secondary_index=True,
-                    source="auto",
-                ),
             ],
             Operation.READ: [
                 OperationDriverEntry(
                     driver_ref="items_postgresql_driver",
                 ),
             ],
-            Operation.SEARCH: [
+            Operation.INDEX: [
                 OperationDriverEntry(
                     driver_ref="items_elasticsearch_driver",
                     source="auto",
@@ -288,18 +307,12 @@ def _items_routing_pg() -> ItemsRoutingConfig:
                     driver_ref="items_postgresql_driver",
                 ),
             ],
-            Operation.SEARCH: [
-                OperationDriverEntry(
-                    driver_ref="items_postgresql_driver",
-                    source="operator",
-                ),
-            ],
         },
     )
 
 
 def _items_routing_pg_pes() -> ItemsRoutingConfig:
-    """PG primary + private-ES secondary items routing.
+    """PG primary + private-ES INDEX items routing.
 
     Reuses the single private-items routing SSOT (``_build_private_items_routing``)
     so ``routing(drivers=pg_pes)`` and the ``private_catalog`` / ``items_es_private``
@@ -460,7 +473,7 @@ class RoutingPreset(BundlePreset):
             name="catalog-pg-es",
             summary=(
                 "Route a catalog's collections and items to PG primary with a "
-                "public ES secondary + search.  Apply at catalog scope via "
+                "public ES INDEX (materialization + search).  Apply at catalog scope via "
                 "POST /configs/catalogs/{catalog_id}/presets/routing with "
                 "params {\"drivers\": \"pg_es\"}.  Future collections inherit "
                 "the templates (inherit-only — already-materialised collections "
@@ -482,8 +495,8 @@ class RoutingPreset(BundlePreset):
         PresetExample(
             name="catalog-pg-private-es",
             summary=(
-                "Route a catalog to PG primary with a private ES secondary + "
-                "search for items (collection metadata stays in PG).  Apply at "
+                "Route a catalog to PG primary with a private ES INDEX "
+                "(materialization + search) for items (collection metadata stays in PG).  Apply at "
                 "catalog scope with params {\"drivers\": \"pg_pes\"}."
             ),
             params={"drivers": "pg_pes"},

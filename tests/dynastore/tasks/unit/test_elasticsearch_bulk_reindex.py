@@ -203,21 +203,23 @@ class _FakeResolvedDriver:
         self.driver_ref = driver_ref
 
 
-def _make_routing_config(driver_ref: str = "items_elasticsearch_driver", secondary_index: bool = True):
+def _make_routing_config(driver_ref: str = "items_elasticsearch_driver"):
+    """Fake routing-config stand-in. ``get_items_search_driver`` /
+    ``get_write_drivers`` are patched directly in these tests (see
+    ``_build_router_patches``), so this object's ``operations`` shape is
+    never actually introspected by the reindex code under test — it only
+    needs to satisfy ``ConfigsProtocol.get_config``'s return type."""
     return type("Routing", (), {
-        "operations": {"WRITE": [
-            type("Entry", (), {
-                "driver_ref": driver_ref,
-                "secondary_index": secondary_index,
-            })()
+        "operations": {"INDEX": [
+            type("Entry", (), {"driver_ref": driver_ref})()
         ]},
     })()
 
 
 def _routing_without_es():
     return type("Routing", (), {
-        "operations": {"WRITE": [
-            type("Entry", (), {"driver_ref": "other_driver", "secondary_index": False})()
+        "operations": {"INDEX": [
+            type("Entry", (), {"driver_ref": "other_driver"})()
         ]},
     })()
 
@@ -1306,7 +1308,6 @@ async def test_is_es_active_for_returns_false_for_private_only_routing():
                 OperationDriverEntry(driver_ref="items_postgresql_driver"),
                 OperationDriverEntry(
                     driver_ref="items_elasticsearch_private_driver",
-                    secondary_index=True,
                 ),
             ],
         },
@@ -1353,11 +1354,9 @@ async def test_is_es_active_for_returns_true_when_public_and_private_both_pinned
                 OperationDriverEntry(driver_ref="items_postgresql_driver"),
                 OperationDriverEntry(
                     driver_ref="items_elasticsearch_driver",
-                    secondary_index=True,
                 ),
                 OperationDriverEntry(
                     driver_ref="items_elasticsearch_private_driver",
-                    secondary_index=True,
                 ),
             ],
         },

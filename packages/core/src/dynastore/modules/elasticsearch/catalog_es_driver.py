@@ -145,16 +145,21 @@ class CatalogElasticsearchDriver(TypedDriver[CatalogElasticsearchDriverConfig]):
 
     teardown_lane: ClassVar[TeardownLane] = TeardownLane.ASYNC_CASCADE
 
-    # Catalog ES is the canonical async secondary index + primary SEARCH
-    # backend for catalog metadata routing.  It auto-defaults into WRITE
-    # (as a secondary index, identified by ``is_catalog_indexer``), SEARCH,
-    # and READ (hinted — only selected when the caller explicitly requests it
-    # via ``prefer:es`` or ``geometry_simplified``; default path stays on PG).
+    # Catalog ES is the canonical async materialization target + derived-
+    # search-preferred backend for catalog metadata routing.  It auto-
+    # defaults into the INDEX lane (identified by ``is_catalog_indexer``;
+    # its declared ``supported_hints`` below does not include Hint.SEARCH,
+    # so it does not win the derived-search preference ranking — it still
+    # participates in the pool as the sole INDEX entry) and — documentary
+    # only, this membership is never consulted by an auto-registration
+    # helper — READ (hinted — only selected when the caller explicitly
+    # requests it via ``prefer:es`` or ``geometry_simplified``; default
+    # path stays on PG, hard-coded in ``CatalogRoutingConfig``).
     auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({
-        Operation.SEARCH, Operation.WRITE, Operation.READ,
+        Operation.INDEX, Operation.READ,
     })
 
-    # Hints this driver serves on the READ/SEARCH operations.
+    # Hints this driver serves on the READ / derived-search operations.
     # GEOMETRY_SIMPLIFIED: ES stores the index-time simplified geometry.
     # METADATA: generic "I want catalog metadata" — declares this driver
     #   participates in metadata reads at all.  There is no geometry at the

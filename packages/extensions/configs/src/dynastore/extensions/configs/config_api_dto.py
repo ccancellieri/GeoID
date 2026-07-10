@@ -71,18 +71,18 @@ class DriverRef(BaseModel):
     on_failure: str = Field(
         "fatal",
         description=(
-            "Failure policy: ``fatal`` (raise — default), ``outbox`` "
-            "(defer to drain task; standard for an ES secondary index), "
-            "``warn`` (log + continue), ``ignore``."
+            "Failure policy, WRITE-lane entries only: ``fatal`` (raise — "
+            "default) or ``warn`` (log + continue). READ and INDEX entries "
+            "carry no per-entry failure policy — INDEX-lane failure "
+            "handling is structural, not a per-entry choice."
         ),
     )
-    write_mode: str = Field("sync", description="Write mode: sync | async.")
     input_transformers: List[str] = Field(
         default_factory=list,
         description=(
             "Ordered transformer ``driver_ref``s applied to entities going "
-            "INTO this driver call. Wired hops in this release: ``WRITE`` "
-            "(secondary-index propagation). Declaring this on other "
+            "INTO this driver call. Wired hops in this release: ``INDEX`` "
+            "(materialization propagation). Declaring this on other "
             "operations emits a one-time WARN at load time. Mirrors "
             "``OperationDriverEntry.input_transformers``; accepted on "
             "PUT/PATCH request bodies."
@@ -92,8 +92,9 @@ class DriverRef(BaseModel):
         default_factory=list,
         description=(
             "Ordered transformer ``driver_ref``s applied to entities coming "
-            "OUT of this driver call. Wired hops in this release: ``SEARCH``. "
-            "Mirrors ``OperationDriverEntry.output_transformers``."
+            "OUT of this driver call. Wired hops in this release: ``INDEX`` "
+            "and ``READ`` (whichever lane the resolved search driver was "
+            "found in). Mirrors ``OperationDriverEntry.output_transformers``."
         ),
     )
     meta: Dict[str, Any] = Field(

@@ -39,7 +39,6 @@ from dynastore.modules.storage.routing_config import (
     ItemsRoutingConfig,
     Operation,
     OperationDriverEntry,
-    WriteMode,
 )
 from dynastore.modules.storage.obligation_sweep import (
     LOOKBACK_MULTIPLIER,
@@ -73,15 +72,14 @@ def _pg_primary_entry() -> OperationDriverEntry:
 def _es_secondary_entry() -> OperationDriverEntry:
     return OperationDriverEntry(
         driver_ref="items_elasticsearch_driver",
-        write_mode=WriteMode.ASYNC,
-        on_failure=FailurePolicy.OUTBOX,
-        secondary_index=True,
+        source="auto",
     )
 
 
 def _routing_with_pg_primary_and_async_secondary() -> ItemsRoutingConfig:
     return ItemsRoutingConfig(operations={
-        Operation.WRITE: [_pg_primary_entry(), _es_secondary_entry()],
+        Operation.WRITE: [_pg_primary_entry()],
+        Operation.INDEX: [_es_secondary_entry()],
     })
 
 
@@ -95,8 +93,8 @@ def _routing_with_es_primary() -> ItemsRoutingConfig:
     return ItemsRoutingConfig(operations={
         Operation.WRITE: [
             OperationDriverEntry(driver_ref="items_elasticsearch_driver", on_failure=FailurePolicy.FATAL),
-            _es_secondary_entry(),
         ],
+        Operation.INDEX: [_es_secondary_entry()],
     })
 
 

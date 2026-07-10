@@ -167,8 +167,8 @@ def test_apply_is_idempotent_when_catalog_and_collection_exist():
 def test_apply_persists_items_routing_before_upsert_and_recomputes_extent(monkeypatch):
     """A seed carrying ``items_routing`` persists it at the seed's own
     catalog/collection scope *before* the upsert (so the write fans out to the
-    declared secondary indexers), and the collection extent is recomputed
-    *after* the upsert. Regression cover for #2241 / #2240."""
+    declared INDEX-lane materialization targets), and the collection extent
+    is recomputed *after* the upsert. Regression cover for #2241 / #2240."""
     from dynastore.modules.storage.routing_config import (
         ItemsRoutingConfig,
         Operation,
@@ -179,9 +179,10 @@ def test_apply_persists_items_routing_before_upsert_and_recomputes_extent(monkey
         operations={
             Operation.WRITE: [
                 OperationDriverEntry(driver_ref="items_postgresql_driver"),
+            ],
+            Operation.INDEX: [
                 OperationDriverEntry(
                     driver_ref="items_elasticsearch_driver",
-                    secondary_index=True,
                     source="auto",
                 ),
             ],

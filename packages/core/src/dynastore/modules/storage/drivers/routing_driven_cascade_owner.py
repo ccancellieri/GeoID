@@ -153,7 +153,7 @@ async def _enumerate_configured_drivers(
                 frozenset(),
             )
 
-            for driver_ref, _on_failure, _write_mode in entries:
+            for driver_ref, _on_failure in entries:
                 key = (registry_kind, driver_ref)
                 # Process each (registry_kind, driver_ref) at most once, even
                 # when the same driver is configured for several operations —
@@ -201,18 +201,18 @@ async def _enumerate_configured_drivers(
                     )
                     result.append(key)
 
-    # Items drivers (WRITE fans-out to secondary indexes; READ/SEARCH for primaries)
+    # Items drivers (WRITE = primary; INDEX = materialized/derived stores; READ = primaries)
     await _collect(
         _REGISTRY_ITEMS,
         ItemsRoutingConfig,
-        [Operation.WRITE, Operation.READ, Operation.SEARCH],
+        [Operation.WRITE, Operation.READ, Operation.INDEX],
     )
 
     # Asset drivers
     await _collect(
         _REGISTRY_ASSET,
         AssetRoutingConfig,
-        [Operation.WRITE, Operation.UPLOAD, Operation.READ],
+        [Operation.WRITE, Operation.UPLOAD, Operation.READ, Operation.INDEX],
     )
 
     # Collection-metadata drivers (fixes #1750: includes collection_es_driver
@@ -220,7 +220,7 @@ async def _enumerate_configured_drivers(
     await _collect(
         _REGISTRY_COLLECTION,
         CollectionRoutingConfig,
-        [Operation.WRITE, Operation.READ, Operation.SEARCH],
+        [Operation.WRITE, Operation.READ, Operation.INDEX],
     )
 
     return result

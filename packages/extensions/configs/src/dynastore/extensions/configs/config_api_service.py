@@ -1053,7 +1053,6 @@ class ConfigApiService:
                         driver_ref=driver_ref,
                         hints=[str(h) for h in (entry.get("hints") or [])],
                         on_failure=entry.get("on_failure", "fatal"),
-                        write_mode=entry.get("write_mode", "sync"),
                         input_transformers=[
                             str(t) for t in (entry.get("input_transformers") or ())
                         ],

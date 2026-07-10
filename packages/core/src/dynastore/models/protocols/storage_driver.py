@@ -93,11 +93,11 @@ class Capability:
     # ``ATTRIBUTE_FILTER``, ``AGGREGATION``, ``COUNT``, ``STATISTICS``,
     # ``SORT``, ``GROUP_BY``) were retired in PR #3b of the routing
     # cleanup.  They were not structural facts about the driver — they
-    # were per-request flavours of READ/SEARCH that callers asked for,
+    # were per-request flavours of READ/search that callers asked for,
     # and they've moved to the canonical ``Hint`` catalogue
     # (``modules/storage/hints.py``).  Drivers express which flavours
     # they serve via ``supported_hints``; routing dispatches via
-    # ``get_driver(Operation.SEARCH, hints=frozenset({Hint.AGGREGATION}))``.
+    # ``get_items_search_driver(catalog_id, hints=frozenset({Hint.AGGREGATION}))``.
 
     # --- Data management ---
     SOFT_DELETE = "soft_delete"

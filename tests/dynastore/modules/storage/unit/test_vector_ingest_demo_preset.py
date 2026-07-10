@@ -152,15 +152,14 @@ def test_get_data_seed_declares_pg_primary_routing() -> None:
     assert pg, "PG primary write entry must be present"
 
 
-def test_get_data_seed_declares_es_secondary_routing() -> None:
+def test_get_data_seed_declares_es_index_routing() -> None:
     from dynastore.modules.storage.routing_config import Operation
 
     seed = list(_default_contributor().get_data())[0]
     assert seed.items_routing is not None
-    write_entries = seed.items_routing.operations[Operation.WRITE]
-    es = [e for e in write_entries if e.driver_ref == "items_elasticsearch_driver"]
-    assert es, "ES secondary write entry must be present"
-    assert es[0].secondary_index is True
+    index_entries = seed.items_routing.operations[Operation.INDEX]
+    es = [e for e in index_entries if e.driver_ref == "items_elasticsearch_driver"]
+    assert es, "ES INDEX-lane entry must be present"
     assert es[0].source == "auto"
 
 

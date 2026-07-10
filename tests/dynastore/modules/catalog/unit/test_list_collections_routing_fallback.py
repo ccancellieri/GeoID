@@ -25,7 +25,7 @@ each via the configured READ router.  This makes listing work for a pure-ES
 populated yet: existence comes from PG, metadata from wherever the preset
 routes it.
 
-A filtered listing (free-text ``q``) still goes through the SEARCH-capable
+A filtered listing (free-text ``q``) still goes through the INDEX-lane
 router (with a READ fallback) because the registry cannot evaluate ``q``.
 """
 
@@ -82,7 +82,7 @@ def _patch_enumeration(monkeypatch, svc, ids: List[str]):
 @pytest.mark.asyncio
 async def test_unfiltered_listing_enumerates_registry_and_hydrates(monkeypatch):
     """Unfiltered listing returns every registry collection, hydrated — and
-    does NOT depend on the SEARCH router (which would be empty under ES lag)."""
+    does NOT depend on the INDEX-lane router (which would be empty under ES lag)."""
     search_called: List[str] = []
 
     async def _fake_search(*_a, **_kw):
@@ -100,7 +100,7 @@ async def test_unfiltered_listing_enumerates_registry_and_hydrates(monkeypatch):
 
     assert [c.id for c in out] == ["coll-a", "coll-b"]
     assert out[0].extent is not None            # hydrated via READ router
-    assert search_called == []                  # SEARCH router not used for unfiltered list
+    assert search_called == []                  # INDEX-lane router not used for unfiltered list
 
 
 @pytest.mark.asyncio
@@ -131,8 +131,8 @@ async def test_unfiltered_listing_skips_ids_that_fail_to_hydrate(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_filtered_listing_uses_search_router(monkeypatch):
-    """A free-text ``q`` must route through the SEARCH driver (the registry
-    cannot evaluate q), returning complete rows from the search slice."""
+    """A free-text ``q`` must route through the INDEX-lane driver (the
+    registry cannot evaluate q), returning complete rows from the search slice."""
     ops: List[str] = []
     _COMPLETE_ROW = {
         "id": "coll-a",
@@ -146,7 +146,7 @@ async def test_filtered_listing_uses_search_router(monkeypatch):
     }
 
     async def _fake_search(catalog_id, *, q=None, limit=100, offset=0,
-                           db_resource=None, operation=Operation.SEARCH, **_kw):
+                           db_resource=None, operation=Operation.INDEX, **_kw):
         ops.append(operation)
         return [_COMPLETE_ROW], 1
 
@@ -159,12 +159,12 @@ async def test_filtered_listing_uses_search_router(monkeypatch):
 
     assert [c.id for c in out] == ["coll-a"]
     assert out[0].extent is not None
-    assert ops == [Operation.SEARCH]            # READ fallback not needed
+    assert ops == [Operation.INDEX]              # READ fallback not needed
 
 
 @pytest.mark.asyncio
 async def test_filtered_listing_falls_back_to_read_when_search_empty(monkeypatch):
-    """``q`` set but the SEARCH slice is empty (ES index not populated) →
+    """``q`` set but the INDEX-lane slice is empty (ES index not populated) →
     re-run against the READ-routed driver."""
     ops: List[str] = []
     _COMPLETE_ROW = {
@@ -179,9 +179,9 @@ async def test_filtered_listing_falls_back_to_read_when_search_empty(monkeypatch
     }
 
     async def _fake_search(catalog_id, *, q=None, limit=100, offset=0,
-                           db_resource=None, operation=Operation.SEARCH, **_kw):
+                           db_resource=None, operation=Operation.INDEX, **_kw):
         ops.append(operation)
-        if operation == Operation.SEARCH:
+        if operation == Operation.INDEX:
             return [], 0
         return [_COMPLETE_ROW], 1
 
@@ -193,4 +193,4 @@ async def test_filtered_listing_falls_back_to_read_when_search_empty(monkeypatch
     out = await svc.list_collections("cat", q="complete")
 
     assert [c.id for c in out] == ["coll-a"]
-    assert ops == [Operation.SEARCH, Operation.READ]
+    assert ops == [Operation.INDEX, Operation.READ]

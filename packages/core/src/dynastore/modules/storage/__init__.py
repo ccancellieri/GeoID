@@ -33,6 +33,11 @@ Storage routing is controlled by ``ItemsRoutingConfig`` via the existing
 config API (identity is the class itself; see ``class_key()`` in
 ``platform_config_service.py``).
 Per-driver settings are in ``DriverPluginConfig`` subclasses.
+
+See also ``get_items_search_driver`` / ``get_asset_search_driver`` in
+``dynastore.modules.storage.router`` for the derived-search resolution
+path (INDEX lane preferred, READ lane fallback — search is not a
+configured operation).
 """
 
 from dynastore.models.protocols.storage_driver import (
@@ -100,7 +105,6 @@ from dynastore.modules.storage.routing_config import (
     Operation,
     OperationDriverEntry,
     TransformerEntry,
-    WriteMode,
 )
 
 __all__ = [
@@ -154,7 +158,6 @@ __all__ = [
     "TransformerEntry",
     "FailurePolicy",
     "Operation",
-    "WriteMode",
     # Router
     "resolve_drivers",
     "ResolvedDriver",

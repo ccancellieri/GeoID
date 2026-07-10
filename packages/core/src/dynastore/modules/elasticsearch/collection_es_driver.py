@@ -134,16 +134,21 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
 
     teardown_lane: ClassVar[TeardownLane] = TeardownLane.ASYNC_CASCADE
 
-    # Collection ES is the canonical async secondary index + primary SEARCH
-    # backend for collection metadata routing.  It auto-defaults into WRITE
-    # (as a secondary index, identified by ``is_collection_indexer``), SEARCH,
-    # and READ (hinted — only selected when the caller explicitly requests it
-    # via ``prefer:es`` or ``geometry_simplified``; default path stays on PG).
+    # Collection ES is the canonical async materialization target + derived-
+    # search-preferred backend for collection metadata routing.  It auto-
+    # defaults into the INDEX lane (identified by ``is_collection_indexer``;
+    # its declared ``supported_hints`` below does not include Hint.SEARCH,
+    # so it does not win the derived-search preference ranking — it still
+    # participates in the pool as the sole INDEX entry) and — documentary
+    # only, this membership is never consulted by an auto-registration
+    # helper — READ (hinted — only selected when the caller explicitly
+    # requests it via ``prefer:es`` or ``geometry_simplified``; default
+    # path stays on PG, hard-coded in ``CollectionRoutingConfig``).
     auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({
-        Operation.SEARCH, Operation.WRITE, Operation.READ,
+        Operation.INDEX, Operation.READ,
     })
 
-    # Hints this driver serves on the READ/SEARCH operations.
+    # Hints this driver serves on the READ / derived-search operations.
     # GEOMETRY_SIMPLIFIED: ES stores the index-time simplified geometry.
     # METADATA: generic "I want collection metadata" — declares this driver
     #   participates in metadata reads at all.  There is no geometry at the
@@ -500,11 +505,11 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
 
         Tier guard (#728): non-collection ops are refused outright rather
         than silently upserted into the singleton ``dynastore-collections``
-        index. A misconfigured secondary-index ``WRITE`` entry
-        (``secondary_index=True``) in ``ItemsRoutingConfig.operations[WRITE]``
-        pointing at the collection driver previously leaked 180 STAC
-        items into the collection index and poisoned its dynamic mapping;
-        the loud refusal here surfaces that misconfiguration immediately.
+        index. A misconfigured INDEX-lane entry in
+        ``ItemsRoutingConfig.operations[INDEX]`` pointing at the collection
+        driver previously leaked 180 STAC items into the collection index
+        and poisoned its dynamic mapping; the loud refusal here surfaces
+        that misconfiguration immediately.
         """
         op_entity_type = getattr(op, "entity_type", None)
         if op_entity_type is not None and op_entity_type != "collection":

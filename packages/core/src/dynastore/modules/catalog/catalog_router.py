@@ -46,14 +46,13 @@ per-catalog routing config.  Callers that need a filtered subset
 Per-catalog routing-config overrides live on a different code path:
 :func:`dynastore.modules.catalog.reindex_worker._resolve_catalog_indexers`
 queries ``CatalogRoutingConfig`` through the ``ConfigsProtocol`` 4-tier
-waterfall for secondary-index ``WRITE`` entries (``secondary_index=True``).
-The primary WRITE / READ / DELETE router deliberately does NOT honour
-per-catalog overrides — routing-config overrides of the canonical Primary
-store would split writes across drivers with inconsistent schemas, which is
-explicitly not supported.
+waterfall for its INDEX-lane entries. The primary WRITE / READ / DELETE
+router deliberately does NOT honour per-catalog overrides — routing-config
+overrides of the canonical Primary store would split writes across
+drivers with inconsistent schemas, which is explicitly not supported.
 
-Catalog secondary-index WRITE hop — asymmetric with ``collection_router`` by design
------------------------------------------------------------------------------------
+Catalog secondary-index hop — asymmetric with ``collection_router`` by design
+-------------------------------------------------------------------------------
 
 This module has no ``_dispatch_catalog_index`` analogue to
 :func:`dynastore.modules.catalog.collection_router._dispatch_collection_index`
@@ -61,27 +60,26 @@ This module has no ``_dispatch_catalog_index`` analogue to
 
 - **Collection secondary indexing (#748 / #732)** runs *directly* from the
   router: every upsert / delete inline-dispatches an ``IndexOp`` via
-  ``get_index_dispatcher().fan_out_bulk()`` with OUTBOX-durable
+  ``get_index_dispatcher().fan_out_bulk()`` with storage-plane-durable
   semantics.  The choice was driven by ingestion-rate volume and the
   "search finds nothing" symptom that fix closed.
 - **Catalog secondary indexing** runs *event-driven*: the WRITE path emits a
   ``catalog_metadata_changed`` event (see
   :func:`_emit_catalog_metadata_changed` below) inside the same
   transaction as the Primary write; ``ReindexWorker`` consumes that
-  event off the outbox and fans the mutation out to every secondary-index
-  ``WRITE`` entry (``secondary_index=True``) in
-  ``CatalogRoutingConfig.operations[WRITE]`` (today
+  event off the outbox and fans the mutation out to every INDEX-lane
+  entry in ``CatalogRoutingConfig.operations[INDEX]`` (today
   ``catalog_elasticsearch_driver``).  Catalogs mutate at admin rate
   rather than ingest rate, so the extra hop costs nothing in practice
   and keeps the worker's batch / SLA / TRANSFORM-chain logic in one
   place rather than duplicated on the write path.
 
-Both paths reach the same Indexer drivers through OUTBOX-durable
-plumbing — the difference is the *trigger*, not the destination.  Any
-future work that unifies the two should change ``ReindexWorker`` to
-consume the same ``IndexOp`` stream the dispatcher emits (or move the
-collection side onto the event bus); piecemeal symmetry on this module
-alone would just add a second indexing path with no consumer.
+Both paths reach the same Indexer drivers through durable plumbing — the
+difference is the *trigger*, not the destination.  Any future work that
+unifies the two should change ``ReindexWorker`` to consume the same
+``IndexOp`` stream the dispatcher emits (or move the collection side onto
+the event bus); piecemeal symmetry on this module alone would just add a
+second indexing path with no consumer.
 
 Failure policy
 --------------
@@ -230,9 +228,9 @@ async def _routed_catalog_drivers(
     ``CatalogRoutingConfig.operations[operation]``, or ``None`` when the
     routing config could not be consulted (early boot — caller falls back to
     :func:`_resolve_catalog_store_drivers` discovery).  The entry is surfaced
-    so callers can inspect ``write_mode`` and ``secondary_index`` without a
-    separate lookup, enabling the routing-driven sync/async split in the
-    WRITE fan-out.
+    so callers can inspect its provenance without a separate lookup — the
+    resolved WRITE list is, by lane definition, every synchronous primary
+    entry (INDEX-lane entries never appear there).
     """
     resolved = await resolve_routed(
         CatalogRoutingConfig, operation, catalog_id, collection_id=None,
@@ -346,7 +344,7 @@ async def get_catalog_metadata(
 
 
 def _is_secondary_index(driver: CatalogStore) -> bool:
-    """True for async secondary-index drivers (e.g. the catalog ES indexer).
+    """True for INDEX-lane drivers (e.g. the catalog ES indexer).
 
     Such drivers are reindexed asynchronously off the
     ``catalog_metadata_changed`` outbox event emitted after the fan-out (see
@@ -356,10 +354,13 @@ def _is_secondary_index(driver: CatalogStore) -> bool:
     Primary stores (PG core / STAC) stay fatal.
 
     Identified by ``is_catalog_indexer`` on the driver class, the same marker
-    the ES catalog driver sets to auto-default into the WRITE operation as a
-    secondary index.  Secondary-index drivers (ES) never share the caller's PG
-    ``db_resource``, so swallowing their failure cannot corrupt the outer
-    transaction.
+    the ES catalog driver sets to auto-default into the INDEX lane.  Used
+    only by the discovery-fallback path (no routing config available) and
+    the injected-``drivers=`` path, both of which have no lane information
+    to consult; the routed path resolves WRITE directly and structurally
+    excludes INDEX-lane drivers already (lane membership IS the role now).
+    INDEX-lane drivers (ES) never share the caller's PG ``db_resource``, so
+    swallowing their failure cannot corrupt the outer transaction.
 
     Tested via identity (``is True``) so the canonical PG drivers — and any
     ``MagicMock`` stand-in whose attribute access auto-vivifies a truthy mock —
@@ -417,24 +418,22 @@ async def upsert_catalog_metadata(
             Operation.WRITE, catalog_id, db_resource=db_resource,
         )
         if routed is not None:
-            # Routing-driven sync/async split. Secondary-index entries
-            # (secondary_index=True — co-stamped write_mode=ASYNC,
-            # on_failure=OUTBOX by _self_register_indexers_into, e.g.
-            # catalog_elasticsearch_driver) are owned by the async reindex
-            # path: _resolve_catalog_indexers resolves exactly the
-            # secondary_index entries off the catalog_metadata_changed event
-            # emitted after this loop. The synchronous fan-out is their exact
-            # complement — every NON-secondary primary entry, regardless of
-            # write_mode — so no primary write is ever silently dropped while
-            # the secondary ES write (with its HEAD/GET/PUT?refresh=wait_for
-            # round-trips) is kept off the synchronous catalog write path.
-            sync_primary = [d for e, d in routed if not e.secondary_index]
-            drivers = _filter_capable(sync_primary, EntityStoreCapability.WRITE)
+            # Lane model: operations[WRITE] never contains an INDEX-lane
+            # driver (e.g. catalog_elasticsearch_driver) — that role lives
+            # entirely in operations[INDEX], resolved independently by
+            # _resolve_catalog_indexers off the catalog_metadata_changed
+            # event emitted after this loop. So every routed WRITE entry is
+            # already the exact synchronous-fan-out set; no per-entry role
+            # filter needed here any more.
+            drivers = _filter_capable(
+                [d for _, d in routed], EntityStoreCapability.WRITE,
+            )
         else:
             # Discovery fallback (early boot, ConfigsProtocol unavailable):
-            # consult the is_catalog_indexer ClassVar since there is no routing
-            # entry to read write_mode from.  Primary mechanism is the routing
-            # entry; this ClassVar check is the unrouted-only fallback.
+            # consult the is_catalog_indexer ClassVar since there is no
+            # routing config to resolve the WRITE lane from.  Primary
+            # mechanism is the routed path above; this ClassVar check is
+            # the unrouted-only fallback.
             all_capable = _filter_capable(
                 _resolve_catalog_store_drivers(), EntityStoreCapability.WRITE,
             )
@@ -501,13 +500,13 @@ async def delete_catalog_metadata(
             Operation.WRITE, catalog_id, db_resource=db_resource,
         )
         if routed is not None:
-            # Mirror upsert: the synchronous fan-out is the complement of the
-            # reindex-owned set — every non-secondary primary entry, regardless
-            # of write_mode. Secondary-index entries are excluded; the
-            # catalog_metadata_changed event emitted below triggers async
-            # propagation via the reindex_listener.
-            sync_primary = [d for e, d in routed if not e.secondary_index]
-            drivers = _filter_capable(sync_primary, EntityStoreCapability.WRITE)
+            # Mirror upsert: lane model means operations[WRITE] is already
+            # the synchronous fan-out set (no INDEX-lane driver can appear
+            # there). The catalog_metadata_changed event emitted below
+            # triggers async propagation to the INDEX lane separately.
+            drivers = _filter_capable(
+                [d for _, d in routed], EntityStoreCapability.WRITE,
+            )
         else:
             # Discovery fallback: ClassVar marker is the unrouted-only fallback.
             all_capable = _filter_capable(

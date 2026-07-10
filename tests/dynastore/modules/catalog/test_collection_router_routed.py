@@ -129,7 +129,7 @@ async def test_search_uses_first_config_resolved_driver(monkeypatch):
     pg = _RecordingDriver("pg")
 
     async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, hints=frozenset(), db_resource=None):
-        if operation == Operation.SEARCH:
+        if operation == Operation.INDEX:
             return [
                 (OperationDriverEntry(driver_ref="collection_elasticsearch_driver"), es),
                 (OperationDriverEntry(driver_ref="collection_postgresql_driver"), pg),
@@ -148,8 +148,8 @@ import pytest  # noqa: E402 — appended after existing non-pytest tests
 @pytest.mark.asyncio
 async def test_search_operation_kwarg_selects_read_routed_drivers(monkeypatch):
     """``operation=READ`` resolves the READ-routed driver list (PG, the system
-    of record) instead of the SEARCH slice — the routing-driven fallback the
-    collection service uses when an ES-only SEARCH slice has no rows yet."""
+    of record) instead of the INDEX slice — the routing-driven fallback the
+    collection service uses when an ES-only INDEX slice has no rows yet."""
     from dynastore.modules.catalog import collection_router
     from dynastore.modules.storage.routing_config import Operation, OperationDriverEntry
 
@@ -157,7 +157,7 @@ async def test_search_operation_kwarg_selects_read_routed_drivers(monkeypatch):
     pg = _RecordingDriver("pg")
 
     async def _fake_resolve(rpc, operation, catalog_id, collection_id=None, *, hints=frozenset(), db_resource=None):
-        if operation == Operation.SEARCH:
+        if operation == Operation.INDEX:
             return [(OperationDriverEntry(driver_ref="collection_elasticsearch_driver"), es)]
         if operation == Operation.READ:
             return [(OperationDriverEntry(driver_ref="collection_postgresql_driver"), pg)]

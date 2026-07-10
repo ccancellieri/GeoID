@@ -34,8 +34,8 @@ Two drivers in this module:
 
 * ``AssetElasticsearchDriver``  (driver_ref ``"elasticsearch_assets"``)
   Indexes asset metadata into per-catalog ``{prefix}-assets-{catalog_id}``
-  indices.  Driven by the secondary-index ``WRITE`` entries
-  (``secondary_index=True``) in ``AssetRoutingConfig.operations[WRITE]``
+  indices.  Driven by the INDEX-lane entries in
+  ``AssetRoutingConfig.operations[INDEX]``
   (auto-augmented with discoverable ``AssetIndexer`` impls) and dispatched via
   ``AssetEntitySyncSubscriber`` from the events outbox — single-writer fan-out,
   no per-driver listener block.  Direct programmatic indexing via
@@ -48,9 +48,8 @@ its own self-contained subpackage at
 file.
 
 All drivers register as async event listeners, dispatched by the post-PR-#261
-operation-based router via the secondary-index ``WRITE`` entries
-(``secondary_index=True``) in ``ItemsRoutingConfig.operations[WRITE]`` /
-``AssetRoutingConfig.operations[WRITE]``.
+operation-based router via the INDEX-lane entries in
+``ItemsRoutingConfig.operations[INDEX]`` / ``AssetRoutingConfig.operations[INDEX]``.
 """
 
 import logging
@@ -1351,8 +1350,7 @@ class ItemsElasticsearchDriver(
     Registered as ``storage_elasticsearch`` via entry points.
 
     Indexer marker — opts in to :class:`ItemIndexer` so the items routing
-    config auto-registers it in ``operations[WRITE]`` as a secondary-index
-    entry (``secondary_index=True``).
+    config auto-registers it in ``operations[INDEX]``.
     """
 
     is_item_indexer: ClassVar[bool] = True
@@ -1361,10 +1359,12 @@ class ItemsElasticsearchDriver(
     # the shared _resolve_simplify_* helpers to the correct config row.
     _driver_config_class: ClassVar[Any] = ItemsElasticsearchDriverConfig
 
-    # ES (public) is the canonical async secondary index + primary SEARCH
-    # backend for items routing.  It auto-defaults into WRITE (as a secondary
-    # index, identified by ``is_item_indexer``) and SEARCH.
-    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({Operation.SEARCH, Operation.WRITE})
+    # ES (public) is the canonical async materialization target + derived-
+    # search-preferred backend for items routing.  It auto-defaults into
+    # the INDEX lane (identified by ``is_item_indexer``); its declared
+    # ``supported_hints`` (below) includes ``Hint.SEARCH``, so it wins the
+    # derived-search pool's preference ranking without a separate opt-in.
+    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({Operation.INDEX})
 
     priority: int = 50
     preferred_chunk_size: int = 500
@@ -2416,14 +2416,13 @@ class ItemsElasticsearchDriver(
     async def index(self, ctx, op) -> None:
         """Apply a single :class:`IndexOp` to the per-tenant items index.
 
-        Called by :class:`IndexDispatcher` from inside the caller's PG
-        transaction.  Failure raises; the dispatcher applies the
-        configured ``FailurePolicy`` (FATAL → caller rollback, OUTBOX
-        → enqueue retry row in same TX, WARN → log).
+        Called by :class:`IndexDispatcher`, reached only on the (rare)
+        in-task-run inline-absorption leg (see the dispatcher's module
+        docstring) — INDEX entries carry no per-entry failure policy;
+        a raised failure here is logged and dropped by the dispatcher.
 
         No routing-membership guard here: the dispatcher only invokes
-        drivers pinned as secondary-index ``WRITE`` entries
-        (``secondary_index=True``) in ``operations[WRITE]`` for this
+        drivers pinned in ``operations[INDEX]`` for this
         ``(catalog, collection)`` — the guard lives in the routing layer,
         not the driver.
         """
@@ -2761,10 +2760,9 @@ class AssetElasticsearchDriver(
     Lifecycle wiring
     ----------------
     No lifespan-time wiring is required.  Asset writes flow through the
-    ``AssetIndexer`` secondary-index ``WRITE`` entry (``secondary_index=True``)
-    in ``AssetRoutingConfig.operations[WRITE]`` —
-    invoked by ``AssetService``'s secondary-driver fan-out — and through
-    direct programmatic calls to ``index_asset()`` / ``delete_asset()``.
+    ``AssetIndexer`` INDEX-lane entry in ``AssetRoutingConfig.operations[INDEX]``
+    — invoked by ``AssetEntitySyncSubscriber`` off the events bus — and
+    through direct programmatic calls to ``index_asset()`` / ``delete_asset()``.
 
     Registered as ``storage_elasticsearch_assets`` via entry points.
     """
@@ -2778,10 +2776,13 @@ class AssetElasticsearchDriver(
     # ItemsElasticsearchDriverConfig (the _ElasticsearchBase fallback).
     _driver_config_class: ClassVar[Any] = AssetElasticsearchDriverConfig
 
-    # Asset ES is the canonical async secondary index + primary SEARCH
-    # backend for asset metadata routing.  It auto-defaults into WRITE (as a
-    # secondary index, identified by ``is_asset_indexer``) and SEARCH.
-    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({Operation.SEARCH, Operation.WRITE})
+    # Asset ES is the canonical async materialization target + derived-
+    # search-preferred backend for asset metadata routing.  It auto-
+    # defaults into the INDEX lane (identified by ``is_asset_indexer``);
+    # its declared ``supported_hints`` (below) includes ``Hint.SEARCH``, so
+    # it wins the derived-search pool's preference ranking without a
+    # separate opt-in.
+    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({Operation.INDEX})
 
     priority: int = 52
     capabilities: FrozenSet[str] = frozenset({
@@ -2797,12 +2798,11 @@ class AssetElasticsearchDriver(
 
     @asynccontextmanager
     async def lifespan(self, app_state: object):
-        # Asset writes flow exclusively through the AssetIndexer secondary-index
-        # WRITE entry (secondary_index=True) in AssetRoutingConfig.operations[WRITE]
-        # — invoked by AssetService's
-        # secondary-driver fan-out. The previous CatalogEventType.ASSET_*
-        # listener path was retired to eliminate a dual-write race against
-        # the same index.
+        # Asset writes flow exclusively through the AssetIndexer INDEX-lane
+        # entry in AssetRoutingConfig.operations[INDEX] — invoked by
+        # AssetEntitySyncSubscriber off the events bus. The previous
+        # per-driver CatalogEventType.ASSET_* listener path was retired to
+        # eliminate a dual-write race against the same index.
         yield
 
     # ------------------------------------------------------------------

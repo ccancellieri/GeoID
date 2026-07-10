@@ -153,11 +153,9 @@ async def test_pipeline_router_emit_listener_worker_indexer(
     routing_cfg = CatalogRoutingConfig(
         operations={
             **_base_ops,
-            # Secondary-index sink merged into the WRITE list (#990).
-            Operation.WRITE: list(_base_ops.get(Operation.WRITE, [])) + [
-                OperationDriverEntry(
-                    driver_ref="LogCatalogIndexer", secondary_index=True,
-                ),
+            # INDEX-lane materialization target (#2494 lane model).
+            Operation.INDEX: list(_base_ops.get(Operation.INDEX, [])) + [
+                OperationDriverEntry(driver_ref="LogCatalogIndexer"),
             ],
         },
     )
@@ -269,11 +267,9 @@ async def test_pipeline_deletes_route_to_delete_catalog_metadata(
     routing_cfg = CatalogRoutingConfig(
         operations={
             **_base_ops,
-            # Secondary-index sink merged into the WRITE list (#990).
-            Operation.WRITE: list(_base_ops.get(Operation.WRITE, [])) + [
-                OperationDriverEntry(
-                    driver_ref="LogCatalogIndexer", secondary_index=True,
-                ),
+            # INDEX-lane materialization target (#2494 lane model).
+            Operation.INDEX: list(_base_ops.get(Operation.INDEX, [])) + [
+                OperationDriverEntry(driver_ref="LogCatalogIndexer"),
             ],
         },
     )

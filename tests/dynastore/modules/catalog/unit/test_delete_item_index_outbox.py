@@ -21,14 +21,15 @@
 Background: ``ItemQueryMixin.delete_item`` previously dispatched a delete
 ``IndexOp`` keyed by the *external* path id through the index dispatcher,
 while ``ItemService.upsert_bulk`` indexes the ES document under the
-*geoid* (the persisted feature's default ``id``) via an async-OUTBOX
+*geoid* (the persisted feature's default ``id``) via an async-durable
 ``OutboxRecord``. The two paths derived the ES ``_id`` independently, so a
 delete targeted a non-existent ``_id`` and never purged the document.
 
 These tests pin the fixed contract: delete enqueues one lightweight
-``WriteIdOutboxRecord(op="delete")`` per async target, keyed by the same
-logical write id stamped on the tombstoned hub rows. The drain then reads
-tombstoned geoids by write id and removes the same documents the upsert wrote.
+``WriteIdOutboxRecord(op="delete")`` per INDEX-lane target, keyed by the
+same logical write id stamped on the tombstoned hub rows. The drain then
+reads tombstoned geoids by write id and removes the same documents the
+upsert wrote.
 """
 from __future__ import annotations
 
@@ -42,7 +43,6 @@ from dynastore.modules.storage.routing_config import (
     FailurePolicy,
     Operation,
     OperationDriverEntry,
-    WriteMode,
 )
 
 # Where the delete path imports the storage-emit function (patched per test).
@@ -59,7 +59,12 @@ class _CapableDriver:
         return []
 
 
-def _service_with(routing_entries: List[OperationDriverEntry]) -> ItemService:
+_DEFAULT_WRITE_ENTRY = OperationDriverEntry(
+    driver_ref="items_postgresql_driver", on_failure=FailurePolicy.FATAL,
+)
+
+
+def _service_with(index_entries_: List[OperationDriverEntry]) -> ItemService:
     """Build an ItemService with the routing test seam injected.
 
     ``__new__`` skips ``__init__`` — ``_enqueue_index_deletes`` only reads the
@@ -67,12 +72,18 @@ def _service_with(routing_entries: List[OperationDriverEntry]) -> ItemService:
     The enqueue goes through ``enqueue_storage_op_write_id``, which the tests
     patch, so no live tasks table is needed. The driver registry seam always
     resolves to a write-id-capable stub so the #3116 guard never silently
-    skips the enqueue in these tests.
+    skips the enqueue in these tests. A default WRITE-lane primary entry is
+    always present (``index_entries`` reads ``Operation.INDEX`` only; the
+    WRITE lane is read separately for the primary write-id capability
+    check).
     """
     svc = ItemService.__new__(ItemService)
 
     async def _resolver(_catalog_id: str, _collection_id: str):
-        return SimpleNamespace(operations={Operation.WRITE: list(routing_entries)})
+        return SimpleNamespace(operations={
+            Operation.WRITE: [_DEFAULT_WRITE_ENTRY],
+            Operation.INDEX: list(index_entries_),
+        })
 
     async def _registry(_driver_ref: str) -> _CapableDriver:
         return _CapableDriver()
@@ -82,18 +93,13 @@ def _service_with(routing_entries: List[OperationDriverEntry]) -> ItemService:
     return svc
 
 
-def _async_es_entry() -> OperationDriverEntry:
-    return OperationDriverEntry(
-        driver_ref="items_elasticsearch_driver",
-        on_failure=FailurePolicy.OUTBOX,
-        write_mode=WriteMode.ASYNC,
-        secondary_index=True,
-    )
+def _index_entry() -> OperationDriverEntry:
+    return OperationDriverEntry(driver_ref="items_elasticsearch_driver", source="auto")
 
 
-def test_delete_enqueues_one_write_id_record_per_async_target():
-    """A delete batch yields one lightweight ledger row per async target."""
-    svc = _service_with([_async_es_entry()])
+def test_delete_enqueues_one_write_id_record_per_index_target():
+    """A delete batch yields one lightweight ledger row per INDEX-lane target."""
+    svc = _service_with([_index_entry()])
     geoids = [
         "11111111-1111-7111-8111-111111111111",
         "22222222-2222-7222-8222-222222222222",
@@ -127,7 +133,7 @@ def test_delete_enqueues_one_write_id_record_per_async_target():
 def test_delete_is_noop_when_no_geoids_resolved():
     """No soft-deleted rows ⇒ no enqueue (a missed external id must not
     fan out a phantom delete)."""
-    svc = _service_with([_async_es_entry()])
+    svc = _service_with([_index_entry()])
     enqueue = AsyncMock()
     with patch(_ENQUEUE, enqueue):
         asyncio.run(
@@ -136,15 +142,11 @@ def test_delete_is_noop_when_no_geoids_resolved():
     enqueue.assert_not_awaited()
 
 
-def test_delete_skips_non_async_outbox_index_entries():
-    """Only ASYNC+OUTBOX secondary-index WRITE entries are enqueued here — a
-    SYNC/FATAL primary write entry must not produce an outbox delete row."""
-    sync_entry = OperationDriverEntry(
-        driver_ref="items_postgresql_driver",
-        on_failure=FailurePolicy.FATAL,
-        write_mode=WriteMode.SYNC,
-    )
-    svc = _service_with([sync_entry])
+def test_delete_skips_when_no_index_lane_entries():
+    """Only INDEX-lane entries are enqueued here — a WRITE-lane primary
+    entry (even the same driver_ref) must not produce an outbox delete
+    row when the INDEX lane itself is empty."""
+    svc = _service_with([])  # no INDEX-lane entries at all
     enqueue = AsyncMock()
     with patch(_ENQUEUE, enqueue):
         asyncio.run(

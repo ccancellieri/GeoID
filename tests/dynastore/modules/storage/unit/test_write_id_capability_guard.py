@@ -53,7 +53,6 @@ from dynastore.modules.storage.routing_config import (
     FailurePolicy,
     Operation,
     OperationDriverEntry,
-    WriteMode,
 )
 
 
@@ -233,13 +232,12 @@ def _make_upsert_routing_resolver():
             OperationDriverEntry(
                 driver_ref="items_postgresql_driver",
                 on_failure=FailurePolicy.FATAL,
-                write_mode=WriteMode.SYNC,
             ),
+        ],
+        Operation.INDEX: [
             OperationDriverEntry(
                 driver_ref="items_elasticsearch_driver",
-                on_failure=FailurePolicy.OUTBOX,
-                write_mode=WriteMode.ASYNC,
-                secondary_index=True,
+                source="auto",
             ),
         ],
     }
@@ -307,19 +305,22 @@ async def test_upsert_bulk_falls_back_to_id_only_enqueue_when_primary_lacks_writ
 
 
 def _async_es_entry() -> OperationDriverEntry:
-    return OperationDriverEntry(
-        driver_ref="items_elasticsearch_driver",
-        on_failure=FailurePolicy.OUTBOX,
-        write_mode=WriteMode.ASYNC,
-        secondary_index=True,
-    )
+    return OperationDriverEntry(driver_ref="items_elasticsearch_driver", source="auto")
 
 
 def test_enqueue_index_deletes_falls_back_to_id_only_when_primary_lacks_write_id_capability():
     svc = ItemService.__new__(ItemService)
 
     async def _resolver(_catalog_id: str, _collection_id: str):
-        return SimpleNamespace(operations={Operation.WRITE: [_async_es_entry()]})
+        return SimpleNamespace(operations={
+            Operation.WRITE: [
+                OperationDriverEntry(
+                    driver_ref="items_postgresql_driver",
+                    on_failure=FailurePolicy.FATAL,
+                ),
+            ],
+            Operation.INDEX: [_async_es_entry()],
+        })
 
     svc._test_routing_resolver = _resolver  # type: ignore[attr-defined]
 

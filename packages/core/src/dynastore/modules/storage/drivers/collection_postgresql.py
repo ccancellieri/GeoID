@@ -83,7 +83,6 @@ from dynastore.models.protocols.typed_driver import (
 )
 from dynastore.models.mutability import Immutable
 from dynastore.modules.storage.hints import Hint
-from dynastore.modules.storage.routing_config import Operation
 from dynastore.tools.cache import cached
 
 logger = logging.getLogger(__name__)
@@ -335,11 +334,12 @@ class CollectionPostgresqlDriver(TypedDriver[CollectionPostgresqlDriverConfig]):
     # delete transaction; the async cascade must not re-drop them.
     teardown_lane: ClassVar[TeardownLane] = TeardownLane.INLINE_TXN
 
-    # Collection metadata fallback for SEARCH (PG serves the
-    # query-fallback path when ES is unavailable / not registered).
-    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({Operation.SEARCH})
+    # PG serves the derived-search fallback path via the READ lane when ES
+    # is unavailable / not registered. Not an INDEX-lane (materialization)
+    # driver, so it opts into no auto-registration set.
+    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset()
 
-    # Hints this driver serves on READ/SEARCH operations.
+    # Hints this driver serves on READ / derived-search operations.
     # GEOMETRY_EXACT: PG is the system of record with full WKB geometry.
     # METADATA: generic participation in metadata reads.
     supported_hints: ClassVar[FrozenSet[Hint]] = frozenset({

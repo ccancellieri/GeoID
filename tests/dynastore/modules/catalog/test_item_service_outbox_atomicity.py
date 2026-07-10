@@ -55,7 +55,6 @@ from dynastore.modules.storage.routing_config import (
     FailurePolicy,
     Operation,
     OperationDriverEntry,
-    WriteMode,
 )
 
 # Where ``upsert_bulk`` imports the storage-emit function (patched per test).
@@ -177,18 +176,13 @@ def _make_routing_resolver(
             OperationDriverEntry(
                 driver_ref=d,
                 on_failure=FailurePolicy.FATAL,
-                write_mode=WriteMode.SYNC,
             )
             for d in fatal_drivers
-        ] + [
-            # Secondary-index sinks live in the same WRITE list, role-tagged
-            # via secondary_index=True (#990).
-            OperationDriverEntry(
-                driver_ref=d,
-                on_failure=FailurePolicy.OUTBOX,
-                write_mode=WriteMode.ASYNC,
-                secondary_index=True,
-            )
+        ],
+        # INDEX-lane materialization targets — async by lane definition,
+        # no per-entry failure policy.
+        Operation.INDEX: [
+            OperationDriverEntry(driver_ref=d, source="auto")
             for d in outbox_drivers
         ],
     }

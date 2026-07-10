@@ -38,10 +38,10 @@ from dynastore.modules.storage.routing_config import (
 def _routing_with_private() -> ItemsRoutingConfig:
     return ItemsRoutingConfig(
         operations={
-            Operation.WRITE: [
+            Operation.INDEX: [
                 OperationDriverEntry(
                     driver_ref="items_elasticsearch_private_driver",
-                    secondary_index=True,
+                    source="auto",
                 ),
             ],
         },

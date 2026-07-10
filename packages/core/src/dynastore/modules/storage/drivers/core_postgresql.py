@@ -74,7 +74,6 @@ from dynastore.modules.db_config.query_executor import (
     managed_transaction,
 )
 from dynastore.modules.storage.driver_config import DriverPluginConfig
-from dynastore.modules.storage.routing_config import Operation
 from dynastore.tools.db import build_upsert
 
 if TYPE_CHECKING:
@@ -471,9 +470,11 @@ class CollectionCorePostgresqlDriver(
     _columns: ClassVar[Tuple[str, ...]] = _COLLECTION_CORE_COLUMNS
     teardown_lane: ClassVar[TeardownLane] = TeardownLane.INLINE_TXN
 
-    # Collection metadata fallback for SEARCH (PG serves the
-    # query-fallback path when ES is unavailable / not registered).
-    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({Operation.SEARCH})
+    # PG serves the derived-search fallback path via the READ lane when ES
+    # is unavailable / not registered (see the router's derived-search
+    # pool: INDEX first, READ fallback). Not an INDEX-lane (materialization)
+    # driver, so it opts into no auto-registration set.
+    auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset()
 
     capabilities: FrozenSet[str] = frozenset({
         EntityStoreCapability.READ,
