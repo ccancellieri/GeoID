@@ -2571,7 +2571,8 @@ async def claim_batch(
             locked_until = :locked_until,
             owner_id = :owner_id,
             started_at = COALESCE(started_at, NOW()),
-            last_heartbeat_at = NOW()
+            last_heartbeat_at = NOW(),
+            error_message = NULL
         WHERE (timestamp, task_id) IN (
             SELECT timestamp, task_id
             FROM {task_schema}.tasks
