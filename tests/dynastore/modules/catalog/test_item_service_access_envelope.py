@@ -255,3 +255,180 @@ def test_resolve_write_owner_falls_back_to_subject_id():
 def test_resolve_write_owner_none_without_principal():
     assert ItemService._resolve_write_owner({}) is None
     assert ItemService._resolve_write_owner(None) is None
+
+
+# ---------------------------------------------------------------------------
+# #3175 — write-time _attrs stamping threads the real per-item feature
+#
+# Before this fix, ``_resolve_index_stamp_context`` resolved
+# ``_resolve_access_envelope`` once per dispatch with no feature, so
+# ``_attrs`` fell back to ``processing_context`` (which never carries a
+# Feature's "properties") — write-time ``_attrs`` was effectively always
+# ``{}``. The fix carries the resolved ``AttributeStampingPolicy`` paths on
+# ``_IndexStampContext`` and stamps ``_attrs`` per item, from that item's own
+# payload, in ``_apply_index_stamp``.
+# ---------------------------------------------------------------------------
+
+
+def _patch_stamping_policy(monkeypatch, attribute_paths: dict, is_public: bool = False):
+    """Patch ``ConfigsProtocol`` so both ``CatalogLookupAudience`` and
+    ``AttributeStampingPolicy`` resolve for the access-envelope base."""
+    class _Audience:
+        def __init__(self, pub):
+            self.is_public = pub
+
+    class _Policy:
+        def __init__(self, paths):
+            self.attribute_paths = paths
+
+    class _Configs:
+        async def get_config(self, model, *, catalog_id=None, collection_id=None, **k):
+            from dynastore.modules.iam.audience_configs import CatalogLookupAudience
+            from dynastore.modules.iam.stamping_config import AttributeStampingPolicy
+            if model is CatalogLookupAudience:
+                return _Audience(is_public)
+            if model is AttributeStampingPolicy:
+                return _Policy(attribute_paths)
+            return None
+
+    def _get_protocol(proto, *a, **k):
+        from dynastore.models.protocols import ConfigsProtocol
+        return _Configs() if proto is ConfigsProtocol else None
+
+    monkeypatch.setattr(
+        "dynastore.tools.discovery.get_protocol", _get_protocol,
+    )
+
+
+async def test_dispatch_stamps_attrs_from_each_items_own_feature_properties(monkeypatch):
+    """(a) A write to an access-aware collection with a stamping policy
+    indexes ``_attrs`` populated from each item's own Feature properties —
+    not frozen once for the whole batch."""
+    svc = ItemService()
+    _wire_write_drivers(monkeypatch, [_StubResolved(_EnvelopeDriver())])
+    _patch_stamping_policy(
+        monkeypatch, attribute_paths={"dept": "$.properties.department"},
+    )
+    captured = _capture_dispatcher(monkeypatch)
+
+    async def _no_external_id(catalog_id, collection_id):
+        return None
+
+    monkeypatch.setattr(svc, "_resolve_external_id_path", _no_external_id)
+    monkeypatch.setattr(svc, "engine", None)
+
+    results = [
+        Feature(type="Feature", id="g1", geometry=None, properties={"department": "finance"}),
+        Feature(type="Feature", id="g2", geometry=None, properties={"department": "legal"}),
+    ]
+    await svc._dispatch_index_upsert(
+        "c", "col", results, processing_context={"owner": "alice"},
+    )
+
+    ops = {op.entity_id: op for op in captured["ops"]}
+    assert ops["g1"].payload["_attrs"] == {"dept": "finance"}
+    assert ops["g2"].payload["_attrs"] == {"dept": "legal"}
+
+
+async def test_dispatch_no_attrs_key_without_stamping_policy(monkeypatch):
+    """(c) Access-aware collection with no stamping policy (empty paths) →
+    behaviour unchanged: no ``_attrs`` key."""
+    svc = ItemService()
+    _wire_write_drivers(monkeypatch, [_StubResolved(_EnvelopeDriver())])
+    _patch_audience(monkeypatch, is_public=False)
+    captured = _capture_dispatcher(monkeypatch)
+
+    async def _no_external_id(catalog_id, collection_id):
+        return None
+
+    monkeypatch.setattr(svc, "_resolve_external_id_path", _no_external_id)
+    monkeypatch.setattr(svc, "engine", None)
+
+    results = [Feature(type="Feature", id="g1", geometry=None, properties={"department": "finance"})]
+    await svc._dispatch_index_upsert(
+        "c", "col", results, processing_context={"owner": "alice"},
+    )
+
+    payload = captured["ops"][0].payload
+    assert "_attrs" not in payload
+
+
+async def test_dispatch_not_access_aware_ignores_stamping_policy(monkeypatch):
+    """(d) Non-access-aware collections are completely unaffected, even with
+    an ``AttributeStampingPolicy`` configured."""
+    svc = ItemService()
+    _wire_write_drivers(monkeypatch, [_StubResolved(_PublicDriver())])
+    _patch_stamping_policy(
+        monkeypatch, attribute_paths={"dept": "$.properties.department"},
+    )
+    captured = _capture_dispatcher(monkeypatch)
+
+    async def _no_external_id(catalog_id, collection_id):
+        return None
+
+    monkeypatch.setattr(svc, "_resolve_external_id_path", _no_external_id)
+    monkeypatch.setattr(svc, "engine", None)
+
+    results = [Feature(type="Feature", id="g1", geometry=None, properties={"department": "finance"})]
+    await svc._dispatch_index_upsert(
+        "c", "col", results, processing_context={"owner": "alice"},
+    )
+
+    payload = captured["ops"][0].payload
+    assert "_visibility" not in payload
+    assert "_owner" not in payload
+    assert "_attrs" not in payload
+
+
+async def test_resolve_access_envelope_base_carries_paths_not_baked_attrs(monkeypatch):
+    """``_resolve_access_envelope_base`` resolves ``attrs_paths`` once but never
+    bakes a resolved ``_attrs`` value into the batch-level result — there is
+    no feature at this point to derive one from."""
+    from dynastore.modules.catalog.item_service import _AccessEnvelopeBase
+
+    svc = ItemService()
+    _wire_write_drivers(monkeypatch, [_StubResolved(_EnvelopeDriver())])
+    _patch_stamping_policy(
+        monkeypatch, attribute_paths={"dept": "$.properties.department"},
+    )
+
+    base = await svc._resolve_access_envelope_base("c", "col", {"owner": "alice"})
+    assert isinstance(base, _AccessEnvelopeBase)
+    assert base.visibility == "private"
+    assert base.owner == "alice"
+    assert base.attrs_paths == {"dept": "$.properties.department"}
+
+
+async def test_write_and_drain_attrs_parity(monkeypatch):
+    """(b) Write-time ``_apply_index_stamp`` and drain-time
+    ``_apply_access_envelope`` derive identical ``_attrs`` for the same item's
+    properties (#3175 — the write and drain paths must agree)."""
+    from dynastore.modules.catalog.canonical_index_read import _apply_access_envelope
+    from dynastore.modules.catalog.item_service import _IndexStampContext
+
+    attrs_paths = {"dept": "$.properties.department", "region": "$.properties.region"}
+    properties = {"department": "finance", "region": "EU", "irrelevant": "x"}
+
+    # Write-time: the per-item index payload already carries the item's own
+    # properties; _apply_index_stamp derives _attrs from it.
+    svc = ItemService()
+    ctx = _IndexStampContext(
+        external_id_path=None,
+        asset_id=None,
+        access_envelope={"_visibility": "private", "_owner": "alice"},
+        access_envelope_attrs_paths=attrs_paths,
+    )
+    write_payload = svc._apply_index_stamp(
+        {"id": "g1", "properties": dict(properties)}, ctx,
+    )
+
+    # Drain-time: the storage-plane recompute derives _attrs from the item's
+    # stored user_properties using the same declared paths.
+    drain_envelope = _apply_access_envelope(
+        {"geoid": "g1", "access_owner": "alice"}, properties,
+        is_access_aware=True, visibility="private", attrs_paths=attrs_paths,
+    )
+
+    assert drain_envelope is not None
+    assert write_payload["_attrs"] == drain_envelope["_attrs"]
+    assert write_payload["_attrs"] == {"dept": "finance", "region": "EU"}

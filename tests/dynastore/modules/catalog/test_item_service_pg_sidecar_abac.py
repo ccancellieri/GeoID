@@ -171,8 +171,11 @@ async def test_g4_fails_open_when_get_driver_config_raises(monkeypatch: Any) -> 
 async def test_g1_access_envelope_injected_into_item_context(
     monkeypatch: Any,
 ) -> None:
-    """G1: when _resolve_access_envelope returns an envelope, it is present in
-    every item_context passed to sidecar.prepare_upsert_payload."""
+    """G1: when _resolve_access_envelope_base returns a base envelope, it is
+    stamped into every item_context passed to sidecar.prepare_upsert_payload
+    (#3175: per item, from the base's ``visibility``/``owner`` — ``_attrs``
+    is derived separately per item from that item's own feature)."""
+    from dynastore.modules.catalog.item_service import _AccessEnvelopeBase
 
     _EXPECTED_ENVELOPE = {
         "_visibility": "private",
@@ -205,11 +208,12 @@ async def test_g1_access_envelope_injected_into_item_context(
 
     svc = ItemService()
 
-    # Patch _resolve_access_envelope to return the fixed envelope.
-    async def _fake_resolve(cat: str, col: str, pc: Any, feature: Any = None) -> Dict[str, Any]:
-        return _EXPECTED_ENVELOPE
+    # Patch _resolve_access_envelope_base to return the fixed base envelope
+    # (the batch-level resolution the per-item loop builds on).
+    async def _fake_resolve_base(cat: str, col: str, pc: Any) -> _AccessEnvelopeBase:
+        return _AccessEnvelopeBase(visibility="private", owner="alice", attrs_paths={})
 
-    monkeypatch.setattr(svc, "_resolve_access_envelope", _fake_resolve)
+    monkeypatch.setattr(svc, "_resolve_access_envelope_base", _fake_resolve_base)
 
     # Wire all Branch B dependencies: managed_transaction, configs, sidecars,
     # insert_or_update_distributed, etc.  _patch_branch_b also sets
@@ -232,8 +236,8 @@ async def test_g1_access_envelope_injected_into_item_context(
 async def test_g1_no_envelope_when_collection_not_access_aware(
     monkeypatch: Any,
 ) -> None:
-    """G1: when _resolve_access_envelope returns None (not an access-aware
-    collection), _access_envelope is absent from item_context."""
+    """G1: when _resolve_access_envelope_base returns None (not an
+    access-aware collection), _access_envelope is absent from item_context."""
 
     captured_contexts: List[Dict[str, Any]] = []
 
@@ -261,10 +265,10 @@ async def test_g1_no_envelope_when_collection_not_access_aware(
 
     svc = ItemService()
 
-    async def _no_envelope(cat: str, col: str, pc: Any, feature: Any = None) -> None:
+    async def _no_envelope_base(cat: str, col: str, pc: Any) -> None:
         return None
 
-    monkeypatch.setattr(svc, "_resolve_access_envelope", _no_envelope)
+    monkeypatch.setattr(svc, "_resolve_access_envelope_base", _no_envelope_base)
     _patch_branch_b(monkeypatch, svc, [_CapturingSidecar()])
 
     items = [{"type": "Feature", "id": "item2", "geometry": None, "properties": {}}]
@@ -283,10 +287,10 @@ async def test_pg_primary_upsert_persists_write_id_in_hub_payload(
 
     svc = ItemService()
 
-    async def _no_envelope(cat: str, col: str, pc: Any, feature: Any = None) -> None:
+    async def _no_envelope_base(cat: str, col: str, pc: Any) -> None:
         return None
 
-    monkeypatch.setattr(svc, "_resolve_access_envelope", _no_envelope)
+    monkeypatch.setattr(svc, "_resolve_access_envelope_base", _no_envelope_base)
     _patch_branch_b(monkeypatch, svc, [])
 
     captured_hub_payloads: List[Dict[str, Any]] = []
@@ -330,10 +334,10 @@ async def test_pg_primary_upsert_persists_access_owner_when_principal_present(
 
     svc = ItemService()
 
-    async def _no_envelope(cat: str, col: str, pc: Any, feature: Any = None) -> None:
+    async def _no_envelope_base(cat: str, col: str, pc: Any) -> None:
         return None  # not an access-aware collection
 
-    monkeypatch.setattr(svc, "_resolve_access_envelope", _no_envelope)
+    monkeypatch.setattr(svc, "_resolve_access_envelope_base", _no_envelope_base)
     _patch_branch_b(monkeypatch, svc, [])
 
     captured_hub_payloads: List[Dict[str, Any]] = []
@@ -377,10 +381,10 @@ async def test_pg_primary_upsert_omits_access_owner_without_principal(
 
     svc = ItemService()
 
-    async def _no_envelope(cat: str, col: str, pc: Any, feature: Any = None) -> None:
+    async def _no_envelope_base(cat: str, col: str, pc: Any) -> None:
         return None
 
-    monkeypatch.setattr(svc, "_resolve_access_envelope", _no_envelope)
+    monkeypatch.setattr(svc, "_resolve_access_envelope_base", _no_envelope_base)
     _patch_branch_b(monkeypatch, svc, [])
 
     captured_hub_payloads: List[Dict[str, Any]] = []

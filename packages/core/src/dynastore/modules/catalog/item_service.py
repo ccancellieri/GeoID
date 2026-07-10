@@ -20,7 +20,7 @@ import asyncio
 import copy
 import logging
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, FrozenSet, List, Optional, Any, Dict, Union, Sequence, Tuple
 
@@ -291,6 +291,29 @@ soft_delete_item_query = DQLQuery(
 
 
 @dataclass(frozen=True)
+class _AccessEnvelopeBase:
+    """Feature-independent access-envelope inputs, resolved once per batch.
+
+    ``visibility`` / ``owner`` are true batch-level values (see
+    :meth:`ItemService._resolve_access_envelope`). ``attrs_paths`` carries the
+    resolved :class:`~dynastore.modules.iam.stamping_config.AttributeStampingPolicy`
+    ``attribute_paths`` so a caller writing many items can apply
+    :func:`~dynastore.modules.iam.stamping_config.stamp_attrs_from_feature` per
+    item — cheap, no I/O — instead of re-resolving the policy per row.  ``None``
+    (the whole base, not this field) means the collection does not route WRITE
+    to an access-aware driver.
+
+    Mirrors the drain-time split in ``canonical_index_read._resolve_access_context``
+    / ``_apply_access_envelope`` (#2687) so write-time and drain-time ``_attrs``
+    are derived the same way — batch-level paths, per-item extraction (#3175).
+    """
+
+    visibility: str
+    owner: Optional[str]
+    attrs_paths: Dict[str, str]
+
+
+@dataclass(frozen=True)
 class _IndexStampContext:
     """Resolved inputs for stamping the canonical identity + access-envelope
     fields onto an index/outbox payload.
@@ -300,6 +323,12 @@ class _IndexStampContext:
     (:meth:`ItemService._dispatch_index_upsert`) and the atomic OUTBOX bulk
     path (:meth:`ItemService.upsert_bulk`). ``access_envelope`` is ``None``
     unless the collection routes WRITE to an access-aware driver.
+
+    ``access_envelope`` carries only the batch-level ``_visibility`` /
+    ``_owner`` values — ``_attrs`` is per-item (a Feature's declared attribute
+    values differ item to item) and is stamped separately by
+    :meth:`ItemService._apply_index_stamp` from ``access_envelope_attrs_paths``
+    applied to that item's own payload (#3175).
 
     ``external_id`` carries the pre-resolved value from the inbound item (set
     on ``processing_context["external_id"]`` by the sidecar or write-boundary).
@@ -312,6 +341,7 @@ class _IndexStampContext:
     asset_id: Optional[Any]
     access_envelope: Optional[Dict[str, Any]]
     external_id: Optional[str] = None
+    access_envelope_attrs_paths: Dict[str, str] = field(default_factory=dict)
 
 
 class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
@@ -1540,23 +1570,31 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                 _items_schema = None
             schema_validator = _build_write_validator(_items_schema)
 
-        # G1 (#1457): Pre-resolve the access envelope once for the whole batch.
-        # ``_resolve_access_envelope`` returns a non-None dict only when
-        # ``_collection_uses_access_aware_driver`` is True (G4 wires in PG-sidecar
-        # detection).  Resolving here — outside the per-item loop and outside any
-        # DB transaction — avoids repeated async calls and ensures the envelope is
-        # identical for every item in the batch (visibility + owner are batch-level
-        # properties, not per-item).  The result is injected into ``item_context``
-        # below so ``AccessEnvelopeSidecar.prepare_upsert_payload`` receives it
-        # via ``context["_access_envelope"]``.
-        _batch_access_envelope: Optional[Dict[str, Any]] = (
-            await self._resolve_access_envelope(
+        # G1 (#1457): Pre-resolve the access-envelope BASE once for the whole
+        # batch. ``_resolve_access_envelope_base`` returns non-None only when
+        # ``_collection_uses_access_aware_driver`` is True (G4 wires in
+        # PG-sidecar detection). ``_visibility``/``_owner`` are true
+        # batch-level values and are stamped as-is below; ``_attrs`` is NOT
+        # — a Feature's declared attribute values differ item to item, so
+        # freezing one stamp for the whole batch would either stamp the
+        # wrong item's values onto every row or (in production, since no
+        # feature was ever threaded here) always stamp an empty ``_attrs``
+        # (#3175). Instead ``attrs_paths`` (the resolved
+        # ``AttributeStampingPolicy``) is resolved once here and applied per
+        # item below via ``stamp_attrs_from_feature`` on that item's own
+        # ``raw_item`` — mirroring the drain-time recompute in
+        # ``canonical_index_read._apply_access_envelope``. The per-item
+        # result is injected into ``item_context`` below so
+        # ``AccessEnvelopeSidecar.prepare_upsert_payload`` receives it via
+        # ``context["_access_envelope"]``.
+        _access_envelope_base: Optional[_AccessEnvelopeBase] = (
+            await self._resolve_access_envelope_base(
                 catalog_id, collection_id, processing_context,
             )
         )
 
         # #2687: resolve the write-time owner once for the whole batch — mirrors
-        # ``_batch_access_envelope`` above but is stamped onto every item's hub
+        # ``_access_envelope_base.owner`` above but is stamped onto every item's hub
         # row UNCONDITIONALLY (no access-aware gate; a cheap nullable column,
         # same rollout shape as ``write_id``) so the storage-plane drain can
         # recompute ``_owner`` from stored state instead of the write-time-only
@@ -1585,6 +1623,29 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             try:
                 _validate_feature_properties(schema_validator, raw_item)
 
+                # #3175: stamp this item's ``_attrs`` from its OWN (still
+                # pristine at this point — no sidecar has run yet) inbound
+                # ``raw_item``, applying the batch-resolved
+                # ``AttributeStampingPolicy`` paths. A fresh dict per item —
+                # never share ``_access_envelope_base`` across items — so one
+                # item's attribute values can never leak onto another's.
+                _item_access_envelope: Optional[Dict[str, Any]] = None
+                if _access_envelope_base is not None:
+                    _item_access_envelope = {
+                        "_visibility": _access_envelope_base.visibility,
+                        "_owner": _access_envelope_base.owner,
+                    }
+                    if _access_envelope_base.attrs_paths:
+                        from dynastore.modules.iam.stamping_config import (
+                            stamp_attrs_from_feature,
+                        )
+
+                        _item_attrs = stamp_attrs_from_feature(
+                            raw_item, _access_envelope_base.attrs_paths,
+                        )
+                        if _item_attrs:
+                            _item_access_envelope["_attrs"] = _item_attrs
+
                 geoid = generate_geoid()
                 item_context: Dict[str, Any] = {
                     "geoid": geoid,
@@ -1600,12 +1661,12 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                     "_pristine_item": copy.deepcopy(raw_item),
                     "_items_write_policy": items_write_policy,
                     **(processing_context or {}),
-                    # G1 (#1457): inject the pre-resolved access envelope so
+                    # G1 (#1457): inject this item's access envelope so
                     # AccessEnvelopeSidecar.prepare_upsert_payload can build the
                     # sub-table row.  None when the collection does not use an
                     # access-aware driver; the sidecar skips the write in that case.
-                    **({"_access_envelope": _batch_access_envelope}
-                       if _batch_access_envelope is not None else {}),
+                    **({"_access_envelope": _item_access_envelope}
+                       if _item_access_envelope is not None else {}),
                 }
                 # Pre-resolve external_id from the inbound feature before any
                 # sidecar runs so PG sidecars and the index-stamp path share
@@ -2051,38 +2112,30 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         owner = pc.get("owner") or pc.get("principal_id") or pc.get("subject_id")
         return str(owner) if owner is not None else None
 
-    async def _resolve_access_envelope(
+    async def _resolve_access_envelope_base(
         self,
         catalog_id: str,
         collection_id: str,
         processing_context: Optional[Dict[str, Any]],
-        feature: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Resolve the access-envelope stamping values for an index dispatch.
+    ) -> Optional[_AccessEnvelopeBase]:
+        """Resolve the batch-level (feature-independent) access-envelope inputs once.
 
-        Returns ``{_visibility, _owner, _attrs}`` to stamp onto the index
-        payload, or ``None`` when the collection does NOT route to an
-        access-aware driver (``applies_access_filter=True``) — nothing is
-        stamped in that case.
-
-        Sources:
-
-        * ``_owner``      ← creating principal's subject id from
-          ``processing_context`` (``owner`` / ``principal_id`` /
-          ``subject_id``).
-        * ``_visibility`` ← catalog's ``CatalogLookupAudience.is_public``
-          (``"public"`` / ``"private"``). Defaults to ``"private"``.
-        * ``_attrs``      ← per-collection ``AttributeStampingPolicy``.
-          When the policy is absent or ``attribute_paths`` is empty the key is
-          omitted entirely (behaviour unchanged vs. pre-#1441).  Only
-          ``$.properties.<field>`` paths are resolved in this slice.
+        Returns ``None`` when the collection does NOT route WRITE to an
+        access-aware driver — nothing is stamped in that case. Otherwise
+        resolves ``_visibility`` / ``_owner`` (true batch-level values) plus
+        the ``AttributeStampingPolicy.attribute_paths`` so a caller writing
+        many items can apply :func:`~dynastore.modules.iam.stamping_config.
+        stamp_attrs_from_feature` per item — no config round trip per row.
+        Every sub-resolution degrades to a closed default on failure (a
+        config lookup failure must never block a write); mirrors the
+        drain-time ``canonical_index_read._resolve_access_context`` split
+        (#2687, #3175).
         """
         if not await self._collection_uses_access_aware_driver(
             catalog_id, collection_id,
         ):
             return None
 
-        pc = processing_context or {}
         owner = self._resolve_write_owner(processing_context)
 
         visibility = "private"  # closed default for the tenant-isolated index
@@ -2096,48 +2149,74 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             # Missing/unavailable audience config → keep the closed default.
             pass
 
-        envelope: Dict[str, Any] = {
-            "_visibility": visibility,
-            "_owner": owner,
-        }
-
-        # --- Attribute stamping (#1441) -----------------------------------
-        attrs = await self._stamp_attrs(
-            catalog_id, collection_id, feature or pc,
-        )
-        if attrs:
-            envelope["_attrs"] = attrs
-        # ------------------------------------------------------------------
-
-        return envelope
-
-    async def _stamp_attrs(
-        self,
-        catalog_id: str,
-        collection_id: str,
-        source: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Extract per-collection attribute values from ``source`` for ``_attrs``.
-
-        Reads :class:`~dynastore.modules.iam.stamping_config.AttributeStampingPolicy`
-        for the collection. For each declared path (only ``$.properties.<key>``
-        is supported in this slice) extracts the value from ``source`` (a raw
-        Feature dict or processing context dict).  Returns an empty dict when
-        the policy is absent or ``attribute_paths`` is empty.
-        """
+        attrs_paths: Dict[str, str] = {}
         try:
-            from dynastore.modules.iam.stamping_config import stamp_attrs_from_feature
             from dynastore.modules.storage.access_envelope import (
                 resolve_attribute_stamping_paths,
             )
 
-            paths = await resolve_attribute_stamping_paths(catalog_id, collection_id)
-            if not paths:
-                return {}
+            attrs_paths = await resolve_attribute_stamping_paths(
+                catalog_id, collection_id,
+            )
         except Exception:
-            return {}
+            attrs_paths = {}
 
-        return stamp_attrs_from_feature(source, paths)
+        return _AccessEnvelopeBase(
+            visibility=visibility, owner=owner, attrs_paths=attrs_paths,
+        )
+
+    async def _resolve_access_envelope(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        processing_context: Optional[Dict[str, Any]],
+        feature: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve the access-envelope stamping values for a single item.
+
+        Returns ``{_visibility, _owner, _attrs}`` to stamp onto the index
+        payload, or ``None`` when the collection does NOT route to an
+        access-aware driver (``applies_access_filter=True``) — nothing is
+        stamped in that case.
+
+        Sources:
+
+        * ``_owner``      ← creating principal's subject id from
+          ``processing_context`` (``owner`` / ``principal_id`` /
+          ``subject_id``).
+        * ``_visibility`` ← catalog's ``CatalogLookupAudience.is_public``
+          (``"public"`` / ``"private"``). Defaults to ``"private"``.
+        * ``_attrs``      ← per-collection ``AttributeStampingPolicy``,
+          extracted from ``feature`` (falling back to ``processing_context``
+          when no feature is given). When the policy is absent or
+          ``attribute_paths`` is empty the key is omitted entirely (behaviour
+          unchanged vs. pre-#1441). Only ``$.properties.<field>`` paths are
+          resolved in this slice.
+
+        A caller writing many items in one batch should prefer
+        :meth:`_resolve_access_envelope_base` (resolved once) plus
+        :func:`~dynastore.modules.iam.stamping_config.stamp_attrs_from_feature`
+        applied per item — this method re-resolves the policy on every call,
+        which is fine for a single item but wasteful in a loop (#3175).
+        """
+        base = await self._resolve_access_envelope_base(
+            catalog_id, collection_id, processing_context,
+        )
+        if base is None:
+            return None
+
+        from dynastore.modules.iam.stamping_config import stamp_attrs_from_feature
+
+        pc = processing_context or {}
+        envelope: Dict[str, Any] = {
+            "_visibility": base.visibility,
+            "_owner": base.owner,
+        }
+        if base.attrs_paths:
+            attrs = stamp_attrs_from_feature(feature or pc, base.attrs_paths)
+            if attrs:
+                envelope["_attrs"] = attrs
+        return envelope
 
     async def _collection_uses_access_aware_driver(
         self,
@@ -2170,17 +2249,31 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         (:meth:`upsert_bulk`) so a collection populated via either path indexes
         the same canonical ``_external_id`` / ``_asset_id`` — and, when it
         routes WRITE to an access-aware driver, the same ``_visibility`` /
-        ``_owner`` / ``_attrs``. See #1287 and #1441.
+        ``_owner``. See #1287 and #1441.
+
+        ``access_envelope`` here carries only the batch-level ``_visibility`` /
+        ``_owner`` — ``_attrs`` is per-item and is stamped by
+        :meth:`_apply_index_stamp` from ``access_envelope_attrs_paths``
+        applied to that item's own payload (#3175: a feature was never in
+        hand at this batch-level call, so freezing ``_attrs`` here always
+        stamped an empty dict in production).
         """
+        base = await self._resolve_access_envelope_base(
+            catalog_id, collection_id, processing_context,
+        )
+        access_envelope: Optional[Dict[str, Any]] = None
+        attrs_paths: Dict[str, str] = {}
+        if base is not None:
+            access_envelope = {"_visibility": base.visibility, "_owner": base.owner}
+            attrs_paths = base.attrs_paths
         return _IndexStampContext(
             external_id_path=await self._resolve_external_id_path(
                 catalog_id, collection_id,
             ),
             asset_id=(processing_context or {}).get("asset_id"),
-            access_envelope=await self._resolve_access_envelope(
-                catalog_id, collection_id, processing_context,
-            ),
+            access_envelope=access_envelope,
             external_id=(processing_context or {}).get("external_id"),
+            access_envelope_attrs_paths=attrs_paths,
         )
 
     def _apply_index_stamp(
@@ -2199,7 +2292,11 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
 
         ``_attrs`` is stamped when the collection has an
         :class:`~dynastore.modules.iam.stamping_config.AttributeStampingPolicy`
-        with a non-empty ``attribute_paths`` map.
+        with a non-empty ``attribute_paths`` map, extracted from ``payload``
+        itself — the per-item Feature dict already in hand at this call site
+        (#3175). ``payload`` is the same post-write/post-read-back Feature
+        shape the drain-time recompute derives ``_attrs`` from, so the two
+        agree for the same stored item.
         """
         if ctx.external_id is not None:
             payload["_external_id"] = str(ctx.external_id)
@@ -2216,10 +2313,18 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             payload.setdefault("_visibility", ctx.access_envelope["_visibility"])
             if ctx.access_envelope["_owner"] is not None:
                 payload.setdefault("_owner", ctx.access_envelope["_owner"])
-            # ``_attrs`` from the per-collection stamping policy (#1441).
-            attrs = ctx.access_envelope.get("_attrs")
-            if attrs:
-                payload.setdefault("_attrs", attrs)
+            # ``_attrs`` from the per-collection stamping policy (#1441),
+            # extracted per item from this item's own payload (#3175).
+            if ctx.access_envelope_attrs_paths:
+                from dynastore.modules.iam.stamping_config import (
+                    stamp_attrs_from_feature,
+                )
+
+                attrs = stamp_attrs_from_feature(
+                    payload, ctx.access_envelope_attrs_paths,
+                )
+                if attrs:
+                    payload.setdefault("_attrs", attrs)
         return payload
 
     async def _dispatch_index_upsert(
