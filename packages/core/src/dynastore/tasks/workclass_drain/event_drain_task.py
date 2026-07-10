@@ -485,6 +485,7 @@ class EventDrainTask(AsyncWriteDrainTaskProtocol):
                 )
             return len(rows)
 
+        completed_rows: List[Dict[str, Any]] = []
         for row in rows:
             event_type = row.get("event_type") or ""
             payload = self._coerce_payload(row.get("payload"))
@@ -514,10 +515,13 @@ class EventDrainTask(AsyncWriteDrainTaskProtocol):
             # event/subscription). Best-effort: never blocks the ack.
             await self._fan_out_webhooks(engine=engine, row=row, payload=payload)
 
-            await self._mark_done(
+            completed_rows.append(row)
+
+        if completed_rows:
+            await self._mark_done_many(
                 engine=engine,
                 task_schema=task_schema,
-                row=row,
+                rows=completed_rows,
                 owner_id=owner_id,
             )
 
@@ -786,26 +790,73 @@ class EventDrainTask(AsyncWriteDrainTaskProtocol):
         Rows are not deleted on ack; ``DROP PARTITION`` retention reclaims
         COMPLETED rows.
         """
+        await self._mark_done_many(
+            engine=engine,
+            task_schema=task_schema,
+            rows=[row],
+            owner_id=owner_id,
+        )
+
+    async def _mark_done_many(
+        self,
+        *,
+        engine: Any,
+        task_schema: str,
+        rows: List[Dict[str, Any]],
+        owner_id: str,
+    ) -> None:
+        """Mark rows COMPLETED in one fenced UPDATE.
+
+        Each VALUES tuple carries the row's claim_version, preserving the same
+        per-row CAS semantics as ``_mark_done`` while collapsing a successful
+        drain batch into one database round trip.
+        """
         from dynastore.modules.db_config.query_executor import (
             DQLQuery,
             ResultHandler,
             managed_transaction,
         )
 
+        if not rows:
+            return
+
+        values_sql: List[str] = []
+        params: Dict[str, Any] = {"owner_id": owner_id}
+        for idx, row in enumerate(rows):
+            values_sql.append(
+                f"(CAST(:day_{idx} AS date), "
+                f"CAST(:event_id_{idx} AS uuid), "
+                f"CAST(:claim_version_{idx} AS integer))"
+            )
+            params[f"day_{idx}"] = row["day"]
+            params[f"event_id_{idx}"] = str(row["event_id"])
+            params[f"claim_version_{idx}"] = row["claim_version"]
+
         sql = (
-            f"UPDATE {task_schema}.events"
+            f"UPDATE {task_schema}.events AS e"
             f" SET status='COMPLETED', owner_id=NULL, locked_until=NULL,"
             f"     processed_at=now()"
-            f" WHERE day=:day AND event_id=:event_id"
-            f"   AND owner_id=:owner_id AND claim_version=:claim_version"
+            f" FROM (VALUES {', '.join(values_sql)})"
+            f"      AS v(day, event_id, claim_version)"
+            f" WHERE e.day=v.day AND e.event_id=v.event_id"
+            f"   AND e.owner_id=:owner_id AND e.claim_version=v.claim_version"
+            f" RETURNING e.event_id"
         )
         async with managed_transaction(engine) as conn:
-            await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
+            updated = await DQLQuery(
+                sql, result_handler=ResultHandler.ALL_DICTS
+            ).execute(
                 conn,
-                day=row["day"],
-                event_id=str(row["event_id"]),
-                owner_id=owner_id,
-                claim_version=row["claim_version"],
+                **params,
+            )
+
+        updated_count = len(updated or [])
+        if updated_count != len(rows):
+            logger.debug(
+                "EventDrainTask: bulk mark_done finalized %d/%d row(s); "
+                "misses are expected for stale claims.",
+                updated_count,
+                len(rows),
             )
 
     async def _mark_retry(

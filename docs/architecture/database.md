@@ -266,3 +266,27 @@ Tenant tables are created idempotently on first access by
 tables — assets, tiles, proxy, IAM, log_manager, …). DDL is authored with
 `CREATE TABLE IF NOT EXISTS`/`ALTER TABLE ... IF NOT EXISTS` so concurrent
 workers converge on the same target state without a versioned migration runner.
+
+### Control-Plane Tables In `configs`
+
+The `configs` schema is the platform metadata schema, not only the user-facing
+configuration store. It also holds small, cross-service control-plane tables
+whose rows are written by every service instance and read by background
+coordination loops:
+
+- `configs.leader_lease` — transaction-safe leader-election rows. A row records
+  which instance currently owns a named background role and expires naturally
+  when the owner stops renewing it.
+- `configs.task_capability_registry` — observed task ownership facts keyed by
+  service and task key. This complements `TaskRoutingConfig`: routing says
+  where a task should run, while the registry says which deployed services are
+  currently alive and able to run it.
+- `configs.instance_liveness` — per-process heartbeat rows used by database
+  session cleanup. This is intentionally separate from leader leases because
+  most instances never hold a leader role.
+
+These tables are expected to stay small. Stale rows are safe to prune by age or
+clear during a full maintenance window; the next healthy service instances will
+re-publish them. They should not be dropped in a running deployment, because
+startup, routing diagnostics, leader election, and session cleanup depend on the
+relations existing.

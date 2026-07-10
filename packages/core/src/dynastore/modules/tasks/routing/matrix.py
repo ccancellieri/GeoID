@@ -91,7 +91,15 @@ LIGHTWEIGHT_PROCESSES: frozenset = frozenset(
 # ``background`` target (no Job exists in that topology).  The fail-open in
 # ``_restrict_to_offload_runners`` preserves in-process execution when no
 # offload runner is registered (e.g. the Job is not yet deployed).
-OFFLOADABLE_SYSTEM_TASKS: frozenset = frozenset({"catalog_provision"})
+#
+# ``storage_drain`` is intentionally absent: it starts in-process and self-
+# escapes to ``storage_drain_offload`` once its byte/wall-clock budget is
+# exhausted. ``event_drain`` and ``storage_drain_offload`` are hosted by the
+# async-writer job in cloud deployments, so the materialized config should
+# point at ``gcp_cloud_run`` instead of pinning them to catalog/background.
+OFFLOADABLE_SYSTEM_TASKS: frozenset = frozenset(
+    {"catalog_provision", "event_drain", "storage_drain_offload"}
+)
 
 
 def build_routing_matrix(

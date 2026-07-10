@@ -126,13 +126,14 @@ a non-empty `consumers` list — the structural guard against a task with no
 claimer:
 
 - **cloud** — processes offload to GCP Cloud Run Jobs (`gcp_cloud_run`, hints
-  `{OFFLOAD, HEAVY}`) unless lightweight; system tasks and lightweight processes
-  stay in-process (`background`).
-- **onprem** — every task/process runs as a `background` worker on the `worker`
-  tier; heavy processes get the `HEAVY` hint for a dedicated worker pool.
-- **review** — mirrors cloud, except `gdal` runs in-process on the catalog pod
-  (`background`, `["catalog"]`, hints `{BACKGROUND, INTERACTIVE}`) for review/local
-  images; the production catalog image is unchanged.
+  `{OFFLOAD, HEAVY}`) unless lightweight. Most system tasks stay in-process
+  (`background`), but Cloud Run-backed system tasks such as
+  `catalog_provision`, `event_drain`, and `storage_drain_offload` emit
+  `gcp_cloud_run` targets with `{OFFLOAD}`.
+- **onprem** — every task/process runs in-process through the `background`
+  runner on its natural service tier (`catalog`, `maps`, or both); nothing is
+  routed to Cloud Run or to a bare `worker` tier.
+- **review** — retired alias for `cloud`.
 
 Apply a profile from the admin presets UI (platform scope) or the `/admin/presets`
 API — **dry-run → apply → rollback**. The presets register as
@@ -146,6 +147,19 @@ API — **dry-run → apply → rollback**. The presets register as
 | `GET /configs/tasks/catalogue` | The task/process registry (kind-split). |
 | `GET /configs/tasks/runners` | Runners registered on this service. |
 | `GET /configs/tasks/capabilities` | Reconcile report; a non-empty `starving` list is a routed-but-unclaimable gap. |
+
+The durable capability registry (`configs.task_capability_registry`) is an
+observed-facts table, not the routing source of truth. `TaskRoutingConfig`
+answers "where should this task run?"; the registry answers "which deployed
+services are currently alive and advertise this task key?" The registry stores
+small schema metadata for diagnostics and client tooling, but dispatch decisions
+still go through the routing resolver and registered runners.
+
+Rows are keyed by `(service, task_key)` and heartbeated with `last_seen`. Old
+rows from retired service names or old builds are harmless once outside the live
+TTL window, but they can make diagnostics noisy. Operators may prune stale rows
+or clear the table during a full maintenance window; live services republish
+current rows on startup/heartbeat.
 
 ### Runbook: a task never executes
 
@@ -203,8 +217,7 @@ On startup `TasksModule` (priority=15, before `CatalogModule` at 20):
 1. Acquires an advisory lock for the duration of all DDL — prevents concurrent-revision
    races on rolling deploys. If that outer startup lock times out, the module
    replays idempotent startup DDL in a scoped fallback that skips only the nested
-   per-query advisory wait. Verified idempotent peer races are tolerated after a
-   successful existence re-check; ordinary DDL errors still fail startup.
+   per-query advisory wait; ordinary DDL errors still fail startup.
 2. Creates the `tasks` table, indexes, pg_notify triggers, and the DEFAULT
    partition if absent. Warm starts also repair `tasks.tasks_default` with a
    separate `to_regclass` check so the sentinel-skipped DDL batch cannot leave
@@ -226,8 +239,7 @@ Periodic task maintenance is driven by `tasks.maintenance_schedule`; it is the
 single scheduler table for the in-process maintenance supervisor. Each row has a
 `job_name`, cadence (`interval_seconds`), the latest run outcome, and
 `running_since` while a leader is executing it. The supervisor reclaims stale
-`running_since` values by comparing them to `now - make_interval(...)` with a
-row-derived threshold:
+`running_since` values with a row-derived threshold:
 `min(600s, max(180s, interval_seconds * 3))`. Short-cadence jobs such as
 `task_reaper` recover after about three minutes; daily jobs still recover within
 ten minutes.

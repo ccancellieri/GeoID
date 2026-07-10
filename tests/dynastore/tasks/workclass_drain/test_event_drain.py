@@ -486,6 +486,62 @@ async def test_delivery_success_marks_completed(
     assert all(r["owner_id"] is None for r in rows)
 
 
+@pytest.mark.asyncio
+async def test_delivery_success_finalizes_successes_in_one_bulk_write(monkeypatch):
+    from dynastore.tasks.workclass_drain.event_drain_task import EventDrainTask
+
+    rows = [
+        {
+            "day": datetime.now(timezone.utc).date(),
+            "event_id": str(uuid4()),
+            "event_type": "catalog_creation",
+            "payload": {"args": [], "kwargs": {}},
+            "retry_count": 0,
+            "max_retries": None,
+            "claim_version": 1,
+            "owner_id": "owner",
+        },
+        {
+            "day": datetime.now(timezone.utc).date(),
+            "event_id": str(uuid4()),
+            "event_type": "catalog_creation",
+            "payload": {"args": [], "kwargs": {}},
+            "retry_count": 0,
+            "max_retries": None,
+            "claim_version": 1,
+            "owner_id": "owner",
+        },
+    ]
+    task = EventDrainTask(batch_size=10)
+    bus = _FakeEventBus()
+    captured: Dict[str, Any] = {}
+
+    async def claim_batch(**_: Any) -> List[Dict[str, Any]]:
+        return rows
+
+    async def fan_out_webhooks(**_: Any) -> None:
+        return None
+
+    async def mark_done_many(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    async def mark_done(**_: Any) -> None:
+        raise AssertionError("drain_once must bulk-finalize successful rows")
+
+    monkeypatch.setattr(task, "_claim_batch", claim_batch)
+    monkeypatch.setattr(task, "_resolve_event_bus", lambda: bus)
+    monkeypatch.setattr(task, "_fan_out_webhooks", fan_out_webhooks)
+    monkeypatch.setattr(task, "_mark_done_many", mark_done_many)
+    monkeypatch.setattr(task, "_mark_done", mark_done)
+
+    count = await task.drain_once(engine=object(), owner_id="owner")
+
+    assert count == 2
+    assert len(bus.calls) == 2
+    assert captured["rows"] == rows
+    assert captured["owner_id"] == "owner"
+
+
 # ---------------------------------------------------------------------------
 # 6. Delivery failure -> retry; exhaustion -> DEAD_LETTER
 # ---------------------------------------------------------------------------

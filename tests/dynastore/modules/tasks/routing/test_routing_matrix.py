@@ -253,12 +253,12 @@ def test_empty_inventory_returns_empty_maps():
 
 
 # ---------------------------------------------------------------------------
-# #2129 — the WorkClass hot-plane drains must be claimable on a worker-less
-# topology. There is no always-on "worker" service (dev/cloud run only
-# catalog/auth/maps/tools plus on-demand single-task Cloud Run jobs), so the
-# drains are tier-agnostic and route to the catalog tier, which co-locates the
-# dispatcher and the in-process event listeners / secondary-write driver they
-# need. A regression to affinity_tier="worker" would make them unclaimable.
+# #2129/#2732 — WorkClass hot-plane drains remain tier-agnostic so they never
+# route to a nonexistent "worker" tier. ``storage_drain`` is in-process-first
+# and hands off to ``storage_drain_offload`` when its budget is exhausted.
+# The marker-carrying drain jobs (``event_drain`` and
+# ``storage_drain_offload``) route to Cloud Run under the cloud profile while
+# onprem keeps them background.
 # ---------------------------------------------------------------------------
 
 
@@ -274,15 +274,39 @@ def test_workclass_drains_are_tier_agnostic():
     assert StorageDrainTask.affinity_tier is None
 
 
-def test_workclass_drains_route_to_catalog_not_worker():
+def test_storage_drain_starts_in_process_on_catalog():
     for preset in ("cloud", "review", "onprem"):
         tasks, _ = build_routing_matrix(
-            [_task("event_drain"), _task("storage_drain")],
+            [_task("storage_drain")],
             preset=preset,
         )
-        for key in ("event_drain", "storage_drain"):
-            assert tasks[key][0].consumers == ["catalog"], (
-                f"{key} under {preset} must route to catalog, not {tasks[key][0].consumers}"
-            )
-            assert tasks[key][0].consumers != ["worker"]
-            assert tasks[key][0].runner == "background"
+        target = tasks["storage_drain"][0]
+        assert target.consumers == ["catalog"]
+        assert target.consumers != ["worker"]
+        assert target.runner == "background"
+
+
+def test_cloud_async_writer_drains_route_to_cloud_run():
+    tasks, _ = build_routing_matrix(
+        [_task("event_drain"), _task("storage_drain_offload")],
+        preset="cloud",
+    )
+    for key in ("event_drain", "storage_drain_offload"):
+        target = tasks[key][0]
+        assert target.runner == "gcp_cloud_run"
+        assert ExecHint.OFFLOAD in target.hints
+        assert ExecHint.BACKGROUND not in target.hints
+        assert target.consumers == ["catalog"]
+
+
+def test_onprem_async_writer_drains_stay_background():
+    tasks, _ = build_routing_matrix(
+        [_task("event_drain"), _task("storage_drain_offload")],
+        preset="onprem",
+    )
+    for key in ("event_drain", "storage_drain_offload"):
+        target = tasks[key][0]
+        assert target.runner == "background"
+        assert ExecHint.BACKGROUND in target.hints
+        assert ExecHint.OFFLOAD not in target.hints
+        assert target.consumers == ["catalog"]
