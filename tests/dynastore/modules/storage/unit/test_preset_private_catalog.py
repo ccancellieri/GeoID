@@ -128,9 +128,11 @@ def _patch_es_drivers_discoverable(monkeypatch):
     from dynastore.modules.storage.routing_config import Operation
 
     class CatalogElasticsearchDriver:  # __name__ → catalog_elasticsearch_driver
+        index_tiers = frozenset({"catalog"})
         auto_register_for_routing = frozenset({Operation.INDEX})
 
     class CollectionElasticsearchDriver:  # → collection_elasticsearch_driver
+        index_tiers = frozenset({"collection"})
         auto_register_for_routing = frozenset({Operation.INDEX})
 
     catalog_es = CatalogElasticsearchDriver()
@@ -138,10 +140,8 @@ def _patch_es_drivers_discoverable(monkeypatch):
 
     def fake_get_protocols(marker):
         name = getattr(marker, "__name__", "")
-        if name in ("CatalogIndexer", "CatalogStore"):
-            return [catalog_es]
-        if name in ("CollectionIndexer", "CollectionStore"):
-            return [collection_es]
+        if name in ("IndexTierDriver", "CatalogStore", "CollectionStore"):
+            return [catalog_es, collection_es]
         return []
 
     monkeypatch.setattr(discovery, "get_protocols", fake_get_protocols)
@@ -186,19 +186,20 @@ def test_private_catalog_collection_routing_pg_only_under_es_pollution(monkeypat
 
 def _patch_items_es_driver_discoverable(monkeypatch):
     """Make the public items ES driver discoverable to the items-tier
-    self-register helper (``ItemIndexer``), simulating the full-run registry
-    state."""
+    self-register helper (via ``IndexTierDriver``/``index_tiers``),
+    simulating the full-run registry state."""
     import dynastore.tools.discovery as discovery
     from dynastore.modules.storage.routing_config import Operation
 
     class ItemsElasticsearchDriver:  # __name__ → items_elasticsearch_driver
+        index_tiers = frozenset({"item"})
         auto_register_for_routing = frozenset({Operation.INDEX})
 
     items_es = ItemsElasticsearchDriver()
 
     def fake_get_protocols(marker):
         name = getattr(marker, "__name__", "")
-        if name == "ItemIndexer":
+        if name == "IndexTierDriver":
             return [items_es]
         return []
 

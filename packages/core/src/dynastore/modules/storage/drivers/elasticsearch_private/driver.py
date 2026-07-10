@@ -100,7 +100,7 @@ class ItemsElasticsearchPrivateDriver(
     Registered as ``storage_elasticsearch_private`` via entry points.
     """
 
-    is_item_indexer: ClassVar[bool] = True
+    index_tiers: ClassVar[FrozenSet[str]] = frozenset({"item"})
 
     # Opt out of items-tier auto-default routing.  The private variant is
     # tenant-isolated DENY-policy indexing; it must only run for collections

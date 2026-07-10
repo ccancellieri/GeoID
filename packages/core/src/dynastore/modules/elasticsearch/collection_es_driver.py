@@ -125,18 +125,18 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
 
     Uses opensearch-py client (wire-compatible with ES and OpenSearch).
     Indexes ONE tier — collection metadata, keyed by ``(catalog_id,
-    collection_id)`` — so it opts in to :class:`CollectionIndexer` only.
+    collection_id)`` — so it claims the ``collection`` INDEX tier only.
     Catalog-tier indexing is handled by a separate driver class (NEW —
     not part of this rename).
     """
 
-    is_collection_indexer: ClassVar[bool] = True
+    index_tiers: ClassVar[FrozenSet[str]] = frozenset({"collection"})
 
     teardown_lane: ClassVar[TeardownLane] = TeardownLane.ASYNC_CASCADE
 
     # Collection ES is the canonical async materialization target + derived-
     # search-preferred backend for collection metadata routing.  It auto-
-    # defaults into the INDEX lane (identified by ``is_collection_indexer``;
+    # defaults into the INDEX lane (claimed via ``index_tiers``;
     # its declared ``supported_hints`` below does not include Hint.SEARCH,
     # so it does not win the derived-search preference ranking — it still
     # participates in the pool as the sole INDEX entry) and — documentary

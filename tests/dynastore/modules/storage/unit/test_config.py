@@ -450,7 +450,7 @@ class TestAssetRoutingConfig:
     def test_write_default_is_pg_only(self):
         """Assets WRITE defaults to PG only — the ES asset driver is
         no longer a hardcoded secondary. Operators who install an
-        ``AssetIndexer`` implementation get it appended via the
+        asset-tier indexer implementation get it appended via the
         auto-augment path (``_self_register_indexers_into``); the
         zero-config bare default is PG-only.
         """

@@ -24,10 +24,10 @@ Two task types:
   elasticsearch_bulk_reindex_collection — single collection reindex (Cloud Run Job)
 
 Both use the routing-resolved source-of-truth reader (PG primary via
-GEOMETRY_EXACT hint) and the routing-resolved secondary-index writer (the
+GEOMETRY_EXACT hint) and the routing-resolved INDEX-lane writer (the
 items ES driver) rather than hardcoded driver references. The task
-``driver`` input field selects the WRITE target explicitly when supplied;
-otherwise the first ``is_item_indexer`` WRITE driver is used.
+``driver`` input field selects the target explicitly when supplied;
+otherwise the first INDEX-lane driver is used.
 
 Per-event private tasks (``elasticsearch_private_index`` /
 ``elasticsearch_private_delete``) live in the private driver
@@ -112,13 +112,13 @@ class BulkCatalogReindexTask(TaskProtocol):
     Iterates the catalog's collections, skips those that don't route
     through the regular ES driver, and streams each collection's items
     from the routing-resolved source-of-truth reader (PG primary, via the
-    GEOMETRY_EXACT hint) into the routing-resolved secondary-index writer
+    GEOMETRY_EXACT hint) into the routing-resolved INDEX-lane writer
     (the items ES driver). Stale items for the catalog are removed via
     ``delete_by_query`` before reindex begins.
 
-    The optional ``driver`` input field pins the WRITE target by
-    ``driver_ref`` (e.g. ``"items_elasticsearch_driver"``); when omitted the
-    first ``is_item_indexer`` WRITE driver is selected automatically.
+    The optional ``driver`` input field pins the target by ``driver_ref``
+    (e.g. ``"items_elasticsearch_driver"``); when omitted the first
+    INDEX-lane driver is selected automatically.
     """
 
     task_type = "elasticsearch_bulk_reindex_catalog"
@@ -209,10 +209,10 @@ class BulkCollectionReindexTask(TaskProtocol):
     ``POST /search/reindex/catalogs/{id}/collections/{cid}``.
 
     Reads from the routing-resolved source-of-truth (PG primary via the
-    GEOMETRY_EXACT hint) and writes to the routing-resolved secondary-index
+    GEOMETRY_EXACT hint) and writes to the routing-resolved INDEX-lane
     writer (the items ES driver). The optional ``driver`` input field pins
-    the WRITE target by ``driver_ref``; when omitted the first
-    ``is_item_indexer`` WRITE driver is selected automatically.
+    the target by ``driver_ref``; when omitted the first INDEX-lane driver
+    is selected automatically.
     """
 
     task_type = "elasticsearch_bulk_reindex_collection"

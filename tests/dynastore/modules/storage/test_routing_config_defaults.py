@@ -209,7 +209,7 @@ def test_collection_routing_default_read_is_pg_primary():
 def test_collection_routing_default_index_has_no_hardcoded_es_hop():
     """The ES INDEX hop is NOT hard-coded in the code default (#1069 / #1073).
 
-    A PG-only deployment (no ES CollectionIndexer registered, no preset
+    A PG-only deployment (no ES collection-tier indexer registered, no preset
     applied) must get NO INDEX entry — otherwise a plain collection create
     enqueues an obligation row into tasks.storage that nothing will ever
     drain. The ES INDEX hop is supplied at validation time by

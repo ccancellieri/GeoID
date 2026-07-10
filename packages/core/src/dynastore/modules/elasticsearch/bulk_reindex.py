@@ -41,7 +41,7 @@ from typing import Any, Iterator, List, Optional, Tuple
 # Module-level imports give tests a stable patch target:
 #   ``dynastore.modules.elasticsearch.bulk_reindex.<name>``.
 # The router does not import from bulk_reindex so there is no cycle.
-from dynastore.modules.storage.router import get_items_search_driver, get_write_drivers
+from dynastore.modules.storage.router import get_index_drivers, get_items_search_driver
 from dynastore.modules.storage.hints import Hint
 from dynastore.modules.storage.errors import EsBulkWriteError
 from dynastore.modules.elasticsearch.aliases import add_index_to_public_alias
@@ -150,26 +150,27 @@ async def is_es_active_for(catalog_id: str, collection_id: str) -> bool:
 
 
 def _select_writer(
-    write_drivers: "List[Any]",
+    index_drivers: "List[Any]",
     reader_ref: str,
     driver_hint: Optional[str],
 ) -> "Any":
-    """Select the WRITE driver to use as the reindex target.
+    """Select the INDEX-lane driver to use as the reindex target.
 
     Selection order (first match wins):
 
     1. If ``driver_hint`` is given (from task inputs): pick the entry whose
        ``driver_ref`` equals the hint, provided it is not the reader.
-    2. Otherwise: pick the first WRITE entry whose driver declares
-       ``is_item_indexer = True`` (a secondary search-index), provided it is
-       not the reader.
+    2. Otherwise: pick the first INDEX-lane entry distinct from the reader
+       — lane membership IS the materialization-target role now, so every
+       resolved entry is already a valid candidate; no per-driver marker
+       check is needed.
 
     A reader and writer sharing the same ``driver_ref`` would feed a driver
     back into itself — that is never the intent of a reindex, so the guard
     raises rather than silently no-ops.
 
     Args:
-        write_drivers: List of ``ResolvedDriver`` from ``get_write_drivers``.
+        index_drivers: List of ``ResolvedDriver`` from ``get_index_drivers``.
         reader_ref: ``driver_ref`` of the resolved reader (must not equal
             the selected writer's ref).
         driver_hint: Optional driver_ref override from task inputs.
@@ -182,7 +183,7 @@ def _select_writer(
             matches the reader (which would loop reads back to the source).
     """
     if driver_hint:
-        for rd in write_drivers:
+        for rd in index_drivers:
             if rd.driver_ref == driver_hint:
                 if rd.driver_ref == reader_ref:
                     raise ValueError(
@@ -192,31 +193,21 @@ def _select_writer(
                     )
                 return rd
         raise ValueError(
-            f"Reindex: driver_hint '{driver_hint}' not found in WRITE drivers "
-            f"({[rd.driver_ref for rd in write_drivers]}). "
+            f"Reindex: driver_hint '{driver_hint}' not found in INDEX drivers "
+            f"({[rd.driver_ref for rd in index_drivers]}). "
             "Verify ItemsRoutingConfig for this collection."
         )
 
-    # Prefer secondary-index drivers (is_item_indexer) that differ from the reader.
-    for rd in write_drivers:
-        if rd.driver_ref != reader_ref and getattr(type(rd.driver), "is_item_indexer", False):
+    for rd in index_drivers:
+        if rd.driver_ref != reader_ref:
             return rd
 
-    # No secondary-index driver found distinct from the reader.
-    candidates = [rd.driver_ref for rd in write_drivers if rd.driver_ref != reader_ref]
-    if not candidates:
-        raise ValueError(
-            f"Reindex: no writer found that is distinct from the reader "
-            f"('{reader_ref}'). WRITE drivers: "
-            f"{[rd.driver_ref for rd in write_drivers]}. "
-            "Add a secondary-index driver (is_item_indexer=True) to the "
-            "WRITE routing entries, or pass an explicit driver_hint."
-        )
     raise ValueError(
-        f"Reindex: no secondary-index (is_item_indexer) writer found distinct "
-        f"from the reader ('{reader_ref}'). Non-reader WRITE drivers that were "
-        f"found but lack is_item_indexer: {candidates}. "
-        "Pass driver_hint to select one explicitly."
+        f"Reindex: no INDEX-lane writer found that is distinct from the "
+        f"reader ('{reader_ref}'). INDEX drivers: "
+        f"{[rd.driver_ref for rd in index_drivers]}. "
+        "Add a materialization-target driver to the INDEX routing entries, "
+        "or pass an explicit driver_hint."
     )
 
 
@@ -300,7 +291,7 @@ async def reindex_collection_into_index(
     page_size: Optional[int] = None,
 ) -> ReindexResult:
     """Stream every item of a collection from the routing-resolved source-of-truth
-    reader and bulk-write it via the routing-resolved secondary-index writer.
+    reader and bulk-write it via the routing-resolved INDEX-lane writer.
 
     Resolution strategy:
 
@@ -313,10 +304,11 @@ async def reindex_collection_into_index(
       driver (DuckDB) for a file-backed one, since that driver also advertises
       ``GEOMETRY_EXACT``. Either way the ES read path is bypassed — we must not
       read from the index we are rebuilding.
-    - **Writer**: resolved via :func:`~dynastore.modules.storage.router.get_write_drivers`,
-      then filtered to the first secondary-index entry (``is_item_indexer=True``) that
-      differs from the reader.  When ``driver_hint`` is supplied, that ``driver_ref``
-      is used directly instead.
+    - **Writer**: resolved via :func:`~dynastore.modules.storage.router.get_index_drivers`
+      (the items ``operations[INDEX]`` lane — lane membership IS the
+      materialization-target role now), then filtered to the first entry that
+      differs from the reader.  When ``driver_hint`` is supplied, that
+      ``driver_ref`` is used directly instead.
 
     The reader and writer MUST resolve to different drivers. If the resolved writer
     equals the reader this function raises ``ValueError`` immediately — a reindex that
@@ -378,9 +370,9 @@ async def reindex_collection_into_index(
     Args:
         catalog_id: Catalog owning the collection.
         collection_id: Collection to reindex.
-        driver_hint: Optional ``driver_ref`` override that selects the WRITE target
-            directly (e.g. ``"items_elasticsearch_driver"``). Takes precedence over
-            the secondary-index auto-select.
+        driver_hint: Optional ``driver_ref`` override that selects the INDEX-lane
+            target directly (e.g. ``"items_elasticsearch_driver"``). Takes
+            precedence over the auto-select.
         reader_ref: Optional ``driver_ref`` override that selects the READ source
             directly (e.g. ``"items_duckdb_driver"`` for a file-backed collection).
             Takes precedence over the GEOMETRY_EXACT hint resolution.
@@ -420,11 +412,11 @@ async def reindex_collection_into_index(
         reader = reader_resolved.driver
         reader_ref = reader_resolved.driver_ref
 
-    # --- Resolve writers: WRITE fan-out list (all configured WRITE drivers). ---
-    write_drivers = await get_write_drivers(catalog_id, collection_id)
+    # --- Resolve writers: the items INDEX lane (all materialization targets). ---
+    index_drivers = await get_index_drivers(catalog_id, collection_id)
 
     # --- Select the target writer (must differ from the reader). ---
-    writer_resolved = _select_writer(write_drivers, reader_ref, driver_hint)
+    writer_resolved = _select_writer(index_drivers, reader_ref, driver_hint)
     writer = writer_resolved.driver
     writer_ref = writer_resolved.driver_ref
 

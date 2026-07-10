@@ -699,8 +699,8 @@ class AssetService(AssetsProtocol):
         multi-writes. The first entry is the primary (the caller handles it
         directly); the rest are returned here.
 
-        INDEX-lane drivers (auto-augmented with discoverable
-        ``AssetIndexer`` drivers like ``AssetElasticsearchDriver``) are
+        INDEX-lane drivers (auto-augmented with discoverable asset-tier
+        indexer drivers like ``AssetElasticsearchDriver``) are
         **not** folded in here — indexer drivers are driven by
         ``AssetEntitySyncSubscriber`` via the events bus, decoupling WRITE
         fan-out from index fan-out.

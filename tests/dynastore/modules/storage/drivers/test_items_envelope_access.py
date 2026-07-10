@@ -465,7 +465,7 @@ def test_config_is_bound_to_driver():
 
 
 def test_driver_classvars():
-    assert ItemsElasticsearchEnvelopeDriver.is_item_indexer is True
+    assert ItemsElasticsearchEnvelopeDriver.index_tiers == frozenset({"item"})
     assert ItemsElasticsearchEnvelopeDriver.auto_register_for_routing == frozenset()
     from dynastore.models.protocols.storage_driver import Capability
     caps = ItemsElasticsearchEnvelopeDriver.capabilities

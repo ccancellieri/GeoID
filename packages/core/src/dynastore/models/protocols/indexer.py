@@ -27,29 +27,30 @@ Two protocol surfaces:
 * :class:`Indexer` — slim generic surface (``index`` / ``index_bulk``).
   Every concrete indexer (public ES tenant index, private geoid-only ES
   index, vector DB, audit log, …) implements the same shape.  The
-  :class:`IndexDispatcher` walks the secondary-index ``WRITE`` entries
-  (``secondary_index=True``) in ``routing.operations[WRITE]`` and calls
-  this surface uniformly; failure policy + outbox + circuit breaker are
-  driver-agnostic.
+  :class:`IndexDispatcher` walks the ``INDEX``-lane entries in
+  ``routing.operations[INDEX]`` and calls this surface uniformly; lane
+  membership IS the materialization-target role.
 
 * :class:`IndexerProtocol` — the historical fat surface (per-entity
   methods, private-index slots).  Retained for backward compatibility
   with ``ElasticsearchModule``; new code targets :class:`Indexer`.
 
-Per-tier marker Protocols (``CatalogIndexer``, ``CollectionIndexer``,
-``AssetIndexer``, ``ItemIndexer``) let drivers opt in to one or more tiers
-they can serve as secondary-index propagation targets.  Routing-config
-self-registration validators walk these markers per tier to auto-populate
-``operations[WRITE]`` with secondary-index entries (``secondary_index=True``)
-carrying sensible async defaults.  Both metadata and data are indexable —
-markers are tier-scoped, not metadata-vs-data.
+:class:`IndexTierDriver` is the discovery/seeding/validation-time marker:
+a driver declares which tiers it materializes via
+``index_tiers: ClassVar[FrozenSet[str]]`` (values from :data:`IndexTier`).
+Routing-config self-registration walks this marker, checked BY VALUE, to
+auto-populate ``operations[INDEX]`` with entries for the requested tier.
+Both metadata and data are indexable — tiers are orthogonal to the
+metadata-vs-data distinction.  Runtime dispatch never reads
+``index_tiers``: once an entry lands in ``operations[INDEX]``, lane
+membership alone drives it.
 """
 
 from __future__ import annotations
 
 from typing import (
-    Any, ClassVar, Dict, List, Literal, Optional, Protocol, Sequence,
-    runtime_checkable,
+    Any, ClassVar, Dict, FrozenSet, List, Literal, Optional, Protocol,
+    Sequence, runtime_checkable,
 )
 
 from pydantic import BaseModel, Field
@@ -183,10 +184,9 @@ class Indexer(Protocol):
     Every concrete indexer — public ES tenant index, private geoid-only
     ES index, OpenSearch, vector DB, audit log, future search engine —
     implements this same surface.  Routing config decides which fires
-    per ``(catalog, collection)`` via the secondary-index ``WRITE``
-    entries (``secondary_index=True``) in ``operations[WRITE]``; the
-    :class:`IndexDispatcher` walks those entries and calls this Protocol
-    uniformly.
+    per ``(catalog, collection)`` via the ``INDEX``-lane entries in
+    ``operations[INDEX]``; the :class:`IndexDispatcher` walks those
+    entries and calls this Protocol uniformly.
 
     Implementations remain free to expose richer per-backend operations
     (bulk reindex, ensure_index, mapping management) on their concrete
@@ -329,114 +329,59 @@ class IndexerProtocol(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Per-tier indexer marker Protocols
+# Index-tier marker Protocol
 # ---------------------------------------------------------------------------
 
 
-@runtime_checkable
-class CatalogIndexer(Protocol):
-    """Marker — driver indexes catalog-tier records.
+IndexTier = Literal[
+    "catalog", "collection", "item", "asset", "item_asset", "platform_asset",
+]
+"""The tier vocabulary a driver can claim via ``index_tiers``.
 
-    A driver opts in by setting ``is_catalog_indexer: ClassVar[bool] = True``.
-    Routing-config self-registration validators walk this marker to
-    auto-populate the catalog routing config's ``operations[WRITE]`` with
-    a secondary-index entry (``secondary_index=True``),
-    ``write_mode='async'``, ``on_failure='warn'``.
-    """
+``item_asset`` and ``platform_asset`` are reserved tokens — no implementer
+ships in this PR:
 
-    is_catalog_indexer: ClassVar[bool]
-
-
-@runtime_checkable
-class CollectionIndexer(Protocol):
-    """Marker — driver indexes collection-tier records.
-
-    A driver opts in by setting ``is_collection_indexer: ClassVar[bool] = True``.
-    Auto-registers into the collection routing config's ``operations[WRITE]``
-    as a secondary-index entry (``secondary_index=True``) with
-    ``write_mode='async'``, ``on_failure='warn'``.
-    """
-
-    is_collection_indexer: ClassVar[bool]
+* ``item_asset`` — item-embedded assets promoted to first-class index
+  entries.  Today STAC item documents carry an embedded ``assets`` map
+  stored as opaque blob (``mappings.py`` ``COMMON_PROPERTIES`` declares
+  ``"assets": {"type": "object", "enabled": False}``); promoting them is a
+  deferred STAC read/write refactor.
+* ``platform_asset`` — assets above any catalog scope.  No "platform
+  asset" concept exists in the asset model today (``AssetBase`` requires
+  ``catalog_id``); this token reserves the design space.
+"""
 
 
 @runtime_checkable
-class AssetIndexer(Protocol):
-    """Marker — driver indexes asset-tier records (catalog + collection assets).
+class IndexTierDriver(Protocol):
+    """Marker — driver declares which INDEX-lane tiers it materializes.
 
-    Today the canonical implementer (``AssetElasticsearchDriver``)
-    indexes BOTH catalog-level and collection-level assets in a single
-    per-catalog index keyed by ``(catalog_id, nullable collection_id)``.
-    The ``AssetIndexer`` marker is therefore tier-spanning at the
-    catalog/collection level.
+    Replaces the six per-tier boolean marker Protocols
+    (``CatalogIndexer``, ``CollectionIndexer``, ``AssetIndexer``,
+    ``ItemIndexer``, ``ItemAssetIndexer``, ``PlatformAssetIndexer``) with
+    one declarative ClassVar, checked BY VALUE rather than by attribute
+    presence — a driver opts in to one or more tiers via
+    ``index_tiers: ClassVar[FrozenSet[str]]`` (values from
+    :data:`IndexTier`), e.g. ``index_tiers = frozenset({"catalog"})``.
 
-    A driver opts in by setting ``is_asset_indexer: ClassVar[bool] = True``.
-    Auto-registers into the asset routing config's ``operations[WRITE]``
-    as a secondary-index entry (``secondary_index=True``) with
-    ``write_mode='async'``, ``on_failure='warn'``.
+    Structural discovery (``isinstance(obj, IndexTierDriver)`` /
+    ``get_protocols(IndexTierDriver)``) only tests that ``index_tiers`` is
+    present on the class — the presence-not-value trap that made the old
+    boolean markers undeletable.  Consumers MUST additionally check
+    ``tier in driver.index_tiers`` to classify which tier(s) a driver
+    serves; a driver indexing multiple tiers lists them all in the one
+    frozenset.
 
-    Per-tier asset markers
-    ----------------------
-    :class:`ItemAssetIndexer` and :class:`PlatformAssetIndexer` (below)
-    are the extension axis for tiers ``AssetIndexer`` does NOT cover
-    today: item-embedded assets (currently stored as opaque blob in item
-    docs — promoting them to first-class index entries is a deferred
-    STAC read/write refactor) and platform-level assets (no design yet).
-    Future drivers — or a future extension of ``AssetElasticsearchDriver``
-    when item-asset promotion lands — opt in to those markers as the
-    tiers they serve grow.
+    Routing-config self-registration (``_self_register_indexers_into``)
+    walks this marker per tier to auto-populate the matching routing
+    config's ``operations[INDEX]``.  A driver claiming a tier must also
+    structurally satisfy :class:`Indexer` (``index_bulk``) — validated at
+    routing-config validate time (``_validate_routing_entries`` /
+    ``_validate_collection_routing_config``), not here.
+
+    This marker is a discovery/seeding/validation-time construct only —
+    runtime dispatch never reads ``index_tiers``; once a driver lands in
+    ``operations[INDEX]``, lane membership alone drives it.
     """
 
-    is_asset_indexer: ClassVar[bool]
-
-
-@runtime_checkable
-class ItemAssetIndexer(Protocol):
-    """Marker — driver indexes item-embedded assets as first-class index entries.
-
-    Today STAC item documents carry an embedded ``assets`` map that is
-    stored as opaque blob (``mappings.py`` ``COMMON_PROPERTIES`` declares
-    ``"assets": {"type": "object", "enabled": False}``).  A driver opting
-    in to ``ItemAssetIndexer`` promotes those item-embedded assets to
-    individual searchable documents in the assets index — making per-asset
-    search + filter possible without re-shaping the item write path
-    operators rely on.
-
-    The opt-in flag ``is_item_asset_indexer: ClassVar[bool] = True`` is
-    the extension axis only — no implementer ships in this PR.  Reserves
-    the marker so future drivers (or a future ``AssetElasticsearchDriver``
-    extension) can self-register without renaming.
-    """
-
-    is_item_asset_indexer: ClassVar[bool]
-
-
-@runtime_checkable
-class PlatformAssetIndexer(Protocol):
-    """Marker — driver indexes platform-scope assets (above any catalog).
-
-    A "platform" asset is one not owned by any specific catalog —
-    typically global static resources (UI assets, shared imagery,
-    cross-tenant references).  No "platform asset" concept exists in the
-    asset model today (``AssetBase`` requires ``catalog_id``); this
-    marker reserves the design space.
-
-    The opt-in flag ``is_platform_asset_indexer: ClassVar[bool] = True``
-    is the extension axis only — no implementer ships in this PR.
-    """
-
-    is_platform_asset_indexer: ClassVar[bool]
-
-
-@runtime_checkable
-class ItemIndexer(Protocol):
-    """Marker — driver indexes item / feature records (the per-collection
-    items table; aka record-tier indexer).
-
-    A driver opts in by setting ``is_item_indexer: ClassVar[bool] = True``.
-    Auto-registers into the items routing config's ``operations[WRITE]``
-    as a secondary-index entry (``secondary_index=True``) with
-    ``write_mode='async'``, ``on_failure='warn'``.
-    """
-
-    is_item_indexer: ClassVar[bool]
+    index_tiers: ClassVar[FrozenSet[str]]

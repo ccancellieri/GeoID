@@ -16,30 +16,26 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Per-tier indexer marker discrimination.
+"""Index-tier marker discrimination.
 
-Pins the contract that the four marker Protocols
-(``CatalogIndexer``, ``CollectionIndexer``, ``AssetIndexer``, ``ItemIndexer``)
-discriminate by ``ClassVar[bool]`` opt-in flag and that the existing ES
-drivers correctly self-declare their tiers.
+Pins the contract that :class:`IndexTierDriver` — the single Protocol that
+replaced the six per-tier boolean markers (``CatalogIndexer``,
+``CollectionIndexer``, ``AssetIndexer``, ``ItemIndexer``,
+``ItemAssetIndexer``, ``PlatformAssetIndexer``) — discriminates BY VALUE:
+structural ``isinstance`` only tests that ``index_tiers`` is present, so
+callers must additionally check tier membership in the frozenset.
 
-A driver indexing multiple tiers opts in to multiple markers; a driver
-indexing none of them satisfies none.  The split-by-tier is independent
-of the data/metadata distinction — both are indexable.
+A driver indexing multiple tiers lists them all in one ``index_tiers``
+frozenset; a driver indexing none does not satisfy any tier check. The
+split-by-tier is independent of the data/metadata distinction — both are
+indexable.
 """
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import ClassVar, FrozenSet
 
-from dynastore.models.protocols.indexer import (
-    AssetIndexer,
-    CatalogIndexer,
-    CollectionIndexer,
-    ItemAssetIndexer,
-    ItemIndexer,
-    PlatformAssetIndexer,
-)
+from dynastore.models.protocols.indexer import IndexTierDriver
 
 
 # ---------------------------------------------------------------------------
@@ -47,95 +43,72 @@ from dynastore.models.protocols.indexer import (
 # ---------------------------------------------------------------------------
 
 
-def test_marker_requires_opt_in_flag():
-    """A class without the marker's ClassVar flag is NOT a marker member."""
+def test_marker_requires_index_tiers_attribute():
+    """A class without ``index_tiers`` at all does NOT satisfy
+    :class:`IndexTierDriver` structurally — presence is the isinstance gate."""
 
-    class _NoFlag:
+    class _NoAttr:
         pass
 
-    assert not isinstance(_NoFlag(), CatalogIndexer)
-    assert not isinstance(_NoFlag(), CollectionIndexer)
-    assert not isinstance(_NoFlag(), AssetIndexer)
-    assert not isinstance(_NoFlag(), ItemIndexer)
-    assert not isinstance(_NoFlag(), ItemAssetIndexer)
-    assert not isinstance(_NoFlag(), PlatformAssetIndexer)
+    assert not isinstance(_NoAttr(), IndexTierDriver)
 
 
-def test_item_asset_marker_requires_opt_in_flag():
-    """``is_item_asset_indexer = True`` opts in to :class:`ItemAssetIndexer`,
-    nothing else.  No implementer ships in this PR; this test pins the
-    contract so a future opt-in surfaces immediately.
-    """
+def test_marker_presence_alone_does_not_imply_any_tier():
+    """The GOTCHA this design fixes: a class DOES satisfy IndexTierDriver
+    once ``index_tiers`` exists, even with an empty frozenset — presence is
+    the structural gate, but callers MUST check tier membership BY VALUE to
+    classify which tier(s) (if any) the driver actually claims."""
 
-    class _ItemAssetOnly:
-        is_item_asset_indexer: ClassVar[bool] = True
+    class _EmptyTiers:
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset()
 
-    obj = _ItemAssetOnly()
-    assert isinstance(obj, ItemAssetIndexer)
-    assert not isinstance(obj, AssetIndexer)
-    assert not isinstance(obj, PlatformAssetIndexer)
-    assert not isinstance(obj, CatalogIndexer)
-    assert not isinstance(obj, CollectionIndexer)
-    assert not isinstance(obj, ItemIndexer)
-
-
-def test_platform_asset_marker_requires_opt_in_flag():
-    """``is_platform_asset_indexer = True`` opts in to
-    :class:`PlatformAssetIndexer` only.  No implementer ships in this PR.
-    """
-
-    class _PlatformAssetOnly:
-        is_platform_asset_indexer: ClassVar[bool] = True
-
-    obj = _PlatformAssetOnly()
-    assert isinstance(obj, PlatformAssetIndexer)
-    assert not isinstance(obj, AssetIndexer)
-    assert not isinstance(obj, ItemAssetIndexer)
-    assert not isinstance(obj, CatalogIndexer)
-
-
-def test_existing_asset_es_driver_opts_into_AssetIndexer_only():
-    """``AssetElasticsearchDriver`` covers catalog + collection assets via
-    its per-catalog index — it MUST opt into :class:`AssetIndexer` only,
-    NOT into :class:`ItemAssetIndexer` or :class:`PlatformAssetIndexer`.
-    Surfaces accidental future opt-ins that haven't yet shipped the
-    item-asset / platform-asset write paths.
-    """
-    from dynastore.modules.storage.drivers.elasticsearch import (
-        AssetElasticsearchDriver,
-    )
-
-    obj = AssetElasticsearchDriver()
-    assert isinstance(obj, AssetIndexer)
-    assert not isinstance(obj, ItemAssetIndexer)
-    assert not isinstance(obj, PlatformAssetIndexer)
+    obj = _EmptyTiers()
+    assert isinstance(obj, IndexTierDriver)
+    assert "catalog" not in obj.index_tiers
+    assert "item" not in obj.index_tiers
 
 
 def test_single_tier_opt_in():
-    """Setting one ClassVar flag opts in to that tier only."""
+    """Declaring one tier in ``index_tiers`` opts in to that tier only."""
 
     class _CatOnly:
-        is_catalog_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"catalog"})
 
     obj = _CatOnly()
-    assert isinstance(obj, CatalogIndexer)
-    assert not isinstance(obj, CollectionIndexer)
-    assert not isinstance(obj, AssetIndexer)
-    assert not isinstance(obj, ItemIndexer)
+    assert isinstance(obj, IndexTierDriver)
+    assert "catalog" in obj.index_tiers
+    assert "collection" not in obj.index_tiers
+    assert "asset" not in obj.index_tiers
+    assert "item" not in obj.index_tiers
 
 
 def test_multi_tier_opt_in():
-    """A driver indexing multiple tiers opts in to multiple markers."""
+    """A driver indexing multiple tiers lists them all in one frozenset."""
 
     class _CatAndCol:
-        is_catalog_indexer: ClassVar[bool] = True
-        is_collection_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"catalog", "collection"})
 
     obj = _CatAndCol()
-    assert isinstance(obj, CatalogIndexer)
-    assert isinstance(obj, CollectionIndexer)
-    assert not isinstance(obj, AssetIndexer)
-    assert not isinstance(obj, ItemIndexer)
+    assert {"catalog", "collection"}.issubset(obj.index_tiers)
+    assert "asset" not in obj.index_tiers
+    assert "item" not in obj.index_tiers
+
+
+def test_reserved_tiers_are_valid_values_with_no_shipping_implementer():
+    """``item_asset`` / ``platform_asset`` are reserved tokens in the tier
+    vocabulary — a class MAY declare them (extension axis), but no shipped
+    driver does yet (pinned by the driver-shape tests below)."""
+
+    class _ItemAssetOnly:
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"item_asset"})
+
+    class _PlatformAssetOnly:
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"platform_asset"})
+
+    assert "item_asset" in _ItemAssetOnly().index_tiers
+    assert "asset" not in _ItemAssetOnly().index_tiers
+    assert "platform_asset" in _PlatformAssetOnly().index_tiers
+    assert "asset" not in _PlatformAssetOnly().index_tiers
 
 
 # ---------------------------------------------------------------------------
@@ -145,36 +118,26 @@ def test_multi_tier_opt_in():
 
 def test_catalog_es_driver_indexes_catalog_only():
     """``CatalogElasticsearchDriver`` indexes ONE tier — catalog metadata,
-    keyed by ``catalog_id``.  It opts in to :class:`CatalogIndexer` only.
+    keyed by ``catalog_id``.  It claims the ``catalog`` tier only.
     """
     from dynastore.modules.elasticsearch.catalog_es_driver import (
         CatalogElasticsearchDriver,
     )
 
-    obj = CatalogElasticsearchDriver()
-    assert isinstance(obj, CatalogIndexer)
-    assert not isinstance(obj, CollectionIndexer)
-    assert not isinstance(obj, AssetIndexer)
-    assert not isinstance(obj, ItemIndexer)
-    assert not isinstance(obj, ItemAssetIndexer)
-    assert not isinstance(obj, PlatformAssetIndexer)
+    assert CatalogElasticsearchDriver.index_tiers == frozenset({"catalog"})
 
 
 def test_collection_es_driver_indexes_collection_only():
     """``CollectionElasticsearchDriver`` indexes ONE tier — collection
-    metadata, keyed by ``(catalog_id, collection_id)``.  It opts in to
-    :class:`CollectionIndexer` only.  Catalog-tier indexing is a
-    separate driver class (NEW; not part of the catch-all rename).
+    metadata, keyed by ``(catalog_id, collection_id)``.  It claims the
+    ``collection`` tier only.  Catalog-tier indexing is a separate driver
+    class (NEW; not part of the catch-all rename).
     """
     from dynastore.modules.elasticsearch.collection_es_driver import (
         CollectionElasticsearchDriver,
     )
 
-    obj = CollectionElasticsearchDriver()
-    assert isinstance(obj, CollectionIndexer)
-    assert not isinstance(obj, CatalogIndexer)
-    assert not isinstance(obj, AssetIndexer)
-    assert not isinstance(obj, ItemIndexer)
+    assert CollectionElasticsearchDriver.index_tiers == frozenset({"collection"})
 
 
 def test_items_es_driver_indexes_items_only():
@@ -182,11 +145,7 @@ def test_items_es_driver_indexes_items_only():
         ItemsElasticsearchDriver,
     )
 
-    obj = ItemsElasticsearchDriver()
-    assert isinstance(obj, ItemIndexer)
-    assert not isinstance(obj, AssetIndexer)
-    assert not isinstance(obj, CatalogIndexer)
-    assert not isinstance(obj, CollectionIndexer)
+    assert ItemsElasticsearchDriver.index_tiers == frozenset({"item"})
 
 
 def test_asset_es_driver_indexes_assets_only():
@@ -194,8 +153,57 @@ def test_asset_es_driver_indexes_assets_only():
         AssetElasticsearchDriver,
     )
 
-    obj = AssetElasticsearchDriver()
-    assert isinstance(obj, AssetIndexer)
-    assert not isinstance(obj, ItemIndexer)
-    assert not isinstance(obj, CatalogIndexer)
-    assert not isinstance(obj, CollectionIndexer)
+    assert AssetElasticsearchDriver.index_tiers == frozenset({"asset"})
+
+
+def test_items_private_and_envelope_drivers_index_items_only():
+    """The private and envelope items drivers both claim the ``item`` tier
+    (opting out of auto-registration via ``auto_register_for_routing``, not
+    via the tier marker — the two axes are independent)."""
+    from dynastore.modules.storage.drivers.elasticsearch_envelope.driver import (
+        ItemsElasticsearchEnvelopeDriver,
+    )
+    from dynastore.modules.storage.drivers.elasticsearch_private.driver import (
+        ItemsElasticsearchPrivateDriver,
+    )
+
+    assert ItemsElasticsearchPrivateDriver.index_tiers == frozenset({"item"})
+    assert ItemsElasticsearchEnvelopeDriver.index_tiers == frozenset({"item"})
+
+
+# ---------------------------------------------------------------------------
+# Repository hygiene — the six retired markers must not reappear
+# ---------------------------------------------------------------------------
+
+
+def test_no_retired_marker_classvars_remain_in_source():
+    """Guard against a future edit reintroducing one of the six retired
+    ``is_*_indexer`` boolean ClassVars (the presence-not-value trap this
+    design retired) anywhere under ``packages/*/src``."""
+    import re
+    from pathlib import Path
+
+    import pytest
+
+    here = Path(__file__).resolve()
+    repo_root = None
+    for parent in here.parents:
+        if (parent / "packages").is_dir() and (parent / "tests").is_dir():
+            repo_root = parent
+            break
+    if repo_root is None:
+        pytest.skip("could not locate repo root from test file location")
+
+    pattern = re.compile(
+        r"is_catalog_indexer|is_collection_indexer|is_item_indexer|"
+        r"is_asset_indexer|is_item_asset_indexer|is_platform_asset_indexer"
+    )
+    hits = []
+    for path in (repo_root / "packages").rglob("*.py"):
+        if "src" not in path.parts:
+            continue
+        text = path.read_text(encoding="utf-8")
+        if pattern.search(text):
+            hits.append(str(path.relative_to(repo_root)))
+
+    assert not hits, f"retired marker ClassVars still referenced: {hits}"

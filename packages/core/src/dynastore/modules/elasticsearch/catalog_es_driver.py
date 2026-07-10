@@ -130,7 +130,7 @@ class CatalogElasticsearchDriver(TypedDriver[CatalogElasticsearchDriverConfig]):
 
     Uses opensearch-py client (wire-compatible with ES and OpenSearch).
     Indexes ONE tier — catalog-tier metadata, keyed by ``catalog_id`` —
-    and opts in to :class:`CatalogIndexer` only.
+    and claims the ``catalog`` INDEX tier only.
 
     Index naming
     ------------
@@ -141,13 +141,13 @@ class CatalogElasticsearchDriver(TypedDriver[CatalogElasticsearchDriverConfig]):
     cross-catalog search.
     """
 
-    is_catalog_indexer: ClassVar[bool] = True
+    index_tiers: ClassVar[FrozenSet[str]] = frozenset({"catalog"})
 
     teardown_lane: ClassVar[TeardownLane] = TeardownLane.ASYNC_CASCADE
 
     # Catalog ES is the canonical async materialization target + derived-
     # search-preferred backend for catalog metadata routing.  It auto-
-    # defaults into the INDEX lane (identified by ``is_catalog_indexer``;
+    # defaults into the INDEX lane (claimed via ``index_tiers``;
     # its declared ``supported_hints`` below does not include Hint.SEARCH,
     # so it does not win the derived-search preference ranking — it still
     # participates in the pool as the sole INDEX entry) and — documentary

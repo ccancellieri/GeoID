@@ -592,6 +592,26 @@ async def get_write_drivers(
     return cast(List["ResolvedDriver[_CSDP]"], result)
 
 
+async def get_index_drivers(
+    catalog_id: str,
+    collection_id: Optional[str] = None,
+    *,
+    hints: FrozenSet[Hint] = frozenset(),
+) -> "List[ResolvedDriver[CollectionItemsStore]]":
+    """Multi-driver resolution for the items INDEX lane.
+
+    Every resolved entry IS a materialization target by lane membership —
+    no additional role filter needed.  Used by operator-triggered bulk
+    reindex (``dynastore.modules.elasticsearch.bulk_reindex``) to select the
+    writer distinct from the routing-resolved reader.
+    """
+    from dynastore.models.protocols.storage_driver import CollectionItemsStore as _CSDP
+    result = await resolve_drivers(
+        Operation.INDEX, catalog_id, collection_id, hints=hints,
+    )
+    return cast(List["ResolvedDriver[_CSDP]"], result)
+
+
 # ---------------------------------------------------------------------------
 # Convenience wrappers — asset drivers
 # ---------------------------------------------------------------------------

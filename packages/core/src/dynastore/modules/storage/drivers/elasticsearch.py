@@ -36,7 +36,7 @@ Two drivers in this module:
   Indexes asset metadata into per-catalog ``{prefix}-assets-{catalog_id}``
   indices.  Driven by the INDEX-lane entries in
   ``AssetRoutingConfig.operations[INDEX]``
-  (auto-augmented with discoverable ``AssetIndexer`` impls) and dispatched via
+  (auto-augmented with discoverable asset-tier indexer impls) and dispatched via
   ``AssetEntitySyncSubscriber`` from the events outbox — single-writer fan-out,
   no per-driver listener block.  Direct programmatic indexing via
   ``index_asset()`` / ``delete_asset()`` remains available.
@@ -1349,11 +1349,11 @@ class ItemsElasticsearchDriver(
 
     Registered as ``storage_elasticsearch`` via entry points.
 
-    Indexer marker — opts in to :class:`ItemIndexer` so the items routing
+    Indexer marker — claims the ``item`` INDEX tier so the items routing
     config auto-registers it in ``operations[INDEX]``.
     """
 
-    is_item_indexer: ClassVar[bool] = True
+    index_tiers: ClassVar[FrozenSet[str]] = frozenset({"item"})
 
     # Config class for the public items index — wires get_driver_config and
     # the shared _resolve_simplify_* helpers to the correct config row.
@@ -1361,7 +1361,7 @@ class ItemsElasticsearchDriver(
 
     # ES (public) is the canonical async materialization target + derived-
     # search-preferred backend for items routing.  It auto-defaults into
-    # the INDEX lane (identified by ``is_item_indexer``); its declared
+    # the INDEX lane (claimed via ``index_tiers``); its declared
     # ``supported_hints`` (below) includes ``Hint.SEARCH``, so it wins the
     # derived-search pool's preference ranking without a separate opt-in.
     auto_register_for_routing: ClassVar[FrozenSet[str]] = frozenset({Operation.INDEX})
@@ -2729,45 +2729,42 @@ class AssetElasticsearchDriver(
     NOT a per-tier driver; it serves the catalog/collection asset
     spectrum from one index.
 
-    Indexer marker — opts in to :class:`AssetIndexer` only.  The
-    ``AssetIndexer`` marker is documented as tier-spanning at the
-    catalog/collection level (see ``models/protocols/indexer.py``); per-tier
-    asset routing is unnecessary today because both tiers land in the
-    same index.
+    Indexer marker — claims the ``asset`` INDEX tier only.  That tier is
+    documented as tier-spanning at the catalog/collection level (see
+    ``models/protocols/indexer.py``); per-tier asset routing is unnecessary
+    today because both tiers land in the same index.
 
     Extension axis — future tier expansions
     ---------------------------------------
-    Two future tiers are pre-declared as marker Protocols in
-    ``models/protocols/indexer.py`` but have no implementer yet:
+    Two future tiers are reserved tokens in :data:`IndexTier`
+    (``models/protocols/indexer.py``) but have no implementer yet:
 
-    * :class:`ItemAssetIndexer` (``is_item_asset_indexer``) — for
-      promoting item-embedded assets to first-class index entries.
-      Today STAC item docs store ``assets`` as opaque blob
+    * ``item_asset`` — for promoting item-embedded assets to first-class
+      index entries. Today STAC item docs store ``assets`` as opaque blob
       (``COMMON_PROPERTIES`` declares ``"assets": {"enabled": False}``);
       promotion is a deferred STAC read/write refactor.  When it lands,
-      this class will add ``is_item_asset_indexer: ClassVar[bool] = True``
-      and start emitting per-item-asset documents to the same per-catalog
-      index (with ``item_id`` populated; mapping field already added for
+      this class will add ``"item_asset"`` to ``index_tiers`` and start
+      emitting per-item-asset documents to the same per-catalog index
+      (with ``item_id`` populated; mapping field already added for
       forward-compat).
-    * :class:`PlatformAssetIndexer` (``is_platform_asset_indexer``) —
-      for assets above the catalog scope (no design yet; ``AssetBase``
-      requires ``catalog_id`` today).
+    * ``platform_asset`` — for assets above the catalog scope (no design
+      yet; ``AssetBase`` requires ``catalog_id`` today).
 
-    Both marker opt-ins are deferred until the consumer tier ships;
-    the markers themselves exist so future drivers (or this driver's
+    Both tier opt-ins are deferred until the consumer tier ships; the
+    tokens themselves are reserved so future drivers (or this driver's
     future extension) can self-register without a rename.
 
     Lifecycle wiring
     ----------------
     No lifespan-time wiring is required.  Asset writes flow through the
-    ``AssetIndexer`` INDEX-lane entry in ``AssetRoutingConfig.operations[INDEX]``
+    ``asset``-tier INDEX-lane entry in ``AssetRoutingConfig.operations[INDEX]``
     — invoked by ``AssetEntitySyncSubscriber`` off the events bus — and
     through direct programmatic calls to ``index_asset()`` / ``delete_asset()``.
 
     Registered as ``storage_elasticsearch_assets`` via entry points.
     """
 
-    is_asset_indexer: ClassVar[bool] = True
+    index_tiers: ClassVar[FrozenSet[str]] = frozenset({"asset"})
 
     teardown_lane: ClassVar[TeardownLane] = TeardownLane.ASYNC_CASCADE
 
@@ -2778,7 +2775,7 @@ class AssetElasticsearchDriver(
 
     # Asset ES is the canonical async materialization target + derived-
     # search-preferred backend for asset metadata routing.  It auto-
-    # defaults into the INDEX lane (identified by ``is_asset_indexer``);
+    # defaults into the INDEX lane (claimed via ``index_tiers``);
     # its declared ``supported_hints`` (below) includes ``Hint.SEARCH``, so
     # it wins the derived-search pool's preference ranking without a
     # separate opt-in.
@@ -2798,7 +2795,7 @@ class AssetElasticsearchDriver(
 
     @asynccontextmanager
     async def lifespan(self, app_state: object):
-        # Asset writes flow exclusively through the AssetIndexer INDEX-lane
+        # Asset writes flow exclusively through the asset-tier INDEX-lane
         # entry in AssetRoutingConfig.operations[INDEX] — invoked by
         # AssetEntitySyncSubscriber off the events bus. The previous
         # per-driver CatalogEventType.ASSET_* listener path was retired to

@@ -24,13 +24,13 @@ writer via the storage routing layer rather than hardcoding driver references.
 Coverage in this file:
 
 - Routing resolution: reader comes from get_items_search_driver (GEOMETRY_EXACT
-  hint → PG primary); writer comes from get_write_drivers filtered to the first
-  secondary-index (is_item_indexer) driver distinct from the reader.
+  hint → PG primary); writer comes from get_index_drivers (the items INDEX
+  lane) filtered to the first entry distinct from the reader.
 - Streaming contract: features from reader.read_entities are written via
   writer.write_entities in chunks.
 - Error propagation: a write_entities failure propagates (no silent success).
 - Skip condition: collections not routing through the public ES driver are skipped.
-- driver_hint input: an explicit driver_ref in task inputs selects the WRITE target.
+- driver_hint input: an explicit driver_ref in task inputs selects the INDEX target.
 - Pre-reindex wipe: delete_by_query still fires before the routing-driven reindex.
 - Supersedes ``test_bypass_matches_dispatcher_bulk_contract``: the hardcoded-bypass
   path (issue #507 Option B) has been replaced by routing-resolved read/write; the
@@ -103,7 +103,6 @@ class _FakeReader:
 
     driver_id = "fake_reader_driver"
     preferred_chunk_size: int = 0
-    is_item_indexer: bool = False
 
     def __init__(self, features_by_collection: Dict[str, List[dict]]):
         self._features = features_by_collection
@@ -141,7 +140,6 @@ class _FakeWriter:
 
     driver_id = "fake_writer_driver"
     preferred_chunk_size: int = 0
-    is_item_indexer: bool = True  # marks as secondary-index / ES-like target
 
     def __init__(
         self,
@@ -205,7 +203,7 @@ class _FakeResolvedDriver:
 
 def _make_routing_config(driver_ref: str = "items_elasticsearch_driver"):
     """Fake routing-config stand-in. ``get_items_search_driver`` /
-    ``get_write_drivers`` are patched directly in these tests (see
+    ``get_index_drivers`` are patched directly in these tests (see
     ``_build_router_patches``), so this object's ``operations`` shape is
     never actually introspected by the reindex code under test — it only
     needs to satisfy ``ConfigsProtocol.get_config``'s return type."""
@@ -251,7 +249,7 @@ def _build_router_patches(
     async def _fake_get_items_search_driver(catalog_id, collection_id, *, hints=frozenset()):
         return resolved_reader
 
-    async def _fake_get_write_drivers(catalog_id, collection_id, *, hints=frozenset()):
+    async def _fake_get_index_drivers(catalog_id, collection_id, *, hints=frozenset()):
         return [resolved_writer]
 
     import contextlib
@@ -262,8 +260,8 @@ def _build_router_patches(
             "dynastore.modules.elasticsearch.bulk_reindex.get_items_search_driver",
             side_effect=_fake_get_items_search_driver,
         ), patch(
-            "dynastore.modules.elasticsearch.bulk_reindex.get_write_drivers",
-            side_effect=_fake_get_write_drivers,
+            "dynastore.modules.elasticsearch.bulk_reindex.get_index_drivers",
+            side_effect=_fake_get_index_drivers,
         ):
             yield
 
@@ -317,7 +315,7 @@ async def test_reindex_reader_is_routing_resolved_not_hardcoded():
 
 @pytest.mark.asyncio
 async def test_reindex_writer_is_secondary_index_driver_not_reader():
-    """Writer is the is_item_indexer driver; it must not equal the reader."""
+    """Writer is the resolved INDEX-lane driver; it must not equal the reader."""
     reader = _FakeReader({"col1": [_make_feature("f1")]})
     writer = _FakeWriter()
 
@@ -360,8 +358,8 @@ async def test_reindex_writer_is_secondary_index_driver_not_reader():
 
 @pytest.mark.asyncio
 async def test_reindex_raises_when_reader_equals_writer():
-    """If the only WRITE driver matches the reader, reindex raises ValueError
-    rather than silently looping reads back to the source."""
+    """If the only INDEX-lane driver matches the reader, reindex raises
+    ValueError rather than silently looping reads back to the source."""
     from dynastore.modules.elasticsearch.bulk_reindex import _select_writer
 
     # Simulate reader and writer resolving to the same driver_ref.
@@ -373,18 +371,17 @@ async def test_reindex_raises_when_reader_equals_writer():
 
 
 @pytest.mark.asyncio
-async def test_reindex_raises_when_no_secondary_index_writer():
-    """When no WRITE driver with is_item_indexer=True exists (distinct from reader),
-    reindex raises ValueError rather than silently no-oping."""
+async def test_reindex_raises_when_no_index_lane_writer_distinct_from_reader():
+    """When every resolved INDEX-lane entry equals the reader (or none
+    resolve), reindex raises ValueError rather than silently no-oping.
+    Lane membership IS the role now — no per-driver marker to lack."""
     from dynastore.modules.elasticsearch.bulk_reindex import _select_writer
 
-    class _NonIndexerWriter:
-        is_item_indexer = False
+    reader_ref = "items_postgresql_driver"
+    writer_entry = _FakeResolvedDriver(_FakeWriter(), reader_ref)
 
-    writer_entry = _FakeResolvedDriver(_NonIndexerWriter(), "other_driver")
-
-    with pytest.raises(ValueError, match="secondary-index"):
-        _select_writer([writer_entry], "items_postgresql_driver", driver_hint=None)
+    with pytest.raises(ValueError, match="no INDEX-lane writer found"):
+        _select_writer([writer_entry], reader_ref, driver_hint=None)
 
 
 # ---------------------------------------------------------------------------
@@ -1420,7 +1417,7 @@ async def test_reindex_reader_ref_override_resolves_from_registry():
         search_driver_calls.append((catalog_id, collection_id))
         raise AssertionError("get_items_search_driver must NOT be called when reader_ref is set")
 
-    async def _fake_get_write_drivers(catalog_id, collection_id, *, hints=frozenset()):
+    async def _fake_get_index_drivers(catalog_id, collection_id, *, hints=frozenset()):
         return [_FakeResolvedDriver(writer, "items_elasticsearch_driver")]
 
     with patch("dynastore.tools.discovery.get_protocol", side_effect=_get_protocol), patch(
@@ -1430,8 +1427,8 @@ async def test_reindex_reader_ref_override_resolves_from_registry():
         "dynastore.modules.elasticsearch.bulk_reindex.get_items_search_driver",
         side_effect=_fake_search_driver,
     ), patch(
-        "dynastore.modules.elasticsearch.bulk_reindex.get_write_drivers",
-        side_effect=_fake_get_write_drivers,
+        "dynastore.modules.elasticsearch.bulk_reindex.get_index_drivers",
+        side_effect=_fake_get_index_drivers,
     ), patch(
         "dynastore.modules.elasticsearch.bulk_reindex.add_index_to_public_alias",
         return_value=None,
@@ -1457,15 +1454,15 @@ async def test_reindex_reader_ref_unknown_raises():
     """An unregistered reader_ref is a hard error, not a silent skip."""
     writer = _FakeWriter()
 
-    async def _fake_get_write_drivers(catalog_id, collection_id, *, hints=frozenset()):
+    async def _fake_get_index_drivers(catalog_id, collection_id, *, hints=frozenset()):
         return [_FakeResolvedDriver(writer, "items_elasticsearch_driver")]
 
     with patch(
         "dynastore.modules.storage.driver_registry.DriverRegistry.get_collection",
         return_value=None,
     ), patch(
-        "dynastore.modules.elasticsearch.bulk_reindex.get_write_drivers",
-        side_effect=_fake_get_write_drivers,
+        "dynastore.modules.elasticsearch.bulk_reindex.get_index_drivers",
+        side_effect=_fake_get_index_drivers,
     ):
         from dynastore.modules.elasticsearch.bulk_reindex import reindex_collection_into_index
         with pytest.raises(ValueError):

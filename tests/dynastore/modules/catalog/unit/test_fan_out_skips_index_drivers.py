@@ -19,7 +19,7 @@
 """Regression: the storage write fan-out must NOT call ``write_entities`` on
 item-indexer drivers (#1289).
 
-An item-indexer driver (``is_item_indexer = True`` — the public/private ES
+An item-indexer driver (``"item" in index_tiers`` — the public/private ES
 drivers) lives in ``operations[INDEX]``, never ``operations[WRITE]``, and
 is propagated by the *index dispatcher* (``_dispatch_index_upsert`` →
 ``index_bulk``), which stamps the canonical identity fields
@@ -36,7 +36,7 @@ drivers are owned by the dispatcher; the storage fan-out must skip them.
 """
 from __future__ import annotations
 
-from typing import Any, List
+from typing import Any, FrozenSet, List
 
 import pytest
 
@@ -48,7 +48,7 @@ from dynastore.modules.storage.routing_config import FailurePolicy
 class _RecordingDriver:
     """Minimal driver stub recording ``write_entities`` invocations."""
 
-    is_item_indexer: bool = False
+    index_tiers: FrozenSet[str] = frozenset()
 
     def __init__(self) -> None:
         self.writes: List[Any] = []
@@ -59,17 +59,17 @@ class _RecordingDriver:
 
 
 class _PrimaryStorageDriver(_RecordingDriver):
-    is_item_indexer = False
+    index_tiers = frozenset()
 
 
 class _SecondaryStorageDriver(_RecordingDriver):
-    is_item_indexer = False
+    index_tiers = frozenset()
 
 
 class _SecondaryIndexerDriver(_RecordingDriver):
     """An ES-style driver that is also an item indexer (dispatcher-owned)."""
 
-    is_item_indexer = True
+    index_tiers = frozenset({"item"})
 
 
 @pytest.mark.asyncio

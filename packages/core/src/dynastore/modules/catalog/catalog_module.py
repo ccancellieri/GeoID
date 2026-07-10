@@ -369,7 +369,7 @@ class CatalogModule(ModuleProtocol):
             from dynastore.modules.catalog.cascade_registry import finalize_cascade_registry
             finalize_cascade_registry()
 
-            # Wire AssetEntitySyncSubscriber to drive AssetIndexer fan-out
+            # Wire AssetEntitySyncSubscriber to drive asset-tier indexer fan-out
             # from the events bus. Replaces the legacy per-driver listener
             # blocks (one less coupling between drivers and the events bus).
             from dynastore.modules.catalog.asset_sync import (

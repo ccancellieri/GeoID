@@ -353,20 +353,23 @@ def _is_secondary_index(driver: CatalogStore) -> bool:
     must degrade to that async path instead of aborting the canonical PG write.
     Primary stores (PG core / STAC) stay fatal.
 
-    Identified by ``is_catalog_indexer`` on the driver class, the same marker
-    the ES catalog driver sets to auto-default into the INDEX lane.  Used
-    only by the discovery-fallback path (no routing config available) and
-    the injected-``drivers=`` path, both of which have no lane information
-    to consult; the routed path resolves WRITE directly and structurally
-    excludes INDEX-lane drivers already (lane membership IS the role now).
-    INDEX-lane drivers (ES) never share the caller's PG ``db_resource``, so
-    swallowing their failure cannot corrupt the outer transaction.
+    Identified by ``"catalog" in driver.index_tiers`` — the same tier
+    marker the ES catalog driver claims to auto-default into the INDEX
+    lane.  Used only by the discovery-fallback path (no routing config
+    available) and the injected-``drivers=`` path, both of which have no
+    lane information to consult; the routed path resolves WRITE directly
+    and structurally excludes INDEX-lane drivers already (lane membership
+    IS the role now).  INDEX-lane drivers (ES) never share the caller's PG
+    ``db_resource``, so swallowing their failure cannot corrupt the outer
+    transaction.
 
-    Tested via identity (``is True``) so the canonical PG drivers — and any
-    ``MagicMock`` stand-in whose attribute access auto-vivifies a truthy mock —
-    are correctly treated as primary (fatal-on-failure).
+    Checked via ``in`` on ``getattr(driver, "index_tiers", frozenset())`` so
+    the canonical PG drivers — and any ``MagicMock`` stand-in whose
+    attribute access auto-vivifies a truthy child mock — are correctly
+    treated as primary (fatal-on-failure): an unconfigured mock's
+    ``__contains__`` defaults to ``False``.
     """
-    return getattr(driver, "is_catalog_indexer", False) is True
+    return "catalog" in getattr(driver, "index_tiers", frozenset())
 
 
 async def upsert_catalog_metadata(
@@ -430,7 +433,7 @@ async def upsert_catalog_metadata(
             )
         else:
             # Discovery fallback (early boot, ConfigsProtocol unavailable):
-            # consult the is_catalog_indexer ClassVar since there is no
+            # consult the driver's ``index_tiers`` ClassVar since there is no
             # routing config to resolve the WRITE lane from.  Primary
             # mechanism is the routed path above; this ClassVar check is
             # the unrouted-only fallback.

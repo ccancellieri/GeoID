@@ -2897,17 +2897,26 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
 
         # Position 0 is the primary driver — already written by the caller.
         secondaries = resolved[1:] if _primary_already_written else resolved
-        # Item-indexer drivers (the ES public/private drivers —
-        # ``is_item_indexer=True``) live in the INDEX lane, never WRITE, so
-        # ``get_write_drivers`` structurally cannot return one — this filter
-        # is a defensive no-op against a stale/misconfigured persisted
-        # config. The index dispatcher (``_dispatch_index_upsert`` →
-        # ``index_bulk``) is their single write path (role separation,
-        # #990); double-writing here would race its stamped identity fields
-        # (``_external_id`` / ``_asset_id``, #1289).
+        # Item-indexer drivers (the ES public/private drivers — declaring
+        # "item" in ``index_tiers``) live in the INDEX lane, never WRITE, so
+        # ``get_write_drivers`` structurally cannot return one *once a
+        # config has been re-validated / re-PUT under the lane model*. This
+        # filter is the migration-window safety net: a routing config
+        # persisted before the WRITE/READ/INDEX lane cutover could still
+        # carry the ES driver under ``operations[WRITE]`` (its pre-cutover
+        # location) until an operator re-PUTs it or runs the lane-migration
+        # SQL. Reading the driver class's own tier marker is therefore not
+        # a lane-runtime decision — it is validating that a resolved WRITE
+        # entry is legitimately WRITE-role, protecting against exactly that
+        # stale shape. The index dispatcher (``_dispatch_index_upsert`` ->
+        # ``index_bulk``) is the item-indexer's single write path (role
+        # separation, #990); double-writing here would race its stamped
+        # identity fields (``_external_id`` / ``_asset_id``, #1289).  Safe to
+        # retire once every environment's persisted routing configs are
+        # confirmed migrated to the lane shape.
         secondaries = [
             r for r in secondaries
-            if not getattr(type(r.driver), "is_item_indexer", False)
+            if "item" not in getattr(type(r.driver), "index_tiers", frozenset())
         ]
         if not secondaries:
             return

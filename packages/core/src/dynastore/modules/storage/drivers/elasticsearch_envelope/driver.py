@@ -92,7 +92,7 @@ class ItemsElasticsearchEnvelopeDriver(
     Registered as ``storage_elasticsearch_envelope`` via entry points.
     """
 
-    is_item_indexer: ClassVar[bool] = True
+    index_tiers: ClassVar[FrozenSet[str]] = frozenset({"item"})
 
     # Opt in to document-level read scoping (#1285). The search dispatch reads
     # this marker, and only when it is ``True`` does it compile the caller's

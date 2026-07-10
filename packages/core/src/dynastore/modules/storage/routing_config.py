@@ -74,11 +74,6 @@ from pydantic import (
 )
 
 from dynastore.models.protocols.driver_roles import DriverSla
-from dynastore.models.protocols.indexer import (
-    AssetIndexer,
-    CatalogIndexer,
-    CollectionIndexer,
-)
 from dynastore.models.mutability import Immutable, Mutable
 from dynastore.models.plugin_config import PluginConfig
 from dynastore.modules.storage.hints import Hint
@@ -792,13 +787,11 @@ class ItemsRoutingConfig(_RoutingConfigBase):
         ),
     )
     def _self_register_drivers(self) -> None:
-        """Fold discoverable :class:`ItemIndexer` drivers into
+        """Fold discoverable ``item``-tier indexer drivers into
         ``operations[INDEX]`` — so a deployed ``ItemsElasticsearchDriver``
         shows up without operator PUT.
         """
-        from dynastore.models.protocols.indexer import ItemIndexer
-
-        _self_register_indexers_into(self.operations, ItemIndexer)
+        _self_register_indexers_into(self.operations, "item")
 
 
 class CollectionRoutingConfig(_RoutingConfigBase):
@@ -865,8 +858,8 @@ class CollectionRoutingConfig(_RoutingConfigBase):
             #
             # The ES INDEX entry is intentionally NOT hard-coded here: it
             # is supplied by ``_self_register_indexers_into`` at validation
-            # time when a CollectionIndexer (ES) driver is registered, and
-            # by the routing presets (e.g. public_catalog) for explicit
+            # time when a collection-tier indexer (ES) driver is registered,
+            # and by the routing presets (e.g. public_catalog) for explicit
             # deployments. A PG-only deployment with no ES driver and no
             # drain worker therefore gets no INDEX entry, so a plain
             # collection create does not enqueue an obligation row into
@@ -905,8 +898,8 @@ class CollectionRoutingConfig(_RoutingConfigBase):
             # Operation.INDEX is intentionally absent here — see the
             # module-level comment above: the ES INDEX entry is supplied by
             # ``_self_register_indexers_into`` at validation time (below)
-            # when a CollectionIndexer (ES) driver is registered, or by a
-            # routing preset. Hard-coding it here would resurrect #1069 /
+            # when a collection-tier indexer (ES) driver is registered, or by
+            # a routing preset. Hard-coding it here would resurrect #1069 /
             # #1073 under the lane model: INDEX now doubles as the async
             # materialization trigger (``collection_router._dispatch_
             # collection_index`` fans out to every ``operations[INDEX]``
@@ -919,18 +912,18 @@ class CollectionRoutingConfig(_RoutingConfigBase):
             "WRITE/READ = collection_postgresql_driver (system of record). "
             "The ES INDEX entry propagates asynchronously (storage-plane-"
             "durable), added by self-registration when an ES "
-            "CollectionIndexer is registered (or by a routing preset) — not "
-            "hard-coded, so a PG-only deployment enqueues no undrainable "
+            "collection-tier indexer is registered (or by a routing preset) "
+            "— not hard-coded, so a PG-only deployment enqueues no undrainable "
             "obligation rows. Search is derived: INDEX (Elasticsearch, "
             "geometry_simplified) preferred, READ (PostgreSQL, "
             "geometry_exact) fallback."
         ),
     )
     def _self_register_drivers(self) -> None:
-        """Fold discoverable :class:`CollectionIndexer` drivers into
+        """Fold discoverable ``collection``-tier indexer drivers into
         ``operations[INDEX]``.
         """
-        _self_register_indexers_into(self.operations, CollectionIndexer)
+        _self_register_indexers_into(self.operations, "collection")
 
 
 class AssetRoutingConfig(_RoutingConfigBase):
@@ -967,7 +960,7 @@ class AssetRoutingConfig(_RoutingConfigBase):
             # absent from the hardcoded defaults — an operator pins it
             # via PluginConfig, or it arrives through the auto-augment
             # path below if ``AssetElasticsearchDriver`` is installed
-            # and registers itself as an ``AssetIndexer``.
+            # and claims the ``asset`` INDEX tier.
             Operation.WRITE: [
                 OperationDriverEntry(
                     driver_ref="asset_postgresql_driver",
@@ -989,8 +982,8 @@ class AssetRoutingConfig(_RoutingConfigBase):
             "Defaults wire PG only (FATAL primary on WRITE and READ); "
             "the ES asset driver is not a default. ``operations[INDEX]`` "
             "is auto-augmented at validation time with discoverable "
-            "AssetIndexer drivers, so operators that install an ES asset "
-            "indexer still get async fan-out; ``operations[UPLOAD]`` is "
+            "asset-tier indexer drivers, so operators that install an ES "
+            "asset indexer still get async fan-out; ``operations[UPLOAD]`` is "
             "auto-augmented with discoverable AssetUploadProtocol impls."
         ),
     )
@@ -1009,7 +1002,7 @@ class AssetRoutingConfig(_RoutingConfigBase):
         """
         from dynastore.models.protocols.asset_upload import AssetUploadProtocol
 
-        _self_register_indexers_into(self.operations, AssetIndexer)
+        _self_register_indexers_into(self.operations, "asset")
         _self_register_upload_into(self.operations, AssetUploadProtocol)
 
 
@@ -1065,8 +1058,8 @@ class CatalogRoutingConfig(_RoutingConfigBase):
             # record (FATAL) for both WRITE and READ. The ES INDEX entry
             # propagates to Elasticsearch asynchronously (storage-plane-
             # durable). That entry is NOT hard-coded: it is auto-augmented
-            # at validation time with discoverable CatalogIndexer drivers
-            # (and supplied by routing presets for explicit deployments). A
+            # at validation time with discoverable catalog-tier indexer
+            # drivers (and supplied by routing presets for explicit deployments). A
             # PG-only deployment with no ES driver and no drain worker
             # therefore gets no INDEX entry, so a plain catalog create does
             # not enqueue an obligation row into tasks.storage that nothing
@@ -1108,7 +1101,7 @@ class CatalogRoutingConfig(_RoutingConfigBase):
             "drivers. WRITE/READ = catalog_postgresql_driver (system of "
             "record). The ES INDEX entry propagates asynchronously "
             "(storage-plane-durable), auto-augmented at validation time "
-            "with every discoverable CatalogIndexer (or supplied by a "
+            "with every discoverable catalog-tier indexer (or supplied by a "
             "routing preset) — not hard-coded, so a PG-only deployment "
             "enqueues no undrainable obligation rows. Operator-explicit "
             "entries take precedence; auto-augmentation is idempotent "
@@ -1116,7 +1109,8 @@ class CatalogRoutingConfig(_RoutingConfigBase):
         ),
     )
     def _self_register_drivers(self) -> None:
-        """Fold discoverable CatalogIndexer drivers into ``operations[INDEX]``.
+        """Fold discoverable ``catalog``-tier indexer drivers into
+        ``operations[INDEX]``.
 
         Closes the gap where the default-state config (no operator write)
         shows no INDEX entry even when an ES catalog driver is installed.
@@ -1124,7 +1118,7 @@ class CatalogRoutingConfig(_RoutingConfigBase):
         apply-time configs converge — ``_on_apply_catalog_routing_config``
         calls the same helper with the same idempotent semantics.
         """
-        _self_register_indexers_into(self.operations, CatalogIndexer)
+        _self_register_indexers_into(self.operations, "catalog")
 
 
 # ---------------------------------------------------------------------------
@@ -1298,9 +1292,9 @@ def _is_operator_managed(
 
 def _self_register_indexers_into(
     target_ops: Dict[str, List["OperationDriverEntry"]],
-    marker_proto: type,
+    tier: str,
 ) -> None:
-    """Auto-append every installed driver satisfying ``marker_proto`` to
+    """Auto-append every installed driver claiming *tier* to
     ``target_ops[INDEX]``.
 
     An indexer is not a WRITE-lane driver: it is an INDEX-lane
@@ -1308,11 +1302,15 @@ def _self_register_indexers_into(
     ``target_ops[INDEX]`` with every discoverable indexer that opts in —
     role is lane membership, not a per-entry flag.
 
-    Tier-scoped: caller passes the right marker (``CatalogIndexer`` →
-    catalog routing, ``CollectionIndexer`` → collection routing,
-    ``AssetIndexer`` → asset routing, ``ItemIndexer`` → items routing).
-    Drivers indexing multiple tiers opt in to multiple markers and
-    self-register into each tier's ``operations[INDEX]`` independently.
+    Tier-scoped: caller passes the tier string (``"catalog"`` → catalog
+    routing, ``"collection"`` → collection routing, ``"asset"`` → asset
+    routing, ``"item"`` → items routing — see
+    :data:`dynastore.models.protocols.indexer.IndexTier`). Discovery walks
+    every driver structurally satisfying
+    :class:`~dynastore.models.protocols.indexer.IndexTierDriver` and keeps
+    those whose ``index_tiers`` contains *tier* — checked BY VALUE, so one
+    driver class can claim (and self-register into) multiple tiers by
+    listing them all in its ``index_tiers`` frozenset.
 
     Seeds INDEX only when there is no explicit operator intent on either
     lane — three independent no-op gates, all of which must clear:
@@ -1346,6 +1344,7 @@ def _self_register_indexers_into(
     or auto) — never appends a ref already listed, never duplicates on
     repeated validation passes.
     """
+    from dynastore.models.protocols.indexer import IndexTierDriver
     from dynastore.tools.discovery import get_protocols
 
     if _is_operator_managed(target_ops, Operation.WRITE):
@@ -1358,7 +1357,12 @@ def _self_register_indexers_into(
         if any(entry.source == "operator" for entry in existing_index):
             return
     listed = {entry.driver_ref for entry in target_ops.get(Operation.INDEX, [])}
-    for driver in get_protocols(marker_proto):
+    for driver in get_protocols(IndexTierDriver):
+        # Value check, not presence check: a driver satisfies IndexTierDriver
+        # structurally by merely declaring ``index_tiers`` — whether *this*
+        # tier is in that frozenset is what actually opts it in here.
+        if tier not in getattr(driver, "index_tiers", frozenset()):
+            continue
         # Single gate on the per-Operation auto-default set.  Drivers
         # explicitly declare which Operations they auto-default into via
         # ``auto_register_for_routing: ClassVar[FrozenSet[Operation]]``;
@@ -1375,9 +1379,9 @@ def _self_register_indexers_into(
         )
         listed.add(driver_ref)
         logger.debug(
-            "Routing config self-registration: appended %s indexer '%s' "
+            "Routing config self-registration: appended tier=%r indexer '%s' "
             "to operations[INDEX] (source=auto)",
-            marker_proto.__name__, driver_ref,
+            tier, driver_ref,
         )
 
 
@@ -1482,7 +1486,7 @@ async def _validate_items_routing_config(
 
     Validates driver_ref, hints, and operations for items dispatch
     entries (``CollectionItemsStore`` drivers) and auto-registers
-    discoverable ``ItemIndexer`` drivers into the INDEX lane.
+    discoverable ``item``-tier indexer drivers into the INDEX lane.
 
     Runs PRE-PERSIST: a failure here propagates as HTTP 4xx and the upsert
     is rolled back.  The ``_self_register_*`` calls mutate ``config.operations``
@@ -1490,18 +1494,17 @@ async def _validate_items_routing_config(
     ``source="auto"`` entries are actually persisted (they were silently
     dropped when this ran post-upsert).
     """
-    from dynastore.models.protocols.indexer import ItemIndexer
     from dynastore.models.protocols.storage_driver import CollectionItemsStore
     from dynastore.tools.discovery import get_protocols
 
     driver_index = {_to_snake(type(d).__name__): d for d in get_protocols(CollectionItemsStore)}
     _validate_routing_entries(config, driver_index, "Items routing config")
 
-    # Items-tier: auto-register ItemIndexer drivers into operations[INDEX]
-    # (gated on ``Operation.INDEX in driver.auto_register_for_routing``) —
-    # parity with the read-time model_validator so operator PUTs also pick
-    # up auto-augmentation.
-    _self_register_indexers_into(config.operations, ItemIndexer)
+    # Items-tier: auto-register item-tier indexer drivers into
+    # operations[INDEX] (gated on ``Operation.INDEX in
+    # driver.auto_register_for_routing``) — parity with the read-time
+    # model_validator so operator PUTs also pick up auto-augmentation.
+    _self_register_indexers_into(config.operations, "item")
 
 
 async def _on_apply_items_routing_config(
@@ -1614,25 +1617,29 @@ async def _validate_collection_routing_config(
 
     Validates entries against the ``CollectionStore`` registry and
     auto-registers installed metadata drivers (READ/WRITE) plus
-    discoverable ``CollectionIndexer`` drivers.  Runs PRE-PERSIST so the
-    ``_self_register_*`` ``source="auto"`` entries persist and a bad
+    discoverable ``collection``-tier indexer drivers.  Runs PRE-PERSIST so
+    the ``_self_register_*`` ``source="auto"`` entries persist and a bad
     driver_ref propagates as HTTP 4xx.
     """
     from dynastore.models.protocols.entity_store import CollectionStore
+    from dynastore.models.protocols.indexer import IndexTierDriver
     from dynastore.models.protocols.storage_driver import CollectionItemsStore
     from dynastore.tools.discovery import get_protocols
 
     driver_index = {_to_snake(type(d).__name__): d for d in get_protocols(CollectionItemsStore)}
     store_driver_index = {_to_snake(type(d).__name__): d for d in get_protocols(CollectionStore)}
-    # Known CollectionIndexer driver_refs (e.g. the ES collection_elasticsearch_driver).
-    # An indexer is an INDEX-lane materialization target, never a READ/WRITE-
-    # capable CollectionStore.  A WRITE/READ entry that happens to name a
-    # known indexer (operator mis-pin, not a persisted-shape concern — lane
-    # membership IS the role now) is warn-skipped, not raised — the runtime
-    # router skips any unregistered/wrong-role entry at dispatch, so
-    # skipping here keeps a misconfigured catalog readable and lets it
-    # self-heal on the next apply.
-    indexer_refs = {_to_snake(type(d).__name__) for d in get_protocols(CollectionIndexer)}
+    # Known collection-tier indexer driver_refs (e.g. the ES
+    # collection_elasticsearch_driver).  An indexer is an INDEX-lane
+    # materialization target, never a READ/WRITE-capable CollectionStore.  A
+    # WRITE/READ entry that happens to name a known indexer (operator
+    # mis-pin, not a persisted-shape concern — lane membership IS the role
+    # now) is warn-skipped, not raised — the runtime router skips any
+    # unregistered/wrong-role entry at dispatch, so skipping here keeps a
+    # misconfigured catalog readable and lets it self-heal on the next apply.
+    indexer_refs = {
+        _to_snake(type(d).__name__) for d in get_protocols(IndexTierDriver)
+        if "collection" in getattr(d, "index_tiers", frozenset())
+    }
 
     # Auto-register installed store drivers (WRITE/READ) so operators
     # reading ``/configs/...`` see every driver that will run; no implicit
@@ -1670,7 +1677,7 @@ async def _validate_collection_routing_config(
             )
 
     # Validate operations[WRITE] entries (CollectionStore drivers — the primary
-    # metadata store). A known indexer (e.g. the ES ``CollectionIndexer``) is
+    # metadata store). A known indexer (e.g. the ES collection-tier driver) is
     # not a distinct operation any more — it lives in operations[INDEX], never
     # WRITE — and it is NOT a ``CollectionStore`` driver, so it must be
     # skipped here if an operator mis-pinned one under WRITE. Validating it
@@ -1703,7 +1710,7 @@ async def _validate_collection_routing_config(
 
     # Auto-register discoverable indexers — parity with the read-time
     # model_validator on CollectionRoutingConfig.
-    _self_register_indexers_into(config.operations, CollectionIndexer)
+    _self_register_indexers_into(config.operations, "collection")
 
     # Composition guard (#1047): a public-ES collection requires a public-ES
     # parent catalog. Cross-tier rule — needs the parent catalog's routing
@@ -1759,8 +1766,8 @@ async def _validate_asset_routing_config(
     """Validate-phase handler for asset routing config (#738).
 
     Validates entries against the ``AssetStore`` registry and auto-registers
-    discoverable ``AssetIndexer`` + ``AssetUploadProtocol`` drivers.  Runs
-    PRE-PERSIST so the ``source="auto"`` entries persist and a bad
+    discoverable ``asset``-tier indexer + ``AssetUploadProtocol`` drivers.
+    Runs PRE-PERSIST so the ``source="auto"`` entries persist and a bad
     driver_ref / hint propagates as HTTP 4xx.
     """
     from dynastore.models.protocols.asset_driver import AssetStore
@@ -1770,8 +1777,8 @@ async def _validate_asset_routing_config(
     driver_index = {_to_snake(type(d).__name__): d for d in get_protocols(AssetStore)}
     _validate_routing_entries(config, driver_index, "Asset routing config")
 
-    # Auto-register installed AssetIndexer drivers under operations[INDEX].
-    _self_register_indexers_into(config.operations, AssetIndexer)
+    # Auto-register installed asset-tier indexer drivers under operations[INDEX].
+    _self_register_indexers_into(config.operations, "asset")
 
     # Auto-register installed AssetUploadProtocol impls under operations[UPLOAD].
     _self_register_upload_into(config.operations, AssetUploadProtocol)
@@ -1830,7 +1837,7 @@ async def _validate_catalog_routing_config(
 
     Validates ``driver_ref``, hints, and operation capability for every entry in
     ``config.operations`` against the ``CatalogStore`` driver registry, and
-    auto-registers installed store drivers + ``CatalogIndexer`` drivers.
+    auto-registers installed store drivers + ``catalog``-tier indexer drivers.
     Runs PRE-PERSIST.
 
     INDEX entries are validated against the same registry plus a structural
@@ -1848,9 +1855,9 @@ async def _validate_catalog_routing_config(
     _self_register_store_drivers(config, driver_index)
     _validate_routing_entries(config, driver_index, "Catalog routing config")
 
-    # Auto-register installed CatalogIndexer drivers under operations[INDEX]
-    # for parity with the read-time validator.
-    _self_register_indexers_into(config.operations, CatalogIndexer)
+    # Auto-register installed catalog-tier indexer drivers under
+    # operations[INDEX] for parity with the read-time validator.
+    _self_register_indexers_into(config.operations, "catalog")
 
 
 # Register handlers on the config classes themselves (#738/#747 — the

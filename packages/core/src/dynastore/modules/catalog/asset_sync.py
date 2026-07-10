@@ -17,12 +17,12 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 """
-Asset entity sync — event-driven fan-out to AssetIndexer drivers.
+Asset entity sync — event-driven fan-out to asset-tier indexer drivers.
 
 ``AssetEntitySyncSubscriber`` listens for ``CatalogEventType.ASSET_*`` events
 emitted by ``AssetService`` and dispatches the row write/delete to every
 driver in ``AssetRoutingConfig.operations[INDEX]`` (auto-augmented with
-discoverable ``AssetIndexer`` implementors such as ``AssetElasticsearchDriver``).
+discoverable asset-tier indexer implementors such as ``AssetElasticsearchDriver``).
 
 This collapses the prior dual-write race where the ES driver received writes
 from both the routing-config fan-out and a private listener block: the row
@@ -97,7 +97,7 @@ async def _fan_out_and_raise(
 
 
 class AssetEntitySyncSubscriber:
-    """Async event subscribers that drive ``AssetIndexer`` fan-out."""
+    """Async event subscribers that drive asset-tier indexer fan-out."""
 
     @staticmethod
     async def on_asset_upsert(

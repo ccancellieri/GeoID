@@ -185,7 +185,7 @@ def _collection_routing_es() -> CollectionRoutingConfig:
 
     There is no "ES-only" collection tier: ``CollectionElasticsearchDriver`` is
     a write-only INDEX-lane backend (``auto_register_for_routing={INDEX, READ}``,
-    ``is_collection_indexer=True``) — never a READ-capable ``CollectionStore``.
+    ``index_tiers={"collection"}``) — never a READ-capable ``CollectionStore``.
     Authoring it as a READ/WRITE-primary driver fails routing validation
     (``operations[READ] driver 'collection_elasticsearch_driver' is not
     registered``).  Collection metadata therefore stays on PG as the system of

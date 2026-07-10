@@ -252,22 +252,21 @@ def test_self_registration_skips_zero_drivers():
 
 
 def test_indexer_marker_lands_in_index_lane():
-    """A driver opting in to a tier indexer marker auto-registers under
-    ``operations[INDEX]`` — sourced from the per-tier marker, not from
+    """A driver claiming a tier in ``index_tiers`` auto-registers under
+    ``operations[INDEX]`` — sourced from the tier value, not from
     generic capability discovery.  Lane membership IS the role: there is
     no per-entry write_mode/on_failure/secondary_index flag any more.
     """
-    from typing import ClassVar
+    from typing import ClassVar, FrozenSet
     from unittest.mock import patch
 
-    from dynastore.models.protocols.indexer import CollectionIndexer
     from dynastore.modules.storage.routing_config import (
         _self_register_indexers_into,
         index_entries,
     )
 
     class _CollectionES:
-        is_collection_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"collection"})
         auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     class _NotAnIndexer:
@@ -280,7 +279,7 @@ def test_indexer_marker_lands_in_index_lane():
         return [d for d in fake_pool if isinstance(d, proto)]
 
     with patch("dynastore.tools.discovery.get_protocols", _fake_get_protocols):
-        _self_register_indexers_into(target_ops, CollectionIndexer)
+        _self_register_indexers_into(target_ops, "collection")
 
     entries = index_entries(target_ops)
     assert len(entries) == 1
@@ -288,9 +287,56 @@ def test_indexer_marker_lands_in_index_lane():
     assert entries[0].source == "auto"
 
 
+def test_indexer_seeding_checked_by_value_not_by_marker_presence():
+    """A driver claiming only the ``catalog`` tier is discovered when
+    seeding items (structurally satisfies ``IndexTierDriver``), but is NOT
+    seeded into the items INDEX lane — tier membership is checked BY VALUE,
+    not by marker presence.  A multi-tier driver seeds into every tier it
+    claims.  Pins the exact GOTCHA this design fixes: `get_protocols`
+    isinstance checks only test that ``index_tiers`` exists, never its
+    contents."""
+    from typing import ClassVar, FrozenSet
+    from unittest.mock import patch
+
+    from dynastore.modules.storage.routing_config import (
+        _self_register_indexers_into,
+        index_entries,
+    )
+
+    class _CatalogOnlyES:
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"catalog"})
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
+
+    class _MultiTierES:
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"catalog", "item"})
+        auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
+
+    fake_pool = [_CatalogOnlyES(), _MultiTierES()]
+
+    def _fake_get_protocols(proto):
+        return [d for d in fake_pool if isinstance(d, proto)]
+
+    item_ops: dict = {}
+    with patch("dynastore.tools.discovery.get_protocols", _fake_get_protocols):
+        _self_register_indexers_into(item_ops, "item")
+
+    item_refs = {e.driver_ref for e in index_entries(item_ops)}
+    # The catalog-only driver structurally satisfies IndexTierDriver (it HAS
+    # index_tiers) but must not be seeded for "item" — value, not presence.
+    assert "_catalog_only_es" not in item_refs
+    assert "_multi_tier_es" in item_refs
+
+    catalog_ops: dict = {}
+    with patch("dynastore.tools.discovery.get_protocols", _fake_get_protocols):
+        _self_register_indexers_into(catalog_ops, "catalog")
+
+    catalog_refs = {e.driver_ref for e in index_entries(catalog_ops)}
+    assert catalog_refs == {"_catalog_only_es", "_multi_tier_es"}
+
+
 def test_validate_handlers_invoke_indexer_self_registration():
     """Each routing-config validate handler MUST invoke
-    ``_self_register_indexers_into`` against the matching tier marker.
+    ``_self_register_indexers_into`` against its own tier string.
     Pins the wiring against accidental drop in a future refactor.
 
     Self-registration moved apply→validate in #738/#747 — it must run
@@ -308,10 +354,10 @@ def test_validate_handlers_invoke_indexer_self_registration():
         _validate_items_routing_config,
     )
 
-    calls: list[type] = []
+    calls: list[str] = []
 
-    def _spy(target_ops, marker_proto, **_kwargs):
-        calls.append(marker_proto)
+    def _spy(target_ops, tier, **_kwargs):
+        calls.append(tier)
 
     # Empty operations so _validate_routing_entries has nothing to check
     # against the (stubbed-empty) driver registry.
@@ -344,19 +390,13 @@ def test_validate_handlers_invoke_indexer_self_registration():
             cat, catalog_id=None, collection_id=None, db_resource=None,
         ))
 
-    from dynastore.models.protocols.indexer import (
-        AssetIndexer,
-        CatalogIndexer,
-        CollectionIndexer,
-        ItemIndexer,
-    )
     # Each tier's validate handler invokes indexer registration with its own
-    # marker Protocol. Order matches the invocation order above.
-    assert calls == [ItemIndexer, CollectionIndexer, AssetIndexer, CatalogIndexer]
+    # tier string. Order matches the invocation order above.
+    assert calls == ["item", "collection", "asset", "catalog"]
 
 
 def test_end_to_end_marker_to_index_entry_via_real_validate_handler():
-    """End-to-end: register a real driver opting in to ``CatalogIndexer``,
+    """End-to-end: register a real driver claiming the ``catalog`` tier,
     invoke ``_validate_catalog_routing_config`` against a fresh
     ``CatalogRoutingConfig``, assert the driver lands in
     ``operations[INDEX]``.
@@ -366,9 +406,9 @@ def test_end_to_end_marker_to_index_entry_via_real_validate_handler():
     apply→validate in #738/#747.
     """
     import asyncio
-    from typing import ClassVar
+    from typing import ClassVar, FrozenSet
 
-    from dynastore.models.protocols.indexer import CatalogIndexer
+    from dynastore.models.protocols.indexer import IndexTierDriver
     from dynastore.modules.storage.routing_config import (
         _validate_catalog_routing_config,
         index_entries,
@@ -376,11 +416,11 @@ def test_end_to_end_marker_to_index_entry_via_real_validate_handler():
     from dynastore.tools.discovery import register_plugin, unregister_plugin
 
     class _DummyCatalogIndexer:
-        is_catalog_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"catalog"})
         auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
         # Minimal CatalogStore surface — enough for
         # _validate_routing_entries to accept it under operations[WRITE]
-        # if it were referenced (it isn't pre-apply; the marker self-
+        # if it were referenced (it isn't pre-apply; the tier self-
         # registration appends it).  We avoid populating WRITE/READ to
         # skip validation for those op-keys.
         capabilities = frozenset()
@@ -404,8 +444,10 @@ def test_end_to_end_marker_to_index_entry_via_real_validate_handler():
         # Sanity: ensure cleanup so other tests don't see this stub.
         from dynastore.tools.discovery import get_protocols
         assert not any(
-            isinstance(d, CatalogIndexer) and type(d).__name__ == "_dummy_catalog_indexer"
-            for d in get_protocols(CatalogIndexer)
+            isinstance(d, IndexTierDriver)
+            and "catalog" in d.index_tiers
+            and type(d).__name__ == "_dummy_catalog_indexer"
+            for d in get_protocols(IndexTierDriver)
         )
 
 
@@ -420,14 +462,14 @@ def test_indexer_helper_blocked_when_write_lane_is_operator_managed():
     WRITE explicitly, with no INDEX entry at all) free of a silently
     injected ES indexer.
     """
-    from typing import ClassVar
+    from typing import ClassVar, FrozenSet
     from unittest.mock import patch
 
-    from dynastore.models.protocols.indexer import AssetIndexer
+    from dynastore.models.protocols.indexer import IndexTierDriver
     from dynastore.modules.storage.routing_config import _self_register_indexers_into
 
     class _AssetES:
-        is_asset_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"asset"})
         auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     target_ops: dict = {
@@ -441,8 +483,8 @@ def test_indexer_helper_blocked_when_write_lane_is_operator_managed():
     }
 
     with patch("dynastore.tools.discovery.get_protocols",
-               lambda proto: [_AssetES()] if proto is AssetIndexer else []):
-        _self_register_indexers_into(target_ops, AssetIndexer)
+               lambda proto: [_AssetES()] if proto is IndexTierDriver else []):
+        _self_register_indexers_into(target_ops, "asset")
 
     # WRITE is operator-managed → INDEX auto-registration is blocked.
     assert target_ops.get(Operation.INDEX, []) == []
@@ -451,17 +493,17 @@ def test_indexer_helper_blocked_when_write_lane_is_operator_managed():
 def test_indexer_helper_fires_when_write_lane_is_auto_sourced():
     """Inverse of the above: a WRITE lane with only ``source="auto"``
     entries (boot defaults) does not block INDEX auto-registration."""
-    from typing import ClassVar
+    from typing import ClassVar, FrozenSet
     from unittest.mock import patch
 
-    from dynastore.models.protocols.indexer import AssetIndexer
+    from dynastore.models.protocols.indexer import IndexTierDriver
     from dynastore.modules.storage.routing_config import (
         _self_register_indexers_into,
         index_entries,
     )
 
     class _AssetES:
-        is_asset_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"asset"})
         auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     target_ops: dict = {
@@ -475,8 +517,8 @@ def test_indexer_helper_fires_when_write_lane_is_auto_sourced():
     }
 
     with patch("dynastore.tools.discovery.get_protocols",
-               lambda proto: [_AssetES()] if proto is AssetIndexer else []):
-        _self_register_indexers_into(target_ops, AssetIndexer)
+               lambda proto: [_AssetES()] if proto is IndexTierDriver else []):
+        _self_register_indexers_into(target_ops, "asset")
 
     refs = {e.driver_ref for e in index_entries(target_ops)}
     assert refs == {"_asset_es"}
@@ -485,22 +527,22 @@ def test_indexer_helper_fires_when_write_lane_is_auto_sourced():
 def test_indexer_marker_skips_already_listed_driver():
     """An indexer already present in operations[INDEX] is not duplicated;
     only missing drivers get appended."""
-    from typing import ClassVar
+    from typing import ClassVar, FrozenSet
     from unittest.mock import patch
 
-    from dynastore.models.protocols.indexer import AssetIndexer
+    from dynastore.models.protocols.indexer import IndexTierDriver
     from dynastore.modules.storage.routing_config import _self_register_indexers_into
 
     class _AssetES:
-        is_asset_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"asset"})
         auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     operator_entry = OperationDriverEntry(driver_ref="_asset_es", source="operator")
     target_ops: dict = {Operation.INDEX: [operator_entry]}
 
     with patch("dynastore.tools.discovery.get_protocols",
-               lambda proto: [_AssetES()] if proto is AssetIndexer else []):
-        _self_register_indexers_into(target_ops, AssetIndexer)
+               lambda proto: [_AssetES()] if proto is IndexTierDriver else []):
+        _self_register_indexers_into(target_ops, "asset")
 
     # No duplicate; operator-supplied entry preserved as-is.
     assert len(target_ops[Operation.INDEX]) == 1
@@ -512,18 +554,18 @@ def test_indexer_helper_blocked_when_index_lane_has_operator_entry():
     dedup of the entry that happens to share its driver_ref. Two installed
     indexers: one matches the existing operator entry's ref, one is a
     genuinely different, not-yet-listed driver. Neither gets appended."""
-    from typing import ClassVar
+    from typing import ClassVar, FrozenSet
     from unittest.mock import patch
 
-    from dynastore.models.protocols.indexer import AssetIndexer
+    from dynastore.models.protocols.indexer import IndexTierDriver
     from dynastore.modules.storage.routing_config import _self_register_indexers_into
 
     class _AssetEsPublic:
-        is_asset_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"asset"})
         auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     class _AssetEsPrivate:
-        is_asset_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"asset"})
         auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     operator_entry = OperationDriverEntry(driver_ref="_asset_es_public", source="operator")
@@ -531,9 +573,9 @@ def test_indexer_helper_blocked_when_index_lane_has_operator_entry():
 
     with patch(
         "dynastore.tools.discovery.get_protocols",
-        lambda proto: [_AssetEsPublic(), _AssetEsPrivate()] if proto is AssetIndexer else [],
+        lambda proto: [_AssetEsPublic(), _AssetEsPrivate()] if proto is IndexTierDriver else [],
     ):
-        _self_register_indexers_into(target_ops, AssetIndexer)
+        _self_register_indexers_into(target_ops, "asset")
 
     # Only the original operator entry — the second, distinct installed
     # indexer must NOT be silently appended alongside it.
@@ -550,7 +592,7 @@ def test_explicit_empty_index_survives_validate_round_trip():
     no entry to stamp with ``source``, so this must be gated independently
     of the operator-sourced-entry check (#3232 review)."""
     import asyncio
-    from typing import ClassVar
+    from typing import ClassVar, FrozenSet
     from unittest.mock import patch
 
     from dynastore.modules.storage.routing_config import (
@@ -559,7 +601,7 @@ def test_explicit_empty_index_survives_validate_round_trip():
     )
 
     class _ItemsES:
-        is_item_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"item"})
         auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     items = ItemsRoutingConfig(
@@ -583,23 +625,23 @@ def test_explicit_empty_index_survives_validate_round_trip():
 def test_absent_index_key_still_seeds_on_fresh_config():
     """Existing behavior pinned: an ABSENT INDEX key (no operator intent
     expressed at all) still defers to discovery and seeds INDEX."""
-    from typing import ClassVar
+    from typing import ClassVar, FrozenSet
     from unittest.mock import patch
 
-    from dynastore.models.protocols.indexer import AssetIndexer
+    from dynastore.models.protocols.indexer import IndexTierDriver
     from dynastore.modules.storage.routing_config import _self_register_indexers_into
 
     class _AssetES:
-        is_asset_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"asset"})
         auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     target_ops: dict = {}  # INDEX key absent entirely
 
     with patch(
         "dynastore.tools.discovery.get_protocols",
-        lambda proto: [_AssetES()] if proto is AssetIndexer else [],
+        lambda proto: [_AssetES()] if proto is IndexTierDriver else [],
     ):
-        _self_register_indexers_into(target_ops, AssetIndexer)
+        _self_register_indexers_into(target_ops, "asset")
 
     assert [e.driver_ref for e in target_ops[Operation.INDEX]] == ["_asset_es"]
     assert target_ops[Operation.INDEX][0].source == "auto"
@@ -609,14 +651,14 @@ def test_auto_only_index_entries_reregistration_is_idempotent():
     """INDEX present with only ``source="auto"`` entries still defers to
     discovery (gate 2/3 don't fire), and re-running self-registration
     against the same discoverable set never duplicates."""
-    from typing import ClassVar
+    from typing import ClassVar, FrozenSet
     from unittest.mock import patch
 
-    from dynastore.models.protocols.indexer import AssetIndexer
+    from dynastore.models.protocols.indexer import IndexTierDriver
     from dynastore.modules.storage.routing_config import _self_register_indexers_into
 
     class _AssetES:
-        is_asset_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"asset"})
         auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     target_ops: dict = {
@@ -625,10 +667,10 @@ def test_auto_only_index_entries_reregistration_is_idempotent():
 
     with patch(
         "dynastore.tools.discovery.get_protocols",
-        lambda proto: [_AssetES()] if proto is AssetIndexer else [],
+        lambda proto: [_AssetES()] if proto is IndexTierDriver else [],
     ):
-        _self_register_indexers_into(target_ops, AssetIndexer)
-        _self_register_indexers_into(target_ops, AssetIndexer)
+        _self_register_indexers_into(target_ops, "asset")
+        _self_register_indexers_into(target_ops, "asset")
 
     assert len(target_ops[Operation.INDEX]) == 1
     assert target_ops[Operation.INDEX][0].source == "auto"
@@ -641,14 +683,14 @@ def test_auto_only_index_entries_reregistration_is_idempotent():
 
 def test_catalog_routing_validator_augments_index_lane():
     """Constructing a default CatalogRoutingConfig must fold in a
-    discoverable CatalogIndexer into the INDEX lane."""
-    from typing import ClassVar
+    discoverable catalog-tier indexer into the INDEX lane."""
+    from typing import ClassVar, FrozenSet
     from unittest.mock import patch
 
     from dynastore.modules.storage.routing_config import index_entries
 
     class _CatES:
-        is_catalog_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"catalog"})
         auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     instance = _CatES()
@@ -689,13 +731,13 @@ def test_catalog_routing_validator_no_op_when_no_indexers_discoverable():
 
 def test_collection_routing_validator_augments_index_lane():
     """CollectionRoutingConfig validator augments operations[INDEX]."""
-    from typing import ClassVar
+    from typing import ClassVar, FrozenSet
     from unittest.mock import patch
 
     from dynastore.modules.storage.routing_config import index_entries
 
     class _ColES:
-        is_collection_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"collection"})
         auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     with patch("dynastore.tools.discovery.get_protocols",
@@ -708,15 +750,15 @@ def test_collection_routing_validator_augments_index_lane():
 
 def test_items_routing_validator_augments_index_lane():
     """The model_validator on ItemsRoutingConfig augments its `operations`
-    with discoverable ItemIndexer drivers into the INDEX lane.
+    with discoverable item-tier indexer drivers into the INDEX lane.
     """
-    from typing import ClassVar
+    from typing import ClassVar, FrozenSet
     from unittest.mock import patch
 
     from dynastore.modules.storage.routing_config import index_entries
 
     class _ItemsES:
-        is_item_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"item"})
         auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     with patch("dynastore.tools.discovery.get_protocols",
@@ -733,19 +775,19 @@ def test_items_routing_validator_augments_index_lane():
 def test_items_routing_index_optin_gate():
     """ItemsRoutingConfig INDEX gate is the per-Operation opt-in set.  A
     driver lands in the items INDEX lane iff its class declares
-    ``Operation.INDEX`` in ``auto_register_for_routing`` AND it satisfies
-    the ``ItemIndexer`` marker discovery.
+    ``Operation.INDEX`` in ``auto_register_for_routing`` AND ``"item"`` is
+    in its ``index_tiers``.
     """
-    from typing import ClassVar
+    from typing import ClassVar, FrozenSet
     from unittest.mock import patch
 
     class _OptedInIndexer:
-        is_item_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"item"})
         auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     class _OptedOutIndexer:
-        # Marker set but no Op-set declared → not auto-augmented.
-        is_item_indexer: ClassVar[bool] = True
+        # Tier claimed but no Op-set declared → not auto-augmented.
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"item"})
 
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: [_OptedInIndexer(), _OptedOutIndexer()]):
@@ -759,7 +801,7 @@ def test_items_routing_index_optin_gate():
 
 def test_asset_routing_validator_augments_index_lane():
     """AssetRoutingConfig validator augments the INDEX lane."""
-    from typing import ClassVar
+    from typing import ClassVar, FrozenSet
     from unittest.mock import patch
 
     from dynastore.modules.storage.routing_config import (
@@ -768,7 +810,7 @@ def test_asset_routing_validator_augments_index_lane():
     )
 
     class _AssetES:
-        is_asset_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"asset"})
         auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     with patch("dynastore.tools.discovery.get_protocols",
@@ -819,22 +861,21 @@ def test_indexer_helper_marks_entries_as_auto():
     """Entries created by `_self_register_indexers_into` carry
     `source="auto"` so operators can distinguish them in the API
     response."""
-    from typing import ClassVar
+    from typing import ClassVar, FrozenSet
     from unittest.mock import patch
 
-    from dynastore.models.protocols.indexer import CollectionIndexer
     from dynastore.modules.storage.routing_config import (
         _self_register_indexers_into,
     )
 
     class _ColES:
-        is_collection_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"collection"})
         auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     target_ops: dict = {}
     with patch("dynastore.tools.discovery.get_protocols",
                lambda proto: [_ColES()]):
-        _self_register_indexers_into(target_ops, CollectionIndexer)
+        _self_register_indexers_into(target_ops, "collection")
 
     assert len(target_ops[Operation.INDEX]) == 1
     assert target_ops[Operation.INDEX][0].source == "auto"
@@ -1089,11 +1130,11 @@ def test_option_a_fresh_construct_still_auto_augments():
     """End-to-end: constructing a config with no operator overrides
     still picks up discoverable drivers — boot defaults (source='auto')
     do not lock the helper."""
-    from typing import ClassVar
+    from typing import ClassVar, FrozenSet
     from unittest.mock import patch
 
     class _DiscoverableIndexer:
-        is_collection_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"collection"})
         auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     with patch("dynastore.tools.discovery.get_protocols",
@@ -1157,13 +1198,13 @@ def test_external_write_context_blocks_indexer_reinjection_on_removal():
       operator-managed and INDEX auto-registration is blocked — the
       operator's deletion sticks.
     """
-    from typing import ClassVar
+    from typing import ClassVar, FrozenSet
     from unittest.mock import patch
 
     from dynastore.modules.storage.routing_config import index_entries
 
     class _ItemsES:
-        is_item_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"item"})
         auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     # Baseline: no external-write context -> WRITE stays auto-sourced ->
@@ -1193,13 +1234,13 @@ def test_internal_construct_without_context_still_auto_augments():
     """No external-write context (internal DB-load / boot-default construction)
     => discoverable drivers still auto-register. Guards against the stamp
     over-reaching and freezing internal augmentation."""
-    from typing import ClassVar
+    from typing import ClassVar, FrozenSet
     from unittest.mock import patch
 
     from dynastore.modules.storage.routing_config import index_entries
 
     class _ItemsES:
-        is_item_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"item"})
         auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     with patch("dynastore.tools.discovery.get_protocols",
@@ -1370,13 +1411,13 @@ def test_1865_write_lock_also_gates_index_auto_registration():
     is the safe-by-default posture: an operator who explicitly manages
     WRITE for an entity does not get a silently-injected ES indexer.
     """
-    from typing import ClassVar
+    from typing import ClassVar, FrozenSet
     from unittest.mock import patch
 
     from dynastore.modules.storage.routing_config import index_entries
 
     class _ItemsES:
-        is_item_indexer: ClassVar[bool] = True
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"item"})
         auto_register_for_routing: ClassVar = frozenset({Operation.INDEX})
 
     # Stored config has WRITE=[pg], READ=[pg]. Operator PUTs the same
@@ -1418,8 +1459,8 @@ def test_validate_collection_routing_accepts_index_lane_entry_for_unregistered_d
     NOT fail collection routing validation.
 
     Regression for the ES-catalog routing preset apply: the default
-    ``CollectionRoutingConfig`` self-registers the ES ``CollectionIndexer``
-    into ``operations[INDEX]``.  A deployment where the ES driver isn't
+    ``CollectionRoutingConfig`` self-registers the ES collection-tier
+    indexer into ``operations[INDEX]``.  A deployment where the ES driver isn't
     locally installed must not roll back the whole routing bundle — the
     runtime router / drain skip any unregistered entry at dispatch.
     """
@@ -1482,18 +1523,18 @@ def test_validate_collection_routing_still_rejects_unknown_primary_store():
 def test_validate_collection_routing_skips_stale_indexer_in_read():
     """A routing config persisted before the ES-only collection routing fix could
     list the ES ``collection_elasticsearch_driver`` as a READ *primary*.  The ES
-    driver is a ``CollectionIndexer``, never a READ-capable ``CollectionStore``
-    — validating it against the store registry hard-raised
+    driver claims the ``collection`` INDEX tier, never a READ-capable
+    ``CollectionStore`` — validating it against the store registry hard-raised
     ``operations[READ] driver ... is not registered`` and blocked the catalog.
     It must be warn-skipped (the runtime router relaxes READ to an available
     store), so a stale catalog stays readable and self-heals on the next apply.
     """
     import asyncio
-    from typing import ClassVar
+    from typing import ClassVar, FrozenSet
     from unittest.mock import patch
 
     from dynastore.models.protocols.entity_store import CollectionStore
-    from dynastore.models.protocols.indexer import CollectionIndexer
+    from dynastore.models.protocols.indexer import IndexTierDriver
     from dynastore.modules.storage.routing_config import (
         _validate_collection_routing_config,
     )
@@ -1502,8 +1543,8 @@ def test_validate_collection_routing_skips_stale_indexer_in_read():
         capabilities = frozenset({Capability.WRITE, Capability.READ})
         supported_hints: frozenset = frozenset()
 
-    class CollectionElasticsearchDriver:  # a CollectionIndexer, NOT a store
-        is_collection_indexer: ClassVar[bool] = True
+    class CollectionElasticsearchDriver:  # claims "collection", NOT a store
+        index_tiers: ClassVar[FrozenSet[str]] = frozenset({"collection"})
         auto_register_for_routing: ClassVar = frozenset(
             {Operation.INDEX, Operation.READ}
         )
@@ -1514,7 +1555,7 @@ def test_validate_collection_routing_skips_stale_indexer_in_read():
     def _fake_get_protocols(proto):
         if proto is CollectionStore:
             return [pg]
-        if proto is CollectionIndexer:
+        if proto is IndexTierDriver:
             return [es]
         return []
 
@@ -1543,8 +1584,8 @@ def test_validate_collection_routing_skips_stale_indexer_in_read():
 
 def test_validate_collection_routing_still_rejects_unknown_read_driver():
     """A READ entry whose driver_ref is neither a registered ``CollectionStore``
-    nor a known ``CollectionIndexer`` (a genuine typo) still hard-fails — the
-    indexer skip must not weaken typo protection on the READ side.
+    nor a known collection-tier indexer (a genuine typo) still hard-fails —
+    the indexer skip must not weaken typo protection on the READ side.
     """
     import asyncio
     from unittest.mock import patch
@@ -1567,3 +1608,45 @@ def test_validate_collection_routing_still_rejects_unknown_read_driver():
             asyncio.run(_validate_collection_routing_config(
                 cfg, catalog_id=None, collection_id=None, db_resource=None,
             ))
+
+
+# ---------------------------------------------------------------------------
+# Structural validation — a tier-claiming class without index_bulk
+# ---------------------------------------------------------------------------
+
+
+def test_validate_routing_entries_rejects_index_driver_without_index_bulk():
+    """A driver claiming an index tier (``index_tiers``) is not, by itself,
+    enough to serve as an INDEX-lane materialization target: it must also
+    structurally provide ``index_bulk`` (the :class:`Indexer` protocol
+    surface the drain consumes).  Claiming a tier without wiring the drain
+    surface is rejected with a clear error naming the class and the
+    missing method — checked independently of ``index_tiers``, which is a
+    discovery/seeding concern, not a capability guarantee."""
+    import pytest
+
+    from dynastore.modules.storage.routing_config import (
+        _validate_routing_entries,
+    )
+
+    class _ClaimsItemTierButNoIndexBulk:
+        """Claims the ``item`` tier but never implements ``ensure_indexer``
+        / ``index`` / ``index_bulk`` — fails the structural Indexer check."""
+
+        index_tiers = frozenset({"item"})
+        supported_hints: frozenset = frozenset()
+        capabilities: frozenset = frozenset()
+
+    driver = _ClaimsItemTierButNoIndexBulk()
+    cfg = ItemsRoutingConfig()
+    cfg.operations.clear()
+    cfg.operations[Operation.INDEX] = [
+        OperationDriverEntry(driver_ref="fake_index_driver", source="auto"),
+    ]
+
+    driver_index = {"fake_index_driver": driver}
+
+    with pytest.raises(
+        ValueError, match="does not implement the Indexer protocol",
+    ):
+        _validate_routing_entries(cfg, driver_index, "Items routing config")

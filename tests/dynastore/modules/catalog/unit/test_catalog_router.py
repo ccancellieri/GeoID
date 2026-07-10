@@ -237,7 +237,7 @@ async def test_upsert_catalog_metadata_second_driver_skipped_on_first_failure():
 async def test_upsert_degrades_when_secondary_index_driver_fails(caplog):
     """A secondary-index (ES) WRITE failure degrades to async reindex.
 
-    The catalog ES driver marks itself ``is_catalog_indexer = True`` and is
+    The catalog ES driver claims ``"catalog" in index_tiers`` and is
     reindexed off the ``catalog_metadata_changed`` event emitted after the
     fan-out.  When its client is unavailable (e.g. on an env with no catalog
     ES), the synchronous write must NOT abort the canonical PG write — it is
@@ -249,11 +249,11 @@ async def test_upsert_degrades_when_secondary_index_driver_fails(caplog):
     )
 
     core = MagicMock()
-    core.is_catalog_indexer = False
+    core.index_tiers = frozenset()
     core.upsert_catalog_metadata = AsyncMock()
 
     es = MagicMock()
-    es.is_catalog_indexer = True
+    es.index_tiers = frozenset({"catalog"})
     es.upsert_catalog_metadata = AsyncMock(
         side_effect=RuntimeError("Elasticsearch client not available"),
     )
@@ -275,16 +275,17 @@ async def test_upsert_degrades_when_secondary_index_driver_fails(caplog):
 async def test_upsert_primary_failure_still_fatal_even_with_indexer_present():
     """A primary (PG) WRITE failure stays fatal regardless of indexers.
 
-    Guards the asymmetry: only ``is_catalog_indexer`` drivers degrade; the
-    canonical PG store must still propagate so the lifecycle SAVEPOINT rolls
-    back (and so the existing all-or-nothing dual-write contract holds).
+    Guards the asymmetry: only drivers claiming ``"catalog"`` in
+    ``index_tiers`` degrade; the canonical PG store must still propagate
+    so the lifecycle SAVEPOINT rolls back (and so the existing
+    all-or-nothing dual-write contract holds).
     """
     from dynastore.modules.catalog.catalog_router import (
         upsert_catalog_metadata,
     )
 
     core = MagicMock()
-    core.is_catalog_indexer = False
+    core.index_tiers = frozenset()
     core.upsert_catalog_metadata = AsyncMock(
         side_effect=RuntimeError("pg error on CORE"),
     )
@@ -307,11 +308,11 @@ async def test_delete_degrades_when_secondary_index_driver_fails(caplog):
     )
 
     core = MagicMock()
-    core.is_catalog_indexer = False
+    core.index_tiers = frozenset()
     core.delete_catalog_metadata = AsyncMock()
 
     es = MagicMock()
-    es.is_catalog_indexer = True
+    es.index_tiers = frozenset({"catalog"})
     es.delete_catalog_metadata = AsyncMock(
         side_effect=RuntimeError("Elasticsearch client not available"),
     )
@@ -683,20 +684,20 @@ class TestRoutedWriteFanOutIncludesEveryEntry:
     @pytest.mark.asyncio
     async def test_discovery_fallback_excludes_is_catalog_indexer_driver(self, monkeypatch):
         """When _routed_catalog_drivers returns None (ConfigsProtocol unavailable),
-        the discovery fallback uses the is_catalog_indexer ClassVar to exclude
-        secondary-index drivers from the sync write set.
+        the discovery fallback uses the driver's ``index_tiers`` ClassVar to
+        exclude secondary-index drivers from the sync write set.
         """
         from unittest.mock import AsyncMock, MagicMock, patch
         from dynastore.modules.catalog.catalog_router import upsert_catalog_metadata
 
         primary = MagicMock()
         primary.capabilities = frozenset({"write"})
-        primary.is_catalog_indexer = False
+        primary.index_tiers = frozenset()
         primary.upsert_catalog_metadata = AsyncMock()
 
         es_indexer = MagicMock()
         es_indexer.capabilities = frozenset({"write"})
-        es_indexer.is_catalog_indexer = True
+        es_indexer.index_tiers = frozenset({"catalog"})
         es_indexer.upsert_catalog_metadata = AsyncMock()
 
         with (

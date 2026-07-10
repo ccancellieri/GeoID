@@ -29,14 +29,6 @@ from __future__ import annotations
 import inspect
 from unittest.mock import AsyncMock, patch
 
-from dynastore.models.protocols.indexer import (
-    AssetIndexer,
-    CatalogIndexer,
-    CollectionIndexer,
-    ItemAssetIndexer,
-    ItemIndexer,
-    PlatformAssetIndexer,
-)
 from dynastore.models.protocols.entity_store import EntityStoreCapability
 from dynastore.modules.elasticsearch.catalog_es_driver import (
     CatalogElasticsearchDriver,
@@ -68,17 +60,11 @@ def test_capabilities_set_matches_protocol():
 
 
 def test_marker_opt_in_catalog_only():
-    """Driver opts into :class:`CatalogIndexer` only.  Pin against
+    """Driver claims the ``catalog`` INDEX tier only.  Pin against
     accidental future tier opt-ins (would surface routing fan-out
     that nothing supports yet).
     """
-    obj = CatalogElasticsearchDriver()
-    assert isinstance(obj, CatalogIndexer)
-    assert not isinstance(obj, CollectionIndexer)
-    assert not isinstance(obj, AssetIndexer)
-    assert not isinstance(obj, ItemIndexer)
-    assert not isinstance(obj, ItemAssetIndexer)
-    assert not isinstance(obj, PlatformAssetIndexer)
+    assert CatalogElasticsearchDriver.index_tiers == frozenset({"catalog"})
 
 
 def test_typed_driver_bind_resolves():
