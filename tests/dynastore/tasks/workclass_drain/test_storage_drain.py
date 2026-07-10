@@ -1593,6 +1593,7 @@ async def test_run_reports_split_completion_metrics():
 
     assert report.metrics == {
         "drained": 6, "indexed": 3, "auto_done": 2, "retried": 1,
+        "dead_lettered": 0,
     }
 
 
@@ -1635,6 +1636,7 @@ async def test_run_resets_split_metrics_between_runs():
 
     assert report.metrics == {
         "drained": 0, "indexed": 0, "auto_done": 0, "retried": 0,
+        "dead_lettered": 0,
     }
 
 

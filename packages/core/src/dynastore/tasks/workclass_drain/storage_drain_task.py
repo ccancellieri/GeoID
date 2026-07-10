@@ -65,7 +65,8 @@ import asyncio
 import logging
 import time
 from dataclasses import replace as _dataclass_replace
-from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple, cast
+from datetime import datetime, timezone
+from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple, cast
 from uuid import UUID, uuid4
 from weakref import WeakKeyDictionary
 
@@ -157,6 +158,19 @@ _DEFAULT_INPROCESS_MAX_BYTES: int = 32 * 1024 * 1024
 # crossing the byte budget) still hands off rather than holding the catalog
 # API pod's request-serving capacity hostage indefinitely.
 _DEFAULT_INPROCESS_MAX_SECONDS: float = 5.0
+
+# Dead-letter backstop for rows whose driver_id resolves to no local
+# BulkIndexer (#3165). Matches TasksPluginConfig.storage_drain_unresolvable_
+# max_attempts / storage_drain_unresolvable_max_age_seconds — see
+# _handle_unresolvable_rows for the full B (routing-config membership) + A
+# (this cutoff) dead-letter mechanism. 200 attempts is roughly 4 days at the
+# ~30 min backoff cap; 7 days is the independent wall-clock ceiling. Both are
+# deliberately generous: a driver_id that is still listed in the collection's
+# routing config but not registered in THIS process (a driver living on a
+# temporarily-down sibling service, in a split deployment) must not be
+# dead-lettered prematurely just because this worker keeps claiming it.
+_DEFAULT_UNRESOLVABLE_MAX_ATTEMPTS: int = 200
+_DEFAULT_UNRESOLVABLE_MAX_AGE_SECONDS: int = 7 * 24 * 60 * 60  # 7 days
 
 
 def _backoff(attempts: int) -> int:
@@ -259,6 +273,8 @@ class StorageDrainTask(TaskProtocol):
         hydration_byte_budget: int = _DEFAULT_HYDRATION_BYTE_BUDGET,
         inprocess_max_bytes: int = _DEFAULT_INPROCESS_MAX_BYTES,
         inprocess_max_seconds: float = _DEFAULT_INPROCESS_MAX_SECONDS,
+        unresolvable_max_attempts: int = _DEFAULT_UNRESOLVABLE_MAX_ATTEMPTS,
+        unresolvable_max_age_seconds: int = _DEFAULT_UNRESOLVABLE_MAX_AGE_SECONDS,
     ) -> None:
         self.app_state = app_state
         self.batch_size = batch_size
@@ -266,6 +282,8 @@ class StorageDrainTask(TaskProtocol):
         self.hydration_byte_budget = hydration_byte_budget
         self.inprocess_max_bytes = inprocess_max_bytes
         self.inprocess_max_seconds = inprocess_max_seconds
+        self.unresolvable_max_attempts = unresolvable_max_attempts
+        self.unresolvable_max_age_seconds = unresolvable_max_age_seconds
         # Cumulative hydrated bytes processed by the most recent drain_once()
         # call — a side channel that keeps drain_once's public return type
         # ``int`` (row count) unchanged for existing callers/tests, while
@@ -284,16 +302,31 @@ class StorageDrainTask(TaskProtocol):
         # (#2494 P1 canonical re-read — shared by every id-only group under
         # the same catalog).
         self._known_fields_cache: Dict[str, Any] = {}
+        # (catalog_id, collection_id) -> the set of driver_refs configured
+        # across every lane of that collection's ItemsRoutingConfig, or
+        # ``None`` when membership could not be established confidently
+        # (#3165 mechanism B) — memoised for this run, mirrors
+        # ``_indexer_cache``. See ``_resolve_routing_membership``.
+        self._routing_membership_cache: Dict[
+            Tuple[str, str], Optional[FrozenSet[str]]
+        ] = {}
+        # (reason, driver_id, catalog_id, collection_id) already logged this
+        # run (#3165) — dead-lettering is per-row (``_mark_dead``), but the
+        # WARNING that explains why is emitted once per group, not once per
+        # row, so a large stuck backlog cannot flood the log.
+        self._dead_letter_warned: Set[Tuple[str, str, str, str]] = set()
         # Split completion counters for this run (#2731): 'indexed' rows went
         # through a BulkIndexer and were reported passed; 'auto_done' rows were
         # resolved as done WITHOUT the indexer (canonical row verifiably absent
         # — a legitimate deleted-item skip); 'retried' rows were funnelled to
         # backoff for any reason (indexer error, unresolved driver, failed
         # canonical re-read, canonical doc build failure, an indexer-reported
-        # transient result, or an indexer omission). Reset at the start of
-        # every ``run()``; accumulated by ``drain_once()``.
+        # transient result, or an indexer omission); 'dead_lettered' rows were
+        # marked terminal by the #3165 B (routing-config membership) or A
+        # (age/attempts backstop) mechanism. Reset at the start of every
+        # ``run()``; accumulated by ``drain_once()``.
         self._run_metrics: Dict[str, int] = {
-            "indexed": 0, "auto_done": 0, "retried": 0,
+            "indexed": 0, "auto_done": 0, "retried": 0, "dead_lettered": 0,
         }
 
     async def run(self, payload: TaskPayload) -> TaskReport:
@@ -362,9 +395,21 @@ class StorageDrainTask(TaskProtocol):
         # per run. Only consulted when ``_inprocess_budget_enabled`` (the
         # ``storage_drain_offload`` subclass never resolves or checks it).
         inprocess_max_bytes, inprocess_max_seconds = await self._resolve_inprocess_budget()
+        # Hot-reloaded dead-letter age/attempts cutoff (#3165), resolved once
+        # per run and stamped onto self (rather than threaded through
+        # drain_once's call signature, unlike batch_size/hydration_byte_budget
+        # above) so drain_once's public signature stays unchanged for
+        # existing internal callers/tests. Backstop mechanism A — applies
+        # only to rows mechanism B (routing-config membership) did not
+        # classify; see _handle_unresolvable_rows.
+        self.unresolvable_max_attempts, self.unresolvable_max_age_seconds = (
+            await self._resolve_unresolvable_cutoff()
+        )
         # Reset the split counters for this run — drain_once accumulates
         # into self._run_metrics as it classifies each claimed batch (#2731).
-        self._run_metrics = {"indexed": 0, "auto_done": 0, "retried": 0}
+        self._run_metrics = {
+            "indexed": 0, "auto_done": 0, "retried": 0, "dead_lettered": 0,
+        }
         # Cross-pod single-flight (#3144): at most one in-process storage
         # drain runs platform-wide, so a reclaim after lagging heartbeat
         # writes can no longer make two pods pay the same hydration transient
@@ -565,6 +610,42 @@ class StorageDrainTask(TaskProtocol):
             )
         return self.inprocess_max_bytes, self.inprocess_max_seconds
 
+    async def _resolve_unresolvable_cutoff(self) -> Tuple[int, int]:
+        """Resolve the ``TasksPluginConfig.storage_drain_unresolvable_max_attempts``
+        / ``storage_drain_unresolvable_max_age_seconds`` pair, hot-reloaded
+        (#3165).
+
+        Mirrors ``_resolve_batch_size``'s fallback pattern: falls back to the
+        instance defaults (constructor values, themselves matching the field
+        defaults) when the platform configs protocol is unavailable — early
+        startup, lightweight worker contexts, tests.
+        """
+        try:
+            from dynastore.models.protocols.platform_configs import (
+                PlatformConfigsProtocol,
+            )
+            from dynastore.modules.tasks.tasks_config import TasksPluginConfig
+            from dynastore.tools.discovery import get_protocol
+
+            config_mgr = get_protocol(PlatformConfigsProtocol)
+            if config_mgr is not None:
+                cfg = await config_mgr.get_config(TasksPluginConfig)
+                if isinstance(cfg, TasksPluginConfig):
+                    return (
+                        int(cfg.storage_drain_unresolvable_max_attempts),
+                        int(cfg.storage_drain_unresolvable_max_age_seconds),
+                    )
+        except Exception:  # noqa: BLE001 — config read is best-effort
+            logger.debug(
+                "StorageDrainTask: storage_drain_unresolvable_max_attempts/"
+                "storage_drain_unresolvable_max_age_seconds unavailable — "
+                "falling back to the instance defaults (%d, %d).",
+                self.unresolvable_max_attempts,
+                self.unresolvable_max_age_seconds,
+                exc_info=True,
+            )
+        return self.unresolvable_max_attempts, self.unresolvable_max_age_seconds
+
     async def _handoff_to_offload_job(self, engine: Any) -> None:
         """Enqueue the ``storage_drain_offload`` trigger (#2732 step 4).
 
@@ -650,6 +731,13 @@ class StorageDrainTask(TaskProtocol):
         (#2723) — the byte budget bounding hydrated-payload sub-chunks; ``None``
         keeps ``self.hydration_byte_budget``.
 
+        Unresolvable-driver dead-letter cutoff (#3165): unlike the two knobs
+        above, ``self.unresolvable_max_attempts`` / ``self.unresolvable_max_age_seconds``
+        are read directly (not threaded through this call) — ``_run_drain``
+        hot-reloads and stamps them onto ``self`` once per run instead, so
+        this method's signature stays unchanged for existing internal
+        callers/tests.
+
         Sub-chunk indexer exception: a sub-chunk that raises funnels only ITS
         rows to the retry path (#2723) — a flaky indexer can never lose data,
         and one bad sub-chunk no longer forces a retry of rows that would
@@ -657,9 +745,12 @@ class StorageDrainTask(TaskProtocol):
         is the indexer's responsibility.
 
         If a ``driver_id`` in the claimed batch cannot be resolved to a
-        ``BulkIndexer``, those rows are treated as transient-retry so
-        they are not dropped; they will be retried once a capable pod
-        becomes available or the issue is resolved.
+        ``BulkIndexer``, those rows are classified by
+        :meth:`_handle_unresolvable_rows` (#3165): dead-lettered when the
+        collection's routing config confirms ``driver_id`` is configured
+        nowhere, dead-lettered when the age/attempts backstop is exhausted,
+        or funnelled to the ordinary retry/backoff path otherwise — they are
+        never silently dropped.
         """
         from dynastore.modules.tasks.tasks_module import get_task_schema
 
@@ -687,12 +778,14 @@ class StorageDrainTask(TaskProtocol):
         for row in rows:
             by_driver.setdefault(row["driver_id"], []).append(row)
 
-        # Per-batch classification counters (#2731): logged below and folded
-        # into self._run_metrics so a drain's completion report can never
-        # again describe auto_done/retried rows as uniformly "processed".
+        # Per-batch classification counters (#2731, #3165): logged below and
+        # folded into self._run_metrics so a drain's completion report can
+        # never again describe auto_done/retried/dead_lettered rows as
+        # uniformly "processed".
         batch_indexed = 0
         batch_auto_done = 0
         batch_retried = 0
+        batch_dead_lettered = 0
         # Cumulative hydrated-document bytes across every driver in this
         # batch (#2732 step 4) — the run()-level in-process drain budget
         # signal, surfaced via self._last_batch_bytes below.
@@ -701,23 +794,17 @@ class StorageDrainTask(TaskProtocol):
         for driver_id, driver_rows in by_driver.items():
             indexer = await self._resolve_indexer(driver_id)
             if indexer is None:
-                logger.warning(
-                    "StorageDrainTask: driver_id=%r is not registered — "
-                    "%d row(s) queued for retry. Registration is required: "
-                    "the owning driver's module must be installed and "
-                    "instantiated for this runtime's SCOPE so it registers "
-                    "into the storage driver registry.",
-                    driver_id,
-                    len(driver_rows),
-                )
-                await self._apply_retry_all(
+                unresolvable_counts = await self._handle_unresolvable_rows(
                     engine=engine,
                     task_schema=task_schema,
-                    rows=driver_rows,
+                    driver_id=driver_id,
+                    driver_rows=driver_rows,
                     owner_id=owner_id,
-                    error=f"indexer not registered: {driver_id}",
+                    max_attempts=self.unresolvable_max_attempts,
+                    max_age_seconds=self.unresolvable_max_age_seconds,
                 )
-                batch_retried += len(driver_rows)
+                batch_retried += unresolvable_counts["retried"]
+                batch_dead_lettered += unresolvable_counts["dead_lettered"]
                 continue
 
             # Streams hydration + dispatch in byte-budgeted sub-chunks
@@ -741,12 +828,15 @@ class StorageDrainTask(TaskProtocol):
         self._run_metrics["indexed"] += batch_indexed
         self._run_metrics["auto_done"] += batch_auto_done
         self._run_metrics["retried"] += batch_retried
+        self._run_metrics["dead_lettered"] += batch_dead_lettered
         # Side channel for run()'s in-process drain budget (#2732 step 4) —
         # drain_once's public return type stays the row count.
         self._last_batch_bytes = batch_bytes
         logger.info(
-            "StorageDrainTask: batch claimed=%d indexed=%d auto_done=%d retried=%d",
+            "StorageDrainTask: batch claimed=%d indexed=%d auto_done=%d "
+            "retried=%d dead_lettered=%d",
             len(rows), batch_indexed, batch_auto_done, batch_retried,
+            batch_dead_lettered,
         )
 
         return len(rows)
@@ -793,7 +883,7 @@ class StorageDrainTask(TaskProtocol):
             f" WHERE w.day = claimed.day AND w.op_id = claimed.op_id"
             f" RETURNING w.day, w.op_id, w.driver_id, w.catalog_id, w.collection_id,"
             f"           w.op, w.entity_id, w.write_id, w.idempotency_key,"
-            f"           w.attempts, w.claim_version, w.claimed_by"
+            f"           w.attempts, w.claim_version, w.claimed_by, w.created_at"
         )
 
         async with managed_transaction(engine) as conn:
@@ -1649,6 +1739,239 @@ class StorageDrainTask(TaskProtocol):
                 owner_id=owner_id,
                 error=error,
             )
+
+    # ------------------------------------------------------------------
+    # Unresolvable-driver dead-letter classification (#3165)
+    # ------------------------------------------------------------------
+
+    async def _handle_unresolvable_rows(
+        self,
+        *,
+        engine: Any,
+        task_schema: str,
+        driver_id: str,
+        driver_rows: List[Dict[str, Any]],
+        owner_id: str,
+        max_attempts: int,
+        max_age_seconds: int,
+    ) -> Dict[str, int]:
+        """Classify rows whose ``driver_id`` resolved to no local ``BulkIndexer``.
+
+        Two mechanisms, B fires first:
+
+        B — routing-config membership.  For each distinct
+        ``(catalog_id, collection_id)`` among ``driver_rows``, resolve the
+        set of ``driver_ref``s configured across EVERY lane (WRITE / READ /
+        INDEX) of that collection's ``ItemsRoutingConfig`` — the raw
+        config-level membership, never the resolved-driver pipeline (which
+        would only ever list drivers registered in THIS process — a driver
+        configured on a split deployment's sibling service must not be
+        dead-lettered just because it isn't installed here). When that
+        membership is readable and non-empty and does NOT list
+        ``driver_id``, the driver is configured nowhere reachable from this
+        config — no future retry could ever resolve it — so every row in
+        the group is dead-lettered immediately (reason
+        ``driver_unregistered``). See :meth:`_resolve_routing_membership`
+        for exactly which cases count as "not confidently readable" (config
+        absent, unreadable, empty, or ``collection_id`` unset) — those fall
+        through to A rather than risk a false negative that silently drops
+        index writes.
+
+        A — age/attempts backstop.  Rows B did not dead-letter (including
+        rows where the driver IS configured but simply not registered in
+        this process — the split-deployment case) are retried as before
+        UNLESS ``attempts >= max_attempts`` or the row is older than
+        ``max_age_seconds``, in which case they are dead-lettered too
+        (reason ``unresolvable_driver_exhausted``). ``0`` disables the
+        corresponding cutoff. Both thresholds default generously (#3165)
+        specifically so a driver living on a temporarily-down sibling
+        service is never killed prematurely by this backstop.
+
+        Returns ``{"retried": n, "dead_lettered": n}`` for the caller's
+        per-batch classification counters (mirrors ``_apply_outcomes``).
+        """
+        counts = {"retried": 0, "dead_lettered": 0}
+
+        by_scope: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        for row in driver_rows:
+            key = (row["catalog_id"], row.get("collection_id") or "")
+            by_scope.setdefault(key, []).append(row)
+
+        for (catalog_id, collection_id), scope_rows in by_scope.items():
+            membership = await self._resolve_routing_membership(
+                catalog_id, collection_id,
+            )
+            if membership is not None and driver_id not in membership:
+                for row in scope_rows:
+                    await self._mark_dead(
+                        engine=engine, task_schema=task_schema, row=row,
+                        owner_id=owner_id,
+                    )
+                counts["dead_lettered"] += len(scope_rows)
+                self._warn_dead_letter_once(
+                    "driver_unregistered", driver_id, catalog_id, collection_id,
+                    "StorageDrainTask: driver_id=%r is not configured in any "
+                    "lane of %s/%s's items routing config — %d row(s) "
+                    "dead-lettered (#3165 reason=driver_unregistered). Dead "
+                    "rows are recoverable: UPDATE ... SET status='ready', "
+                    "attempts=0 once the driver is (re)configured.",
+                    driver_id, catalog_id, collection_id, len(scope_rows),
+                )
+                continue
+
+            # Not B: config absent/unreadable/empty/collectionless, or the
+            # driver IS configured somewhere (split-deployment guard) — fall
+            # through to the age/attempts backstop.
+            exhausted_rows: List[Dict[str, Any]] = []
+            for row in scope_rows:
+                if self._unresolvable_row_exhausted(
+                    row, max_attempts=max_attempts, max_age_seconds=max_age_seconds,
+                ):
+                    await self._mark_dead(
+                        engine=engine, task_schema=task_schema, row=row,
+                        owner_id=owner_id,
+                    )
+                    counts["dead_lettered"] += 1
+                    exhausted_rows.append(row)
+                else:
+                    await self._mark_retry(
+                        engine=engine, task_schema=task_schema, row=row,
+                        owner_id=owner_id,
+                        error=f"indexer not registered: {driver_id}",
+                    )
+                    counts["retried"] += 1
+
+            if exhausted_rows:
+                attempts_seen = [int(r.get("attempts") or 0) for r in exhausted_rows]
+                self._warn_dead_letter_once(
+                    "unresolvable_driver_exhausted", driver_id, catalog_id,
+                    collection_id,
+                    "StorageDrainTask: driver_id=%r still unresolved for %s/%s "
+                    "after exhausting the age/attempts backstop — %d row(s) "
+                    "dead-lettered (#3165 reason=unresolvable_driver_exhausted, "
+                    "attempts=%d-%d, max_attempts=%d, max_age_seconds=%d). Dead "
+                    "rows are recoverable: UPDATE ... SET status='ready', "
+                    "attempts=0 once the driver is registered.",
+                    driver_id, catalog_id, collection_id, len(exhausted_rows),
+                    min(attempts_seen), max(attempts_seen),
+                    max_attempts, max_age_seconds,
+                )
+
+        return counts
+
+    def _unresolvable_row_exhausted(
+        self, row: Dict[str, Any], *, max_attempts: int, max_age_seconds: int,
+    ) -> bool:
+        """True when ``row`` has exhausted the #3165 mechanism A backstop.
+
+        ``0`` disables the corresponding cutoff (mirrors the
+        ``> 0 and`` pattern used by the in-process byte/wall-clock budget in
+        :meth:`_run_drain`). A row with no ``created_at`` (defensive only —
+        the column is ``NOT NULL`` in production) never trips the age
+        cutoff on its own.
+        """
+        attempts = int(row.get("attempts") or 0)
+        if max_attempts > 0 and attempts >= max_attempts:
+            return True
+        created_at = row.get("created_at")
+        if max_age_seconds > 0 and created_at is not None:
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            age_seconds = (datetime.now(timezone.utc) - created_at).total_seconds()
+            if age_seconds >= max_age_seconds:
+                return True
+        return False
+
+    async def _resolve_routing_membership(
+        self, catalog_id: str, collection_id: str,
+    ) -> Optional[FrozenSet[str]]:
+        """Return every ``driver_ref`` configured across ALL lanes of
+        ``collection_id``'s ``ItemsRoutingConfig``, or ``None`` when
+        membership cannot be established with confidence (#3165 mechanism B
+        guard).
+
+        ``None`` covers: no ``collection_id`` (a catalog-tier obligation —
+        out of scope for the items routing config), the ``ConfigsProtocol``
+        unavailable, the config read raising, or the resolved config
+        carrying no entries in any lane. Any of these must fall through to
+        mechanism A rather than risk a false "not configured" that would
+        silently stop indexing for a driver that genuinely is configured —
+        just not confidently observable right now.
+
+        Reads the config via ``ConfigsProtocol.get_config`` — the 4-tier
+        (collection/catalog/platform/defaults) waterfall — never the
+        resolved-driver pipeline (:func:`router.resolve_drivers`), which
+        would filter to drivers registered in THIS process and defeat the
+        split-deployment guard. The read is not perfectly raw: config
+        validation (``_RoutingConfigBase``'s after-validator) self-registers
+        THIS process's discovered ``IndexTierDriver`` implementations into
+        the INDEX lane. That is safe-directional: self-registration only
+        ever ADDS ``driver_ref`` entries, so it can only enlarge membership
+        and bias toward "still configured" (retry / mechanism A), never
+        toward a false dead-letter — and it cannot add the very driver being
+        classified here, which by definition already failed local registry
+        resolution. Memoised per ``(catalog_id, collection_id)`` for the
+        lifetime of this run, mirroring ``self._indexer_cache``.
+        """
+        if not collection_id:
+            return None
+
+        cache_key = (catalog_id, collection_id)
+        if cache_key in self._routing_membership_cache:
+            return self._routing_membership_cache[cache_key]
+
+        membership: Optional[FrozenSet[str]] = None
+        try:
+            from dynastore.models.protocols.configs import ConfigsProtocol
+            from dynastore.modules.storage.routing_config import ItemsRoutingConfig
+            from dynastore.tools.discovery import get_protocol
+
+            configs = get_protocol(ConfigsProtocol)
+            if configs is not None:
+                routing_config = await configs.get_config(
+                    ItemsRoutingConfig,
+                    catalog_id=catalog_id,
+                    collection_id=collection_id,
+                )
+                refs = {
+                    entry.driver_ref
+                    for entries in routing_config.operations.values()
+                    for entry in entries
+                }
+                if refs:
+                    membership = frozenset(refs)
+        except Exception:  # noqa: BLE001 — membership lookup is best-effort
+            logger.debug(
+                "StorageDrainTask: routing-config membership lookup failed "
+                "for %s/%s — treating as unresolvable (falls through to the "
+                "#3165 age/attempts backstop).",
+                catalog_id, collection_id, exc_info=True,
+            )
+            membership = None
+
+        self._routing_membership_cache[cache_key] = membership
+        return membership
+
+    def _warn_dead_letter_once(
+        self,
+        reason: str,
+        driver_id: str,
+        catalog_id: str,
+        collection_id: str,
+        msg: str,
+        *args: Any,
+    ) -> None:
+        """Emit ``msg % args`` as a WARNING at most once per
+        ``(reason, driver_id, catalog_id, collection_id)`` for this run
+        (#3165) — dead-lettering itself stays per-row (:meth:`_mark_dead`),
+        but a stuck backlog spanning thousands of rows must not flood the
+        log with one WARNING per row.
+        """
+        key = (reason, driver_id, catalog_id, collection_id)
+        if key in self._dead_letter_warned:
+            return
+        self._dead_letter_warned.add(key)
+        logger.warning(msg, *args)
 
     # ------------------------------------------------------------------
     # Fenced terminal writes (CAS on claimed_by + claim_version)

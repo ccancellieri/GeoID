@@ -349,6 +349,46 @@ class TasksPluginConfig(ExposableConfigMixin, PluginConfig):
         ),
     )
 
+    storage_drain_unresolvable_max_attempts: Mutable[int] = Field(
+        default=200,
+        ge=0,
+        description=(
+            "#3165: age/attempts dead-letter backstop for tasks.storage rows "
+            "whose driver_id cannot be resolved to a local BulkIndexer by "
+            "any drain worker that has claimed them (e.g. the driver's "
+            "module was removed from every deployed service). A row whose "
+            "attempts reach this value is marked 'dead' (terminal) with "
+            "reason unresolvable_driver_exhausted instead of retrying "
+            "forever. 200 is roughly 4 days at storage_drain's ~30 min "
+            "backoff cap — deliberately generous so a driver_id that is "
+            "still configured but living on a temporarily-down sibling "
+            "service (split deployment) is never killed prematurely. "
+            "Fires only for rows a routing-config membership check "
+            "(mechanism B) did not already dead-letter as definitively "
+            "unregistered. ``0`` disables this cutoff (forever-retry, "
+            "pre-#3165 behaviour). Dead rows are recoverable: "
+            "UPDATE ... SET status='ready', attempts=0. Read once per drain "
+            "run via the platform configs hot-reload path; no restart "
+            "required."
+        ),
+    )
+
+    storage_drain_unresolvable_max_age_seconds: Mutable[int] = Field(
+        default=7 * 24 * 60 * 60,  # 7 days
+        ge=0,
+        description=(
+            "#3165: companion wall-clock cutoff to "
+            "storage_drain_unresolvable_max_attempts — a still-unresolvable "
+            "row older than this (by created_at) is marked 'dead' "
+            "regardless of its attempts count. 7 days is deliberately "
+            "generous for the same reason: a driver_id configured on a "
+            "temporarily-down sibling service must not be killed "
+            "prematurely. ``0`` disables this cutoff. Read once per drain "
+            "run via the platform configs hot-reload path; no restart "
+            "required."
+        ),
+    )
+
     event_drain_inprocess_max_seconds: Mutable[float] = Field(
         default=5.0,
         ge=0.0,
