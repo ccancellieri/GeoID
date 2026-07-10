@@ -8,6 +8,16 @@
 .gitignore
 .github
 
+# Environment / secrets — developer and CI `.env*` files (real IDP client
+# secrets, sysadmin tokens, DB credentials) must never enter the build
+# context, or `COPY packages ./packages` / `COPY pyproject.toml .en[v]* ./`
+# bakes them into an image layer. Runtime config still reaches containers
+# via compose `env_file:` and platform env vars / Secret Manager mounts,
+# which read straight from the host filesystem — this rule does not touch
+# those paths, only what gets sent to the Docker build.
+**/.env
+**/.env.*
+
 # Virtualenvs
 .venv
 venv
