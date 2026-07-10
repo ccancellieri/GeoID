@@ -150,10 +150,17 @@ namespaces = true
 [tool.setuptools.package-data]
 # Inherit the same broad globs the root meta-package used before the split.
 # Captures HTML/SQL/MD docstrings, package-shipped JS/CSS, notebook templates,
-# Kibana NDJSON dashboards, shell startup scripts, .env baselines, the
+# Kibana NDJSON dashboards, shell startup scripts, .env baselines, JSON config
+# defaults (docker/config/**, tasks/ingestion), QML style templates, the
 # Dockerfile + compose fragments, and the entire `static/**` tree wherever
 # it appears (modules.web, modules.notebooks, …).
-"*" = ["*.html", "*.sql", "*.md", "*.css", "*.js", "*.txt", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ipynb", "*.ndjson", "*.sh", "*.env", "*.yml", "Dockerfile*", "static/**"]
+#
+# Dotfile env templates are enumerated by exact name (not ".env*"): glob()
+# never matches a leading-dot filename against a "*"-prefixed pattern, so the
+# dotfiles need their own entries alongside "*.env" (kept for non-dotfile
+# names like "sample.env") — and a wildcard like ".env*" would also sweep a
+# developer's gitignored ".env.local" (real credentials) into built wheels.
+"*" = ["*.html", "*.sql", "*.md", "*.css", "*.js", "*.txt", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ipynb", "*.ndjson", "*.sh", "*.env", ".env", ".env.example", ".env.local.example", "*.yml", "*.json", "*.qml", "Dockerfile*", "static/**"]
 
 [tool.setuptools_scm]
 version_file = "src/dynastore/_scm_version.py"
