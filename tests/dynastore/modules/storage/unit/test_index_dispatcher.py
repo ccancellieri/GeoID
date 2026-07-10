@@ -131,6 +131,21 @@ def _op(op_type: str = "upsert", entity_id: str = "item-1") -> IndexOp:
     )
 
 
+def _indexable_op(*, op: str = "upsert", entity_id: str = "item-1") -> IndexableOp:
+    from uuid import uuid4
+
+    return IndexableOp(
+        op_id=uuid4(),
+        op=op,
+        catalog_id="cat-x",
+        collection_id="col-y",
+        driver_instance_id="primary-di",
+        item_id=entity_id,
+        payload={"foo": "bar"} if op == "upsert" else {},
+        idempotency_key=f"idem-{entity_id}",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Happy path — no failures
 # ---------------------------------------------------------------------------
@@ -744,6 +759,83 @@ async def test_outbox_policy_delete_failure_enqueues_storage_plane_delete_row(
     row = calls[0]["rows"][0]
     assert row.op == "delete"
     assert row.item_id == "item-1"
+
+
+@pytest.mark.asyncio
+async def test_outbox_policy_all_indexableop_batch_reaches_writer(monkeypatch):
+    """#3173 regression: an all-IndexableOp OUTBOX batch must reach the
+    storage-plane writer instead of being filtered to an empty IndexOp
+    subset and dropped — the IndexOp-only constraint belonged to the
+    retired TaskTableOutboxWriter, and StoragePlaneOutboxWriter already
+    builds records from either op shape.
+    """
+    calls = _patch_storage_emit_recorder(monkeypatch)
+    a = _StubIndexer("a", raise_on="upsert")
+    ctx_with_conn = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    routing = _StubRouting([_entry("a", on_failure=FailurePolicy.OUTBOX)])
+
+    async def routing_resolver(catalog, collection):
+        return routing
+
+    async def indexer_registry(indexer_id):
+        return {"a": a}.get(indexer_id)
+
+    dispatcher = IndexDispatcher(
+        routing_resolver=routing_resolver,
+        indexer_registry=indexer_registry,
+        outbox=StoragePlaneOutboxWriter(),
+    )
+    ops = [
+        _indexable_op(op="upsert", entity_id="item-1"),
+        _indexable_op(op="delete", entity_id="item-2"),
+    ]
+    results = await dispatcher.fan_out_bulk(ctx_with_conn, ops)
+
+    assert len(a.bulk_calls) == 1
+    assert len(calls) == 1, "the batch must reach the storage-plane writer"
+    rows_by_id = {r.item_id: r.op for r in calls[0]["rows"]}
+    assert rows_by_id == {"item-1": "upsert", "item-2": "delete"}
+    # The failure policy still reports the whole batch as failed —
+    # accepted-count semantics for the ASYNC caller are unaffected.
+    assert results["a"].failed == 2
+
+
+@pytest.mark.asyncio
+async def test_outbox_policy_mixed_op_shapes_all_reach_writer(monkeypatch):
+    """A batch mixing legacy IndexOp and IndexableOp members must not have
+    the IndexableOp members silently dropped."""
+    calls = _patch_storage_emit_recorder(monkeypatch)
+    a = _StubIndexer("a", raise_on="upsert")
+    ctx_with_conn = IndexContext(
+        catalog="cat-x", collection="col-y",
+        correlation_id="cid-1", pg_conn=object(),
+    )
+    routing = _StubRouting([_entry("a", on_failure=FailurePolicy.OUTBOX)])
+
+    async def routing_resolver(catalog, collection):
+        return routing
+
+    async def indexer_registry(indexer_id):
+        return {"a": a}.get(indexer_id)
+
+    dispatcher = IndexDispatcher(
+        routing_resolver=routing_resolver,
+        indexer_registry=indexer_registry,
+        outbox=StoragePlaneOutboxWriter(),
+    )
+    ops = [
+        _op(op_type="upsert", entity_id="legacy-1"),
+        _indexable_op(op="delete", entity_id="new-1"),
+    ]
+    results = await dispatcher.fan_out_bulk(ctx_with_conn, ops)
+
+    assert len(calls) == 1
+    row_ids = {r.item_id for r in calls[0]["rows"]}
+    assert row_ids == {"legacy-1", "new-1"}
+    assert results["a"].failed == 2
 
 
 @pytest.mark.asyncio

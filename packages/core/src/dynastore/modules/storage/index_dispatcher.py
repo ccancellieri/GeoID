@@ -153,7 +153,7 @@ class OutboxWriterProtocol(Protocol):
         *,
         indexer_id: str,
         ctx: IndexContext,
-        ops: Sequence[IndexOp],
+        ops: Sequence[DispatchableOp],
         last_error: Optional[str] = None,
         chunk_size: Optional[int] = None,
     ) -> None:
@@ -190,7 +190,7 @@ class StoragePlaneOutboxWriter:
         *,
         indexer_id: str,
         ctx: IndexContext,
-        ops: Sequence[IndexOp],
+        ops: Sequence[DispatchableOp],
         last_error: Optional[str] = None,
         chunk_size: Optional[int] = None,
     ) -> None:
@@ -198,14 +198,12 @@ class StoragePlaneOutboxWriter:
             return
         if ctx.pg_conn is None:
             # Without a caller TX we can't honour the atomicity guarantee.
-            sample = ops[0]
             logger.warning(
                 "StoragePlaneOutboxWriter: ctx.pg_conn is None — skipping "
-                "outbox enqueue for indexer '%s' on %s/%s/%s (+%d more). "
+                "outbox enqueue for indexer '%s' on %s (+%d more). "
                 "Caller must pass an open PG connection on IndexContext "
                 "for the OUTBOX policy to be durable.",
-                indexer_id, sample.op_type, sample.entity_type,
-                sample.entity_id, max(len(ops) - 1, 0),
+                indexer_id, _describe_op(ops[0]), max(len(ops) - 1, 0),
             )
             return
 
@@ -910,9 +908,9 @@ class IndexDispatcher:
         deliberately-omitted driver doesn't flood the log on every op.
         OUTBOX path degrades through :meth:`_enqueue_or_warn` for both
         :class:`IndexableOp` and legacy :class:`IndexOp` shapes — the
-        singular-``enqueue`` outbox writer only accepts ``IndexOp``, so an
-        all-``IndexableOp`` batch is filtered out and dropped with a
-        warning there.
+        wired :class:`StoragePlaneOutboxWriter` accepts either shape, so
+        the batch (mixed or all-``IndexableOp``) reaches the durable
+        outbox unchanged.
         """
         policy = entry.on_failure
         if policy == FailurePolicy.FATAL:
@@ -1374,27 +1372,16 @@ class IndexDispatcher:
                 )
             return 0
 
-        # ``OutboxWriterProtocol.enqueue`` is typed to accept the legacy
-        # IndexOp shape; an IndexableOp-only batch is skipped with a single
-        # warning rather than hard-failing — the caller's failure policy
-        # already chose tolerance.
+        # ``OutboxWriterProtocol.enqueue`` accepts the full ``DispatchableOp``
+        # union — the wired :class:`StoragePlaneOutboxWriter` builds records
+        # from either shape via ``_op_kind``/``_op_entity_id``/``_op_write_id``,
+        # the same helpers ``_enqueue_storage_plane_ids`` already relies on.
         enqueue = getattr(self._outbox, "enqueue", None)
         if enqueue is None:
             logger.warning(
                 "IndexDispatcher: outbox writer for indexer '%s' has no "
                 "``enqueue`` method; cannot enqueue %d ops.",
                 entry.driver_ref, len(ops),
-            )
-            return 0
-        index_ops: List[IndexOp] = [
-            cast(IndexOp, o) for o in ops if not isinstance(o, IndexableOp)
-        ]
-        if not index_ops:
-            logger.warning(
-                "IndexDispatcher: %d IndexableOp(s) routed to the outbox "
-                "writer for indexer '%s' — dropping; wire an OutboxStore "
-                "for the bulk path.",
-                len(ops), entry.driver_ref,
             )
             return 0
         # Drop path (b): caller has no open PG connection.
@@ -1406,17 +1393,17 @@ class IndexDispatcher:
                 "IndexDispatcher: cannot enqueue %d op(s) for indexer '%s' — "
                 "ctx.pg_conn is None (no open TX); ops dropped. "
                 "Caller must supply an open PG connection for durable enqueue.",
-                len(index_ops), entry.driver_ref,
+                len(ops), entry.driver_ref,
             )
             return 0
         try:
             await enqueue(
                 indexer_id=entry.driver_ref,
                 ctx=ctx,
-                ops=index_ops,
+                ops=ops,
                 last_error=str(original) if original else None,
             )
-            return len(index_ops)
+            return len(ops)
         except Exception as enqueue_exc:
             # Drop path (c): transient PG error during enqueue.
             # We do NOT escalate to FATAL here because the upstream caller has
