@@ -1309,8 +1309,17 @@ class GeometriesSidecar(SidecarProtocol):
                 if key in indices:
                     payload[key] = indices[key]
 
-        # 3. Calculate storage-bearing Computed Fields
-        storage_fields = self._storage_fields()
+        # 3. Calculate storage-bearing Computed Fields — 2D geometry kinds
+        # only. The 3D place statistics ride the same overlay (they have no
+        # sidecar target of their own) but are computed from the JSON-FG
+        # ``place`` member by ``prepare_place_upsert_payload``;
+        # ``compute_derived_fields`` raises ``UnsupportedComputedKind`` for
+        # them, which under the default all-stats policy would fail every
+        # real-geometry ingestion (#3222). Same filter as the DDL place-column
+        # loop and ``resolve_computed_value``.
+        storage_fields = [
+            f for f in self._storage_fields() if f.kind not in _PLACE_TABLE_KINDS
+        ]
         if storage_fields and shapely_geom:
             # ``compute_derived_fields`` handles centroid WKB conversion
             # internally when ``centroid_type`` is set on the field.
