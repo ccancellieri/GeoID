@@ -393,63 +393,20 @@ class TasksPluginConfig(ExposableConfigMixin, PluginConfig):
         ),
     )
 
-    items_secondary_via_storage_plane: Mutable[bool] = Field(
-        default=False,
-        description=(
-            "#2494 P1: when True, every ASYNC secondary-index WRITE entry "
-            "for items (``IndexContext.entity_type == 'item'``) enqueues an "
-            "id-only obligation onto the ``tasks.storage`` plane instead of "
-            "ever running inline (even inside a task/job run, where it "
-            "would otherwise be absorbed into the running job). The "
-            "``storage_drain`` worker re-reads the canonical PG row at "
-            "replay time, so the queued obligation can never go stale. "
-            "Default False: byte-identical to the pre-#2494 dispatch path, "
-            "so upgrading this service changes nothing until an operator "
-            "opts in. Read on every dispatch via the platform configs "
-            "hot-reload path; no restart required. Scope (#2687): entries "
-            "pinned to an access-aware driver (``applies_access_filter=True``, "
-            "e.g. the envelope ES driver) take the id-only plane exactly "
-            "like any other item-tier ASYNC entry — the drain recomputes "
-            "``_visibility``/``_owner``/``_attrs`` from the hub row's "
-            "persisted ``access_owner`` column plus live config, and never "
-            "indexes a document whose envelope recompute failed (fail-"
-            "closed: the row retries instead). (#2716) applies uniformly "
-            "too: once an operator opts in, storage_drain owns every "
-            "item-tier ASYNC write, access-aware or not, in-run or not."
-        ),
-    )
-
-    in_task_run_inline_chunk_size: Mutable[int] = Field(
-        default=150,
-        ge=1,
-        description=(
-            "#2716: chunk size for the in-run absorption path (#2621) — "
-            "an ASYNC secondary-index entry dispatched inline because the "
-            "write is already executing inside a task/job run. Distinct "
-            "from the fixed ``INLINE_DISPATCH_CHUNK_SIZE`` (500) the "
-            "serving-path SYNC chunking still uses: a Cloud Run Job "
-            "container's memory budget is sized for its own ingest "
-            "working set, not for 500-2000 full ES envelopes absorbed on "
-            "top of it (the OOM traced in #2716). Conservative default "
-            "(150) keeps one absorbed chunk small relative to a typical "
-            "2Gi job. Read once per chunked dispatch via the platform "
-            "configs hot-reload path; no restart required."
-        ),
-    )
-
     ingest_backpressure_sleep_seconds: Mutable[float] = Field(
         default=2.0,
         ge=0.0,
         le=60.0,
         description=(
-            "#2494 P1: bounded sleep applied before a bulk-ingestion batch "
+            "#2494: bounded sleep applied before a bulk-ingestion batch "
             "flush when the aggregate tasks.storage/tasks.events outbox "
             "backlog is high (``async_writer_backlog.backlog_is_high()``, "
             "gated by ``async_writer_backlog_threshold``). Cooperative "
             "backpressure only — ingestion keeps running, just slower, "
             "giving the storage_drain worker room to catch up instead of "
-            "the backlog growing unbounded. Only consulted when "
-            "``items_secondary_via_storage_plane`` is enabled."
+            "the backlog growing unbounded. Items INDEX materialization is "
+            "unconditionally storage-plane (#2494 WP-I), so this backpressure "
+            "check always runs."
         ),
     )
 

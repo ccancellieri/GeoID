@@ -19,19 +19,27 @@
 """Unit tests for :class:`IndexDispatcher` under the lane model (#2494).
 
 An INDEX-lane entry is async by lane definition — there is no per-entry
-``write_mode`` any more.  ``fan_out_bulk`` has exactly two dispatch shapes:
+``write_mode`` any more.  ``fan_out_bulk`` has three dispatch shapes:
 
-* **Default (outside a task run)** — every entry is durably enqueued via
-  the wired :class:`OutboxWriterProtocol` (proactive, up-front obligation);
-  the indexer is never called inline.
-* **In-task-run absorption** — when the dispatch is already running inside
-  a background task/job execution (``in_task_run()``) for the SAME catalog
-  the run declared (or a run that declared no catalog at all), the write is
-  absorbed inline through the driver-agnostic chunked path instead of
-  spawning an outbox row.  This is the ONLY way ``indexer.index_bulk`` is
-  ever called by this dispatcher — the tests below that exercise
-  ``ensure_indexer``, the circuit breaker, per-document partial failures,
-  or a raised bulk exception all wrap the call in ``task_run_scope()``.
+* **Item-tier storage plane (unconditional, #2494 WP-I)** — every item-tier
+  entry (``ctx.entity_type == "item"``) enqueues an id-only ``tasks.storage``
+  obligation via :meth:`IndexDispatcher._enqueue_storage_plane_ids`,
+  regardless of ``in_task_run()``. The indexer is never called inline for
+  item-tier entries. See the ``test_storage_plane_*`` tests below.
+* **Default (non-item tiers, outside a task run)** — every entry is durably
+  enqueued via the wired :class:`OutboxWriterProtocol` (proactive, up-front
+  obligation); the indexer is never called inline.
+* **In-task-run absorption (non-item tiers only)** — when the dispatch is
+  already running inside a background task/job execution
+  (``in_task_run()``) for the SAME catalog the run declared (or a run that
+  declared no catalog at all), the write is absorbed inline through the
+  driver-agnostic chunked path instead of spawning an outbox row. This is
+  the ONLY way ``indexer.index_bulk`` is ever called by this dispatcher —
+  the tests below that exercise ``ensure_indexer``, the circuit breaker,
+  per-document partial failures, or a raised bulk exception all wrap the
+  call in ``task_run_scope()`` and use a non-item ``IndexContext``
+  (``_ctx()`` / ``_ctx_with_conn()``, ``entity_type=None``) so they are
+  unaffected by the item-tier storage-plane branch.
 
 INDEX entries carry no per-entry failure policy: an inline failure (only
 reachable via the in-task-run absorption path above) is logged and
@@ -795,18 +803,8 @@ async def test_in_task_run_silent_noop_delete_only_does_not_fail():
 # ---------------------------------------------------------------------------
 
 
-def _patch_in_task_run_chunk_size(monkeypatch, size: int) -> None:
-    import dynastore.modules.storage.index_dispatcher as idx_mod
-
-    async def _resolved() -> int:
-        return size
-
-    monkeypatch.setattr(idx_mod, "_resolve_in_task_run_chunk_size", _resolved)
-
-
 @pytest.mark.asyncio
-async def test_in_task_run_chunks_large_batch(monkeypatch):
-    _patch_in_task_run_chunk_size(monkeypatch, INLINE_DISPATCH_CHUNK_SIZE)
+async def test_in_task_run_chunks_large_batch():
     a = _StubIndexer("a")
     dispatcher = _make_dispatcher(entries=[_entry("a")], indexers={"a": a})
     n = INLINE_DISPATCH_CHUNK_SIZE * 2 + 37
@@ -823,12 +821,11 @@ async def test_in_task_run_chunks_large_batch(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_in_task_run_opens_one_short_tx_per_chunk(monkeypatch):
+async def test_in_task_run_opens_one_short_tx_per_chunk():
     """With a tx_factory, the dispatcher opens a FRESH transaction per
     chunk — never one long-lived transaction across the whole sequential
     fan-out — so a busy job never parks a pooled connection with an open
     transaction across the full dispatch."""
-    _patch_in_task_run_chunk_size(monkeypatch, INLINE_DISPATCH_CHUNK_SIZE)
     opened: list = []
 
     class _FakeTx:
@@ -863,26 +860,6 @@ async def test_in_task_run_opens_one_short_tx_per_chunk(monkeypatch):
     assert len(opened) == expected_chunks
     assert all(tx.entered and tx.exited for tx in opened)
     assert len(a.bulk_calls) == expected_chunks
-    assert results["a"].succeeded == n
-
-
-@pytest.mark.asyncio
-async def test_in_task_run_honors_configured_chunk_size_cap(monkeypatch):
-    """#2716: inside a task run, the inline chunk size is bounded by
-    ``TasksPluginConfig.in_task_run_inline_chunk_size`` — NOT the fixed
-    ``INLINE_DISPATCH_CHUNK_SIZE`` (500)."""
-    _patch_in_task_run_chunk_size(monkeypatch, 7)
-    a = _StubIndexer("a")
-    dispatcher = _make_dispatcher(entries=[_entry("a")], indexers={"a": a})
-    n = 20
-    ops = [_op(entity_id=f"i{i}") for i in range(n)]
-    with task_run_scope():
-        results = await dispatcher.fan_out_bulk(_ctx_with_conn(), ops)
-
-    import math
-    assert len(a.bulk_calls) == math.ceil(n / 7)
-    assert all(len(chunk) <= 7 for chunk in a.bulk_calls)
-    assert sum(len(c) for c in a.bulk_calls) == n
     assert results["a"].succeeded == n
 
 
@@ -1249,23 +1226,13 @@ async def test_outbox_all_indexableop_batch_reaches_writer(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# #2494 P1 — storage-plane id-only routing gate (item-tier, flag-driven)
+# #2494 WP-I — storage-plane id-only routing (item-tier, unconditional)
 # ---------------------------------------------------------------------------
 
 
-def _patch_storage_plane_flag(monkeypatch, *, enabled: bool) -> None:
-    import dynastore.modules.storage.index_dispatcher as idx_mod
-
-    async def _flag() -> bool:
-        return enabled
-
-    monkeypatch.setattr(idx_mod, "_storage_plane_routing_enabled", _flag)
-
-
 @pytest.mark.asyncio
-async def test_storage_plane_flag_on_item_entry_enqueues_id_only_not_in_task_run(monkeypatch):
+async def test_storage_plane_item_entry_enqueues_id_only_not_in_task_run(monkeypatch):
     assert not in_task_run()
-    _patch_storage_plane_flag(monkeypatch, enabled=True)
     calls = _patch_storage_emit_recorder(monkeypatch)
 
     a = _StubIndexer("a")
@@ -1284,10 +1251,9 @@ async def test_storage_plane_flag_on_item_entry_enqueues_id_only_not_in_task_run
 
 
 @pytest.mark.asyncio
-async def test_storage_plane_flag_on_item_entry_enqueues_id_only_in_task_run(monkeypatch):
-    """Flag ON, INSIDE a task run: still routed to the storage plane —
-    never absorbed inline (the #2657 runaway path)."""
-    _patch_storage_plane_flag(monkeypatch, enabled=True)
+async def test_storage_plane_item_entry_enqueues_id_only_in_task_run(monkeypatch):
+    """INSIDE a task run: still routed to the storage plane — never
+    absorbed inline (the #2657 runaway path)."""
     calls = _patch_storage_emit_recorder(monkeypatch)
 
     a = _StubIndexer("a")
@@ -1302,8 +1268,7 @@ async def test_storage_plane_flag_on_item_entry_enqueues_id_only_in_task_run(mon
 
 
 @pytest.mark.asyncio
-async def test_storage_plane_flag_on_enqueues_grouped_write_id_row(monkeypatch):
-    _patch_storage_plane_flag(monkeypatch, enabled=True)
+async def test_storage_plane_enqueues_grouped_write_id_row(monkeypatch):
     _patch_write_id_capable_primary(monkeypatch)
     calls = _patch_storage_emit_recorders(monkeypatch)
 
@@ -1326,10 +1291,9 @@ async def test_storage_plane_flag_on_enqueues_grouped_write_id_row(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_storage_plane_flag_on_uses_tx_factory_when_no_pg_conn(monkeypatch):
+async def test_storage_plane_uses_tx_factory_when_no_pg_conn(monkeypatch):
     """When ctx.pg_conn is None (in-task-run inline seam), the enqueue opens
     a short transaction via tx_factory instead of dropping the write."""
-    _patch_storage_plane_flag(monkeypatch, enabled=True)
     calls = _patch_storage_emit_recorder(monkeypatch)
 
     opened: list = []
@@ -1354,10 +1318,9 @@ async def test_storage_plane_flag_on_uses_tx_factory_when_no_pg_conn(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_storage_plane_flag_on_no_conn_no_tx_factory_drops_and_fails(monkeypatch, caplog):
+async def test_storage_plane_no_conn_no_tx_factory_drops_and_fails(monkeypatch, caplog):
     import logging as _logging
 
-    _patch_storage_plane_flag(monkeypatch, enabled=True)
     calls = _patch_storage_emit_recorder(monkeypatch)
 
     a = _StubIndexer("a")
@@ -1373,31 +1336,9 @@ async def test_storage_plane_flag_on_no_conn_no_tx_factory_drops_and_fails(monke
 
 
 @pytest.mark.asyncio
-async def test_storage_plane_flag_off_preserves_generic_outbox_path(monkeypatch):
-    """Flag OFF: item-tier entries still go through the generic
-    ``OutboxWriterProtocol`` path, not the id-only storage plane."""
-    _patch_storage_plane_flag(monkeypatch, enabled=False)
-    calls = _patch_storage_emit_recorder(monkeypatch)
-
-    a = _StubIndexer("a")
-    writer = _RecordingWriter()
-    dispatcher = _make_dispatcher_with_outbox(
-        entries=[_entry("a")], indexers={"a": a}, outbox=writer,
-    )
-    ops = [_op(entity_id="i1"), _op(entity_id="i2")]
-    results = await dispatcher.fan_out_bulk(_item_ctx(), ops)
-
-    assert calls == [], "flag OFF must never touch the storage-plane id-only path"
-    assert a.bulk_calls == []
-    assert len(writer.rows) >= 1
-    assert results["a"].succeeded == 2
-
-
-@pytest.mark.asyncio
-async def test_storage_plane_flag_on_non_item_entity_type_unaffected(monkeypatch):
-    """The flag is item-scoped: a collection-tier dispatch must not be
-    routed into the item-shaped id-only storage plane."""
-    _patch_storage_plane_flag(monkeypatch, enabled=True)
+async def test_storage_plane_non_item_entity_type_unaffected(monkeypatch):
+    """Storage-plane routing is item-scoped: a collection-tier dispatch
+    must not be routed into the item-shaped id-only storage plane."""
     calls = _patch_storage_emit_recorder(monkeypatch)
 
     a = _StubIndexer("a")
@@ -1418,12 +1359,11 @@ async def test_storage_plane_flag_on_non_item_entity_type_unaffected(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_storage_plane_flag_on_access_aware_entry_included(monkeypatch):
-    """An access-aware entry now takes the SAME id-only storage-plane
-    branch as any other item-tier entry (#2687) — the drain recomputes the
-    envelope from stored state, so there is no longer a payload requirement
-    forcing it onto a different plane."""
-    _patch_storage_plane_flag(monkeypatch, enabled=True)
+async def test_storage_plane_access_aware_entry_included(monkeypatch):
+    """An access-aware entry takes the SAME id-only storage-plane branch as
+    any other item-tier entry (#2687) — the drain recomputes the envelope
+    from stored state, so there is no payload requirement forcing it onto a
+    different plane."""
     calls = _patch_storage_emit_recorder(monkeypatch)
 
     a = _AccessAwareStubIndexer("a")
@@ -1439,11 +1379,10 @@ async def test_storage_plane_flag_on_access_aware_entry_included(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_storage_plane_flag_on_access_aware_entry_not_absorbed_in_task_run(monkeypatch):
-    """The storage-plane flag prevents in-run absorption even for
-    access-aware entries — the operator opted into letting storage_drain
-    own every item-tier write."""
-    _patch_storage_plane_flag(monkeypatch, enabled=True)
+async def test_storage_plane_access_aware_entry_not_absorbed_in_task_run(monkeypatch):
+    """Unconditional item-tier storage-plane routing prevents in-run
+    absorption even for access-aware entries — storage_drain owns every
+    item-tier write."""
     calls = _patch_storage_emit_recorder(monkeypatch)
 
     a = _AccessAwareStubIndexer("a")
@@ -1454,28 +1393,8 @@ async def test_storage_plane_flag_on_access_aware_entry_not_absorbed_in_task_run
     with task_run_scope(catalog="cat-x"):
         results = await dispatcher.fan_out_bulk(_item_ctx(), [_op(entity_id="i1")])
 
-    assert a.bulk_calls == [], "storage-plane flag on must prevent in-run absorption"
+    assert a.bulk_calls == [], "item-tier storage-plane routing must prevent in-run absorption"
     assert len(calls) == 1
-    assert writer.rows == []
-    assert results["a"].succeeded == 1
-
-
-@pytest.mark.asyncio
-async def test_storage_plane_flag_off_access_aware_entry_still_absorbed_in_task_run(monkeypatch):
-    """Companion negative case: flag OFF keeps the ordinary in-run
-    absorption behaviour unchanged for an access-aware entry."""
-    _patch_storage_plane_flag(monkeypatch, enabled=False)
-    _patch_storage_emit_recorder(monkeypatch)
-
-    a = _AccessAwareStubIndexer("a")
-    writer = _RecordingWriter()
-    dispatcher = _make_dispatcher_with_outbox(
-        entries=[_entry("a")], indexers={"a": a}, outbox=writer,
-    )
-    with task_run_scope(catalog="cat-x"):
-        results = await dispatcher.fan_out_bulk(_item_ctx(), [_op(entity_id="i1")])
-
-    assert len(a.bulk_calls) == 1
     assert writer.rows == []
     assert results["a"].succeeded == 1
 
@@ -1484,7 +1403,6 @@ async def test_storage_plane_flag_off_access_aware_entry_still_absorbed_in_task_
 async def test_storage_plane_dispatch_path_log_mode(monkeypatch, caplog):
     import logging as _logging
 
-    _patch_storage_plane_flag(monkeypatch, enabled=True)
     _patch_storage_emit_recorder(monkeypatch)
 
     a = _StubIndexer("a")

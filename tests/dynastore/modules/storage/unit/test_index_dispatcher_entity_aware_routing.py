@@ -165,12 +165,24 @@ async def test_call_resolver_passes_entity_type_to_new_signature():
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_reads_items_routing_when_entity_type_is_item():
+async def test_dispatcher_reads_items_routing_when_entity_type_is_item(monkeypatch):
     """The dispatcher MUST pick ItemsRoutingConfig entries for items-tier
     dispatch — the central #810 fix. The resolver receives entity_type
     and returns different configs; the dispatcher acts on whichever it
-    got. Asserts the indexer pinned under ItemsRoutingConfig fires when
-    ctx.entity_type='item'."""
+    got. Asserts the indexer pinned under ItemsRoutingConfig is the one
+    the id-only storage-plane obligation (#2494 WP-I: item-tier INDEX
+    dispatch is unconditionally storage-plane, never inline) is enqueued
+    for when ctx.entity_type='item'."""
+    import dynastore.modules.storage.storage_emit as storage_emit_mod
+
+    id_only_calls: list = []
+
+    async def _fake_enqueue_id_only(conn, *, catalog_id, rows):
+        id_only_calls.append(list(rows))
+
+    monkeypatch.setattr(
+        storage_emit_mod, "enqueue_storage_op_id_only", _fake_enqueue_id_only,
+    )
 
     items_indexer = _StubIndexer("items_indexer")
     collection_indexer = _StubIndexer("collection_indexer")
@@ -197,7 +209,7 @@ async def test_dispatcher_reads_items_routing_when_entity_type_is_item():
 
     item_ctx = IndexContext(
         catalog="cat", collection="col",
-        correlation_id="cid", entity_type="item",
+        correlation_id="cid", entity_type="item", pg_conn=object(),
     )
     item_op = IndexOp(
         op_type="upsert", entity_type="item", entity_id="i-1", payload={"k": "v"},
@@ -205,16 +217,21 @@ async def test_dispatcher_reads_items_routing_when_entity_type_is_item():
     with task_run_scope():
         await dispatcher.fan_out_bulk(item_ctx, [item_op])
 
-    assert len(items_indexer.bulk_calls) == 1, (
-        "items_indexer must fire when entity_type='item' picks "
-        "ItemsRoutingConfig.operations[INDEX] — the #810 contract"
+    assert items_indexer.bulk_calls == [] and collection_indexer.bulk_calls == [], (
+        "item-tier INDEX dispatch is unconditionally storage-plane — "
+        "neither indexer is ever called inline (#2494 WP-I)"
     )
-    assert items_indexer.bulk_calls[0][0].entity_id == "i-1"
-    assert collection_indexer.bulk_calls == [], (
-        "collection_indexer must NOT fire when entity_type='item' — that "
-        "was the pre-#810 bug (silent no-op when only ItemsRoutingConfig "
-        "had the pin)"
+    assert len(id_only_calls) == 1, (
+        "the id-only obligation must be enqueued for the driver pinned "
+        "under ItemsRoutingConfig.operations[INDEX] — the #810 contract"
     )
+    rows = id_only_calls[0]
+    assert {r.driver_id for r in rows} == {"items_indexer"}, (
+        "collection_indexer must NOT receive an obligation when "
+        "entity_type='item' — that was the pre-#810 bug (silent no-op "
+        "when only ItemsRoutingConfig had the pin)"
+    )
+    assert {r.item_id for r in rows} == {"i-1"}
 
 
 @pytest.mark.asyncio
@@ -301,7 +318,14 @@ async def test_dispatcher_back_compat_none_entity_type_reads_collection_routing(
 async def test_dispatcher_works_with_legacy_two_arg_resolver_stub():
     """Existing tests in test_index_dispatcher.py define
     ``routing_resolver(catalog, collection)`` without the entity_type
-    kwarg. _call_resolver's TypeError fallback must keep them green."""
+    kwarg. _call_resolver's TypeError fallback must keep them green.
+
+    Uses a non-item ``IndexContext`` (``entity_type`` unset, back-compat
+    ``None``) — the fallback itself is entity-type-agnostic, and a
+    non-item entity_type keeps this dispatch on the general in-task-run
+    absorption path so the assertion below (inline ``bulk_calls``) stays
+    meaningful now that item-tier entries are unconditionally
+    storage-plane (#2494 WP-I)."""
     indexer = _StubIndexer("a")
 
     routing = CollectionRoutingConfig(
@@ -318,12 +342,9 @@ async def test_dispatcher_works_with_legacy_two_arg_resolver_stub():
         routing_resolver=legacy_resolver, indexer_registry=registry,
     )
 
-    ctx = IndexContext(
-        catalog="cat", collection="col",
-        correlation_id="cid", entity_type="item",
-    )
+    ctx = IndexContext(catalog="cat", collection="col", correlation_id="cid")
     op = IndexOp(
-        op_type="upsert", entity_type="item", entity_id="i-1", payload={"k": "v"},
+        op_type="upsert", entity_type="collection", entity_id="i-1", payload={"k": "v"},
     )
     with task_run_scope():
         await dispatcher.fan_out_bulk(ctx, [op])

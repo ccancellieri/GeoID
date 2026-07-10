@@ -239,12 +239,12 @@ def _merge_index_results(
 
 
 async def _maybe_apply_ingest_backpressure() -> None:
-    """Cooperative backpressure before a batch flush (#2494 P1).
+    """Cooperative backpressure before a batch flush (#2494).
 
-    No-op unless ``TasksPluginConfig.items_secondary_via_storage_plane`` is
-    enabled — with the flag off, ingestion behaviour is unchanged. When the
-    flag is on and the aggregate tasks.storage/tasks.events outbox backlog
-    is high (``async_writer_backlog.backlog_is_high()``), sleeps for
+    Items INDEX materialization is unconditionally storage-plane (#2494
+    WP-I), so this check always runs. When the aggregate
+    tasks.storage/tasks.events outbox backlog is high
+    (``async_writer_backlog.backlog_is_high()``), sleeps for
     ``TasksPluginConfig.ingest_backpressure_sleep_seconds`` before the
     caller flushes the next batch, so the storage_drain worker gets room to
     catch up instead of the backlog growing unbounded under a hot ingestion
@@ -259,7 +259,7 @@ async def _maybe_apply_ingest_backpressure() -> None:
 
         config_mgr = get_protocol(PlatformConfigsProtocol)
         cfg = await config_mgr.get_config(TasksPluginConfig) if config_mgr else None
-        if not isinstance(cfg, TasksPluginConfig) or not cfg.items_secondary_via_storage_plane:
+        if not isinstance(cfg, TasksPluginConfig):
             return
         if await backlog_is_high():
             logger.info(
@@ -309,31 +309,6 @@ async def _persist_ingestion_cursor(
             "%s — a retry will restart from the original offset.",
             next_offset, task_id, exc_info=True,
         )
-
-
-async def _resolve_items_secondary_via_storage_plane() -> bool:
-    """Best-effort read of ``TasksPluginConfig.items_secondary_via_storage_plane``.
-
-    Mirrors :func:`_maybe_apply_ingest_backpressure`'s config-read pattern.
-    Any failure (missing protocol, config error) resolves to ``False`` so a
-    completion never reports a secondary-indexing state it can't back with
-    data (#2897).
-    """
-    try:
-        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
-        from dynastore.modules.tasks.tasks_config import TasksPluginConfig
-        from dynastore.tools.discovery import get_protocol
-
-        config_mgr = get_protocol(PlatformConfigsProtocol)
-        cfg = await config_mgr.get_config(TasksPluginConfig) if config_mgr else None
-        return isinstance(cfg, TasksPluginConfig) and cfg.items_secondary_via_storage_plane
-    except Exception:  # noqa: BLE001 — config read is best-effort
-        logger.debug(
-            "ingestion: items_secondary_via_storage_plane read failed — "
-            "treating as off.",
-            exc_info=True,
-        )
-        return False
 
 
 async def _count_pending_secondary_index_ops(
@@ -1626,36 +1601,36 @@ async def run_ingestion_task(
             }
 
         # --- Secondary-indexing honesty (#2897) ---
-        # With items_secondary_via_storage_plane on, the primary PG write above
-        # is synchronous but ES/secondary indexing is only an id-only
-        # obligation on tasks.storage until storage_drain converges it — a bare
-        # COMPLETED here would overstate what's actually searchable. Best-
-        # effort: a count failure omits the field entirely rather than
-        # guessing, and never fails the (already-successful) task.
+        # Items INDEX materialization is unconditionally storage-plane
+        # (#2494 WP-I): the primary PG write above is synchronous but
+        # ES/secondary indexing is only an id-only obligation on
+        # tasks.storage until storage_drain converges it — a bare COMPLETED
+        # here would overstate what's actually searchable. Best-effort: a
+        # count failure omits the field entirely rather than guessing, and
+        # never fails the (already-successful) task.
         secondary_indexing: Optional[Dict[str, Any]] = None
-        if await _resolve_items_secondary_via_storage_plane():
-            try:
-                queued = await _count_pending_secondary_index_ops(
-                    engine, catalog_id, collection_id,
-                )
-                secondary_indexing = (
-                    {
-                        "state": "pending",
-                        "queued": queued,
-                        "message": (
-                            f"primary write complete; {queued} entries "
-                            "pending asynchronous indexing"
-                        ),
-                    }
-                    if queued > 0
-                    else {"state": "converged", "queued": 0}
-                )
-            except Exception:  # noqa: BLE001 — count is best-effort, never fail the task
-                logger.warning(
-                    "ingestion task %s: secondary-index backlog count failed "
-                    "for %s/%s — omitting secondary_indexing from summary.",
-                    task_id, catalog_id, collection_id, exc_info=True,
-                )
+        try:
+            queued = await _count_pending_secondary_index_ops(
+                engine, catalog_id, collection_id,
+            )
+            secondary_indexing = (
+                {
+                    "state": "pending",
+                    "queued": queued,
+                    "message": (
+                        f"primary write complete; {queued} entries "
+                        "pending asynchronous indexing"
+                    ),
+                }
+                if queued > 0
+                else {"state": "converged", "queued": 0}
+            )
+        except Exception:  # noqa: BLE001 — count is best-effort, never fail the task
+            logger.warning(
+                "ingestion task %s: secondary-index backlog count failed "
+                "for %s/%s — omitting secondary_indexing from summary.",
+                task_id, catalog_id, collection_id, exc_info=True,
+            )
         if secondary_indexing is not None:
             if summary is None:
                 summary = {}

@@ -56,22 +56,6 @@ def test_runner_and_dispatcher_fields_present_with_defaults():
     assert cfg.task_timeout_seconds == 3600
 
 
-def test_in_task_run_inline_chunk_size_default_is_conservative():
-    cfg = TasksPluginConfig()
-    # Conservative default (#2716): well below the fixed serving-path
-    # INLINE_DISPATCH_CHUNK_SIZE (500) so an absorbed in-run chunk never
-    # builds one oversized driver call inside a memory-bounded job.
-    assert 100 <= cfg.in_task_run_inline_chunk_size <= 200
-
-
-def test_in_task_run_inline_chunk_size_rejects_non_positive():
-    import pytest
-    from pydantic import ValidationError
-
-    with pytest.raises(ValidationError):
-        TasksPluginConfig(in_task_run_inline_chunk_size=0)
-
-
 # ---------------------------------------------------------------------------
 # BackgroundRunner pool-aware concurrency clamp
 # ---------------------------------------------------------------------------

@@ -16,12 +16,12 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Unit tests for :func:`_maybe_apply_ingest_backpressure` (#2494 P1).
+"""Unit tests for :func:`_maybe_apply_ingest_backpressure` (#2494).
 
-Cooperative backpressure only fires when
-``TasksPluginConfig.items_secondary_via_storage_plane`` is enabled AND the
-aggregate outbox backlog is high. Every other combination must be a no-op
-so bulk ingestion behaviour is unchanged with the flag off.
+Cooperative backpressure fires unconditionally whenever the aggregate
+outbox backlog is high — items INDEX materialization is
+storage-plane-always by design (#2494 WP-I), so there is no flag gate any
+more; only the backlog check itself governs whether the sleep fires.
 """
 from __future__ import annotations
 
@@ -37,35 +37,11 @@ def _fake_config_mgr(cfg: object) -> MagicMock:
 
 
 @pytest.mark.asyncio
-async def test_backpressure_noop_when_flag_off():
+async def test_backpressure_noop_when_backlog_not_high():
     from dynastore.modules.tasks.tasks_config import TasksPluginConfig
     from dynastore.tasks.ingestion.main_ingestion import _maybe_apply_ingest_backpressure
 
-    cfg = TasksPluginConfig(items_secondary_via_storage_plane=False)
-    mgr = _fake_config_mgr(cfg)
-
-    with (
-        patch(
-            "dynastore.tools.discovery.get_protocol", return_value=mgr,
-        ),
-        patch(
-            "dynastore.modules.tasks.async_writer_backlog.backlog_is_high",
-            new=AsyncMock(return_value=True),
-        ) as backlog_mock,
-        patch("asyncio.sleep", new=AsyncMock()) as sleep_mock,
-    ):
-        await _maybe_apply_ingest_backpressure()
-
-    backlog_mock.assert_not_called()
-    sleep_mock.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_backpressure_noop_when_flag_on_but_backlog_not_high():
-    from dynastore.modules.tasks.tasks_config import TasksPluginConfig
-    from dynastore.tasks.ingestion.main_ingestion import _maybe_apply_ingest_backpressure
-
-    cfg = TasksPluginConfig(items_secondary_via_storage_plane=True)
+    cfg = TasksPluginConfig()
     mgr = _fake_config_mgr(cfg)
 
     with (
@@ -85,14 +61,11 @@ async def test_backpressure_noop_when_flag_on_but_backlog_not_high():
 
 
 @pytest.mark.asyncio
-async def test_backpressure_sleeps_when_flag_on_and_backlog_high():
+async def test_backpressure_sleeps_when_backlog_high():
     from dynastore.modules.tasks.tasks_config import TasksPluginConfig
     from dynastore.tasks.ingestion.main_ingestion import _maybe_apply_ingest_backpressure
 
-    cfg = TasksPluginConfig(
-        items_secondary_via_storage_plane=True,
-        ingest_backpressure_sleep_seconds=3.5,
-    )
+    cfg = TasksPluginConfig(ingest_backpressure_sleep_seconds=3.5)
     mgr = _fake_config_mgr(cfg)
 
     with (

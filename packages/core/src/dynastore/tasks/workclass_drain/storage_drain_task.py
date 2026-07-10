@@ -474,11 +474,9 @@ class StorageDrainTask(TaskProtocol):
     async def _resolve_batch_size(self) -> int:
         """Resolve ``TasksPluginConfig.storage_drain_batch_size``, hot-reloaded.
 
-        Mirrors the resolution pattern of
-        ``index_dispatcher._storage_plane_routing_enabled``: falls back to
-        the instance default (constructor value, itself matching the field
-        default) when the platform configs protocol is unavailable — early
-        startup, lightweight worker contexts, tests.
+        Falls back to the instance default (constructor value, itself
+        matching the field default) when the platform configs protocol is
+        unavailable — early startup, lightweight worker contexts, tests.
         """
         try:
             from dynastore.models.protocols.platform_configs import (
@@ -992,9 +990,10 @@ class StorageDrainTask(TaskProtocol):
         reads); otherwise ``entity_id`` must be set — ``op='delete'`` rows
         convert to ``IndexableOp`` directly (:meth:`_row_to_op`; an id is
         all the indexer needs), and ``op='upsert'`` rows are id-only
-        obligations written by ``IndexDispatcher._enqueue_storage_plane_ids``
-        when ``TasksPluginConfig.items_secondary_via_storage_plane`` is
-        enabled, grouped by ``(catalog_id, collection_id)``. A row with
+        obligations written unconditionally by
+        ``IndexDispatcher._enqueue_storage_plane_ids`` (#2494 WP-I: items
+        INDEX materialization is storage-plane-always by design), grouped
+        by ``(catalog_id, collection_id)``. A row with
         neither ``write_id`` nor ``entity_id`` can never hydrate and is
         marked dead. Each id-only group's canonical re-read
         (:func:`read_canonical_index_inputs`) stays batched, but in

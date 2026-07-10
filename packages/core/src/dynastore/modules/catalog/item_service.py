@@ -2914,10 +2914,21 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         # identity fields (``_external_id`` / ``_asset_id``, #1289).  Safe to
         # retire once every environment's persisted routing configs are
         # confirmed migrated to the lane shape.
-        secondaries = [
-            r for r in secondaries
-            if "item" not in getattr(type(r.driver), "index_tiers", frozenset())
-        ]
+        kept = []
+        for r in secondaries:
+            if "item" in getattr(type(r.driver), "index_tiers", frozenset()):
+                logger.warning(
+                    "_fan_out_to_secondary_drivers: dropping WRITE-lane "
+                    "resolution for indexer '%s' (catalog=%s collection=%s) "
+                    "— it declares 'item' in index_tiers and belongs on the "
+                    "INDEX lane. This routing config predates the WRITE/"
+                    "READ/INDEX lane cutover; re-PUT it (or run the "
+                    "lane-migration SQL) to clear this warning.",
+                    r.driver_ref, catalog_id, collection_id,
+                )
+                continue
+            kept.append(r)
+        secondaries = kept
         if not secondaries:
             return
 

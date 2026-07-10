@@ -247,71 +247,6 @@ def _log_dispatch_path(
 
 
 
-async def _storage_plane_routing_enabled() -> bool:
-    """Read ``TasksPluginConfig.items_secondary_via_storage_plane``, hot-reloaded.
-
-    Mirrors the resolution pattern in
-    ``dynastore.modules.tasks.async_writer_backlog._resolve_threshold``:
-    fails open to the field default (``False``) when the platform configs
-    protocol is unavailable (early startup, tests) so an unreadable flag
-    degrades to the pre-#2494 dispatch path rather than raising.
-    """
-    try:
-        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
-        from dynastore.modules.tasks.tasks_config import TasksPluginConfig
-        from dynastore.tools.discovery import get_protocol
-
-        config_mgr = get_protocol(PlatformConfigsProtocol)
-        if config_mgr is None:
-            return bool(
-                TasksPluginConfig.model_fields["items_secondary_via_storage_plane"].default
-            )
-        cfg = await config_mgr.get_config(TasksPluginConfig)
-        if isinstance(cfg, TasksPluginConfig):
-            return cfg.items_secondary_via_storage_plane
-    except Exception:  # noqa: BLE001 — config read is best-effort
-        logger.debug(
-            "IndexDispatcher: items_secondary_via_storage_plane flag "
-            "unavailable — defaulting to the legacy dispatch path.",
-            exc_info=True,
-        )
-    from dynastore.modules.tasks.tasks_config import TasksPluginConfig
-    return bool(TasksPluginConfig.model_fields["items_secondary_via_storage_plane"].default)
-
-
-async def _resolve_in_task_run_chunk_size() -> int:
-    """Read ``TasksPluginConfig.in_task_run_inline_chunk_size``, hot-reloaded.
-
-    Bounds the per-chunk size of the in-run absorption path (#2716) — a job
-    container's memory budget was sized for ITS OWN write path, not for
-    ``INLINE_DISPATCH_CHUNK_SIZE`` (500) full envelopes on top of it.
-    Mirrors the fail-open resolution pattern of
-    ``_storage_plane_routing_enabled``: falls back to the field default when
-    the platform configs protocol is unavailable (early startup, tests).
-    """
-    try:
-        from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
-        from dynastore.modules.tasks.tasks_config import TasksPluginConfig
-        from dynastore.tools.discovery import get_protocol
-
-        config_mgr = get_protocol(PlatformConfigsProtocol)
-        if config_mgr is None:
-            return int(
-                TasksPluginConfig.model_fields["in_task_run_inline_chunk_size"].default
-            )
-        cfg = await config_mgr.get_config(TasksPluginConfig)
-        if isinstance(cfg, TasksPluginConfig):
-            return cfg.in_task_run_inline_chunk_size
-    except Exception:  # noqa: BLE001 — config read is best-effort
-        logger.debug(
-            "IndexDispatcher: in_task_run_inline_chunk_size unavailable — "
-            "falling back to the field default.",
-            exc_info=True,
-        )
-    from dynastore.modules.tasks.tasks_config import TasksPluginConfig
-    return int(TasksPluginConfig.model_fields["in_task_run_inline_chunk_size"].default)
-
-
 def _task_run_absorption_allowed(catalog: str) -> bool:
     """True when the currently running task run may absorb an ASYNC write
     for *catalog* inline instead of enqueuing it to the durable outbox.
@@ -617,16 +552,18 @@ class IndexDispatcher:
             # pg_conn, transient PG error) the returned 0 flows through as
             # succeeded=0/failed=N so _check_index_health escalates to
             # FAILED instead of silently claiming success.
-            # #2494 P1: when the storage-plane flag is on and this is an
-            # item-tier entry, ALWAYS route to id-only ``tasks.storage``
-            # obligations — regardless of ``in_task_run()``. The drain
-            # re-reads canonical PG state at replay time, so there is no
-            # snapshot to go stale and no reason to ever absorb the write
-            # inline (the in-task-run inline path is exactly the mechanism
-            # #2657 traced the ES secondary-write runaway to). Because this
-            # branch never falls through to ``_dispatch_bulk_chunked``, the
-            # noop-reenqueue (:1044) and partial-failure-resurface (:1054)
-            # amplifiers inside ``_dispatch_bulk`` cannot fire for these ops.
+            # #2494 WP-I: item-tier entries ALWAYS route to id-only
+            # ``tasks.storage`` obligations — unconditionally, regardless of
+            # ``in_task_run()``. Items INDEX materialization is
+            # storage-plane-always by design (the lane model, #3232): the
+            # drain re-reads canonical PG state at replay time, so there is
+            # no snapshot to go stale and no reason to ever absorb the write
+            # inline (the in-task-run inline path below is exactly the
+            # mechanism #2657 traced the ES secondary-write runaway to).
+            # Because this branch never falls through to
+            # ``_dispatch_bulk_chunked``, the noop-reenqueue (:1044) and
+            # partial-failure-resurface (:1054) amplifiers inside
+            # ``_dispatch_bulk`` cannot fire for these ops.
             #
             # Access-aware drivers are INCLUDED (#2687): the hub row now
             # persists the write-time owner (``access_owner`` column,
@@ -642,10 +579,7 @@ class IndexDispatcher:
             # therefore no longer a payload requirement that would force an
             # access-aware entry onto a different plane than any other
             # item-tier entry.
-            storage_plane_active = (
-                ctx.entity_type == "item"
-                and await _storage_plane_routing_enabled()
-            )
+            storage_plane_active = ctx.entity_type == "item"
             if storage_plane_active:
                 actually_enqueued = await self._enqueue_storage_plane_ids(
                     entry, ctx, entry_ops, tx_factory=tx_factory,
@@ -674,23 +608,22 @@ class IndexDispatcher:
             # background task/job execution (``in_task_run()``), spawning an
             # outbox row per chunk would fan out onto the serving pods that
             # drain it — the write is instead absorbed inline below, in the
-            # running job. #2716 narrows the exception two ways so a busy
-            # job's memory budget is never spent on work that isn't its own:
-            # (a) ``storage_plane_active`` — the flag owner (storage_drain)
-            # already claimed item-tier obligations above; an access-aware
-            # entry that fell through here still must not be absorbed once
-            # the operator has opted into the storage plane; (b)
-            # ``_task_run_absorption_allowed`` — a task run that declared
-            # its own catalog via ``task_run_scope(catalog=...)`` may only
-            # absorb writes for THAT catalog; a write for any other catalog
-            # is foreign backlog that belongs to the async-writer job, not
-            # to this job's container. A task run with no declared catalog
+            # running job. Only reachable for non-item tiers (collection /
+            # catalog / asset) — item-tier entries always ``continue``d
+            # above via the unconditional storage-plane branch, so
+            # ``storage_plane_active`` is guaranteed False here. #2716
+            # narrows the exception so a busy job's memory budget is never
+            # spent on work that isn't its own: ``_task_run_absorption_allowed``
+            # — a task run that declared its own catalog via
+            # ``task_run_scope(catalog=...)`` may only absorb writes for
+            # THAT catalog; a write for any other catalog is foreign backlog
+            # that belongs to the async-writer job, not to this job's
+            # container. A task run with no declared catalog
             # (``current_task_catalog() is None`` — e.g. the Cloud Run Job
             # entrypoint, which predates catalog-scoped ``task_run_scope``)
             # stays unrestricted, matching the original #2621 behaviour.
             if not (
                 in_task_run()
-                and not storage_plane_active
                 and _task_run_absorption_allowed(ctx.catalog)
             ):
                 actually_enqueued = await self._enqueue_obligation(entry, ctx, entry_ops)
@@ -1078,17 +1011,7 @@ class IndexDispatcher:
         # post-commit tail. Same code path, different provenance in the logs.
         running_in_task = in_task_run()
         chunk_mode = "inline_in_task_run" if running_in_task else "sync_chunked"
-        # #2716: a job container's memory budget is sized for its own write
-        # path, not for INLINE_DISPATCH_CHUNK_SIZE (500) full envelopes on
-        # top of it. Inside a task run, chunk at the smaller, hot-reloadable
-        # ``TasksPluginConfig.in_task_run_inline_chunk_size`` instead — the
-        # serving-path SYNC chunk size (this same code path outside a task
-        # run) is unaffected.
-        chunk_size = (
-            await _resolve_in_task_run_chunk_size()
-            if running_in_task
-            else INLINE_DISPATCH_CHUNK_SIZE
-        )
+        chunk_size = INLINE_DISPATCH_CHUNK_SIZE
         aggregated = BulkResult()
         for start in range(0, len(ops), chunk_size):
             chunk = ops[start:start + chunk_size]
@@ -1330,8 +1253,8 @@ class IndexDispatcher:
     ) -> int:
         """Enqueue ``tasks.storage`` obligations for the storage plane.
 
-        Used for item-tier ASYNC secondary-index entries when
-        ``TasksPluginConfig.items_secondary_via_storage_plane`` is enabled.
+        Used unconditionally for item-tier INDEX-lane entries (#2494 WP-I —
+        items INDEX materialization is storage-plane-always by design).
         Prefers ``ctx.pg_conn`` when the caller already has an open
         transaction (the serving-path wrapping TX
         ``ItemService._dispatch_index_upsert`` opens around the fan-out

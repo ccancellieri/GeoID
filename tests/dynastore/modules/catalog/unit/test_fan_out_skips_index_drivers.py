@@ -105,3 +105,40 @@ async def test_fan_out_skips_item_indexer_secondary(monkeypatch):
     # The item-indexer secondary is owned by the index dispatcher and MUST NOT
     # be double-written here (that path drops identity → #1289 race).
     assert indexer_secondary.writes == []
+
+
+@pytest.mark.asyncio
+async def test_fan_out_warns_when_dropping_stale_item_indexer_resolution(monkeypatch, caplog):
+    """A resolved WRITE entry that is actually an item-indexer driver means
+    the persisted routing config predates the lane cutover — surface it
+    (driver ref + collection id) instead of silently dropping the write, so
+    an operator knows to re-PUT the config (#3238 review)."""
+    import logging
+
+    indexer_secondary = _SecondaryIndexerDriver()
+    resolved = [
+        ResolvedDriver(driver=indexer_secondary, on_failure=FailurePolicy.WARN),
+    ]
+
+    async def _fake_get_write_drivers(catalog_id, collection_id=None, **kwargs):
+        return resolved
+
+    monkeypatch.setattr(
+        "dynastore.modules.storage.router.get_write_drivers",
+        _fake_get_write_drivers,
+    )
+
+    svc = ItemService(engine=None)
+    with caplog.at_level(logging.WARNING):
+        await svc._fan_out_to_secondary_drivers(
+            "cat_a", "col_a", [{"id": "geoid-1"}],
+            _primary_already_written=False,
+        )
+
+    assert indexer_secondary.writes == []
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        "_SecondaryIndexerDriver" in r.getMessage()
+        and "col_a" in r.getMessage()
+        for r in warnings
+    ), [r.getMessage() for r in warnings]

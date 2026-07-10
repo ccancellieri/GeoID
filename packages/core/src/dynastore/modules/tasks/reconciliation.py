@@ -218,8 +218,7 @@ async def reconcile_secondary_indexing(
 ) -> "Task":
     """Best-effort read-side convergence check for a pending secondary index.
 
-    An ingestion COMPLETED with ``items_secondary_via_storage_plane`` on and a
-    non-empty ``tasks.storage`` backlog persists
+    An ingestion COMPLETED with a non-empty ``tasks.storage`` backlog persists
     ``outputs["secondary_indexing"] = {"state": "pending", ...}``. This
     re-counts that backlog on read (mirroring :func:`reconcile_task_liveness`'s
     on-demand pattern) so a client polling after ``storage_drain`` has caught

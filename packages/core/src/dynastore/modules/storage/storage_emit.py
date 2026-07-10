@@ -325,9 +325,9 @@ async def enqueue_storage_op_id_only(
 
     Used by the
     :class:`~dynastore.modules.storage.index_dispatcher.IndexDispatcher` for
-    ASYNC secondary-index ``WRITE`` entries when
-    ``TasksPluginConfig.items_secondary_via_storage_plane`` is enabled
-    (#2494 P1). Each row carries only the entity id — the drain re-reads
+    item-tier INDEX-lane entries — unconditionally, items INDEX
+    materialization is storage-plane-always by design (#2494 WP-I). Each
+    row carries only the entity id — the drain re-reads
     the canonical PG row for each id at replay time instead of replaying
     a payload snapshot, so the queued obligation can never go stale.
 
