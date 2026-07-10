@@ -312,6 +312,20 @@ def select_collection_configs_batch(phys_schema: str) -> DQLQuery:
     )
 
 
+def select_collection_configs_for_ref(phys_schema: str) -> DQLQuery:
+    """Every collection-level ``config_data`` row at one ``ref_key``,
+    regardless of collection (no lock). Lets tier-local scans (e.g. the
+    cold-boot deny-policy restore, #3160) read only the collections that
+    actually stored a delta for the class instead of resolving the full
+    waterfall per collection.
+    """
+    validate_sql_identifier(phys_schema)
+    return DQLQuery(
+        f'SELECT config_data FROM "{phys_schema}".{COLLECTION_CONFIGS_TABLE} WHERE ref_key = :ref_key;',
+        result_handler=ResultHandler.ALL_SCALARS,
+    )
+
+
 def list_collection_refs(phys_schema: str) -> DQLQuery:
     """F.4c.2 enumerate {ref_key: class_key} for a given collection_id."""
     validate_sql_identifier(phys_schema)

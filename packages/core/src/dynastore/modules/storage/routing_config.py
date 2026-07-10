@@ -1660,16 +1660,14 @@ async def _sync_deny_policy_for_catalog(
             await ItemsElasticsearchPrivateDriver._apply_deny_policy(catalog_id)
             return
 
-        from dynastore.models.protocols import CatalogsProtocol
         from dynastore.models.protocols.configs import ConfigsProtocol
         from dynastore.tools.discovery import get_protocol
 
-        catalogs_proto = get_protocol(CatalogsProtocol)
         configs_proto = get_protocol(ConfigsProtocol)
-        if catalogs_proto is None or configs_proto is None:
+        if configs_proto is None:
             return
         if not await ItemsElasticsearchPrivateDriver._catalog_has_private_collection(
-            catalogs_proto, configs_proto, catalog_id,
+            configs_proto, catalog_id,
         ):
             await ItemsElasticsearchPrivateDriver._revoke_deny_policy(catalog_id)
     except Exception as exc:

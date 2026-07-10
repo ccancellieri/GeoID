@@ -18,6 +18,7 @@
 
 import logging
 import json
+from collections import OrderedDict
 from typing import Optional, Dict, Any, List, Tuple, Type, Union
 from dynastore.tools.cache import cached, DEFAULT_CONFIG_CACHE_TTL, DEFAULT_CONFIG_CACHE_L1_TTL
 from dynastore.modules.storage.router import invalidate_router_cache
@@ -269,6 +270,13 @@ def invalidate_catalog_config_caches(internal_catalog_id: str) -> None:
 # ==============================================================================
 
 
+# Hot-working-set bound for ``_validated_config_cache`` — matches the row
+# caches' maxsize (1024). Entries beyond the bound are the least recently
+# resolved (class, catalog, collection) triples and simply re-validate on
+# next use.
+_VALIDATED_CONFIG_CACHE_MAXSIZE = 1024
+
+
 class ConfigService(ConfigsProtocol):
     """Hierarchical Configuration Manager with framework-level immutability enforcement."""
 
@@ -284,10 +292,17 @@ class ConfigService(ConfigsProtocol):
         self._catalog_manager = catalog_manager
         self._catalogs_service = catalog_manager
         self._platform_config_service = platform_config_manager
-        self._validated_config_cache: Dict[
+        # Per-process memo of fully-validated waterfall results, keyed by
+        # (class_key, catalog_id, collection_id) and identity-guarded against
+        # the exact base/delta objects it was computed from — correctness
+        # never depends on an entry surviving, so LRU eviction is safe. The
+        # bound exists because an unbounded dict grows with every
+        # catalog x collection ever resolved in the process (#3160: the
+        # cold-boot deny-policy scan pushed workers into OOM through it).
+        self._validated_config_cache: OrderedDict[
             Tuple[str, Optional[str], Optional[str]],
             Tuple[PluginConfig, Optional[dict], Optional[dict], PluginConfig],
-        ] = {}
+        ] = OrderedDict()
 
     @property
     def catalog_manager(self) -> CatalogsProtocol:
@@ -460,6 +475,7 @@ class ConfigService(ConfigsProtocol):
                 and cached[1] is catalog_delta
                 and cached[2] is collection_delta
             ):
+                self._validated_config_cache.move_to_end(cache_key)
                 return cached[3]
 
         # Merge base.model_dump() with deltas in order (catalog → collection).
@@ -480,6 +496,9 @@ class ConfigService(ConfigsProtocol):
                 collection_delta,
                 resolved,
             )
+            self._validated_config_cache.move_to_end(cache_key)
+            while len(self._validated_config_cache) > _VALIDATED_CONFIG_CACHE_MAXSIZE:
+                self._validated_config_cache.popitem(last=False)
         return resolved
 
     async def get_configs_batch(
@@ -653,6 +672,35 @@ class ConfigService(ConfigsProtocol):
         if getter is None:
             return None
         return await getter(class_key)
+
+    async def list_collection_config_deltas(
+        self,
+        config_cls: "Union[str, Type[PluginConfig]]",
+        catalog_id: str,
+        ctx: Optional[DriverContext] = None,
+    ) -> List[Dict[str, Any]]:
+        """Every collection-level delta row stored for ``config_cls`` in
+        ``catalog_id``, in one query — see ConfigsProtocol (#3160).
+
+        Tier-local: raw partial dicts exactly as persisted, no waterfall,
+        no class-default filling. Collections without a stored row inherit
+        the catalog-scope resolution and do not appear here.
+        """
+        _, class_key = _resolve(config_cls)
+        validate_sql_identifier(catalog_id)
+        db_resource = ctx.db_resource if ctx else None
+        async with managed_transaction(db_resource or self.engine) as conn:
+            phys_schema = await self._get_catalog_manager().resolve_physical_schema(
+                catalog_id, ctx=DriverContext(db_resource=conn), allow_missing=True
+            )
+            if not phys_schema:
+                return []
+            if not await check_table_exists(conn, COLLECTION_CONFIGS_TABLE, phys_schema):
+                return []
+            rows = await _cq.select_collection_configs_for_ref(phys_schema).execute(
+                conn, ref_key=class_key
+            )
+        return [row for row in rows if row]
 
     async def get_config_versioned(
         self,

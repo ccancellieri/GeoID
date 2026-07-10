@@ -95,6 +95,24 @@ class ConfigsProtocol(Protocol):
         """
         ...
 
+    async def list_collection_config_deltas(
+        self,
+        config_cls: Type["PluginConfig"],
+        catalog_id: str,
+        ctx: Optional["DriverContext"] = None,
+    ) -> List[Dict[str, Any]]:
+        """Tier-local read of every collection-level delta row stored for
+        ``config_cls`` in ``catalog_id``, in one query (#3160).
+
+        Returns the raw delta payloads (partial dicts, exactly as persisted)
+        for the collections that explicitly stored a row for this class —
+        collections without a row inherit the catalog-scope resolution and
+        therefore do not appear here. Never walks the waterfall; never fills
+        class defaults. Empty list when the catalog has no such rows (or no
+        collection-configs table yet).
+        """
+        ...
+
     async def get_config_versioned(
         self,
         config_cls: Type[_T_Config],

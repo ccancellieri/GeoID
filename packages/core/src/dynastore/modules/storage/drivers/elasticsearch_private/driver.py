@@ -716,9 +716,17 @@ class ItemsElasticsearchPrivateDriver(
 
         #733 cutover: privacy is now expressed as the presence of the
         private driver variants in a collection's routing configs.  We
-        scan all catalogs, list each catalog's collections, and re-apply
-        the DENY policy idempotently for any catalog with at least one
-        collection whose routing configs pin a private driver.
+        scan all catalogs and re-apply the DENY policy idempotently for
+        any catalog whose items routing pins a private driver — at
+        catalog scope or in any stored collection-level delta.
+
+        #3160: the check reads only what is actually persisted — one
+        resolved catalog-scope config plus one query over the stored
+        collection-level ``ItemsRoutingConfig`` delta rows per catalog.
+        The previous implementation listed every collection and resolved
+        the full config waterfall for each, which on a catalog with tens
+        of thousands of collections ran the serving worker out of memory
+        before it could bind the port.
 
         The DENY pattern stays catalog-wide
         (``private_deny_{catalog_id}`` blocking
@@ -748,11 +756,11 @@ class ItemsElasticsearchPrivateDriver(
                     if not catalog_id:
                         continue
                     if await self._catalog_has_private_collection(
-                        catalogs_proto, configs, catalog_id,
+                        configs, catalog_id,
                     ):
                         await self._apply_deny_policy(catalog_id)
                         logger.info(
-                            "PrivateDriver: restored DENY for '%s' (#733 — at least one collection pins a private driver).",
+                            "PrivateDriver: restored DENY for '%s' (#733 — items routing pins a private driver).",
                             catalog_id,
                         )
                 if len(catalog_list) < batch:
@@ -765,50 +773,58 @@ class ItemsElasticsearchPrivateDriver(
 
     @staticmethod
     async def _catalog_has_private_collection(
-        catalogs_proto: Any,
         configs: Any,
         catalog_id: str,
     ) -> bool:
-        """Return True iff any collection of the catalog has an items routing
-        config pinning ``items_elasticsearch_private_driver`` (#733, #1047).
+        """Return True iff the catalog's items routing pins
+        ``items_elasticsearch_private_driver`` (#733, #1047) — at catalog
+        scope, or in any STORED collection-level delta row (#3160).
+
+        Equivalence with the old per-collection walk: a collection without
+        a stored ``ItemsRoutingConfig`` row resolves exactly to the
+        catalog-scope config checked first; a stored delta replaces
+        ``operations`` wholesale on merge, so a private pin in the resolved
+        view implies the pin is visible either at catalog scope or verbatim
+        in the delta payload. One deliberate widening: a catalog-scope
+        private pin now restores the DENY even before the first collection
+        exists (fails closed for privacy).
 
         Collection-envelope privacy via a separate ES driver is no longer
         supported (#1047 Phase 2). Only items-level private routing is checked.
-        Iterates collections in batches.
         """
         from dynastore.modules.storage.routing_config import (
+            _PRIVATE_ITEMS_DRIVER_ID,
             ItemsRoutingConfig,
             _items_routing_has_private_driver,
         )
 
-        offset, batch = 0, 100
-        while True:
-            try:
-                collections = await catalogs_proto.list_collections(
-                    catalog_id, limit=batch, offset=offset,
-                )
-            except Exception:
-                return False
-            if not collections:
-                return False
-            for col in collections:
-                col_id = getattr(col, "id", None)
-                if not col_id:
-                    continue
-                try:
-                    items_routing = await configs.get_config(
-                        ItemsRoutingConfig,
-                        catalog_id=catalog_id, collection_id=col_id,
-                    )
-                except Exception:
-                    items_routing = None
-                if isinstance(items_routing, ItemsRoutingConfig) and (
-                    _items_routing_has_private_driver(items_routing)
-                ):
-                    return True
-            if len(collections) < batch:
-                return False
-            offset += batch
+        try:
+            catalog_scope = await configs.get_config(
+                ItemsRoutingConfig, catalog_id=catalog_id,
+            )
+        except Exception:
+            catalog_scope = None
+        if isinstance(catalog_scope, ItemsRoutingConfig) and (
+            _items_routing_has_private_driver(catalog_scope)
+        ):
+            return True
+
+        try:
+            deltas = await configs.list_collection_config_deltas(
+                ItemsRoutingConfig, catalog_id,
+            )
+        except Exception:
+            return False
+        for delta in deltas:
+            operations = delta.get("operations") or {}
+            for entries in operations.values():
+                for entry in entries or []:
+                    if (
+                        isinstance(entry, dict)
+                        and entry.get("driver_ref") == _PRIVATE_ITEMS_DRIVER_ID
+                    ):
+                        return True
+        return False
 
     # ``location``, ``get_entity_fields``, ``export_entities``,
     # ``rename_storage``, ``restore_entities`` are inherited from
