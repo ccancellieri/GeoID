@@ -27,7 +27,7 @@ where = ["src"]
 namespaces = true
 
 [tool.setuptools.package-data]
-"dynastore.extensions.edr" = ["static/**/*"]
+"dynastore.extensions.edr" = ["notebooks/*.ipynb", "static/**/*"]
 
 [tool.uv.sources]
 dynastore = { workspace = true }

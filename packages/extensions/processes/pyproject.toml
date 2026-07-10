@@ -24,7 +24,7 @@ where = ["src"]
 namespaces = true
 
 [tool.setuptools.package-data]
-"dynastore.extensions.processes" = ["static/**/*"]
+"dynastore.extensions.processes" = ["notebooks/*.ipynb", "static/**/*"]
 
 [tool.uv.sources]
 dynastore = { workspace = true }
