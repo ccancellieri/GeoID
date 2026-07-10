@@ -18,6 +18,7 @@
 
 # File: dynastore/modules/iam/module.py
 
+import asyncio
 import logging
 from uuid import UUID
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -66,6 +67,12 @@ from dynastore.modules.catalog.lifecycle_manager import lifecycle_registry
 from dynastore.modules.db_config.query_executor import DbResource
 from typing import Optional, Any, AsyncGenerator, List, Tuple, cast
 from dynastore.tools.discovery import register_plugin, unregister_plugin
+from dynastore.tools.background_service import (
+    Leadership,
+    PeriodicService,
+    PodPolicy,
+    ServiceContext,
+)
 
 # Import at module-load time so PluginConfig.__init_subclass__ runs its
 # TypedModelRegistry registration before any lifespan starts.  The
@@ -86,6 +93,8 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
     _authorizer: Optional[IamAuthorizer] = None
     _listing_visibility: Optional[Any] = None
     _identity_provider: Optional[Any] = None
+    _identity_provider_fingerprint: Optional[Any] = None
+    _identity_provider_lock: Optional[asyncio.Lock] = None
     storage: Optional[AbstractIamStorage] = None
 
     @asynccontextmanager
@@ -222,6 +231,12 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
             _iam_bg_shutdown = _asyncio.Event()
             _iam_supervisor = _IamBgSupervisor()
             _iam_supervisor.register(IamRuleCacheRefreshService())
+            # Periodic identity-provider reconcile (#3231): closes the
+            # first-boot gap (a process that saw no IdpConfig row at t=0
+            # never got a second look) and runtime rotation (a PATCH to
+            # IdpConfig never reached an already-running process) left by
+            # the per-process, lifespan-only registration above.
+            _iam_supervisor.register(IdentityProviderReconcileService(self))
             # One initial refresh so the first cache read sees the live TTL
             # and rule-version without waiting for the first tick.
             try:
@@ -301,6 +316,109 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
         iterates the list) and never a window with zero. A transient config
         read failure leaves the previously-registered provider in place
         rather than tearing it down.
+
+        A third caller (geoid#3231): ``IdentityProviderReconcileService``,
+        a periodic tick on the module's ``BackgroundSupervisor``, calls this
+        on every cadence where the resolved config's registration-relevant
+        fields changed since the last successful call — closing the
+        first-boot gap (a process that saw no ``IdpConfig`` row at t=0 never
+        got a second look) and runtime rotation (a PATCH never reached an
+        already-running process) that the lifespan-only call above leaves
+        open. On every successful resolution (whether or not it yields a
+        backend to register) this method updates
+        ``self._identity_provider_fingerprint`` so that reconciler can cheaply
+        detect "no change" without repeating the OIDC-discovery / JWKS /
+        provider-rebuild work below.
+
+        Concurrency (geoid#3231 review): three callers can be in flight on
+        the same instance — the lifespan boot call, the reconcile tick
+        above, and ``IamColdBootContributor``'s step-7 self-heal — each
+        driven by its own supervisor on its own ~30s-scale cadence, with no
+        ordering guarantee between them. Two overlapping calls both read
+        ``IdpConfig`` (an await), so the one that started first can finish
+        LAST if its read is slower; without serialization its (now stale)
+        registration and fingerprint update would overwrite a newer one that
+        finished first, and because the fingerprint is updated in the same
+        call that set it, the result looks self-consistent — nothing notices
+        until the next tick reads the DB again. The whole body below
+        therefore runs under ``self._identity_provider_lock`` so overlapping
+        calls serialize instead of racing; the call is rare (once at boot,
+        then only on an actual config change) and cheap enough that
+        serializing costs nothing observable.
+        """
+        if self._identity_provider_lock is None:
+            # Safe lazy-init: no ``await`` between the check and the set, so
+            # this can't interleave with another coroutine on the same
+            # instance (same single-flight idiom as
+            # ``EngineInstanceCache._ref_locks.setdefault`` in
+            # ``modules/db_config/engine_instance_cache.py``, simplified to
+            # one lock since this instance has exactly one thing to guard).
+            self._identity_provider_lock = asyncio.Lock()
+
+        async with self._identity_provider_lock:
+            cfg, ok = await self._resolve_idp_config()
+            if not ok:
+                return
+
+            if cfg is not None and cfg.is_configured:
+                from .identity_providers.oidc_identity import OidcIdentityProvider
+
+                secret = cfg.client_secret.reveal() if cfg.client_secret else None
+                logger.info("IdP: issuer_url=%s, client_id=%s, audience=%s, roles_claim_path=%s",
+                    cfg.issuer_url, cfg.client_id, cfg.audience, cfg.roles_claim_path)
+                provider = OidcIdentityProvider(
+                    issuer_url=cast(str, cfg.issuer_url),
+                    client_id=cfg.client_id,
+                    client_secret=secret,
+                    audience=cfg.audience,
+                    public_url=cfg.public_url,
+                    roles_claim_path=cfg.roles_claim_path,
+                )
+                old = self._identity_provider
+                register_plugin(provider)
+                self._identity_provider = provider
+                if old is not None and old is not provider:
+                    unregister_plugin(old)
+                logger.info(
+                    "Registered OIDC identity provider from IdpConfig: %s",
+                    cfg.issuer_url,
+                )
+                self._identity_provider_fingerprint = _idp_registration_fingerprint(cfg)
+                return
+
+            # cfg was resolved (no read failure) but selects no backend — either
+            # no PlatformConfigsProtocol is registered, no row exists, or the row
+            # does not select an implemented + addressed backend. This is an
+            # intentional "no provider configured" state, not a transient
+            # failure, so any previously-registered provider is removed.
+            if self._identity_provider is not None:
+                unregister_plugin(self._identity_provider)
+                self._identity_provider = None
+
+            if cfg is not None and cfg.type == "saml2":
+                logger.warning(
+                    "IdpConfig.type=saml2 is not yet implemented; no IdP "
+                    "registered. See modules/iam/identity_providers/README.md."
+                )
+
+            if cfg is None:
+                logger.warning("IdP: No IdpConfig found in database")
+            elif not cfg.is_configured:
+                logger.warning("IdP: IdpConfig not configured (type=%s, issuer_url=%s)", cfg.type, cfg.issuer_url)
+
+            self._identity_provider_fingerprint = _idp_registration_fingerprint(cfg)
+
+    async def _resolve_idp_config(self) -> Tuple[Optional["IdpConfig"], bool]:
+        """Read the current :class:`IdpConfig` row via ``PlatformConfigsProtocol``.
+
+        Shared by :meth:`_register_identity_provider` and the periodic
+        :class:`IdentityProviderReconcileService` tick (geoid#3231) so both
+        read the config the exact same way.
+
+        Returns ``(cfg, ok)``. ``ok=False`` signals a transient read
+        failure — every caller must leave the previously-registered
+        provider (and, for the reconciler, the stored fingerprint)
+        untouched rather than treating a failed read as "not configured".
         """
         from dynastore.models.protocols.platform_configs import (
             PlatformConfigsProtocol,
@@ -331,52 +449,8 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
                     "registered provider (if any) in place.",
                     exc_info=True,
                 )
-                return
-
-        if cfg is not None and cfg.is_configured:
-            from .identity_providers.oidc_identity import OidcIdentityProvider
-
-            secret = cfg.client_secret.reveal() if cfg.client_secret else None
-            logger.info("IdP: issuer_url=%s, client_id=%s, audience=%s, roles_claim_path=%s",
-                cfg.issuer_url, cfg.client_id, cfg.audience, cfg.roles_claim_path)
-            provider = OidcIdentityProvider(
-                issuer_url=cast(str, cfg.issuer_url),
-                client_id=cfg.client_id,
-                client_secret=secret,
-                audience=cfg.audience,
-                public_url=cfg.public_url,
-                roles_claim_path=cfg.roles_claim_path,
-            )
-            old = self._identity_provider
-            register_plugin(provider)
-            self._identity_provider = provider
-            if old is not None and old is not provider:
-                unregister_plugin(old)
-            logger.info(
-                "Registered OIDC identity provider from IdpConfig: %s",
-                cfg.issuer_url,
-            )
-            return
-
-        # cfg was resolved (no read failure) but selects no backend — either
-        # no PlatformConfigsProtocol is registered, no row exists, or the row
-        # does not select an implemented + addressed backend. This is an
-        # intentional "no provider configured" state, not a transient
-        # failure, so any previously-registered provider is removed.
-        if self._identity_provider is not None:
-            unregister_plugin(self._identity_provider)
-            self._identity_provider = None
-
-        if cfg is not None and cfg.type == "saml2":
-            logger.warning(
-                "IdpConfig.type=saml2 is not yet implemented; no IdP "
-                "registered. See modules/iam/identity_providers/README.md."
-            )
-
-        if cfg is None:
-            logger.warning("IdP: No IdpConfig found in database")
-        elif not cfg.is_configured:
-            logger.warning("IdP: IdpConfig not configured (type=%s, issuer_url=%s)", cfg.type, cfg.issuer_url)
+                return None, False
+        return cfg, True
 
     async def _register_usage_counter_drivers(self, stack: AsyncExitStack) -> None:
         """Wire a :class:`UsageCounterProtocol` driver for rate-limit / quota.
@@ -601,6 +675,87 @@ class IamModule(ModuleProtocol, AuthenticationProtocol, AuthorizationProtocol, P
             offset=offset,
             catalog_id=catalog_id,
         )
+
+
+def _idp_registration_fingerprint(cfg: Optional["IdpConfig"]) -> Any:
+    """Cheap fingerprint of the :class:`IdpConfig` fields that
+    ``IamModule._register_identity_provider`` actually consumes to build a
+    provider (geoid#3231).
+
+    ``None`` covers both "no config row" and "a row present but not
+    selecting an implemented + addressed backend" (``issuer_url`` unset, or
+    ``type=saml2``) — both produce the exact same "nothing registered"
+    outcome in ``_register_identity_provider``, so they must compare equal.
+    Any other change (issuer, client id/secret, audience, public URL,
+    roles-claim path) is registration-relevant and must trigger a
+    re-registration.
+    """
+    if cfg is None or not cfg.is_configured:
+        return None
+    return (
+        cfg.type,
+        cfg.issuer_url,
+        cfg.client_id,
+        cfg.client_secret.reveal() if cfg.client_secret else None,
+        cfg.audience,
+        cfg.public_url,
+        cfg.roles_claim_path,
+    )
+
+
+class IdentityProviderReconcileService(PeriodicService):
+    """Periodic self-heal: re-run ``_register_identity_provider`` only when
+    the registration-relevant fields of ``IdpConfig`` changed (geoid#3231).
+
+    Closes two gaps left by the per-process, lifespan-only registration
+    (geoid#3199/#3227), which runs exactly once per process:
+
+    * First-ever deployment — a process that boots into the t=0 window
+      before the fleet-once cold-boot leader has seeded a fresh
+      ``IdpConfig`` row sees no config, registers nothing, and never got a
+      second look. This tick keeps checking every cadence until a row
+      appears — an absent config row simply fingerprints the same as the
+      previous "nothing registered" state, so those ticks are one cheap
+      config read and nothing else.
+    * Runtime rotation — a PATCH to ``IdpConfig`` (issuer/audience/client
+      change) never reached an already-running process; only a fresh
+      process boot ever re-read the row.
+
+    A fingerprint-unchanged tick costs one config read and skips the OIDC
+    discovery / JWKS-client / provider-rebuild work a full re-registration
+    performs. ``_register_identity_provider`` updates the stored fingerprint
+    itself on every successful read (whether or not that read yields a
+    backend to register), so a transient read failure — here or inside the
+    delegated call — leaves both the previously-registered provider and the
+    fingerprint untouched, same as every other caller of that method. A
+    deleted ``IdpConfig`` row is a fingerprint change like any other (goes
+    from a config tuple back to ``None``), so it is reconciled the same
+    way — the provider is deregistered on the next tick.
+
+    ``leadership = RUN_EVERYWHERE``: the identity-provider registry
+    (``tools.discovery``) is process-local, so every pod must reconcile its
+    own registration independently — there is no shared state to elect a
+    leader over. ``pod_policy = ALL`` mirrors ``IamRuleCacheRefreshService``:
+    job pods handling authenticated work need a live registration too.
+    Cadence is left at :class:`PeriodicService`'s default (30s), the same
+    interval ``IamRuleCacheRefreshService`` already ticks on — no new knob.
+    """
+
+    name = "iam_identity_provider_reconcile"
+    leadership = Leadership.RUN_EVERYWHERE
+    pod_policy = PodPolicy.ALL
+
+    def __init__(self, module: "IamModule") -> None:
+        self._module = module
+
+    async def tick(self, ctx: ServiceContext) -> None:
+        module = self._module
+        cfg, ok = await module._resolve_idp_config()
+        if not ok:
+            return
+        if _idp_registration_fingerprint(cfg) == module._identity_provider_fingerprint:
+            return
+        await module._register_identity_provider()
 
 
 async def _seed_oidc_role_sync_config(engine: Any) -> None:
