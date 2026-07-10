@@ -1235,6 +1235,7 @@ async def get_tile_resolution_params(
         max_features_per_tile_by_zoom: Dict[int, int] = {}
         feature_rank_column: Optional[str] = None
         min_feature_rank_by_zoom: Dict[int, float] = {}
+        tile_byte_budget: int = 0
         if isinstance(tiles_config, TilesConfig):
             simplification_by_zoom = tiles_config.simplification_by_zoom or {}
             min_feature_pixel_area_by_zoom = (
@@ -1250,6 +1251,7 @@ async def get_tile_resolution_params(
             min_feature_rank_by_zoom = (
                 tiles_config.min_feature_rank_by_zoom or {}
             )
+            tile_byte_budget = tiles_config.tile_byte_budget or 0
 
         # 4. Resolve the collection config for sidecar-aware MVT queries from
         # the SAME tile-capable driver resolved above (Hint.TILES → PG). Two
@@ -1291,6 +1293,7 @@ async def get_tile_resolution_params(
             "max_features_per_tile_by_zoom": max_features_per_tile_by_zoom,
             "feature_rank_column": feature_rank_column,
             "min_feature_rank_by_zoom": min_feature_rank_by_zoom,
+            "tile_byte_budget": tile_byte_budget,
             "catalog_id": catalog_id,
             "collection_id": collection_id,
             "col_config": col_config,

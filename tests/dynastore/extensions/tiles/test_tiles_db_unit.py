@@ -54,7 +54,7 @@ async def test_get_features_as_mvt_filtered_query_structure():
         mock_execute = AsyncMock()
         mock_execute.side_effect = [
             True,  # srid_exists
-            b"fake_mvt_bytes",  # final result
+            (b"fake_mvt_bytes", 3),  # final result row: (mvt, feature_count)
         ]
         mock_query_instance.execute = mock_execute
 

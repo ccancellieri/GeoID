@@ -205,6 +205,36 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
         ),
     )
 
+    # Self-tuning per-tile BYTE budget (#3155).
+    #
+    # The feature cap above bounds render cost, but bytes-per-feature varies
+    # by orders of magnitude across layers (a 2-vertex segment vs a dense
+    # MultiLineString), so no single count holds tile *bytes* to a target.
+    # The budget adapts the effective per-tile LIMIT from the measured
+    # bytes-per-feature of previous successful renders of the same collection
+    # at the same zoom:
+    #
+    #   effective LIMIT = min(bracket cap, byte_budget // measured bytes/feature)
+    #
+    # The first render of a (collection, zoom) pair has no measurement yet and
+    # uses the feature-cap ladder alone; every successful render refines the
+    # estimate, so oversized tiles decay toward the budget on re-render instead
+    # of being re-served at full weight forever. It is a target, not a hard
+    # cap — a rendered tile is never discarded for exceeding it, and the
+    # estimator is per-process (each worker converges after one render).
+    tile_byte_budget: Mutable[int] = Field(
+        default=1_048_576,
+        ge=0,
+        description=(
+            "Target upper bound in bytes for a rendered MVT tile. The effective "
+            "per-tile feature LIMIT adapts toward it using the measured "
+            "bytes-per-feature of previous renders of the same collection and "
+            "zoom (never above the max_features_per_tile_by_zoom bracket). "
+            "A target, not a hard cap: an already-rendered tile is served "
+            "whole. 0 disables the byte budget. Default 1 MiB."
+        ),
+    )
+
     # Optional stored column used to rank features when the per-tile cap or the
     # min-rank filter is active — e.g. a precomputed, indexed length-in-metres or
     # area-in-metres column on the geometry sidecar. When set, low-zoom tiles

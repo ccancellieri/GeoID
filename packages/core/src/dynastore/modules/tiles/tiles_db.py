@@ -19,6 +19,7 @@
 # dynastore/modules/tiles/tiles_db.py
 
 import logging
+from collections import OrderedDict
 from typing import Dict, Any, List, Mapping, Optional, Tuple, Union
 from sqlalchemy import text
 from shapely.geometry import box
@@ -35,6 +36,45 @@ from dynastore.tools.geospatial import SimplificationAlgorithm
 from .tiles_models import TileMatrixSet
 
 logger = logging.getLogger(__name__)
+
+# --- Self-tuning per-tile byte budget (#3155) --------------------------------
+#
+# Measured bytes-per-feature of successful MVT renders, keyed by
+# (catalog_id, collection_id, zoom). Sizing the next render's feature LIMIT
+# from the previous render's measured byte cost is the same adaptive-estimator
+# mechanism ``dynastore.tools.adaptive_chunk_sizing`` (#3163) applies to
+# ingest chunks; tiles keep their own map because the sample here is a
+# (bytes, feature_count) pair per rendered tile, not a chunk of documents.
+#
+# Deliberately per-process: one successful render per key is enough to size
+# the next one, the feature-cap ladder bounds the cold-start miss, and no
+# distributed state means no coherence traffic on the tile hot path. The EWMA
+# smooths within-zoom variance (a coastal tile vs an inland one).
+_BPF_ESTIMATES: "OrderedDict[Tuple[str, str, int], float]" = OrderedDict()
+_BPF_MAX_ENTRIES = 4096
+_BPF_EWMA_ALPHA = 0.5
+
+
+def _bpf_get(key: Tuple[str, str, int]) -> Optional[float]:
+    val = _BPF_ESTIMATES.get(key)
+    if val is not None:
+        _BPF_ESTIMATES.move_to_end(key)
+    return val
+
+
+def _bpf_update(key: Tuple[str, str, int], tile_bytes: int, features: int) -> None:
+    if tile_bytes <= 0 or features <= 0:
+        return
+    sample = tile_bytes / features
+    prev = _BPF_ESTIMATES.get(key)
+    _BPF_ESTIMATES[key] = (
+        sample if prev is None
+        else _BPF_EWMA_ALPHA * sample + (1.0 - _BPF_EWMA_ALPHA) * prev
+    )
+    _BPF_ESTIMATES.move_to_end(key)
+    while len(_BPF_ESTIMATES) > _BPF_MAX_ENTRIES:
+        _BPF_ESTIMATES.popitem(last=False)
+
 
 # Query to check if a specific SRID exists in PostGIS
 check_srid_query = text(
@@ -329,6 +369,34 @@ async def get_features_as_mvt_filtered(
     )
     min_rank = _bracket("min_feature_rank_by_zoom")
 
+    # Self-tuning byte budget (#3155): shrink the bracket cap using the
+    # measured bytes-per-feature of previous renders of this collection at
+    # this zoom, so the effective LIMIT converges the tile toward the byte
+    # budget without per-collection tuning. Single-collection tiles only —
+    # a multi-collection tile cannot attribute its bytes to one estimator
+    # key. The first render of a key has no estimate and runs under the
+    # ladder cap alone; the measurement after execution below seeds it.
+    bpf_key: Optional[Tuple[str, str, int]] = None
+    if len(resolved_collections) == 1:
+        byte_budget = int(resolved_collections[0].get("tile_byte_budget") or 0)
+        if byte_budget > 0:
+            try:
+                bpf_key = (
+                    resolved_collections[0]["catalog_id"],
+                    resolved_collections[0]["collection_id"],
+                    int(z),
+                )
+            except (KeyError, ValueError):
+                bpf_key = None
+        if bpf_key is not None:
+            bytes_per_feature = _bpf_get(bpf_key)
+            if bytes_per_feature and bytes_per_feature > 0:
+                budget_rows = max(1, int(byte_budget / bytes_per_feature))
+                if max_features and max_features > 0:
+                    max_features = min(int(max_features), budget_rows)
+                else:
+                    max_features = budget_rows
+
     # 3. Build Subqueries for each collection
     for i, meta in enumerate(resolved_collections):
         # meta contains: catalog_id, collection_id, col_config, source_srid, simplification_by_zoom
@@ -429,11 +497,15 @@ async def get_features_as_mvt_filtered(
             z, min_pixel_area, min_pixel_length,
         )
 
-    # 5. Final SQL Execution
+    # 5. Final SQL Execution. The COUNT(*) rides the same aggregate pass as
+    # ST_AsMVT (one row, no GROUP BY) and feeds the byte-budget estimator —
+    # bytes-per-feature needs the number of features actually aggregated,
+    # which the LIMIT-ed subqueries make different from the requested cap.
     full_query = f"""
         WITH
         mvtgeom AS ({" UNION ALL ".join(union_queries)})
-        SELECT ST_AsMVT(mvtgeom.*, 'default', {extent}, 'geom')
+        SELECT ST_AsMVT(mvtgeom.*, 'default', {extent}, 'geom') AS mvt,
+               COUNT(*) AS feature_count
         FROM mvtgeom{area_where};
     """
 
@@ -442,9 +514,14 @@ async def get_features_as_mvt_filtered(
     )
     logger.debug(f"target_srid value: {all_bind_params.get('target_srid')}")
 
-    mvt = await DQLQuery(
-        full_query, result_handler=ResultHandler.SCALAR_ONE_OR_NONE
+    row = await DQLQuery(
+        full_query, result_handler=ResultHandler.ONE_OR_NONE
     ).execute(conn, **all_bind_params)
+    mvt = None
+    if row is not None:
+        mvt = row[0]
+        if bpf_key is not None and mvt:
+            _bpf_update(bpf_key, len(mvt), int(row[1] or 0))
     # ST_AsMVT is an aggregate over `mvtgeom`, which this query always
     # executes as a single row (no GROUP BY) — the only way this comes back
     # None is the aggregate itself being NULL, i.e. zero features matched.

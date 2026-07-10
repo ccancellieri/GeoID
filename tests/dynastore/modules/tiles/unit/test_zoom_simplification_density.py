@@ -199,6 +199,7 @@ def _make_collection_meta(
     max_features_per_tile_by_zoom=None,
     feature_rank_column=None,
     min_feature_rank_by_zoom=None,
+    tile_byte_budget=None,
 ):
     """Return a minimal resolved-collection meta dict for tiles_db tests."""
     return {
@@ -212,6 +213,7 @@ def _make_collection_meta(
         "max_features_per_tile_by_zoom": max_features_per_tile_by_zoom,
         "feature_rank_column": feature_rank_column,
         "min_feature_rank_by_zoom": min_feature_rank_by_zoom,
+        "tile_byte_budget": tile_byte_budget,
     }
 
 
@@ -244,10 +246,10 @@ async def _run_mvt_filtered(meta, z="2", extent=4096):
         def execute(self, conn, **params):
             captured_sql.append(self._sql)
             # First call: SRID exists check → True
-            # Second call: final MVT query → b"mvt"
+            # Second call: final MVT query → (mvt bytes, feature_count) row
             if len(captured_sql) == 1:
                 return _async_return(True)
-            return _async_return(b"mvt")
+            return _async_return((b"mvt", 3))
 
     def _async_return(value):
         async def _inner(*args, **kwargs):
@@ -418,7 +420,7 @@ async def _capture_builder_params(meta, z="2"):
             captured.append(self._sql)
 
             async def _inner(*a, **k):
-                return True if len(captured) == 1 else b"mvt"
+                return True if len(captured) == 1 else (b"mvt", 3)
             return _inner()
 
     with patch("dynastore.modules.tiles.tiles_db.DQLQuery", side_effect=_DQL):
@@ -529,6 +531,123 @@ def test_feature_rank_config_defaults_are_none():
     cfg = TilesConfig()
     assert cfg.feature_rank_column is None
     assert cfg.min_feature_rank_by_zoom is None
+
+
+# ---------------------------------------------------------------------------
+# Self-tuning per-tile byte budget (#3155 option B)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_bpf_estimates():
+    """The bytes-per-feature estimator is module-global; isolate every test."""
+    tiles_db._BPF_ESTIMATES.clear()
+    yield
+    tiles_db._BPF_ESTIMATES.clear()
+
+
+def test_tile_byte_budget_default_is_one_mib():
+    from dynastore.modules.tiles.tiles_config import TilesConfig
+    assert TilesConfig().tile_byte_budget == 1_048_576
+
+
+def test_tile_byte_budget_zero_disables():
+    from dynastore.modules.tiles.tiles_config import TilesConfig
+    assert TilesConfig(tile_byte_budget=0).tile_byte_budget == 0
+
+
+def test_bpf_update_seeds_then_ewma():
+    key = ("cat", "col", 2)
+    tiles_db._bpf_update(key, tile_bytes=1000, features=10)  # seed: 100 B/feat
+    assert tiles_db._bpf_get(key) == 100.0
+    tiles_db._bpf_update(key, tile_bytes=2000, features=10)  # sample: 200
+    assert tiles_db._bpf_get(key) == pytest.approx(150.0)  # alpha 0.5
+
+
+def test_bpf_update_ignores_empty_measurements():
+    key = ("cat", "col", 2)
+    tiles_db._bpf_update(key, tile_bytes=0, features=10)
+    tiles_db._bpf_update(key, tile_bytes=100, features=0)
+    assert tiles_db._bpf_get(key) is None
+
+
+def test_bpf_estimates_bounded_lru():
+    for i in range(tiles_db._BPF_MAX_ENTRIES + 10):
+        tiles_db._bpf_update(("cat", f"col{i}", 0), tile_bytes=100, features=1)
+    assert len(tiles_db._BPF_ESTIMATES) == tiles_db._BPF_MAX_ENTRIES
+    assert tiles_db._bpf_get(("cat", "col0", 0)) is None  # oldest evicted
+
+
+@pytest.mark.asyncio
+async def test_byte_budget_shrinks_limit_once_measured():
+    """With a measured 100 B/feature and a 100 KB budget, the effective LIMIT
+    drops from the 20000 bracket cap to 1000."""
+    tiles_db._bpf_update(("cat", "col", 2), tile_bytes=100_000, features=1000)
+    meta = _make_collection_meta(
+        max_features_per_tile_by_zoom={0: 20000},
+        tile_byte_budget=100_000,
+    )
+    params = await _capture_builder_params(meta, z="2")
+    assert params.get("limit") == 1000
+
+
+@pytest.mark.asyncio
+async def test_byte_budget_without_measurement_uses_ladder():
+    """Cold start: no estimate for the key → the bracket cap alone applies."""
+    meta = _make_collection_meta(
+        max_features_per_tile_by_zoom={0: 20000},
+        tile_byte_budget=100_000,
+    )
+    params = await _capture_builder_params(meta, z="2")
+    assert params.get("limit") == 20000
+
+
+@pytest.mark.asyncio
+async def test_byte_budget_never_raises_ladder_cap():
+    """A generous budget must not lift the LIMIT above the bracket cap."""
+    tiles_db._bpf_update(("cat", "col", 2), tile_bytes=100, features=100)  # 1 B/feat
+    meta = _make_collection_meta(
+        max_features_per_tile_by_zoom={0: 20000},
+        tile_byte_budget=1_048_576,  # budget alone would allow ~1M rows
+    )
+    params = await _capture_builder_params(meta, z="2")
+    assert params.get("limit") == 20000
+
+
+@pytest.mark.asyncio
+async def test_byte_budget_applies_when_ladder_opted_out():
+    """{0: 0} opts out of the count ladder, but a measured byte budget still
+    bounds the tile."""
+    tiles_db._bpf_update(("cat", "col", 2), tile_bytes=100_000, features=1000)
+    meta = _make_collection_meta(
+        max_features_per_tile_by_zoom={0: 0},
+        tile_byte_budget=100_000,
+    )
+    params = await _capture_builder_params(meta, z="2")
+    assert params.get("limit") == 1000
+
+
+@pytest.mark.asyncio
+async def test_render_measures_bytes_per_feature():
+    """A successful render seeds the estimator from (len(mvt), COUNT(*))."""
+    meta = _make_collection_meta(tile_byte_budget=100_000)
+    await _run_mvt_filtered(meta, z="2")  # harness row: (b"mvt", 3)
+    assert tiles_db._bpf_get(("cat", "col", 2)) == pytest.approx(3 / 3)
+
+
+@pytest.mark.asyncio
+async def test_render_measurement_skipped_when_budget_disabled():
+    meta = _make_collection_meta(tile_byte_budget=0)
+    await _run_mvt_filtered(meta, z="2")
+    assert tiles_db._bpf_get(("cat", "col", 2)) is None
+
+
+@pytest.mark.asyncio
+async def test_final_query_counts_features():
+    """COUNT(*) must ride the ST_AsMVT aggregate for the estimator."""
+    meta = _make_collection_meta()
+    sql = await _run_mvt_filtered(meta, z="2")
+    assert "COUNT(*)" in sql
 
 
 def test_feature_rank_config_overridable():
