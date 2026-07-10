@@ -81,17 +81,21 @@ logger = logging.getLogger(__name__)
 
 
 class ESBulkIndexer:
-    """Wrap :class:`ItemsElasticsearchDriver` to expose the
-    :class:`BulkIndexer` Protocol.
+    """Wrap an ``_ItemsElasticsearchBase`` items driver — today
+    :class:`ItemsElasticsearchDriver` (standard) or
+    :class:`ItemsElasticsearchEnvelopeDriver` (access-aware, #2687) — to
+    expose the :class:`BulkIndexer` Protocol.
 
-    The driver instance is passed in at construction so the adapter
-    can resolve the active ES client (via
-    :func:`dynastore.modules.storage.drivers.elasticsearch._es_client_required`)
-    and the per-tenant items index name (via
-    :func:`dynastore.modules.storage.drivers.elasticsearch._tenant_items_index`).
-    The adapter does not touch the driver's higher-level
-    ``write_entities`` path — drain tasks operate on pre-serialised
-    STAC item payloads emitted by the dispatcher.
+    The driver instance is passed in at construction so the adapter can
+    resolve the active ES client, the per-tenant index name, and the
+    ``_routing`` key entirely through the driver's own shared seams
+    (``_get_client``/``_items_index_name``/``_collection_routing`` on
+    ``_ItemsElasticsearchBase``) — so a drain-issued write/delete lands on
+    the exact index and shard ``write_entities`` would have used, for
+    whichever driver is wrapped. The adapter does not touch the driver's
+    higher-level ``write_entities`` path — drain tasks operate on
+    pre-serialised item payloads built by the drain's own canonical-doc
+    assembly (see ``StorageDrainTask._build_canonical_doc``).
     """
 
     preferred_chunk_size: int = 1500
@@ -131,11 +135,7 @@ class ESBulkIndexer:
             catalogs_in_batch.add(op.catalog_id)
             if op.op == "delete":
                 bulk_body.append({
-                    "delete": {
-                        "_index": index_name,
-                        "_id": op.idempotency_key,
-                        "routing": op.collection_id,
-                    },
+                    "delete": self._action_meta(index_name, op.idempotency_key, op),
                 })
             else:  # upsert — index op overwrites; safe given a deterministic _id
                 # Drain-path parity (#2769): apply the same byte-budget
@@ -147,11 +147,7 @@ class ESBulkIndexer:
                 payload = await self._simplify_payload(op)
                 doc_by_key[op.idempotency_key] = payload
                 bulk_body.append({
-                    "index": {
-                        "_index": index_name,
-                        "_id": op.idempotency_key,
-                        "routing": op.collection_id,
-                    },
+                    "index": self._action_meta(index_name, op.idempotency_key, op),
                 })
                 bulk_body.append(payload)
             op_index_map.append(op)
@@ -269,9 +265,20 @@ class ESBulkIndexer:
     # ------------------------------------------------------------------
 
     def _index_name(self, catalog_id: str) -> str:
-        """Resolve the per-tenant items index name."""
-        helper = getattr(self._driver, "_get_index_name", None) or getattr(
-            self._driver, "get_index_name", None,
+        """Resolve the per-tenant items index name.
+
+        ``_items_index_name`` is the actual shared naming seam every
+        ``_ItemsElasticsearchBase`` subclass overrides (the standard driver
+        returns the private/public tenant index; the envelope driver
+        returns its own ``{prefix}-{catalog_id}-envelope-items`` name, #2687)
+        — tried ahead of the ``_get_index_name``/``get_index_name`` hooks
+        (kept for a driver that only exposes those) and the historical
+        direct fallback (unchanged for a test double exposing neither).
+        """
+        helper = (
+            getattr(self._driver, "_get_index_name", None)
+            or getattr(self._driver, "get_index_name", None)
+            or getattr(self._driver, "_items_index_name", None)
         )
         if helper is not None:
             return cast(str, helper(catalog_id))
@@ -279,6 +286,27 @@ class ESBulkIndexer:
             _tenant_items_index,
         )
         return _tenant_items_index(catalog_id)
+
+    def _action_meta(
+        self, index_name: str, doc_id: str, op: IndexableOp,
+    ) -> Dict[str, Any]:
+        """Build one bulk action's metadata dict (``_index``/``_id``/``routing``).
+
+        ``routing`` is resolved via the wrapped driver's own
+        ``_collection_routing`` seam (``_ItemsElasticsearchBase``) when
+        available — the standard driver routes by ``collection_id`` (shard
+        locality), the envelope driver returns ``None`` (its index is not
+        collection-routed, #2687) — so a drain-issued write/delete lands on
+        the exact same shard ``write_entities`` would have used. Falls back
+        to the historical hardcoded ``collection_id`` for a driver/test
+        double that doesn't expose the seam.
+        """
+        get_routing = getattr(self._driver, "_collection_routing", None)
+        routing = get_routing(op.collection_id) if callable(get_routing) else op.collection_id
+        meta: Dict[str, Any] = {"_index": index_name, "_id": doc_id}
+        if routing is not None:
+            meta["routing"] = routing
+        return meta
 
     def _get_client(self) -> Any:
         """Resolve the async ES client."""

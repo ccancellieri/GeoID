@@ -713,3 +713,65 @@ def test_canonical_input_access_fields_not_in_properties():
     props = doc.get("properties", {})
     assert "visibility" not in props
     assert "owner" not in props
+
+
+# ---------------------------------------------------------------------------
+# CanonicalIndexInput.access — drain-time recompute (#2687)
+# ---------------------------------------------------------------------------
+
+
+def _make_canonical_input_with_access(access):
+    from dynastore.modules.catalog.canonical_index_read import CanonicalIndexInput
+    row = {
+        "geoid": "geo-ci-2",
+        "external_id": "ext-ci-2",
+        "geometry_hash": "ghash-ci-2",
+    }
+    return CanonicalIndexInput(
+        row=row,
+        resolved_sidecars=[_FakeStatsSidecar()],
+        geometry={"type": "Point", "coordinates": [10.0, 20.0]},
+        bbox=[10.0, 20.0, 10.0, 20.0],
+        user_properties={"kind": "station"},
+        access=access,
+    )
+
+
+def test_canonical_input_access_fallback_populates_root_fields():
+    """With no explicit visibility/owner/attrs args, the drain-recomputed
+    ``CanonicalIndexInput.access`` (#2687) is the source for the root
+    fields — this is the shape ``StorageDrainTask._build_canonical_doc``
+    relies on for the envelope-driver branch."""
+    ci = _make_canonical_input_with_access(
+        {"_visibility": "private", "_owner": "alice", "_attrs": {"dept": "finance"}},
+    )
+    doc = build_envelope_feature_doc(ci, catalog_id="cat", collection_id="col")
+    assert doc.get("visibility") == "private"
+    assert doc.get("owner") == "alice"
+    assert doc.get("attrs") == {"dept": "finance"}
+
+
+def test_canonical_input_access_container_never_set():
+    """``ENVELOPE_FEATURE_MAPPING`` declares no ``access`` field (root
+    ``dynamic: false``) — the canonical ``access`` container must never be
+    set on this driver's doc, even when ``CanonicalIndexInput.access`` is
+    populated; the ABAC values live only at the flat root."""
+    ci = _make_canonical_input_with_access(
+        {"_visibility": "private", "_owner": "alice"},
+    )
+    doc = build_envelope_feature_doc(ci, catalog_id="cat", collection_id="col")
+    assert "access" not in doc
+
+
+def test_canonical_input_explicit_args_override_access_fallback():
+    """An explicit ``visibility``/``owner`` arg still wins over
+    ``CanonicalIndexInput.access`` — caller opt-in takes precedence."""
+    ci = _make_canonical_input_with_access(
+        {"_visibility": "private", "_owner": "alice"},
+    )
+    doc = build_envelope_feature_doc(
+        ci, catalog_id="cat", collection_id="col",
+        visibility="public", owner="bob",
+    )
+    assert doc.get("visibility") == "public"
+    assert doc.get("owner") == "bob"

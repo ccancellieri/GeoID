@@ -120,9 +120,18 @@ class CanonicalIndexInput:
                                document top level where
                                ``unproject_item_from_es`` can restore them on
                                read.
-        access:                Access-envelope dict for the access-aware ES
-                               driver variant.  Always ``None`` in this
-                               implementation; wired in a follow-up pass.
+        access:                Access-envelope dict (``{_visibility, _owner,
+                               _attrs}``) for the access-aware ES driver
+                               variant, recomputed from stored state (#2687):
+                               ``_owner`` from the hub row's persisted
+                               ``access_owner`` column, ``_visibility`` /
+                               ``_attrs`` from live config. ``None`` when the
+                               collection does not route to an access-aware
+                               WRITE driver, or when the recompute itself
+                               failed — a caller writing into a resolved
+                               access-aware driver must treat ``None`` as a
+                               failure to retry, never as "no envelope
+                               needed" (see ``_resolve_access_context``).
         stac_reserved_members: Per-item STAC members that must live at the ES
                                doc top level (``assets``, ``stac_extensions``).
                                Populated when these keys are found in the
@@ -219,6 +228,109 @@ async def _resolve_sidecars_for(col_config: Any, catalog_id: str, collection_id:
             catalog_id, collection_id, exc,
         )
         return []
+
+
+async def _resolve_access_context(
+    catalog_id: str, collection_id: str,
+) -> "tuple[bool, Optional[str], Dict[str, str]]":
+    """Resolve ``(is_access_aware, visibility, attribute_stamping_paths)`` once
+    per :func:`read_canonical_index_inputs` call (#2687).
+
+    ``_owner`` is read per-row from the hub row's persisted ``access_owner``
+    column (see ``_apply_access_envelope`` below) — nothing to resolve here.
+    ``_visibility`` and the attribute-stamping paths are batch-level (catalog
+    / collection scoped), so resolving them once and applying per row avoids
+    a config round trip per geoid.
+
+    Degrade-safe like the sibling resolvers in this module
+    (:func:`_get_col_config`, :func:`_resolve_sidecars_for`): any failure is
+    logged and folded into "not access-aware" / "no visibility" / "no attrs"
+    rather than raised — a collection that does not actually need an
+    envelope must never be blocked by this. The drain's fail-closed
+    guarantee ("never index an access-aware doc without its envelope") is
+    enforced by the caller that already knows it is about to write into a
+    resolved access-aware driver — see
+    ``StorageDrainTask._build_canonical_doc`` — not by this best-effort
+    resolver.
+    """
+    try:
+        from dynastore.modules.storage.access_envelope import (
+            collection_uses_access_aware_driver,
+        )
+
+        is_access_aware = await collection_uses_access_aware_driver(
+            catalog_id, collection_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "canonical_index_read._resolve_access_context: access-aware "
+            "detection failed for %s/%s: %s",
+            catalog_id, collection_id, exc,
+        )
+        return False, None, {}
+
+    if not is_access_aware:
+        return False, None, {}
+
+    visibility: Optional[str] = None
+    attrs_paths: Dict[str, str] = {}
+    try:
+        from dynastore.modules.storage.access_envelope import (
+            resolve_attribute_stamping_paths,
+            resolve_catalog_visibility,
+        )
+
+        visibility = await resolve_catalog_visibility(catalog_id)
+        attrs_paths = await resolve_attribute_stamping_paths(catalog_id, collection_id)
+    except Exception as exc:
+        logger.warning(
+            "canonical_index_read._resolve_access_context: envelope "
+            "recompute failed for %s/%s: %s — rows will carry no access "
+            "envelope this read.",
+            catalog_id, collection_id, exc,
+        )
+        # ``is_access_aware`` stays True: the caller (the drain) must treat a
+        # missing envelope on an access-aware collection as a failure to
+        # retry, never as "not access-aware" — see module docstring above.
+        visibility = None
+        attrs_paths = {}
+
+    return is_access_aware, visibility, attrs_paths
+
+
+def _apply_access_envelope(
+    row: Dict[str, Any],
+    user_properties: Optional[Dict[str, Any]],
+    *,
+    is_access_aware: bool,
+    visibility: Optional[str],
+    attrs_paths: Dict[str, str],
+) -> Optional[Dict[str, Any]]:
+    """Build one row's ``{_visibility, _owner, _attrs}`` envelope (#2687).
+
+    ``None`` when the collection is not access-aware (zero behaviour change)
+    OR when the batch-level visibility recompute failed (fail-closed — an
+    absent envelope on an access-aware collection must never be indexed;
+    see :func:`_resolve_access_context`). ``_owner`` comes from the hub
+    row's persisted ``access_owner`` column — ``None`` when no principal was
+    present at write time.
+    """
+    if not is_access_aware or visibility is None:
+        return None
+
+    from dynastore.modules.iam.stamping_config import stamp_attrs_from_feature
+
+    envelope: Dict[str, Any] = {
+        "_visibility": visibility,
+        "_owner": row.get("access_owner"),
+    }
+    if attrs_paths:
+        attrs = stamp_attrs_from_feature(
+            {"properties": user_properties or {}}, attrs_paths,
+        )
+        if attrs:
+            envelope["_attrs"] = attrs
+    return envelope
 
 
 async def _resolve_collection_type(
@@ -395,6 +507,9 @@ async def read_canonical_index_inputs(
     col_config = await _get_col_config(catalog_id, collection_id, db_resource=db_resource)
     resolved_sidecars = await _resolve_sidecars_for(col_config, catalog_id, collection_id)
     collection_type, allow_geometry = await _resolve_collection_type(catalog_id, collection_id)
+    is_access_aware, visibility, attrs_paths = await _resolve_access_context(
+        catalog_id, collection_id,
+    )
     raw_rows = await _fetch_raw_rows(
         catalog_id, collection_id, geoids, col_config, db_resource=db_resource,
     )
@@ -405,13 +520,18 @@ async def read_canonical_index_inputs(
             row, col_config, resolved_sidecars, catalog_id, collection_id,
             collection_type=collection_type, allow_geometry=allow_geometry,
         )
+        access = _apply_access_envelope(
+            row, user_properties,
+            is_access_aware=is_access_aware, visibility=visibility,
+            attrs_paths=attrs_paths,
+        )
         result[geoid] = CanonicalIndexInput(
             row=row,
             resolved_sidecars=resolved_sidecars,
             geometry=geometry,
             bbox=bbox,
             user_properties=user_properties,
-            access=None,
+            access=access,
             stac_reserved_members=stac_reserved_members,
         )
 

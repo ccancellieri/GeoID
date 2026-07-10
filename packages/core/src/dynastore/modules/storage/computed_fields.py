@@ -658,6 +658,11 @@ SYSTEM_FIELD_KEYS: tuple[str, ...] = (
     "transaction_time",
     "deleted_at",
     "write_id",
+    # #2687: persisted write-time owner (hub column ``access_owner``) — the
+    # drain-time source for an access-aware collection's ``_owner`` envelope
+    # value. Never a user-facing field; excluded from properties exactly like
+    # ``write_id``.
+    "access_owner",
 )
 
 # The three identity axes live flat at the document root in the canonical ES envelope.

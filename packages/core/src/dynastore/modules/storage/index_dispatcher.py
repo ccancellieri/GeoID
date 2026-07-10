@@ -664,30 +664,25 @@ class IndexDispatcher:
             # noop-reenqueue (:1044) and partial-failure-resurface (:1054)
             # amplifiers inside ``_dispatch_bulk`` cannot fire for these ops.
             #
-            # Access-aware drivers are EXCLUDED (review finding, HIGH):
-            # ``read_canonical_index_inputs`` hardcodes ``access=None`` (it
-            # only reads the raw PG row), so a drain-time re-read can never
-            # recover ``_visibility``/``_owner``/``_attrs`` — those are
-            # write-time-only values that live in ``processing_context``
-            # (item_service.py's ``_resolve_access_envelope``) and are never
-            # persisted to a PG column. Routing an access-aware entry through
-            # this branch would silently drop row-level ABAC from the
-            # indexed document. Mirrors the ES-envelope detection branch of
-            # ``_collection_uses_access_aware_driver`` (item_service.py).
-            # Recovering the envelope at drain time is tracked as a
-            # follow-up; until then these entries take the legacy path
-            # below unchanged — but #2716 still keeps them off the in-run
-            # absorption path (see ``storage_plane_active`` below: the flag
-            # applies to every item-tier ASYNC entry, access-aware or not).
+            # Access-aware drivers are INCLUDED (#2687): the hub row now
+            # persists the write-time owner (``access_owner`` column,
+            # ``ItemService._resolve_write_owner``), and
+            # ``read_canonical_index_inputs`` recomputes ``_visibility`` /
+            # ``_owner`` / ``_attrs`` from that column plus live config
+            # (``CatalogLookupAudience`` / ``AttributeStampingPolicy``) —
+            # see ``canonical_index_read._resolve_access_context``. The drain
+            # enforces the ABAC invariant fail-closed:
+            # ``StorageDrainTask._build_canonical_doc`` raises (→ retry,
+            # never index) rather than write an access-aware doc whose
+            # envelope recompute failed or came back empty. There is
+            # therefore no longer a payload requirement that would force an
+            # access-aware entry onto a different plane than any other
+            # item-tier ASYNC entry.
             storage_plane_active = (
                 ctx.entity_type == "item"
                 and await _storage_plane_routing_enabled()
             )
-            if (
-                entry.write_mode == WriteMode.ASYNC
-                and storage_plane_active
-                and not getattr(type(indexer), "applies_access_filter", False)
-            ):
+            if entry.write_mode == WriteMode.ASYNC and storage_plane_active:
                 actually_enqueued = await self._enqueue_storage_plane_ids(
                     entry, ctx, entry_ops, tx_factory=tx_factory,
                 )

@@ -273,6 +273,13 @@ class StorageDrainTask(TaskProtocol):
         self._last_batch_bytes: int = 0
         # driver_id -> resolved BulkIndexer, memoised for this run.
         self._indexer_cache: Dict[str, BulkIndexer] = {}
+        # driver_ids resolved to an access-aware ES driver
+        # (``applies_access_filter=True``, e.g. the envelope driver) this run
+        # (#2687). Populated by ``_resolve_indexer``; consulted by
+        # ``_build_canonical_doc`` to pick the envelope-shaped doc builder and
+        # to enforce the fail-closed "never index without an envelope"
+        # invariant.
+        self._envelope_driver_ids: set[str] = set()
         # catalog_id -> resolved known-fields set, memoised for this run
         # (#2494 P1 canonical re-read — shared by every id-only group under
         # the same catalog).
@@ -861,6 +868,9 @@ class StorageDrainTask(TaskProtocol):
         from dynastore.modules.storage.drivers.elasticsearch import (
             ItemsElasticsearchDriver,
         )
+        from dynastore.modules.storage.drivers.elasticsearch_envelope.driver import (
+            ItemsElasticsearchEnvelopeDriver,
+        )
         from dynastore.modules.storage.driver_registry import DriverRegistry
         from dynastore.tasks.workclass_drain.es_indexer_adapter import ESBulkIndexer
 
@@ -871,7 +881,14 @@ class StorageDrainTask(TaskProtocol):
         )
 
         if driver is not None:
-            if isinstance(driver, ItemsElasticsearchDriver):
+            # ``ESBulkIndexer`` wraps either ES items driver: both resolve
+            # their index name / ``_routing`` / client entirely through the
+            # shared ``_ItemsElasticsearchBase`` seams the adapter delegates
+            # to, so one adapter serves the standard driver and the
+            # access-aware envelope driver alike (#2687) — the envelope
+            # driver's index naming/routing differences are handled by those
+            # seams, not by a separate adapter class.
+            if isinstance(driver, (ItemsElasticsearchDriver, ItemsElasticsearchEnvelopeDriver)):
                 if not driver.is_available():
                     logger.warning(
                         "StorageDrainTask: ES driver unavailable (opensearch-py "
@@ -880,6 +897,8 @@ class StorageDrainTask(TaskProtocol):
                         driver_id,
                     )
                     return None
+                if isinstance(driver, ItemsElasticsearchEnvelopeDriver):
+                    self._envelope_driver_ids.add(driver_id)
                 indexer = cast(BulkIndexer, ESBulkIndexer(driver))
                 self._indexer_cache[driver_id] = indexer
                 return indexer
@@ -1257,6 +1276,7 @@ class StorageDrainTask(TaskProtocol):
                     try:
                         doc = await self._build_canonical_doc(
                             catalog_id=catalog_id, collection_id=collection_id, ci=ci,
+                            driver_id=driver_id,
                         )
                     except Exception as exc:  # noqa: BLE001 — funnel to retry
                         logger.warning(
@@ -1311,6 +1331,7 @@ class StorageDrainTask(TaskProtocol):
 
     async def _build_canonical_doc(
         self, *, catalog_id: str, collection_id: str, ci: Any,
+        driver_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Assemble the canonical ES doc for one re-read row (test seam).
 
@@ -1319,12 +1340,44 @@ class StorageDrainTask(TaskProtocol):
         it instead of re-resolving per group.
 
         Couples this generically-named drain task to the ES-shaped
-        canonical envelope (``build_canonical_index_doc``); today the only
-        ``BulkIndexer`` the drain resolves is the ES adapter
-        (``items_elasticsearch_driver``), so this is not a behaviour change —
-        a future non-ES ``BulkIndexer`` would need its own re-read
-        strategy here.
+        canonical envelope; today the drain resolves only ES-family
+        ``BulkIndexer`` adapters, so this is not a behaviour change — a
+        future non-ES ``BulkIndexer`` would need its own re-read strategy
+        here.
+
+        ``driver_id`` selects the doc shape (#2687): when it names a driver
+        ``_resolve_indexer`` resolved to the access-aware envelope driver
+        (``self._envelope_driver_ids``), this builds the envelope-shaped doc
+        via :func:`build_envelope_feature_doc` and enforces the fail-closed
+        invariant below; otherwise (``None`` or any other driver) it builds
+        the standard canonical doc exactly as before.
+
+        Fail-closed (#2687): an access-aware driver's doc MUST carry its
+        ABAC envelope. ``ci.access`` is ``None`` when the collection does
+        not route to an access-aware WRITE driver — which cannot be true
+        here, since ``driver_id`` itself already resolved to one — or when
+        the envelope recompute failed (see
+        ``canonical_index_read._resolve_access_context``). Either way,
+        indexing this row without ``_visibility``/``_owner`` would be an
+        ABAC violation, so this raises instead of silently building a
+        doc-less-of-envelope; the caller (``_process_driver_rows``) funnels
+        the exception to retry, never to a poison/dead classification.
         """
+        if driver_id is not None and driver_id in self._envelope_driver_ids:
+            if not ci.access:
+                raise RuntimeError(
+                    f"access envelope unavailable for access-aware "
+                    f"driver_id={driver_id!r} ({catalog_id}/{collection_id}) — "
+                    f"refusing to index a document without its ABAC envelope."
+                )
+            from dynastore.modules.storage.drivers.elasticsearch_envelope.doc_builder import (
+                build_envelope_feature_doc,
+            )
+
+            return build_envelope_feature_doc(
+                ci, catalog_id=catalog_id, collection_id=collection_id,
+            )
+
         from dynastore.modules.elasticsearch.canonical_doc import (
             build_canonical_index_doc,
         )
@@ -1420,6 +1473,7 @@ class StorageDrainTask(TaskProtocol):
                             catalog_id=catalog_id,
                             collection_id=collection_id,
                             ci=ci,
+                            driver_id=driver_id,
                         )
                         ops.append(IndexableOp(
                             op_id=uuid4(),

@@ -1744,35 +1744,38 @@ async def test_storage_plane_flag_on_non_item_entity_type_unaffected(monkeypatch
 
 class _AccessAwareStubIndexer(_StubIndexer):
     """An ASYNC secondary indexer that carries the same
-    ``applies_access_filter = True`` class marker as the private ES
-    envelope driver — used to pin that the storage-plane gate excludes
-    access-aware entries (review finding: the drain's canonical re-read
-    cannot recover the write-time access envelope)."""
+    ``applies_access_filter = True`` class marker as the envelope ES
+    driver — used to pin that the storage-plane gate now INCLUDES
+    access-aware entries (#2687: the drain recomputes the ABAC envelope
+    from the hub row's persisted ``access_owner`` column plus live config,
+    fail-closed)."""
 
     applies_access_filter = True
 
 
 @pytest.mark.asyncio
-async def test_storage_plane_flag_on_access_aware_entry_excluded(monkeypatch):
-    """An access-aware ASYNC entry (applies_access_filter=True) must NEVER
-    take the id-only storage-plane branch, even with the flag on — the
-    drain cannot recover _visibility/_owner/_attrs from a bare PG re-read.
-    It falls back to the legacy payload-carrying outbox path unchanged.
+async def test_storage_plane_flag_on_access_aware_entry_included(monkeypatch):
+    """An access-aware ASYNC entry (applies_access_filter=True) now takes
+    the SAME id-only storage-plane branch as any other item-tier ASYNC
+    entry (#2687) — the drain recomputes the envelope from stored state, so
+    there is no longer a payload requirement forcing it onto a different
+    plane.
     """
     _patch_storage_plane_flag(monkeypatch, enabled=True)
     calls = _patch_storage_emit_recorder(monkeypatch)
 
     a = _AccessAwareStubIndexer("a")
-    writer = _RecordingWriter()
-    dispatcher = _make_dispatcher_with_outbox(
-        entries=[_async_entry("a")], indexers={"a": a}, outbox=writer,
+    dispatcher = _make_dispatcher(
+        entries=[_async_entry("a")], indexers={"a": a},
     )
     results = await dispatcher.fan_out_bulk(_item_ctx(), [_op(entity_id="i1")])
 
-    assert calls == [], "an access-aware entry must never use the id-only storage plane"
-    assert a.bulk_calls == [], "ASYNC must still not be absorbed inline"
-    assert len(writer.rows) >= 1, "must fall back to the legacy payload-carrying outbox path"
+    assert a.bulk_calls == [], "storage-plane routing must never call the indexer inline"
+    assert len(calls) == 1, "an access-aware entry now uses the id-only storage plane too"
+    row_ids = {r.item_id for r in calls[0]["rows"]}
+    assert row_ids == {"i1"}
     assert results["a"].succeeded == 1
+    assert results["a"].failed == 0
 
 
 @pytest.mark.asyncio
@@ -1941,15 +1944,16 @@ async def test_in_task_run_foreign_catalog_logs_outbox_handoff_not_inline(caplog
 async def test_storage_plane_flag_on_access_aware_entry_not_absorbed_in_task_run(
     monkeypatch,
 ):
-    """#2716: when ``items_secondary_via_storage_plane`` is enabled, an
-    access-aware ASYNC entry (excluded from the id-only plane) must still
-    NOT be absorbed inline while inside a task run — the operator opted
-    into letting storage_drain own every item-tier ASYNC write, payload or
-    not, in-run or not. It falls back to the legacy payload-carrying
-    outbox instead.
+    """#2716 + #2687: when ``items_secondary_via_storage_plane`` is enabled,
+    an access-aware ASYNC entry is NEVER absorbed inline while inside a task
+    run — the operator opted into letting storage_drain own every item-tier
+    ASYNC write, access-aware or not, in-run or not. Since #2687 lifted the
+    access-aware exclusion, it now takes the SAME id-only storage-plane path
+    as any other entry (no longer a fallback to the legacy payload-carrying
+    outbox).
     """
     _patch_storage_plane_flag(monkeypatch, enabled=True)
-    _patch_storage_emit_recorder(monkeypatch)
+    calls = _patch_storage_emit_recorder(monkeypatch)
 
     a = _AccessAwareStubIndexer("a")
     writer = _RecordingWriter()
@@ -1961,9 +1965,10 @@ async def test_storage_plane_flag_on_access_aware_entry_not_absorbed_in_task_run
 
     assert a.bulk_calls == [], (
         "storage-plane flag on must prevent in-run absorption even for "
-        "entries excluded from the id-only plane"
+        "access-aware entries"
     )
-    assert len(writer.rows) >= 1, "must fall back to the legacy payload-carrying outbox"
+    assert len(calls) == 1, "access-aware entries now use the id-only storage plane"
+    assert writer.rows == [], "must never fall back to the legacy payload-carrying outbox"
     assert results["a"].succeeded == 1
 
 

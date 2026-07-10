@@ -121,8 +121,13 @@ def _patch_audience(monkeypatch, is_public):
     def _get_protocol(proto, *a, **k):
         return _Configs() if proto is ConfigsProtocol else None
 
+    # #2687: visibility resolution now lives in
+    # ``dynastore.modules.storage.access_envelope`` (shared with drain-time
+    # recompute), which resolves ``get_protocol`` freshly from
+    # ``dynastore.tools.discovery`` at call time rather than through
+    # ``item_service``'s module-level import.
     monkeypatch.setattr(
-        "dynastore.modules.catalog.item_service.get_protocol", _get_protocol,
+        "dynastore.tools.discovery.get_protocol", _get_protocol,
     )
 
 
@@ -164,7 +169,7 @@ async def test_envelope_visibility_defaults_private_without_audience(monkeypatch
         return None  # no ConfigsProtocol registered
 
     monkeypatch.setattr(
-        "dynastore.modules.catalog.item_service.get_protocol", _get_protocol,
+        "dynastore.tools.discovery.get_protocol", _get_protocol,
     )
     env = await svc._resolve_access_envelope("c", "col", {"principal_id": "bob"})
     assert env is not None
@@ -223,3 +228,30 @@ async def test_dispatch_does_not_stamp_for_public_target(monkeypatch):
     assert "_visibility" not in payload
     assert "_owner" not in payload
     assert "_grant_subjects" not in payload
+
+
+# ---------------------------------------------------------------------------
+# _resolve_write_owner (#2687) — shared by _resolve_access_envelope and the
+# unconditional hub ``access_owner`` stamp
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_write_owner_prefers_owner_key():
+    assert ItemService._resolve_write_owner(
+        {"owner": "alice", "principal_id": "bob", "subject_id": "carol"},
+    ) == "alice"
+
+
+def test_resolve_write_owner_falls_back_to_principal_id():
+    assert ItemService._resolve_write_owner(
+        {"principal_id": "bob", "subject_id": "carol"},
+    ) == "bob"
+
+
+def test_resolve_write_owner_falls_back_to_subject_id():
+    assert ItemService._resolve_write_owner({"subject_id": "carol"}) == "carol"
+
+
+def test_resolve_write_owner_none_without_principal():
+    assert ItemService._resolve_write_owner({}) is None
+    assert ItemService._resolve_write_owner(None) is None

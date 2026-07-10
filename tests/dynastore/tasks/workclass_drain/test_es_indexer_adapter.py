@@ -322,3 +322,79 @@ async def test_index_bulk_recovers_geo_shape_rejection_via_ladder() -> None:
     assert result.poison == []
     assert result.passed == [oid]
     assert client.index_calls, "the ladder must have retried via a single-doc index() call"
+
+
+# ---------------------------------------------------------------------------
+# #2687 — index-name / routing generalization for the envelope driver
+# ---------------------------------------------------------------------------
+
+
+class _ItemsIndexNameOnlyDriver:
+    """Driver exposing only ``_items_index_name`` (the real shared seam on
+    ``_ItemsElasticsearchBase``) — no ``_get_index_name``/``get_index_name``.
+    Mirrors both concrete ES items drivers today."""
+
+    def __init__(self, client: Any, index_name: str, routing: Any = "col1") -> None:
+        self._client = client
+        self._index_name_value = index_name
+        self._routing_value = routing
+
+    def _items_index_name(self, catalog_id: str) -> str:
+        return self._index_name_value
+
+    def _get_client(self) -> Any:
+        return self._client
+
+    def _collection_routing(self, collection_id: Any) -> Any:
+        return self._routing_value
+
+
+@pytest.mark.asyncio
+async def test_index_bulk_resolves_index_name_via_items_index_name() -> None:
+    """A driver that only exposes ``_items_index_name`` (both concrete ES
+    items drivers) must have it used — not the generic per-catalog fallback,
+    which would resolve the WRONG index for the envelope driver (#2687)."""
+    client = _FakeAsyncClient()
+    driver = _ItemsIndexNameOnlyDriver(client, "prefix-cat1-envelope-items")
+    indexer = ESBulkIndexer(driver)
+
+    await indexer.index_bulk([_op("upsert")])
+
+    body = client.calls[0]
+    assert body[0]["index"]["_index"] == "prefix-cat1-envelope-items"
+
+
+@pytest.mark.asyncio
+async def test_index_bulk_omits_routing_when_driver_collection_routing_is_none() -> None:
+    """The envelope driver's index is not collection-routed
+    (``_collection_routing`` returns ``None``) — the bulk action must omit
+    ``routing`` entirely so a drain-issued write/delete lands on the same
+    (default, id-hashed) shard ``write_entities`` used (#2687)."""
+    client = _FakeAsyncClient()
+    driver = _ItemsIndexNameOnlyDriver(client, "prefix-cat1-envelope-items", routing=None)
+    indexer = ESBulkIndexer(driver)
+    op = _op("delete")
+
+    await indexer.index_bulk([op])
+
+    body = client.calls[0]
+    assert body == [{"delete": {
+        "_index": "prefix-cat1-envelope-items",
+        "_id": op.idempotency_key,
+    }}]
+    assert "routing" not in body[0]["delete"]
+
+
+@pytest.mark.asyncio
+async def test_index_bulk_keeps_routing_when_driver_collection_routing_returns_collection_id() -> None:
+    """A driver whose ``_collection_routing`` returns the collection id
+    (the standard/private driver's shape) keeps ``routing`` on the action —
+    unchanged behaviour."""
+    client = _FakeAsyncClient()
+    driver = _ItemsIndexNameOnlyDriver(client, "prefix-cat1-items", routing="col1")
+    indexer = ESBulkIndexer(driver)
+
+    await indexer.index_bulk([_op("delete")])
+
+    body = client.calls[0]
+    assert body[0]["delete"]["routing"] == "col1"

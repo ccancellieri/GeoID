@@ -919,7 +919,7 @@ def _patch_canonical_reread(monkeypatch, task, *, present: set) -> List[tuple]:
         calls.append((catalog_id, collection_id, tuple(sorted(geoids))))
         return {g: _StubCanonicalInput(g) for g in geoids if g in present}
 
-    async def _fake_build(*, catalog_id, collection_id, ci):
+    async def _fake_build(*, catalog_id, collection_id, ci, driver_id=None):
         return {"id": ci.row["geoid"], "catalog_id": catalog_id, "collection_id": collection_id}
 
     monkeypatch.setattr(task, "_read_canonical_inputs", _fake_read)
@@ -1301,7 +1301,7 @@ async def test_primary_write_batch_hydrates_from_pg_write_id_chunk_protocol(monk
 
     engine_ref = engine
 
-    async def _fake_build_canonical_doc(*, catalog_id, collection_id, ci):
+    async def _fake_build_canonical_doc(*, catalog_id, collection_id, ci, driver_id=None):
         return {"id": ci.row["geoid"], "collection": collection_id}
 
     monkeypatch.setattr(task, "_read_canonical_inputs", _fake_read_canonical_inputs)
@@ -1417,7 +1417,7 @@ async def test_hydration_byte_budget_splits_dispatch_into_multiple_sub_chunks(
     async def _fake_read(*, engine, catalog_id, collection_id, geoids):
         return {g: _StubCanonicalInput(g) for g in geoids}
 
-    async def _fake_build(*, catalog_id, collection_id, ci):
+    async def _fake_build(*, catalog_id, collection_id, ci, driver_id=None):
         return {"id": ci.row["geoid"], "blob": heavy}
 
     one_doc_bytes = _estimate_doc_bytes({"id": "geoid-hb0", "blob": heavy})
@@ -1486,7 +1486,7 @@ async def test_hydration_sub_chunk_failure_isolates_retry_to_that_chunk(
     async def _fake_read(*, engine, catalog_id, collection_id, geoids):
         return {g: _StubCanonicalInput(g) for g in geoids}
 
-    async def _fake_build(*, catalog_id, collection_id, ci):
+    async def _fake_build(*, catalog_id, collection_id, ci, driver_id=None):
         return {"id": ci.row["geoid"], "blob": heavy}
 
     one_doc_bytes = _estimate_doc_bytes({"id": "geoid-fc0", "blob": heavy})
@@ -1912,7 +1912,7 @@ async def test_run_byte_budget_integration_leaves_backlog_and_offload_trigger(
     async def _fake_read(*, engine, catalog_id, collection_id, geoids):
         return {g: _StubCanonicalInput(g) for g in geoids}
 
-    async def _fake_build(*, catalog_id, collection_id, ci):
+    async def _fake_build(*, catalog_id, collection_id, ci, driver_id=None):
         return {"id": ci.row["geoid"], "blob": heavy}
 
     one_doc_bytes = _estimate_doc_bytes({"id": "geoid-ib0", "blob": heavy})
@@ -1967,7 +1967,7 @@ async def test_run_high_byte_budget_drains_to_empty_no_offload_trigger(
     async def _fake_read(*, engine, catalog_id, collection_id, geoids):
         return {g: _StubCanonicalInput(g) for g in geoids}
 
-    async def _fake_build(*, catalog_id, collection_id, ci):
+    async def _fake_build(*, catalog_id, collection_id, ci, driver_id=None):
         return {"id": ci.row["geoid"], "blob": heavy}
 
     task = StorageDrainTask(

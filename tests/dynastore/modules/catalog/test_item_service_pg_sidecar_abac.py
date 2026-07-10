@@ -320,6 +320,95 @@ async def test_pg_primary_upsert_persists_write_id_in_hub_payload(
     assert {p.get("write_id") for p in captured_hub_payloads} == {"w-upsert-1"}
 
 
+async def test_pg_primary_upsert_persists_access_owner_when_principal_present(
+    monkeypatch: Any,
+) -> None:
+    """#2687: the write-time owner is stamped onto every hub row whenever a
+    principal is present in ``processing_context`` — UNGATED, regardless of
+    whether the collection routes to an access-aware driver (mirrors the
+    write_id rollout shape: a cheap nullable column, no access-aware gate)."""
+
+    svc = ItemService()
+
+    async def _no_envelope(cat: str, col: str, pc: Any, feature: Any = None) -> None:
+        return None  # not an access-aware collection
+
+    monkeypatch.setattr(svc, "_resolve_access_envelope", _no_envelope)
+    _patch_branch_b(monkeypatch, svc, [])
+
+    captured_hub_payloads: List[Dict[str, Any]] = []
+
+    async def _capture_insert(
+        conn: Any,
+        cat: str,
+        col: str,
+        hub_payload: Dict[str, Any],
+        sidecar_payloads: Any,
+        **_kw: Any,
+    ) -> Dict[str, Any]:
+        captured_hub_payloads.append(dict(hub_payload))
+        return {"geoid": hub_payload["geoid"]}
+
+    async def _noop(*_a: Any, **_kw: Any) -> None:
+        pass
+
+    monkeypatch.setattr(svc, "insert_or_update_distributed", _capture_insert)
+    monkeypatch.setattr(svc, "_dispatch_index_upsert", _noop)
+
+    items = [{"type": "Feature", "id": "item4", "geometry": None, "properties": {}}]
+    await svc.upsert(
+        "cat1",
+        "col1",
+        items,
+        processing_context={"owner": "alice"},
+    )
+
+    assert captured_hub_payloads
+    assert {p.get("access_owner") for p in captured_hub_payloads} == {"alice"}
+
+
+async def test_pg_primary_upsert_omits_access_owner_without_principal(
+    monkeypatch: Any,
+) -> None:
+    """No principal in ``processing_context`` → ``access_owner`` key is
+    absent from the hub payload entirely (not stamped as ``None``), so the
+    dynamic batch-insert column union never gains the column for a batch
+    with no principal at all."""
+
+    svc = ItemService()
+
+    async def _no_envelope(cat: str, col: str, pc: Any, feature: Any = None) -> None:
+        return None
+
+    monkeypatch.setattr(svc, "_resolve_access_envelope", _no_envelope)
+    _patch_branch_b(monkeypatch, svc, [])
+
+    captured_hub_payloads: List[Dict[str, Any]] = []
+
+    async def _capture_insert(
+        conn: Any,
+        cat: str,
+        col: str,
+        hub_payload: Dict[str, Any],
+        sidecar_payloads: Any,
+        **_kw: Any,
+    ) -> Dict[str, Any]:
+        captured_hub_payloads.append(dict(hub_payload))
+        return {"geoid": hub_payload["geoid"]}
+
+    async def _noop(*_a: Any, **_kw: Any) -> None:
+        pass
+
+    monkeypatch.setattr(svc, "insert_or_update_distributed", _capture_insert)
+    monkeypatch.setattr(svc, "_dispatch_index_upsert", _noop)
+
+    items = [{"type": "Feature", "id": "item5", "geometry": None, "properties": {}}]
+    await svc.upsert("cat1", "col1", items)
+
+    assert captured_hub_payloads
+    assert all("access_owner" not in p for p in captured_hub_payloads)
+
+
 # ---------------------------------------------------------------------------
 # Branch B infrastructure helpers
 # ---------------------------------------------------------------------------

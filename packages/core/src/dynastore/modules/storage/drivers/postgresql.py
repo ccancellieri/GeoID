@@ -860,6 +860,15 @@ class ItemsPostgresqlDriver(TypedDriver[ItemsPostgresqlDriverConfig], ModuleProt
         # --- Build hub table DDL ---
         hub_cols_map = col_config.get_column_definitions()
         hub_cols_map.setdefault("write_id", "TEXT")
+        # #2687: persisted write-time owner — nullable, ungated (stamped
+        # whenever a principal is present, see ItemService._resolve_write_owner).
+        # Lets the storage-plane drain recompute an access-aware collection's
+        # ``_owner`` envelope value from stored state instead of the
+        # write-time-only ``processing_context``. Mirrors the ``write_id``
+        # rollout shape exactly: CREATE-only DDL here; an existing hub table
+        # from before this change needs an operator-run ``ALTER TABLE ... ADD
+        # COLUMN IF NOT EXISTS`` (never issued by application code).
+        hub_cols_map.setdefault("access_owner", "TEXT")
         for key in partition_keys:
             if key not in hub_cols_map:
                 col_type = partition_key_types.get(key, "TEXT")

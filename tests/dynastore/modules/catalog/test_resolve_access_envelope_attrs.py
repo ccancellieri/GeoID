@@ -69,8 +69,12 @@ def _patch_audience(monkeypatch, is_public: bool = False):
     def _get_protocol(proto, *a, **k):
         return _Configs() if proto is ConfigsProtocol else None
 
+    # #2687: visibility/attrs-path resolution now lives in
+    # ``dynastore.modules.storage.access_envelope`` (shared with drain-time
+    # recompute), which resolves ``get_protocol`` freshly from
+    # ``dynastore.tools.discovery`` at call time.
     monkeypatch.setattr(
-        "dynastore.modules.catalog.item_service.get_protocol", _get_protocol,
+        "dynastore.tools.discovery.get_protocol", _get_protocol,
     )
 
 
@@ -96,8 +100,12 @@ def _patch_stamping_policy(monkeypatch, attribute_paths: dict, is_public: bool =
     def _get_protocol(proto, *a, **k):
         return _Configs() if proto is ConfigsProtocol else None
 
+    # #2687: visibility/attrs-path resolution now lives in
+    # ``dynastore.modules.storage.access_envelope`` (shared with drain-time
+    # recompute), which resolves ``get_protocol`` freshly from
+    # ``dynastore.tools.discovery`` at call time.
     monkeypatch.setattr(
-        "dynastore.modules.catalog.item_service.get_protocol", _get_protocol,
+        "dynastore.tools.discovery.get_protocol", _get_protocol,
     )
 
 

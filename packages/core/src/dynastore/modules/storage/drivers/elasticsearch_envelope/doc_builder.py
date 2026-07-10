@@ -177,8 +177,25 @@ def build_envelope_feature_doc(
                 geometry=item.geometry,
                 bbox=item.bbox,
                 user_properties=item.user_properties,
-                access=item.access,
+                # ABAC fields are overlaid below as flat root keys (the ONLY
+                # shape ``ENVELOPE_FEATURE_MAPPING`` declares for them — see
+                # its ``visibility``/``owner``/``attrs`` root properties); the
+                # canonical ``access`` container is never passed through here
+                # even when ``item.access`` is populated (#2687).
+                access=None,
             )
+            # ``access=None`` above keeps ``doc["access"]`` from ever being
+            # set here — ``ENVELOPE_FEATURE_MAPPING`` (root ``dynamic:
+            # false``) declares no ``access`` field, and the ABAC values
+            # live at the flat root instead (overlaid below). ``stats`` /
+            # ``system`` stay: the mapping stores-but-does-not-index
+            # unmapped ``dynamic: false`` fields, and letting them ride
+            # along unindexed for observability is existing, tested
+            # behaviour (see ``test_canonical_input_fast_path_stats_populated``).
+            # Canonical sets ``id``=geoid; envelope read path uses ``geoid`` at root.
+            geoid = doc.get("id")
+            if geoid and "geoid" not in doc:
+                doc["geoid"] = geoid
             # Hoist ``properties.extras`` back to flat ``properties`` so the
             # envelope read path finds user attrs at ``properties.<key>``
             # (the read does not hoist from extras).  A flat key already
@@ -193,12 +210,16 @@ def build_envelope_feature_doc(
                 # extras we just un-nested; the envelope mapping does not need
                 # it (properties is dynamic:True, full-text is not used there).
                 doc.pop("_search_text", None)
-            # Canonical sets ``id``=geoid; envelope read path uses ``geoid`` at root.
-            geoid = doc.get("id")
-            if geoid and "geoid" not in doc:
-                doc["geoid"] = geoid
-            # Overlay access fields from caller args or dispatcher-stamped row keys.
-            raw_src: Dict[str, Any] = item.row or {}
+            # Overlay access fields: an explicit ``visibility``/``owner``/
+            # ``attrs`` arg wins (caller opts in to a specific value), else
+            # fall back to ``item.access`` (#2687 — the drain-recomputed
+            # envelope) via the same ``_owner``/``_visibility``/``_attrs``
+            # source keys a dispatcher-stamped row would carry.
+            raw_src: Dict[str, Any] = dict(item.row or {})
+            if item.access:
+                raw_src.setdefault("_visibility", item.access.get("_visibility"))
+                raw_src.setdefault("_owner", item.access.get("_owner"))
+                raw_src.setdefault("_attrs", item.access.get("_attrs"))
             _overlay_access_fields(doc, src=raw_src, visibility=visibility, owner=owner, attrs=attrs)
             if system:
                 doc.setdefault("system", {}).update(system)

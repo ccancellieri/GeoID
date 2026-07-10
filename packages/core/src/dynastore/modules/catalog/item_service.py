@@ -1555,6 +1555,14 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             )
         )
 
+        # #2687: resolve the write-time owner once for the whole batch — mirrors
+        # ``_batch_access_envelope`` above but is stamped onto every item's hub
+        # row UNCONDITIONALLY (no access-aware gate; a cheap nullable column,
+        # same rollout shape as ``write_id``) so the storage-plane drain can
+        # recompute ``_owner`` from stored state instead of the write-time-only
+        # ``processing_context``. ``None`` when no principal is present.
+        _batch_owner: Optional[str] = self._resolve_write_owner(processing_context)
+
         prepared: List[Dict[str, Any]] = []
         unique_partition_values: set = set()
         # Per-row preparation rejections. A single feature that fails value
@@ -1613,6 +1621,8 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
                     "transaction_time": datetime.now(timezone.utc),
                     "deleted_at": None,
                 }
+                if _batch_owner is not None:
+                    hub_payload["access_owner"] = _batch_owner
                 sidecar_payloads: Dict[str, Dict[str, Any]] = {}
                 partition_values: Dict[str, Any] = {}
 
@@ -2024,6 +2034,23 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             return None
         return str(path) if path else None
 
+    @staticmethod
+    def _resolve_write_owner(
+        processing_context: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Resolve the creating principal's subject id from ``processing_context``.
+
+        Single source for the write-time owner value (``owner`` /
+        ``principal_id`` / ``subject_id``, first match wins). Used both to
+        persist ``access_owner`` on every hub row unconditionally (#2687 —
+        a cheap nullable column, no access-aware gate) and, when the
+        collection routes to an access-aware driver, to stamp ``_owner`` on
+        the index payload via :meth:`_resolve_access_envelope`.
+        """
+        pc = processing_context or {}
+        owner = pc.get("owner") or pc.get("principal_id") or pc.get("subject_id")
+        return str(owner) if owner is not None else None
+
     async def _resolve_access_envelope(
         self,
         catalog_id: str,
@@ -2056,26 +2083,22 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
             return None
 
         pc = processing_context or {}
-        owner = pc.get("owner") or pc.get("principal_id") or pc.get("subject_id")
+        owner = self._resolve_write_owner(processing_context)
 
         visibility = "private"  # closed default for the tenant-isolated index
         try:
-            from dynastore.modules.iam.audience_configs import CatalogLookupAudience
+            from dynastore.modules.storage.access_envelope import (
+                resolve_catalog_visibility,
+            )
 
-            configs = get_protocol(ConfigsProtocol)
-            if configs is not None:
-                audience = await configs.get_config(
-                    CatalogLookupAudience, catalog_id=catalog_id,
-                )
-                if audience is not None and getattr(audience, "is_public", False):
-                    visibility = "public"
+            visibility = await resolve_catalog_visibility(catalog_id)
         except Exception:
             # Missing/unavailable audience config → keep the closed default.
             pass
 
         envelope: Dict[str, Any] = {
             "_visibility": visibility,
-            "_owner": str(owner) if owner is not None else None,
+            "_owner": owner,
         }
 
         # --- Attribute stamping (#1441) -----------------------------------
@@ -2103,22 +2126,12 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
         the policy is absent or ``attribute_paths`` is empty.
         """
         try:
-            from dynastore.modules.iam.stamping_config import (
-                AttributeStampingPolicy,
-                stamp_attrs_from_feature,
+            from dynastore.modules.iam.stamping_config import stamp_attrs_from_feature
+            from dynastore.modules.storage.access_envelope import (
+                resolve_attribute_stamping_paths,
             )
 
-            configs = get_protocol(ConfigsProtocol)
-            if configs is None:
-                return {}
-            policy = await configs.get_config(
-                AttributeStampingPolicy,
-                catalog_id=catalog_id,
-                collection_id=collection_id,
-            )
-            if policy is None:
-                return {}
-            paths: Dict[str, str] = getattr(policy, "attribute_paths", {}) or {}
+            paths = await resolve_attribute_stamping_paths(catalog_id, collection_id)
             if not paths:
                 return {}
         except Exception:
@@ -2133,47 +2146,16 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
     ) -> bool:
         """True when any WRITE driver for the collection opts in to row-level ABAC.
 
-        Two detection branches:
-
-        1. **ES-envelope** — the driver class carries ``applies_access_filter=True``
-           (the standardised attribute set by the private Elasticsearch driver).
-        2. **PG-sidecar** — the driver exposes a ``get_driver_config`` method (PG
-           drivers) and its per-collection config lists a sidecar with
-           ``sidecar_type == "access_envelope"`` (#1457 G4).
-
-        Returns ``False`` on any resolution error so a misconfigured collection
-        never gets access fields stamped.
+        Thin delegate to the shared, driver-agnostic
+        :func:`~dynastore.modules.storage.access_envelope.collection_uses_access_aware_driver`
+        — the single derivation point shared by write-time stamping (here) and
+        drain-time envelope recompute (``canonical_index_read``, #2687).
         """
-        try:
-            from dynastore.modules.storage.router import get_write_drivers
+        from dynastore.modules.storage.access_envelope import (
+            collection_uses_access_aware_driver,
+        )
 
-            resolved = await get_write_drivers(catalog_id, collection_id)
-        except Exception:
-            return False
-
-        for r in resolved:
-            # Branch 1: ES-envelope driver (applies_access_filter class attr).
-            if getattr(type(r.driver), "applies_access_filter", False):
-                return True
-
-            # Branch 2: PG sidecar with sidecar_type == "access_envelope" (G4).
-            get_cfg = getattr(r.driver, "get_driver_config", None)
-            if callable(get_cfg):
-                try:
-                    from dynastore.modules.storage.drivers.pg_sidecars import (
-                        driver_sidecars,
-                    )
-
-                    drv_cfg = await get_cfg(catalog_id, collection_id)  # type: ignore[misc]
-                    if any(
-                        getattr(sc, "sidecar_type", None) == "access_envelope"
-                        for sc in driver_sidecars(drv_cfg)
-                    ):
-                        return True
-                except Exception:
-                    pass  # fail-open for this branch; ES check already handled above
-
-        return False
+        return await collection_uses_access_aware_driver(catalog_id, collection_id)
 
     async def _resolve_index_stamp_context(
         self,

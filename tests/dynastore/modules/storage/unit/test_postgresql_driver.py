@@ -394,6 +394,9 @@ class TestLifecycleMethods:
 
         assert executed_sql, "expected hub DDL to execute"
         assert '"write_id" TEXT' in executed_sql[0]
+        # #2687: persisted write-time owner — CREATE-only, nullable, same
+        # rollout shape as write_id.
+        assert '"access_owner" TEXT' in executed_sql[0]
         assert any(
             'CREATE INDEX IF NOT EXISTS "items_hub_write_id_active_idx"' in sql
             and 'ON "cat_schema"."items_hub" ("write_id", "geoid")' in sql
