@@ -171,7 +171,7 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
         ),
     )
 
-    # Zoom-aware per-tile FEATURE CAP (opt-in, default disabled).
+    # Zoom-aware per-tile FEATURE CAP (bounded by default, opt-out).
     #
     # The density filters above run AFTER ST_AsMVTGeom transforms every feature
     # intersecting the tile bbox, so at low zoom the transform cost is
@@ -185,19 +185,23 @@ class TilesConfig(ExposableConfigMixin, PluginConfig):
     #
     #   - Each key is the minimum zoom for the bracket (highest key ≤ current
     #     zoom wins), mirroring the simplification/density resolution.
-    #   - Value is the maximum number of features aggregated into one tile.
-    #   - Default None = uncapped (existing behavior, safe for all collections).
-    #   - Example: {0: 20000, 4: 50000, 8: 200000} — tight at world scale,
-    #     looser as each tile covers less ground.
+    #   - Value is the maximum number of features aggregated into one tile;
+    #     0 in a bracket = uncapped for that zoom and above (the opt-out).
+    #   - Default {0: 20000, 4: 50000, 8: 200000} — tight at world scale,
+    #     looser as each tile covers less ground. Ordinary collections stay
+    #     far below these per-tile counts; only pathological low-zoom tiles
+    #     of very large collections are clipped. Disable with {0: 0}.
     #   - Without ``feature_rank_column`` the N kept are storage-order
     #     (arbitrary); set it to keep the most important features instead.
     max_features_per_tile_by_zoom: Mutable[Optional[Dict[int, int]]] = Field(
-        default=None,
+        default_factory=lambda: {0: 20000, 4: 50000, 8: 200000},
         description=(
-            "Opt-in zoom-aware per-tile feature cap. Each key is the minimum zoom "
+            "Zoom-aware per-tile feature cap. Each key is the minimum zoom "
             "for the bracket; value is the maximum number of features aggregated "
             "into a tile (a LIMIT applied before ST_AsMVTGeom, bounding render "
-            "cost and tile size regardless of dataset size). Default None = uncapped."
+            "cost and tile size regardless of dataset size). 0 in a bracket = "
+            "uncapped for that zoom and above; set {0: 0} to disable. "
+            "Default {0: 20000, 4: 50000, 8: 200000}."
         ),
     )
 

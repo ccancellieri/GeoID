@@ -489,15 +489,39 @@ async def test_rank_filter_absent_without_column():
     assert params.get("where") is None
 
 
-def test_max_features_config_default_is_none():
+def test_max_features_config_default_is_bounded():
+    """Every layer is bounded-cost out of the box (#3155): the cap ships a
+    non-None default ladder, tight at world scale and looser as each tile
+    covers less ground."""
     from dynastore.modules.tiles.tiles_config import TilesConfig
-    assert TilesConfig().max_features_per_tile_by_zoom is None
+    assert TilesConfig().max_features_per_tile_by_zoom == {
+        0: 20000,
+        4: 50000,
+        8: 200000,
+    }
 
 
 def test_max_features_config_overridable():
     from dynastore.modules.tiles.tiles_config import TilesConfig
     cfg = TilesConfig(max_features_per_tile_by_zoom={0: 20000, 8: 200000})
     assert cfg.max_features_per_tile_by_zoom == {0: 20000, 8: 200000}
+
+
+def test_max_features_config_opt_out():
+    """{0: 0} is the documented opt-out: 0 resolves for every zoom and a
+    0-valued bracket pushes no LIMIT."""
+    from dynastore.modules.tiles.tiles_config import TilesConfig
+    cfg = TilesConfig(max_features_per_tile_by_zoom={0: 0})
+    assert cfg.max_features_per_tile_by_zoom == {0: 0}
+
+
+@pytest.mark.asyncio
+async def test_feature_cap_zero_bracket_uncapped():
+    """A 0 value in the resolved bracket disables the cap for that zoom and
+    above — the per-zoom opt-out of the default ladder."""
+    meta = _make_collection_meta(max_features_per_tile_by_zoom={0: 20000, 8: 0})
+    params = await _capture_builder_params(meta, z="8")  # z8 ≥ key 8 → 0 → uncapped
+    assert params.get("limit") is None
 
 
 def test_feature_rank_config_defaults_are_none():
