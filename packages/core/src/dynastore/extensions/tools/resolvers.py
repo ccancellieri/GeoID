@@ -49,6 +49,7 @@ async def resolve_catalog_or_404(
     *,
     detail: Optional[str] = None,
     use_model: bool = False,
+    include_tombstoned: bool = False,
     **kwargs: Any,
 ) -> "Catalog":
     """Fetch a catalog model or raise 404.
@@ -59,14 +60,28 @@ async def resolve_catalog_or_404(
     ``use_model=True`` to call ``get_catalog_model`` instead (the raw/cached
     lookup used by config- and status-style endpoints that don't need
     localization).
+
+    Both getters deliberately fall through to a tombstone lookup for a
+    soft-deleted catalog and return a populated model with ``deleted_at``
+    set rather than ``None`` (the 200+deleted-state reclaim contract; see
+    ``CatalogService._get_tombstoned_catalog_model_by_external_id_db``).
+    Read-surface callers must not resurface that model as if the catalog
+    were live, so by default (``include_tombstoned=False``) a tombstoned
+    catalog is treated exactly like a missing one and raises the same 404 —
+    fail-closed visibility, no oracle about the catalog's prior existence.
+    Pass ``include_tombstoned=True`` for the narrow set of admin/reclaim
+    surfaces that must still observe the deleted state.
     """
     getter = catalogs_svc.get_catalog_model if use_model else catalogs_svc.get_catalog
     catalog = await getter(catalog_id, **kwargs)
+    not_found = HTTPException(
+        status_code=404,
+        detail=detail or f"Catalog '{catalog_id}' not found.",
+    )
     if not catalog:
-        raise HTTPException(
-            status_code=404,
-            detail=detail or f"Catalog '{catalog_id}' not found.",
-        )
+        raise not_found
+    if not include_tombstoned and getattr(catalog, "deleted_at", None) is not None:
+        raise not_found
     return catalog
 
 

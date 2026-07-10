@@ -836,10 +836,17 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         """
         catalog_id = validate_sql_identifier(catalog_id)
         _reject_internal_id(catalog_id, "c", "Catalog")
-        catalogs_svc = await self._get_catalogs_service()
+        # Route through the shared resolver (rather than an inline
+        # get_catalog + falsy check) so a tombstoned catalog's collections
+        # are not listable at a stable URL after soft-delete (#3166) — same
+        # fail-closed contract as get_stac_catalog's direct GET (#3159/#3164).
         try:
-            catalog = await catalogs_svc.get_catalog(catalog_id, lang=language, hints=request_hints)
-        except (ValueError, Exception):
+            catalog = await self._resolve_catalog_or_404(
+                catalog_id, lang=language, hints=request_hints,
+            )
+        except HTTPException:
+            raise
+        except Exception:
             catalog = None
         if not catalog:
             raise HTTPException(

@@ -171,7 +171,11 @@ def test_platform_preset_catalog_scopable_reachable_at_catalog_url():
 def test_apply_collection_preset_unknown_collection_returns_404(monkeypatch):
     """Unknown collection segment → 404 before any config write."""
     catalogs_mock = MagicMock()
-    catalogs_mock.get_catalog_model = AsyncMock(return_value=MagicMock())
+    # deleted_at=None explicitly: a bare MagicMock() auto-mocks .deleted_at to
+    # a truthy attribute, which the resolver's tombstone check (#3166) would
+    # otherwise misread as a soft-deleted catalog and 404 before this test's
+    # actual target (the unknown collection) is ever reached.
+    catalogs_mock.get_catalog_model = AsyncMock(return_value=MagicMock(deleted_at=None))
     catalogs_mock.collections.get_collection = AsyncMock(return_value=None)
 
     def _fake_get_protocol(proto):

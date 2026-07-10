@@ -333,6 +333,7 @@ class OGCServiceMixin:
         *,
         detail: Optional[str] = None,
         use_model: bool = False,
+        include_tombstoned: bool = False,
         **kwargs: Any,
     ) -> Any:
         """Fetch a catalog model via this service's catalogs protocol or raise 404.
@@ -343,7 +344,12 @@ class OGCServiceMixin:
 
         catalogs_svc = await self._get_catalogs_service()
         return await resolve_catalog_or_404(
-            catalogs_svc, catalog_id, detail=detail, use_model=use_model, **kwargs
+            catalogs_svc,
+            catalog_id,
+            detail=detail,
+            use_model=use_model,
+            include_tombstoned=include_tombstoned,
+            **kwargs,
         )
 
     async def _resolve_collection_or_404(
