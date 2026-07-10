@@ -52,7 +52,7 @@ def _layer_cfg(srid: int) -> MagicMock:
 
 
 def _patch_meta_resolution(monkeypatch) -> None:
-    async def _fake_get_driver(_op, _schema, collection):
+    async def _fake_get_driver(_op, _schema, collection, hints=frozenset()):
         return _FakeDriver(_layer_cfg(4326))
 
     async def _fake_get_table_column_names(_conn, _schema, _table):

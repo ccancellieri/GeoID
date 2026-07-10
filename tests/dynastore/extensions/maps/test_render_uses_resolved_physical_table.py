@@ -65,8 +65,10 @@ async def test_query_uses_resolved_physical_table_not_collection_id(monkeypatch)
 
     physical_table = "physical_tbl_9f2"
     cfg = _layer_cfg(4326)
+    seen_hints = []
 
-    async def _fake_get_driver(_op, _schema, _collection):
+    async def _fake_get_driver(_op, _schema, _collection, hints=frozenset()):
+        seen_hints.append(hints)
         return _FakeDriverWithDivergingPhysicalTable(physical_table, cfg)
 
     seen_table_lookups = []
@@ -111,6 +113,14 @@ async def test_query_uses_resolved_physical_table_not_collection_id(monkeypatch)
             width=256,
             height=256,
         )
+
+    # Driver resolution must request tile-capable routing (Hint.TILES) —
+    # default READ routing returns ES first on ES-primary deployments, and
+    # the ES driver has no ``resolve_physical_table``, silently degrading
+    # the FROM target to the raw collection id (42P01 on divergence).
+    from dynastore.modules.storage.hints import Hint
+
+    assert seen_hints == [frozenset({Hint.TILES})]
 
     # Column introspection must run against the physical table, not the id.
     assert seen_table_lookups == [physical_table]

@@ -65,6 +65,7 @@ async def get_features_for_rendering(
     The heterogeneity check below raises ``ValueError`` (mapped to HTTP 400 by
     the caller) so the failure mode is explicit instead of silent. Refs #737.
     """
+    from dynastore.modules.storage.hints import Hint
     from dynastore.modules.storage.router import get_driver
     from dynastore.modules.storage.routing_config import Operation
     from dynastore.modules.storage.drivers.pg_sidecars import driver_sidecars
@@ -91,7 +92,16 @@ async def get_features_for_rendering(
         )
 
     async def _resolve_collection_meta(collection: str) -> tuple[str, List[str], int]:
-        drv = await get_driver(Operation.READ, schema, collection)
+        # Hint.TILES forces routing to a tile-capable driver (today: PG) —
+        # same as tiles_module.get_tile_resolution_params. Without it, default
+        # READ routing returns ES first when ES is listed ahead of PG; the ES
+        # driver has no ``resolve_physical_table``/geometry sidecars, so the
+        # duck-typed resolution below silently degrades to the collection id
+        # verbatim and the raw PostGIS query 42P01s on any collection whose
+        # physical table diverges from its id.
+        drv = await get_driver(
+            Operation.READ, schema, collection, hints=frozenset({Hint.TILES})
+        )
         # ``collection_id`` is not guaranteed to be the physical table name —
         # resolve it the same way every other physical read/write path does
         # (see ``CatalogsProtocol.resolve_physical_table`` / GeoID #2325).
