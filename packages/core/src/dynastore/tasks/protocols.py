@@ -82,8 +82,7 @@ class TaskProtocol(HasConfigService, Protocol, Generic[DefinitionType, PayloadTy
 
         Use cases: a task class whose execution depends on a per-row
         capability that varies across worker pools (e.g. a specific
-        Indexer module being registered in this process — see
-        :class:`~dynastore.tasks.index_propagation.task.IndexPropagationTask`).
+        Indexer module being registered in this process).
         """
         return True
 

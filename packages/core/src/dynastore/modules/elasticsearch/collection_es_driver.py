@@ -571,10 +571,9 @@ class CollectionElasticsearchDriver(TypedDriver[CollectionElasticsearchDriverCon
                 # #728: log per-op failure with exc_info so the real
                 # cause (e.g. document_parsing_exception body, refused
                 # tier guard) reaches structured logs. The downstream
-                # ``index_propagation`` task currently treats partial
-                # failures as a successful "partial" outcome — see #728
-                # follow-up to wire failures to the DLQ like the items
-                # adapter does.
+                # outbox drain currently treats partial failures as a
+                # successful "partial" outcome — see #728 follow-up to
+                # wire failures to the DLQ like the items adapter does.
                 logger.warning(
                     "CollectionElasticsearchDriver.index_bulk op failed: "
                     "catalog=%r entity_id=%r op_type=%r",

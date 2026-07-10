@@ -35,27 +35,38 @@ from dynastore.tasks.requeue_dead_letter.task import _build_inputs_match
 
 def test_platform_scope_yields_no_filter():
     assert _build_inputs_match(
-        task_type="index_propagation",
+        task_type="storage_drain",
         catalog_id=None,
         collection_id=None,
     ) == {}
 
 
 def test_catalog_scope_maps_to_jsonb_catalog_key():
-    out = _build_inputs_match(
-        task_type="index_propagation",
-        catalog_id="c1",
-        collection_id=None,
-    )
+    """No production task_type currently declares catalog/collection JSONB
+    keys — register a synthetic mapping for the duration of this test so
+    the translator's positive-mapping contract stays pinned."""
+    with patch.dict(
+        "dynastore.tasks.requeue_dead_letter.task.TASK_TYPE_INPUTS_KEYS",
+        {"storage_drain": {"catalog_id": "catalog", "collection_id": "collection"}},
+    ):
+        out = _build_inputs_match(
+            task_type="storage_drain",
+            catalog_id="c1",
+            collection_id=None,
+        )
     assert out == {"catalog": "c1"}
 
 
 def test_collection_scope_maps_both_keys():
-    out = _build_inputs_match(
-        task_type="index_propagation",
-        catalog_id="c1",
-        collection_id="col1",
-    )
+    with patch.dict(
+        "dynastore.tasks.requeue_dead_letter.task.TASK_TYPE_INPUTS_KEYS",
+        {"storage_drain": {"catalog_id": "catalog", "collection_id": "collection"}},
+    ):
+        out = _build_inputs_match(
+            task_type="storage_drain",
+            catalog_id="c1",
+            collection_id="col1",
+        )
     assert out == {"catalog": "c1", "collection": "col1"}
 
 
@@ -83,7 +94,7 @@ async def test_maintenance_fn_rejects_unsafe_jsonb_key():
     with pytest.raises(ValueError, match="unsafe JSONB key"):
         await maintenance.requeue_dead_letter_tasks_by_type(
             engine=object(),  # type: ignore[arg-type]
-            task_type="index_propagation",
+            task_type="storage_drain",
             inputs_match={"catalog'; DROP TABLE--": "c1"},
         )
 
@@ -116,7 +127,7 @@ async def test_maintenance_fn_passes_jsonb_filter_into_sql_and_params():
     ), patch.object(maintenance, "get_task_schema", return_value="tasks"):
         count = await maintenance.requeue_dead_letter_tasks_by_type(
             engine=object(),  # type: ignore[arg-type]
-            task_type="index_propagation",
+            task_type="storage_drain",
             inputs_match={"catalog": "c1", "collection": "col1"},
             limit=42,
         )
@@ -126,7 +137,7 @@ async def test_maintenance_fn_passes_jsonb_filter_into_sql_and_params():
     assert "inputs->>'collection' = :jm_collection" in captured["sql"]
     assert captured["params"]["jm_catalog"] == "c1"
     assert captured["params"]["jm_collection"] == "col1"
-    assert captured["params"]["task_type"] == "index_propagation"
+    assert captured["params"]["task_type"] == "storage_drain"
     assert captured["params"]["lim"] == 42
 
 
@@ -161,7 +172,7 @@ async def test_maintenance_fn_without_inputs_match_keeps_old_shape():
     ), patch.object(maintenance, "get_task_schema", return_value="tasks"):
         count = await maintenance.requeue_dead_letter_tasks_by_type(
             engine=object(),  # type: ignore[arg-type]
-            task_type="index_propagation",
+            task_type="storage_drain",
         )
 
     assert count == 2

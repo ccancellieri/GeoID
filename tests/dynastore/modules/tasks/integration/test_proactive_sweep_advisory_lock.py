@@ -61,7 +61,7 @@ pytestmark = [
 ]
 
 
-_TASK_TYPE = "index_propagation"  # listed in TASK_TYPE_CAPABILITY_INPUTS_KEY
+_TASK_TYPE = "storage_drain"
 _INPUTS_KEY = "indexer_id"
 
 
@@ -85,6 +85,16 @@ async def _pending_rows(task_app_state, monkeypatch):
     """
     from dynastore.modules.concurrency import _background_tasks
     from dynastore.modules.tasks import capability_oracle
+
+    # No production TaskProtocol currently declares ``required_capability``
+    # (``index_propagation`` was the last one, retired) — register a
+    # synthetic mapping so the bulk-DLQ sweep SQL this test exercises
+    # stays reachable. A real capability-gated task lands its own entry
+    # here (#522).
+    monkeypatch.setitem(
+        capability_oracle.TASK_TYPE_CAPABILITY_INPUTS_KEY,
+        _TASK_TYPE, _INPUTS_KEY,
+    )
 
     cap_id = f"dead-cap-{uuid.uuid4().hex[:10]}"
     engine = task_app_state.engine

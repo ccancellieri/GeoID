@@ -114,7 +114,6 @@ export_features = "dynastore.tasks.export_features.export_features_task:ExportFe
 tiles_preseed = "dynastore.tasks.tiles_preseed.task:TilePreseedTask"
 tiles_invalidate = "dynastore.tasks.tiles_invalidate.task:TileInvalidateTask"
 dimensions_materialize = "dynastore.tasks.dimensions_materialize.task:DimensionsMaterializeTask"
-index_propagation = "dynastore.tasks.index_propagation.task:IndexPropagationTask"
 gcp_catalog_cleanup = "dynastore.tasks.gcp.gcp_catalog_cleanup_task:GcpCatalogCleanupTask"
 cascade_cleanup = "dynastore.tasks.cascade_cleanup.task:CascadeCleanupTask"
 requeue_dead_letter_tasks = "dynastore.tasks.requeue_dead_letter.task:RequeueDeadLetterTasksTask"

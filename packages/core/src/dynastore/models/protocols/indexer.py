@@ -194,8 +194,8 @@ class Indexer(Protocol):
     write path.
 
     Identity: ``_to_snake(type(driver).__name__)`` — same convention used
-    by ``DriverRegistry``, ``_self_register_indexers_into``, and the
-    ``index_propagation`` task.  No separate ``indexer_id`` attribute.
+    by ``DriverRegistry`` and ``_self_register_indexers_into``.  No
+    separate ``indexer_id`` attribute.
     """
 
     async def ensure_indexer(self, ctx: IndexContext) -> None:

@@ -56,6 +56,24 @@ def _ctx(*, shutdown_set: bool = False) -> ServiceContext:
     )
 
 
+@pytest.fixture(autouse=True)
+def _capability_gated_task_type():
+    """No production ``TaskProtocol`` currently declares
+    ``required_capability`` (``index_propagation`` was the last one,
+    retired). Register a synthetic mapping so ``ProactiveSweepService.
+    tick()``'s per-task-type sweep loop — driven by
+    ``TASK_TYPE_CAPABILITY_INPUTS_KEY`` — stays exercised end-to-end; a
+    real capability-gated task lands its own entry here (#522).
+    """
+    from dynastore.modules.tasks.capability_oracle import (
+        TASK_TYPE_CAPABILITY_INPUTS_KEY,
+    )
+    with patch.dict(
+        TASK_TYPE_CAPABILITY_INPUTS_KEY, {"storage_drain": "indexer_id"}, clear=True,
+    ):
+        yield
+
+
 @pytest.mark.asyncio
 async def test_sweep_logs_dlq_count_on_nonzero_result(caplog):
     """When sweep_dead_capability_rows returns N>0 the tick emits a
@@ -81,7 +99,7 @@ async def test_sweep_logs_dlq_count_on_nonzero_result(caplog):
         svc = ProactiveSweepService(schema="tasks", interval_s=0.01)
         await svc.tick(_ctx())
 
-    sweep.assert_awaited_with(ANY, "dead_cap_1", task_type="index_propagation")
+    sweep.assert_awaited_with(ANY, "dead_cap_1", task_type="storage_drain")
     info_lines = [
         r.message for r in caplog.records if r.levelno == logging.INFO
     ]
@@ -230,7 +248,7 @@ async def test_distinct_query_filters_pending_retry_zero_with_min_age():
         out = await _distinct_pending_capability_ids(
             engine=object(),
             schema="tasks",
-            task_type="index_propagation",
+            task_type="storage_drain",
             inputs_key="indexer_id",
             min_age_s=300.0,
             sample_limit=50,

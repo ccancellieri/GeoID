@@ -512,11 +512,12 @@ def test_every_dynastore_extensions_entry_point_loads_or_misses_optional_dep() -
 
 
 # ---------------------------------------------------------------------------
-# #506: every SCOPE that discovers `index_propagation` must pin at least one
-# Indexer-providing module — otherwise the dispatcher loads the task entry
-# point but no class with ``is_<tier>_indexer = True`` is registered, and
-# first dispatch dead-letters at runtime (the claim predicate from #491
-# catches it post-deploy, but CI should catch it pre-deploy).
+# #506: every SCOPE that boots the full task dispatcher must pin at least one
+# Indexer-providing module — otherwise an Indexer-dependent task entry point
+# (e.g. ``elasticsearch_indexer``) loads but no class with
+# ``is_<tier>_indexer = True`` is registered, and first dispatch
+# dead-letters at runtime (the claim predicate from #491 catches it
+# post-deploy, but CI should catch it pre-deploy).
 # ---------------------------------------------------------------------------
 
 
@@ -578,27 +579,27 @@ _INDEXER_GATING_EXTRAS: frozenset[str] = frozenset({
 })
 
 
-def test_every_scope_discovering_index_propagation_pins_an_indexer_module() -> None:
+def test_every_scope_with_task_dispatch_pins_an_indexer_module() -> None:
     """B6 #506: any deployable SCOPE whose closure contains ``core`` must
     also contain at least one Indexer-providing extras key.
 
     Rationale: ``core`` is the marker for services that boot the full
     dispatcher (db_async + web + configs + storage + cache). Such a
-    service will discover the ``index_propagation`` ``dynastore.tasks``
-    entry-point at startup. If no Indexer driver class is in the import
-    closure, the very first dispatch finds zero implementors of
-    ``is_<tier>_indexer = True`` and dead-letters — exactly the regression
-    class #491's claim predicate guards against at *runtime*. This test
-    enforces the same property at *build* time so a mis-deployed SCOPE
-    breaks CI, not production.
+    service will discover Indexer-dependent ``dynastore.tasks``
+    entry-points (e.g. ``elasticsearch_indexer``) at startup. If no
+    Indexer driver class is in the import closure, the very first
+    dispatch finds zero implementors of ``is_<tier>_indexer = True`` and
+    dead-letters — exactly the regression class #491's claim predicate
+    guards against at *runtime*. This test enforces the same property at
+    *build* time so a mis-deployed SCOPE breaks CI, not production.
 
     Filter: SCOPEs whose closure contains BOTH ``core`` and ``tasks``.
     ``core`` marks a service that boots the full dispatcher; ``tasks``
     is the canonical extras key that pulls in ``module_tasks`` +
     ``extension_tasks`` — the actual task-dispatch surface. A service
     with ``core`` but no ``tasks`` (e.g. ``scope_tools``, which forwards
-    ``index_propagation`` to the catalog service per its task routing)
-    is a router, not a dispatcher, and is out of scope for this invariant.
+    task dispatch to the catalog service per its task routing) is a
+    router, not a dispatcher, and is out of scope for this invariant.
     Likewise
     ``worker_task_*`` images intentionally drop ``core`` and use
     ``task_base`` instead — a dedicated job image only runs the one
@@ -624,8 +625,9 @@ def test_every_scope_discovering_index_propagation_pins_an_indexer_module() -> N
             bad.append((scope, trimmed))
 
     assert not bad, (
-        "SCOPE(s) that discover `index_propagation` (via `core`) but do not "
-        "pin any Indexer-providing extras — first dispatch will dead-letter:\n  "
+        "SCOPE(s) that boot the task dispatcher (via `core` + `tasks`) but "
+        "do not pin any Indexer-providing extras — first dispatch will "
+        "dead-letter:\n  "
         + "\n  ".join(
             f"{scope}: module/grp closure = {sorted(extras)}"
             for scope, extras in bad

@@ -56,7 +56,7 @@ async def enqueue_render_preseed_task(
     """Enqueue a durable ``render_preseed`` obligation for one collection.
 
     Inserts a ``render_preseed`` task row using the same ``create_task`` path
-    used by every other durable obligation (tiles_invalidate, index_propagation,
+    used by every other durable obligation (tiles_invalidate, storage_drain,
     etc.).  The task worker drains the row off the request path.
 
     ``producer_kind`` is ``"raster"`` or ``"vector"``.  The worker dispatches

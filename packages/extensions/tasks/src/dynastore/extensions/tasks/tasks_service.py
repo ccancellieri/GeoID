@@ -179,8 +179,8 @@ async def _get_task_scoped_uncached(
     listing-visibility re-check (hidden collection ⇒ 404) needs a resolvable
     catalog, same as the catalog one.
 
-    #2777: internal machinery (index_propagation, storage_drain,
-    cascade_cleanup, ...) stores the *physical* collection id on the task
+    #2777: internal machinery (storage_drain, cascade_cleanup, ...)
+    stores the *physical* collection id on the task
     row at spawn time, but ``collection_id`` here is always the *external*
     URL id (#2710) — a raw comparison would spuriously 404 those tasks. The
     row is projected to its external id via ``_project_collection_external_ids``
@@ -249,8 +249,8 @@ async def _get_task_scoped_uncached(
 async def _project_collection_external_ids(tasks: List[Task]) -> List[Task]:
     """Project each task's stored ``collection_id`` to its public external_id.
 
-    Internal machinery (index_propagation, storage_drain, cascade_cleanup, ...)
-    stores the physical collection id in the ``collection_id`` column at spawn
+    Internal machinery (storage_drain, cascade_cleanup, ...) stores the
+    physical collection id in the ``collection_id`` column at spawn
     time. Resolving here, at the REST read boundary, rather than at spawn
     time keeps every task row correct across a collection rename. Reuses the
     same ``CollectionsProtocol.resolve_collection_external_id`` mapping the

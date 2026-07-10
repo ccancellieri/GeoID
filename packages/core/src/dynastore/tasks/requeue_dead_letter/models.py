@@ -38,7 +38,7 @@ class RequeueDeadLetterTasksRequest(BaseModel):
 
     task_type: str = Field(
         description=(
-            "task_type to replay (e.g. 'index_propagation'). Required — "
+            "task_type to replay (e.g. 'storage_drain'). Required — "
             "matches the value the dispatcher uses to claim rows."
         ),
     )
@@ -84,6 +84,4 @@ class RequeueDeadLetterTasksRequest(BaseModel):
 # carry catalog/collection in their inputs payload appear here; for any
 # other task_type the entity-scoped endpoints reject the request (no
 # safe filter to apply).
-TASK_TYPE_INPUTS_KEYS: dict[str, dict[str, str]] = {
-    "index_propagation": {"catalog_id": "catalog", "collection_id": "collection"},
-}
+TASK_TYPE_INPUTS_KEYS: dict[str, dict[str, str]] = {}

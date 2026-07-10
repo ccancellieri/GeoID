@@ -55,9 +55,7 @@ CAPABILITY_KEY_PREFIX = "dynastore:caps:"
 # (``inputs->>'<key>'``). Add a new entry here when a new capability-gated
 # TaskProtocol lands; the mapping intentionally lives alongside the oracle
 # so all capability-aware code paths share one source of truth.
-TASK_TYPE_CAPABILITY_INPUTS_KEY: dict[str, str] = {
-    "index_propagation": "indexer_id",
-}
+TASK_TYPE_CAPABILITY_INPUTS_KEY: dict[str, str] = {}
 
 
 def capability_key(capability_id: str) -> str:

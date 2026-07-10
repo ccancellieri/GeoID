@@ -2264,10 +2264,11 @@ class ItemService(ItemQueryMixin, ItemDistributedMixin, ItemsProtocol):
 
         Phase 2f atomic OUTBOX: when an engine is supplied, the dispatch
         is wrapped in its own ``managed_transaction`` so ``ctx.pg_conn``
-        is non-None.  The ``TaskTableOutboxWriter.enqueue`` INSERT and the
-        indexer attempt then live in the same TX — outbox writes are
-        durable instead of being skipped with a warning.  Cost: one extra
-        TX open/commit per dispatch call (cheap vs the indexer
+        is non-None.  ``StoragePlaneOutboxWriter.enqueue`` (via
+        ``enqueue_storage_op_id_only`` / ``enqueue_storage_op_write_id``)
+        and the indexer attempt then live in the same TX — outbox writes
+        are durable instead of being skipped with a warning.  Cost: one
+        extra TX open/commit per dispatch call (cheap vs the indexer
         round-trip).  Non-OUTBOX policies (FATAL, WARN, IGNORE) are
         unaffected by the wrapping TX since they don't write to the outbox
         table.

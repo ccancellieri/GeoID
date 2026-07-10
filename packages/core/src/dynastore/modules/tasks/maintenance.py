@@ -283,16 +283,16 @@ async def requeue_dead_letter_tasks_by_type(
     selected ``inputs`` keys).
 
     Companion to the reactive reaper added in #502: after fixing a
-    persistent SCOPE drift, operators run this to replay reaped
-    ``index_propagation`` rows in one call instead of looping
+    persistent SCOPE drift, operators run this to replay reaped rows of
+    a given ``task_type`` in one call instead of looping
     :func:`requeue_dead_letter_task`.
 
     ``inputs_match`` is an AND-joined set of ``inputs->>'key' = value``
     JSONB equality filters. The caller picks the JSONB keys appropriate
-    to the given ``task_type`` (e.g. ``{"catalog": "c1"}`` for
-    ``index_propagation``). Keys MUST match ``[A-Za-z_][A-Za-z0-9_]*``
-    so the literal can be safely inlined; anything else raises
-    :class:`ValueError`.
+    to the given ``task_type`` (e.g. ``{"catalog": "c1"}`` for a task
+    type that carries a top-level ``catalog`` key in its ``inputs``).
+    Keys MUST match ``[A-Za-z_][A-Za-z0-9_]*`` so the literal can be
+    safely inlined; anything else raises :class:`ValueError`.
 
     Returns the count of rows transitioned back to PENDING.
     """

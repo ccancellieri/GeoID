@@ -127,7 +127,7 @@ def test_hint_falls_back_to_routing_check_when_no_capability():
 
 def test_hint_surfaces_dead_capability_reaper_signal():
     msg = _stuck_pending_hint(
-        "index_propagation", "collection_elasticsearch_driver", False,
+        "storage_drain", "collection_elasticsearch_driver", False,
     )
     assert "live=false" in msg
     assert "reactive reaper" in msg
@@ -137,7 +137,7 @@ def test_hint_surfaces_dead_capability_reaper_signal():
 
 def test_hint_surfaces_transient_starvation_when_capability_alive():
     msg = _stuck_pending_hint(
-        "index_propagation", "collection_elasticsearch_driver", True,
+        "storage_drain", "collection_elasticsearch_driver", True,
     )
     assert "live=true" in msg
     assert "transient pool starvation" in msg
@@ -164,7 +164,7 @@ def test_resolve_row_capability_parses_json_string_inputs():
 
     with patch("dynastore.tasks.get_task_instance", return_value=_FakeTask()):
         cap = _resolve_row_capability(
-            {"task_type": "index_propagation",
+            {"task_type": "storage_drain",
              "inputs": '{"indexer_id": "collection_elasticsearch_driver"}'},
             {},
         )
@@ -188,7 +188,7 @@ def test_resolve_row_capability_uses_task_instance_cache():
         cache: dict = {}
         for _ in range(5):
             _resolve_row_capability(
-                {"task_type": "index_propagation",
+                {"task_type": "storage_drain",
                  "inputs": {"indexer_id": "d1"}},
                 cache,
             )
@@ -214,7 +214,7 @@ async def test_emit_coalesces_oracle_calls_per_distinct_capability(caplog):
             return payload["inputs"]["indexer_id"]
 
     rows = [
-        {"task_id": f"r-{i}", "task_type": "index_propagation",
+        {"task_id": f"r-{i}", "task_type": "storage_drain",
          "schema_name": "s", "age_s": 999.0,
          "inputs": {"indexer_id": "dead_driver"}}
         for i in range(30)

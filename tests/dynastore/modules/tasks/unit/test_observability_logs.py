@@ -27,12 +27,21 @@ from unittest.mock import MagicMock
 import pytest
 
 from dynastore.models.protocols.indexer import IndexContext, IndexOp
-from dynastore.modules.storage.index_dispatcher import TaskTableOutboxWriter
+from dynastore.modules.storage.index_dispatcher import StoragePlaneOutboxWriter
 
 
 @pytest.mark.asyncio
-async def test_outbox_enqueue_emits_chunk_emitted_log(caplog):
-    writer = TaskTableOutboxWriter(task_schema_resolver=lambda: "tasks")
+async def test_outbox_enqueue_emits_chunk_emitted_log(caplog, monkeypatch):
+    import dynastore.modules.storage.storage_emit as storage_emit_mod
+
+    async def _fake_enqueue_id_only(conn, *, catalog_id, rows):
+        return None
+
+    monkeypatch.setattr(
+        storage_emit_mod, "enqueue_storage_op_id_only", _fake_enqueue_id_only,
+    )
+
+    writer = StoragePlaneOutboxWriter()
     conn = MagicMock()
     ctx = IndexContext(
         catalog="catA", collection="colB", correlation_id="cid",
@@ -42,11 +51,6 @@ async def test_outbox_enqueue_emits_chunk_emitted_log(caplog):
         op_type="upsert", entity_type="item", entity_id="e1", payload={},
     )
 
-    async def _noop_exec(*_a, **_kw):
-        return None
-
-    writer._exec_insert = _noop_exec  # type: ignore[assignment]
-
     with caplog.at_level(logging.INFO, logger="dynastore.modules.storage.index_dispatcher"):
         await writer.enqueue(indexer_id="ix1", ctx=ctx, ops=[op])
 
@@ -54,8 +58,7 @@ async def test_outbox_enqueue_emits_chunk_emitted_log(caplog):
     assert len(matches) == 1
     msg = matches[0].getMessage()
     assert "indexer=ix1" in msg
-    assert "source=legacy" in msg
-    assert "op_type=upsert" in msg
+    assert "source=storage_plane_outbox" in msg
     assert "catalog=catA" in msg
     assert "chunk_size=1" in msg
 
@@ -66,12 +69,12 @@ def test_task_drained_success_emission(caplog):
     ts = datetime.now(timezone.utc) - timedelta(seconds=0.5)
     with caplog.at_level(logging.INFO, logger="dynastore.modules.tasks.dispatcher"):
         _log_task_terminal(
-            "index_propagation", "t-1", ts, outcome="success", error=None,
+            "storage_drain", "t-1", ts, outcome="success", error=None,
         )
     msgs = [r.getMessage() for r in caplog.records]
     assert any(m.startswith("task_drained ") for m in msgs)
     m = next(m for m in msgs if m.startswith("task_drained "))
-    assert "task_type=index_propagation" in m
+    assert "task_type=storage_drain" in m
     assert "outcome=success" in m
     assert re.search(r"enqueue_to_drain_seconds=\d+\.\d+", m)
 
@@ -85,7 +88,7 @@ def test_task_failed_emission_per_outcome(caplog):
     with caplog.at_level(logging.INFO, logger="dynastore.modules.tasks.dispatcher"):
         for outcome in outcomes:
             _log_task_terminal(
-                "index_propagation", "t-X", ts, outcome=outcome, error="boom",
+                "storage_drain", "t-X", ts, outcome=outcome, error="boom",
             )
 
     failed_msgs = [
@@ -100,12 +103,12 @@ def test_task_failed_emission_per_outcome(caplog):
 
 
 def test_task_claim_rejected_log_shape():
-    line = "task_claim_rejected task_type=index_propagation capability=ix1 task_id=t-1 — can_claim returned False on this worker"
+    line = "task_claim_rejected task_type=storage_drain capability=ix1 task_id=t-1 — can_claim returned False on this worker"
     m = re.match(
         r"^task_claim_rejected task_type=(?P<task_type>\S+) "
         r"capability=(?P<capability>\S+) task_id=(?P<task_id>\S+) — ",
         line,
     )
     assert m is not None
-    assert m["task_type"] == "index_propagation"
+    assert m["task_type"] == "storage_drain"
     assert m["capability"] == "ix1"

@@ -852,10 +852,10 @@ async def run_dispatcher(
         deferred = False
 
         # Payload-aware claim predicate.  If the task class refuses this
-        # specific row (e.g. ``IndexPropagationTask`` whose target indexer
-        # is not registered in this process), release the claim back to
-        # PENDING with a small back-off so another worker can pick it up
-        # without this one hot-looping.  See #491.
+        # specific row (e.g. a task whose target driver is not registered
+        # in this process), release the claim back to PENDING with a small
+        # back-off so another worker can pick it up without this one
+        # hot-looping.  See #491.
         task_instance = get_task_instance(row["task_type"])
         if task_instance is not None:
             can_claim_fn = getattr(type(task_instance), "can_claim", None)

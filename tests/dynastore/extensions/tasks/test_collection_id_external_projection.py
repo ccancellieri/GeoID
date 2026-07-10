@@ -19,8 +19,8 @@
 """Regression coverage for #2710: task rows must never echo the internal
 physical collection id on the REST surface.
 
-Internal machinery (index_propagation, storage_drain, cascade_cleanup, ...)
-stores the physical ``collection_id`` in the task row at spawn time. The
+Internal machinery (storage_drain, cascade_cleanup, ...) stores the
+physical ``collection_id`` in the task row at spawn time. The
 tasks read/serializer path must resolve it back to the collection's public
 ``external_id`` before it reaches the wire, reusing the same
 ``CollectionsProtocol.resolve_collection_external_id`` mapping the
@@ -41,7 +41,7 @@ _EXTERNAL_COLLECTION_ID = "stations"
 _CATALOG_ID = "s_abc123"
 
 
-def _task(collection_id: str | None, task_type: str = "index_propagation") -> Task:
+def _task(collection_id: str | None, task_type: str = "storage_drain") -> Task:
     return Task(
         task_type=task_type,
         status=TaskStatusEnum.COMPLETED,

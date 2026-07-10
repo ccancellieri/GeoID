@@ -126,7 +126,7 @@ async def test_redispatch_skips_dead_capability_rows():
         def required_capability(cls, payload):
             return "dead_indexer"
 
-    rows = _make_rows(3, task_type="index_propagation")
+    rows = _make_rows(3, task_type="storage_drain")
     for row in rows:
         row["inputs"] = {"indexer_id": "dead_indexer"}
 

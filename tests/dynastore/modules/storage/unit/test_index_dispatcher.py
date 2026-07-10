@@ -35,7 +35,7 @@ from dynastore.models.protocols.indexer import (
 from dynastore.models.protocols.indexing import IndexableOp
 from dynastore.modules.storage.index_dispatcher import (
     INLINE_DISPATCH_CHUNK_SIZE, IndexDispatcher, IndexerFatal,
-    StoragePlaneOutboxWriter, TaskTableOutboxWriter, get_index_dispatcher,
+    StoragePlaneOutboxWriter, get_index_dispatcher,
     reset_index_dispatcher,
 )
 from dynastore.modules.storage.routing_config import (
@@ -495,170 +495,34 @@ class _FakePgConn:
         return None
 
 
-@pytest.mark.asyncio
-async def test_outbox_writer_skips_when_no_pg_conn(caplog):
-    """When IndexContext has no pg_conn, atomicity can't be guaranteed —
-    writer logs a warning and returns without raising.
+class _RecordingWriter:
+    """Generic ``OutboxWriterProtocol`` double — records each accepted op
+    without touching a database.  Used by tests that exercise the
+    dispatcher's OUTBOX routing decisions (which writer gets called, with
+    which ops), not the internals of any specific writer implementation.
     """
-    writer = TaskTableOutboxWriter(task_schema_resolver=lambda: "tasks")
-    import logging as _logging
-    with caplog.at_level(_logging.WARNING):
-        await writer.enqueue(
-            indexer_id="x", ctx=_ctx(), ops=[_op()], last_error="boom",
-        )
-    assert any("ctx.pg_conn is None" in r.getMessage() for r in caplog.records)
-
-
-class _RecordingWriter(TaskTableOutboxWriter):
-    """Bypass DQLQuery so chunk emission can be asserted in isolation
-    from the SA dialect resolution layer (which the legacy ``_FakePgConn``
-    fixture no longer satisfies)."""
 
     def __init__(self) -> None:
-        super().__init__(task_schema_resolver=lambda: "tasks")
         self.rows: list[dict] = []
 
-    async def _exec_insert(self, conn, sql, params):  # type: ignore[override]
-        self.rows.append({"sql": sql, "params": dict(params)})
-
-
-
-@pytest.mark.asyncio
-async def test_outbox_writer_inserts_task_row_on_caller_conn():
-    """Happy path: writer issues INSERT INTO {task_schema}.tasks on the
-    caller's connection.  The shape of the SQL + bind args is the load-
-    bearing assertion — this is the contract that gives the atomicity
-    guarantee.
-    """
-    ctx = IndexContext(
-        catalog="cat-x", collection="col-y", correlation_id="cid-1",
-        pg_conn=object(),
-    )
-    writer = _RecordingWriter()
-
-    await writer.enqueue(
-        indexer_id="items_elasticsearch_driver",
-        ctx=ctx,
-        ops=[_op()],
-        last_error="ES timeout",
-    )
-    assert len(writer.rows) == 1
-    sql = writer.rows[0]["sql"]
-    params = writer.rows[0]["params"]
-
-    # SQL must INSERT into the tasks table with task_type='index_propagation'.
-    assert "INSERT INTO tasks.tasks" in sql
-    # Named binds preserved (DQLQuery uses sqlalchemy text named binds).
-    assert ":task_id" in sql
-    # ``inputs`` is a JSON-serialized payload bound by name.
-    import json as _json
-    inputs = _json.loads(params["inputs"])
-    assert inputs["indexer_id"] == "items_elasticsearch_driver"
-    assert inputs["ops"][0]["entity_id"] == "item-1"
-    assert inputs["op_type"] == "upsert"
-    assert inputs["catalog"] == "cat-x"
-    assert inputs["last_error"] == "ES timeout"
-
-
-@pytest.mark.asyncio
-async def test_outbox_dedup_key_is_stable_across_calls():
-    """Same chunk identity → same dedup_key.  Different op_type → distinct
-    key.  Different chunk membership → distinct key.
-    """
-    k_a = TaskTableOutboxWriter._dedup_key("ix", "upsert", "item", ["abc"])
-    k_b = TaskTableOutboxWriter._dedup_key("ix", "delete", "item", ["abc"])
-    k_c = TaskTableOutboxWriter._dedup_key("ix", "upsert", "item", ["abc"])
-    k_d = TaskTableOutboxWriter._dedup_key("ix", "upsert", "item", ["abc", "def"])
-    # Same chunk content, different ordering → same key (sorted).
-    k_d2 = TaskTableOutboxWriter._dedup_key("ix", "upsert", "item", ["def", "abc"])
-    assert k_a == k_c, "same chunk identity must coalesce"
-    assert k_a != k_b, "upsert and delete must stay distinct"
-    assert k_a != k_d, "different chunk membership must produce distinct keys"
-    assert k_d == k_d2, "order-independent: sort entity_ids before hashing"
-
-
-@pytest.mark.asyncio
-async def test_outbox_chunks_large_batch_into_one_row_per_chunk():
-    """A 1500-op batch with chunk_size=500 → 3 task rows, each carrying
-    500 ops under inputs.ops.
-    """
-    ctx = IndexContext(
-        catalog="cat-x", collection="col-y", correlation_id="cid-1",
-        pg_conn=object(),  # truthy; bypassed by _RecordingWriter._exec_insert
-    )
-    writer = _RecordingWriter()
-    ops = [_op(entity_id=f"i{i}") for i in range(1500)]
-
-    await writer.enqueue(
-        indexer_id="items_elasticsearch_driver",
-        ctx=ctx, ops=ops, chunk_size=500,
-    )
-    assert len(writer.rows) == 3
-    import json as _json
-    sizes = [
-        len(_json.loads(r["params"]["inputs"])["ops"]) for r in writer.rows
-    ]
-    assert sizes == [500, 500, 500]
-    keys = {r["params"]["dedup_key"] for r in writer.rows}
-    assert len(keys) == 3, "distinct chunks must produce distinct dedup_keys"
-
-
-@pytest.mark.asyncio
-async def test_outbox_one_op_call_writes_single_row_of_one_op():
-    ctx = IndexContext(
-        catalog="cat-x", collection="col-y", correlation_id="cid-1",
-        pg_conn=object(),
-    )
-    writer = _RecordingWriter()
-
-    await writer.enqueue(
-        indexer_id="items_elasticsearch_driver",
-        ctx=ctx, ops=[_op()],
-    )
-    assert len(writer.rows) == 1
-    import json as _json
-    inputs = _json.loads(writer.rows[0]["params"]["inputs"])
-    assert len(inputs["ops"]) == 1
-    assert inputs["ops"][0]["entity_id"] == "item-1"
-
-
-@pytest.mark.asyncio
-async def test_outbox_mixed_op_types_chunk_separately():
-    """Mixing upsert + delete in one enqueue call splits per op_type so
-    each chunk's dedup_key stays meaningful (upsert/delete don't share
-    a coalescing identity).
-    """
-    ctx = IndexContext(
-        catalog="cat-x", collection="col-y", correlation_id="cid-1",
-        pg_conn=object(),
-    )
-    writer = _RecordingWriter()
-    ops = [
-        _op("upsert", entity_id="a"),
-        _op("delete", entity_id="b"),
-        _op("upsert", entity_id="c"),
-    ]
-    await writer.enqueue(
-        indexer_id="items_elasticsearch_driver",
-        ctx=ctx, ops=ops,
-    )
-    assert len(writer.rows) == 2
-    import json as _json
-    op_types = sorted(
-        _json.loads(r["params"]["inputs"])["op_type"] for r in writer.rows
-    )
-    assert op_types == ["delete", "upsert"]
-
-
-@pytest.mark.asyncio
-async def test_outbox_empty_ops_is_noop():
-    ctx = IndexContext(
-        catalog="cat", collection="col", correlation_id="cid",
-        pg_conn=object(),
-    )
-    writer = _RecordingWriter()
-    await writer.enqueue(indexer_id="x", ctx=ctx, ops=[])
-    assert writer.rows == []
+    async def enqueue(
+        self,
+        *,
+        indexer_id: str,
+        ctx: IndexContext,
+        ops: Sequence[IndexOp],
+        last_error: Optional[str] = None,
+        chunk_size: Optional[int] = None,
+    ) -> None:
+        for op in ops:
+            self.rows.append({
+                "indexer_id": indexer_id,
+                "catalog": ctx.catalog,
+                "collection": ctx.collection,
+                "op_type": op.op_type,
+                "entity_id": op.entity_id,
+                "last_error": last_error,
+            })
 
 
 # ---------------------------------------------------------------------------
@@ -697,53 +561,16 @@ async def test_default_dispatcher_describe_with_no_routing_returns_empty_indexer
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_outbox_policy_with_writer_enqueues_on_failure():
-    """OUTBOX policy + a real OutboxWriter should write the task row when
-    the indexer call fails.  Validates the production durability path
-    end-to-end against the dispatcher.
-    """
-    a = _StubIndexer("a", raise_on="upsert")
-    ctx_with_conn = IndexContext(
-        catalog="cat-x", collection="col-y",
-        correlation_id="cid-1", pg_conn=object(),
-    )
-    writer = _RecordingWriter()
-
-    routing = _StubRouting([_entry("a", on_failure=FailurePolicy.OUTBOX)])
-
-    async def routing_resolver(catalog, collection):
-        return routing
-
-    async def indexer_registry(indexer_id):
-        return {"a": a}.get(indexer_id)
-
-    dispatcher = IndexDispatcher(
-        routing_resolver=routing_resolver,
-        indexer_registry=indexer_registry,
-        outbox=writer,
-    )
-    await dispatcher.fan_out_bulk(ctx_with_conn, [_op()])
-
-    # Indexer was attempted once (and raised).
-    assert len(a.bulk_calls) == 1
-    # Outbox row was written on the caller's connection.
-    assert len(writer.rows) == 1
-    assert "INSERT INTO tasks.tasks" in writer.rows[0]["sql"]
-
-
 # ---------------------------------------------------------------------------
-# StoragePlaneOutboxWriter — replaces TaskTableOutboxWriter as the default
-# OUTBOX failure-policy handler (un-fao/GeoID#2732 step 1: index_propagation
-# consolidation).
+# StoragePlaneOutboxWriter — the default OUTBOX failure-policy handler
+# (un-fao/GeoID#2732 step 1).
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_storage_plane_outbox_writer_skips_when_no_pg_conn(caplog):
-    """Same atomicity guard as TaskTableOutboxWriter: no open TX means the
-    enqueue can't be made durable, so it degrades to a warning instead of
-    silently writing a non-atomic row."""
+    """No open TX means the enqueue can't be made durable, so it degrades
+    to a warning instead of silently writing a non-atomic row."""
     import logging as _logging
 
     writer = StoragePlaneOutboxWriter()
@@ -852,8 +679,8 @@ async def test_outbox_policy_with_storage_plane_writer_enqueues_on_failure(
     monkeypatch,
 ):
     """OUTBOX policy + the storage-plane writer wired as ``outbox`` writes a
-    tasks.storage row on inline failure and never produces an
-    index_propagation (tasks.tasks) row."""
+    tasks.storage row on inline failure and never produces a
+    payload-carrying tasks.tasks row."""
     calls = _patch_storage_emit_recorder(monkeypatch)
     a = _StubIndexer("a", raise_on="upsert")
     ctx_with_conn = IndexContext(
@@ -922,13 +749,11 @@ async def test_outbox_policy_delete_failure_enqueues_storage_plane_delete_row(
 @pytest.mark.asyncio
 async def test_default_dispatcher_wires_storage_plane_outbox_writer():
     """un-fao/GeoID#2732 step 1: the process-wide default dispatcher's
-    OUTBOX handler is the storage-plane writer, not TaskTableOutboxWriter —
-    fresh writes must never produce index_propagation rows."""
+    OUTBOX handler is the storage-plane writer."""
     await reset_index_dispatcher()
     dispatcher = get_index_dispatcher()
     try:
         assert isinstance(dispatcher._outbox, StoragePlaneOutboxWriter)
-        assert not isinstance(dispatcher._outbox, TaskTableOutboxWriter)
     finally:
         await reset_index_dispatcher()
 
@@ -1113,12 +938,7 @@ async def test_silent_noop_upsert_batch_enqueues_and_returns_failed():
 
     # (a) outbox must have been written
     assert len(writer.rows) >= 1, "outbox enqueue must be called for noop upserts"
-    import json as _json
-    enqueued_ids = {
-        item["entity_id"]
-        for row in writer.rows
-        for item in _json.loads(row["params"]["inputs"])["ops"]
-    }
+    enqueued_ids = {row["entity_id"] for row in writer.rows}
     assert "i1" in enqueued_ids
     assert "i2" in enqueued_ids
 
@@ -1243,12 +1063,7 @@ async def test_async_write_mode_skips_inline_index_and_enqueues():
     )
     # Outbox must have received the ops.
     assert len(writer.rows) >= 1, "ASYNC entry must enqueue ops to outbox"
-    import json as _json
-    enqueued_ids = {
-        item["entity_id"]
-        for row in writer.rows
-        for item in _json.loads(row["params"]["inputs"])["ops"]
-    }
+    enqueued_ids = {row["entity_id"] for row in writer.rows}
     assert "i1" in enqueued_ids
     assert "i2" in enqueued_ids
 
@@ -1584,13 +1399,10 @@ async def test_mixed_sync_and_async_entries_dispatch_correctly():
 # ---------------------------------------------------------------------------
 
 
-class _FailingWriter(TaskTableOutboxWriter):
-    """Simulates a transient PG error during task-row insertion (drop path c)."""
+class _FailingWriter:
+    """Simulates a transient PG error during outbox enqueue (drop path c)."""
 
-    def __init__(self) -> None:
-        super().__init__(task_schema_resolver=lambda: "tasks")
-
-    async def _exec_insert(self, conn, sql, params):  # type: ignore[override]
+    async def enqueue(self, **kwargs) -> None:
         raise RuntimeError("simulated transient PG error")
 
 
@@ -1618,9 +1430,9 @@ async def test_async_enqueue_drop_path_a_no_outbox_returns_failed():
 
 @pytest.mark.asyncio
 async def test_async_enqueue_drop_path_b_pg_conn_none_returns_failed():
-    """Drop path (b): ctx.pg_conn is None — TaskTableOutboxWriter.enqueue
-    returns silently without enqueuing anything.  The ASYNC branch pre-checks
-    and must return BulkResult(succeeded=0, failed=N).
+    """Drop path (b): ctx.pg_conn is None. The ASYNC branch pre-checks
+    before ever calling the outbox writer's enqueue and must return
+    BulkResult(succeeded=0, failed=N).
     """
     a = _StubIndexer("a")
     writer = _RecordingWriter()
@@ -1869,7 +1681,7 @@ async def test_storage_plane_flag_on_no_conn_no_tx_factory_drops_and_fails(monke
 @pytest.mark.asyncio
 async def test_storage_plane_flag_off_preserves_legacy_async_outbox_path(monkeypatch):
     """Flag OFF: byte-identical to the pre-#2494 dispatch — ASYNC entries
-    still go through the payload-carrying TaskTableOutboxWriter."""
+    still go through the payload-carrying legacy outbox writer."""
     _patch_storage_plane_flag(monkeypatch, enabled=False)
     calls = _patch_storage_emit_recorder(monkeypatch)
 

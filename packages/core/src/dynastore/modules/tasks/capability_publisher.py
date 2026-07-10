@@ -56,19 +56,11 @@ logger = logging.getLogger(__name__)
 def _collect_local_capabilities() -> List[str]:
     """Return the set of capability ids served by this process.
 
-    Today this is just the snake-cased Indexer class names — the only
-    consumer of ``can_claim`` is :class:`IndexPropagationTask`. Generalize
-    here when a second consumer lands (#522).
+    Currently empty — no capability-gated ``TaskProtocol`` (a task
+    declaring ``can_claim``/``required_capability``) is registered.
+    Populate here when one lands (#522).
     """
-    try:
-        from dynastore.tasks.index_propagation.task import (
-            registered_indexer_ids,
-        )
-
-        return list(registered_indexer_ids())
-    except Exception as exc:  # noqa: BLE001 — never break lifespan
-        logger.debug("capability_publisher: enumerate failed (%s)", exc)
-        return []
+    return []
 
 
 async def _refresh_once(capabilities: Iterable[str], ttl_seconds: float) -> int:

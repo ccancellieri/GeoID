@@ -59,9 +59,9 @@ def _patch_backend(backend):
 async def test_bump_dlq_reactive_writes_expected_key_and_ttl():
     backend = _FakeAsyncBackend()
     with _patch_backend(backend):
-        await cs.bump_dlq("reactive", "cap-1", "index_propagation", 4)
+        await cs.bump_dlq("reactive", "cap-1", "storage_drain", 4)
     assert backend.incr_calls == [
-        ("dynastore:cap_stats:dlq_reactive:cap-1:index_propagation", 4, 24 * 3600.0),
+        ("dynastore:cap_stats:dlq_reactive:cap-1:storage_drain", 4, 24 * 3600.0),
     ]
 
 
@@ -69,12 +69,12 @@ async def test_bump_dlq_reactive_writes_expected_key_and_ttl():
 async def test_bump_dlq_proactive_uses_distinct_key():
     backend = _FakeAsyncBackend()
     with _patch_backend(backend):
-        await cs.bump_dlq("proactive", "cap-1", "index_propagation", 2)
-        await cs.bump_dlq("reactive", "cap-1", "index_propagation", 1)
+        await cs.bump_dlq("proactive", "cap-1", "storage_drain", 2)
+        await cs.bump_dlq("reactive", "cap-1", "storage_drain", 1)
     keys = sorted({k for k, _, _ in backend.incr_calls})
     assert keys == [
-        "dynastore:cap_stats:dlq_proactive:cap-1:index_propagation",
-        "dynastore:cap_stats:dlq_reactive:cap-1:index_propagation",
+        "dynastore:cap_stats:dlq_proactive:cap-1:storage_drain",
+        "dynastore:cap_stats:dlq_reactive:cap-1:storage_drain",
     ], "reactive and proactive must not collide"
 
 
@@ -82,7 +82,7 @@ async def test_bump_dlq_proactive_uses_distinct_key():
 async def test_bump_dlq_unknown_source_is_noop():
     backend = _FakeAsyncBackend()
     with _patch_backend(backend):
-        await cs.bump_dlq("mystery", "cap-1", "index_propagation", 7)
+        await cs.bump_dlq("mystery", "cap-1", "storage_drain", 7)
     assert backend.incr_calls == []
 
 
@@ -90,9 +90,9 @@ async def test_bump_dlq_unknown_source_is_noop():
 async def test_bump_claim_rejected_uses_distinct_key():
     backend = _FakeAsyncBackend()
     with _patch_backend(backend):
-        await cs.bump_claim_rejected("cap-1", "index_propagation")
+        await cs.bump_claim_rejected("cap-1", "storage_drain")
     assert backend.incr_calls == [
-        ("dynastore:cap_stats:claim_rejected:cap-1:index_propagation", 1, 24 * 3600.0),
+        ("dynastore:cap_stats:claim_rejected:cap-1:storage_drain", 1, 24 * 3600.0),
     ]
 
 
@@ -100,10 +100,10 @@ async def test_bump_claim_rejected_uses_distinct_key():
 async def test_bump_swallows_zero_or_empty_args():
     backend = _FakeAsyncBackend()
     with _patch_backend(backend):
-        await cs.bump_dlq("reactive", "", "index_propagation", 1)
+        await cs.bump_dlq("reactive", "", "storage_drain", 1)
         await cs.bump_dlq("reactive", "cap-1", "", 1)
-        await cs.bump_dlq("reactive", "cap-1", "index_propagation", 0)
-        await cs.bump_claim_rejected("", "index_propagation")
+        await cs.bump_dlq("reactive", "cap-1", "storage_drain", 0)
+        await cs.bump_claim_rejected("", "storage_drain")
     assert backend.incr_calls == []
 
 
@@ -113,7 +113,7 @@ async def test_bump_fail_open_when_backend_raises():
     backend.incr = AsyncMock(side_effect=RuntimeError("valkey down"))
     with _patch_backend(backend):
         # Must not raise.
-        await cs.bump_claim_rejected("cap-1", "index_propagation")
+        await cs.bump_claim_rejected("cap-1", "storage_drain")
 
 
 @pytest.mark.asyncio
@@ -124,14 +124,14 @@ async def test_bump_fail_open_when_no_backend():
         "dynastore.tools.cache.get_cache_manager",
         side_effect=RuntimeError("no cache"),
     ):
-        await cs.bump_claim_rejected("cap-1", "index_propagation")
+        await cs.bump_claim_rejected("cap-1", "storage_drain")
 
 
 @pytest.mark.asyncio
 async def test_read_counters_returns_zero_for_unset_keys():
     backend = _FakeAsyncBackend()
     with _patch_backend(backend):
-        out = await cs.read_counters("cap-1", "index_propagation")
+        out = await cs.read_counters("cap-1", "storage_drain")
     assert out == {
         "claim_rejected": 0,
         "dlq_reactive": 0,
@@ -143,11 +143,11 @@ async def test_read_counters_returns_zero_for_unset_keys():
 async def test_read_counters_returns_recorded_values():
     backend = _FakeAsyncBackend()
     with _patch_backend(backend):
-        await cs.bump_dlq("reactive", "cap-1", "index_propagation", 3)
-        await cs.bump_dlq("proactive", "cap-1", "index_propagation", 5)
-        await cs.bump_claim_rejected("cap-1", "index_propagation")
-        await cs.bump_claim_rejected("cap-1", "index_propagation")
-        out = await cs.read_counters("cap-1", "index_propagation")
+        await cs.bump_dlq("reactive", "cap-1", "storage_drain", 3)
+        await cs.bump_dlq("proactive", "cap-1", "storage_drain", 5)
+        await cs.bump_claim_rejected("cap-1", "storage_drain")
+        await cs.bump_claim_rejected("cap-1", "storage_drain")
+        out = await cs.read_counters("cap-1", "storage_drain")
     assert out == {
         "claim_rejected": 2,
         "dlq_reactive": 3,
@@ -163,7 +163,7 @@ async def test_read_counters_returns_none_on_backend_unavailable():
         "dynastore.tools.cache.get_cache_manager",
         side_effect=RuntimeError("no cache"),
     ):
-        out = await cs.read_counters("cap-1", "index_propagation")
+        out = await cs.read_counters("cap-1", "storage_drain")
     assert out == {
         "claim_rejected": None,
         "dlq_reactive": None,

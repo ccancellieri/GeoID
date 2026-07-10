@@ -28,8 +28,6 @@ Contract:
 - When the CAS UPDATE matches zero rows (race: another dispatcher
   flipped the row to ACTIVE) → returns False, no exception.
 - Any infra failure → returns False (fail-safe; no false DLQ).
-- IndexPropagationTask.required_capability extracts ``indexer_id`` from
-  the row payload.
 """
 from __future__ import annotations
 
@@ -43,10 +41,25 @@ from dynastore.modules.tasks.dispatcher import (
     _stable_advisory_lock_key,
     sweep_dead_capability_rows,
 )
-from dynastore.tasks.index_propagation.task import IndexPropagationTask
 
 
-def _row(task_id: str = "t-1", task_type: str = "index_propagation"):
+@pytest.fixture(autouse=True)
+def _capability_gated_task_type():
+    """No production ``TaskProtocol`` currently declares
+    ``required_capability`` (``index_propagation`` was the last one,
+    retired). Register a synthetic mapping for the duration of this
+    suite so the bulk-DLQ sweep path — gated on
+    ``TASK_TYPE_CAPABILITY_INPUTS_KEY`` — stays exercised end-to-end;
+    a real capability-gated task lands its own entry here (#522).
+    """
+    from dynastore.modules.tasks.capability_oracle import (
+        TASK_TYPE_CAPABILITY_INPUTS_KEY,
+    )
+    with patch.dict(TASK_TYPE_CAPABILITY_INPUTS_KEY, {"storage_drain": "indexer_id"}):
+        yield
+
+
+def _row(task_id: str = "t-1", task_type: str = "storage_drain"):
     return {
         "task_id": task_id,
         "timestamp": datetime(2026, 5, 11, tzinfo=timezone.utc),
@@ -311,20 +324,6 @@ async def test_inner_oracle_timeout_uses_cache_config(caplog):
     assert not any("UPDATE" in s and "DEAD_LETTER" in s for s in _FakeQuery._sql_log)
 
 
-def test_index_propagation_required_capability_from_payload():
-    payload = {"inputs": {"indexer_id": "collection_elasticsearch_driver"}}
-    assert (
-        IndexPropagationTask.required_capability(payload)
-        == "collection_elasticsearch_driver"
-    )
-
-
-def test_index_propagation_required_capability_missing_returns_none():
-    assert IndexPropagationTask.required_capability({"inputs": {}}) is None
-    assert IndexPropagationTask.required_capability({}) is None
-    assert IndexPropagationTask.required_capability(None) is None
-
-
 @pytest.mark.asyncio
 async def test_bulk_dlq_sweeps_siblings_for_known_task_type(caplog):
     """#529: after the per-row CAS DLQ wins, the same locked transaction
@@ -353,7 +352,7 @@ async def test_bulk_dlq_sweeps_siblings_for_known_task_type(caplog):
     assert result is True
     pattern = re.compile(
         r"dispatcher_dlq_bulk_total source=reactive "
-        r"task_type=index_propagation "
+        r"task_type=storage_drain "
         r"capability=dead_driver reason=no_live_worker count=3"
     )
     assert any(pattern.search(r.message) for r in caplog.records), (
@@ -410,16 +409,6 @@ async def test_bulk_dlq_skipped_for_unmapped_task_type():
     )
 
 
-def test_task_type_capability_inputs_key_mapping_exposes_index_propagation():
-    """Regression: the mapping must declare ``index_propagation`` so the
-    bulk-DLQ sweep can extract ``inputs->>'indexer_id'``. Future
-    capability-gated tasks add their own entries here."""
-    from dynastore.modules.tasks.capability_oracle import (
-        TASK_TYPE_CAPABILITY_INPUTS_KEY,
-    )
-    assert TASK_TYPE_CAPABILITY_INPUTS_KEY["index_propagation"] == "indexer_id"
-
-
 # ---------------------------------------------------------------------------
 # sweep_dead_capability_rows — standalone helper used by the proactive
 # sweeper task (#524 PR B). Shares ``_emit_bulk_dlq`` with the reactive
@@ -472,7 +461,7 @@ async def test_sweep_returns_zero_when_capability_live():
         count = await sweep_dead_capability_rows(
             engine=MagicMock(),
             capability_id="alive_driver",
-            task_type="index_propagation",
+            task_type="storage_drain",
         )
     finally:
         for p in patches: p.stop()
@@ -499,14 +488,14 @@ async def test_sweep_bulk_dlqs_when_capability_dead(caplog):
         count = await sweep_dead_capability_rows(
             engine=MagicMock(),
             capability_id="dead_driver",
-            task_type="index_propagation",
+            task_type="storage_drain",
         )
     finally:
         for p in patches: p.stop()
     assert count == 2
     pattern = re.compile(
         r"dispatcher_dlq_bulk_total source=proactive "
-        r"task_type=index_propagation "
+        r"task_type=storage_drain "
         r"capability=dead_driver reason=no_live_worker count=2"
     )
     assert any(pattern.search(r.message) for r in caplog.records), (
@@ -525,7 +514,7 @@ async def test_sweep_skips_when_advisory_lock_contended():
         count = await sweep_dead_capability_rows(
             engine=MagicMock(),
             capability_id="dead_driver",
-            task_type="index_propagation",
+            task_type="storage_drain",
         )
     finally:
         for p in patches: p.stop()
@@ -541,7 +530,7 @@ async def test_sweep_fails_safe_on_infra_error():
         count = await sweep_dead_capability_rows(
             engine=MagicMock(),
             capability_id="x",
-            task_type="index_propagation",
+            task_type="storage_drain",
         )
     assert count == 0
 
