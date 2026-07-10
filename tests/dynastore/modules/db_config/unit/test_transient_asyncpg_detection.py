@@ -76,3 +76,41 @@ class TestTransientDetectionByMessageFragment:
 
     def test_unrelated_message_not_matched(self):
         assert _is_transient_asyncpg_error(ValueError("unrelated failure")) is False
+
+
+class TestTransientDetectionOfCancelRaceInterfaceError:
+    """#3181: asyncpg's own statement-cancel handling losing a race against
+    another operation on the same wire raises ``InterfaceError("cannot
+    perform operation: another operation is in progress")`` instead of a
+    clean pgcode-57014 ``QueryCanceledError``. The cancel-drain path in
+    ``managed_transaction`` relies on this predicate to invalidate that
+    connection instead of returning it to the pool poisoned."""
+
+    def test_raw_asyncpg_interface_error_recognised(self):
+        import asyncpg.exceptions as ae
+
+        exc = ae.InterfaceError(
+            "cannot perform operation: another operation is in progress"
+        )
+        assert _is_transient_asyncpg_error(exc) is True
+
+    def test_sqlalchemy_wrapped_interface_error_recognised(self):
+        import asyncpg.exceptions as ae
+
+        class _FakeDBAPIError(Exception):
+            """Stand-in for SQLAlchemy's DBAPIError: `.orig` set to the raw
+            asyncpg exception, mirroring how the real dialect wraps it."""
+
+            def __init__(self, orig):
+                self.orig = orig
+                super().__init__(str(orig))
+
+        wrapped = _FakeDBAPIError(
+            ae.InterfaceError(
+                "cannot perform operation: another operation is in progress"
+            )
+        )
+        assert _is_transient_asyncpg_error(wrapped) is True
+
+    def test_plain_value_error_still_rejected(self):
+        assert _is_transient_asyncpg_error(ValueError("unrelated failure")) is False

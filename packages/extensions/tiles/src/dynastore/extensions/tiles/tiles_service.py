@@ -55,7 +55,11 @@ from dynastore.modules.db_config.query_executor import (
     DQLQuery,
     ResultHandler,
 )
-from dynastore.modules.db_config.exceptions import PoolSaturationError, QueryExecutionError
+from dynastore.modules.db_config.exceptions import (
+    DatabaseConnectionError,
+    PoolSaturationError,
+    QueryExecutionError,
+)
 from dynastore.tools.render_admission import RenderAdmissionGate, RenderAdmissionRejected
 from dynastore.extensions.tools.query import parse_hints_param, validate_filter_lang
 from dynastore.extensions.tools.resolvers import (
@@ -113,6 +117,63 @@ _TILE_CACHE_WRITER_DRAIN_SECONDS = 8.0
 # so it is never reported as 204; it falls back to a stale cached tile or a
 # 503 instead (#2965).
 _QUERY_CANCELED_PGCODE = "57014"
+
+# A second cancellation shape (#3181): asyncpg's own statement-cancel
+# handling can lose a race against another operation on the same wire
+# (SQLAlchemy's rollback-on-error, or ``managed_transaction``'s cancel
+# drain in ``query_executor.py``) and raise ``InterfaceError`` instead of
+# the clean pgcode-57014 ``QueryCanceledError``. Detected by class name +
+# message rather than an ``isinstance`` check — this extension has no
+# other reason to depend on asyncpg directly.
+_INTERFACE_ERROR_CLASS_NAME = "InterfaceError"
+_ANOTHER_OPERATION_IN_PROGRESS_FRAGMENT = "another operation is in progress"
+
+
+def _is_timeout_cancel_race(
+    exc: BaseException, elapsed_s: float, timeout_s: float
+) -> bool:
+    """True if ``exc`` represents the live-tile statement-timeout cancelling
+    the render, in either of its two observed shapes (#3181).
+
+    Walks ``exc``'s cause chain — ``.original_exception`` (this codebase's
+    ``DatabaseError`` idiom), ``.orig`` (SQLAlchemy's ``DBAPIError`` idiom),
+    then ``__cause__``/``__context__`` (plain Python exception chaining) —
+    mirroring the walk in ``query_executor._is_transient_asyncpg_error``,
+    looking for either:
+
+    - pgcode ``57014`` (``query_canceled``): PostgreSQL cleanly reported the
+      cancellation. Matches regardless of ``elapsed_s``.
+    - An ``InterfaceError`` whose message says another operation was
+      already in progress on the wire: asyncpg's own cancel-vs-concurrent-
+      operation race, which carries no pgcode. Only counted as *this*
+      request's timeout once ``elapsed_s`` has actually reached
+      ``timeout_s`` — an ``InterfaceError`` well before the deadline is an
+      unrelated wire fault and must still surface as a 500.
+
+    The walk is bounded to a handful of hops so a malformed cause chain (or
+    a test double whose attribute access never returns ``None``) cannot
+    loop forever.
+    """
+    seen: set[int] = set()
+    candidate: Optional[BaseException] = exc
+    for _ in range(6):
+        if candidate is None or id(candidate) in seen:
+            break
+        seen.add(id(candidate))
+        if getattr(candidate, "pgcode", None) == _QUERY_CANCELED_PGCODE:
+            return True
+        if (
+            type(candidate).__name__ == _INTERFACE_ERROR_CLASS_NAME
+            and _ANOTHER_OPERATION_IN_PROGRESS_FRAGMENT in str(candidate)
+        ):
+            return elapsed_s >= timeout_s
+        candidate = (
+            getattr(candidate, "original_exception", None)
+            or getattr(candidate, "orig", None)
+            or getattr(candidate, "__cause__", None)
+            or getattr(candidate, "__context__", None)
+        )
+    return False
 
 # Raster render imports — guarded so the tiles extension can load in
 # environments without rio-tiler (graceful degradation: map-tile routes
@@ -1315,9 +1376,13 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 # a client disconnect).
                 _render_admitted = False
                 mvt_content = await asyncio.shield(render_task)
-            except QueryExecutionError as exc:
+            except (QueryExecutionError, DatabaseConnectionError) as exc:
                 pgcode = getattr(exc.original_exception, "pgcode", None)
-                if pgcode != _QUERY_CANCELED_PGCODE:
+                elapsed_s = time.perf_counter() - start_time
+                cancel_race = _is_timeout_cancel_race(
+                    exc, elapsed_s, tiles_config.live_tile_timeout_seconds,
+                )
+                if pgcode != _QUERY_CANCELED_PGCODE and not cancel_race:
                     raise
                 # A cancelled statement means this render never learned
                 # whether the tile has data or not — reporting 204 here would
@@ -1325,11 +1390,22 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 # tile that may well be full. Fall back to a stale cached
                 # tile (200, honest even if outdated), else tell the client
                 # to retry (503) rather than render a false hole (#2965).
+                #
+                # ``cancel_race`` covers the second cancellation shape
+                # (#3181): asyncpg's own cancel handling losing a race
+                # against another wire operation raises ``InterfaceError``
+                # (no pgcode) instead of the clean pgcode-57014 cancel, and
+                # the DB layer's transient-asyncpg classifier (#235/#239)
+                # surfaces that as ``DatabaseConnectionError`` rather than
+                # ``QueryExecutionError`` — same unknown-content situation
+                # as the pgcode case, so it gets the same fallback here
+                # instead of falling through to a raw 500.
+                trigger = "pgcode" if pgcode == _QUERY_CANCELED_PGCODE else "cancel-race"
                 logger.warning(
-                    "get_vector_tile: statement timeout (pgcode %s, "
+                    "get_vector_tile: statement timeout (trigger=%s, pgcode=%s, "
                     "live_tile_timeout_seconds=%s) catalog=%s collection=%s "
                     "z=%s x=%s y=%s — attempting stale tile fallback",
-                    pgcode, tiles_config.live_tile_timeout_seconds,
+                    trigger, pgcode, tiles_config.live_tile_timeout_seconds,
                     dataset, collections, z, x, y,
                 )
                 stale = await self._try_stale_tile_fallback(
