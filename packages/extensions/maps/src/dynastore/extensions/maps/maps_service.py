@@ -1030,6 +1030,12 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
             alias="style-url",
             description="External SLD URL to apply to raster map rendering.",
         ),
+        style_url_compat: Optional[str] = Query(
+            None,
+            alias="style_url",
+            include_in_schema=False,
+            description="Compatibility spelling of 'style-url'.",
+        ),
         bgcolor: Optional[str] = Query(None, description="Background color of the map."),
         transparent: bool = Query(True, description="Whether the map background should be transparent."),
         datetime: Optional[str] = Query(None, description="Temporal filter (timestamp or interval)."),
@@ -1042,6 +1048,10 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         immutable IDs, enforces visibility per collection, then delegates to
         ``_get_map_impl`` (OGC API - Maps /conf/dataset-map, Req 10).
         """
+        # isinstance guard: direct (non-FastAPI) callers leave the Query
+        # sentinel in place of the compat param — adopt only a real string.
+        if style_url is None and isinstance(style_url_compat, str):
+            style_url = style_url_compat
         catalogs_svc = get_protocol(CatalogsProtocol)
         if not catalogs_svc:
             raise HTTPException(status_code=500, detail="Catalogs service not available.")
@@ -1156,6 +1166,12 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
             alias="style-url",
             description="External SLD URL to apply to raster map rendering.",
         ),
+        style_url_compat: Optional[str] = Query(
+            None,
+            alias="style_url",
+            include_in_schema=False,
+            description="Compatibility spelling of 'style-url'.",
+        ),
     ):
         """Render the default-style map for a specific collection under the aligned path.
 
@@ -1163,6 +1179,10 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         internal immutable IDs, enforces visibility, then delegates to
         ``_get_map_impl``.
         """
+        # isinstance guard: direct (non-FastAPI) callers leave the Query
+        # sentinel in place of the compat param — adopt only a real string.
+        if style_url is None and isinstance(style_url_compat, str):
+            style_url = style_url_compat
         catalogs_svc = get_protocol(CatalogsProtocol)
         if not catalogs_svc:
             raise HTTPException(status_code=500, detail="Catalogs service not available.")
@@ -1222,6 +1242,12 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
             alias="style-url",
             description="External SLD URL to apply to raster map rendering.",
         ),
+        style_url_compat: Optional[str] = Query(
+            None,
+            alias="style_url",
+            include_in_schema=False,
+            description="Compatibility spelling of 'style-url'.",
+        ),
     ):
         """Render a map for a specific collection with an explicit style under the aligned path.
 
@@ -1229,6 +1255,10 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         internal immutable IDs, enforces visibility, then delegates to
         ``_get_map_impl``.
         """
+        # isinstance guard: direct (non-FastAPI) callers leave the Query
+        # sentinel in place of the compat param — adopt only a real string.
+        if style_url is None and isinstance(style_url_compat, str):
+            style_url = style_url_compat
         catalogs_svc = get_protocol(CatalogsProtocol)
         if not catalogs_svc:
             raise HTTPException(status_code=500, detail="Catalogs service not available.")

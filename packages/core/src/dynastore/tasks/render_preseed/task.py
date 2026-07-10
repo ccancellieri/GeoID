@@ -479,17 +479,35 @@ class RenderPreseedTask(TaskProtocol):
     async def _resolve_colormap(
         self, catalog_id: str, collection_id: str, style_id: str
     ) -> Optional[Any]:
-        """Return the colormap for ``style_id``, or ``None`` on any failure."""
+        """Return the colormap for ``style_id``, or ``None`` on any failure.
+
+        Queries the styles db directly: ``StylesProtocol.get_style`` is a
+        route handler that expects EXTERNAL ids and a request-scoped ``conn``
+        dependency, while this task holds INTERNAL ids — calling it here
+        always raised and the broad except below silently returned ``None``.
+        The ``get_protocol(StylesProtocol)`` check stays as the
+        styles-extension-enabled gate.
+        """
         try:
             from dynastore.models.protocols import StylesProtocol  # type: ignore[attr-defined]
             from dynastore.modules import get_protocol
             from dynastore.modules.renders.colormap import extract_sld_body, parse_sld_colormap
+            from dynastore.modules.styles import db as styles_db
+            from dynastore.modules.db_config.query_executor import managed_transaction
+            from dynastore.tools.protocol_helpers import get_engine
 
             styles_svc = get_protocol(StylesProtocol)
             if styles_svc is None:
                 return None
 
-            style_obj = await styles_svc.get_style(catalog_id, collection_id, style_id)
+            engine = get_engine()
+            if engine is None:
+                return None
+
+            async with managed_transaction(engine) as conn:
+                style_obj = await styles_db.get_style_by_id_and_collection(
+                    conn, catalog_id, collection_id, style_id
+                )
             if not style_obj:
                 return None
 

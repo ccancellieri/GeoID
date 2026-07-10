@@ -226,3 +226,17 @@ class TestApplyColormapHillshade:
         # All three channels should be equal (greyscale)
         assert np.all(out[0] == out[1])
         assert np.all(out[1] == out[2])
+
+    def test_interval_colormap_matches_discrete_equivalent(self):
+        """SLD ramp/intervals parses now yield interval colormaps; the
+        hillshade blender must treat them like the equivalent discrete dict."""
+        interval_cmap: RioColormap = [
+            ((0.0, 500.0), (0, 0, 255, 255)),
+            ((500.0, 2000.0), (0, 255, 0, 255)),
+            ((2000.0, float("inf")), (255, 255, 255, 255)),
+        ]
+        elev = np.array([[100.0, 900.0], [2500.0, -50.0]], dtype=np.float32)
+        shade = np.ones((2, 2), dtype=np.float64)
+        out = _apply_colormap_hillshade(elev, shade, interval_cmap)
+        expected = _apply_colormap_hillshade(elev, shade, self._SIMPLE_CMAP)
+        assert np.array_equal(out, expected)

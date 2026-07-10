@@ -502,7 +502,7 @@ class TestTileOutsideBounds:
             svc._get_first_item = AsyncMock(return_value=_first_item_stub())
 
             styles_svc = MagicMock()
-            styles_svc.get_style = AsyncMock(return_value=MagicMock())
+            svc._get_style_record = AsyncMock(return_value=MagicMock())
 
             original_esb = _ts_mod._EXTRACT_SLD_BODY
             original_psc = _ts_mod._PARSE_SLD_COLORMAP
@@ -611,7 +611,7 @@ class TestMissingStyle404:
             svc._get_first_item = AsyncMock(return_value=_first_item_stub())
 
             styles_svc = MagicMock()
-            styles_svc.get_style = AsyncMock(return_value=None)  # style not found
+            svc._get_style_record = AsyncMock(return_value=None)  # style not found
 
             with patch("dynastore.extensions.tiles.tiles_service.get_protocol", return_value=styles_svc):
                 with patch(

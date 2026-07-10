@@ -1935,6 +1935,41 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             return None
 
     @staticmethod
+    async def _get_style_record(
+        request: Request,
+        internal_catalog_id: str,
+        internal_collection_id: str,
+        style_id: str,
+        *,
+        external_catalog_id: str,
+        external_collection_id: str,
+    ):
+        """Fetch a style row by internal ids on a real connection.
+
+        ``StylesService.get_style`` is a FastAPI route handler: it expects
+        EXTERNAL ids (it re-resolves them through the external-only
+        ``resolve_catalog_id``) and a request-scoped ``conn`` dependency, so
+        calling it programmatically with internal ids raises
+        ``ValueError("Catalog '<internal id>' not found.")`` — surfacing the
+        internal id on the wire as a 404. Mirror the maps extension's
+        ``_get_style_to_render`` instead: query the styles db directly with
+        the ids this service already resolved. Returns ``None`` when the
+        style does not exist.
+        """
+        from dynastore.modules.styles import db as styles_db
+
+        engine = get_async_engine(request)
+        async with engine.connect() as conn:
+            return await styles_db.get_style_by_id_and_collection(
+                conn,
+                internal_catalog_id,
+                internal_collection_id,
+                style_id,
+                external_catalog_id=external_catalog_id,
+                external_collection_id=external_collection_id,
+            )
+
+    @staticmethod
     async def _load_render_caching_config():  # type: ignore[return]
         """Fetch live RenderCachingConfig; fall back to defaults if unavailable."""
         if _RenderCachingConfig is None:
@@ -2202,6 +2237,12 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             alias="style-url",
             description="External SLD URL to apply to raster tile rendering.",
         ),
+        style_url_compat: Optional[str] = Query(
+            None,
+            alias="style_url",
+            include_in_schema=False,
+            description="Compatibility spelling of 'style-url'.",
+        ),
         serve: Optional[Literal["proxy", "redirect"]] = Query(
             None,
             description=(
@@ -2230,6 +2271,10 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         """
         from dynastore.modules.catalog.catalog_config import CollectionKind
 
+        # isinstance guard: direct (non-FastAPI) callers leave the Query
+        # sentinel in place of the compat param — adopt only a real string.
+        if style_url is None and isinstance(style_url_compat, str):
+            style_url = style_url_compat
         fmt_lower = format.lower()
 
         start = time.perf_counter()
@@ -2340,8 +2385,13 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         from dynastore.models.protocols import StylesProtocol as _StylesProtocol
         styles_svc = get_protocol(_StylesProtocol)
         if colormap is None and styles_svc and style_id != "default":
-            style_obj = await styles_svc.get_style(
-                internal_catalog_id, internal_collection_id, style_id
+            style_obj = await self._get_style_record(
+                request,
+                internal_catalog_id,
+                internal_collection_id,
+                style_id,
+                external_catalog_id=catalog_id,
+                external_collection_id=collection_id,
             )
             if style_obj and _EXTRACT_SLD_BODY:
                 sld_body = _EXTRACT_SLD_BODY(style_obj)
@@ -2598,6 +2648,12 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             alias="style-url",
             description="External SLD URL to apply to raster tile rendering.",
         ),
+        style_url_compat: Optional[str] = Query(
+            None,
+            alias="style_url",
+            include_in_schema=False,
+            description="Compatibility spelling of 'style-url'.",
+        ),
         azimuth: float = Query(default=315.0, ge=0.0, lt=360.0, description="Hillshade sun azimuth in degrees (0=North, clockwise)."),
         altitude: float = Query(default=45.0, ge=0.0, le=90.0, description="Hillshade sun altitude above horizon in degrees."),
         serve: Optional[Literal["proxy", "redirect"]] = Query(
@@ -2628,6 +2684,10 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         self._validate_style_id(style_id)
         self._require_raster_engine()
 
+        # isinstance guard: direct (non-FastAPI) callers leave the Query
+        # sentinel in place of the compat param — adopt only a real string.
+        if style_url is None and isinstance(style_url_compat, str):
+            style_url = style_url_compat
         fmt_lower = format.lower()
         if fmt_lower not in _FORMAT_MEDIA_TYPE:
             raise HTTPException(
@@ -2766,8 +2826,13 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         from dynastore.models.protocols import StylesProtocol as _StylesProtocol
         styles_svc = get_protocol(_StylesProtocol)
         if colormap is None and styles_svc:
-            style_obj = await styles_svc.get_style(
-                internal_catalog_id, internal_collection_id, style_id
+            style_obj = await self._get_style_record(
+                request,
+                internal_catalog_id,
+                internal_collection_id,
+                style_id,
+                external_catalog_id=catalog_id,
+                external_collection_id=collection_id,
             )
             if not style_obj and not is_hillshade:
                 raise HTTPException(

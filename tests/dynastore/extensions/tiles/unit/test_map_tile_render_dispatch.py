@@ -416,7 +416,7 @@ class TestHillshadeDispatch:
             bg = _make_bg_tasks()
             cfg = _make_render_config(cache_enabled=True)
             provider = MagicMock()
-            provider.get_style = AsyncMock(return_value=None)  # hillshade tolerates a missing style
+            svc._get_style_record = AsyncMock(return_value=None)  # hillshade tolerates a missing style
 
             p1, p2, p3, p4, p5 = _patch_common(cfg, provider=provider)
             with p1, p2, p3, p4, p5:
@@ -759,7 +759,7 @@ class TestStyledRasterDispatch:
             cfg = _make_render_config(cache_enabled=False)
 
             styles_svc = MagicMock()
-            styles_svc.get_style = AsyncMock(return_value=MagicMock())
+            svc._get_style_record = AsyncMock(return_value=MagicMock())
             _ts_mod._EXTRACT_SLD_BODY = lambda obj: None
 
             p1, p2, p3, p4, p5 = _patch_common(cfg, provider=styles_svc)
@@ -795,7 +795,7 @@ class TestStyledRasterDispatch:
             cfg = _make_render_config(cache_enabled=False)
 
             styles_svc = MagicMock()
-            styles_svc.get_style = AsyncMock(return_value=MagicMock())
+            svc._get_style_record = AsyncMock(return_value=MagicMock())
             _ts_mod._EXTRACT_SLD_BODY = lambda obj: None
 
             p1, p2, p3, p4, p5 = _patch_common(cfg, provider=styles_svc)

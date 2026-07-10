@@ -64,14 +64,13 @@ understood natively by MapLibre GL v4+.
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Literal, Optional, Sequence, Tuple
+from typing import List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
+from dynastore.modules.renders.colormap import RGBA, RioColormap
 
-# rio-tiler colormap type
-RioColormap = Dict[int, Tuple[int, int, int, int]]
+logger = logging.getLogger(__name__)
 
 OutputFormat = Literal["PNG", "WEBP"]
 
@@ -154,8 +153,10 @@ def render_cog_tile(
         z: Tile zoom level.
         x: Tile column index.
         y: Tile row index.
-        colormap: Discrete colormap dict ``{pixel_value: (R, G, B, A)}``.
-            Pass ``None`` to render the raw pixel values.
+        colormap: Discrete colormap dict ``{pixel_value: (R, G, B, A)}`` or
+            interval colormap ``[((lo, hi), (R, G, B, A)), ...]`` — both are
+            accepted verbatim by rio-tiler.  Pass ``None`` to render the raw
+            pixel values.
         output_format: ``"PNG"`` (default) or ``"WEBP"``.
         band: Single band index to read (1-based). Defaults to 1.  Ignored
             when ``bands`` or ``expression`` is supplied.
@@ -235,7 +236,8 @@ def render_cog_map(
         bbox: ``[min_lon, min_lat, max_lon, max_lat]`` in EPSG:4326.
         width: Output image width in pixels.
         height: Output image height in pixels.
-        colormap: Discrete colormap ``{pixel_value: (R, G, B, A)}``.
+        colormap: Discrete colormap ``{pixel_value: (R, G, B, A)}`` or
+            interval colormap ``[((lo, hi), (R, G, B, A)), ...]``.
             Pass ``None`` to render raw values.
         output_format: ``"PNG"`` (default) or ``"WEBP"``.
         band: Single band index to read (1-based). Defaults to 1.  Ignored
@@ -496,7 +498,10 @@ def _apply_colormap_hillshade(
     Args:
         elevation: 2-D float array of elevation values.
         shade: 2-D float array in ``[0, 1]`` (hillshade intensity).
-        colormap: Discrete colormap ``{int_key: (R, G, B, A)}``.
+        colormap: Discrete colormap ``{key: (R, G, B, A)}`` or interval
+            colormap ``[((lo, hi), (R, G, B, A)), ...]``; either way each
+            entry colours the values from its key/lower bound up to the next
+            entry.
 
     Returns:
         ``(4, H, W)`` uint8 RGBA array.
@@ -511,12 +516,16 @@ def _apply_colormap_hillshade(
         grey = (shade * 255).astype(np.uint8)
         return np.stack([grey, grey, grey, np.full((h, w), 255, dtype=np.uint8)], axis=0)
 
-    keys = sorted(colormap.keys())
+    # Normalize both colormap shapes to sorted (lower_bound, rgba) pairs; the
+    # loop below treats each lower bound as covering up to the next one.
+    if isinstance(colormap, dict):
+        pairs: List[Tuple[float, RGBA]] = sorted(colormap.items())
+    else:
+        pairs = sorted((bounds[0], rgba) for bounds, rgba in colormap)
 
-    for i, key in enumerate(keys):
-        r, g, b, a = colormap[key]
-        if i + 1 < len(keys):
-            mask = (elevation >= key) & (elevation < keys[i + 1])
+    for i, (key, (r, g, b, a)) in enumerate(pairs):
+        if i + 1 < len(pairs):
+            mask = (elevation >= key) & (elevation < pairs[i + 1][0])
         else:
             mask = elevation >= key
 
@@ -527,8 +536,7 @@ def _apply_colormap_hillshade(
         out_a[mask] = a
 
     # Pixels below the lowest key get the lowest colour with hillshade applied.
-    lowest_key = keys[0]
-    r0, g0, b0, a0 = colormap[lowest_key]
+    lowest_key, (r0, g0, b0, a0) = pairs[0]
     below = elevation < lowest_key
     hs_below = shade[below]
     out_r[below] = np.clip(r0 * hs_below, 0, 255).astype(np.uint8)

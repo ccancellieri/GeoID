@@ -16,11 +16,21 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""SLD ColorMap → rio-tiler discrete colormap dict.
+"""SLD ColorMap → rio-tiler colormap (discrete dict or interval sequence).
 
-Parses an SLD 1.1 ``<ColorMap type="values">`` element and produces a
-``dict[int, tuple[int, int, int, int]]`` suitable for passing directly to
-``rio_tiler.models.ImageData.render(colormap=...)``.
+Parses an SLD ``<ColorMap>`` element (SLD 1.0 or 1.1, any namespace) and
+produces a value suitable for passing directly to
+``rio_tiler.models.ImageData.render(colormap=...)``:
+
+- ``type="values"`` → ``dict[int | float, RGBA]`` (rio-tiler's discrete
+  colormap; pixels must match an entry exactly, per GeoServer semantics).
+- ``type="intervals"`` → ``[((lo, hi), RGBA), ...]`` (rio-tiler's interval
+  colormap; each entry's quantity is the lower bound of its interval).
+- ``type="ramp"`` — the SLD **default** when the attribute is absent — →
+  interval colormap approximating GeoServer's linear color interpolation:
+  each segment between adjacent entries is subdivided into
+  ``_RAMP_STEPS_PER_SEGMENT`` linearly-interpolated sub-intervals, with
+  values clamped to the first/last entry color outside the entry range.
 
 Design constraints:
 - Pure function, no I/O, no DB, no FastAPI — unit-testable without any
@@ -28,23 +38,31 @@ Design constraints:
 - Only ``lxml`` is required (already a transitive dependency via the styles
   extension, and explicitly listed in the renders extension's own
   pyproject.toml).
-- Handles ``type="values"`` (discrete) only; ``type="ramp"`` and
-  ``type="intervals"`` are out of scope for Slice 1.
-- Each ``<ColorMapEntry>`` maps an integer pixel quantity → RGBA. Entries
-  whose ``quantity`` cannot be parsed as an integer are skipped with a
-  warning, rather than failing the whole parse.
+- Quantities are floats (gismgr SLDs emit ``quantity="0.0"``); entries whose
+  ``quantity`` cannot be parsed as a number are skipped with a warning,
+  rather than failing the whole parse.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
-# rio-tiler colormap type alias for documentation clarity.
-RioColormap = Dict[int, Tuple[int, int, int, int]]
+# rio-tiler colormap type aliases for documentation clarity. Both shapes are
+# accepted verbatim by ``ImageData.render(colormap=...)`` (dict → discrete
+# lookup, sequence → interval lookup).
+RGBA = Tuple[int, int, int, int]
+DiscreteColormap = Dict[Union[int, float], RGBA]
+IntervalColormap = List[Tuple[Tuple[float, float], RGBA]]
+RioColormap = Union[DiscreteColormap, IntervalColormap]
+
+# Sub-intervals generated per adjacent-entry segment when approximating a
+# ramp. 16 steps keeps the color error per step imperceptible (< 1/16 of the
+# segment's color delta) while bounding the interval count (~16×segments).
+_RAMP_STEPS_PER_SEGMENT = 16
 
 # SLD XML namespaces used when parsing the document.
 _SLD_NS = {
@@ -110,18 +128,73 @@ def extract_sld_body(style_obj: object) -> Optional[str]:
     return None
 
 
+def _lerp_rgba(a: RGBA, b: RGBA, t: float) -> RGBA:
+    """Linearly interpolate two RGBA tuples at ``t`` in [0, 1]."""
+    return (
+        round(a[0] + (b[0] - a[0]) * t),
+        round(a[1] + (b[1] - a[1]) * t),
+        round(a[2] + (b[2] - a[2]) * t),
+        round(a[3] + (b[3] - a[3]) * t),
+    )
+
+
+def _ramp_colormap(entries: List[Tuple[float, RGBA]]) -> IntervalColormap:
+    """Approximate SLD ramp (linear interpolation) as interval sub-steps.
+
+    ``entries`` must be sorted by quantity. Values below the first entry get
+    the first color and values above the last get the last color, matching
+    GeoServer's edge clamping.
+    """
+    first_q, first_rgba = entries[0]
+    last_q, last_rgba = entries[-1]
+    out: IntervalColormap = [((float("-inf"), first_q), first_rgba)]
+    for (qa, ca), (qb, cb) in zip(entries, entries[1:]):
+        if qb <= qa:
+            continue
+        for j in range(_RAMP_STEPS_PER_SEGMENT):
+            lo = qa + (qb - qa) * j / _RAMP_STEPS_PER_SEGMENT
+            hi = qa + (qb - qa) * (j + 1) / _RAMP_STEPS_PER_SEGMENT
+            # Sample at the sub-interval's lower bound so a value exactly on
+            # an entry quantity gets that entry's exact color — load-bearing
+            # for opacity-0 nodata entries like gismgr's -9999.
+            out.append(((lo, hi), _lerp_rgba(ca, cb, j / _RAMP_STEPS_PER_SEGMENT)))
+    out.append(((last_q, float("inf")), last_rgba))
+    return out
+
+
+def _intervals_colormap(entries: List[Tuple[float, RGBA]]) -> IntervalColormap:
+    """Build an interval colormap with each entry's quantity as lower bound.
+
+    ``entries`` must be sorted by quantity. GeoServer renders each interval
+    between two entries with the lower entry's color; values below the first
+    entry are left unrendered (transparent) and values at or above the last
+    entry are clamped to the last color.
+    """
+    out: IntervalColormap = []
+    for (qa, ca), (qb, _) in zip(entries, entries[1:]):
+        if qb > qa:
+            out.append(((qa, qb), ca))
+    last_q, last_rgba = entries[-1]
+    out.append(((last_q, float("inf")), last_rgba))
+    return out
+
+
 def parse_sld_colormap(sld_body: str) -> RioColormap:
-    """Parse an SLD 1.1 XML document and extract a discrete colormap.
+    """Parse an SLD XML document and extract a rio-tiler colormap.
 
     The function locates the first ``<ColorMap>`` element in the document
-    (via namespace-agnostic search) and reads each ``<ColorMapEntry>``.
+    (via namespace-agnostic search), reads each ``<ColorMapEntry>``, and
+    dispatches on the ColorMap ``type`` attribute (``ramp`` — the SLD
+    default — ``intervals``, or ``values``; see module docstring).
 
     Args:
         sld_body: A well-formed SLD XML string (the ``SLDContent.sld_body``
             value from the styles module).
 
     Returns:
-        A dict mapping integer pixel values to (R, G, B, A) tuples.
+        For ``type="values"``: a dict mapping pixel values to (R, G, B, A)
+        tuples (integral quantities keep ``int`` keys). For ``ramp`` and
+        ``intervals``: a list of ``((lo, hi), (R, G, B, A))`` intervals.
         Empty dict when no parseable entries exist.
 
     Raises:
@@ -151,7 +224,7 @@ def parse_sld_colormap(sld_body: str) -> RioColormap:
         logger.warning("parse_sld_colormap: no <ColorMap> element found in SLD")
         return {}
 
-    cmap: RioColormap = {}
+    entries: List[Tuple[float, RGBA]] = []
 
     for entry in colormap_el.iter():
         local = etree.QName(entry.tag).localname if "}" in entry.tag else entry.tag
@@ -168,10 +241,10 @@ def parse_sld_colormap(sld_body: str) -> RioColormap:
             continue
 
         try:
-            quantity = int(quantity_str)
+            quantity = float(quantity_str)
         except ValueError:
             logger.warning(
-                "parse_sld_colormap: non-integer quantity %r skipped", quantity_str
+                "parse_sld_colormap: non-numeric quantity %r skipped", quantity_str
             )
             continue
 
@@ -184,6 +257,24 @@ def parse_sld_colormap(sld_body: str) -> RioColormap:
             continue
 
         alpha = _opacity_to_alpha(attrib.get("opacity"))
-        cmap[quantity] = (r, g, b, alpha)
+        entries.append((quantity, (r, g, b, alpha)))
 
-    return cmap
+    if not entries:
+        return {}
+
+    map_type = (colormap_el.get("type") or "ramp").strip().lower()
+
+    if map_type == "values":
+        return {
+            (int(q) if q.is_integer() else q): rgba for q, rgba in entries
+        }
+
+    entries.sort(key=lambda e: e[0])
+    if map_type == "intervals":
+        return _intervals_colormap(entries)
+    if map_type != "ramp":
+        logger.warning(
+            "parse_sld_colormap: unknown ColorMap type %r; treating as 'ramp'",
+            map_type,
+        )
+    return _ramp_colormap(entries)
