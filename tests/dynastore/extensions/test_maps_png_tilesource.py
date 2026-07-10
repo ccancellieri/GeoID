@@ -37,6 +37,7 @@ from dynastore.extensions.maps.maps_png_tilesource import (  # noqa: E402
     MapsPngTileSource,
     _tile_bbox,
 )
+from dynastore.tools.geospatial import SimplificationAlgorithm  # noqa: E402
 
 
 def _pg_driver() -> MagicMock:
@@ -160,6 +161,53 @@ async def test_render_tile_falls_back_to_postgis_when_mvt_cache_absent(monkeypat
     render_mock.assert_called_once()
     # Native storage SRID (4326), not the tile's render SRID (3857).
     assert render_mock.call_args.args[4] == 4326
+
+
+@pytest.mark.asyncio
+async def test_render_tile_accepts_every_engine_forwarded_kwarg(monkeypatch):
+    """tiles_engine.render_tile forwards the FULL TileSourceProtocol kwarg set
+    (including filter_lang / filter_crs_srid) to whichever source it resolved;
+    a source signature that lags the protocol turns every render into a
+    TypeError 500. Call with the engine's exact keyword set so drift fails here
+    instead of in production."""
+    import dynastore.extensions.maps.maps_png_tilesource as mod
+
+    full = 20037508.342789244
+    matrix = _FakeMatrix(
+        id_="0", pointOfOrigin=[-full, full], cellSize=(2 * full) / 256,
+        tileWidth=256, tileHeight=256,
+    )
+    tms = _FakeTMS("WebMercatorQuad", [matrix])
+
+    monkeypatch.setattr(mod, "_TILES_IMPORTS_OK", False)
+    features = [{"layer": "coll1", "geom": b"\x00", "geoid": "1", "attributes": {}}]
+    monkeypatch.setattr(
+        mod.maps_db, "get_features_for_rendering", AsyncMock(return_value=features)
+    )
+    monkeypatch.setattr(mod, "render_map_image", MagicMock(return_value=b"png-bytes"))
+
+    source = MapsPngTileSource()
+    result = await source.render_tile(
+        MagicMock(),
+        resolved_collections=[
+            {"catalog_id": "cat1", "collection_id": "coll1", "source_srid": 4326}
+        ],
+        tms_def=tms,
+        target_srid=3857,
+        z="0",
+        x=0,
+        y=0,
+        format="png",
+        datetime_str=None,
+        cql_filter=None,
+        filter_lang="cql2-text",
+        filter_crs_srid=None,
+        subset_params=None,
+        simplification=None,
+        simplification_algorithm=SimplificationAlgorithm.TOPOLOGY_PRESERVING,
+    )
+
+    assert result == b"png-bytes"
 
 
 @pytest.mark.asyncio

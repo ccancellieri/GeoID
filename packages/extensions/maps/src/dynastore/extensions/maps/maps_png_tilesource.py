@@ -122,6 +122,8 @@ class MapsPngTileSource(TileSourceProtocol):
         format: str = "png",
         datetime_str: Optional[str] = None,
         cql_filter: Optional[str] = None,
+        filter_lang: str = "cql2-text",
+        filter_crs_srid: Optional[int] = None,
         subset_params: Optional[Dict[str, Any]] = None,
         simplification: Optional[float] = None,
         simplification_algorithm: SimplificationAlgorithm = SimplificationAlgorithm.TOPOLOGY_PRESERVING,
