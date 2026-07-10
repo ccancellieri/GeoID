@@ -1041,8 +1041,15 @@ async def test_id_only_delete_bypasses_reread(drain_env, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_id_only_batches_one_read_per_catalog_collection_group(drain_env, monkeypatch):
-    """Multiple id-only rows in the same (catalog, collection) group share
-    ONE canonical re-read call; a different group gets its own call."""
+    """Id-only rows are re-read strictly within their own (catalog,
+    collection) group — a group's rows never share a re-read call with
+    another group's.
+
+    Each group's first re-read is a single-row probe (#3141's byte-adaptive
+    chunking, sized by ``_ID_ONLY_READ_PROBE_ROWS``); the chunk size can only
+    grow from the *previous* chunk's measured byte cost, so a 2-row group
+    like ``coll_a`` still needs a probe call plus a remainder call — never a
+    single shared call. ``coll_b``'s lone row is read in its own call."""
     from dynastore.models.protocols.indexing import BulkIndexResult
 
     task_schema, engine = drain_env
@@ -1074,12 +1081,16 @@ async def test_id_only_batches_one_read_per_catalog_collection_group(drain_env, 
     count = await task.drain_once(engine=engine, owner_id=owner_id)
     assert count == 3
 
-    # One batched read per distinct (catalog_id, collection_id) group.
-    assert len(reread_calls) == 2, reread_calls
+    # coll_a's 2-row group splits into a probe call + a remainder call;
+    # coll_b's 1-row group is read in its own (trivially single) call.
+    # Every call's geoids stay within their own group — never mixed.
+    assert len(reread_calls) == 3, reread_calls
     groups = {(c, coll) for c, coll, _ids in reread_calls}
     assert groups == {("tenant_a", "coll_a"), ("tenant_a", "coll_b")}
-    coll_a_call = next(c for c in reread_calls if c[1] == "coll_a")
-    assert set(coll_a_call[2]) == {"g1", "g2"}
+    coll_a_ids = {g for c, coll, ids in reread_calls if coll == "coll_a" for g in ids}
+    assert coll_a_ids == {"g1", "g2"}
+    coll_b_ids = {g for c, coll, ids in reread_calls if coll == "coll_b" for g in ids}
+    assert coll_b_ids == {"g3"}
 
     rows = await _fetch_rows(engine, task_schema)
     assert {r["status"] for r in rows} == {"done"}

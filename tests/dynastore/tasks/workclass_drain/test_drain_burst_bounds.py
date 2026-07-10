@@ -57,7 +57,7 @@ class TestNextIdOnlyChunkRows:
         # fetch it alone rather than split (a row is atomic).
         got = _next_id_only_chunk_rows(
             chunk_bytes=5 * 20 * 1024 * 1024, rows_read=5,
-            byte_budget=self.BUDGET, current=5,
+            byte_budget=self.BUDGET, current=5, ceiling=_ID_ONLY_READ_CHUNK_ROWS,
         )
         assert got == 1
 
@@ -65,7 +65,7 @@ class TestNextIdOnlyChunkRows:
         # ~4MiB rows: 16MiB budget fits 4 per SELECT.
         got = _next_id_only_chunk_rows(
             chunk_bytes=5 * 4 * 1024 * 1024, rows_read=5,
-            byte_budget=self.BUDGET, current=5,
+            byte_budget=self.BUDGET, current=5, ceiling=_ID_ONLY_READ_CHUNK_ROWS,
         )
         assert got == 4
 
@@ -73,7 +73,7 @@ class TestNextIdOnlyChunkRows:
         # 1KiB rows would fit thousands — the pre-#3121 fixed size caps it.
         got = _next_id_only_chunk_rows(
             chunk_bytes=5 * 1024, rows_read=5,
-            byte_budget=self.BUDGET, current=5,
+            byte_budget=self.BUDGET, current=5, ceiling=_ID_ONLY_READ_CHUNK_ROWS,
         )
         assert got == _ID_ONLY_READ_CHUNK_ROWS
 
@@ -81,9 +81,11 @@ class TestNextIdOnlyChunkRows:
         # Every geoid absent → nothing hydrated → no evidence to resize on.
         assert _next_id_only_chunk_rows(
             chunk_bytes=0, rows_read=5, byte_budget=self.BUDGET, current=7,
+            ceiling=_ID_ONLY_READ_CHUNK_ROWS,
         ) == 7
         assert _next_id_only_chunk_rows(
             chunk_bytes=1024, rows_read=0, byte_budget=self.BUDGET, current=7,
+            ceiling=_ID_ONLY_READ_CHUNK_ROWS,
         ) == 7
 
     def test_probe_is_small_and_within_ceiling(self):

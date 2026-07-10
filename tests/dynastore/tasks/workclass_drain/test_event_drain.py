@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS "{schema}".events (
     event_id        UUID            NOT NULL,
     day             DATE            NOT NULL DEFAULT CURRENT_DATE,
     shard           SMALLINT        NOT NULL DEFAULT 0,
-    schema_name     TEXT,
+    catalog_id      TEXT,
     scope           TEXT            NOT NULL DEFAULT 'platform'
                         CHECK (scope = lower(scope)),
     event_type      TEXT            NOT NULL,
@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS "{schema}".events (
 _TASKS_DDL = """
 CREATE TABLE IF NOT EXISTS "{schema}".tasks (
     task_id         UUID            NOT NULL,
-    schema_name     VARCHAR(255)    NOT NULL,
+    catalog_id      VARCHAR(255)    NOT NULL,
     scope           VARCHAR(50)     NOT NULL DEFAULT 'CATALOG',
     caller_id       VARCHAR(255),
     task_type       VARCHAR         NOT NULL,
@@ -190,7 +190,7 @@ async def _seed_events(
     n: int = 3,
     event_type: str = "catalog_creation",
     scope: str = "platform",
-    schema_name: str = "tenant_a",
+    catalog_id: str = "tenant_a",
     status: str = "PENDING",
     payload: Optional[Dict[str, Any]] = None,
     owner_id: Optional[str] = None,
@@ -215,10 +215,10 @@ async def _seed_events(
 
         sql = (
             f"INSERT INTO {task_schema}.events"
-            f" (event_id, day, shard, schema_name, scope, event_type, status,"
+            f" (event_id, day, shard, catalog_id, scope, event_type, status,"
             f"  payload, claim_version, owner_id, locked_until, retry_count,"
             f"  max_retries)"
-            f" VALUES (:event_id, CURRENT_DATE, 0, :schema_name, :scope,"
+            f" VALUES (:event_id, CURRENT_DATE, 0, :catalog_id, :scope,"
             f"         :event_type, :status, CAST(:payload AS jsonb),"
             f"         :claim_version, :owner_id, {locked_expr}, :retry_count,"
             f"         :max_retries)"
@@ -227,7 +227,7 @@ async def _seed_events(
             await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
                 conn,
                 event_id=event_id,
-                schema_name=schema_name,
+                catalog_id=catalog_id,
                 scope=scope,
                 event_type=event_type,
                 status=status,
@@ -630,7 +630,6 @@ async def _publish(engine: Any, task_schema: str, *, item: str) -> None:
             conn,
             event_type="catalog_creation",
             scope="PLATFORM",
-            schema_name=task_schema,
             catalog_id=task_schema,
             collection_id=None,
             identity_id=None,
@@ -677,7 +676,6 @@ async def test_drain_trigger_rolls_back_with_outer_transaction(drain_env):
                 conn,
                 event_type="catalog_creation",
                 scope="PLATFORM",
-                schema_name=task_schema,
                 catalog_id=task_schema,
                 collection_id=None,
                 identity_id=None,
