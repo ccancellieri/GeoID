@@ -164,7 +164,10 @@ class TestGetCollectionTilesets:
 
 class TestInvalidateCollectionTileCache:
     @pytest.mark.asyncio
-    async def test_happy_path_calls_impl(self):
+    async def test_happy_path_invalidates_external_then_sweeps_internal(self):
+        """The external-id namespace (preseed / tile routes) is the primary
+        target; the internal-id namespace is swept too because pre-fix
+        aligned renders keyed cache entries by internal ids."""
         svc = _make_service()
         svc._resolve_catalog_and_collection = AsyncMock(
             return_value=("internal-cat", "internal-coll")
@@ -183,8 +186,33 @@ class TestInvalidateCollectionTileCache:
             collection_id="ext-coll",
         )
 
-        assert impl_calls == [("internal-cat", "internal-coll")]
+        assert impl_calls == [
+            ("ext-cat", "ext-coll"),
+            ("internal-cat", "internal-coll"),
+        ]
         assert "ok" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_no_double_invalidation_when_ids_already_external(self):
+        svc = _make_service()
+        svc._resolve_catalog_and_collection = AsyncMock(
+            return_value=("ext-cat", "ext-coll")
+        )
+
+        impl_calls: list[tuple] = []
+
+        async def _fake_impl(catalog_id, collection_id):
+            impl_calls.append((catalog_id, collection_id))
+            return {"message": "ok", "invalidated_targets": [f"{catalog_id}:{collection_id}"]}
+
+        svc._invalidate_tile_cache_impl = _fake_impl
+
+        await svc.invalidate_collection_tile_cache(
+            catalog_id="ext-cat",
+            collection_id="ext-coll",
+        )
+
+        assert impl_calls == [("ext-cat", "ext-coll")]
 
     @pytest.mark.asyncio
     async def test_unknown_catalog_raises_404(self):
@@ -210,7 +238,11 @@ class TestInvalidateCollectionTileCache:
 
 class TestGetVectorTileAlignedDefault:
     @pytest.mark.asyncio
-    async def test_delegates_to_get_vector_tile_with_internal_ids(self):
+    async def test_delegates_to_get_vector_tile_with_external_ids(self):
+        """Cache namespaces are keyed by external ids (preseed writes
+        ``<external_id>@<hash>/…``), so the aligned route must validate the
+        ids but delegate them unresolved — internal ids would fork a second
+        cache namespace and miss every preseeded tile."""
         svc = _make_service()
         svc._resolve_catalog_and_collection = AsyncMock(
             return_value=("int-cat", "int-coll")
@@ -244,9 +276,14 @@ class TestGetVectorTileAlignedDefault:
             request_hints=frozenset(),
         )
 
+        # Resolution still runs (404 semantics for unknown external ids)…
+        svc._resolve_catalog_and_collection.assert_awaited_once_with(
+            "ext-cat", "ext-coll"
+        )
+        # …but the delegate receives the EXTERNAL ids.
         assert len(delegated) == 1
-        assert delegated[0]["dataset"] == "int-cat"
-        assert delegated[0]["collections"] == "int-coll"
+        assert delegated[0]["dataset"] == "ext-cat"
+        assert delegated[0]["collections"] == "ext-coll"
         assert delegated[0]["tileMatrixSetId"] == "WebMercatorQuad"
 
     @pytest.mark.asyncio
@@ -320,8 +357,8 @@ class TestGetVectorTileAligned:
         )
 
         assert len(delegated) == 1
-        assert delegated[0]["dataset"] == "int-cat"
-        assert delegated[0]["collections"] == "int-coll"
+        assert delegated[0]["dataset"] == "ext-cat"
+        assert delegated[0]["collections"] == "ext-coll"
         assert delegated[0]["tileMatrixSetId"] == "WorldCRS84Quad"
 
     @pytest.mark.asyncio

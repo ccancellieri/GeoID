@@ -3135,22 +3135,24 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
     ):
         """Get a vector tile (MVT) using the default WebMercatorQuad TMS.
 
-        catalog_id and collection_id are external (public) IDs resolved to
-        internal IDs before dispatch.
+        catalog_id and collection_id are external (public) IDs. They are
+        validated here (404 on unknown ids) but dispatched unresolved: tile
+        cache namespaces are keyed by external ids (preseed and the flat
+        routes write ``<external_id>@<content_hash>/…``), so delegating
+        internal ids would fork a second cache namespace per collection and
+        miss every preseeded tile.
         """
-        internal_catalog_id, internal_collection_id = await self._resolve_catalog_and_collection(
-            catalog_id, collection_id
-        )
+        await self._resolve_catalog_and_collection(catalog_id, collection_id)
         return await self.get_vector_tile(
             request=request,
-            dataset=internal_catalog_id,
+            dataset=catalog_id,
             tileMatrixSetId="WebMercatorQuad",
             z=z,
             x=x,
             y=y,
             format="mvt",
             background_tasks=background_tasks,
-            collections=internal_collection_id,
+            collections=collection_id,
             datetime=datetime,
             filter=filter,
             filter_lang=filter_lang,
@@ -3200,22 +3202,22 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
     ):
         """Get a vector tile for a collection with an explicit TMS (OGC aligned path).
 
-        catalog_id and collection_id are external (public) IDs resolved to
-        internal IDs before dispatch.
+        catalog_id and collection_id are external (public) IDs. They are
+        validated here (404 on unknown ids) but dispatched unresolved — same
+        rationale as get_vector_tile_aligned_default: external-id cache
+        namespaces must stay unified with preseed and the flat routes.
         """
-        internal_catalog_id, internal_collection_id = await self._resolve_catalog_and_collection(
-            catalog_id, collection_id
-        )
+        await self._resolve_catalog_and_collection(catalog_id, collection_id)
         return await self.get_vector_tile(
             request=request,
-            dataset=internal_catalog_id,
+            dataset=catalog_id,
             tileMatrixSetId=tileMatrixSetId,
             z=z,
             x=x,
             y=y,
             format=format,
             background_tasks=background_tasks,
-            collections=internal_collection_id,
+            collections=collection_id,
             datetime=datetime,
             filter=filter,
             filter_lang=filter_lang,
@@ -3439,14 +3441,20 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
     ):
         """Invalidate the tile cache for a specific collection (OGC aligned path).
 
-        Resolves external catalog_id and collection_id to internal IDs before
-        dispatching to the shared invalidation logic.
+        Validates the external ids (404 on unknown), then invalidates the
+        external-id cache namespace — the one preseed and the tile routes
+        write to. The internal-id namespace is swept as well: renders
+        dispatched through this route used to key the cache by internal ids,
+        and those entries linger in the buckets until invalidated here.
         """
         try:
             internal_catalog_id, internal_collection_id = await self._resolve_catalog_and_collection(
                 catalog_id, collection_id
             )
-            return await self._invalidate_tile_cache_impl(internal_catalog_id, internal_collection_id)
+            result = await self._invalidate_tile_cache_impl(catalog_id, collection_id)
+            if (internal_catalog_id, internal_collection_id) != (catalog_id, collection_id):
+                await self._invalidate_tile_cache_impl(internal_catalog_id, internal_collection_id)
+            return result
         except HTTPException:
             raise
         except Exception as e:
