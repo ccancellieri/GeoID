@@ -17,7 +17,7 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 """Verify ``_is_transient_asyncpg_error`` recognises the asyncpg client-state
-error class names and message fragments that should be surfaced as
+error classes and message fragments that should be surfaced as
 ``DatabaseConnectionError`` (so callers like ``tasks/dispatcher.py`` can
 back off + retry instead of escalating to ERROR).
 
@@ -25,31 +25,43 @@ Tracks the surface for issues #235 (``ConnectionDoesNotExistError``) and
 #239 (``InternalClientError`` — "cannot switch to state N").
 """
 
+from asyncpg.exceptions import (
+    ConnectionDoesNotExistError,
+    ConnectionFailureError,
+    InterfaceError,
+    InternalClientError,
+)
+
 from dynastore.modules.db_config.query_executor import (
     _is_transient_asyncpg_error,
 )
 
 
-class _FakeAsyncpgError(Exception):
-    """Test double — class name is what the detector keys on."""
+class TestTransientDetectionByAsyncpgClass:
+    """The detector keys on ``isinstance`` against the imported asyncpg
+    classes (plus the message-fragment fallback below) — never on class
+    names (#3201)."""
 
-
-class TestTransientDetectionByClassName:
     def test_connection_does_not_exist_error_recognised(self):
-        exc = type("ConnectionDoesNotExistError", (Exception,), {})("conn closed")
-        assert _is_transient_asyncpg_error(exc) is True
+        assert _is_transient_asyncpg_error(ConnectionDoesNotExistError("conn closed")) is True
 
     def test_internal_client_error_recognised(self):
-        exc = type("InternalClientError", (Exception,), {})("state machine broke")
-        assert _is_transient_asyncpg_error(exc) is True
-
-    def test_connection_failure_error_recognised(self):
-        exc = type("ConnectionFailureError", (Exception,), {})("network down")
-        assert _is_transient_asyncpg_error(exc) is True
+        assert _is_transient_asyncpg_error(InternalClientError("state machine broke")) is True
 
     def test_interface_error_recognised(self):
+        assert _is_transient_asyncpg_error(InterfaceError("driver broke")) is True
+
+    def test_connection_failure_error_is_not_this_detectors_job(self):
+        # ConnectionFailureError carries sqlstate 08006, which
+        # ``PGCODE_EXCEPTION_MAP`` maps to ``DatabaseConnectionError`` in
+        # ``_handle_db_exception`` before the transient check ever runs.
+        assert _is_transient_asyncpg_error(ConnectionFailureError("network down")) is False
+
+    def test_lookalike_class_name_not_recognised(self):
+        # A non-asyncpg exception merely NAMED like an asyncpg one must not
+        # match: detection is isinstance + message, never the class name.
         exc = type("InterfaceError", (Exception,), {})("driver broke")
-        assert _is_transient_asyncpg_error(exc) is True
+        assert _is_transient_asyncpg_error(exc) is False
 
     def test_generic_exception_not_recognised(self):
         assert _is_transient_asyncpg_error(ValueError("oops")) is False

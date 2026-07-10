@@ -109,18 +109,6 @@ except ImportError:
     AsyncpgInterfaceError = type("AsyncpgInterfaceError", (Exception,), {})
 
 
-# Class names of asyncpg client-side errors that indicate transient connection
-# / state-machine issues (no pgcode — they predate the query reaching PG).
-# Used by ``_handle_db_exception`` to surface them as
-# ``DatabaseConnectionError`` so callers (e.g. ``tasks/dispatcher.py``) can
-# apply transient back-off + retry instead of treating them as hard failures.
-_TRANSIENT_ASYNCPG_ERROR_CLASS_NAMES = frozenset({
-    "ConnectionDoesNotExistError",       # connection closed mid-operation
-    "InternalClientError",               # "cannot switch to state N" — concurrent use
-    "ConnectionFailureError",
-    "InterfaceError",                    # asyncpg base client error
-})
-
 _TRANSIENT_ASYNCPG_MESSAGE_FRAGMENTS = (
     "cannot switch to state",            # concurrent use of one connection
     "another operation",                 # ditto, alternative phrasing
