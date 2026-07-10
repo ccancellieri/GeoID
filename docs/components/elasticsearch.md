@@ -2,7 +2,7 @@
 
 The `elasticsearch` module and its companion `search` extension provide full-text, spatial, and temporal search over DynaStore entities backed by Elasticsearch. Together they form a complete indexing pipeline with runtime-configurable per-catalog behaviours — including the **GeoID private mode** for privacy-sensitive catalogs.
 
-This component follows the "Three Pillars" architecture: a silent `module` (event-driven indexing), a stateless API `extension` (search + admin endpoints), and asynchronous `tasks` (durable workers and bulk reindex jobs).
+This component follows the "Three Pillars" architecture: a silent `module` (platform lifecycle + `Indexer`-driver implementations wired through routing-config `INDEX`-lane entries), a stateless API `extension` (search + admin endpoints), and asynchronous `tasks` (durable drain/bulk-reindex workers and jobs).
 
 > **Implementation details:** see the [Elasticsearch module README](../../packages/core/src/dynastore/modules/elasticsearch/README.md).
 
@@ -10,40 +10,57 @@ This component follows the "Three Pillars" architecture: a silent `module` (even
 
 ## Protocol-Based Decoupling
 
-The search and indexing layers are decoupled via two protocols defined in `models/protocols/`:
+Search and indexing are decoupled via protocols defined in `models/protocols/`:
 
-| Protocol | Contract | Current implementor | Discovery |
+| Protocol | Contract | Current implementor(s) | Discovery |
 |---|---|---|---|
 | `SearchProtocol` | Query execution (items, catalogs, collections) + reindex triggers | `SearchService` (ES-backed) | `get_protocol(SearchProtocol)` |
-| `IndexerProtocol` | Document lifecycle (index, delete, bulk reindex, ensure index) | `ElasticsearchModule` | `get_protocol(IndexerProtocol)` |
+| `Indexer` | Slim `index` / `index_bulk` surface every INDEX-lane driver implements | `ItemsElasticsearchDriver`, `ItemsElasticsearchPrivateDriver`, `CollectionElasticsearchDriver`, `CatalogElasticsearchDriver`, `AssetElasticsearchDriver` | `IndexDispatcher` walks `RoutingConfig.operations[INDEX]` and calls this surface uniformly |
+| `IndexTierDriver` | Discovery/seeding marker — `index_tiers: ClassVar[FrozenSet[str]]`, checked by value | same ES driver classes | `get_index_drivers()` / routing-config self-registration |
+
+`IndexerProtocol` (the older per-entity fat surface) still exists for backward compatibility but has no current implementor — new indexing drivers target `Indexer` + `IndexTierDriver` and are wired through routing-config `INDEX`-lane entries instead.
 
 **Why this matters:**
 - The **router** (`extensions/search/router.py`) has zero imports from `modules/elasticsearch` — it discovers `SearchProtocol` at runtime.
-- The **module** (`modules/elasticsearch/module.py`) exposes `IndexerProtocol` methods so other components can dispatch indexing without knowing the backend.
-- To **swap backends** (Solr, Meilisearch, etc.), implement the same protocols in a new module/extension and load it instead. No changes to the router or consumers.
+- ES-backed drivers expose `Indexer` so `IndexDispatcher` can dispatch indexing without knowing the backend.
+- To **swap backends** (Solr, Meilisearch, etc.), implement `Indexer` (+ `IndexTierDriver` for auto-registration) in a new module and pin the new `driver_ref` under the relevant `*RoutingConfig.operations[INDEX]`. No changes to the router, dispatcher, or consumers.
 
 ```
 Router  ──discovers──>  SearchProtocol  ──implemented by──>  SearchService (ES)
-                                                                   |
-Other modules  ──discover──>  IndexerProtocol  ──implemented by──>  ElasticsearchModule
-                                                                         |
-                                                                    Task Queue  ──>  ES Cluster
+
+RoutingConfig.operations[INDEX]  ──walked by──>  IndexDispatcher  ──calls──>  Indexer (ES driver)
 ```
 
 ---
 
 ## Module Core (`modules/elasticsearch`)
 
-### Event-Driven Indexing Pipeline
+### Indexing Pipeline (routing-config driven)
 
-```
-Domain Event  ──>  ElasticsearchModule listener  ──>  Task Queue  ──>  Worker/Job  ──>  ES Cluster
-```
+Catalog / collection / item / asset `INDEX`-lane propagation flows through routing-config rails,
+not through lifecycle-event listeners on `ElasticsearchModule` (that listener path — and the
+`elasticsearch_index` / `elasticsearch_delete` task types it enqueued — was retired: it ran in
+parallel to the canonical rails and produced misleading log lines on every routing-config write).
 
-1. **Event emission**: core services emit events (`ITEM_CREATION`, `CATALOG_DELETION`, `BULK_ITEM_CREATION`, etc.) during database transactions.
-2. **Event listening**: `ElasticsearchModule.lifespan` registers async listeners for all CRUD events on catalogs, collections, and items. Listeners receive event kwargs directly (`catalog_id`, `collection_id`, `item_id`, `payload`).
-3. **Task enqueuing**: each listener enqueues a durable background task (`elasticsearch_index`, `elasticsearch_delete`, `elasticsearch_private_index`, or `elasticsearch_private_delete`) and returns immediately — the HTTP request is never blocked by ES I/O.
-4. **Execution & retries**: the worker picks up the task with heartbeat and retry guarantees.
+1. **Items.** `item_service` calls `IndexDispatcher.fan_out_bulk` directly; the dispatcher reads
+   the `INDEX`-lane entries in `ItemsRoutingConfig.operations[INDEX]` and dispatches to whichever
+   `Indexer` drivers are pinned there — typically `items_elasticsearch_driver` (public) or
+   `items_elasticsearch_private_driver` (private). Item-tier obligations are always durably
+   enqueued into the global `tasks.storage` table (id-only rows) and drained asynchronously by
+   `StorageDrainTask`. Soft-delete fan-out uses the same dispatcher.
+2. **Collections.** `collection_router._dispatch_collection_index` calls
+   `IndexDispatcher.fan_out_bulk` with `entity_type='collection'` directly from the write path
+   (the same trigger shape as items) against `CollectionRoutingConfig.operations[INDEX]`. Both
+   upsert and hard-delete trigger the dispatch.
+3. **Catalogs.** `catalog_router` emits `CATALOG_METADATA_CHANGED` inside the WRITE transaction;
+   `ReindexWorker` consumes the durable event and fans out to `CatalogRoutingConfig.operations[INDEX]`
+   — the trigger is event-driven rather than a direct call from the write path.
+4. **Assets.** `AssetEntitySyncSubscriber` listens for `CatalogEventType.ASSET_*` events and fans
+   out to `AssetRoutingConfig.operations[INDEX]` — mirrors the catalog-tier event-driven trigger.
+
+All four tiers end at the same `Indexer` surface through durable plumbing; the asymmetry is in how
+the hop is *triggered* (direct dispatch for items/collections, event-plane for catalogs/assets),
+not in what runs once triggered.
 
 ### Index Design
 
@@ -201,12 +218,15 @@ Response:
 
 ## Tasks
 
-### Per-item tasks (worker, incremental)
+### Per-item private tasks (worker, incremental)
+
+Public per-item indexing is not a standalone task type: item-tier `INDEX`-lane obligations are
+durably enqueued as id-only rows into the global `tasks.storage` table and dispatched by
+`StorageDrainTask`, which re-reads canonical PG state and calls the resolved `Indexer` driver
+directly. The private driver retains discrete task types:
 
 | Task type | Input | Description |
 |---|---|---|
-| `elasticsearch_index` | `entity_type`, `entity_id`, `payload` | Index a full STAC document |
-| `elasticsearch_delete` | `entity_type`, `entity_id` | Delete a document (safe on NotFoundError) |
 | `elasticsearch_private_index` | `geoid`, `catalog_id`, `collection_id` | Index one geoid-only doc |
 | `elasticsearch_private_delete` | `geoid`, `catalog_id` | Delete one geoid doc (safe on NotFoundError) |
 
@@ -214,13 +234,15 @@ Response:
 
 | Task type | Input | Description |
 |---|---|---|
-| `elasticsearch_bulk_reindex_catalog` | `catalog_id`, `mode` | Stream all collections/items, bulk-index in 500-doc batches |
-| `elasticsearch_bulk_reindex_collection` | `catalog_id`, `collection_id`, `mode` | Same for one collection |
+| `elasticsearch_bulk_reindex_catalog` | `catalog_id`, `driver` (optional), `page_size` (optional) | Wipe + stream all collections/items into the routing-resolved `INDEX`-lane writer |
+| `elasticsearch_bulk_reindex_collection` | `catalog_id`, `collection_id`, `driver` (optional), `page_size` (optional) | Same for one collection |
 
-Bulk tasks clean the complementary index before reindexing:
-- `mode="private"` removes stale STAC items for the catalog.
-- `mode="catalog"` removes stale private docs for the catalog.
-- `mode="catalog"` skips collections with `search_index=False`.
+Both tasks read from the routing-resolved source-of-truth reader (PG primary via the
+`GEOMETRY_EXACT` hint) and write to the routing-resolved `INDEX`-lane driver (the items ES driver
+by default); `driver` pins a specific `driver_ref` explicitly. Each run wipes stale documents for
+its scope (`delete_by_query`, catalog-wide or collection-scoped) before reindexing. The private
+driver does not ship a bulk reindex — the fresh-start cutover protocol (drop PG + delete ES
+indexes pre-deploy) makes one unnecessary.
 
 ### Bulk reindex job
 
@@ -243,11 +265,12 @@ poetry add elasticsearch[async]
 ```
 models/protocols/
   search.py                # SearchProtocol — backend-agnostic search contract
-  indexer.py               # IndexerProtocol — backend-agnostic indexing contract
+  indexer.py               # Indexer / IndexTierDriver (current) + IndexerProtocol (legacy)
 
 modules/elasticsearch/
   __init__.py              # Exports ElasticsearchModule
-  module.py                # Event listeners, IndexerProtocol impl
+  module.py                # Platform-level lifecycle: shared client, index templates
+                           #   (no lifecycle-event listeners — that path is retired)
   client_config.py         # EnvVar-based ES connection config
   mappings.py              # Index mappings + helpers
   collection_es_driver.py  # Public CollectionStore driver (shared
@@ -256,6 +279,7 @@ modules/elasticsearch/
 modules/storage/drivers/elasticsearch_private/
   driver.py                # ItemsElasticsearchPrivateDriver — per-tenant
                            #   geoid-only index + DENY policy management
+  tasks.py                 # elasticsearch_private_index / _delete task types
   mappings.py              # Tenant-feature mapping for items private index
 
 extensions/search/
@@ -266,17 +290,20 @@ extensions/search/
   policies.py              # Admin-only policy for reindex endpoints
 
 tasks/elasticsearch_indexer/
-  __init__.py              # Exports bulk + private task classes
-  tasks.py                 # Bulk reindex + private index/delete tasks
+  __init__.py              # Exports bulk reindex + envelope-backfill task classes
+  tasks.py                 # BulkCatalogReindexTask / BulkCollectionReindexTask
 ```
 
 ## Implementing an Alternative Backend
 
 To replace Elasticsearch with another search engine (e.g. Meilisearch):
 
-1. **Create a new module** (e.g. `modules/meilisearch/`) implementing `IndexerProtocol`:
-   - `index_document()`, `delete_document()`, `bulk_reindex()`, `ensure_index()`
-   - Register event listeners in `lifespan` (same pattern as `ElasticsearchModule`).
+1. **Create a new driver** (e.g. `modules/meilisearch/`) implementing `Indexer` (`index`,
+   `index_bulk`) and `IndexTierDriver` (`index_tiers: ClassVar[FrozenSet[str]]`) for the tiers it
+   materializes.
+   - Pin the new `driver_ref` under the relevant `*RoutingConfig.operations[INDEX]` (or let
+     `IndexTierDriver` self-registration add it automatically).
+   - No lifecycle-event listeners to register — `IndexDispatcher` calls `Indexer` directly.
 
 2. **Create a new search service** implementing `SearchProtocol`:
    - `search_items()`, `search_catalogs()`, `search_collections()`, `search_by_geoid()`, `reindex_catalog()`, `reindex_collection()`

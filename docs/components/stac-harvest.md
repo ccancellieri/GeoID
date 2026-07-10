@@ -97,7 +97,7 @@ searchable:
 | Backend | Item WRITE | Item READ | Searchability | Use when |
 |---|---|---|---|---|
 | `es` (default) | Elasticsearch (direct) | Elasticsearch (direct) | **Immediate** — no async drain | You want items searchable as soon as the harvest finishes; ES is the system of record for this catalog. |
-| `es_pg` | Postgres (primary) | Postgres | After the async ES secondary-index write drains | Default platform routing — durable PG primary with an ES secondary search index. |
+| `es_pg` | Postgres (primary) | Postgres | After the `INDEX`-lane obligation drains | Default platform routing — durable PG primary with an ES `INDEX`-lane search sink. |
 | `pg` | Postgres only | Postgres | N/A (no ES) | No search index needed; PG-only catalog. |
 
 Because `es` writes (and reads) items directly to Elasticsearch, the per-catalog

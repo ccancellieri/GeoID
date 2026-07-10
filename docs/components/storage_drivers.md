@@ -4,7 +4,7 @@ Entity-level storage abstraction that routes catalog/collection/items/asset data
 Each driver is a self-contained module with its own connection lifecycle, location config, and
 capabilities. Drivers are discovered via entry points and selected at runtime through an
 **operation-based routing system** — one routing config per tier (items / collection /
-asset / catalog), each mapping `Operation` (WRITE / READ / SEARCH / INDEX / BACKUP / UPLOAD) to an
+asset / catalog), each mapping `Operation` (WRITE / READ / INDEX / UPLOAD) to an
 ordered list of drivers.
 
 > **Implementation details:** see the [Storage module README](../../packages/core/src/dynastore/modules/storage/README.md).
@@ -53,8 +53,9 @@ Drivers (instances discovered via `dynastore.modules` entry points)
 - **Capability declaration**: drivers declare what they support via `Capability` enum. The router can
   validate capability before dispatching.
 - **Lazy initialization**: connections (DuckDB pool, Iceberg catalog) are created on first use.
-- **Async fan-out via outbox**: non-fatal `INDEX` writes land in the per-tenant
-  `storage_outbox` table and the `OutboxDrainTask` consumer dispatches them asynchronously.
+- **Async fan-out via the storage plane**: `INDEX`-lane obligations land in the global
+  `tasks.storage` table (co-transactionally with the upstream write) and `StorageDrainTask`
+  dispatches them asynchronously with retry.
 
 ## Quick Start
 
@@ -786,7 +787,8 @@ src/dynastore/
 │   ├── hints.py                         # Hint StrEnum (closed catalog)
 │   ├── driver_config.py                 # ItemsWritePolicy, ItemsSchema, *DriverConfig, ...
 │   ├── router.py                        # get_driver() with cached operation-based resolution
-│   ├── outbox_ddl.py                    # storage_outbox DDL (failures emitted as log events)
+│   ├── storage_emit.py                  # enqueue_storage_op_write_id / _id_only into tasks.storage
+│   ├── index_dispatcher.py              # IndexDispatcher — fan-out across INDEX-lane entries
 │   ├── errors.py                        # ReadOnlyDriverError, SoftDeleteNotSupportedError, ConflictError
 │   └── drivers/
 │       ├── __init__.py

@@ -76,11 +76,11 @@ is WRITE-lane only — `fatal` or `warn`):
 
 ## Storage-Plane Outbox (`tasks.storage`)
 
-An `ASYNC` secondary-index `WRITE` entry persists its obligation into the
-global `tasks.storage` table — co-transactionally with the upstream write —
-via `storage_emit.py`'s `enqueue_storage_op_write_id` / `enqueue_storage_op_id_only`,
-then drained by `StorageDrainTask`. The ledger stores identifiers only; there
-is no payload column.
+Each item-tier `INDEX`-lane entry's materialization obligation persists into
+the global `tasks.storage` table — co-transactionally with the upstream
+`WRITE` — via `storage_emit.py`'s `enqueue_storage_op_write_id` /
+`enqueue_storage_op_id_only`, then drained by `StorageDrainTask`. The ledger
+stores identifiers only; there is no payload column.
 
 - `enqueue_storage_op_write_id` writes one row per `(write_id, driver,
   collection, op)` representing a whole primary write batch; the drain
@@ -120,36 +120,36 @@ read at all.
 
 **Current state.** `ItemsPostgresqlDriver` is the only driver in this
 package that implements the pair. Every shipped routing preset also lists a
-PostgreSQL driver first in each tier's `WRITE` operation list with
-`on_failure=FailurePolicy.FATAL` (the durability primary), with
-Elasticsearch — which does not implement either reader — listed second as an
-`ASYNC` / `OUTBOX` secondary sink. So in the shipped configuration there is
-no gap between "drivers that can serve write-id reads" and "drivers that are
-ever a resolved WRITE primary": the one driver that needs the capability has
-it. `WRITE` ordering is operator-configurable, though (routing is a regular
-`ConfigsProtocol` waterfall, not a hard-coded invariant) — the guarantee
-holds for the defaults this package ships, not as a runtime constraint
-enforced anywhere else.
+PostgreSQL driver as the sole `WRITE`-lane entry with
+`on_failure=FailurePolicy.FATAL` (the durability primary); Elasticsearch —
+which does not implement either reader — is an `INDEX`-lane entry instead, a
+separate async materialization sink rather than a second `WRITE` driver. So
+in the shipped configuration there is no gap between "drivers that can serve
+write-id reads" and "drivers that are ever a resolved WRITE primary": the one
+driver that needs the capability has it. `WRITE` ordering is
+operator-configurable, though (routing is a regular `ConfigsProtocol`
+waterfall, not a hard-coded invariant) — the guarantee holds for the defaults
+this package ships, not as a runtime constraint enforced anywhere else.
 
 **Contract for driver authors.** To make a new driver eligible as a
-collection's WRITE primary *without losing write-id batching* when async
-secondary indexing is configured behind it, implement
+collection's WRITE primary *without losing write-id batching* when an
+`INDEX`-lane sink is configured behind it, implement
 `read_indexable_write_batch` (or the by-write-id reader pair) against your
 driver's durable row store, keyed on the `write_id` stamped at write time. If
 you skip this, your driver still works correctly as a WRITE primary — see
 the degradation guarantee below — it just loses the batching optimization
-and every async secondary-index write pays the cost of one outbox row per
-entity instead of one per batch.
+and every `INDEX`-lane materialization write pays the cost of one obligation
+row per entity instead of one per batch.
 
 **Degradation guarantee.** When the resolved WRITE primary lacks the
 capability, every producer (bulk upsert, delete, and the index dispatcher's
-outbox writer) falls back to one id-only outbox row per entity instead of a
-single grouped write-id row. The enqueue itself is never skipped — lacking
-the capability changes *how* the secondary-index obligation is recorded,
-never *whether* it is recorded. Id-only rows are always hydratable, because
-the drain re-reads canonical state by id rather than replaying a write-id
-batch, so the fallback is always correct — only less efficient than a
-grouped write-id row.
+obligation writer) falls back to one id-only ledger row per entity instead of
+a single grouped write-id row. The enqueue itself is never skipped — lacking
+the capability changes *how* the `INDEX`-lane obligation is recorded, never
+*whether* it is recorded. Id-only rows are always hydratable, because the
+drain re-reads canonical state by id rather than replaying a write-id batch,
+so the fallback is always correct — only less efficient than a grouped
+write-id row.
 
 Full row-shape/classification contract and the drain side are documented in
 [`../tasks/README.md`](../tasks/README.md).
