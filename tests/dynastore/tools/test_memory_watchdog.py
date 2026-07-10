@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import signal
 
 import pytest
@@ -1102,3 +1103,75 @@ async def test_diagnostic_disable_stops_tracing_it_started(
     _patch_config(monkeypatch, MemoryWatchdogConfig())  # diagnostic now off
     await svc.tick(ctx)
     assert not tracemalloc.is_tracing()
+
+
+def _decode_json_payload(raw: str):
+    """Stand-in for the real callers of ``json.loads`` (cache decode, HTTP
+    bodies): the frame the diagnostic has to name."""
+    import json
+
+    return json.loads(raw)
+
+
+def test_tracemalloc_keeps_enough_frames_to_reach_the_caller() -> None:
+    """``raw_decode`` <- ``decode`` <- ``loads`` <- caller is four frames deep,
+    so anything below that can only ever name ``json/decoder.py``."""
+    from dynastore.tools.memory_watchdog import _TRACEMALLOC_FRAMES
+
+    assert _TRACEMALLOC_FRAMES >= 4
+
+
+@pytest.mark.asyncio
+async def test_growth_report_names_the_caller_not_just_the_leaf_frame(
+    monkeypatch, caplog, _stop_tracemalloc
+) -> None:
+    """A spike inside ``json.loads`` must be attributed to the code that asked
+    for the decode. Retaining one frame reports ``json/decoder.py`` — true, and
+    useless for finding the culprit (geoid#3121)."""
+    import json
+    import tracemalloc
+
+    assert not tracemalloc.is_tracing()
+    raw = json.dumps([{"k": i, "v": "x" * 64} for i in range(20000)])
+
+    _patch_config(
+        monkeypatch,
+        MemoryWatchdogConfig(
+            diagnostic_tracemalloc_enabled=True,
+            diagnostic_ratio=0.50,
+            diagnostic_min_interval_seconds=0.0,
+            self_recycle_enabled=False,
+            readiness_shed_enabled=False,
+        ),
+    )
+    svc = MemoryWatchdogService(
+        limit_bytes=1000,
+        warn_ratio=0.8,
+        critical_ratio=0.9,
+        get_rss_bytes=lambda: 700,  # 70% — above diagnostic_ratio, below warn
+    )
+
+    await svc.tick(_make_ctx())  # arming tick: starts tracing, takes the baseline
+    decoded = _decode_json_payload(raw)  # the spike the next report must explain
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger="dynastore.tools.memory_watchdog"):
+        await svc.tick(_make_ctx())
+
+    reports = [
+        r.getMessage()
+        for r in caplog.records
+        if "memory_watchdog[diagnostic]" in r.getMessage()
+    ]
+    assert len(reports) == 1
+
+    # Each ranked entry starts with "  N. +X.YMiB ...". Isolate the entry that
+    # the decode dominates; the caller must be inside *that* entry, not merely
+    # somewhere else in the report.
+    entries = re.split(r"\n\s+\d+\.\s", reports[0])
+    decode_entries = [e for e in entries if "decoder.py" in e]
+    assert decode_entries, "expected the json decode to dominate the growth"
+    assert "test_memory_watchdog.py" in decode_entries[0], (
+        "the decode entry must name the caller of json.loads, not only its leaf "
+        f"frame. Entry was:\n{decode_entries[0]}"
+    )
+    assert len(decoded) == 20000  # keep the allocation alive past the snapshot

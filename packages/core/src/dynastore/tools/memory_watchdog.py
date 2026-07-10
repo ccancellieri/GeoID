@@ -111,9 +111,30 @@ _PROC_STATUS_PATH = "/proc/self/status"
 _WORKERS_ENV = "GUNICORN_WORKERS"
 
 # Number of stack frames tracemalloc keeps per allocation for the diagnostic
-# (geoid#3121). One frame (the allocation site) is enough to pin the culprit
-# line while keeping tracemalloc's per-allocation memory overhead minimal.
-_TRACEMALLOC_FRAMES = 1
+# (geoid#3121). One frame only ever names the leaf, which for the spikes seen on
+# dev is always ``json/decoder.py`` — true and useless. Reaching the code that
+# asked for the decode costs four frames (raw_decode <- decode <- loads <-
+# caller); six leaves room for one wrapper. tracemalloc interns tracebacks and
+# stores one pointer per traced block, so depth costs a bounded number of
+# traceback objects, not per-allocation memory.
+_TRACEMALLOC_FRAMES = 6
+
+# tracemalloc groups by leaf line under "lineno"; "traceback" keys each
+# statistic by the whole retained frame chain, which is the point of keeping
+# more than one frame.
+_TRACEMALLOC_GROUP_BY = "traceback"
+
+
+def _format_alloc_site(traceback: "tracemalloc.Traceback") -> str:
+    """Render a traced allocation's frame chain, leaf first.
+
+    ``str(Traceback)`` shows only the most recent frame, so a multi-frame
+    snapshot would still read as a bare ``json/decoder.py:361``.
+    """
+    frames = [f"{frame.filename}:{frame.lineno}" for frame in reversed(traceback)]
+    if not frames:
+        return "<no traceback>"
+    return "\n".join(f"       {frame}" for frame in frames)
 
 
 def read_process_rss_bytes() -> Optional[int]:
@@ -341,11 +362,14 @@ class MemoryWatchdogService(PeriodicService):
         runs, so the allocation that spiked RSS is otherwise invisible. When
         ``diagnostic_tracemalloc_enabled`` is on, this lazily starts tracemalloc,
         captures a baseline snapshot on that same arming tick, and from the next
-        qualifying tick on logs ``snapshot.compare_to(baseline, "lineno")`` —
+        qualifying tick on logs ``snapshot.compare_to(baseline, "traceback")`` —
         the sites whose footprint grew since the previous report — rather than
         an absolute top-N, which is dominated by legitimate steady-state
         allocations (SQLAlchemy metadata, client buffers) and never names the
-        *growing* site. The baseline rolls forward after every report, so
+        *growing* site. Grouping by traceback rather than leaf line keeps the
+        calling frames: a spike inside ``json.loads`` is attributable to the
+        code that asked for the decode, not to ``json/decoder.py``. The
+        baseline rolls forward after every report, so
         one-time warm-up allocations appear once and disappear while a genuine
         leak dominates every subsequent report, with a per-interval growth rate.
 
@@ -390,7 +414,7 @@ class MemoryWatchdogService(PeriodicService):
             self._diag_baseline = tracemalloc.take_snapshot()
             logger.warning(
                 "memory_watchdog: diagnostic_tracemalloc_enabled — started "
-                "tracemalloc (%d frame) and captured the baseline snapshot on "
+                "tracemalloc (%d frames) and captured the baseline snapshot on "
                 "%s; allocation-growth reports begin on the next tick above "
                 "diagnostic_ratio.",
                 _TRACEMALLOC_FRAMES,
@@ -422,11 +446,11 @@ class MemoryWatchdogService(PeriodicService):
             # is no arming-tick baseline. Report the absolute top sites once —
             # this is the baseline report — and diff from here on.
             self._diag_baseline = snapshot
-            stats = snapshot.statistics("lineno")
+            stats = snapshot.statistics(_TRACEMALLOC_GROUP_BY)
             top = stats[:top_n]
             lines = "\n".join(
-                f"  {i + 1}. {s.size / (1024 * 1024):.1f}MiB in {s.count} blocks: "
-                f"{s.traceback}"
+                f"  {i + 1}. {s.size / (1024 * 1024):.1f}MiB in {s.count} blocks:\n"
+                f"{_format_alloc_site(s.traceback)}"
                 for i, s in enumerate(top)
             )
             logger.error(
@@ -444,7 +468,7 @@ class MemoryWatchdogService(PeriodicService):
             )
             return
 
-        diffs = snapshot.compare_to(self._diag_baseline, "lineno")
+        diffs = snapshot.compare_to(self._diag_baseline, _TRACEMALLOC_GROUP_BY)
         self._diag_baseline = snapshot
         since = f"{interval:.0f}s ago" if interval is not None else "arming"
         grown = [d for d in diffs if d.size_diff > 0][:top_n]
@@ -466,8 +490,8 @@ class MemoryWatchdogService(PeriodicService):
 
         lines = "\n".join(
             f"  {i + 1}. +{d.size_diff / (1024 * 1024):.1f}MiB "
-            f"(+{d.count_diff} blocks, total {d.size / (1024 * 1024):.1f}MiB): "
-            f"{d.traceback}"
+            f"(+{d.count_diff} blocks, total {d.size / (1024 * 1024):.1f}MiB):\n"
+            f"{_format_alloc_site(d.traceback)}"
             for i, d in enumerate(grown)
         )
         logger.error(
