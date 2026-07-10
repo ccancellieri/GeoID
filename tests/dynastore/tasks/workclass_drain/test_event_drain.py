@@ -48,6 +48,7 @@ import pytest
 import pytest_asyncio
 
 from dynastore.tools.identifiers import generate_id_hex
+from tests.dynastore.test_utils.engine_mocks import make_fake_async_engine
 
 
 # ---------------------------------------------------------------------------
@@ -749,7 +750,7 @@ async def test_run_hands_off_when_row_budget_exceeded_with_backlog_remaining():
     from dynastore.tasks.workclass_drain.event_drain_task import EventDrainTask
 
     task = EventDrainTask(inprocess_max_rows=3, inprocess_max_seconds=999.0)
-    fake_engine = MagicMock()
+    fake_engine = make_fake_async_engine()
     fake_engine.dispose = AsyncMock()
 
     calls = {"n": 0}
@@ -782,7 +783,7 @@ async def test_run_hands_off_when_time_budget_exceeded_with_backlog_remaining():
     from dynastore.tasks.workclass_drain.event_drain_task import EventDrainTask
 
     task = EventDrainTask(inprocess_max_rows=0, inprocess_max_seconds=0.02)
-    fake_engine = MagicMock()
+    fake_engine = make_fake_async_engine()
     fake_engine.dispose = AsyncMock()
 
     calls = {"n": 0}
@@ -814,7 +815,7 @@ async def test_run_generous_budget_drains_to_empty_without_handoff():
     from dynastore.tasks.workclass_drain.event_drain_task import EventDrainTask
 
     task = EventDrainTask(inprocess_max_rows=10**6, inprocess_max_seconds=999.0)
-    fake_engine = MagicMock()
+    fake_engine = make_fake_async_engine()
     fake_engine.dispose = AsyncMock()
 
     calls = {"n": 0}
@@ -888,7 +889,7 @@ async def test_run_drains_to_empty_ignoring_budget_when_running_as_async_writer_
     task = EventDrainTask(
         app_state=job_app_state, inprocess_max_rows=1, inprocess_max_seconds=0.001,
     )
-    fake_engine = MagicMock()
+    fake_engine = make_fake_async_engine()
     fake_engine.dispose = AsyncMock()
 
     calls = {"n": 0}
