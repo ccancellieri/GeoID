@@ -192,11 +192,21 @@ class TestCombinedAndEdges:
         assert materialize_feature_fields(None, None) == {}
 
     def test_empty_schema_default_policy_yields_default_special_fields(self):
-        # The default ItemsWritePolicy tracks asset_id and carries a default
-        # external_id identity axis, so the projection surfaces both even with an
-        # empty schema. No user-data fields appear.
+        # The default ItemsWritePolicy tracks asset_id, carries a default
+        # external_id identity axis, and (since #3155) derives every
+        # geometry/place statistic — so the projection surfaces the special
+        # fields plus the stored stats even with an empty schema. No
+        # user-data fields appear.
+        from dynastore.modules.storage.computed_fields import default_derive_spec
+
         out = materialize_feature_fields(ItemsSchema(), ItemsWritePolicy())
-        assert set(out) == {"external_id", "asset_id"}
+        stat_names = {
+            cf.resolved_name for cf in default_derive_spec().to_computed_fields()
+        }
+        assert set(out) == {"external_id", "asset_id"} | stat_names
+        # The stored stats are queryable out of the box.
+        assert FieldCapability.FILTERABLE in out["area"].capabilities
+        assert FieldCapability.SORTABLE in out["vertex_count"].capabilities
 
     def test_no_asset_id_no_external_id_minimal_policy(self):
         # A policy with no identity axis and no asset tracking projects nothing.

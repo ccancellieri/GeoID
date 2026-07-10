@@ -102,3 +102,24 @@ def test_columnar_geom_stat_stays_flat_not_blobbed() -> None:
     assert payload is not None
     assert "geom_stats" not in payload
     assert isinstance(payload["area"], float)
+
+
+def test_underivable_geometry_skips_stats_instead_of_raising() -> None:
+    """Stats that can't be derived skip silently; the row is kept.
+
+    The trusted pre-processed WKB path stores the hex as-is; when it can't
+    be re-parsed to a Shapely geometry the declared stats are underivable.
+    With statistics enabled by default (#3155) a hard failure here would
+    discard the whole feature — the geometry itself is still stored, so
+    keep the row and leave the stat columns unset.
+    """
+    sidecar = _geom_sidecar(
+        ComputedField(kind=ComputedKind.AREA, storage_mode=StatisticStorageMode.COLUMNAR)
+    )
+    payload = sidecar.prepare_upsert_payload(
+        # Valid hex, not valid WKB — unhexlifies fine, shapely can't load it.
+        {"wkb_hex_processed": "deadbeef", "geom_type": "POLYGON"}, {"geoid": "g1"}
+    )
+    assert payload is not None
+    assert "area" not in payload
+    assert "geom_stats" not in payload

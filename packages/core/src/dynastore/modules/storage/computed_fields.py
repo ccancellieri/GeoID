@@ -61,7 +61,7 @@ Public surface:
 
 import re
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional
+from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -618,6 +618,72 @@ class DeriveSpec(BaseModel):
             geometry_stats=geometry_stats,
             attribute_stats=attribute_stats,
         )
+
+
+# Stable authoring order for the platform-default statistics: geometry
+# scalars first, then the JSON-FG place family. Order is part of the
+# contract — it fixes the column order the sidecar DDL emits.
+_DEFAULT_STAT_ORDER: Tuple[ComputedKind, ...] = (
+    ComputedKind.AREA,
+    ComputedKind.PERIMETER,
+    ComputedKind.LENGTH,
+    ComputedKind.CENTROID,
+    ComputedKind.BBOX,
+    ComputedKind.VERTEX_COUNT,
+    ComputedKind.HOLE_COUNT,
+    ComputedKind.CIRCULARITY,
+    ComputedKind.CONVEXITY,
+    ComputedKind.ASPECT_RATIO,
+    ComputedKind.VOLUME,
+    # JSON-FG 3D place statistics — computed only when a feature carries a
+    # ``place`` member; materialised on the ``{table}_place`` sidecar.
+    ComputedKind.SURFACE_AREA,
+    ComputedKind.SURFACE_TO_VOLUME_RATIO,
+    ComputedKind.NET_FLOOR_AREA,
+    ComputedKind.CENTROID_3D,
+    ComputedKind.Z_RANGE,
+    ComputedKind.VERTICAL_GRADIENT,
+    ComputedKind.TEMPORAL_DURATION,
+)
+
+# The render-rank scalars: B-tree indexed by default so
+# ``feature_rank_column`` / density ceilings can filter and order on them
+# without per-collection configuration. Everything else stays unindexed to
+# keep write amplification bounded.
+_DEFAULT_INDEXED_STATS: frozenset = frozenset({
+    ComputedKind.AREA,
+    ComputedKind.LENGTH,
+    ComputedKind.VERTEX_COUNT,
+})
+
+
+def default_derive_spec() -> DeriveSpec:
+    """The platform-default :class:`DeriveSpec`: every geometry/place
+    statistic, materialised COLUMNAR on its sidecar (#3155).
+
+    Applied by ``ItemsWritePolicy.derive`` when a collection doesn't author
+    its own spec. Each stat lands as its own typed column — JSONB keys
+    can't back the B-tree lookups the render path needs — and the three
+    render-rank scalars (``area``, ``length``, ``vertex_count``) are
+    indexed. The JSON-FG place statistics are included so 3D sources get
+    their stats without extra configuration; they are computed only when a
+    feature carries a ``place`` member.
+
+    Identity semantics are untouched: no content hashes or spatial cells
+    are enabled, and ``external_id`` keeps its lazy default. Authoring an
+    explicit ``derive`` replaces this default entirely (an empty
+    ``DeriveSpec`` opts a collection out of all statistics).
+    """
+    return DeriveSpec(
+        geometry_stats=[
+            GeometryStat(
+                stat=kind,
+                store=StatisticStorageMode.COLUMNAR,
+                indexed=kind in _DEFAULT_INDEXED_STATS,
+            )
+            for kind in _DEFAULT_STAT_ORDER
+        ]
+    )
 
 
 class IdentityRule(BaseModel):

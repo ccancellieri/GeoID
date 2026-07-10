@@ -735,3 +735,171 @@ class TestGeodesicMetrics:
         )
         # A near-square remains ~pi/4 whether computed planar or geodesic.
         assert out["circularity"] == pytest.approx(math.pi / 4, rel=1e-2)
+
+
+class TestVertexCountAllCoordinates:
+    """VERTEX_COUNT counts every coordinate (ST_NPoints parity, #3155)."""
+
+    def _count(self, geom) -> int:
+        out = compute_derived_fields(
+            geom, {}, [ComputedField(kind=ComputedKind.VERTEX_COUNT)]
+        )
+        return out["vertex_count"]
+
+    def test_polygon_with_hole_counts_interior_ring(self) -> None:
+        shell = [(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)]
+        hole = [(2, 2), (4, 2), (4, 4), (2, 2)]
+        poly = Polygon(shell, [hole])
+        # 5 shell coords + 4 hole coords, closing points included — what
+        # PostGIS ST_NPoints reports for the same geometry.
+        assert self._count(poly) == 9
+
+    def test_multipolygon_counts_all_parts_and_rings(self) -> None:
+        from shapely.geometry import MultiPolygon
+
+        a = Polygon([(0, 0), (1, 0), (1, 1), (0, 0)])
+        b = Polygon(
+            [(5, 5), (9, 5), (9, 9), (5, 9), (5, 5)],
+            [[(6, 6), (7, 6), (7, 7), (6, 6)]],
+        )
+        assert self._count(MultiPolygon([a, b])) == 4 + 5 + 4
+
+    def test_linestring_and_point(self) -> None:
+        from shapely.geometry import LineString
+
+        assert self._count(LineString([(0, 0), (1, 1), (2, 2)])) == 3
+        assert self._count(Point(1, 1)) == 1
+
+    def test_3d_coordinates_count_like_2d(self) -> None:
+        from shapely.geometry import LineString
+
+        assert self._count(LineString([(0, 0, 1), (1, 1, 2), (2, 2, 3)])) == 3
+
+
+class TestDefaultDeriveSpec:
+    """The platform default enables every geometry/place stat (#3155)."""
+
+    def test_derive_spec_itself_stays_empty(self) -> None:
+        # Regression guard: DeriveSpec() is the explicit opt-out shape and
+        # many call sites construct it expecting no derivations.
+        assert DeriveSpec().to_computed_fields() == []
+
+    def test_default_contains_every_geometry_stat_kind(self) -> None:
+        from dynastore.modules.storage.computed_fields import (
+            _GEOMETRY_STAT_KINDS,
+            default_derive_spec,
+        )
+
+        spec = default_derive_spec()
+        kinds = {gs.stat for gs in spec.geometry_stats}
+        assert kinds == set(_GEOMETRY_STAT_KINDS)
+
+    def test_default_is_columnar_with_render_rank_indexes(self) -> None:
+        from dynastore.modules.storage.computed_fields import default_derive_spec
+
+        spec = default_derive_spec()
+        assert all(
+            gs.store == StatisticStorageMode.COLUMNAR for gs in spec.geometry_stats
+        )
+        indexed = {gs.stat for gs in spec.geometry_stats if gs.indexed}
+        assert indexed == {
+            ComputedKind.AREA,
+            ComputedKind.LENGTH,
+            ComputedKind.VERTEX_COUNT,
+        }
+
+    def test_default_leaves_identity_axes_alone(self) -> None:
+        from dynastore.modules.storage.computed_fields import default_derive_spec
+
+        spec = default_derive_spec()
+        assert spec.external_id is None
+        assert spec.content_hashes == []
+        assert spec.spatial_cells == []
+        assert spec.attribute_stats == []
+
+    def test_default_flattens_with_unique_names(self) -> None:
+        from dynastore.modules.storage.computed_fields import default_derive_spec
+
+        fields = default_derive_spec().to_computed_fields()
+        names = [f.resolved_name for f in fields]
+        assert len(names) == len(set(names))
+        assert all(f.storage_mode is StatisticStorageMode.COLUMNAR for f in fields)
+
+    def test_items_write_policy_defaults_to_all_stats(self) -> None:
+        from dynastore.modules.storage.driver_config import ItemsWritePolicy
+        from dynastore.modules.storage.computed_fields import default_derive_spec
+
+        policy = ItemsWritePolicy()
+        assert policy.derive == default_derive_spec()
+        assert len(policy.compute) == len(
+            default_derive_spec().to_computed_fields()
+        )
+
+    def test_items_write_policy_explicit_empty_derive_opts_out(self) -> None:
+        from dynastore.modules.storage.driver_config import ItemsWritePolicy
+
+        policy = ItemsWritePolicy(derive=DeriveSpec())
+        assert policy.compute == []
+
+    def test_stored_config_with_explicit_derive_wins_over_default(self) -> None:
+        # Backward compatibility: a persisted config that authored its own
+        # derive (even a sparse one) must round-trip unchanged.
+        from dynastore.modules.storage.driver_config import ItemsWritePolicy
+
+        stored = {
+            "derive": {
+                "geometry_stats": [
+                    {"stat": "vertex_count", "store": "columnar", "indexed": True}
+                ]
+            }
+        }
+        policy = ItemsWritePolicy.model_validate(stored)
+        assert [gs.stat for gs in policy.derive.geometry_stats] == [
+            ComputedKind.VERTEX_COUNT
+        ]
+
+
+class TestGeodesicRingSemantics:
+    """Geodesic polygon metrics follow polygon semantics, not ring winding.
+
+    ``Geod.geometry_area_perimeter`` is ring-naive: a hole's area flips sign
+    with its winding and its length never reaches the perimeter. The
+    ring-summing wrapper pins parity with planar Shapely and with PostGIS
+    ``ST_Area``/``ST_Perimeter`` on ``geography`` (#3155).
+    """
+
+    SHELL = [(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)]
+    HOLE_CCW = [(2, 2), (4, 2), (4, 4), (2, 2)]
+    HOLE_CW = [(2, 2), (4, 4), (4, 2), (2, 2)]
+
+    def _stats(self, poly: Polygon) -> dict:
+        return compute_derived_fields(
+            poly,
+            {},
+            [
+                ComputedField(kind=ComputedKind.AREA),
+                ComputedField(kind=ComputedKind.PERIMETER),
+                ComputedField(kind=ComputedKind.LENGTH),
+                ComputedField(kind=ComputedKind.CONVEXITY),
+            ],
+            srid=4326,
+        )
+
+    def test_hole_area_is_subtracted_regardless_of_winding(self) -> None:
+        shell_only = self._stats(Polygon(self.SHELL))
+        ccw = self._stats(Polygon(self.SHELL, [self.HOLE_CCW]))
+        cw = self._stats(Polygon(self.SHELL, [self.HOLE_CW]))
+        assert ccw["area"] == pytest.approx(cw["area"], rel=1e-12)
+        assert ccw["area"] < shell_only["area"]
+
+    def test_hole_ring_counts_toward_perimeter_and_length(self) -> None:
+        shell_only = self._stats(Polygon(self.SHELL))
+        holed = self._stats(Polygon(self.SHELL, [self.HOLE_CCW]))
+        assert holed["perimeter"] > shell_only["perimeter"]
+        # A polygon's geodesic length is its full ring length — identical to
+        # the perimeter, mirroring planar ``.length``.
+        assert holed["length"] == pytest.approx(holed["perimeter"], rel=1e-12)
+
+    def test_convexity_never_exceeds_one(self) -> None:
+        holed = self._stats(Polygon(self.SHELL, [self.HOLE_CCW]))
+        assert holed["convexity"] < 1.0

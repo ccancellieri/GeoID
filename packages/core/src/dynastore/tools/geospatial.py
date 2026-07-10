@@ -704,19 +704,56 @@ def _geodesic_area_perimeter(
 
     Returns ``None`` when pyproj is unavailable so the caller can fall back to
     the planar Shapely values.
+
+    Polygonal geometry is measured ring by ring: area = |shell| − Σ|holes|
+    (clamped at 0), perimeter = every ring's length, shells and holes alike.
+    ``Geod.geometry_area_perimeter`` itself is ring-naive — it adds or
+    subtracts a hole's area depending on its winding and drops interior
+    rings from the perimeter — which diverges from both the planar Shapely
+    semantics and PostGIS ``ST_Area``/``ST_Perimeter`` on ``geography``.
     """
     try:
         from pyproj import Geod
 
-        area, perim = Geod(ellps="WGS84").geometry_area_perimeter(geometry)
-        return abs(float(area)), abs(float(perim))
+        geod = Geod(ellps="WGS84")
+        geom_type = geometry.geom_type
+        if geom_type not in ("Polygon", "MultiPolygon"):
+            area, perim = geod.geometry_area_perimeter(geometry)
+            return abs(float(area)), abs(float(perim))
+
+        parts = (
+            geometry.geoms  # type: ignore[attr-defined]
+            if geom_type == "MultiPolygon"
+            else [geometry]
+        )
+        total_area = 0.0
+        total_perim = 0.0
+        for poly in parts:
+            if poly.is_empty:
+                continue
+            area, perim = geod.geometry_area_perimeter(poly.exterior)  # type: ignore[attr-defined]
+            total_area += abs(float(area))
+            total_perim += abs(float(perim))
+            for ring in poly.interiors:  # type: ignore[attr-defined]
+                area, perim = geod.geometry_area_perimeter(ring)
+                total_area -= abs(float(area))
+                total_perim += abs(float(perim))
+        return max(total_area, 0.0), total_perim
     except Exception:
         return None
 
 
 def _geodesic_length(geometry: "BaseGeometry") -> Optional[float]:
-    """Geodesic length in metres on the WGS84 ellipsoid, or ``None``."""
+    """Geodesic length in metres on the WGS84 ellipsoid, or ``None``.
+
+    Polygonal geometry reports its full ring length (shell + holes) — the
+    same value planar ``.length`` yields — via the ring-summing
+    :func:`_geodesic_area_perimeter`.
+    """
     try:
+        if geometry.geom_type in ("Polygon", "MultiPolygon"):
+            ap = _geodesic_area_perimeter(geometry)
+            return ap[1] if ap is not None else None
         from pyproj import Geod
 
         return float(Geod(ellps="WGS84").geometry_length(geometry))
@@ -925,23 +962,13 @@ def compute_derived_fields(
             out[key] = [float(minx), float(miny), float(maxx), float(maxy)]
 
         elif kind == ComputedKind.VERTEX_COUNT:
-            exterior = getattr(geometry, "exterior", None)
-            geoms = getattr(geometry, "geoms", None)
-            if exterior is not None:
-                out[key] = len(exterior.coords)
-            elif hasattr(geometry, "coords"):
-                out[key] = len(geometry.coords)
-            elif geoms is not None:
-                total = 0
-                for g in geoms:
-                    g_exterior = getattr(g, "exterior", None)
-                    if g_exterior is not None:
-                        total += len(g_exterior.coords)
-                    elif hasattr(g, "coords"):
-                        total += len(g.coords)
-                out[key] = total
-            else:
-                out[key] = 0
+            # Count EVERY coordinate — all parts, exterior AND interior
+            # rings, closing points included — matching PostGIS
+            # ``ST_NPoints`` so SQL-computed values and write-path values
+            # can never diverge. (An exterior-only walk undercounts
+            # exactly the hole-rich polygons a density signal must flag.)
+            import shapely as _sh
+            out[key] = int(_sh.count_coordinates(geometry))
 
         elif kind == ComputedKind.HOLE_COUNT:
             interiors = getattr(geometry, "interiors", None)

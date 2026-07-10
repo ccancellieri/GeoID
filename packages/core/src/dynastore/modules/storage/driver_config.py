@@ -61,6 +61,7 @@ from dynastore.modules.storage.computed_fields import (
     ComputedKind,
     DeriveSpec,
     IdentityRule,
+    default_derive_spec,
 )
 from dynastore.modules.storage.validity import ValiditySpec
 
@@ -463,7 +464,7 @@ class ItemsWritePolicy(PluginConfig):
         ),
     )
     derive: Immutable[DeriveSpec] = Field(
-        default_factory=DeriveSpec,
+        default_factory=default_derive_spec,
         description=(
             "Per-row derivations materialised by every capable driver, grouped "
             "into homogeneous buckets (:class:`DeriveSpec`): ``external_id`` "
@@ -480,6 +481,11 @@ class ItemsWritePolicy(PluginConfig):
             "standalone ``GeometriesSidecarConfig.geohash_precision`` knob is "
             "gone, so the stored precision can never diverge from the identity "
             "axis). "
+            "Default: every geometry/place statistic as its own COLUMNAR "
+            "sidecar column, with ``area``/``length``/``vertex_count`` "
+            "indexed (see ``default_derive_spec``) — authoring an explicit "
+            "``derive`` replaces the default entirely, and an empty spec "
+            "(``derive: {}``) opts the collection out of all statistics. "
             "Immutable once a collection is materialised: the derived "
             "columns and identity axis are baked into existing rows, so "
             "changing this after data lands would silently diverge the shape "

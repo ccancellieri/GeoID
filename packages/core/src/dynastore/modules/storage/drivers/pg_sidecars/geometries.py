@@ -1347,11 +1347,15 @@ class GeometriesSidecar(SidecarProtocol):
                     jsonb_payload, cls=CustomJSONEncoder
                 )
         elif storage_fields and not shapely_geom:
-            # Fail-fast: if stats are declared we MUST have a valid geometry.
-            raise ValueError(
-                f"GeometrySidecar: storage-bearing computed fields declared but "
-                f"no valid geometry provided for geoid {geoid}. "
-                "Discarding feature to maintain data integrity."
+            # Stats are declared but this feature carries no usable geometry.
+            # With statistics on by default this is a normal shape for
+            # geometry-less features — leave the stat columns unset rather
+            # than rejecting the row (geometry presence is a schema/policy
+            # concern, not a statistics one).
+            logger.warning(
+                "GeometrySidecar: no valid geometry for geoid %s; leaving %d "
+                "declared geometry stat(s) unset.",
+                geoid, len(storage_fields),
             )
         return payload
 
