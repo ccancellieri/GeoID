@@ -819,3 +819,51 @@ class TestStyledRasterDispatch:
             assert response.headers["X-Render-Source"] == "rio-tiler"
         finally:
             _ts_mod._RENDER_COG_TILE = original
+
+
+# ---------------------------------------------------------------------------
+# Vector dispatch — public-id delegation (#3236)
+# ---------------------------------------------------------------------------
+
+
+class TestGetMapTileVectorDispatch:
+    @pytest.mark.asyncio
+    async def test_vector_dispatch_passes_public_ids(self):
+        """Non-RASTER kinds delegate to ``_get_vector_map_tile`` with the
+        PUBLIC route ids, not the resolved internal ids — the storage router,
+        physical-table resolution (#2325) and the tile cache namespace are
+        all keyed by external ids (#3235/#3236). Internal ids resolve no
+        physical table (42P01 -> 404) and miss the preseeded cache."""
+        svc = _make_service()
+        _wire_common_mocks(svc, kind=CollectionKind.VECTOR)
+        sentinel = MagicMock()
+        svc._get_vector_map_tile = AsyncMock(return_value=sentinel)
+
+        cfg = _make_render_config(cache_enabled=False)
+        p1, p2, p3, p4, p5 = _patch_common(cfg, provider=None)
+        with p1, p2, p3, p4, p5:
+            response = await svc.get_map_tile(
+                request=_make_request(),
+                background_tasks=_make_bg_tasks(),
+                catalog_id="cat",
+                collection_id="coll",
+                tms_id="WebMercatorQuad",
+                z=3,
+                x=1,
+                y=2,
+                format="png",
+                bands=None,
+                expression=None,
+                rescale=None,
+                style_url=None,
+            )
+
+        assert response is sentinel
+        args = svc._get_vector_map_tile.await_args.args
+        # (request, background_tasks, catalog_id, collection_id, tms_id, ...)
+        assert args[2] == "cat"
+        assert args[3] == "coll"
+        # The internal resolution still ran as existence validation.
+        svc._require_collection_visible.assert_awaited_once_with(
+            "internal-cat", "internal-coll"
+        )

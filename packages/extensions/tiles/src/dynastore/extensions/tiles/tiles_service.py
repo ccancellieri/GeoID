@@ -2380,11 +2380,16 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
 
         kind = await self._collection_kind(internal_catalog_id, internal_collection_id)
         if kind != CollectionKind.RASTER:
+            # Delegate the PUBLIC ids (#3236, mirroring #3235 for the vector
+            # lane): the storage router, physical-table resolution (#2325) and
+            # the tile cache namespace are all keyed by the logical external
+            # ids — internal ids miss the cache and resolve no physical table.
+            # The resolution above stays as existence/visibility validation.
             return await self._get_vector_map_tile(
                 request,
                 background_tasks,
-                internal_catalog_id,
-                internal_collection_id,
+                catalog_id,
+                collection_id,
                 tms_id,
                 z,
                 x,
@@ -2540,8 +2545,8 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         self,
         request: Request,
         background_tasks: BackgroundTasks,
-        internal_catalog_id: str,
-        internal_collection_id: str,
+        catalog_id: str,
+        collection_id: str,
         tms_id: str,
         z: int,
         x: int,
@@ -2556,12 +2561,17 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         ``format="png"`` — this extension never imports the maps extension;
         the maps extension imports core and registers itself (DI).
 
-        Cached under the plain ``internal_collection_id`` (no
+        ``catalog_id``/``collection_id`` are the PUBLIC (external) ids —
+        the storage router and physical-table resolution want logical ids
+        (#2325), and the tile cache namespace is keyed by them (#3235/#3236).
+
+        Cached under the plain public ``collection_id`` (no
         ``build_render_cache_key``, no style/params suffix) — the SAME
-        cache-id the vector MVT lane uses — so the existing feature-write
-        invalidation (which iterates ``SERVED_TILE_FORMATS`` per z/x/y) drops
-        it automatically. Only the default style is supported here; a named
-        style still 404s via ``get_map_tile_styled``.
+        cache-id the vector MVT lane and the preseed task use — so the
+        existing feature-write invalidation (which iterates
+        ``SERVED_TILE_FORMATS`` per z/x/y) drops it automatically. Only the
+        default style is supported here; a named style still 404s via
+        ``get_map_tile_styled``.
         """
         if fmt_lower != "png":
             raise HTTPException(
@@ -2572,20 +2582,20 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 ),
             )
 
-        cache_id = internal_collection_id
+        cache_id = collection_id
         provider = get_protocol(TileStorageProtocol)
-        cache_enabled = await cache_on_demand_enabled(internal_catalog_id, internal_collection_id)
+        cache_enabled = await cache_on_demand_enabled(catalog_id, collection_id)
 
         if provider and cache_enabled:
             cached = await provider.get_tile(
-                internal_catalog_id, cache_id, tms_id, z, x, y, "png"
+                catalog_id, cache_id, tms_id, z, x, y, "png"
             )
             if cached is not None:
                 duration_ms = (time.perf_counter() - start) * 1000
                 logger.info(
                     "map_tile: cache=hit source=tile_storage catalog=%s cache_id=%s "
                     "z=%s x=%s y=%s duration_ms=%.2f bytes=%d",
-                    internal_catalog_id, cache_id, z, x, y, duration_ms, len(cached),
+                    catalog_id, cache_id, z, x, y, duration_ms, len(cached),
                 )
                 if not cached:
                     return Response(
@@ -2613,8 +2623,8 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         engine = get_async_engine(request)
         try:
             ctx = await tiles_engine.build_render_context(
-                internal_catalog_id,
-                [internal_collection_id],
+                catalog_id,
+                [collection_id],
                 tms_id,
                 engine=engine,
                 format="png",
@@ -2627,7 +2637,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             raise HTTPException(
                 status_code=404,
                 detail=(
-                    f"Collection '{internal_collection_id}' could not be resolved "
+                    f"Collection '{collection_id}' could not be resolved "
                     "for map-tile rendering."
                 ),
             )
@@ -2646,7 +2656,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                     logger.error(
                         "map_tile: failed to acquire DB connection for vector "
                         "PNG render catalog=%s collection=%s: %s",
-                        internal_catalog_id, internal_collection_id, exc,
+                        catalog_id, collection_id, exc,
                     )
                     raise HTTPException(status_code=503, detail="Database unavailable.") from exc
 
@@ -2660,7 +2670,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             logger.warning(
                 "map_tile: render admission rejected (%s) catalog=%s "
                 "collection=%s z=%s x=%s y=%s",
-                exc.reason, internal_catalog_id, internal_collection_id, z, x, y,
+                exc.reason, catalog_id, collection_id, z, x, y,
             )
             raise HTTPException(
                 status_code=503,
@@ -2674,7 +2684,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         if tile_bytes is not None and provider and cache_enabled and self._tile_cache_writer is not None:
             self._tile_cache_writer.submit_nowait(
                 provider,
-                internal_catalog_id, cache_id, tms_id, z, x, y, tile_bytes, "png",
+                catalog_id, cache_id, tms_id, z, x, y, tile_bytes, "png",
             )
 
         if not tile_bytes:
@@ -2682,7 +2692,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             logger.info(
                 "map_tile: cache=miss source=vector_png catalog=%s collection=%s "
                 "z=%s x=%s y=%s duration_ms=%.2f bytes=0 (no features)",
-                internal_catalog_id, internal_collection_id, z, x, y, duration_ms,
+                catalog_id, collection_id, z, x, y, duration_ms,
             )
             return Response(status_code=204)
 
@@ -2690,7 +2700,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         logger.info(
             "map_tile: cache=miss source=vector_png catalog=%s collection=%s "
             "z=%s x=%s y=%s duration_ms=%.2f bytes=%d",
-            internal_catalog_id, internal_collection_id, z, x, y, duration_ms, len(tile_bytes),
+            catalog_id, collection_id, z, x, y, duration_ms, len(tile_bytes),
         )
         return Response(
             content=tile_bytes,
