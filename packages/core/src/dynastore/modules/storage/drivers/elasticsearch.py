@@ -2847,20 +2847,21 @@ class AssetElasticsearchDriver(
         *,
         db_resource: Optional[Any] = None,
     ) -> None:
-        """Delete a single asset document from the index."""
+        """Delete a single asset document from the index.
+
+        Deleting an already-absent document — e.g. on event redelivery —
+        is idempotent success via ``ignore: "404"`` on the ES call (same
+        convention as ``ItemsElasticsearchDriver``'s item deletes). Any
+        other failure propagates: callers (``AssetEntitySyncSubscriber``)
+        apply their ``on_failure`` policy and the durable events plane
+        retries.
+        """
         from dynastore.modules.elasticsearch.mappings import get_assets_index_name
         from dynastore.modules.elasticsearch.client import get_index_prefix as _get_index_prefix
 
         index_name = get_assets_index_name(_get_index_prefix(), catalog_id)
         es = self._get_client()
-        try:
-            await es.delete(index=index_name, id=asset_id)
-        except Exception as exc:
-            logger.warning(
-                "AssetElasticsearchDriver: failed to delete asset"
-                " id=%s catalog=%s: %s",
-                asset_id, catalog_id, exc,
-            )
+        await es.delete(index=index_name, id=asset_id, params={"ignore": "404"})
 
     # ------------------------------------------------------------------
     # Generic Indexer Protocol — slim, dispatcher-facing surface

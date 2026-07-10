@@ -30,6 +30,19 @@ from both the routing-config fan-out and a private listener block: the row
 goes to the primary WRITE driver (``secondary_index=False``) synchronously
 inside ``AssetService``; secondary-index fan-out happens via this subscriber,
 fed by the events outbox so failures are replayable.
+
+Failure propagation: this subscriber is invoked twice per event — once
+immediately in-process (``EventService.emit``'s fast path) and once more
+durably when ``EventDrainTask`` drains the corresponding ``tasks.events``
+row and calls ``EventService.dispatch_to_listeners``. Every per-indexer
+failure is logged; failures on entries whose ``on_failure`` policy is
+``FATAL`` or ``OUTBOX`` additionally raise a single chained exception after
+every entry has been attempted, so the durable leg's caller
+(``EventDrainTask``) retries the row. ``WARN`` (logged) and ``IGNORE``
+(silent, per its documented meaning) never trigger a retry. The immediate
+leg swallows the same exception at the ``emit`` dispatch site (see
+``event_service._invoke_listener_detached``) so it never surfaces as
+unretrieved-task noise; the durable leg is the retry authority.
 """
 
 import asyncio
@@ -45,6 +58,57 @@ from dynastore.modules.catalog.event_service import (
 logger = logging.getLogger(__name__)
 
 
+async def _fan_out_and_raise(
+    *,
+    action: str,
+    catalog_id: str,
+    asset_id: str,
+    indexers: List[Any],
+    calls: List[Any],
+) -> None:
+    """Await *calls* (one per entry in *indexers*) in parallel.
+
+    Logs every per-indexer failure — ERROR for ``on_failure=FATAL``, WARNING
+    for ``OUTBOX``/``WARN``, DEBUG for ``IGNORE`` (its documented meaning is
+    silent skip, so it must not surface at WARNING). Once every entry has
+    been attempted, raises a single ``RuntimeError`` — chained from the first
+    such failure — summarizing every entry whose ``on_failure`` policy is
+    ``FATAL`` or ``OUTBOX``, so the durable events-outbox row retries.
+    ``WARN`` and ``IGNORE`` are tolerant: logged (or silently skipped for
+    ``IGNORE``) but never trigger a retry.
+    """
+    from dynastore.modules.storage.routing_config import FailurePolicy
+
+    results = await asyncio.gather(*calls, return_exceptions=True)
+
+    first_failure: Optional[BaseException] = None
+    retry_refs: List[str] = []
+    for r, result in zip(indexers, results):
+        if not isinstance(result, BaseException):
+            continue
+        if r.on_failure == FailurePolicy.FATAL:
+            level = logger.error
+        elif r.on_failure == FailurePolicy.IGNORE:
+            level = logger.debug
+        else:
+            level = logger.warning
+        level(
+            "AssetEntitySync: indexer '%s' %s failed for %s/%s: %s",
+            r.driver_ref, action, catalog_id, asset_id, result,
+        )
+        if r.on_failure in (FailurePolicy.FATAL, FailurePolicy.OUTBOX):
+            retry_refs.append(r.driver_ref)
+            if first_failure is None:
+                first_failure = result
+
+    if first_failure is not None:
+        raise RuntimeError(
+            f"AssetEntitySync: {action} failed for {catalog_id}/{asset_id} on "
+            f"{len(retry_refs)} indexer(s) requiring retry: "
+            f"{', '.join(retry_refs)}"
+        ) from first_failure
+
+
 class AssetEntitySyncSubscriber:
     """Async event subscribers that drive ``AssetIndexer`` fan-out."""
 
@@ -57,10 +121,14 @@ class AssetEntitySyncSubscriber:
         **_kwargs,
     ) -> None:
         if not catalog_id or not asset_id:
+            logger.debug(
+                "AssetEntitySync: on_asset_upsert missing catalog_id/asset_id "
+                "(catalog_id=%r, asset_id=%r) — dropping malformed event, no retry.",
+                catalog_id, asset_id,
+            )
             return
 
         from dynastore.modules.storage.router import get_asset_index_drivers
-        from dynastore.modules.storage.routing_config import FailurePolicy
 
         try:
             indexers = await get_asset_index_drivers(catalog_id, collection_id)
@@ -69,7 +137,10 @@ class AssetEntitySyncSubscriber:
                 "AssetEntitySync: index-driver resolution failed for %s/%s: %s",
                 catalog_id, asset_id, exc,
             )
-            return
+            raise RuntimeError(
+                f"AssetEntitySync: index-driver resolution failed for "
+                f"{catalog_id}/{asset_id}"
+            ) from exc
         if not indexers:
             return
 
@@ -79,20 +150,13 @@ class AssetEntitySyncSubscriber:
         if collection_id:
             doc.setdefault("collection_id", collection_id)
 
-        results = await asyncio.gather(
-            *(r.driver.index_asset(catalog_id, doc) for r in indexers),
-            return_exceptions=True,
+        await _fan_out_and_raise(
+            action="index_asset",
+            catalog_id=catalog_id,
+            asset_id=asset_id,
+            indexers=indexers,
+            calls=[r.driver.index_asset(catalog_id, doc) for r in indexers],
         )
-        for r, result in zip(indexers, results):
-            if isinstance(result, BaseException):
-                level = (
-                    logger.error if r.on_failure == FailurePolicy.FATAL
-                    else logger.warning
-                )
-                level(
-                    "AssetEntitySync: indexer '%s' index_asset failed for "
-                    "%s/%s: %s", r.driver_ref, catalog_id, asset_id, result,
-                )
 
     @staticmethod
     async def on_asset_delete(
@@ -106,10 +170,14 @@ class AssetEntitySyncSubscriber:
             _val = (payload if isinstance(payload, dict) else {}).get("asset_id")
             asset_id = str(_val) if _val is not None else None
         if not catalog_id or not asset_id:
+            logger.debug(
+                "AssetEntitySync: on_asset_delete missing catalog_id/asset_id "
+                "(catalog_id=%r, asset_id=%r) — dropping malformed event, no retry.",
+                catalog_id, asset_id,
+            )
             return
 
         from dynastore.modules.storage.router import get_asset_index_drivers
-        from dynastore.modules.storage.routing_config import FailurePolicy
 
         try:
             indexers = await get_asset_index_drivers(catalog_id, collection_id)
@@ -118,24 +186,20 @@ class AssetEntitySyncSubscriber:
                 "AssetEntitySync: index-driver resolution failed for %s/%s: %s",
                 catalog_id, asset_id, exc,
             )
-            return
+            raise RuntimeError(
+                f"AssetEntitySync: index-driver resolution failed for "
+                f"{catalog_id}/{asset_id}"
+            ) from exc
         if not indexers:
             return
 
-        results = await asyncio.gather(
-            *(r.driver.delete_asset(catalog_id, asset_id) for r in indexers),
-            return_exceptions=True,
+        await _fan_out_and_raise(
+            action="delete_asset",
+            catalog_id=catalog_id,
+            asset_id=asset_id,
+            indexers=indexers,
+            calls=[r.driver.delete_asset(catalog_id, asset_id) for r in indexers],
         )
-        for r, result in zip(indexers, results):
-            if isinstance(result, BaseException):
-                level = (
-                    logger.error if r.on_failure == FailurePolicy.FATAL
-                    else logger.warning
-                )
-                level(
-                    "AssetEntitySync: indexer '%s' delete_asset failed for "
-                    "%s/%s: %s", r.driver_ref, catalog_id, asset_id, result,
-                )
 
 
 def register_asset_entity_sync_subscriber() -> None:

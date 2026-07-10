@@ -267,7 +267,13 @@ class OperationDriverEntry(BaseModel):
             "Execution mode for WRITE operations.  "
             "'sync' = await result (parallel with other sync drivers, participates "
             "in coordinated rollback).  "
-            "'async' = fire-and-forget after sync phase succeeds."
+            "'async' = fire-and-forget after sync phase succeeds.  "
+            "Not consulted for catalog-/asset-tier secondary-index WRITE "
+            "entries: those propagate through the durable ``tasks.events`` "
+            "plane (``ReindexWorker`` off ``catalog_metadata_changed`` / "
+            "``AssetEntitySyncSubscriber`` off ``ASSET_*``) and are "
+            "effectively always ASYNC regardless of the configured value — "
+            "see :class:`CatalogRoutingConfig` and :class:`AssetRoutingConfig`."
         ),
     )
     sla: Optional[DriverSla] = Field(
@@ -975,6 +981,15 @@ class AssetRoutingConfig(_RoutingConfigBase):
 
     Same structure as :class:`ItemsRoutingConfig` but scoped to
     asset-domain drivers.
+
+    Secondary-index ``WRITE`` entries on this config (``secondary_index=True``,
+    e.g. ``AssetElasticsearchDriver``) are consumed by
+    ``dynastore.modules.catalog.asset_sync.AssetEntitySyncSubscriber`` off the
+    ``CatalogEventType.ASSET_*`` event stream — mirrors the catalog-tier
+    trigger documented on :class:`CatalogRoutingConfig` (durable
+    ``tasks.events`` plane, not a direct call from ``AssetService``). Dispatch
+    is durable and effectively always async regardless of the entry's
+    ``write_mode``, which is not consulted for these entries today.
 
     Identity is the class itself; see ``class_key()`` in ``platform_config_service.py``.
     """

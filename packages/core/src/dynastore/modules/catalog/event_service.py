@@ -210,6 +210,37 @@ class CatalogEventType(EventType):
 Listener = Callable[..., Coroutine[Any, Any, None]]
 
 
+async def _invoke_listener_detached(
+    listener: Listener, event_name: str, *args: Any, **kwargs: Any
+) -> None:
+    """Await *listener* for the immediate/in-process dispatch leg of ``emit``.
+
+    ``emit`` schedules every async listener twice: once here (fire-and-forget,
+    for low-latency delivery) and again durably once ``EventDrainTask`` claims
+    the same event's outbox row and calls
+    :meth:`EventService.dispatch_to_listeners` — which does NOT wrap the
+    listener call, because a handler exception there is exactly the signal
+    that tells the drain to retry the row.
+
+    Nothing awaits the ``run_in_background`` task scheduled for this leg, so
+    a listener exception here would otherwise surface only as an asyncio
+    "Task exception was never retrieved" warning at garbage-collection time —
+    context-free noise, and misleading now that listeners are allowed to
+    raise for the durable leg's benefit. Catching and logging here keeps the
+    fast-path delivery best-effort while the durable leg remains the retry
+    authority.
+    """
+    try:
+        await listener(*args, **kwargs)
+    except Exception as e:
+        logger.error(
+            "Async listener %s raised during immediate dispatch of '%s'; "
+            "the durable events-outbox copy (if any) will retry it: %s",
+            getattr(listener, "__qualname__", repr(listener)), event_name, e,
+            exc_info=True,
+        )
+
+
 class EventService(EventBusProtocol):
     """
     Manages event registration, emission, and persistence.
@@ -347,8 +378,12 @@ class EventService(EventBusProtocol):
                     # Hold a strong ref via ``run_in_background`` so the loop
                     # cannot GC the task mid-execution and silently drop the
                     # event delivery (Python asyncio docs §"Important").
+                    # The coroutine is wrapped so a listener exception on
+                    # this immediate leg is caught and logged rather than
+                    # left to become an unretrieved-task warning — see
+                    # ``_invoke_listener_detached``.
                     run_in_background(
-                        listener(*args, **kwargs),
+                        _invoke_listener_detached(listener, e_val, *args, **kwargs),
                         name=f"event_listener:{e_val}",
                     )
                 except Exception as e:

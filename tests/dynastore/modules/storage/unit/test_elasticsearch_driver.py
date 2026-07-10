@@ -2733,3 +2733,87 @@ class TestAssetIndexExistenceCache:
 
         # drop_storage evicted the cache entry — the write after it re-checks.
         assert len(es.indices.exists_calls) == 2
+
+
+class TestAssetDeleteIdempotent:
+    """``AssetElasticsearchDriver.delete_asset`` redelivery safety.
+
+    ``AssetEntitySyncSubscriber`` (#2494) now raises on indexer failure so
+    the durable events plane retries — every entry in a retried batch is
+    re-attempted, including ones that already succeeded. A delete must
+    therefore tolerate deleting an already-absent document without raising
+    (idempotent), while a real backend failure must still propagate so the
+    subscriber's failure policy applies.
+    """
+
+    def _patches(self, es):
+        return [
+            patch(
+                "dynastore.modules.elasticsearch.client.get_client", return_value=es,
+            ),
+            patch(
+                "dynastore.modules.elasticsearch.client.get_index_prefix",
+                return_value="dynastore",
+            ),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_delete_asset_passes_ignore_404(self):
+        """Every delete_asset call opts the ES client out of raising on a
+        missing document — a redelivered delete for an already-deleted
+        asset must be a no-op, not an error."""
+        from dynastore.modules.storage.drivers.elasticsearch import AssetElasticsearchDriver
+
+        es = _StubEs()
+        patches = self._patches(es)
+        for p in patches:
+            p.start()
+        try:
+            driver = AssetElasticsearchDriver()
+            await driver.delete_asset("cat1", "asset-1")
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert len(es.delete_calls) == 1
+        assert es.delete_calls[0]["params"] == {"ignore": "404"}
+        assert es.delete_calls[0]["id"] == "asset-1"
+
+    @pytest.mark.asyncio
+    async def test_delete_asset_redelivery_is_idempotent(self):
+        """Deleting the same asset id twice (redelivery) never raises."""
+        from dynastore.modules.storage.drivers.elasticsearch import AssetElasticsearchDriver
+
+        es = _StubEs()
+        patches = self._patches(es)
+        for p in patches:
+            p.start()
+        try:
+            driver = AssetElasticsearchDriver()
+            await driver.delete_asset("cat1", "asset-1")
+            await driver.delete_asset("cat1", "asset-1")
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert len(es.delete_calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_delete_asset_real_failure_propagates(self):
+        """A non-404 backend failure must NOT be swallowed — the caller
+        (``AssetEntitySyncSubscriber``) needs to see it to apply its
+        ``on_failure`` policy and trigger a durable retry."""
+        from dynastore.modules.storage.drivers.elasticsearch import AssetElasticsearchDriver
+
+        es = _StubEs()
+        es.delete = AsyncMock(side_effect=ConnectionError("cluster unreachable"))
+        patches = self._patches(es)
+        for p in patches:
+            p.start()
+        try:
+            driver = AssetElasticsearchDriver()
+            with pytest.raises(ConnectionError):
+                await driver.delete_asset("cat1", "asset-1")
+        finally:
+            for p in patches:
+                p.stop()
