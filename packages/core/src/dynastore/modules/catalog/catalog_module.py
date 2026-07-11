@@ -535,7 +535,7 @@ class CatalogModule(ModuleProtocol):
             )
 
             # Wire render preseed subscriber — enqueues durable render_preseed
-            # obligations on AFTER_ASSET_CREATION when the feature is enabled
+            # obligations on ASSET_CREATION when the feature is enabled
             # via RenderPreseedConfig (disabled by default).
             try:
                 from dynastore.modules.renders.preseed_sync import (

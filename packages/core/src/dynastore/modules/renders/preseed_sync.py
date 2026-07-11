@@ -18,7 +18,7 @@
 
 """Durable render-preseed enqueue helper and event subscriber.
 
-``enqueue_render_preseed_task`` is called on the ``AFTER_ASSET_CREATION`` event
+``enqueue_render_preseed_task`` is called on the ``ASSET_CREATION`` event
 path and inserts a ``render_preseed`` task row into the unified task queue.
 The task worker drains off the request path and fills the render cache for
 the configured zoom range without blocking the ingestion write.
@@ -30,8 +30,10 @@ Design mirrors ``modules/tiles/tile_cache_sync.enqueue_tile_invalidation_task``:
 - Never raises out — a pre-seed failure must not break asset creation.
 
 ``register_render_preseed_subscriber`` wires the subscriber to
-``CatalogEventType.AFTER_ASSET_CREATION``.  It is called from
-``CatalogModule.lifespan`` alongside the other event subscribers.
+``CatalogEventType.ASSET_CREATION`` — the event the asset bridge in
+``catalog_module.py`` actually emits for ``AssetEventType.ASSET_CREATED``.
+It is called from ``CatalogModule.lifespan`` alongside the other event
+subscribers.
 """
 from __future__ import annotations
 
@@ -174,7 +176,7 @@ async def enqueue_render_preseed_task(
 class RenderPreseedSubscriber:
     """Async event subscriber that enqueues render-preseed obligations.
 
-    Handles ``AFTER_ASSET_CREATION``.  Determines the producer kind from the
+    Handles ``ASSET_CREATION``.  Determines the producer kind from the
     asset role field (``data``/``coverage`` → raster; vector collections →
     vector).  Skips when the asset role is not pre-seedable.
     """
@@ -257,16 +259,20 @@ class RenderPreseedSubscriber:
 
 
 def register_render_preseed_subscriber() -> None:
-    """Wire ``RenderPreseedSubscriber`` to ``AFTER_ASSET_CREATION``.
+    """Wire ``RenderPreseedSubscriber`` to ``ASSET_CREATION``.
+
+    ``ASSET_CREATION`` is what the asset bridge emits when an asset row is
+    created (``AssetEventType.ASSET_CREATED`` → ``_ASSET_EVENT_MAP`` in
+    ``catalog_module.py``) — the same event the asset-sync subscribers use.
 
     Called from ``CatalogModule.lifespan`` alongside other event subscribers.
     Idempotent at the registration site — duplicate registrations would cause
     duplicate dispatches but not data corruption (dedup_key prevents double-
     insert into the tasks table).
     """
-    async_event_listener(CatalogEventType.AFTER_ASSET_CREATION)(
+    async_event_listener(CatalogEventType.ASSET_CREATION)(
         RenderPreseedSubscriber.on_asset_creation
     )
     logger.info(
-        "RenderPreseedSubscriber: registered on CatalogEventType.AFTER_ASSET_CREATION"
+        "RenderPreseedSubscriber: registered on CatalogEventType.ASSET_CREATION"
     )

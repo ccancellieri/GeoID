@@ -117,7 +117,7 @@ class RenderPreseedConfig(PluginConfig):
     """Opt-in configuration for durable bounded-zoom render tile pre-seeding.
 
     Pre-seeding is disabled by default (``enabled=False``).  When enabled, an
-    ``AFTER_ASSET_CREATION`` event triggers a durable ``render_preseed`` task
+    ``ASSET_CREATION`` event triggers a durable ``render_preseed`` task
     that fills the render cache for the configured zoom range off the request
     path.  The task uses ``build_render_cache_key`` (raster) or the vector MVT
     cache-key convention (vector) so a style edit invalidates all pre-seeded
@@ -136,7 +136,7 @@ class RenderPreseedConfig(PluginConfig):
         description=(
             "Master opt-in for durable tile pre-seeding.  ``False`` by default — "
             "no pre-seed obligations are enqueued on asset registration.  Set to "
-            "``True`` to enable bounded-zoom cache fill on ``AFTER_ASSET_CREATION``."
+            "``True`` to enable bounded-zoom cache fill on ``ASSET_CREATION``."
         ),
     )
 

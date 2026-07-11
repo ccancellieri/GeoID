@@ -300,3 +300,39 @@ async def test_subscriber_skips_when_catalog_id_missing():
         collection_id="col1",
         asset_id="a1",
     )
+
+
+# ---------------------------------------------------------------------------
+# #3275 — the subscriber must be wired to an event the asset bridge actually
+# emits. It was originally registered on AFTER_ASSET_CREATION, which is
+# defined on CatalogEventType but emitted nowhere, so render preseed never
+# fired at all.
+# ---------------------------------------------------------------------------
+
+
+def test_registration_targets_an_event_the_asset_bridge_emits(monkeypatch):
+    """register_render_preseed_subscriber() must subscribe to one of the
+    CatalogEventType values the asset event bridge emits — a subscription to
+    any other (never-emitted) lifecycle event is dead wiring (#3275)."""
+    from dynastore.modules.catalog.catalog_module import _ASSET_EVENT_MAP
+
+    captured: List[Any] = []
+
+    def _fake_listener(event_type):
+        captured.append(event_type)
+
+        def _decorator(fn):
+            return fn
+
+        return _decorator
+
+    monkeypatch.setattr(ps, "async_event_listener", _fake_listener)
+    ps.register_render_preseed_subscriber()
+
+    assert len(captured) == 1
+    assert captured[0] in set(_ASSET_EVENT_MAP.values()), (
+        f"RenderPreseedSubscriber is subscribed to {captured[0]!r}, which the "
+        "asset event bridge never emits — the preseed obligation would never "
+        "fire (#3275)"
+    )
+    assert captured[0].name == "ASSET_CREATION"

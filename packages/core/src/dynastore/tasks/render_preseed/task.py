@@ -20,7 +20,7 @@
 
 Drains a ``render_preseed`` obligation enqueued by
 ``modules/renders/preseed_sync.enqueue_render_preseed_task`` on
-``AFTER_ASSET_CREATION``.  Dispatches to:
+``ASSET_CREATION``.  Dispatches to:
 
 - **raster**: ``modules/renders/engine.render_cog_tile`` (single-band COG
   via rio-tiler); cache key via ``modules/renders/config.build_render_cache_key``

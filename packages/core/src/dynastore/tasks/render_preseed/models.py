@@ -27,7 +27,7 @@ class RenderPreseedInputs(BaseModel):
     """Inputs serialised into the ``tasks.tasks.inputs`` JSONB column.
 
     Enqueued by ``modules/renders/preseed_sync.enqueue_render_preseed_task``
-    on ``AFTER_ASSET_CREATION``.  The worker validates this model at drain
+    on ``ASSET_CREATION``.  The worker validates this model at drain
     time, so the field contract is stable between enqueueing and execution.
     """
 
