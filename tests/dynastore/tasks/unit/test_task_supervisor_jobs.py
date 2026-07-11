@@ -548,10 +548,15 @@ def test_global_tasks_ddl_matches_shared_partition_template():
     shared workclass_ddl template renders for (table="tasks",
     granularity="month", window=4, retention=1) — guards against
     tasks_module.py drifting from the template it wires up (#2702).
+
+    Retention also passes purge_safe_statuses (#3216): tasks.tasks rows
+    carry audit value events/storage don't, so age-based partition pruning
+    is status-gated there — see _TASKS_PURGE_SAFE_STATUSES.
     """
     from dynastore.modules.tasks.tasks_module import (
         GLOBAL_TASKS_PARTCREATE_FUNC_DDL,
         GLOBAL_TASKS_RETENTION_FUNC_DDL,
+        _TASKS_PURGE_SAFE_STATUSES,
     )
     from dynastore.modules.tasks.workclass_ddl import (
         render_partition_create_ahead_ddl,
@@ -562,5 +567,6 @@ def test_global_tasks_ddl_matches_shared_partition_template():
         table="tasks", granularity="month", window=4
     )
     assert GLOBAL_TASKS_RETENTION_FUNC_DDL == render_partition_retention_ddl(
-        table="tasks", granularity="month", retention=1
+        table="tasks", granularity="month", retention=1,
+        purge_safe_statuses=_TASKS_PURGE_SAFE_STATUSES,
     )

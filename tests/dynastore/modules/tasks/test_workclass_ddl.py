@@ -736,6 +736,63 @@ def test_render_functions_reject_unknown_granularity():
 
 
 # ---------------------------------------------------------------------------
+# purge_safe_statuses guard (#3216) — tasks.tasks retention must spare
+# non-terminal rows (PENDING/ACTIVE) and terminal-but-graced rows
+# (DEAD_LETTER) regardless of partition/row age; events/storage are
+# unaffected (no purge_safe_statuses passed for them).
+# ---------------------------------------------------------------------------
+
+
+def test_render_retention_without_purge_safe_statuses_unchanged():
+    """Omitting purge_safe_statuses must reproduce the exact prior pure
+    age-based rendering — events/storage retention is untouched by #3216."""
+    rendered = render_partition_retention_ddl(table="events", granularity="day", retention=30)
+    assert "status" not in rendered
+    assert "part_is_purgeable" not in rendered
+
+
+def test_render_tasks_retention_with_purge_safe_statuses_guards_leaf_drop():
+    rendered = render_partition_retention_ddl(
+        table="tasks", granularity="month", retention=1,
+        purge_safe_statuses=("COMPLETED", "FAILED", "DISMISSED"),
+    )
+    # Leaf partitions are only dropped once no non-purge-safe row remains.
+    assert "part_is_purgeable BOOLEAN;" in rendered
+    assert "WHERE status NOT IN (''COMPLETED'', ''FAILED'', ''DISMISSED'')" in rendered
+    assert "IF NOT part_is_purgeable THEN" in rendered
+    assert "CONTINUE;" in rendered
+
+
+def test_render_tasks_retention_with_purge_safe_statuses_guards_default_delete():
+    rendered = render_partition_retention_ddl(
+        table="tasks", granularity="month", retention=1,
+        purge_safe_statuses=("COMPLETED", "FAILED", "DISMISSED"),
+    )
+    assert "AND status IN ('COMPLETED', 'FAILED', 'DISMISSED')" in rendered
+
+
+def test_global_tasks_retention_ddl_is_status_aware():
+    """Production wiring: GLOBAL_TASKS_RETENTION_FUNC_DDL (tasks_module.py)
+    must actually pass purge_safe_statuses — this is the constant the
+    MaintenanceSupervisor provisions and calls."""
+    from dynastore.modules.tasks.tasks_module import GLOBAL_TASKS_RETENTION_FUNC_DDL
+
+    assert "part_is_purgeable BOOLEAN;" in GLOBAL_TASKS_RETENTION_FUNC_DDL
+    assert "'COMPLETED'" in GLOBAL_TASKS_RETENTION_FUNC_DDL
+    assert "'DISMISSED'" in GLOBAL_TASKS_RETENTION_FUNC_DDL
+    # DEAD_LETTER is deliberately excluded — it has its own longer grace
+    # period (dlq_max_age_days) enforced by TaskRetentionService.
+    assert "'DEAD_LETTER'" not in GLOBAL_TASKS_RETENTION_FUNC_DDL
+
+
+def test_events_and_storage_retention_ddl_remain_status_unaware():
+    """Regression guard: the production events/storage constants must not
+    pick up the tasks-only status guard."""
+    assert "part_is_purgeable" not in EVENTS_RETENTION_FUNC_DDL
+    assert "part_is_purgeable" not in STORAGE_RETENTION_FUNC_DDL
+
+
+# ---------------------------------------------------------------------------
 # Live-PG tests (skip when no PG is available)
 # ---------------------------------------------------------------------------
 

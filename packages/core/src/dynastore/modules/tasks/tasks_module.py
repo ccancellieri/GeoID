@@ -56,7 +56,7 @@ from dynastore.tools.background_service import (
     ServiceContext,
 )
 
-from .models import Task, TaskCreate, TaskUpdate
+from .models import Task, TaskCreate, TaskUpdate, TaskStatusEnum
 from .workclass_ddl import render_partition_create_ahead_ddl, render_partition_retention_ddl
 
 logger = logging.getLogger(__name__)
@@ -272,8 +272,25 @@ def set_hard_retry_cap(value: int) -> None:
 # shared template in workclass_ddl.py — see that module's docstring for why
 # {schema} survives as a literal placeholder and why the regex uses the
 # single-brace form \d{4}_\d{2}.
+#
+# Unlike events/storage (ephemeral queues), tasks.tasks rows carry audit
+# value (DEAD_LETTER history, PENDING/ACTIVE in-flight work) that must
+# outlive a 1-month partition boundary (#3216). purge_safe_statuses
+# restricts age-based pruning — both the leaf DROP TABLE and the
+# DEFAULT-partition DELETE — to rows already in a state nothing further
+# happens to. DEAD_LETTER is deliberately excluded even though it is
+# otherwise terminal: it has its own, longer grace period
+# (TasksPluginConfig.dlq_max_age_days, default 90d) enforced row-by-row by
+# TaskRetentionService.tick() below, independent of partition age.
+_TASKS_PURGE_SAFE_STATUSES = (
+    TaskStatusEnum.COMPLETED.value,
+    TaskStatusEnum.FAILED.value,
+    TaskStatusEnum.DISMISSED.value,
+)
+
 GLOBAL_TASKS_RETENTION_FUNC_DDL = render_partition_retention_ddl(
-    table="tasks", granularity="month", retention=1
+    table="tasks", granularity="month", retention=1,
+    purge_safe_statuses=_TASKS_PURGE_SAFE_STATUSES,
 )
 
 GLOBAL_TASKS_PARTCREATE_FUNC_DDL = render_partition_create_ahead_ddl(

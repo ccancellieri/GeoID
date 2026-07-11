@@ -66,6 +66,7 @@ the same startup block.
 """
 
 import logging
+from typing import Optional, Sequence
 
 from dynastore.modules.db_config.query_executor import (
     DDLQuery,
@@ -210,6 +211,14 @@ CREATE INDEX IF NOT EXISTS idx_storage_entity_id_lookup
 # entirely (which would require escaping every literal brace) — it uses
 # str.replace() against @MARKER@ tokens that cannot collide with {schema},
 # \d{4}, or the %I/%L specifiers passed to PostgreSQL's own format().
+#
+# ``render_partition_retention_ddl`` also accepts an optional
+# ``purge_safe_statuses`` sequence. When given (tasks.tasks — see
+# tasks_module.py), age alone is no longer sufficient to prune: a leaf
+# partition is only DROPped once it contains no row outside that status set,
+# and the DEFAULT-partition DELETE only removes rows whose status is in it.
+# Left unset (events/storage), retention behaves exactly as before — pure
+# age-based pruning, no status awareness (see #3216).
 # ---------------------------------------------------------------------------
 
 _GRANULARITY_SPECS: dict[str, dict[str, str]] = {
@@ -298,7 +307,7 @@ DECLARE
     default_deleted BIGINT;
     prune_count INT;
     prune_list TEXT;
-BEGIN
+@LEAF_STATUS_DECL@BEGIN
     -- Bound AccessExclusiveLock wait: if a partition is being actively scanned,
     -- fail fast and let the next supervisor tick retry rather than stalling.
     SET LOCAL lock_timeout = '10s';
@@ -329,7 +338,7 @@ BEGIN
             date_str := substring(row.relname from '@NAME_REGEX@$');
             part_date := to_date(date_str, '@DATE_FORMAT@');
             IF part_date < cutoff_date THEN
-                RAISE NOTICE 'Pruning old partition: {schema}.%', row.relname;
+@LEAF_STATUS_GUARD@                RAISE NOTICE 'Pruning old partition: {schema}.%', row.relname;
                 EXECUTE format('DROP TABLE "{schema}".%I', row.relname);
             END IF;
         EXCEPTION WHEN OTHERS THEN
@@ -338,7 +347,8 @@ BEGIN
     END LOOP;
     -- Drain stale rows from the DEFAULT partition (clock skew / far-future @TABLE@).
     DELETE FROM "{schema}".@TABLE@_default
-    WHERE @DEFAULT_COLUMN@ < (@DEFAULT_EXPR@ - INTERVAL '@RETENTION@ @STEP_UNIT@');
+    WHERE @DEFAULT_COLUMN@ < (@DEFAULT_EXPR@ - INTERVAL '@RETENTION@ @STEP_UNIT@')
+      @DEFAULT_STATUS_GUARD@;
     GET DIAGNOSTICS default_deleted = ROW_COUNT;
     IF default_deleted > 0 THEN
         RAISE NOTICE 'Pruned % row(s) from {schema}.@TABLE@_default', default_deleted;
@@ -383,15 +393,55 @@ def render_partition_create_ahead_ddl(*, table: str, granularity: str, window: i
     return _fill(_PARTCREATE_TEMPLATE, mapping)
 
 
-def render_partition_retention_ddl(*, table: str, granularity: str, retention: int) -> str:
+def render_partition_retention_ddl(
+    *,
+    table: str,
+    granularity: str,
+    retention: int,
+    purge_safe_statuses: Optional[Sequence[str]] = None,
+) -> str:
     """Render the retention PL/pgSQL function DDL for one workclass table.
 
     Drops leaf partitions (and drains the DEFAULT partition) older than
     ``retention`` periods (days or months, per ``granularity``). The
     returned string still carries the literal ``{schema}`` placeholder for
     ``DDLQuery`` to substitute.
+
+    ``purge_safe_statuses``, when given, makes pruning status-aware (see
+    #3216): a leaf partition is only DROPped once every row in it has a
+    ``status`` in this set, and the DEFAULT-partition DELETE only removes
+    rows whose ``status`` is in it. Rows in any other status (in-flight
+    work, or a terminal state with its own longer grace period — e.g.
+    DEAD_LETTER) are spared regardless of age; they are purged by their own
+    row-level retention policy instead. Leaving this ``None`` (the default,
+    used for events/storage) reproduces the prior pure age-based behavior
+    exactly.
     """
     spec = _GRANULARITY_SPECS[granularity]
+    if purge_safe_statuses:
+        status_list_sql = ", ".join(f"'{s}'" for s in purge_safe_statuses)
+        default_status_guard = f"AND status IN ({status_list_sql})"
+        leaf_status_decl = "    part_is_purgeable BOOLEAN;\n"
+        # Nested inside the single-quoted argument to format(), so each
+        # literal quote must be doubled ('' ) or it terminates that
+        # argument early and corrupts the generated statement.
+        status_list_sql_escaped = ", ".join(f"''{s}''" for s in purge_safe_statuses)
+        leaf_status_guard = (
+            "                EXECUTE format(\n"
+            "                    'SELECT NOT EXISTS (SELECT 1 FROM \"{schema}\".%I "
+            f"WHERE status NOT IN ({status_list_sql_escaped}))',\n"
+            "                    row.relname\n"
+            "                ) INTO part_is_purgeable;\n"
+            "                IF NOT part_is_purgeable THEN\n"
+            "                    RAISE NOTICE 'Skipping partition {schema}.%: "
+            "non-terminal rows remain', row.relname;\n"
+            "                    CONTINUE;\n"
+            "                END IF;\n"
+        )
+    else:
+        default_status_guard = ""
+        leaf_status_decl = ""
+        leaf_status_guard = ""
     mapping = {
         "TABLE": table,
         "TABLE_PREFIX": f"{table}_",
@@ -403,6 +453,9 @@ def render_partition_retention_ddl(*, table: str, granularity: str, retention: i
         "CUTOFF_EXPR": spec["cutoff_expr"],
         "DEFAULT_COLUMN": spec["default_partition_column"],
         "DEFAULT_EXPR": spec["default_partition_expr"],
+        "DEFAULT_STATUS_GUARD": default_status_guard,
+        "LEAF_STATUS_DECL": leaf_status_decl,
+        "LEAF_STATUS_GUARD": leaf_status_guard,
     }
     return _fill(_RETENTION_TEMPLATE, mapping)
 

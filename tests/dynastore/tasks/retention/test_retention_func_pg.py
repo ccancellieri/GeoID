@@ -137,25 +137,59 @@ async def test_retention_func_drops_old_monthly_partition(retention_schema, asyn
     )
 
 
+async def _insert_task(conn, schema: str, *, timestamp: datetime, status: str) -> uuid.UUID:
+    task_id = uuid.uuid4()
+    await conn.execute(  # type: ignore[attr-defined]
+        f'INSERT INTO "{schema}".tasks (task_id, timestamp, status) VALUES ($1, $2, $3)',
+        task_id,
+        timestamp,
+        status,
+    )
+    return task_id
+
+
+async def _create_old_leaf(conn, schema: str, *, months_ago: int) -> str:
+    """Create a monthly leaf partition older than the 1-month cutoff and
+    return its name plus a timestamp that falls inside it."""
+    from dateutil.relativedelta import relativedelta
+
+    old_dt = datetime.now(tz=timezone.utc).replace(day=1) - relativedelta(months=months_ago)
+    part_name = f"tasks_{old_dt.strftime('%Y_%m')}"
+    start = old_dt.replace(day=1)
+    end = start + relativedelta(months=1)
+    await conn.execute(  # type: ignore[attr-defined]
+        f"""
+        CREATE TABLE IF NOT EXISTS "{schema}"."{part_name}"
+        PARTITION OF "{schema}".tasks
+        FOR VALUES FROM ('{start.isoformat()}') TO ('{end.isoformat()}');
+        """
+    )
+    return part_name
+
+
+async def _partition_exists(conn, schema: str, part_name: str) -> bool:
+    return await conn.fetchval(  # type: ignore[attr-defined]
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = $1 AND c.relname = $2
+        )
+        """,
+        schema,
+        part_name,
+    )
+
+
 @pytest.mark.asyncio
 async def test_retention_func_drains_tasks_default(retention_schema, async_conn):
-    """Retention function must DELETE stale rows from tasks_default.
-
-    Rows with timestamps older than 1 month that ended up in the DEFAULT
-    partition (e.g. due to clock-skew) must be removed.
-    """
+    """Retention function must DELETE stale COMPLETED/FAILED/DISMISSED rows
+    from tasks_default — status is in the purge-safe set."""
     schema = retention_schema
     conn = async_conn
 
-    # Insert a row with a timestamp well outside the monthly partition range
-    # so it lands in tasks_default.
     old_ts = datetime(2020, 1, 15, tzinfo=timezone.utc)
-    task_id = uuid.uuid4()
-    await conn.execute(  # type: ignore[attr-defined]
-        f'INSERT INTO "{schema}".tasks (task_id, timestamp) VALUES ($1, $2)',
-        task_id,
-        old_ts,
-    )
+    await _insert_task(conn, schema, timestamp=old_ts, status="COMPLETED")
 
     # Verify it actually landed in tasks_default.
     count_before = await conn.fetchval(  # type: ignore[attr-defined]
@@ -170,7 +204,123 @@ async def test_retention_func_drains_tasks_default(retention_schema, async_conn)
         f'SELECT COUNT(*) FROM "{schema}".tasks_default'
     )
     assert count_after == 0, (
-        "Retention function should have deleted the stale row from tasks_default"
+        "Retention function should have deleted the stale COMPLETED row from tasks_default"
+    )
+
+
+# ---------------------------------------------------------------------------
+# #3216 — retention must SPARE non-terminal rows (PENDING/ACTIVE) and rows in
+# a terminal-but-graced state (DEAD_LETTER) regardless of age; only rows
+# already in purge_safe_statuses (COMPLETED/FAILED/DISMISSED) are eligible
+# for age-based pruning.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retention_func_spares_pending_row_in_tasks_default(retention_schema, async_conn):
+    """A PENDING row in tasks_default must survive the DEFAULT-partition
+    age-based DELETE — it is still in flight."""
+    schema = retention_schema
+    conn = async_conn
+
+    old_ts = datetime(2020, 1, 15, tzinfo=timezone.utc)
+    task_id = await _insert_task(conn, schema, timestamp=old_ts, status="PENDING")
+
+    await _provision_retention_func(conn, schema)
+    await _call_retention_func(conn, schema)
+
+    row = await conn.fetchrow(  # type: ignore[attr-defined]
+        f'SELECT task_id FROM "{schema}".tasks_default WHERE task_id = $1', task_id,
+    )
+    assert row is not None, "PENDING row must not be deleted by age-only retention"
+
+
+@pytest.mark.asyncio
+async def test_retention_func_spares_dead_letter_row_in_tasks_default(retention_schema, async_conn):
+    """A DEAD_LETTER row in tasks_default must survive the DEFAULT-partition
+    age-based DELETE — it has its own longer DLQ grace period, enforced
+    elsewhere (TaskRetentionService), not by partition-age alone."""
+    schema = retention_schema
+    conn = async_conn
+
+    old_ts = datetime(2020, 1, 15, tzinfo=timezone.utc)
+    task_id = await _insert_task(conn, schema, timestamp=old_ts, status="DEAD_LETTER")
+
+    await _provision_retention_func(conn, schema)
+    await _call_retention_func(conn, schema)
+
+    row = await conn.fetchrow(  # type: ignore[attr-defined]
+        f'SELECT task_id FROM "{schema}".tasks_default WHERE task_id = $1', task_id,
+    )
+    assert row is not None, "DEAD_LETTER row must not be deleted by age-only retention"
+
+
+@pytest.mark.asyncio
+async def test_retention_func_spares_leaf_partition_with_dead_letter_row(retention_schema, async_conn):
+    """Reproduces the #3216 failure scenario: a monthly leaf partition
+    holding a DEAD_LETTER row must NOT be dropped once the partition ages
+    past the 1-month cutoff — the row's DLQ grace period has not elapsed."""
+    schema = retention_schema
+    conn = async_conn
+
+    part_name = await _create_old_leaf(conn, schema, months_ago=3)
+    start = datetime.strptime(part_name, "tasks_%Y_%m").replace(
+        day=15, tzinfo=timezone.utc
+    )
+    task_id = await _insert_task(conn, schema, timestamp=start, status="DEAD_LETTER")
+
+    await _provision_retention_func(conn, schema)
+    await _call_retention_func(conn, schema)
+
+    assert await _partition_exists(conn, schema, part_name), (
+        f"{part_name} holding a DEAD_LETTER row must survive retention"
+    )
+    row = await conn.fetchrow(  # type: ignore[attr-defined]
+        f'SELECT task_id FROM "{schema}"."{part_name}" WHERE task_id = $1', task_id,
+    )
+    assert row is not None
+
+
+@pytest.mark.asyncio
+async def test_retention_func_spares_leaf_partition_with_pending_row(retention_schema, async_conn):
+    """A monthly leaf partition holding a PENDING row must NOT be dropped —
+    the work is still unclaimed / in flight."""
+    schema = retention_schema
+    conn = async_conn
+
+    part_name = await _create_old_leaf(conn, schema, months_ago=3)
+    start = datetime.strptime(part_name, "tasks_%Y_%m").replace(
+        day=15, tzinfo=timezone.utc
+    )
+    await _insert_task(conn, schema, timestamp=start, status="PENDING")
+
+    await _provision_retention_func(conn, schema)
+    await _call_retention_func(conn, schema)
+
+    assert await _partition_exists(conn, schema, part_name), (
+        f"{part_name} holding a PENDING row must survive retention"
+    )
+
+
+@pytest.mark.asyncio
+async def test_retention_func_drops_leaf_partition_when_all_rows_terminal(retention_schema, async_conn):
+    """A monthly leaf partition whose rows are all COMPLETED/FAILED/DISMISSED
+    is still dropped once past the cutoff — the guard must not block the
+    cheap-path space reclamation the partition-drop mechanism exists for."""
+    schema = retention_schema
+    conn = async_conn
+
+    part_name = await _create_old_leaf(conn, schema, months_ago=3)
+    start = datetime.strptime(part_name, "tasks_%Y_%m").replace(
+        day=15, tzinfo=timezone.utc
+    )
+    await _insert_task(conn, schema, timestamp=start, status="COMPLETED")
+
+    await _provision_retention_func(conn, schema)
+    await _call_retention_func(conn, schema)
+
+    assert not await _partition_exists(conn, schema, part_name), (
+        f"{part_name} with only terminal-purge-safe rows should have been dropped"
     )
 
 

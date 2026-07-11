@@ -70,13 +70,16 @@ async def retention_schema(async_conn) -> AsyncIterator[str]:  # noqa: ANN001
     conn = async_conn
     await conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')  # type: ignore[attr-defined]
 
-    # Minimal tasks table (partition key only — avoids importing the full DDL
-    # chain which needs triggers / indexes not required for this test).
+    # Minimal tasks table (partition key + status — avoids importing the full
+    # DDL chain which needs triggers / indexes not required for this test).
+    # ``status`` is required: the retention function's purge_safe_statuses
+    # guard (#3216) filters on it.
     await conn.execute(  # type: ignore[attr-defined]
         f"""
         CREATE TABLE "{schema}".tasks (
             task_id   UUID        NOT NULL,
             timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            status    TEXT        NOT NULL DEFAULT 'PENDING',
             PRIMARY KEY (timestamp, task_id)
         ) PARTITION BY RANGE (timestamp);
         """
