@@ -37,10 +37,12 @@ import pytest
 
 from dynastore.modules.catalog.maintenance_supervisor import (
     JOB_CONTROL_PLANE_RETENTION,
+    JOB_OBLIGATION_SWEEP,
     JOB_TASK_PARTITION_CREATE,
     JOB_TASK_REAPER,
     JOB_TASK_RETENTION,
     _CADENCE_CONTROL_PLANE_RETENTION,
+    _CADENCE_OBLIGATION_SWEEP,
     _CADENCE_TASK_PARTITION_CREATE,
     _CADENCE_TASK_REAPER,
     _CADENCE_TASK_RETENTION,
@@ -145,10 +147,13 @@ async def test_register_supervisor_jobs_includes_task_jobs():
     cadence_map = dict(upserted)
     job_names = list(cadence_map.keys())
 
-    # Total: 3 optional/logs/iam + 3 task + 4 events/storage + control-plane = 11
-    # (the 3 legacy events.events accumulation jobs were retired in #1807 P4).
-    assert len(job_names) == 11
+    # Total: 3 optional/logs/iam + 3 task + 4 events/storage + control-plane
+    # + obligation-sweep = 12
+    # (the 3 legacy events.events accumulation jobs were retired in #1807 P4;
+    # obligation_sweep was added by #3196).
+    assert len(job_names) == 12
 
+    assert JOB_OBLIGATION_SWEEP in cadence_map
     assert JOB_TASK_REAPER in cadence_map
     assert JOB_TASK_PARTITION_CREATE in cadence_map
     assert JOB_TASK_RETENTION in cadence_map
@@ -158,6 +163,7 @@ async def test_register_supervisor_jobs_includes_task_jobs():
     assert cadence_map[JOB_TASK_PARTITION_CREATE] == _CADENCE_TASK_PARTITION_CREATE
     assert cadence_map[JOB_TASK_RETENTION] == _CADENCE_TASK_RETENTION
     assert cadence_map[JOB_CONTROL_PLANE_RETENTION] == _CADENCE_CONTROL_PLANE_RETENTION
+    assert cadence_map[JOB_OBLIGATION_SWEEP] == _CADENCE_OBLIGATION_SWEEP
 
 
 # ---------------------------------------------------------------------------
