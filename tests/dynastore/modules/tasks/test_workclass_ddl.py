@@ -243,11 +243,15 @@ def test_retention_funcs_have_lock_timeout():
 
 
 def test_retention_funcs_drain_default_partition():
-    """Retention functions must DELETE stale rows from the DEFAULT partition."""
-    assert "events_default" in EVENTS_RETENTION_FUNC_DDL
-    assert "DELETE FROM" in EVENTS_RETENTION_FUNC_DDL
-    assert "storage_default" in STORAGE_RETENTION_FUNC_DDL
-    assert "DELETE FROM" in STORAGE_RETENTION_FUNC_DDL
+    """Retention functions must DELETE stale rows from the DEFAULT partition —
+    addressed through the parent table pinned by tableoid, never by naming the
+    DEFAULT leaf directly (privileges are checked on the named table only, and
+    the leaf may be owned by a different role — #3158)."""
+    for table, ddl in (("events", EVENTS_RETENTION_FUNC_DDL),
+                       ("storage", STORAGE_RETENTION_FUNC_DDL)):
+        assert f'DELETE FROM "{{schema}}".{table}\n' in ddl
+        assert f"to_regclass('\"{{schema}}\".{table}_default')" in ddl
+        assert f'DELETE FROM "{{schema}}".{table}_default' not in ddl
 
 
 def test_partcreate_funcs_use_to_char_yyyy_mm_dd():
@@ -724,8 +728,12 @@ def test_render_tasks_retention_pinned():
     assert "date_trunc('daily'" not in rendered
     assert r"tasks_\d{4}_\d{2}" in rendered
     assert r"\d{{4}}" not in rendered
-    assert "WHERE timestamp <" in rendered
-    assert "tasks_default" in rendered
+    # Default-partition drain goes through the parent, pinned by tableoid
+    # (#3158) — the age predicate follows the pin.
+    assert 'DELETE FROM "{schema}".tasks\n' in rendered
+    assert "WHERE tableoid = to_regclass('\"{schema}\".tasks_default')" in rendered
+    assert "AND timestamp <" in rendered
+    assert 'DELETE FROM "{schema}".tasks_default' not in rendered
 
 
 def test_render_functions_reject_unknown_granularity():

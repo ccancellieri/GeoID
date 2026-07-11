@@ -346,8 +346,17 @@ DECLARE
         END;
     END LOOP;
     -- Drain stale rows from the DEFAULT partition (clock skew / far-future @TABLE@).
-    DELETE FROM "{schema}".@TABLE@_default
-    WHERE @DEFAULT_COLUMN@ < (@DEFAULT_EXPR@ - INTERVAL '@RETENTION@ @STEP_UNIT@')
+    -- Addressed through the PARENT table, pinned to the DEFAULT leaf via
+    -- tableoid (#3158): Postgres checks privileges only on the table named in
+    -- the statement, so DELETE on the parent — which any role operating this
+    -- plane holds — suffices even when the DEFAULT leaf was created by, and is
+    -- owned by, a different role (naming the leaf directly raises 42501 and
+    -- fails the whole retention run: unlike the per-leaf DROP above, this
+    -- statement has no per-item exception guard). to_regclass resolves at
+    -- execution time and yields NULL (=> no-op) if the leaf does not exist.
+    DELETE FROM "{schema}".@TABLE@
+    WHERE tableoid = to_regclass('"{schema}".@TABLE@_default')
+      AND @DEFAULT_COLUMN@ < (@DEFAULT_EXPR@ - INTERVAL '@RETENTION@ @STEP_UNIT@')
       @DEFAULT_STATUS_GUARD@;
     GET DIAGNOSTICS default_deleted = ROW_COUNT;
     IF default_deleted > 0 THEN

@@ -208,6 +208,65 @@ async def test_retention_func_drains_tasks_default(retention_schema, async_conn)
     )
 
 
+@pytest.mark.asyncio
+async def test_retention_func_drains_default_partition_owned_by_another_role(
+    retention_schema, async_conn,
+):
+    """#3158 regression: the DEFAULT-partition drain must not require any
+    privilege on the DEFAULT leaf itself.
+
+    In mixed-role deployments the DEFAULT partition can be created — and is
+    then owned — by a different role than the one running retention. The
+    retention role necessarily holds DML privileges on the *parent* table
+    (it operates the task plane) but may hold none on the leaf; the drain
+    must still succeed instead of failing the whole run with 42501.
+    """
+    schema = retention_schema
+    conn = async_conn
+
+    suffix = schema.rsplit("_", 1)[-1]
+    owner_role = f"ret3158_owner_{suffix}"
+    runner_role = f"ret3158_runner_{suffix}"
+    await conn.execute(f'CREATE ROLE "{owner_role}"')  # type: ignore[attr-defined]
+    await conn.execute(f'CREATE ROLE "{runner_role}"')  # type: ignore[attr-defined]
+    try:
+        # The DEFAULT leaf belongs to somebody else; the runner gets the
+        # parent-table privileges any task-plane role has — and nothing on
+        # the leaf.
+        await conn.execute(  # type: ignore[attr-defined]
+            f'ALTER TABLE "{schema}".tasks_default OWNER TO "{owner_role}"'
+        )
+        await conn.execute(  # type: ignore[attr-defined]
+            f'GRANT USAGE ON SCHEMA "{schema}" TO "{runner_role}"'
+        )
+        await conn.execute(  # type: ignore[attr-defined]
+            f'GRANT SELECT, INSERT, UPDATE, DELETE ON "{schema}".tasks TO "{runner_role}"'
+        )
+
+        old_ts = datetime(2020, 1, 15, tzinfo=timezone.utc)
+        await _insert_task(conn, schema, timestamp=old_ts, status="COMPLETED")
+
+        await _provision_retention_func(conn, schema)
+        await conn.execute(f'SET ROLE "{runner_role}"')  # type: ignore[attr-defined]
+        try:
+            await _call_retention_func(conn, schema)
+        finally:
+            await conn.execute("RESET ROLE")  # type: ignore[attr-defined]
+
+        count_after = await conn.fetchval(  # type: ignore[attr-defined]
+            f'SELECT COUNT(*) FROM "{schema}".tasks_default'
+        )
+        assert count_after == 0, (
+            "DEFAULT-partition drain must succeed without privileges on the "
+            "leaf — DELETE privilege on the parent table must be sufficient"
+        )
+    finally:
+        await conn.execute("RESET ROLE")  # type: ignore[attr-defined]
+        await conn.execute(f'DROP OWNED BY "{owner_role}", "{runner_role}"')  # type: ignore[attr-defined]
+        await conn.execute(f'DROP ROLE "{owner_role}"')  # type: ignore[attr-defined]
+        await conn.execute(f'DROP ROLE "{runner_role}"')  # type: ignore[attr-defined]
+
+
 # ---------------------------------------------------------------------------
 # #3216 — retention must SPARE non-terminal rows (PENDING/ACTIVE) and rows in
 # a terminal-but-graced state (DEAD_LETTER) regardless of age; only rows
