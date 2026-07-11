@@ -60,7 +60,12 @@ from dynastore.modules.db_config.exceptions import (
     PoolSaturationError,
     QueryExecutionError,
 )
-from dynastore.tools.render_admission import RenderAdmissionGate, RenderAdmissionRejected
+from dynastore.tools.render_admission import (
+    DEFAULT_RASTER_RENDER_SHARE,
+    DEFAULT_VECTOR_RENDER_SHARE,
+    RenderAdmissionGate,
+    RenderAdmissionRejected,
+)
 from dynastore.extensions.tools.query import parse_hints_param, validate_filter_lang
 from dynastore.extensions.tools.resolvers import (
     resolve_internal_catalog_id_or_404,
@@ -284,16 +289,24 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
     # write instead of raising.
     _tile_cache_writer: Optional[TileCacheWriter] = None
 
-    # Per-worker render admission gate (geoid#3155) — caps concurrent MVT
-    # vector-tile and raster/vector map-tile renders against this worker's
-    # memory budget so a burst of heavy renders can no longer pin unbounded
-    # heap together (see tools/render_admission.py). A class-level default
-    # (construction is pure env/derived, no I/O) so tests that build a
-    # TilesService via ``object.__new__`` — bypassing ``__init__``, the same
-    # pattern already used for ``_tile_cache_writer`` above — still exercise
-    # real admission control instead of silently skipping it; ``__init__``
-    # replaces it with a fresh per-instance gate.
-    _render_gate: RenderAdmissionGate = RenderAdmissionGate()
+    # Per-worker render admission — caps concurrent renders against this
+    # worker's memory budget so a burst of heavy renders can no longer pin
+    # unbounded heap together (see tools/render_admission.py). Split into
+    # two independent bulkheads (geoid#3209, follow-up to the single shared
+    # gate #3161 introduced): raster (rio-tiler/COG) renders and vector
+    # (PostGIS MVT + vector-rendered map PNG) renders each get their own
+    # budget, so a burst of one class can no longer starve the other.
+    # Class-level defaults (construction is pure env/derived, no I/O) so
+    # tests that build a TilesService via ``object.__new__`` — bypassing
+    # ``__init__``, the same pattern already used for ``_tile_cache_writer``
+    # above — still exercise real admission control instead of silently
+    # skipping it; ``__init__`` replaces them with fresh per-instance gates.
+    _raster_render_gate: RenderAdmissionGate = RenderAdmissionGate(
+        render_share=DEFAULT_RASTER_RENDER_SHARE
+    )
+    _vector_render_gate: RenderAdmissionGate = RenderAdmissionGate(
+        render_share=DEFAULT_VECTOR_RENDER_SHARE
+    )
 
     def get_web_pages(self):
         from dynastore.extensions.tools.web_collect import collect_web_pages
@@ -337,9 +350,21 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         super().__init__()
         self.app = app
         self.router = APIRouter(tags=["OGC API - Tiles"], prefix="/tiles")
-        self._render_gate = RenderAdmissionGate()
+        self._raster_render_gate = RenderAdmissionGate(render_share=DEFAULT_RASTER_RENDER_SHARE)
+        self._vector_render_gate = RenderAdmissionGate(render_share=DEFAULT_VECTOR_RENDER_SHARE)
         self._register_routes()
         logger.info("Tiles Service: Initializing.")
+        # Observability for #3209: the 2026-07-10 storm forensics found no
+        # admission/shed log line in either storm window, which meant the
+        # derived limit could not be confirmed to have engaged at all. Log
+        # the two computed per-worker caps once at startup so they are
+        # always visible, independent of whether a shed ever fires.
+        logger.info(
+            "Tiles Service: render admission bulkheads — raster max_concurrent=%d "
+            "vector max_concurrent=%d",
+            self._raster_render_gate.max_concurrent,
+            self._vector_render_gate.max_concurrent,
+        )
 
     def contribute(self, ref):
         """AssetContributor: emit a vector-tiles XYZ template link for items."""
@@ -1257,15 +1282,16 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                     _abort_reason, dataset, collections, z, x, y, start_time,
                 )
 
-            # Render admission gate (#3155): cap concurrent renders on this
-            # worker against its memory budget, queueing briefly then
+            # Vector render admission gate (#3155, split into a dedicated
+            # vector bulkhead in #3209): cap concurrent MVT renders on this
+            # worker against its own memory budget, queueing briefly then
             # shedding rather than letting an unbounded burst race the
             # worker's RSS budget — the failure mode that OOM-killed maps
             # under a QGIS multi-tile viewport refresh. Resolved BEFORE the
             # DB connection below so a render queued on the gate never holds
             # a pool connection idle while it waits.
             try:
-                await self._render_gate.acquire()
+                await self._vector_render_gate.acquire()
             except RenderAdmissionRejected as exc:
                 logger.warning(
                     "get_vector_tile: render admission rejected (%s) "
@@ -1307,7 +1333,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 # rather than leaving it to the top-level `finally` (the same
                 # ownership discipline as `_conn` above: whoever fails to
                 # hand a resource off to the render task must release it).
-                self._render_gate.release()
+                self._vector_render_gate.release()
                 _render_admitted = False
                 logger.warning(
                     "get_vector_tile: DB pool saturated (timeout=%.1fs) "
@@ -1539,7 +1565,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                         exc_info=True,
                     )
             if _render_admitted:
-                self._render_gate.release()
+                self._vector_render_gate.release()
 
     # --- Helper Private Methods ---
     #
@@ -1550,17 +1576,18 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
     async def _render_and_release_gate(
         self, render_coro: Awaitable[Optional[bytes]]
     ) -> Optional[bytes]:
-        """Await ``render_coro``, releasing the render-admission slot exactly
-        when the render itself finishes — success, failure, or eventual
-        cancellation — regardless of the awaiting request coroutine's own
-        lifetime (#3155). Pairs with the ``self._render_gate.acquire()`` in
-        ``get_vector_tile``, called right before the wrapped task is created;
-        see the ownership-handoff comment there.
+        """Await ``render_coro``, releasing the vector render-admission slot
+        exactly when the render itself finishes — success, failure, or
+        eventual cancellation — regardless of the awaiting request
+        coroutine's own lifetime (#3155). Pairs with the ``self.
+        _vector_render_gate.acquire()`` in ``get_vector_tile``, called right
+        before the wrapped task is created; see the ownership-handoff
+        comment there.
         """
         try:
             return await render_coro
         finally:
-            self._render_gate.release()
+            self._vector_render_gate.release()
 
     @staticmethod
     def _handle_render_aborted(
@@ -2207,7 +2234,9 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
 
         ``render_gate`` bounds concurrent renders on this worker (#3155) —
         acquired around the actual off-thread render call, released before
-        this returns either way.
+        this returns either way. Callers pass ``self._raster_render_gate``
+        (#3209: this helper only ever renders raster/COG tiles, so it draws
+        from the raster bulkhead, never the vector one).
         """
         from dynastore.modules.concurrency import run_in_thread
 
@@ -2559,7 +2588,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             check_invalid_expression=True,
             provider=provider,
             cfg=cfg,
-            render_gate=self._render_gate,
+            render_gate=self._raster_render_gate,
         )
 
     async def _get_vector_map_tile(
@@ -2663,11 +2692,15 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 ),
             )
 
-        # Render admission gate (#3155), resolved BEFORE the render
-        # connection so a render queued on the gate never holds a pool
-        # connection idle while it waits — same ordering as get_vector_tile.
+        # Vector render admission gate (#3155, split into a dedicated vector
+        # bulkhead in #3209) — this tile's bytes come from PostGIS/MVT
+        # rendering even though the response is PNG, so it shares the
+        # vector budget, not the raster (rio-tiler/COG) one. Resolved
+        # BEFORE the render connection so a render queued on the gate never
+        # holds a pool connection idle while it waits — same ordering as
+        # get_vector_tile.
         try:
-            async with self._render_gate.admit():
+            async with self._vector_render_gate.admit():
                 # Acquired last, once metadata resolution above is done —
                 # this is the only connection this handler ever needs to
                 # hold now.
@@ -2931,7 +2964,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 check_invalid_expression=False,
                 provider=provider,
                 cfg=cfg,
-                render_gate=self._render_gate,
+                render_gate=self._raster_render_gate,
             )
 
         # ------------------------------------------------------------------
@@ -3011,7 +3044,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 check_invalid_expression=True,
                 provider=provider,
                 cfg=cfg,
-                render_gate=self._render_gate,
+                render_gate=self._raster_render_gate,
             )
 
         # ------------------------------------------------------------------
@@ -3047,7 +3080,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             check_invalid_expression=True,
             provider=provider,
             cfg=cfg,
-            render_gate=self._render_gate,
+            render_gate=self._raster_render_gate,
         )
 
     async def _invalidate_tile_cache_impl(self, catalog_id: str, collection_id: Optional[str]) -> dict:

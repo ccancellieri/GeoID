@@ -56,6 +56,14 @@ No web-framework imports — this is a plain control-point primitive
 (runner-agnostic, like ``tools/async_utils.py``); translating
 ``RenderAdmissionRejected`` into an HTTP 503 + ``Retry-After`` response is
 the caller's job (see ``extensions/tiles/tiles_service.py``).
+
+This module builds one gate at a time — it has no opinion on how many a
+caller needs. ``TilesService`` builds TWO independent ``RenderAdmissionGate``
+instances (geoid#3209): one for raster (rio-tiler/COG) renders, one for
+vector (PostGIS MVT + vector-rendered map PNG) renders, via the
+``DEFAULT_RASTER_RENDER_SHARE`` / ``DEFAULT_VECTOR_RENDER_SHARE`` constants
+below — a burst of either class can then only ever exhaust its own budget,
+never the other's.
 """
 
 from __future__ import annotations
@@ -92,7 +100,22 @@ DEFAULT_PRESSURE_RATIO = 0.90
 # pin, used only to size the semaphore cap (see resolve_render_admission_cap).
 # Conservative — the rest of the budget covers the interpreter, connection
 # pools, ORM/L1 caches, and everything else already resident in the process.
+# Kept as the generic default for callers that want a single undivided gate;
+# ``TilesService`` no longer does (see the two shares immediately below).
 DEFAULT_RENDER_SHARE = 0.5
+
+# Raster (rio-tiler/COG) and vector (PostGIS MVT + vector-rendered map PNG)
+# renders are admitted through SEPARATE per-worker budgets — bulkheads
+# (geoid#3209) — instead of the single shared gate #3161 introduced: a burst
+# of one class pinning heap could otherwise starve the other even though
+# neither alone was anywhere near its own cap (e.g. a raster COG storm
+# blocking the vector fast lane, or vice versa). Splitting
+# DEFAULT_RENDER_SHARE evenly between the two classes keeps the combined
+# worst case no higher than the pre-split gate while making each class
+# independently boundable. Not re-tuned against live storm concurrency yet —
+# see the module docstring.
+DEFAULT_RASTER_RENDER_SHARE = 0.25
+DEFAULT_VECTOR_RENDER_SHARE = 0.25
 
 # Estimated peak heap one render can pin. Sized from the incident evidence
 # (#3155): ~3.1GiB RSS pinned by 6-8 concurrent GAUL-level-1 MVT renders,
@@ -169,15 +192,21 @@ class RenderAdmissionGate:
         self,
         *,
         max_concurrent: Optional[int] = None,
+        render_share: float = DEFAULT_RENDER_SHARE,
         queue_wait_seconds: float = DEFAULT_QUEUE_WAIT_SECONDS,
         pressure_ratio: float = DEFAULT_PRESSURE_RATIO,
         get_rss_bytes: Callable[[], Optional[int]] = read_process_rss_bytes,
         get_budget_bytes: Optional[Callable[[], Optional[int]]] = None,
     ) -> None:
+        # ``render_share`` only matters when ``max_concurrent`` is not given
+        # explicitly — it selects which slice of the per-worker memory
+        # budget this gate derives its cap from (geoid#3209: separate
+        # raster/vector bulkheads pass DEFAULT_RASTER_RENDER_SHARE /
+        # DEFAULT_VECTOR_RENDER_SHARE here instead of sharing one gate).
         cap = (
             max_concurrent
             if max_concurrent is not None
-            else resolve_render_admission_cap()
+            else resolve_render_admission_cap(render_share=render_share)
         )
         if cap <= 0:
             raise ValueError("max_concurrent must be positive")
@@ -248,8 +277,10 @@ class RenderAdmissionGate:
 __all__ = [
     "DEFAULT_PRESSURE_RATIO",
     "DEFAULT_QUEUE_WAIT_SECONDS",
+    "DEFAULT_RASTER_RENDER_SHARE",
     "DEFAULT_RENDER_COST_MB",
     "DEFAULT_RENDER_SHARE",
+    "DEFAULT_VECTOR_RENDER_SHARE",
     "RenderAdmissionGate",
     "RenderAdmissionRejected",
     "resolve_render_admission_cap",

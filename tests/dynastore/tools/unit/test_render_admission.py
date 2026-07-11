@@ -254,3 +254,34 @@ def test_resolve_render_admission_cap_floors_at_minimum(monkeypatch):
     # A tiny budget must still admit at least _MIN_CONCURRENT concurrent renders.
     monkeypatch.setattr(render_admission_mod, "resolve_watchdog_budget_mb", lambda: 50)
     assert resolve_render_admission_cap() == render_admission_mod._MIN_CONCURRENT
+
+
+# ---------------------------------------------------------------------------
+# RenderAdmissionGate(render_share=...) — the raster/vector bulkhead knob
+# (geoid#3209)
+# ---------------------------------------------------------------------------
+
+
+def test_gate_render_share_kwarg_selects_the_budget_slice(monkeypatch):
+    """``RenderAdmissionGate(render_share=...)`` must forward to
+    ``resolve_render_admission_cap`` — this is how ``TilesService`` derives
+    two independently-sized gates (raster/vector) from the same per-worker
+    memory budget without duplicating the derivation logic."""
+    import dynastore.tools.render_admission as render_admission_mod
+
+    monkeypatch.setattr(render_admission_mod, "resolve_watchdog_budget_mb", lambda: 4096)
+
+    # 4096 * 0.25 // 400 = 2
+    gate = RenderAdmissionGate(render_share=0.25)
+    assert gate.max_concurrent == 2
+
+    # 4096 * 0.5 // 400 = 5 (the pre-split, undivided share)
+    gate_full = RenderAdmissionGate()
+    assert gate_full.max_concurrent == 5
+
+
+def test_explicit_max_concurrent_overrides_render_share():
+    """``max_concurrent`` still wins outright when given — ``render_share``
+    is only consulted for the derived-cap fallback."""
+    gate = RenderAdmissionGate(max_concurrent=7, render_share=0.01)
+    assert gate.max_concurrent == 7
