@@ -606,11 +606,24 @@ class GeometriesSidecar(SidecarProtocol):
         )
         known_columns.add("geometry_hash")
 
-        # Add Statistics Columns — derived from ``compute_fields_overlay``
-        if self._has_jsonb_stats():
+        # Add Statistics Columns — derived from ``compute_fields_overlay``.
+        # Excludes _PLACE_TABLE_KINDS: those 3D place statistics are computed
+        # from the JSON-FG 'place' member and stored exclusively on the
+        # {table}_place table (below) — minting a bare column here would be
+        # dead weight, never written and never read. Same filter as the
+        # place-column DDL loop, the place payload builder, and
+        # ``resolve_computed_value``.
+        main_table_fields = [
+            f for f in self._storage_fields() if f.kind not in _PLACE_TABLE_KINDS
+        ]
+        if any(
+            f.storage_mode == StatisticStorageMode.JSONB for f in main_table_fields
+        ):
             columns.append("geom_stats JSONB")
             known_columns.add("geom_stats")
-        for f in self._columnar_fields():
+        for f in main_table_fields:
+            if f.storage_mode != StatisticStorageMode.COLUMNAR:
+                continue
             col_name = f.resolved_name
             col_type = self._columnar_sql_type(f, srid)
             columns.append(f"{col_name} {col_type}")
@@ -701,9 +714,11 @@ class GeometriesSidecar(SidecarProtocol):
         # COLUMNAR + indexed=True emits a direct B-tree; JSONB never
         # combines with indexed=True (rejected at ComputedField
         # construction — operators must declare a second COLUMNAR field
-        # to get a B-tree alongside the JSONB key).
-        for f in self._columnar_fields():
-            if not f.indexed:
+        # to get a B-tree alongside the JSONB key). Uses ``main_table_fields``
+        # (place kinds excluded above) so this never indexes a column that
+        # wasn't minted.
+        for f in main_table_fields:
+            if f.storage_mode != StatisticStorageMode.COLUMNAR or not f.indexed:
                 continue
             col_name = f.resolved_name
             ddl += (

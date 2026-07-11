@@ -316,3 +316,55 @@ def test_place_table_has_fk_and_pk():
     assert "PRIMARY KEY" in ddl
     assert "FOREIGN KEY" in ddl
     assert "ON DELETE CASCADE" in ddl
+
+
+# ---------------------------------------------------------------------------
+# DDL shape — main-table COLUMNAR/JSONB loops exclude _PLACE_TABLE_KINDS
+# (#3222 deferred DDL wart: a place stat used to also get a bare, dead
+# column on {table}_geometries in addition to its real place_{name}
+# column on {table}_place).
+# ---------------------------------------------------------------------------
+
+def test_place_kind_columnar_does_not_mint_bare_column_on_main_table():
+    ddl = _make_sidecar_ddl([
+        ComputedField(kind=ComputedKind.Z_RANGE, storage_mode=StatisticStorageMode.COLUMNAR)
+    ])
+    main_table_ddl = ddl.split("_place")[0]
+    assert "z_range DOUBLE PRECISION" not in main_table_ddl
+    assert "place_z_range DOUBLE PRECISION" in ddl
+
+
+def test_place_kind_jsonb_does_not_mint_geom_stats_on_main_table():
+    ddl = _make_sidecar_ddl([
+        ComputedField(kind=ComputedKind.SURFACE_AREA, storage_mode=StatisticStorageMode.JSONB)
+    ])
+    main_table_ddl = ddl.split("_place")[0]
+    assert "geom_stats JSONB" not in main_table_ddl
+    assert "place_stats JSONB" in ddl
+
+
+def test_place_kind_indexed_does_not_mint_bare_index_on_main_table():
+    ddl = _make_sidecar_ddl([
+        ComputedField(
+            kind=ComputedKind.Z_RANGE,
+            storage_mode=StatisticStorageMode.COLUMNAR,
+            indexed=True,
+        )
+    ])
+    main_table_ddl = ddl.split("_place")[0]
+    assert "idx_test_table_geometries_z_range" not in main_table_ddl
+    assert "idx_test_table_place_z_range" in ddl
+
+
+def test_mixed_2d_and_place_kinds_only_place_excluded_from_main_table():
+    """A non-place COLUMNAR field alongside a place field: the non-place
+    field still gets its bare main-table column; only the place field is
+    excluded."""
+    ddl = _make_sidecar_ddl([
+        ComputedField(kind=ComputedKind.AREA, storage_mode=StatisticStorageMode.COLUMNAR),
+        ComputedField(kind=ComputedKind.Z_RANGE, storage_mode=StatisticStorageMode.COLUMNAR),
+    ])
+    main_table_ddl = ddl.split("_place")[0]
+    assert "area DOUBLE PRECISION" in main_table_ddl
+    assert "z_range DOUBLE PRECISION" not in main_table_ddl
+    assert "place_z_range DOUBLE PRECISION" in ddl
