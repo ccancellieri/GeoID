@@ -57,6 +57,24 @@ def _export_dataset_to_png_bytes(dataset: gdal.Dataset) -> bytes:
 # --- High-Performance Default Renderer ---
 
 
+def _explode_collections(geom: ogr.Geometry) -> List[ogr.Geometry]:
+    """Recursively explode a GEOMETRYCOLLECTION into its concrete parts.
+
+    GEOS refuses boundary/overlay operations on GeometryCollection inputs
+    (``IllegalArgumentException: Operation not supported by GeometryCollection``),
+    so a single stored collection feature would crash the stroke pass
+    (``GetBoundary()``) and fail the whole rendered tile. Non-collection
+    geometries pass through unchanged. Multi* types are NOT collections in
+    the flattened-type sense and are kept whole.
+    """
+    if ogr.GT_Flatten(geom.GetGeometryType()) != ogr.wkbGeometryCollection:
+        return [geom]
+    parts: List[ogr.Geometry] = []
+    for i in range(geom.GetGeometryCount()):
+        parts.extend(_explode_collections(geom.GetGeometryRef(i).Clone()))
+    return parts
+
+
 def _render_default_style(
     mem_dataset: gdal.Dataset, geoms: List[ogr.Geometry], srs: osr.SpatialReference
 ):
@@ -524,7 +542,7 @@ def render_map_image(
             if geom:
                 if coord_transform:
                     geom.Transform(coord_transform)
-                all_geoms.append(geom)
+                all_geoms.extend(_explode_collections(geom))
         _render_default_style(mem_dataset, all_geoms, target_srs)
     else:
         # --- Style Dispatch Logic ---
@@ -556,15 +574,16 @@ def render_map_image(
                 if geom:
                     if coord_transform:
                         geom.Transform(coord_transform)
-                    feature = ogr.Feature(ogr_layer.GetLayerDefn())
-                    feature.SetGeometry(geom)
+                    for part in _explode_collections(geom):
+                        feature = ogr.Feature(ogr_layer.GetLayerDefn())
+                        feature.SetGeometry(part)
 
-                    # Set attribute values for the feature
-                    if "attributes" in item and item["attributes"]:
-                        for key, value in item["attributes"].items():
-                            feature.SetField(key, str(value))
+                        # Set attribute values for the feature
+                        if "attributes" in item and item["attributes"]:
+                            for key, value in item["attributes"].items():
+                                feature.SetField(key, str(value))
 
-                    ogr_layer.CreateFeature(feature)
+                        ogr_layer.CreateFeature(feature)
 
             # Dispatch based on style format
             if style_format == "SLD_1.1":
@@ -578,7 +597,11 @@ def render_map_image(
                 all_geoms_from_layer = []
                 ogr_layer.ResetReading()
                 for feature in ogr_layer:
-                    all_geoms_from_layer.append(feature.GetGeometryRef())
+                    # GetGeometryRef() is owned by the feature — clone it, or
+                    # the reference dangles once the loop releases the feature.
+                    geom_ref = feature.GetGeometryRef()
+                    if geom_ref is not None:
+                        all_geoms_from_layer.append(geom_ref.Clone())
                 _render_default_style(mem_dataset, all_geoms_from_layer, target_srs)
             layer_source.Destroy()
 
