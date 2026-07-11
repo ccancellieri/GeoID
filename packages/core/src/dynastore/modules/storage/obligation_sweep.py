@@ -221,7 +221,13 @@ async def _sweep_collection(
 
     Isolated in a SAVEPOINT so a per-collection failure never aborts the
     supervisor's job transaction for every other collection in the tick.
+    The routing-config parse itself is guarded separately (below): a single
+    stored config that fails Pydantic validation (e.g. a legacy field value
+    a model shrink no longer accepts) must not abort the whole sweep either
+    — it is logged and this collection is skipped for the tick.
     """
+    from pydantic import ValidationError
+
     from dynastore.modules.db_config.query_executor import best_effort_savepoint
     from dynastore.modules.storage.routing_config import (
         ItemsRoutingConfig,
@@ -229,12 +235,23 @@ async def _sweep_collection(
         index_entries,
     )
 
-    routing = await configs.get_config(
-        ItemsRoutingConfig,
-        catalog_id=catalog_id,
-        collection_id=collection_id,
-        ctx=ctx,
-    )
+    try:
+        routing = await configs.get_config(
+            ItemsRoutingConfig,
+            catalog_id=catalog_id,
+            collection_id=collection_id,
+            ctx=ctx,
+        )
+    except ValidationError as exc:
+        failing_fields = ", ".join(
+            ".".join(str(part) for part in error["loc"]) for error in exc.errors()
+        )
+        logger.error(
+            "obligation_sweep: %s/%s has an invalid stored ItemsRoutingConfig "
+            "(failing field(s): %s) — skipping this collection for this tick: %s",
+            catalog_id, collection_id, failing_fields, exc,
+        )
+        return 0, 0
     ops_map = getattr(routing, "operations", {}) or {}
     async_entries = index_entries(ops_map)
     if not async_entries:

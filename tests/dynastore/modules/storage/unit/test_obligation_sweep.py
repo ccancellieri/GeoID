@@ -26,11 +26,13 @@ Pure-mock style — no live DB. Run with:
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from dynastore.modules.storage.driver_config import ItemsPostgresqlDriverConfig
@@ -96,6 +98,25 @@ def _routing_with_es_primary() -> ItemsRoutingConfig:
         ],
         Operation.INDEX: [_es_secondary_entry()],
     })
+
+
+def _legacy_on_failure_validation_error() -> ValidationError:
+    """A real ``ValidationError`` shaped exactly like #3240: a stored
+    routing config whose WRITE lane still carries the legacy
+    ``on_failure: "outbox"`` value the shrunk ``FailurePolicy {FATAL, WARN}``
+    rejects at parse time."""
+    try:
+        ItemsRoutingConfig.model_validate({
+            "operations": {
+                "WRITE": [
+                    {"driver_ref": "items_postgresql_driver", "on_failure": "fatal"},
+                    {"driver_ref": "legacy_outbox_driver", "on_failure": "outbox"},
+                ],
+            },
+        })
+    except ValidationError as exc:
+        return exc
+    raise AssertionError("expected ItemsRoutingConfig to reject on_failure='outbox'")
 
 
 class _FakeConfigs:
@@ -607,6 +628,44 @@ async def test_collection_failure_is_isolated_and_retried_next_tick():
     assert (checked, enqueued) == (0, 0)
 
 
+@pytest.mark.asyncio
+async def test_invalid_routing_config_is_skipped_and_logged(caplog):
+    """#3240: a stored ``ItemsRoutingConfig`` that fails Pydantic validation
+    (legacy ``on_failure: outbox`` rejected by the shrunk ``FailurePolicy``)
+    must not raise out of ``_sweep_collection`` — it is logged at ERROR with
+    the catalog/collection id and the failing field, and the collection is
+    skipped for this tick."""
+
+    class _InvalidRoutingConfigs(_FakeConfigs):
+        async def get_config(self, config_cls, catalog_id=None, collection_id=None, ctx=None, config_snapshot=None):
+            self.calls.append((config_cls, catalog_id, collection_id))
+            if config_cls is ItemsRoutingConfig:
+                raise _legacy_on_failure_validation_error()
+            raise AssertionError(f"unexpected config_cls {config_cls!r}")
+
+    configs = _InvalidRoutingConfigs()
+    catalogs = _FakeCatalogs()
+
+    with caplog.at_level(logging.ERROR, logger="dynastore.modules.storage.obligation_sweep"):
+        checked, enqueued = await _sweep_collection(
+            object(),
+            catalogs=catalogs,
+            configs=configs,
+            catalog_id="cat_bad",
+            collection_id="col_bad",
+            ctx=None,
+            window_start=_WINDOW_START,
+            window_end=_WINDOW_END,
+        )
+
+    assert (checked, enqueued) == (0, 0)
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "cat_bad" in message
+    assert "col_bad" in message
+    assert "on_failure" in message
+
+
 # ---------------------------------------------------------------------------
 # sweep_missing_obligations: window math + top-level wiring
 # ---------------------------------------------------------------------------
@@ -764,3 +823,72 @@ async def test_sweep_missing_obligations_totals_across_collections():
     assert total == 1
     mock_enqueue.assert_awaited_once()
     assert mock_enqueue.call_args.kwargs["catalog_id"] == "cat1"
+
+
+@pytest.mark.asyncio
+async def test_sweep_continues_across_catalogs_when_one_routing_config_is_invalid(caplog):
+    """#3240 regression: one catalog's stored ``ItemsRoutingConfig`` failing
+    Pydantic validation (legacy ``on_failure: outbox``) must degrade to a
+    single-catalog skip, not abort the whole sweep — every other catalog's
+    valid config is still swept and the run does not raise."""
+    catalog_ok = MagicMock(id="cat_ok")
+    catalog_bad = MagicMock(id="cat_bad")
+    col_ok = MagicMock(id="col_ok")
+    col_bad = MagicMock(id="col_bad")
+    catalogs = _FakeCatalogs(
+        catalogs=[catalog_ok, catalog_bad],
+        collections={"cat_ok": [col_ok], "cat_bad": [col_bad]},
+    )
+
+    routing_ok = _routing_with_pg_primary_and_async_secondary()
+    driver_cfg = ItemsPostgresqlDriverConfig(physical_table="items_c1")
+
+    class _MixedConfigs(_FakeConfigs):
+        async def get_config(self, config_cls, catalog_id=None, collection_id=None, ctx=None, config_snapshot=None):
+            self.calls.append((config_cls, catalog_id, collection_id))
+            if config_cls is ItemsRoutingConfig:
+                if catalog_id == "cat_bad":
+                    raise _legacy_on_failure_validation_error()
+                return routing_ok
+            if config_cls is ItemsPostgresqlDriverConfig:
+                return driver_cfg
+            raise AssertionError(config_cls)
+
+    configs = _MixedConfigs()
+
+    def _dql_factory_ok_only(sql, **_kw):
+        inst = MagicMock()
+
+        async def _execute(conn, **params):
+            if params["collection_id"] == "col_ok":
+                return [{"geoid": "gX", "deleted_at": None}]
+            return []
+
+        inst.execute = AsyncMock(side_effect=_execute)
+        return inst
+
+    with (
+        patch(
+            "dynastore.tools.discovery.get_protocol",
+            side_effect=_patched_get_protocol(catalogs, configs),
+        ),
+        patch(
+            "dynastore.modules.db_config.query_executor.DQLQuery",
+            side_effect=_dql_factory_ok_only,
+        ),
+        patch(
+            "dynastore.modules.storage.storage_emit.enqueue_storage_op_id_only",
+            new=AsyncMock(),
+        ) as mock_enqueue,
+        caplog.at_level(logging.ERROR, logger="dynastore.modules.storage.obligation_sweep"),
+    ):
+        total = await sweep_missing_obligations(_fake_sa_conn(), interval_seconds=600)
+
+    # The valid catalog was still fully swept despite the other's bad config.
+    assert total == 1
+    mock_enqueue.assert_awaited_once()
+    assert mock_enqueue.call_args.kwargs["catalog_id"] == "cat_ok"
+
+    # The invalid catalog's config error was logged (still alerts) rather
+    # than silently dropped or left to raise out of the sweep.
+    assert any("cat_bad" in r.getMessage() for r in caplog.records)
