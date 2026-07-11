@@ -846,10 +846,17 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                         else:
                             result = await task_instance.run(hydrated_payload)
 
-                    await _complete_task(
+                    completed = await _complete_task(
                         context.engine, claimed_task_id,
                         _dt.now(_tz.utc), outputs=result,
+                        owner_id=context.extra_context.get("prior_owner_id"),
                     )
+                    if not completed:
+                        logger.warning(
+                            "BackgroundRunner: lost terminal-write race completing "
+                            "claimed task '%s' — row was reclaimed, not overwriting.",
+                            claimed_task_id,
+                        )
                     logger.info(f"BackgroundRunner: claimed task '{claimed_task_id}' completed.")
                     await _apply_terminal("success", _terminal.on_success)
 
@@ -884,12 +891,19 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                                 "(shutdown) — resetting to PENDING for retry.",
                                 claimed_task_id,
                             )
-                            await _fail_task(
+                            failed = await _fail_task(
                                 context.engine, claimed_task_id,
                                 _dt.now(_tz.utc),
                                 "Runner interrupted (SIGTERM / pod shutdown)",
                                 retry=True,
+                                owner_id=context.extra_context.get("prior_owner_id"),
                             )
+                            if not failed:
+                                logger.warning(
+                                    "BackgroundRunner: lost terminal-write race "
+                                    "failing claimed task '%s' — row was reclaimed, "
+                                    "not overwriting.", claimed_task_id,
+                                )
                     except Exception as e:
                         logger.error(
                             "BackgroundRunner: failed to handle cancellation for "
@@ -905,12 +919,19 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                     )
                     error_message = f"Asynchronous execution failed: {str(e)}"
                     try:
-                        await _fail_task(
+                        failed = await _fail_task(
                             context.engine, claimed_task_id,
                             _dt.now(_tz.utc),
                             error_message,
                             retry=False,
+                            owner_id=context.extra_context.get("prior_owner_id"),
                         )
+                        if not failed:
+                            logger.warning(
+                                "BackgroundRunner: lost terminal-write race "
+                                "failing claimed task '%s' — row was reclaimed, "
+                                "not overwriting.", claimed_task_id,
+                            )
                     except Exception as update_error:
                         logger.critical(
                             f"BackgroundRunner: failed to mark claimed task "
@@ -929,10 +950,17 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                         claimed_task_id, context.task_type, timeout_s,
                     )
                     try:
-                        await _dead_letter_task(
+                        dead_lettered = await _dead_letter_task(
                             context.engine, claimed_task_id, _dt.now(_tz.utc),
                             f"Runner timed out after {timeout_s}s",
+                            owner_id=context.extra_context.get("prior_owner_id"),
                         )
+                        if not dead_lettered:
+                            logger.warning(
+                                "BackgroundRunner: lost terminal-write race "
+                                "dead-lettering claimed task '%s' — row was "
+                                "reclaimed, not overwriting.", claimed_task_id,
+                            )
                     except Exception as dle:
                         logger.critical(
                             "BackgroundRunner: failed to dead-letter timed-out task '%s': %s — "
@@ -949,12 +977,19 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                     )
                     error_message = f"Asynchronous execution failed: {str(e)}"
                     try:
-                        await _fail_task(
+                        failed = await _fail_task(
                             context.engine, claimed_task_id,
                             _dt.now(_tz.utc),
                             error_message,
                             retry=True,
+                            owner_id=context.extra_context.get("prior_owner_id"),
                         )
+                        if not failed:
+                            logger.warning(
+                                "BackgroundRunner: lost terminal-write race "
+                                "failing claimed task '%s' — row was reclaimed, "
+                                "not overwriting.", claimed_task_id,
+                            )
                     except Exception as update_error:
                         logger.critical(
                             f"BackgroundRunner: failed to mark claimed task "

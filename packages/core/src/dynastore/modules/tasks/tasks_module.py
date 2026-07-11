@@ -362,8 +362,21 @@ BEGIN
                 ELSE NULL
             END,
             error_message     = CASE
-                WHEN s.retry_count + 1 >= p_hard_cap
-                    THEN 'Reaped: hard retry cap (' || p_hard_cap || ') reached'
+                -- Mirrors the same LEAST(...) gate as status/finished_at above:
+                -- without it, a per-row max_retries DLQ (the row's own cap
+                -- below the platform hard cap) fell through to the generic
+                -- heartbeat-expired text even though the row was DLQ'd, not
+                -- requeued.
+                WHEN s.retry_count + 1 >= LEAST(
+                        COALESCE(s.max_retries, p_max_retries),
+                        p_hard_cap
+                    )
+                    THEN CASE
+                        WHEN s.retry_count + 1 >= p_hard_cap
+                            THEN 'Reaped: hard retry cap (' || p_hard_cap || ') reached'
+                        ELSE 'Reaped: max_retries (' ||
+                             COALESCE(s.max_retries, p_max_retries) || ') reached'
+                    END
                 ELSE 'Reaped by {{schema}}.reap_stuck_tasks (heartbeat expired)'
             END
         FROM stuck s

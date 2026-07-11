@@ -112,6 +112,36 @@ def test_reaper_ddl_emits_warning_on_dead_letter_burst():
     assert "RAISE WARNING" in GLOBAL_TASKS_REAPER_DDL
 
 
+def test_reaper_ddl_error_message_mirrors_the_least_dlq_gate():
+    """``error_message``'s CASE must gate on the same ``LEAST(...)``
+    expression as ``status``/``finished_at`` — not a bare
+    ``>= p_hard_cap`` check. Without this, a row whose own ``max_retries``
+    (below the platform hard cap) is the binding cap gets DLQ'd but is
+    stamped with the generic heartbeat-expired text instead of a
+    DLQ-specific reason."""
+    from dynastore.modules.tasks.tasks_module import GLOBAL_TASKS_REAPER_DDL
+
+    error_message_clause = GLOBAL_TASKS_REAPER_DDL.split(
+        "error_message     = CASE", 1,
+    )[1].split("FROM stuck s", 1)[0]
+
+    assert "LEAST(" in error_message_clause
+    assert "COALESCE(s.max_retries, p_max_retries)" in error_message_clause
+    assert "p_hard_cap" in error_message_clause
+
+
+def test_reaper_ddl_distinguishes_per_row_cap_from_hard_cap_reasons():
+    """The two DLQ outcomes must carry distinguishable reasons — the
+    platform hard cap firing is an operational circuit-breaker signal,
+    distinct from a row simply exhausting its own ``max_retries``. Both
+    must remain distinct from the plain heartbeat-expired requeue text."""
+    from dynastore.modules.tasks.tasks_module import GLOBAL_TASKS_REAPER_DDL
+
+    assert "Reaped: hard retry cap (" in GLOBAL_TASKS_REAPER_DDL
+    assert "Reaped: max_retries (" in GLOBAL_TASKS_REAPER_DDL
+    assert "Reaped by {schema}.reap_stuck_tasks (heartbeat expired)" in GLOBAL_TASKS_REAPER_DDL
+
+
 def test_claim_batch_sql_excludes_rows_above_hard_cap():
     """The dispatcher must stop wasting cycles on rows the reaper is about
     to DLQ. Rows with ``retry_count >= :hard_cap`` are excluded from the

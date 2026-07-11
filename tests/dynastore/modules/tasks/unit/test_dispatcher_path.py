@@ -435,6 +435,164 @@ async def test_background_runner_claimed_re_registers_heartbeat():
 
 
 # ---------------------------------------------------------------------------
+# BackgroundRunner — claimed-path terminal writes guard on prior_owner_id
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_background_runner_claimed_success_passes_prior_owner_guard():
+    """The claimed-path completion write must guard on the owner_id the
+    dispatcher stamped at claim time (``extra_context['prior_owner_id']``) —
+    otherwise a stale background coroutine could clobber a row the pg_cron
+    reaper already reclaimed and handed to a fresh attempt."""
+    from dynastore.modules.tasks.runners import BackgroundRunner
+
+    claimed_id = _uuid.uuid4()
+    claimed_ts = datetime(2026, 4, 22, 12, 0, 0, tzinfo=timezone.utc)
+
+    ctx = _make_context({
+        "task_id": str(claimed_id),
+        "task_timestamp": claimed_ts,
+        "prior_owner_id": "dispatcher-worker-1",
+    })
+
+    runner = BackgroundRunner()
+
+    fake_tasks_mgr = MagicMock()
+    fake_tasks_mgr.create_task = AsyncMock()
+
+    fake_task_instance = MagicMock()
+    fake_task_instance.run = AsyncMock(return_value={"bucket": "gs://x"})
+    fake_task_instance.__class__.__name__ = "FakeTask"
+
+    captured: Dict[str, Any] = {}
+
+    def _capture_submit(coro, task_name=None, **_):
+        captured["coro"] = coro
+        return MagicMock()
+
+    fake_complete = AsyncMock(return_value=True)
+    fake_fail = AsyncMock()
+
+    with (
+        patch("dynastore.tools.protocol_helpers.resolve", return_value=fake_tasks_mgr),
+        patch(
+            "dynastore.modules.tasks.runners.get_task_instance",
+            return_value=fake_task_instance,
+        ),
+        patch(
+            "dynastore.modules.tasks.runners.get_background_executor",
+        ) as fake_exec,
+        patch("dynastore.modules.tasks.tasks_module.complete_task", fake_complete),
+        patch("dynastore.modules.tasks.tasks_module.fail_task", fake_fail),
+    ):
+        fake_exec.return_value.submit = _capture_submit
+        await runner.run(ctx)
+        await captured["coro"]
+
+    fake_complete.assert_awaited_once()
+    call = fake_complete.await_args
+    assert call.kwargs.get("owner_id") == "dispatcher-worker-1"
+    fake_fail.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_background_runner_claimed_lost_race_logs_warning(caplog):
+    """When the guarded terminal write matches zero rows (the reaper
+    reclaimed the row before this coroutine finished), the coroutine must
+    log a clear warning instead of silently dropping the outcome."""
+    import logging
+
+    from dynastore.modules.tasks.runners import BackgroundRunner
+
+    claimed_id = _uuid.uuid4()
+    claimed_ts = datetime(2026, 4, 22, 12, 0, 0, tzinfo=timezone.utc)
+
+    ctx = _make_context({
+        "task_id": str(claimed_id),
+        "task_timestamp": claimed_ts,
+        "prior_owner_id": "dispatcher-worker-1",
+    })
+
+    runner = BackgroundRunner()
+
+    fake_tasks_mgr = MagicMock()
+    fake_tasks_mgr.create_task = AsyncMock()
+
+    fake_task_instance = MagicMock()
+    fake_task_instance.run = AsyncMock(return_value={"ok": True})
+    fake_task_instance.__class__.__name__ = "FakeTask"
+
+    captured: Dict[str, Any] = {}
+
+    def _capture_submit(coro, task_name=None, **_):
+        captured["coro"] = coro
+        return MagicMock()
+
+    # The row was reclaimed — the guarded UPDATE matches nothing.
+    fake_complete = AsyncMock(return_value=False)
+
+    caplog.set_level(logging.WARNING)
+    with (
+        patch("dynastore.tools.protocol_helpers.resolve", return_value=fake_tasks_mgr),
+        patch(
+            "dynastore.modules.tasks.runners.get_task_instance",
+            return_value=fake_task_instance,
+        ),
+        patch(
+            "dynastore.modules.tasks.runners.get_background_executor",
+        ) as fake_exec,
+        patch("dynastore.modules.tasks.tasks_module.complete_task", fake_complete),
+    ):
+        fake_exec.return_value.submit = _capture_submit
+        await runner.run(ctx)
+        await captured["coro"]
+
+    assert any(
+        "lost terminal-write race" in r.message
+        and r.name == "dynastore.modules.tasks.runners"
+        for r in caplog.records
+    ), (
+        f"expected a lost-race warning; got: "
+        f"{[(r.levelname, r.name, r.getMessage()) for r in caplog.records]}"
+    )
+
+
+def test_background_runner_claimed_terminal_writes_pass_prior_owner_guard():
+    """Source-level guard: every complete_task / fail_task / dead_letter_task
+    call in ``BackgroundRunner._run_claimed`` must pass
+    ``owner_id=context.extra_context.get("prior_owner_id")`` — the value the
+    dispatcher's ``claim_batch`` stamped on the row it delegated. A mock-based
+    check is brittle here (deeply nested closures, lazy imports); source
+    inspection catches a future regression that drops the guard from any of
+    the five terminal-write sites.
+    """
+    import inspect
+
+    from dynastore.modules.tasks.runners import BackgroundRunner
+
+    source = inspect.getsource(BackgroundRunner._run_claimed)
+    lines = source.splitlines()
+    call_sites = [
+        i for i, ln in enumerate(lines)
+        if any(
+            f"await {fn}(" in ln
+            for fn in ("_complete_task", "_fail_task", "_dead_letter_task")
+        )
+    ]
+    assert len(call_sites) == 5, (
+        f"expected 5 terminal-write call sites in _run_claimed, found "
+        f"{len(call_sites)}: {[lines[i] for i in call_sites]}"
+    )
+    for idx in call_sites:
+        window = "\n".join(lines[idx:idx + 6])
+        assert 'owner_id=context.extra_context.get("prior_owner_id")' in window, (
+            f"_run_claimed:{idx + 1}: terminal write missing the "
+            f"prior_owner_id race guard. Window:\n{window}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Reaper DDL — structural guards
 # ---------------------------------------------------------------------------
 

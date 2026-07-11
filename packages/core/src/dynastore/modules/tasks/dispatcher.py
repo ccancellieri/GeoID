@@ -971,7 +971,16 @@ async def run_dispatcher(
                 )
                 return
 
-            await complete_task(engine, task_id, timestamp, outputs=result)
+            completed = await complete_task(
+                engine, task_id, datetime.now(timezone.utc),
+                outputs=result, owner_id=_RUNNER_ID,
+            )
+            if not completed:
+                logger.warning(
+                    "Dispatcher: lost terminal-write race completing task %s "
+                    "(owner_id no longer %r) — row was reclaimed, not overwriting.",
+                    task_id, _RUNNER_ID,
+                )
             # Observability (#504): single structured terminal-state line
             # (replaces the prior "completed successfully" INFO). Per-task_type
             # so the metric works for every TaskProtocol implementation.
@@ -989,11 +998,17 @@ async def run_dispatcher(
                 f"Dispatcher: Task {task_id} interrupted "
                 f"(CancelledError) — resetting to PENDING."
             )
-            await fail_task(
-                engine, task_id, timestamp,
+            failed = await fail_task(
+                engine, task_id, datetime.now(timezone.utc),
                 "Runner interrupted (SIGTERM)",
-                retry=True,
+                retry=True, owner_id=_RUNNER_ID,
             )
+            if not failed:
+                logger.warning(
+                    "Dispatcher: lost terminal-write race failing task %s "
+                    "(owner_id no longer %r) — row was reclaimed, not overwriting.",
+                    task_id, _RUNNER_ID,
+                )
             _log_task_terminal(
                 task_type, task_id, timestamp,
                 outcome="cancelled", error="SIGTERM",
@@ -1012,10 +1027,17 @@ async def run_dispatcher(
                 "Dispatcher: Task %s (%s) timed out after %ss — dead-lettering.",
                 task_id, task_type, timeout_s,
             )
-            await dead_letter_task(
-                engine, task_id, timestamp,
+            dead_lettered = await dead_letter_task(
+                engine, task_id, datetime.now(timezone.utc),
                 f"Runner timed out after {timeout_s}s",
+                owner_id=_RUNNER_ID,
             )
+            if not dead_lettered:
+                logger.warning(
+                    "Dispatcher: lost terminal-write race dead-lettering task %s "
+                    "(owner_id no longer %r) — row was reclaimed, not overwriting.",
+                    task_id, _RUNNER_ID,
+                )
             _log_task_terminal(
                 task_type, task_id, timestamp,
                 outcome="timeout", error=f"timeout {timeout_s}s",
@@ -1030,11 +1052,17 @@ async def run_dispatcher(
                 f"Dispatcher: Task {task_id} permanently failed "
                 f"(no retries): {e}"
             )
-            await fail_task(
-                engine, task_id, timestamp,
+            failed = await fail_task(
+                engine, task_id, datetime.now(timezone.utc),
                 str(e),
-                retry=False,
+                retry=False, owner_id=_RUNNER_ID,
             )
+            if not failed:
+                logger.warning(
+                    "Dispatcher: lost terminal-write race failing task %s "
+                    "(owner_id no longer %r) — row was reclaimed, not overwriting.",
+                    task_id, _RUNNER_ID,
+                )
             _log_task_terminal(
                 task_type, task_id, timestamp,
                 outcome="permanent_failure", error=str(e),
@@ -1050,11 +1078,17 @@ async def run_dispatcher(
                 f"Dispatcher: Task {task_id} failed with error: "
                 f"{e}\n{traceback.format_exc()}"
             )
-            await fail_task(
-                engine, task_id, timestamp,
+            failed = await fail_task(
+                engine, task_id, datetime.now(timezone.utc),
                 str(e),
-                retry=True,
+                retry=True, owner_id=_RUNNER_ID,
             )
+            if not failed:
+                logger.warning(
+                    "Dispatcher: lost terminal-write race failing task %s "
+                    "(owner_id no longer %r) — row was reclaimed, not overwriting.",
+                    task_id, _RUNNER_ID,
+                )
             _log_task_terminal(
                 task_type, task_id, timestamp,
                 outcome="transient_failure", error=str(e),

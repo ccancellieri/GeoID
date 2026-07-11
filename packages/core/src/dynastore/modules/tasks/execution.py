@@ -1364,20 +1364,43 @@ class ExecutionEngine:
         hb = asyncio.create_task(_heartbeat())
         try:
             result = await self.dispatch(row, engine=engine)
-            await complete_task(engine, task.task_id, row["timestamp"], outputs=result)
+            completed = await complete_task(
+                engine, task.task_id, datetime.now(timezone.utc),
+                outputs=result, owner_id=owner_id,
+            )
+            if not completed:
+                logger.warning(
+                    "run_ephemeral: lost terminal-write race completing task "
+                    "%s (owner_id no longer %r) — row was reclaimed, not "
+                    "overwriting.", task.task_id, owner_id,
+                )
             return result
         except asyncio.CancelledError:
             await reset_task_to_pending(engine, task.task_id)
             raise
         except PermanentTaskFailure as exc:
-            await fail_task(
-                engine, task.task_id, datetime.now(timezone.utc), str(exc), retry=False,
+            failed = await fail_task(
+                engine, task.task_id, datetime.now(timezone.utc), str(exc),
+                retry=False, owner_id=owner_id,
             )
+            if not failed:
+                logger.warning(
+                    "run_ephemeral: lost terminal-write race failing task %s "
+                    "(owner_id no longer %r) — row was reclaimed, not "
+                    "overwriting.", task.task_id, owner_id,
+                )
             raise
         except Exception as exc:
-            await fail_task(
-                engine, task.task_id, datetime.now(timezone.utc), str(exc), retry=True,
+            failed = await fail_task(
+                engine, task.task_id, datetime.now(timezone.utc), str(exc),
+                retry=True, owner_id=owner_id,
             )
+            if not failed:
+                logger.warning(
+                    "run_ephemeral: lost terminal-write race failing task %s "
+                    "(owner_id no longer %r) — row was reclaimed, not "
+                    "overwriting.", task.task_id, owner_id,
+                )
             raise
         finally:
             hb.cancel()
