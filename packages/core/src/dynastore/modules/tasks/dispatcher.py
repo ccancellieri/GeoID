@@ -53,6 +53,7 @@ from typing import Optional, Dict, Any, Union
 from dynastore.modules.tasks.durable.locks import stable_lock_id_blake2b as _stable_lock_id_blake2b
 from dynastore.tools.background_service import (
     Leadership,
+    LeaseRenewalMode,
     PodPolicy,
     ServiceContext,
 )
@@ -1200,6 +1201,10 @@ class DispatcherService:
     leadership = Leadership.RUN_EVERYWHERE
     pod_policy = PodPolicy.SKIP_EPHEMERAL
     lock_key: Optional[Union[int, str]] = None
+    # Required by the BackgroundService protocol; only consulted for a
+    # LEADER_ONLY service under the lease backend, so it is inert for this
+    # RUN_EVERYWHERE dispatcher. Declared to keep the type contract satisfied.
+    lease_renewal_mode: LeaseRenewalMode = LeaseRenewalMode.PER_TICK
     initial_delay_seconds = _env_float("DYNASTORE_DISPATCHER_INITIAL_DELAY_SECONDS", 30.0)
 
     async def run(self, ctx: ServiceContext) -> None:
