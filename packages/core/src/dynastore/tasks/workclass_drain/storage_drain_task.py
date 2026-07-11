@@ -1857,6 +1857,24 @@ class StorageDrainTask(TaskProtocol):
                     max_attempts, max_age_seconds,
                 )
 
+        # Rows funnelled to retry (mechanism A/B did not dead-letter them)
+        # must still surface a WARNING naming the driver_id — the #3165
+        # refactor moved this classification out of drain_once's inline
+        # retry branch, which had logged exactly this on every unresolved
+        # batch; without it a stuck-forever-retrying unregistered driver
+        # produces zero WARNING/ERROR logs, the same silent-failure shape
+        # #2731 identified as unacceptable for this task.
+        if counts["retried"]:
+            logger.warning(
+                "StorageDrainTask: driver_id=%r is not registered — %d "
+                "row(s) queued for retry. Registration is required: the "
+                "owning driver's module must be installed and instantiated "
+                "for this runtime's SCOPE so it registers into the storage "
+                "driver registry.",
+                driver_id,
+                counts["retried"],
+            )
+
         return counts
 
     def _unresolvable_row_exhausted(
