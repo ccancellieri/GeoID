@@ -28,6 +28,7 @@ import inspect
 from typing import Any, Optional
 
 from dynastore.modules import get_protocol
+from dynastore.modules.concurrency import run_in_thread
 from dynastore.models.protocols import CatalogsProtocol
 from dynastore.tools.protocol_helpers import resolve
 
@@ -44,6 +45,11 @@ def _get_catalog_protocol() -> CatalogsProtocol:
 async def call_hook(fn: Any, **kwargs: Any) -> Any:
     """Invoke a provisioner hook, awaiting it if it is a coroutine function.
 
+    Sync hooks run off the event loop via ``run_in_thread`` — provisioning
+    tasks (``catalog_provision``) share the dispatcher's event loop with
+    ``BatchedHeartbeat._beat_loop``, so a blocking sync hook (e.g. a sync GCP
+    SDK call) would otherwise starve heartbeats and let the lease lapse mid-run.
+
     Args:
         fn:      Callable to invoke.  May be sync or async.
         **kwargs: Keyword arguments forwarded to ``fn``.
@@ -53,7 +59,7 @@ async def call_hook(fn: Any, **kwargs: Any) -> Any:
     """
     if inspect.iscoroutinefunction(fn):
         return await fn(**kwargs)
-    return fn(**kwargs)
+    return await run_in_thread(fn, **kwargs)
 
 
 async def get_tasks_config() -> Optional[Any]:

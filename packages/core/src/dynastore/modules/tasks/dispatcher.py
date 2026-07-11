@@ -45,6 +45,7 @@ Both are stateless: any worker instance can resume any task after a crash.
 import asyncio
 import logging
 import os
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, Union
 
@@ -223,7 +224,16 @@ class BatchedHeartbeat:
 
     async def _beat_loop(self) -> None:
         while True:
+            expected_wake = time.monotonic() + self._interval
             await asyncio.sleep(self._interval)
+            drift = time.monotonic() - expected_wake
+            if drift > self._interval:
+                logger.warning(
+                    "BatchedHeartbeat: loop stalled for %.1fs (expected ~%.1fs); "
+                    "event-loop blocking suspected — leases may have lapsed",
+                    self._interval + drift,
+                    self._interval,
+                )
             await self._flush()
 
     async def _flush(self) -> None:
