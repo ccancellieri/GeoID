@@ -144,7 +144,14 @@ class TasksPluginConfig(ExposableConfigMixin, PluginConfig):
         description="Back-off before re-claiming a rejected row.")
     task_timeout_seconds: Mutable[int] = Field(
         default=3600, ge=1,
-        description="Cloud Run Job lease duration for a task executing on a Cloud Run Job.")
+        description=(
+            "Default execution timeout for a task, used whenever the task's "
+            "target does not set its own timeout_seconds override. Applies "
+            "to every runner type — the in-process BackgroundRunner, the "
+            "dispatcher's SyncRunner wait, and Cloud Run Job leases alike — "
+            "so lowering it also caps in-process task execution, not just "
+            "Cloud Run Jobs."
+        ))
 
     provisioning_group_concurrency: Mutable[int] = Field(
         default=4,

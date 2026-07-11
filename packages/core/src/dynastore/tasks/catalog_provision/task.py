@@ -24,9 +24,8 @@ under a bounded semaphore (``provisioning_group_concurrency`` from config,
 default 4) so the dispatcher pool is never saturated by a large set of
 parallel provisioners.
 
-Registered here; nothing enqueues it yet.  The enqueue site is added in a
-subsequent PR when ``create_catalog`` is migrated off the inline
-provisioning call.
+Enqueued by ``create_catalog`` on catalog creation and by
+``deprovision_hard`` on catalog deletion (``catalog_service.py``).
 
 The task is fully idempotent: ``mark_provisioning_step`` is an upsert and
 individual provisioner hooks are expected to use IF-NOT-EXISTS semantics.

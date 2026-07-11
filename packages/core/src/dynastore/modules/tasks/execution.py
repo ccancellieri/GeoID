@@ -44,7 +44,7 @@ OGC Job State Machine::
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List
 from uuid import UUID
 
@@ -1309,101 +1309,6 @@ class ExecutionEngine:
     # ------------------------------------------------------------------
     # Job query helpers (used by OGC endpoints)
     # ------------------------------------------------------------------
-
-    async def run_ephemeral(
-        self,
-        task_data: TaskCreate,
-        schema: str,
-        *,
-        engine: DbResource,
-        visibility_timeout: timedelta = timedelta(minutes=5),
-    ) -> Any:
-        """Enqueue a task as PENDING then immediately claim and run it in this process.
-
-        Unlike BackgroundRunner (which creates tasks as RUNNING), the task starts
-        as PENDING so it remains visible to the dispatcher queue. A heartbeat loop
-        extends the visibility window while the task runs. On CancelledError (SIGTERM)
-        the task is reset to PENDING so another process can pick it up.
-
-        Use for long-running operations that must survive process restarts.
-        """
-        import asyncio
-        from datetime import datetime, timezone
-        from dynastore.modules.tasks.models import PermanentTaskFailure
-        from dynastore.modules.tasks.tasks_module import (
-            claim_by_id,
-            complete_task,
-            create_task,
-            fail_task,
-            heartbeat_tasks,
-            reset_task_to_pending,
-        )
-
-        task = await create_task(engine, task_data, schema)
-        if task is None:
-            raise RuntimeError("run_ephemeral: create_task returned None (dedup hit on a non-dedup task).")
-        owner_id = f"ephemeral-{task.task_id}"
-        row = await claim_by_id(engine, task.task_id, visibility_timeout, owner_id)
-        if row is None:
-            raise RuntimeError(
-                f"run_ephemeral: failed to claim task {task.task_id}"
-            )
-
-        async def _heartbeat() -> None:
-            interval = visibility_timeout.total_seconds() / 3
-            while True:
-                await asyncio.sleep(interval)
-                try:
-                    await heartbeat_tasks(engine, [task.task_id], visibility_timeout)
-                except Exception as exc:
-                    logger.warning(
-                        "task heartbeat failed task_id=%s: %s",
-                        task.task_id, exc,
-                    )
-
-        hb = asyncio.create_task(_heartbeat())
-        try:
-            result = await self.dispatch(row, engine=engine)
-            completed = await complete_task(
-                engine, task.task_id, datetime.now(timezone.utc),
-                outputs=result, owner_id=owner_id,
-            )
-            if not completed:
-                logger.warning(
-                    "run_ephemeral: lost terminal-write race completing task "
-                    "%s (owner_id no longer %r) — row was reclaimed, not "
-                    "overwriting.", task.task_id, owner_id,
-                )
-            return result
-        except asyncio.CancelledError:
-            await reset_task_to_pending(engine, task.task_id)
-            raise
-        except PermanentTaskFailure as exc:
-            failed = await fail_task(
-                engine, task.task_id, datetime.now(timezone.utc), str(exc),
-                retry=False, owner_id=owner_id,
-            )
-            if not failed:
-                logger.warning(
-                    "run_ephemeral: lost terminal-write race failing task %s "
-                    "(owner_id no longer %r) — row was reclaimed, not "
-                    "overwriting.", task.task_id, owner_id,
-                )
-            raise
-        except Exception as exc:
-            failed = await fail_task(
-                engine, task.task_id, datetime.now(timezone.utc), str(exc),
-                retry=True, owner_id=owner_id,
-            )
-            if not failed:
-                logger.warning(
-                    "run_ephemeral: lost terminal-write race failing task %s "
-                    "(owner_id no longer %r) — row was reclaimed, not "
-                    "overwriting.", task.task_id, owner_id,
-                )
-            raise
-        finally:
-            hb.cancel()
 
     async def get_job(
         self,

@@ -1956,9 +1956,9 @@ async def create_task(
     in-process and must not be re-claimed by the dispatcher).
 
     Pass `owner_id` and `locked_until` together with `initial_status='ACTIVE'`
-    to INSERT a row that is *born claimed* — same effect as create_task →
-    claim_by_id, but in a single statement and without firing the
-    `notify_task_ready` trigger (which only fires `WHEN NEW.status =
+    to INSERT a row that is *born claimed* — same effect as create_task
+    followed by an atomic claim, but in a single statement and without
+    firing the `notify_task_ready` trigger (which only fires `WHEN NEW.status =
     'PENDING'`). Used by GcpJobRunner's REST path to close the
     REST↔dispatcher race window where a freshly-created PENDING row could
     be claimed by a dispatcher pod between INSERT and the subsequent
@@ -2050,7 +2050,7 @@ async def create_task(
             cols.append("locked_until")
             insert_kwargs["locked_until"] = locked_until
         # Stamp the ACTIVE ownership/liveness fields so the row looks
-        # identical to one claim_batch / claim_by_id would have produced.
+        # identical to one claim_batch would have produced.
         # started_at is deliberately NOT stamped here (#2893): this branch is
         # the REMOTE born-claimed path (GcpJobRunner's REST dispatch) — the
         # container has not started yet at insert time, so started_at stays
@@ -3362,34 +3362,6 @@ async def stamp_dismiss_confirmed(
     return bool(rowcount and rowcount > 0)
 
 
-async def claim_by_id(
-    engine: DbResource,
-    task_id: uuid.UUID,
-    visibility_timeout: timedelta,
-    owner_id: str,
-) -> Optional[Dict[str, Any]]:
-    """Atomically claim a specific PENDING task by ID (used by run_ephemeral)."""
-    task_schema = get_task_schema()
-    locked_until = datetime.now(timezone.utc) + visibility_timeout
-    sql = f"""
-        UPDATE {task_schema}.tasks
-        SET status = 'ACTIVE',
-            locked_until = :locked_until,
-            owner_id = :owner_id,
-            started_at = COALESCE(started_at, NOW()),
-            last_heartbeat_at = NOW()
-        WHERE task_id = :task_id
-          AND status = 'PENDING'
-        RETURNING task_id, catalog_id, scope, task_type, execution_mode,
-                  caller_id, inputs, collection_id, retry_count, max_retries,
-                  timestamp, dedup_key, owner_id;
-    """
-    async with managed_transaction(engine) as conn:
-        return await DQLQuery(sql, result_handler=ResultHandler.ONE_DICT).execute(
-            conn, task_id=task_id, locked_until=locked_until, owner_id=owner_id,
-        )
-
-
 async def claim_for_execution(
     engine: DbResource,
     task_id: uuid.UUID,
@@ -3399,11 +3371,11 @@ async def claim_for_execution(
 ) -> Optional[Dict[str, Any]]:
     """Atomically claim a task for in-job execution (``main_task.py``).
 
-    This is the consuming-side counterpart to ``claim_by_id`` /
-    ``claim_for_dispatch``: the Cloud Run Job container calls it once it is up,
-    to take ownership of the row the spawner created for it. Unlike the legacy
-    unconditional ``update_task(status=ACTIVE)`` it replaced, the claim is
-    status-guarded — it matches the row **only if** it is safe to (re-)execute:
+    This is the consuming-side counterpart to ``claim_for_dispatch``: the
+    Cloud Run Job container calls it once it is up, to take ownership of
+    the row the spawner created for it. Unlike the legacy unconditional
+    ``update_task(status=ACTIVE)`` it replaced, the claim is status-guarded
+    — it matches the row **only if** it is safe to (re-)execute:
 
     * refuses any terminal row (``COMPLETED`` / ``FAILED`` / ``DISMISSED`` /
       ``DEAD_LETTER``) — re-running a finished task is the #726 regression
@@ -3518,8 +3490,10 @@ async def reset_task_to_pending(
 ) -> None:
     """Requeue an ACTIVE task to PENDING without incrementing retry_count.
 
-    Called by run_ephemeral on CancelledError so the task stays visible
-    for another process to pick up rather than being lost on shutdown.
+    Called when a runner's ``can_claim`` rejects a row (dispatcher back-off
+    path) or a Cloud Run Job container is cancelled mid-execution
+    (``main_task.py`` on SIGTERM), so the task stays visible for another
+    process to pick up rather than being lost.
 
     ``backoff`` sets ``locked_until = NOW() + backoff`` so the same worker
     that released the claim cannot immediately re-claim on the next poll.

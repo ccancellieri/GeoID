@@ -33,7 +33,7 @@ can be called from admin endpoints or the MaintenanceSupervisor's periodic jobs.
 import logging
 import re
 from datetime import datetime, timezone, timedelta
-from typing import List, Mapping, Optional, Dict, Any, Union
+from typing import List, Mapping, Optional, Dict, Any
 
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -655,53 +655,3 @@ async def purge_dead_letter_tasks(
     count = len(rows)
     logger.info(f"Maintenance: Purged {count} stale DEAD_LETTER task(s).")
     return count
-
-
-# ---------------------------------------------------------------------------
-# Stale ACTIVE task cleanup (used by Janitor internally, exposed for tooling)
-# ---------------------------------------------------------------------------
-
-
-async def find_stale_active_tasks(
-    engine_or_conn: Union[AsyncEngine, Any],
-    catalog_id: Optional[str] = None,
-    stale_threshold: timedelta = timedelta(minutes=10),
-) -> List[Dict[str, Any]]:
-    """
-    Returns ACTIVE tasks whose heartbeat is stale or whose lock has expired.
-    The Janitor calls this to decide whether to reset or dead-letter a task.
-
-    Args:
-        engine_or_conn: Either an AsyncEngine (creates own transaction) or an
-            already-open connection (runs inside the caller's transaction).
-        catalog_id: If provided, scopes to that tenant.
-    """
-    task_schema = get_task_schema()
-    cutoff = _now() - stale_threshold
-
-    schema_filter = ""
-    params: Dict[str, Any] = {"cutoff": cutoff}
-    if catalog_id is not None:
-        schema_filter = "AND catalog_id = :catalog_id"
-        params["catalog_id"] = catalog_id
-
-    sql = f"""
-        SELECT task_id, catalog_id, task_type, owner_id, retry_count, max_retries,
-               timestamp, locked_until, last_heartbeat_at, inputs
-        FROM {task_schema}.tasks
-        WHERE status = 'ACTIVE'
-          AND (
-              locked_until < NOW()
-              OR (last_heartbeat_at IS NOT NULL AND last_heartbeat_at < :cutoff)
-              OR (last_heartbeat_at IS NULL AND locked_until < NOW())
-          )
-          {schema_filter};
-    """
-    query = DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS)
-
-    # If a raw connection is passed, use it directly (keeps advisory lock active)
-    if hasattr(engine_or_conn, 'execute'):
-        return await query.execute(engine_or_conn, **params) or []
-
-    async with managed_transaction(engine_or_conn) as conn:
-        return await query.execute(conn, **params) or []
