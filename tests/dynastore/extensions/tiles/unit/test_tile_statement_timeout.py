@@ -144,6 +144,25 @@ def _cancel_race_connection_error() -> DatabaseConnectionError:
     )
 
 
+def _closed_connection_interface_error() -> Exception:
+    """The third cancellation shape: the wire was torn down mid-statement
+    (transaction pooler / TCP keepalive abort) and SQLAlchemy's
+    rollback-on-error then raises ``InterfaceError: ... the underlying
+    connection is closed`` — again keyed on class name + message."""
+    return type("InterfaceError", (Exception,), {})(
+        "cannot call Transaction.rollback(): the underlying connection is closed"
+    )
+
+
+def _closed_connection_error() -> QueryExecutionError:
+    """A ``QueryExecutionError`` wrapping the closed-connection
+    ``InterfaceError``."""
+    return QueryExecutionError(
+        "Database query failed.",
+        original_exception=_closed_connection_interface_error(),
+    )
+
+
 class TestIsTimeoutCancelRace:
     """Pure truth table for ``_is_timeout_cancel_race`` (#3181) — no request
     context needed, matching the module-level helper's stated intent."""
@@ -160,6 +179,14 @@ class TestIsTimeoutCancelRace:
 
     def test_interface_error_before_timeout_window_is_not_a_race(self):
         exc = _cancel_race_error()
+        assert _is_timeout_cancel_race(exc, elapsed_s=0.1, timeout_s=30.0) is False
+
+    def test_closed_connection_after_timeout_window(self):
+        exc = _closed_connection_error()
+        assert _is_timeout_cancel_race(exc, elapsed_s=30.0, timeout_s=30.0) is True
+
+    def test_closed_connection_before_timeout_window_is_not_a_race(self):
+        exc = _closed_connection_error()
         assert _is_timeout_cancel_race(exc, elapsed_s=0.1, timeout_s=30.0) is False
 
     def test_unrelated_exception_not_a_race(self):
@@ -555,6 +582,69 @@ async def test_get_vector_tile_returns_503_on_cancel_race_database_connection_er
     assert exc_info.value.status_code == 503
     assert exc_info.value.headers is not None
     assert exc_info.value.headers.get("Retry-After") == "5"
+
+
+@pytest.mark.asyncio
+async def test_get_vector_tile_returns_503_on_closed_connection_after_timeout():
+    """The third shape: the pooler/TCP stack tears the connection down while
+    the render statement is still running (``InterfaceError: ... the
+    underlying connection is closed``), past the timeout window. Same
+    unknown-content situation — stale-tile/503, never a raw 500."""
+    svc = _make_service()
+    svc._require_collection_visible = AsyncMock()
+    svc._resolve_request_config = AsyncMock(return_value=TilesConfig(live_tile_timeout_seconds=7))
+    svc._is_cache_enabled = AsyncMock(return_value=False)
+    svc._validate_tms_and_matrix = AsyncMock(return_value=MagicMock(crs="EPSG:3857"))
+
+    async def _fast_timeout() -> float:
+        return 5.0
+
+    mock_conn = AsyncMock()
+    # The dead connection fails its own close too — the handler's `finally`
+    # must swallow that instead of letting it replace the 503 below.
+    mock_conn.close = AsyncMock(side_effect=_closed_connection_interface_error())
+    mock_engine = _connectable_engine(mock_conn)
+
+    config_mock = MagicMock()
+    config_mock.get_config = AsyncMock(return_value=MagicMock())
+
+    fake_ctx = MagicMock(target_srid=3857)
+
+    import dynastore.extensions.tiles.tiles_service as tiles_service_mod
+
+    with patch(
+        "dynastore.extensions.tiles.tiles_service._read_live_fg_acquire_timeout",
+        _fast_timeout,
+    ), patch(
+        "dynastore.extensions.tiles.tiles_service.get_async_engine",
+        return_value=mock_engine,
+    ), patch(
+        "dynastore.extensions.tiles.tiles_service.get_protocol",
+        return_value=config_mock,
+    ), patch.object(
+        tiles_service_mod.DQLQuery, "execute", AsyncMock(return_value=None),
+    ), patch(
+        "dynastore.modules.tiles.tiles_engine.build_render_context",
+        AsyncMock(return_value=fake_ctx),
+    ), patch(
+        "dynastore.modules.tiles.tiles_engine.render_tile",
+        AsyncMock(side_effect=_closed_connection_error()),
+    ), patch.object(
+        tiles_service_mod.time,
+        "perf_counter",
+        side_effect=_fake_perf_counter_past_timeout(),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await svc.get_vector_tile(
+                request=_make_request(),
+                background_tasks=_make_bg_tasks(),
+                **_minimal_tile_kwargs(),
+            )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.headers is not None
+    assert exc_info.value.headers.get("Retry-After") == "5"
+    mock_conn.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio

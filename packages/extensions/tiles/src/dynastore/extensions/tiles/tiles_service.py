@@ -128,6 +128,15 @@ _QUERY_CANCELED_PGCODE = "57014"
 _INTERFACE_ERROR_CLASS_NAME = "InterfaceError"
 _ANOTHER_OPERATION_IN_PROGRESS_FRAGMENT = "another operation is in progress"
 
+# A third cancellation shape: the connection itself is torn down while the
+# render statement is still running — the transaction pooler or the TCP
+# keepalive/user-timeout stack aborts a stalled wire, and every later
+# operation (including SQLAlchemy's rollback-on-error) raises
+# ``InterfaceError: ... connection is closed``. Same unknown-content
+# situation as the cancel race above, and same deadline gate: a closed
+# connection well before the timeout window is a genuine wire fault.
+_CONNECTION_IS_CLOSED_FRAGMENT = "connection is closed"
+
 
 def _is_timeout_cancel_race(
     exc: BaseException, elapsed_s: float, timeout_s: float
@@ -162,9 +171,9 @@ def _is_timeout_cancel_race(
         seen.add(id(candidate))
         if getattr(candidate, "pgcode", None) == _QUERY_CANCELED_PGCODE:
             return True
-        if (
-            type(candidate).__name__ == _INTERFACE_ERROR_CLASS_NAME
-            and _ANOTHER_OPERATION_IN_PROGRESS_FRAGMENT in str(candidate)
+        if type(candidate).__name__ == _INTERFACE_ERROR_CLASS_NAME and (
+            _ANOTHER_OPERATION_IN_PROGRESS_FRAGMENT in str(candidate)
+            or _CONNECTION_IS_CLOSED_FRAGMENT in str(candidate)
         ):
             return elapsed_s >= timeout_s
         candidate = (
@@ -1510,13 +1519,25 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"CRITICAL ERROR in get_vector_tile: {e}", exc_info=True)
+            # ``{e!r}``, not ``{e}`` — TimeoutError/CancelledError stringify
+            # to "" and used to leave this line without the exception type.
+            logger.error(f"CRITICAL ERROR in get_vector_tile: {e!r}", exc_info=True)
             raise HTTPException(
                 status_code=500, detail=f"Internal Server Error: {str(e)}"
             ) from e
         finally:
             if _conn is not None:
-                await _conn.close()
+                try:
+                    await _conn.close()
+                except Exception:
+                    # A connection that died mid-render (statement timeout,
+                    # pooler/TCP abort) fails its rollback-on-close too —
+                    # cleanup must never replace the real response/exception
+                    # with an ``InterfaceError`` 500 from the global handler.
+                    logger.debug(
+                        "get_vector_tile: connection close failed after render",
+                        exc_info=True,
+                    )
             if _render_admitted:
                 self._render_gate.release()
 
