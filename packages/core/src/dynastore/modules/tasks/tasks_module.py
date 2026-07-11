@@ -2578,6 +2578,7 @@ async def claim_batch(
             FROM {task_schema}.tasks
             WHERE (timestamp, task_id) IN (SELECT timestamp, task_id FROM candidates)
               AND status = 'PENDING'
+            ORDER BY timestamp ASC
             LIMIT :batch_size
             FOR UPDATE SKIP LOCKED
         )

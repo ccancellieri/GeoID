@@ -124,6 +124,24 @@ def test_claim_batch_sql_excludes_rows_above_hard_cap():
     assert ":hard_cap" in src
 
 
+def test_claim_batch_inner_lock_subquery_orders_by_timestamp():
+    """The inner row-locking subquery (``FOR UPDATE SKIP LOCKED`` over the
+    per-tenant ``candidates`` CTE) must order by ``timestamp ASC`` before
+    ``LIMIT :batch_size``. Without an explicit ORDER BY, which candidates
+    get locked when eligible tenants exceed ``batch_size`` is planner-order
+    dependent, silently breaking the per-tenant fairness the ``candidates``
+    CTE is meant to guarantee — verified by source inspection of the
+    function."""
+    import inspect
+    from dynastore.modules.tasks import tasks_module
+
+    src = inspect.getsource(tasks_module.claim_batch)
+    assert (
+        "ORDER BY timestamp ASC\n            LIMIT :batch_size\n"
+        "            FOR UPDATE SKIP LOCKED" in src
+    )
+
+
 def test_fail_task_retry_branch_uses_hard_cap():
     """``fail_task(retry=True)`` must DLQ once ``retry_count + 1`` would
     exceed ``LEAST(max_retries, hard_cap)`` — closes the loophole where a
