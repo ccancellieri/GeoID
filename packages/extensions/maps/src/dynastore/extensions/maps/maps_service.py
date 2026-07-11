@@ -25,7 +25,7 @@ from typing import Any, List, Optional
 from concurrent.futures import ProcessPoolExecutor
 from fastapi import Depends, FastAPI, APIRouter, HTTPException, Response, Query, Request
 from sqlalchemy.ext.asyncio import AsyncConnection
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from dynastore.modules.concurrency import run_in_thread
 
@@ -63,6 +63,7 @@ from dynastore.extensions.protocols import ExtensionProtocol
 from dynastore.extensions.ogc_base import OGCServiceMixin
 from dynastore.extensions.web.decorators import expose_web_page
 from dynastore.extensions.tools.language_utils import get_language
+from dynastore.tools.readiness_warmup import run_warmup
 import os
 
 
@@ -78,6 +79,17 @@ def _positive_int_env(name: str, default: int) -> int:
     except ValueError:
         logger.warning("Invalid %s=%r; using %d.", name, raw, default)
         return default
+
+
+def _maps_warmup_timeout_seconds() -> int:
+    """Bound on the cold-boot cache warm-up (geoid#3207), in seconds.
+
+    Best-effort: readiness_warmup.run_warmup marks this instance ready
+    once this elapses even if the warm-up hasn't finished, so it never
+    blocks readiness past the startup-probe budget it is meant to fit
+    inside.
+    """
+    return _positive_int_env("DYNASTORE_MAPS_WARMUP_TIMEOUT_SECONDS", 20)
 
 
 def _maps_process_pool_workers() -> int:
@@ -520,6 +532,45 @@ async def _load_render_caching_config():  # type: ignore[return]
     return cfg if isinstance(cfg, _RenderCachingConfig) else _RenderCachingConfig()
 
 
+async def _warm_maps_caches() -> None:
+    """Front-load the platform-tier config reads the maps render/tile path
+    would otherwise pay cold on this instance's first requests under load
+    (geoid#3207).
+
+    Scoped to platform-tier ``PluginConfig`` rows only — never per-catalog
+    or per-collection state — so warm-up cost is bounded and does not scale
+    with catalog count, the same constraint
+    ``dynastore.main._ColdBootReconciliationService`` documents for why its
+    own (much heavier) reconciliation pass must stay off the readiness
+    path entirely. No render is attempted here (dry-run renders are
+    explicitly out of scope); this only pre-populates config caches.
+
+    Each fetch degrades independently: a config class or module that isn't
+    installed in this deployment (e.g. tiles) is skipped rather than
+    aborting the rest of the warm-up.
+    """
+    await _load_render_caching_config()
+
+    from dynastore.models.protocols.platform_configs import PlatformConfigsProtocol
+    mgr = get_protocol(PlatformConfigsProtocol)
+    if mgr is None:
+        return
+
+    try:
+        from dynastore.modules.tiles.tiles_config import TilesConfig, TilesCachingConfig
+    except ImportError:
+        return
+
+    for cls in (TilesConfig, TilesCachingConfig):
+        try:
+            await mgr.get_config(cls)
+        except Exception as exc:
+            logger.debug(
+                "maps warm-up: %s.get_config failed (%s); skipping.",
+                cls.__name__, exc,
+            )
+
+
 def _handle_raster_render_aborted(
     reason: str, catalog_id: str, collection_id: str, start_time: float,
 ) -> Response:
@@ -737,6 +788,7 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
     protocol_description = "Map rendering (WMS-like) with filtering and tiling"
     router:APIRouter = APIRouter(tags=["OGC API - Maps (WMS)"], prefix="/maps")
     process_pool: Optional[ProcessPoolExecutor] = None
+    _warmup_task: "Optional[asyncio.Task[None]]" = None
 
     # OGCServiceMixin standard-route wiring: landing_response_model matches
     # what the "/" route declared before migration. static_dir lets the
@@ -790,6 +842,19 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
         )
         app.state.maps_config = MapsConfig()
 
+        # Cold-boot cache warm-up (geoid#3207): fire-and-forget so it never
+        # blocks this lifespan's own startup — /ready reports not_ready via
+        # readiness_warmup.is_warm() until it finishes (or best-effort gives
+        # up), gating traffic on Cloud Run's existing startup-probe window
+        # without holding up the process's own boot.
+        MapsService._warmup_task = asyncio.create_task(
+            run_warmup(
+                "maps_config_cache",
+                _warm_maps_caches(),
+                timeout=_maps_warmup_timeout_seconds(),
+            )
+        )
+
         # Register the default-style vector PNG map-tile source into core's
         # TileSourceProtocol registry (format-gated on "png"), so
         # tiles_engine.build_render_context(..., format="png") picks this
@@ -813,6 +878,11 @@ class MapsService(ExtensionProtocol, OGCServiceMixin):
 
         yield
         logger.info("Maps Service shutdown: closing process pool.")
+        if MapsService._warmup_task is not None:
+            MapsService._warmup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await MapsService._warmup_task
+            MapsService._warmup_task = None
         if MapsService.process_pool:
             MapsService.process_pool.shutdown(wait=True)
         if png_tile_source is not None:

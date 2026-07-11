@@ -696,6 +696,20 @@ async def readiness_check():
         all_ok = False
         deps["draining"] = {"status": "failed", "detail": "worker is draining for self-recycle"}
 
+    # --- Cache warm-up gate (geoid#3207) ---
+    # Opt-in: an extension that wants to front-load its hot config-cache
+    # reads before this instance takes traffic (currently only maps, on
+    # cold-boot) registers a named warm-up via
+    # dynastore.tools.readiness_warmup.run_warmup from its lifespan.
+    # Deployments where nothing ever registers one see is_warm() default to
+    # True, so this never gates a service that doesn't opt in.
+    from dynastore.tools.readiness_warmup import is_warm
+    if is_warm():
+        deps["cache_warmup"] = {"status": "ok"}
+    else:
+        all_ok = False
+        deps["cache_warmup"] = {"status": "failed", "detail": "cache warm-up still in progress"}
+
     payload = {"status": "ready" if all_ok else "not_ready", "dependencies": deps}
     from fastapi.responses import JSONResponse
     return JSONResponse(

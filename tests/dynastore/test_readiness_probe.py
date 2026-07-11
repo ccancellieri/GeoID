@@ -23,6 +23,8 @@ clients. DB-free — no PostgreSQL, Elasticsearch, or Valkey required.
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -271,3 +273,111 @@ async def test_ready_503_when_draining():
     import json
     body = json.loads(resp.body)
     assert body["dependencies"]["draining"]["status"] == "failed"
+
+
+# ── Cache warm-up gate (geoid#3207) ────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_ready_200_when_no_warmup_registered():
+    """No extension has registered a warm-up -- cache_warmup reports ok and
+    never gates readiness (opt-in, not a new platform-wide dependency)."""
+    with (
+        patch("dynastore.main.get_protocols", return_value=[]),
+        patch("dynastore.modules.elasticsearch.client.get_client", return_value=None),
+        patch("dynastore.tools.cache_valkey._CACHE_DEPS_OK", False),
+    ):
+        resp = await _call_readiness()
+
+    assert resp.status_code == 200
+    import json
+    body = json.loads(resp.body)
+    assert body["dependencies"]["cache_warmup"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_ready_503_while_warmup_pending():
+    """/ready reports 503 while a registered warm-up hasn't finished yet."""
+    from dynastore.tools.readiness_warmup import reset_for_testing, run_warmup
+
+    reset_for_testing()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_warmup():
+        started.set()
+        await release.wait()
+
+    task = asyncio.create_task(run_warmup("test_warmup", _slow_warmup(), timeout=5.0))
+    await started.wait()
+    try:
+        with (
+            patch("dynastore.main.get_protocols", return_value=[]),
+            patch("dynastore.modules.elasticsearch.client.get_client", return_value=None),
+            patch("dynastore.tools.cache_valkey._CACHE_DEPS_OK", False),
+        ):
+            resp = await _call_readiness()
+    finally:
+        release.set()
+        await task
+        reset_for_testing()
+
+    assert resp.status_code == 503
+    import json
+    body = json.loads(resp.body)
+    assert body["dependencies"]["cache_warmup"]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_ready_200_after_warmup_completes():
+    """/ready returns to 200 once the registered warm-up finishes."""
+    from dynastore.tools.readiness_warmup import reset_for_testing, run_warmup
+
+    reset_for_testing()
+
+    async def _fast_warmup():
+        return None
+
+    await run_warmup("test_warmup", _fast_warmup(), timeout=5.0)
+    try:
+        with (
+            patch("dynastore.main.get_protocols", return_value=[]),
+            patch("dynastore.modules.elasticsearch.client.get_client", return_value=None),
+            patch("dynastore.tools.cache_valkey._CACHE_DEPS_OK", False),
+        ):
+            resp = await _call_readiness()
+    finally:
+        reset_for_testing()
+
+    assert resp.status_code == 200
+    import json
+    body = json.loads(resp.body)
+    assert body["dependencies"]["cache_warmup"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_ready_200_after_warmup_fails_best_effort():
+    """A warm-up failure is best-effort: it must not wedge /ready un-ready
+    forever -- once run_warmup resolves (even via failure), /ready is 200
+    again."""
+    from dynastore.tools.readiness_warmup import reset_for_testing, run_warmup
+
+    reset_for_testing()
+
+    async def _broken_warmup():
+        raise RuntimeError("boom")
+
+    await run_warmup("test_warmup", _broken_warmup(), timeout=5.0)
+    try:
+        with (
+            patch("dynastore.main.get_protocols", return_value=[]),
+            patch("dynastore.modules.elasticsearch.client.get_client", return_value=None),
+            patch("dynastore.tools.cache_valkey._CACHE_DEPS_OK", False),
+        ):
+            resp = await _call_readiness()
+    finally:
+        reset_for_testing()
+
+    assert resp.status_code == 200
+    import json
+    body = json.loads(resp.body)
+    assert body["dependencies"]["cache_warmup"]["status"] == "ok"
