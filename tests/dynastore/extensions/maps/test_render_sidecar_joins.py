@@ -51,7 +51,7 @@ def _layer_cfg(srid: int) -> MagicMock:
     return cfg
 
 
-def _patch_meta_resolution(monkeypatch) -> None:
+def _patch_meta_resolution(monkeypatch, extra_sidecars=()) -> None:
     async def _fake_get_driver(_op, _schema, collection, hints=frozenset()):
         return _FakeDriver(_layer_cfg(4326))
 
@@ -64,7 +64,7 @@ def _patch_meta_resolution(monkeypatch) -> None:
         )
         sc = MagicMock(spec=GeometriesSidecarConfig)
         sc.target_srid = cfg.__srid__
-        return [sc]
+        return [sc, *extra_sidecars]
 
     monkeypatch.setattr(
         "dynastore.modules.storage.router.get_driver", _fake_get_driver
@@ -118,3 +118,66 @@ async def test_render_query_joins_geometry_and_attribute_sidecars(monkeypatch):
     assert "h.geoid" in sql
     assert "a.attributes" in sql
     assert "FROM \"c_internal123\".\"gaul_level_1\"\n" not in sql
+
+
+async def _render_sql_with_sidecars(monkeypatch, extra_sidecars) -> str:
+    _patch_meta_resolution(monkeypatch, extra_sidecars=extra_sidecars)
+
+    captured_query = {}
+
+    def _capture_dql_query(sql, **kwargs):
+        captured_query["sql"] = sql
+        return MagicMock(execute=AsyncMock(return_value=[]))
+
+    with patch.object(maps_db, "DQLQuery", side_effect=_capture_dql_query):
+        await maps_db.get_features_for_rendering(
+            conn=AsyncMock(),
+            schema="c_internal123",
+            collections=["gaul_level_1"],
+            bbox=[0, 0, 1, 1],
+            crs="EPSG:4326",
+            width=256,
+            height=256,
+        )
+    return captured_query["sql"]
+
+
+@pytest.mark.asyncio
+async def test_render_query_reassembles_columnar_attributes(monkeypatch):
+    """COLUMNAR-mode collections (attribute_schema declared) have no
+    ``attributes`` blob column — selecting it verbatim 42703s every render.
+    The projection must reassemble the blob from the case-preserved quoted
+    columns instead."""
+    from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
+        AttributeSchemaEntry,
+        FeatureAttributeSidecarConfig,
+    )
+
+    attrs_cfg = FeatureAttributeSidecarConfig(
+        attribute_schema=[
+            AttributeSchemaEntry(name="CODE"),
+            AttributeSchemaEntry(name="Area"),
+        ]
+    )
+    sql = await _render_sql_with_sidecars(monkeypatch, [attrs_cfg])
+
+    assert (
+        "jsonb_build_object('CODE', a.\"CODE\", 'Area', a.\"Area\") AS attributes"
+        in sql
+    )
+    assert "a.attributes" not in sql
+
+
+@pytest.mark.asyncio
+async def test_render_query_uses_configured_jsonb_column_name(monkeypatch):
+    """JSONB-mode collections select the configured blob column, aliased to
+    the renderer's expected ``attributes`` key."""
+    from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
+        FeatureAttributeSidecarConfig,
+    )
+
+    attrs_cfg = FeatureAttributeSidecarConfig(jsonb_column_name="props")
+    sql = await _render_sql_with_sidecars(monkeypatch, [attrs_cfg])
+
+    assert "a.props AS attributes" in sql
+    assert "a.attributes" not in sql

@@ -91,7 +91,70 @@ async def get_features_for_rendering(
             4326,
         )
 
-    async def _resolve_collection_meta(collection: str) -> tuple[str, List[str], int]:
+    def _attributes_projection(layer_cfg: Any) -> str:
+        """SELECT expression producing each feature's ``attributes`` value.
+
+        The attributes sidecar has two storage modes (attributes_config.py):
+        JSONB keeps one blob column (``jsonb_column_name``, DDL'd unquoted →
+        PG-folded lowercase), while COLUMNAR (``attribute_schema`` declared)
+        materialises one case-preserved quoted column per attribute — there
+        is no ``attributes`` column at all, so selecting it verbatim 42703s
+        every render. COLUMNAR reassembles the blob with jsonb_build_object
+        over the declared names, chunked below PG's 100-arg function limit.
+        Falls back to the legacy ``a.attributes`` shape when no attributes
+        sidecar config is resolvable.
+        """
+        from dynastore.modules.storage.drivers.pg_sidecars.attributes_config import (
+            AttributeStorageMode,
+            FeatureAttributeSidecarConfig,
+        )
+        from dynastore.tools.db import validate_sql_identifier
+
+        attrs_cfg = next(
+            (
+                sc
+                for sc in driver_sidecars(layer_cfg)
+                if isinstance(sc, FeatureAttributeSidecarConfig)
+            ),
+            None,
+        )
+        if attrs_cfg is None:
+            return "a.attributes"
+
+        mode = attrs_cfg.storage_mode
+        if mode == AttributeStorageMode.AUTOMATIC:
+            mode = (
+                AttributeStorageMode.COLUMNAR
+                if attrs_cfg.attribute_schema
+                else AttributeStorageMode.JSONB
+            )
+        if mode != AttributeStorageMode.COLUMNAR:
+            # Unquoted on purpose: the DDL creates this column unquoted, so
+            # PG folded it to lowercase and validate_sql_identifier's
+            # lowercasing matches the physical name.
+            jsonb_col = validate_sql_identifier(attrs_cfg.jsonb_column_name)
+            return f"a.{jsonb_col} AS attributes"
+
+        # COLUMNAR: quote names verbatim — the DDL is case-preserving
+        # (``"CODE" TEXT``, geoid #719) and the driver's own read side
+        # references them quoted. Names never legitimately carry quote
+        # characters; refuse rather than build injectable SQL (#1135).
+        names = [attr.name for attr in (attrs_cfg.attribute_schema or [])]
+        for name in names:
+            if '"' in name or "'" in name:
+                raise ValueError(
+                    f"Unsafe attribute column name {name!r} in attributes "
+                    f"sidecar config; cannot compose render projection."
+                )
+        if not names:
+            return "'{}'::jsonb AS attributes"
+        chunks = []
+        for i in range(0, len(names), 40):
+            pairs = ", ".join(f"'{n}', a.\"{n}\"" for n in names[i : i + 40])
+            chunks.append(f"jsonb_build_object({pairs})")
+        return " || ".join(chunks) + " AS attributes"
+
+    async def _resolve_collection_meta(collection: str) -> tuple[str, List[str], int, str]:
         # Hint.TILES forces routing to a tile-capable driver (today: PG) —
         # same as tiles_module.get_tile_resolution_params. Without it, default
         # READ routing returns ES first when ES is listed ahead of PG; the ES
@@ -114,25 +177,42 @@ async def get_features_for_rendering(
                 schema, collection, db_resource=conn
             )
             physical_table = resolved or collection
+        # Prefer the EFFECTIVE config: get_driver_config() returns the
+        # authorable config whose ``sidecars`` defaults to empty (the
+        # persisted row strips that Computed field), which silently
+        # degrades both the source-SRID and the attributes-projection
+        # resolution below. Same duck-typed pattern as
+        # tiles_module.get_tile_resolution_params; no db_resource is passed
+        # so the resolution stays on its cached path.
+        _effective = getattr(drv, "_get_effective_driver_config", None)
+        config_coro = (
+            _effective(schema, collection)
+            if _effective is not None
+            else drv.get_driver_config(schema, collection)
+        )
         cols, cfg = await asyncio.gather(
             # Raw SQL qualifier → physical schema; driver config → logical id.
             shared_queries.get_table_column_names(conn, sql_schema, physical_table),
-            drv.get_driver_config(schema, collection),
+            config_coro,
         )
-        return physical_table, cols, _resolve_source_srid(cfg)
+        return physical_table, cols, _resolve_source_srid(cfg), _attributes_projection(cfg)
 
     # Single-collection (the hot path) keeps its previous one-pass shape; the
     # multi-collection path resolves metadata for every arm in parallel and
     # asserts homogeneity before building the UNION.
     if len(collections) == 1:
-        physical_table, table_columns, source_srid = await _resolve_collection_meta(collections[0])
+        physical_table, table_columns, source_srid, attrs_sql = (
+            await _resolve_collection_meta(collections[0])
+        )
         physical_tables = [physical_table]
+        attrs_projections = [attrs_sql]
     else:
         metas = await asyncio.gather(*(_resolve_collection_meta(c) for c in collections))
         physical_tables = [m[0] for m in metas]
+        attrs_projections = [m[3] for m in metas]
         table_columns, source_srid = metas[0][1], metas[0][2]
         base_cols = set(table_columns)
-        for collection, (_, cols, srid) in zip(collections[1:], metas[1:]):
+        for collection, (_, cols, srid, _attrs) in zip(collections[1:], metas[1:]):
             if set(cols) != base_cols:
                 raise ValueError(
                     f"Heterogeneous multi-collection map request: column sets differ "
@@ -175,7 +255,9 @@ async def get_features_for_rendering(
     resolution_sql = f"GREATEST( (ST_XMax({source_envelope_sql}) - ST_XMin({source_envelope_sql})) / GREATEST(:img_width, 1), 1e-9 )"
 
     union_queries = []
-    for collection, physical_table in zip(collections, physical_tables):
+    for collection, physical_table, attrs_sql in zip(
+        collections, physical_tables, attrs_projections
+    ):
         # We simplify the geometry in PostGIS before sending it to Python.
         # This significantly boosts performance for large datasets.
         # ``layer`` stays the (external-facing) collection id; the FROM
@@ -186,9 +268,9 @@ async def get_features_for_rendering(
         # the ``_geometries``/``_attributes`` sidecars and must be JOINed in,
         # mirroring the PG driver's own query builder
         # (``drivers/postgresql.py``, hub alias ``h`` / geometry alias ``g`` /
-        # attributes alias ``a``). This assumes the standard JSONB attributes
-        # sidecar (production default); COLUMNAR-mode attribute storage is
-        # not handled here.
+        # attributes alias ``a``). ``attrs_sql`` is the storage-mode-aware
+        # attributes projection built per collection in
+        # ``_attributes_projection`` (JSONB blob vs COLUMNAR reassembly).
         union_queries.append(f"""
             SELECT
                 '{collection}' as layer,
@@ -196,7 +278,7 @@ async def get_features_for_rendering(
                     ST_SimplifyPreserveTopology(g.geom, {resolution_sql})
                 ) as geom,
                 h.geoid,
-                a.attributes
+                {attrs_sql}
             FROM "{sql_schema}"."{physical_table}" h
             JOIN "{sql_schema}"."{physical_table}_geometries" g ON h.geoid = g.geoid
             JOIN "{sql_schema}"."{physical_table}_attributes" a ON h.geoid = a.geoid
