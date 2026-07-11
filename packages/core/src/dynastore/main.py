@@ -43,6 +43,7 @@ from dynastore.modules.concurrency import set_concurrency_backend
 from dynastore.tools.background_service import (
     BackgroundSupervisor,
     Leadership,
+    LeaseRenewalMode,
     PodPolicy,
     ServiceContext,
 )
@@ -193,6 +194,13 @@ class _ColdBootReconciliationService:
     leadership = Leadership.RUN_EVERYWHERE
     pod_policy = PodPolicy.ALL
     lock_key: Optional[str] = None
+    # Required by the BackgroundService protocol; only consulted for a
+    # LEADER_ONLY service under the lease backend, so it is inert here —
+    # this is a RUN_EVERYWHERE one-shot: every pod submits it, and run()
+    # takes its own single fleet-wide lease_leadership() call directly
+    # (see below) rather than going through the supervisor's LEADER_ONLY
+    # election path. Declared to keep the type contract satisfied (#3257).
+    lease_renewal_mode: LeaseRenewalMode = LeaseRenewalMode.PER_TICK
     initial_delay_seconds = _env_float(
         "DYNASTORE_COLD_BOOT_INITIAL_DELAY_SECONDS",
         30.0,

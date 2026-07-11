@@ -48,6 +48,7 @@ from dynastore.tools.async_utils import (
 )
 from dynastore.tools.background_service import (
     Leadership,
+    LeaseRenewalMode,
     PodPolicy,
     ServiceContext,
 )
@@ -173,6 +174,11 @@ class NotificationHubService:
     leadership = Leadership.RUN_EVERYWHERE
     pod_policy = PodPolicy.SKIP_EPHEMERAL
     lock_key: Optional[Union[int, str]] = None
+    # Required by the BackgroundService protocol; only consulted for a
+    # LEADER_ONLY service under the lease backend, so it is inert here —
+    # every pod runs its own LISTEN bridge with no leadership election.
+    # Declared to keep the type contract satisfied (#3257).
+    lease_renewal_mode: LeaseRenewalMode = LeaseRenewalMode.PER_TICK
 
     def __init__(self, *, poll_timeout: float = 30.0, db_config=None) -> None:
         self._poll_timeout = poll_timeout

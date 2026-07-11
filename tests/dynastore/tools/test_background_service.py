@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 from contextlib import asynccontextmanager
 from typing import Any, Optional, Union
 from unittest.mock import MagicMock, patch
@@ -852,4 +853,92 @@ async def test_heartbeat_mode_tick_timeout_is_honored(monkeypatch) -> None:
 
     assert tick_finished["done"] is False, (
         "tick_timeout must be honored in HEARTBEAT mode, not silently ignored"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression: every class registered with BackgroundSupervisor.register() in
+# production code must satisfy the full BackgroundService protocol (#3257)
+# ---------------------------------------------------------------------------
+
+# One entry per class passed to a `*_supervisor.register(...)` call anywhere
+# in the codebase. BackgroundService is intentionally NOT @runtime_checkable
+# (see its docstring) — a missing member is invisible to isinstance() and,
+# before this test, was only caught by pyright at the register() call site.
+# #3257 was exactly that: three implementors silently dropped
+# lease_renewal_mode and pytest stayed green. Keep this list in sync with
+# new registrations — add an entry whenever a new class is passed to
+# BackgroundSupervisor.register().
+_REGISTERED_BACKGROUND_SERVICES: list[tuple[str, str]] = [
+    ("dynastore.modules.tasks.dispatcher", "DispatcherService"),
+    ("dynastore.modules.tasks.tasks_module", "StuckPendingWarnerService"),
+    ("dynastore.modules.tasks.tasks_module", "ProactiveSweepService"),
+    ("dynastore.modules.tasks.tasks_module", "TaskRetentionService"),
+    ("dynastore.modules.tasks.drain_spawner", "DrainSpawnerService"),
+    ("dynastore.modules.tasks.capability_publisher", "CapabilityPublisherService"),
+    ("dynastore.modules.tasks.registry.publisher", "RegistryHeartbeatService"),
+    ("dynastore.modules.catalog.soft_delete_reaper", "SoftDeleteReaper"),
+    ("dynastore.modules.catalog.maintenance_supervisor", "MaintenanceSupervisor"),
+    ("dynastore.modules.catalog.log_drainer", "LogDrainer"),
+    ("dynastore.modules.catalog.lifecycle_reaper", "LifecycleReaper"),
+    ("dynastore.modules.db.db_contention_monitor", "DbContentionMonitor"),
+    ("dynastore.modules.db.instance_liveness", "InstanceLivenessHeartbeat"),
+    ("dynastore.modules.db.zombie_session_reaper", "ZombieSessionReaper"),
+    ("dynastore.modules.scaling.publisher", "ScalingSignalPublisher"),
+    ("dynastore.modules.gcp.liveness_reconciler", "GcpLivenessReconciler"),
+    ("dynastore.modules.gcp.liveness_reconciler", "GcpLivenessBackstop"),
+    ("dynastore.modules.gcp.scaling_reconciler", "GcpScalingReconciler"),
+    ("dynastore.modules.scaling.monitoring_signal_provider", "MonitoringSignalProvider"),
+    ("dynastore.modules.db_config.engine_instance_cache", "EngineInstanceCacheSweepService"),
+    ("dynastore.modules.db_config.config_reload_service", "ConfigReloadService"),
+    ("dynastore.modules.db_config.notification_hub", "NotificationHubService"),
+    ("dynastore.modules.iam.compiled_rule_cache", "IamRuleCacheRefreshService"),
+    ("dynastore.modules.iam.module", "IdentityProviderReconcileService"),
+    ("dynastore.tools.memory_watchdog", "MemoryWatchdogService"),
+    ("dynastore.main", "_ColdBootReconciliationService"),
+]
+
+
+@pytest.mark.parametrize(
+    "module_path, class_name",
+    _REGISTERED_BACKGROUND_SERVICES,
+    ids=[name for _, name in _REGISTERED_BACKGROUND_SERVICES],
+)
+def test_registered_service_satisfies_background_service_protocol(
+    module_path: str, class_name: str
+) -> None:
+    """Every registered BackgroundService implementor declares all protocol
+    members at the class level, with the right type for each.
+
+    Checked at the class (not instance) level: every implementor in this
+    codebase declares name/leadership/pod_policy/lock_key/lease_renewal_mode
+    as class attributes (directly, or inherited from PeriodicService), so a
+    missing member is a class-level gap, not something that only appears
+    after __init__ runs.
+    """
+    module = importlib.import_module(module_path)
+    cls = getattr(module, class_name)
+
+    assert isinstance(getattr(cls, "name", None), str), (
+        f"{class_name}.name must be a str"
+    )
+    assert isinstance(getattr(cls, "leadership", None), Leadership), (
+        f"{class_name}.leadership must be a Leadership"
+    )
+    assert isinstance(getattr(cls, "pod_policy", None), PodPolicy), (
+        f"{class_name}.pod_policy must be a PodPolicy"
+    )
+    assert hasattr(cls, "lock_key"), f"{class_name} must declare lock_key"
+    lock_key = getattr(cls, "lock_key")
+    assert lock_key is None or isinstance(lock_key, (int, str)), (
+        f"{class_name}.lock_key must be None, int, or str"
+    )
+    assert isinstance(getattr(cls, "lease_renewal_mode", None), LeaseRenewalMode), (
+        f"{class_name}.lease_renewal_mode must be a LeaseRenewalMode — regression "
+        "guard for #3257 (a bespoke, non-PeriodicService implementor must "
+        "declare this explicitly; PeriodicService subclasses inherit PER_TICK "
+        "automatically)"
+    )
+    assert asyncio.iscoroutinefunction(getattr(cls, "run", None)), (
+        f"{class_name}.run must be an async method"
     )
