@@ -489,15 +489,31 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
             # the dispatcher (or a different runner) picks it up.  fail_task
             # handles the hard_retry_cap circuit breaker centrally; we never
             # write a transient FAILED on the spawner side.
+            #
+            # Race-guarded by ``owner_id`` (#3264): both the dispatcher-path
+            # claim above (``claim_for_dispatch``) and the REST-path
+            # born-claimed insert stamp this attempt's own ``owner_id``. The
+            # RunJob attempts (with backoff between retries) can outlast the
+            # spawn lease, letting the reaper or another owner reclaim the
+            # row before this write lands — without the guard this call
+            # would clobber that fresh attempt's row unconditionally.
             from dynastore.modules.tasks.tasks_module import fail_task
             try:
-                await fail_task(
+                released = await fail_task(
                     context.engine,
                     task_id_for_payload,
                     datetime.now(timezone.utc),
                     f"GcpJobRunner: failed to trigger Cloud Run job '{job_name}': {last_exc}",
                     retry=_is_transient_runjob_error(last_exc),
+                    owner_id=owner_id,
                 )
+                if not released:
+                    logger.warning(
+                        "GcpJobRunner: lost terminal-write race releasing task "
+                        "'%s' after RunJob spawn failure (owner_id no longer "
+                        "%r) — row was reclaimed, not overwriting.",
+                        task_id_for_payload, owner_id,
+                    )
             except Exception as release_err:  # noqa: BLE001 — diagnostic
                 logger.error(
                     "GcpJobRunner: failed to release task '%s' after RunJob "

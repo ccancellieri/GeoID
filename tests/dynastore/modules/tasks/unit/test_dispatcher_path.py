@@ -592,6 +592,43 @@ def test_background_runner_claimed_terminal_writes_pass_prior_owner_guard():
         )
 
 
+def test_background_runner_claimed_follow_on_actions_gated_on_terminal_write_result():
+    """Source-level guard (#3264): every ``_apply_terminal(`` call in
+    ``BackgroundRunner._run_claimed`` must be nested under an ``if`` guarded
+    on the boolean the preceding terminal write returned — a stale
+    coroutine that lost the prior_owner_id race must not fire a duplicate
+    follow-on ROUTE task on top of the winning attempt's own call."""
+    import inspect
+
+    from dynastore.modules.tasks.runners import BackgroundRunner
+
+    source = inspect.getsource(BackgroundRunner._run_claimed)
+    lines = source.splitlines()
+    call_sites = [
+        i for i, ln in enumerate(lines) if "await _apply_terminal(" in ln
+    ]
+    assert len(call_sites) == 4, (
+        f"expected 4 _apply_terminal call sites in _run_claimed, found "
+        f"{len(call_sites)}: {[lines[i] for i in call_sites]}"
+    )
+    for idx in call_sites:
+        call_indent = len(lines[idx]) - len(lines[idx].lstrip())
+        guarded = False
+        for back in range(idx - 1, -1, -1):
+            stripped = lines[back].strip()
+            if not stripped:
+                continue
+            indent = len(lines[back]) - len(lines[back].lstrip())
+            if indent < call_indent:
+                guarded = stripped.startswith("if ")
+                break
+        assert guarded, (
+            f"_run_claimed:{idx + 1}: _apply_terminal call is not gated on "
+            f"the preceding terminal write's CAS result. "
+            f"Line: {lines[idx]!r}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Reaper DDL — structural guards
 # ---------------------------------------------------------------------------

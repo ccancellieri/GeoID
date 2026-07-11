@@ -94,6 +94,7 @@ async def _run_one_batch(
     complete_mock = AsyncMock(return_value=complete_return_value)
     fail_mock = AsyncMock(return_value=fail_return_value)
     dead_letter_mock = AsyncMock(return_value=True)
+    apply_terminal_action_mock = AsyncMock()
 
     default_terminal = execution_mod.RoutingTerminal(
         on_success=None, on_failure=None, on_timeout=None, timeout_seconds=None,
@@ -118,7 +119,7 @@ async def _run_one_batch(
             execution_mod, "resolve_routing_terminal",
             AsyncMock(return_value=default_terminal),
         ),
-        patch.object(execution_mod, "apply_terminal_action", AsyncMock()),
+        patch.object(execution_mod, "apply_terminal_action", apply_terminal_action_mock),
         patch.object(execution_mod.execution_engine, "dispatch", dispatch_mock),
     ):
         cap_map.refresh = AsyncMock()
@@ -135,7 +136,12 @@ async def _run_one_batch(
             timeout=5.0,
         )
 
-    return {"complete": complete_mock, "fail": fail_mock, "dead_letter": dead_letter_mock}
+    return {
+        "complete": complete_mock,
+        "fail": fail_mock,
+        "dead_letter": dead_letter_mock,
+        "apply_terminal_action": apply_terminal_action_mock,
+    }
 
 
 @pytest.mark.asyncio
@@ -200,6 +206,62 @@ async def test_dispatcher_fail_task_passes_owner_guard_on_permanent_failure():
     assert call.kwargs.get("retry") is False
 
 
+# ---------------------------------------------------------------------------
+# #3264 — follow-on ROUTE actions must be gated on winning the terminal
+# write's owner_id CAS, not fired unconditionally after a lost race.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_success_race_lost_skips_follow_on_action():
+    """A stale dispatcher attempt whose ``complete_task`` lost the owner_id
+    race (row already reclaimed and completed by a fresh attempt) must NOT
+    call ``apply_terminal_action`` — the winning attempt already fired its
+    own follow-on off the fresh row; firing it again here would enqueue a
+    duplicate ROUTE task."""
+    task_id = _uuid.uuid4()
+    row = _claimed_row(task_id)
+
+    mocks = await _run_one_batch(
+        row, dispatch_return_value={"ok": True}, complete_return_value=False,
+    )
+
+    mocks["apply_terminal_action"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_success_race_won_fires_follow_on_action():
+    """The attempt that actually wins the ``complete_task`` CAS must still
+    fire its follow-on action exactly once."""
+    task_id = _uuid.uuid4()
+    row = _claimed_row(task_id)
+
+    mocks = await _run_one_batch(
+        row, dispatch_return_value={"ok": True}, complete_return_value=True,
+    )
+
+    mocks["apply_terminal_action"].assert_awaited_once()
+    assert mocks["apply_terminal_action"].await_args.kwargs.get("outcome") == "success"
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_transient_failure_race_lost_skips_follow_on_action():
+    """Same guard on the failure path: a stale attempt whose ``fail_task``
+    lost the owner_id race must not fire ``apply_terminal_action`` either,
+    even though ``apply_terminal_action`` itself re-reads ground truth for
+    failure/timeout outcomes — the ground-truth status may already be
+    DEAD_LETTER/FAILED from the winning attempt, which would otherwise
+    fire a second duplicate ROUTE for this same outcome."""
+    task_id = _uuid.uuid4()
+    row = _claimed_row(task_id)
+
+    mocks = await _run_one_batch(
+        row, dispatch_side_effect=RuntimeError("boom"), fail_return_value=False,
+    )
+
+    mocks["apply_terminal_action"].assert_not_awaited()
+
+
 def test_dispatcher_terminal_writes_pass_owner_guard_grep_guard():
     """Source-level guard covering all 5 inline terminal-write call sites in
     ``run_dispatcher`` (the nested ``_dispatch_one`` closure isn't
@@ -225,4 +287,39 @@ def test_dispatcher_terminal_writes_pass_owner_guard_grep_guard():
         assert "owner_id=_RUNNER_ID" in window, (
             f"run_dispatcher:{idx + 1}: terminal write missing the owner_id "
             f"race guard. Window:\n{window}"
+        )
+
+
+def test_dispatcher_follow_on_actions_gated_on_terminal_write_result():
+    """Source-level guard (#3264): every ``apply_terminal_action`` call in
+    ``run_dispatcher`` must be nested under an ``if`` guarded on the boolean
+    the preceding terminal write returned — a stale attempt that lost the
+    owner_id race must not fire a duplicate follow-on ROUTE task on top of
+    the winning attempt's own call."""
+    import inspect
+
+    source = inspect.getsource(dispatcher_mod.run_dispatcher)
+    lines = source.splitlines()
+    call_sites = [
+        i for i, ln in enumerate(lines) if "await apply_terminal_action(" in ln
+    ]
+    assert len(call_sites) == 4, (
+        f"expected 4 apply_terminal_action call sites in run_dispatcher, "
+        f"found {len(call_sites)}: {[lines[i] for i in call_sites]}"
+    )
+    for idx in call_sites:
+        call_indent = len(lines[idx]) - len(lines[idx].lstrip())
+        guarded = False
+        for back in range(idx - 1, -1, -1):
+            stripped = lines[back].strip()
+            if not stripped:
+                continue
+            indent = len(lines[back]) - len(lines[back].lstrip())
+            if indent < call_indent:
+                guarded = stripped.startswith("if ")
+                break
+        assert guarded, (
+            f"run_dispatcher:{idx + 1}: apply_terminal_action call is not "
+            f"gated on the preceding terminal write's CAS result. "
+            f"Line: {lines[idx]!r}"
         )

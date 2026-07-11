@@ -478,6 +478,52 @@ async def test_runjob_permanent_error_fails_fast_no_retry():
     assert fail_task_mock.await_args.kwargs["retry"] is False
 
 
+@pytest.mark.asyncio
+async def test_runjob_spawn_failure_release_passes_owner_guard():
+    """#3264: the spawn-failure release must guard on THIS attempt's own
+    ``owner_id`` (the value stamped on the born-claimed row by
+    ``create_task``), exactly like every other terminal write in the tasks
+    plane — otherwise a slow release (after the bounded backoff/retry loop)
+    could clobber a row a different owner has since reclaimed."""
+    from dynastore.modules.gcp.gcp_runner import GcpJobRunner
+
+    new_task = MagicMock()
+    new_task.task_id = _uuid.uuid4()
+
+    runner = GcpJobRunner()
+    ctx = RunnerContext(
+        engine=_fake_engine(),
+        task_type="ingestion",
+        caller_id="u",
+        inputs={},
+        db_schema="s_test",
+        extra_context={},
+    )
+
+    create_task_mock = AsyncMock(return_value=new_task)
+    fail_task_mock = AsyncMock()
+
+    with patch(
+        "dynastore.modules.tasks.tasks_module.create_task", create_task_mock
+    ), patch(
+        "dynastore.modules.gcp.tools.jobs.load_job_config",
+        AsyncMock(return_value={"ingestion": "dynastore-ingestion-job"}),
+    ), patch(
+        "dynastore.modules.gcp.tools.jobs.run_cloud_run_job_async",
+        AsyncMock(side_effect=_Permanent4xx("403")),
+    ), patch(
+        "dynastore.modules.gcp.tools.jobs.try_load_process_definition", return_value=None
+    ), patch(
+        "dynastore.modules.tasks.tasks_module.fail_task", fail_task_mock
+    ):
+        with pytest.raises(_Permanent4xx):
+            await runner.run(ctx)
+
+    stamped_owner_id = create_task_mock.await_args.kwargs["owner_id"]
+    fail_task_mock.assert_awaited_once()
+    assert fail_task_mock.await_args.kwargs.get("owner_id") == stamped_owner_id
+
+
 # ---------------------------------------------------------------------------
 # Transient classifier — unit-level coverage
 # ---------------------------------------------------------------------------

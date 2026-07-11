@@ -989,10 +989,14 @@ async def run_dispatcher(
                 task_type, task_id, timestamp,
                 outcome="success", error=None,
             )
-            await apply_terminal_action(
-                engine, outcome="success",
-                action=terminal.on_success, **_action_fields(),
-            )
+            if completed:
+                # Exactly-once (#3264): a stale attempt that lost the
+                # owner_id race above must not fire a duplicate ROUTE
+                # follow-on on top of the winning attempt's own call.
+                await apply_terminal_action(
+                    engine, outcome="success",
+                    action=terminal.on_success, **_action_fields(),
+                )
 
         except asyncio.CancelledError:
             logger.warning(
@@ -1043,10 +1047,14 @@ async def run_dispatcher(
                 task_type, task_id, timestamp,
                 outcome="timeout", error=f"timeout {timeout_s}s",
             )
-            await apply_terminal_action(
-                engine, outcome="timeout",
-                action=terminal.on_timeout, **_action_fields(),
-            )
+            if dead_lettered:
+                # Exactly-once (#3264): a stale attempt that lost the
+                # owner_id race above must not fire a duplicate ROUTE
+                # follow-on on top of the winning attempt's own call.
+                await apply_terminal_action(
+                    engine, outcome="timeout",
+                    action=terminal.on_timeout, **_action_fields(),
+                )
 
         except PermanentTaskFailure as e:
             logger.error(
@@ -1068,10 +1076,14 @@ async def run_dispatcher(
                 task_type, task_id, timestamp,
                 outcome="permanent_failure", error=str(e),
             )
-            await apply_terminal_action(
-                engine, outcome="failure",
-                action=terminal.on_failure, **_action_fields(),
-            )
+            if failed:
+                # Exactly-once (#3264): a stale attempt that lost the
+                # owner_id race above must not fire a duplicate ROUTE
+                # follow-on on top of the winning attempt's own call.
+                await apply_terminal_action(
+                    engine, outcome="failure",
+                    action=terminal.on_failure, **_action_fields(),
+                )
 
         except Exception as e:
             import traceback
@@ -1094,13 +1106,18 @@ async def run_dispatcher(
                 task_type, task_id, timestamp,
                 outcome="transient_failure", error=str(e),
             )
-            # ROUTE continuation fires only if this attempt was the terminal
-            # one (DEAD_LETTER at cap); apply_terminal_action re-reads ground
-            # truth, so a mid-retry PENDING reset does not trigger it.
-            await apply_terminal_action(
-                engine, outcome="failure",
-                action=terminal.on_failure, **_action_fields(),
-            )
+            if failed:
+                # ROUTE continuation fires only if this attempt was the
+                # terminal one (DEAD_LETTER at cap); apply_terminal_action
+                # re-reads ground truth, so a mid-retry PENDING reset does
+                # not trigger it. Gated on ``failed`` as well (#3264) so a
+                # stale attempt that lost the owner_id race above cannot
+                # fire a duplicate ROUTE follow-on on top of the winning
+                # attempt's own call.
+                await apply_terminal_action(
+                    engine, outcome="failure",
+                    action=terminal.on_failure, **_action_fields(),
+                )
 
         finally:
             # Skip unregister when the background runner took heartbeat

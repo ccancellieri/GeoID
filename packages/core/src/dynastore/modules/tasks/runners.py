@@ -858,7 +858,12 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                             claimed_task_id,
                         )
                     logger.info(f"BackgroundRunner: claimed task '{claimed_task_id}' completed.")
-                    await _apply_terminal("success", _terminal.on_success)
+                    if completed:
+                        # Exactly-once (#3264): a stale coroutine that lost
+                        # the prior_owner_id race above must not fire a
+                        # duplicate ROUTE follow-on on top of the winning
+                        # attempt's own call.
+                        await _apply_terminal("success", _terminal.on_success)
 
                 except asyncio.CancelledError:
                     # Distinguish dismiss-driven cancellation from shutdown.
@@ -918,6 +923,7 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                         f"PermanentTaskFailure (no retry): {e}",
                     )
                     error_message = f"Asynchronous execution failed: {str(e)}"
+                    failed = False
                     try:
                         failed = await _fail_task(
                             context.engine, claimed_task_id,
@@ -941,7 +947,11 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                         )
                     # Permanent failure is terminal (FAILED) — fire on_failure.
                     # task.failed emitted inside _fail_task (retry=False → FAILED).
-                    await _apply_terminal("failure", _terminal.on_failure)
+                    # Gated on ``failed`` (#3264): a stale coroutine that lost
+                    # the prior_owner_id race must not fire a duplicate ROUTE
+                    # follow-on on top of the winning attempt's own call.
+                    if failed:
+                        await _apply_terminal("failure", _terminal.on_failure)
 
                 except asyncio.TimeoutError:
                     timeout_s = _bg_effective_timeout
@@ -949,6 +959,7 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                         "BackgroundRunner: claimed task '%s' (%s) timed out after %ss — dead-lettering.",
                         claimed_task_id, context.task_type, timeout_s,
                     )
+                    dead_lettered = False
                     try:
                         dead_lettered = await _dead_letter_task(
                             context.engine, claimed_task_id, _dt.now(_tz.utc),
@@ -968,7 +979,11 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                             claimed_task_id, dle, exc_info=True,
                         )
                     # Distinct terminal outcome — fire on_timeout (NOT on_failure).
-                    await _apply_terminal("timeout", _terminal.on_timeout)
+                    # Gated on ``dead_lettered`` (#3264): a stale coroutine that
+                    # lost the prior_owner_id race must not fire a duplicate
+                    # ROUTE follow-on on top of the winning attempt's own call.
+                    if dead_lettered:
+                        await _apply_terminal("timeout", _terminal.on_timeout)
 
                 except Exception as e:
                     logger.error(
@@ -976,6 +991,7 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                         exc_info=True,
                     )
                     error_message = f"Asynchronous execution failed: {str(e)}"
+                    failed = False
                     try:
                         failed = await _fail_task(
                             context.engine, claimed_task_id,
@@ -1003,7 +1019,11 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                     # does not trigger compensation.
                     # task.failed emitted inside _fail_task when status lands on
                     # DEAD_LETTER (hard-cap crossed) or FAILED; PENDING does not emit.
-                    await _apply_terminal("failure", _terminal.on_failure)
+                    # Gated on ``failed`` (#3264): a stale coroutine that lost
+                    # the prior_owner_id race must not fire a duplicate ROUTE
+                    # follow-on on top of the winning attempt's own call.
+                    if failed:
+                        await _apply_terminal("failure", _terminal.on_failure)
 
                 finally:
                     if heartbeat is not None:

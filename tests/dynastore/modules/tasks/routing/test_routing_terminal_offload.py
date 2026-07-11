@@ -89,10 +89,15 @@ def _make_runner_context():
         extra_context={},
         # asset is expected by raw_payload construction
         asset=None,
+        execution_overrides=None,
     )
 
 
-def _patch_background_runner_deps(monkeypatch, *, terminal, task_run_coro):
+def _patch_background_runner_deps(
+    monkeypatch, *, terminal, task_run_coro,
+    complete_returns: bool = True, fail_returns: bool = True,
+    dead_letter_returns: bool = True,
+):
     """Patch all external helpers called inside ``_execute_background_claimed``.
 
     Returns a namespace with the mocked callables.
@@ -109,9 +114,9 @@ def _patch_background_runner_deps(monkeypatch, *, terminal, task_run_coro):
     )
 
     # Terminal DB helpers
-    complete = AsyncMock(return_value=True)
-    fail = AsyncMock(return_value=True)
-    dead_letter = AsyncMock(return_value=True)
+    complete = AsyncMock(return_value=complete_returns)
+    fail = AsyncMock(return_value=fail_returns)
+    dead_letter = AsyncMock(return_value=dead_letter_returns)
     monkeypatch.setattr(tasks_module, "complete_task", complete)
     monkeypatch.setattr(tasks_module, "fail_task", fail)
     monkeypatch.setattr(tasks_module, "dead_letter_task", dead_letter)
@@ -243,6 +248,37 @@ async def test_background_fast_task_no_timeout_calls_on_success(monkeypatch):
 
     # Timeout path must not fire.
     mocks.dead_letter.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_background_success_race_lost_no_action(monkeypatch):
+    """#3264: ``complete_task`` losing the prior_owner_id race (row already
+    reclaimed and completed by a fresh attempt) must NOT fire
+    ``apply_terminal_action`` — the winning attempt already fired its own
+    follow-on off the fresh row."""
+    on_success_action = _sentinel_action("next_step")
+    terminal = _make_routing_terminal(
+        timeout_seconds=5.0,
+        on_success=on_success_action,
+    )
+
+    async def _fast_run(_payload):
+        return {"result": "ok"}
+
+    context = _make_runner_context()
+    mocks = _patch_background_runner_deps(
+        monkeypatch, terminal=terminal, task_run_coro=_fast_run,
+        complete_returns=False,
+    )
+
+    from dynastore.modules.tasks.runners import BackgroundRunner
+
+    runner = BackgroundRunner()
+    task_id = str(uuid.uuid4())
+    await _run_background_claimed_direct(runner, context, mocks.task_instance, task_id)
+
+    mocks.complete.assert_awaited_once()
+    mocks.apply_ta.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
