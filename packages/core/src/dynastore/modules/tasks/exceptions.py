@@ -23,7 +23,7 @@ The extension boundary (extensions/tools/exception_handlers.py) maps
 them to HTTP status codes via registered handlers.
 """
 
-__all__ = ["JobLockedError", "JobStateConflictError"]
+__all__ = ["JobLockedError", "JobStateConflictError", "UnclaimableRequeueError"]
 
 
 class JobLockedError(Exception):
@@ -41,4 +41,16 @@ class JobStateConflictError(Exception):
     The current status of the job does not allow the requested operation
     (e.g. starting an already-running job, or dismissing a terminal one).
     Maps to HTTP 409 Conflict at the extension boundary.
+    """
+
+
+class UnclaimableRequeueError(Exception):
+    """Raised by ``requeue_dead_letter_task`` when ``reset_retries=False``
+    would produce a PENDING row ``claim_batch`` can never claim.
+
+    ``claim_batch`` only claims rows with ``retry_count < hard_cap``; a
+    requeue that keeps the count as-is while it is already at/above that
+    cap would create a permanently unclaimable zombie row (the reaper only
+    touches ACTIVE rows, so it would never DLQ it again either). Maps to
+    HTTP 409 Conflict at the extension boundary.
     """

@@ -794,6 +794,25 @@ class JobStateConflictExceptionHandler(ExceptionHandler):
         return HTTPException(status_code=409, detail=str(exception))
 
 
+class UnclaimableRequeueExceptionHandler(ExceptionHandler):
+    """Maps ``UnclaimableRequeueError`` to HTTP 409 Conflict.
+
+    Raised by ``requeue_dead_letter_task`` when ``reset_retries=False``
+    would put a task back to PENDING with a ``retry_count`` already at/above
+    ``claim_batch``'s hard retry cap — no dispatcher would ever claim it.
+    """
+
+    def can_handle(self, exception: Exception) -> bool:
+        from dynastore.modules.tasks.exceptions import UnclaimableRequeueError
+
+        return isinstance(exception, UnclaimableRequeueError)
+
+    def handle(
+        self, exception: Exception, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[HTTPException]:
+        return HTTPException(status_code=409, detail=str(exception))
+
+
 class ImmutableConfigExceptionHandler(ExceptionHandler):
     """Handles immutable configuration modification attempts."""
 
@@ -1104,6 +1123,7 @@ class ExceptionHandlerRegistry:
         # status codes are preserved.
         self.register(JobLockedExceptionHandler())
         self.register(JobStateConflictExceptionHandler())
+        self.register(UnclaimableRequeueExceptionHandler())  # 409 — DLQ requeue would be a zombie row
         self.register(ConflictExceptionHandler())
         self.register(GcpServiceUnavailableExceptionHandler())
         self.register(GcpFailedDependencyExceptionHandler())

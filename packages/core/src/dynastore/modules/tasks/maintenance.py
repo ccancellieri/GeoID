@@ -43,7 +43,12 @@ from dynastore.modules.db_config.query_executor import (
     managed_transaction,
 )
 from dynastore.models.tasks import Task
-from dynastore.modules.tasks.tasks_module import decode_cursor, get_task_schema
+from dynastore.modules.tasks.exceptions import UnclaimableRequeueError
+from dynastore.modules.tasks.tasks_module import (
+    decode_cursor,
+    get_hard_retry_cap,
+    get_task_schema,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +231,14 @@ async def requeue_dead_letter_task(
                        Ignored when ``catalog_id`` is None.
     Returns:
         True if the task was found and requeued, False otherwise.
+
+    Raises:
+        UnclaimableRequeueError: ``reset_retries=False`` and the task's current
+            ``retry_count`` is already at/above the hard retry cap that
+            ``claim_batch`` enforces (``retry_count < hard_cap``). Requeuing it
+            as-is would create a PENDING row no dispatcher will ever claim and
+            the reaper (ACTIVE rows only) will never touch either. Re-issue
+            with ``reset_retries=True`` to make it claimable again.
     """
     task_schema = get_task_schema()
     retry_clause = "retry_count = 0," if reset_retries else ""
@@ -235,6 +248,10 @@ async def requeue_dead_letter_task(
         if catalog_id is not None and collection_id is not None
         else ""
     )
+    # #3219: when the retry_count is kept as-is, the row must still clear
+    # claim_batch's `retry_count < hard_cap` filter — otherwise the UPDATE
+    # below would silently produce an unclaimable zombie PENDING row.
+    retry_guard = "" if reset_retries else "AND retry_count < :hard_cap"
     sql = f"""
         UPDATE {task_schema}.tasks
         SET status       = 'PENDING',
@@ -247,6 +264,7 @@ async def requeue_dead_letter_task(
           AND status  IN {_REQUEUEABLE_STATUSES}
           {tenant_clause}
           {collection_clause}
+          {retry_guard}
         RETURNING task_id;
     """
     params: Dict[str, Any] = {"task_id": task_id}
@@ -254,6 +272,8 @@ async def requeue_dead_letter_task(
         params["catalog_id"] = catalog_id
         if collection_id is not None:
             params["collection_id"] = collection_id
+    if not reset_retries:
+        params["hard_cap"] = get_hard_retry_cap()
     async with managed_transaction(engine) as conn:
         row = await DQLQuery(sql, result_handler=ResultHandler.ONE_DICT).execute(
             conn, **params
@@ -262,6 +282,37 @@ async def requeue_dead_letter_task(
         logger.info(f"Maintenance: Task {task_id} re-queued from DEAD_LETTER/FAILED.")
         await _notify_requeued(engine, "dlq_requeue")
         return True
+    if not reset_retries:
+        # The UPDATE matched nothing — find out whether that's because the
+        # task doesn't exist / isn't in a requeueable state (the ordinary
+        # "not found" case below), or because it exists but is stuck at the
+        # hard retry cap, so the operator gets an actionable error instead
+        # of silent no-op. Diagnostic-only: no state change hinges on it.
+        diag_params: Dict[str, Any] = {"task_id": task_id}
+        if catalog_id is not None:
+            diag_params["catalog_id"] = catalog_id
+            if collection_id is not None:
+                diag_params["collection_id"] = collection_id
+        async with managed_transaction(engine) as conn:
+            existing = await DQLQuery(
+                f"""
+                SELECT retry_count FROM {task_schema}.tasks
+                WHERE task_id = :task_id
+                  AND status IN {_REQUEUEABLE_STATUSES}
+                  {tenant_clause}
+                  {collection_clause};
+                """,
+                result_handler=ResultHandler.ONE_DICT,
+            ).execute(conn, **diag_params)
+        hard_cap = params["hard_cap"]
+        if existing and existing["retry_count"] >= hard_cap:
+            raise UnclaimableRequeueError(
+                f"Task {task_id} has retry_count={existing['retry_count']}, "
+                f"already at/above the hard retry cap ({hard_cap}) enforced by "
+                f"claim_batch. Requeuing with reset_retries=False would create "
+                f"a PENDING row no dispatcher will ever claim. Re-issue with "
+                f"reset_retries=True to reset the count and make it claimable."
+            )
     logger.warning(
         f"Maintenance: Task {task_id} not found in a requeueable "
         f"(DEAD_LETTER/FAILED) state."

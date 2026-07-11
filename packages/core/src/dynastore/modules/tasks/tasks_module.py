@@ -2585,6 +2585,10 @@ async def claim_batch(
     # Circuit breaker: rows whose retry_count has reached the platform-wide
     # ``hard_cap`` are invisible to dispatchers — the reaper will DLQ them on
     # its next pass. This caps the cost of any future re-enqueue regression.
+    # `locked` captures error_message as it stood *before* the claim UPDATE
+    # clears it below — so the RETURNING clause can still surface the prior
+    # failure reason (as `prior_error_message`) for the event emitted after
+    # commit (#3225), without weakening the SKIP LOCKED claim itself.
     sql = f"""
         WITH candidates AS (
             SELECT DISTINCT ON (catalog_id) timestamp, task_id
@@ -2595,6 +2599,15 @@ async def claim_batch(
               AND retry_count < :hard_cap
               AND ({mode_filter})
             ORDER BY catalog_id, timestamp ASC
+        ),
+        locked AS (
+            SELECT timestamp, task_id, error_message
+            FROM {task_schema}.tasks
+            WHERE (timestamp, task_id) IN (SELECT timestamp, task_id FROM candidates)
+              AND status = 'PENDING'
+            ORDER BY timestamp ASC
+            LIMIT :batch_size
+            FOR UPDATE SKIP LOCKED
         )
         UPDATE {task_schema}.tasks
         SET status = 'ACTIVE',
@@ -2603,18 +2616,16 @@ async def claim_batch(
             started_at = COALESCE(started_at, NOW()),
             last_heartbeat_at = NOW(),
             error_message = NULL
-        WHERE (timestamp, task_id) IN (
-            SELECT timestamp, task_id
-            FROM {task_schema}.tasks
-            WHERE (timestamp, task_id) IN (SELECT timestamp, task_id FROM candidates)
-              AND status = 'PENDING'
-            ORDER BY timestamp ASC
-            LIMIT :batch_size
-            FOR UPDATE SKIP LOCKED
-        )
-        RETURNING task_id, catalog_id, scope, task_type, execution_mode,
-                  caller_id, inputs, collection_id, retry_count, max_retries,
-                  timestamp, dedup_key, owner_id;
+        FROM locked
+        WHERE {task_schema}.tasks.timestamp = locked.timestamp
+          AND {task_schema}.tasks.task_id = locked.task_id
+        RETURNING {task_schema}.tasks.task_id, {task_schema}.tasks.catalog_id,
+                  {task_schema}.tasks.scope, {task_schema}.tasks.task_type,
+                  {task_schema}.tasks.execution_mode, {task_schema}.tasks.caller_id,
+                  {task_schema}.tasks.inputs, {task_schema}.tasks.collection_id,
+                  {task_schema}.tasks.retry_count, {task_schema}.tasks.max_retries,
+                  {task_schema}.tasks.timestamp, {task_schema}.tasks.dedup_key,
+                  {task_schema}.tasks.owner_id, locked.error_message AS prior_error_message;
     """
 
     async with managed_transaction(engine) as conn:
@@ -2622,7 +2633,36 @@ async def claim_batch(
             conn, **params
         )
 
-    return result or []
+    result = result or []
+
+    # #3225: the claim above just cleared error_message so a retrying task
+    # doesn't carry a stale reason into a successful completion — but that
+    # trades away the only place the prior failure was visible while the
+    # retry is ACTIVE. Emit it as a task event (best-effort, after commit)
+    # so the history survives in the events stream. Skip first-time claims
+    # (no prior error) to keep this cheap in the common case.
+    for row in result:
+        prior_error = row.pop("prior_error_message", None)
+        if not prior_error:
+            continue
+        try:
+            from dynastore.modules.catalog.event_service import emit_event
+            await emit_event(
+                "task.retried",
+                task_id=str(row["task_id"]),
+                task_type=row.get("task_type"),
+                catalog_id=row.get("catalog_id"),
+                collection_id=row.get("collection_id"),
+                retry_count=row.get("retry_count"),
+                prior_error_message=prior_error,
+            )
+        except Exception as emit_exc:  # noqa: BLE001
+            logger.error(
+                "claim_batch: failed to emit task.retried event for task %s: %s",
+                row["task_id"], emit_exc,
+            )
+
+    return result
 
 
 async def complete_task(
