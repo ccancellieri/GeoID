@@ -16,15 +16,20 @@
 #    Company: FAO, Viale delle Terme di Caracalla, 00100 Rome, Italy
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
-"""Code-review guards for two dangerous Python antipatterns.
+"""Code-review guards for dangerous Python antipatterns.
 
 1. **Mutable default arguments** (``def f(x=[])`` / ``={}`` / ``=set()``) — the
    default is created once and shared across every call, so any mutation leaks
    between calls (a classic latent-state bug; ruff/flake8-bugbear B006).
 2. **``time.sleep()`` inside ``async def``** — blocks the whole event loop,
    stalling every coroutine on that loop. Use ``await asyncio.sleep()``.
+3. **Blocking ``requests.*`` calls inside ``async def``** — the synchronous
+   ``requests`` client blocks the event loop for the duration of the network
+   round-trip, same failure mode as (2) (see the provisioner-hook heartbeat
+   starvation this guards against). Route it through ``run_in_thread``/
+   ``asyncio.to_thread`` or an async HTTP client instead.
 
-Both are scanned across all package source and both are clean today (no
+All three are scanned across all package source and are clean today (no
 allowlist). The sidecar ``get_ddl`` mutable defaults that were previously
 grandfathered here have been normalised to a ``None`` sentinel (#1561); any
 mutable default now fails the build.
@@ -106,4 +111,51 @@ def test_no_blocking_time_sleep_in_async() -> None:
     assert not offenders, (
         "time.sleep() inside an async function blocks the event loop. "
         "Use `await asyncio.sleep(...)`:\n  " + "\n  ".join(offenders)
+    )
+
+
+_BLOCKING_REQUESTS_METHODS = frozenset(
+    {"get", "post", "put", "delete", "patch", "head", "request"}
+)
+
+
+def test_no_blocking_requests_call_in_async() -> None:
+    offenders: list[str] = []
+
+    class _V(ast.NodeVisitor):
+        def __init__(self, path):
+            self.path = path
+            self.depth = 0
+
+        def visit_AsyncFunctionDef(self, node):
+            self.depth += 1
+            self.generic_visit(node)
+            self.depth -= 1
+
+        def visit_FunctionDef(self, node):
+            # a sync def nested in an async def resets the loop-blocking context
+            saved, self.depth = self.depth, 0
+            self.generic_visit(node)
+            self.depth = saved
+
+        def visit_Call(self, node):
+            if self.depth > 0:
+                f = node.func
+                if (
+                    isinstance(f, ast.Attribute)
+                    and f.attr in _BLOCKING_REQUESTS_METHODS
+                    and isinstance(f.value, ast.Name)
+                    and f.value.id == "requests"
+                ):
+                    offenders.append(f"{self.path}:{node.lineno} requests.{f.attr}() in async def")
+            self.generic_visit(node)
+
+    for path in _iter_source_files():
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+        _V(path).visit(tree)
+
+    assert not offenders, (
+        "requests.*() inside an async function blocks the event loop for the "
+        "network round-trip. Offload via `await run_in_thread(...)` or use an "
+        "async HTTP client:\n  " + "\n  ".join(offenders)
     )
