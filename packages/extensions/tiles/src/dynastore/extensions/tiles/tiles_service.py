@@ -1118,16 +1118,34 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             )
 
             # 3. Cache Key & Pre-seed Check
+            #
+            # filter_lang and simplification_algorithm both carry non-empty
+            # defaults ("cql2-text" / TOPOLOGY_PRESERVING), so hashing them
+            # verbatim made `_generate_params_hash`'s `any(args[1:])` guard
+            # true on EVERY request — even a fully canonical one — and every
+            # live tile therefore cached under `{collection_id}@{hash}`
+            # instead of the plain `{collection_id}` the preseed task writes
+            # under (#3249). Canonicalize both to `None` here whenever they
+            # still hold their default value so a canonical request hashes
+            # to the same `None` (no-suffix) cache id the preseeded pyramid
+            # uses; a request that actually customizes either one still
+            # gets its own distinct hash.
+            hashed_filter_lang = filter_lang if filter_lang != "cql2-text" else None
+            hashed_simplification_algorithm = (
+                simplification_algorithm
+                if simplification_algorithm != SimplificationAlgorithm.TOPOLOGY_PRESERVING
+                else None
+            )
             params_hash = self._generate_params_hash(
                 collections,
                 datetime,
                 filter,
-                filter_lang,
+                hashed_filter_lang,
                 filter_crs,
                 subset,
                 simplification,
                 simplification_by_zoom,
-                simplification_algorithm,
+                hashed_simplification_algorithm,
             )
 
             # Handle cache control flags
@@ -2591,6 +2609,23 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             render_gate=self._raster_render_gate,
         )
 
+    @staticmethod
+    def _png_tile_cache_response(cached: bytes) -> Response:
+        """Build the Response for an already-rendered PNG map tile fetched
+        from the tile cache — shared by ``_get_vector_map_tile``'s
+        pre-render cache-hit check and its cancel-race stale-tile fallback.
+        """
+        if not cached:
+            return Response(
+                status_code=204,
+                headers={"X-Render-Cache": "hit", "X-Render-Source": "tile_storage"},
+            )
+        return Response(
+            content=cached,
+            media_type="image/png",
+            headers={"X-Render-Cache": "hit", "X-Render-Source": "tile_storage"},
+        )
+
     async def _get_vector_map_tile(
         self,
         request: Request,
@@ -2647,16 +2682,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                     "z=%s x=%s y=%s duration_ms=%.2f bytes=%d",
                     catalog_id, cache_id, z, x, y, duration_ms, len(cached),
                 )
-                if not cached:
-                    return Response(
-                        status_code=204,
-                        headers={"X-Render-Cache": "hit", "X-Render-Source": "tile_storage"},
-                    )
-                return Response(
-                    content=cached,
-                    media_type="image/png",
-                    headers={"X-Render-Cache": "hit", "X-Render-Source": "tile_storage"},
-                )
+                return self._png_tile_cache_response(cached)
 
         from dynastore.modules.tiles import tiles_engine
         from dynastore.modules.tiles.tiles_source import TileSourceNotSupported
@@ -2692,6 +2718,24 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                 ),
             )
 
+        # Timeout reference for cancel-race classification below — this
+        # handler sets no ``SET LOCAL statement_timeout`` of its own (the
+        # PostGIS query runs unbounded), but a request cancelled by an
+        # upstream deadline (load balancer / Cloud Run) still races asyncpg
+        # the same way a statement-timeout cancellation does (#3181), so the
+        # live-tile timeout is reused as the "this is stale, not a fresh
+        # wire fault" cutoff shared with ``get_vector_tile``.
+        config_manager = get_protocol(ConfigsProtocol)
+        tiles_cfg = (
+            await config_manager.get_config(TilesConfig, catalog_id)
+            if config_manager else None
+        )
+        timeout_s = (
+            tiles_cfg.live_tile_timeout_seconds
+            if isinstance(tiles_cfg, TilesConfig)
+            else TilesConfig().live_tile_timeout_seconds
+        )
+
         # Vector render admission gate (#3155, split into a dedicated vector
         # bulkhead in #3209) — this tile's bytes come from PostGIS/MVT
         # rendering even though the response is PNG, so it shares the
@@ -2718,6 +2762,37 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                     tile_bytes = await tiles_engine.render_tile(
                         conn, ctx, str(z), x, y, format="png", use_l1_cache=True,
                     )
+                except (QueryExecutionError, DatabaseConnectionError) as exc:
+                    # Mirrors get_vector_tile's stale-or-503 ladder (#2965,
+                    # #3181, #3200, #3251): a cancelled/torn-down connection
+                    # means this render never learned whether the tile has
+                    # data, so it must never masquerade as a genuine 500 —
+                    # serve a stale cached tile if one exists, else fail
+                    # honestly with 503 + Retry-After. A non-cancel-race
+                    # QueryExecutionError still propagates unchanged.
+                    pgcode = getattr(exc.original_exception, "pgcode", None)
+                    elapsed_s = time.perf_counter() - start
+                    cancel_race = _is_timeout_cancel_race(exc, elapsed_s, timeout_s)
+                    if pgcode != _QUERY_CANCELED_PGCODE and not cancel_race:
+                        raise
+                    trigger = "pgcode" if pgcode == _QUERY_CANCELED_PGCODE else "cancel-race"
+                    logger.warning(
+                        "map_tile: statement timeout (trigger=%s, pgcode=%s, "
+                        "live_tile_timeout_seconds=%s) catalog=%s collection=%s "
+                        "z=%s x=%s y=%s — attempting stale tile fallback",
+                        trigger, pgcode, timeout_s, catalog_id, collection_id, z, x, y,
+                    )
+                    stale = (
+                        await provider.get_tile(catalog_id, cache_id, tms_id, z, x, y, "png")
+                        if provider and cache_enabled else None
+                    )
+                    if stale is not None:
+                        return self._png_tile_cache_response(stale)
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Map tile render timed out, try again shortly.",
+                        headers={"Retry-After": "5"},
+                    ) from None
                 finally:
                     await conn.close()
         except RenderAdmissionRejected as exc:
