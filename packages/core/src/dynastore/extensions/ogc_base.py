@@ -647,6 +647,24 @@ class OGCServiceMixin:
     # ------------------------------------------------------------------
     # Web-nav listing helpers (catalog/collection {id, title, description})
     # ------------------------------------------------------------------
+    # Scope note (evaluated for #2692): these two helpers back the
+    # reduced-payload "web-browser navigation" listings (Coverages, EDR,
+    # Records, Moving Features `list_catalogs`/`list_collections`).
+    # Features' `/catalogs` and `/catalogs/{id}/collections`, and EDR's
+    # `/catalogs/{id}/collections`, are intentionally NOT migrated onto
+    # these helpers: those are the OGC-conformant core resource listings
+    # and return full CatalogDefinition/OGCCollection/EDRCollection models
+    # (license, keywords, extra_metadata, self/items/parent links, a CRS
+    # list, parameter_names) that this {id, title[, description]}
+    # projection cannot reproduce byte-for-byte — a richer contract, not a
+    # copy-pasted one (see the "non-OGC extensions are unaffected" note in
+    # this module's docstring for the equivalent Admin boundary). Admin's
+    # `/admin/catalogs` picker is a non-OGC, platform-scope endpoint
+    # (inherits ExtensionProtocol only, never OGCServiceMixin) with its own
+    # `q` free-text filter and a bare-list wire shape locked in by
+    # tests/dynastore/extensions/admin/integration/test_admin_routes.py::test_list_catalogs_for_admin_returns_200;
+    # folding it onto ``_ogc_list_catalogs`` would drop the filter and
+    # change the response envelope, so it stays hand-rolled by design.
 
     async def _ogc_list_catalogs(
         self,
