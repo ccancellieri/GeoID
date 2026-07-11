@@ -605,7 +605,9 @@ class TestMissingStyle404:
             _ts_mod._RENDER_COG_TILE = lambda *a, **kw: b"PNG"
 
             svc = _make_service()
-            svc._get_catalogs_service = AsyncMock(return_value=_mock_catalogs_svc())
+            svc._get_catalogs_service = AsyncMock(
+                return_value=_mock_catalogs_svc("internal-cat", "internal-coll")
+            )
             svc._require_collection_visible = AsyncMock()
             svc._validate_tms_and_matrix = AsyncMock(return_value=MagicMock())
             svc._get_first_item = AsyncMock(return_value=_first_item_stub())
@@ -635,6 +637,62 @@ class TestMissingStyle404:
                         )
 
             assert exc_info.value.status_code == 404
+        finally:
+            _ts_mod._RENDER_COG_TILE = original_rct
+
+    @pytest.mark.asyncio
+    async def test_missing_style_404_surfaces_external_id_not_internal(self):
+        """#3236 audit: the styled path's 404 must stay on external vocabulary.
+
+        Pre-#3170, this branch called ``StylesProtocol.get_style`` — a route
+        handler that re-resolves its ``catalog_id``/``collection_id`` args as
+        if they were external — with the already-resolved *internal* ids,
+        producing leaks like ``Catalog 'c_t5qach5rjr59h' not found`` on the
+        wire. ``_get_style_record`` (mocked here as returning ``None``, i.e.
+        style not found) replaced that call, and the 404 raised here is built
+        from the handler's own external ``collection_id`` parameter — assert
+        that stays true.
+        """
+        original_rct = _ts_mod._RENDER_COG_TILE
+        try:
+            _ts_mod._RENDER_COG_TILE = lambda *a, **kw: b"PNG"
+
+            svc = _make_service()
+            svc._get_catalogs_service = AsyncMock(
+                return_value=_mock_catalogs_svc("internal-cat", "internal-coll")
+            )
+            svc._require_collection_visible = AsyncMock()
+            svc._validate_tms_and_matrix = AsyncMock(return_value=MagicMock())
+            svc._get_first_item = AsyncMock(return_value=_first_item_stub())
+
+            styles_svc = MagicMock()
+            svc._get_style_record = AsyncMock(return_value=None)  # style not found
+
+            with patch("dynastore.extensions.tiles.tiles_service.get_protocol", return_value=styles_svc):
+                with patch(
+                    "dynastore.extensions.tiles.tiles_service.TilesService._load_render_caching_config",
+                    new_callable=AsyncMock,
+                    return_value=_make_render_config(cache_enabled=False),
+                ):
+                    with pytest.raises(HTTPException) as exc_info:
+                        await svc.get_map_tile_styled(
+                            request=_make_request(),
+                            background_tasks=_make_bg_tasks(),
+                            catalog_id="ext-cat",
+                            collection_id="ext-coll",
+                            style_id="missing-style",
+                            tms_id="WebMercatorQuad",
+                            z=5,
+                            x=0,
+                            y=0,
+                            format="png",
+                            **_STYLED_DEFAULTS,
+                        )
+
+            detail = str(exc_info.value.detail)
+            assert "ext-coll" in detail
+            assert "internal-coll" not in detail
+            assert "internal-cat" not in detail
         finally:
             _ts_mod._RENDER_COG_TILE = original_rct
 

@@ -245,6 +245,12 @@ class TestGetMapTileRasterHappyPath:
             assert call_args[4:7] == (5, 1, 2)
             assert call_args[7] == b"TILE-BYTES"
             assert call_args[8] == "png"
+            # #3236 audit: build_render_cache_key's docstring requires the
+            # internal collection id ("MUST be the immutable internal id,
+            # not the public external_id"), and render_preseed's raster lane
+            # writes to that same namespace — unlike the vector MVT lane
+            # (#3235), the raster cache is intentionally internal-id-keyed.
+            assert "internal-coll" in call_args[2]
         finally:
             _ts_mod._RENDER_COG_TILE = original
 
@@ -445,6 +451,14 @@ class TestHillshadeDispatch:
             call_args = svc._tile_cache_writer.submit_nowait.call_args.args
             assert call_args[7] == b"HILLSHADE-BYTES"
             assert call_args[8] == "png"
+            # #3236 audit: build_render_cache_key requires the internal
+            # collection id (its docstring: "MUST be the immutable internal
+            # id, not the public external_id"), and render_preseed writes
+            # raster cache entries the same way — the styled/hillshade
+            # write-back must match that namespace, not the vector lane's
+            # external-id convention from #3235.
+            assert call_args[1] == "internal-cat"
+            assert "internal-coll" in call_args[2]
         finally:
             _ts_mod._RENDER_COG_HILLSHADE = original
 
