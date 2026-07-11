@@ -108,6 +108,45 @@ async def _heartbeat_loop(
                 logger.warning(f"Progress persist failed for task {task_id}: {e}")
 
 
+def _sigterm_is_final_timeout(
+    elapsed_seconds: float, env: typing.Mapping[str, str] | None = None
+) -> bool:
+    """Classify a SIGTERM as a final-attempt Cloud Run task-timeout kill.
+
+    Cloud Run sends SIGTERM for several unrelated reasons — a routine
+    deploy/scale-in recycle, an OOM preempt, or (the case this targets) the
+    job's own ``timeoutSeconds`` being reached. Only the last one, on the
+    *last* attempt, deserves a terminal write: a non-final attempt's retry
+    resumes normally, and a final-attempt preemption can still be re-dispatched
+    as a fresh execution — but a final-attempt timeout kill would just be
+    respawned and killed again, unbounded, if it were reset to PENDING.
+
+    Returns ``True`` only when ALL of:
+      - ``CLOUD_RUN_TASK_ATTEMPT`` (0-based, Cloud Run auto-injected),
+        ``MAX_RETRIES`` and ``TASK_TIMEOUT`` (both deployment-template env
+        vars) are present and parse as numbers;
+      - ``attempt >= max_retries`` — this is the final attempt, no retry
+        follows;
+      - ``elapsed_seconds >= 0.9 * task_timeout`` — the kill lines up with the
+        configured task timeout rather than an early preemption.
+
+    Any missing or unparseable env var returns ``False``, which preserves
+    today's reset-to-PENDING behaviour — required for deploys that predate
+    ``MAX_RETRIES`` / ``TASK_TIMEOUT`` being surfaced as container env vars.
+    """
+    if env is None:
+        env = os.environ
+    try:
+        attempt = int(env["CLOUD_RUN_TASK_ATTEMPT"])
+        max_retries = int(env["MAX_RETRIES"])
+        task_timeout = float(env["TASK_TIMEOUT"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if attempt < max_retries:
+        return False
+    return elapsed_seconds >= 0.9 * task_timeout
+
+
 def _resolve_payload_model(target_task: object, task_name: str) -> type:
     """Return the pydantic model annotated on ``target_task.run``'s ``payload``.
 
@@ -197,8 +236,13 @@ async def main(task_name: str, payload: dict, schema: str):
       5. On success: ``complete_task(status=COMPLETED, outputs=res)``.
          On expected failure (PermanentTaskFailure): ``fail_task(retry=False)``.
          On unexpected exception: ``fail_task(retry=True)``.
-         On SIGTERM (asyncio.CancelledError): ``reset_task_to_pending`` so the
-         reaper / dispatcher can re-claim it.
+         On SIGTERM (asyncio.CancelledError): a final-attempt Cloud Run task-
+         timeout kill (see ``_sigterm_is_final_timeout``) writes a terminal
+         ``fail_task(retry=False)`` so the row is immediately diagnosable
+         instead of a silent zombie; every other SIGTERM (mid-run preemption,
+         deploy/scale-in recycle, or a non-final attempt whose retry can still
+         resume) still ``reset_task_to_pending`` so the reaper / dispatcher can
+         re-claim it.
       6. ``finally``: cancel the heartbeat coroutine.
 
     Without these writes the row stays ACTIVE; the maintenance reaper would flip it
@@ -266,6 +310,11 @@ async def main(task_name: str, payload: dict, schema: str):
                 engine = db.engine if db else None
 
                 hb_task = None
+                # Assigned inside the ownership-claim block below; stays None
+                # when the task runs without DB ownership (task_id missing /
+                # DB protocol unavailable) — the CancelledError handler must
+                # never reference it unguarded.
+                owner_id: typing.Optional[str] = None
                 if task_id_uuid is not None and engine is not None and tasks_mgr is not None:
                     # Take ownership via an atomic, status-guarded claim. The
                     # owner id MUST share the spawner's ``gcp_cloud_run_``
@@ -333,6 +382,7 @@ async def main(task_name: str, payload: dict, schema: str):
                 try:
                     logger.info(f"--- [main_task.py] Executing task: '{task_name}' ---")
                     from dynastore.tools.execution_context import task_run_scope
+                    run_started = datetime.now(timezone.utc)
                     with task_run_scope(catalog=schema):
                         res = await target_task.run(payload=validate_payload)
                     logger.info(f"--- [main_task.py] Task '{task_name}' returned: {res} ---")
@@ -382,20 +432,60 @@ async def main(task_name: str, payload: dict, schema: str):
                             f"--- [main_task.py] Task {task_id_uuid} marked COMPLETED. ---"
                         )
                 except asyncio.CancelledError:
-                    # SIGTERM during execution — release the row so reaper / another worker
-                    # can pick it up. Honour max_retries as a circuit breaker (per row).
+                    # SIGTERM during execution. A final-attempt Cloud Run
+                    # task-timeout kill gets a terminal FAILED write instead of
+                    # the usual reset-to-PENDING — resetting it would just get
+                    # respawned and killed at the same wall again, unbounded
+                    # (reset_task_to_pending doesn't advance retry_count).
+                    # Every other SIGTERM (mid-run preemption, deploy/scale-in
+                    # recycle, or a non-final attempt whose retry can still
+                    # resume) keeps today's release-to-PENDING behaviour.
                     if task_id_uuid is not None and engine is not None:
-                        from dynastore.modules.tasks.tasks_module import reset_task_to_pending
-                        try:
-                            await reset_task_to_pending(engine, task_id_uuid)
-                            logger.warning(
-                                f"--- [main_task.py] Task {task_id_uuid} cancelled (SIGTERM); "
-                                f"reset to PENDING for retry. ---"
+                        elapsed = (datetime.now(timezone.utc) - run_started).total_seconds()
+                        if owner_id is not None and _sigterm_is_final_timeout(elapsed):
+                            from dynastore.modules.tasks.tasks_module import fail_task
+                            configured_timeout = os.getenv("TASK_TIMEOUT", "?")
+                            reason = (
+                                "Terminated by the Cloud Run task timeout on the "
+                                f"final attempt (elapsed={elapsed:.0f}s, "
+                                f"TASK_TIMEOUT={configured_timeout}s)."
                             )
-                        except Exception as reset_err:
-                            logger.error(
-                                f"Failed to reset task {task_id_uuid} on cancel: {reset_err}"
-                            )
+                            try:
+                                _fail_updated = await fail_task(
+                                    engine, task_id_uuid, datetime.now(timezone.utc),
+                                    reason, retry=False, owner_id=owner_id,
+                                )
+                                if _fail_updated:
+                                    logger.warning(
+                                        f"--- [main_task.py] Task {task_id_uuid} cancelled "
+                                        f"(SIGTERM) on final-attempt timeout after "
+                                        f"{elapsed:.0f}s; marked FAILED. ---"
+                                    )
+                                else:
+                                    logger.warning(
+                                        "--- [main_task.py] lost terminal-write race "
+                                        "failing task %s on final-attempt timeout "
+                                        "SIGTERM (owner_id no longer %r) — row was "
+                                        "reclaimed, not overwriting. ---",
+                                        task_id_uuid, owner_id,
+                                    )
+                            except Exception as fail_err:
+                                logger.error(
+                                    f"Failed to fail task {task_id_uuid} on "
+                                    f"final-attempt timeout SIGTERM: {fail_err}"
+                                )
+                        else:
+                            from dynastore.modules.tasks.tasks_module import reset_task_to_pending
+                            try:
+                                await reset_task_to_pending(engine, task_id_uuid)
+                                logger.warning(
+                                    f"--- [main_task.py] Task {task_id_uuid} cancelled (SIGTERM); "
+                                    f"reset to PENDING for retry. ---"
+                                )
+                            except Exception as reset_err:
+                                logger.error(
+                                    f"Failed to reset task {task_id_uuid} on cancel: {reset_err}"
+                                )
                     raise
                 except PermanentTaskFailure as exc:
                     if task_id_uuid is not None and engine is not None:
