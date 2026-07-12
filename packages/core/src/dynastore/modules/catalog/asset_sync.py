@@ -413,8 +413,8 @@ def register_item_forward_cascade_subscriber() -> None:
     """Register ``ItemForwardCascadeSubscriber`` on the global event bus.
 
     Wires ``ITEM_DELETION`` only — soft delete is symmetric with the item's own
-    soft-delete.  ``ITEM_HARD_DELETION`` is defined but never emitted; do not
-    wire it here.
+    soft-delete.  Hard delete has no counterpart event: the never-emitted
+    ``ITEM_HARD_DELETION`` member was pruned (#3288).
     """
     async_event_listener(CatalogEventType.ITEM_DELETION)(
         ItemForwardCascadeSubscriber.on_item_delete

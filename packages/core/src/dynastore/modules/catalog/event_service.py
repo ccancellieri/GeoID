@@ -127,25 +127,13 @@ class CatalogEventType(EventType):
     ASSET_HARD_DELETION = define_event("asset_hard_deletion", EventScope.COLLECTION)
 
     # Item Lifecycle
-    BEFORE_ITEM_CREATION = define_event("before_item_creation", EventScope.COLLECTION)
+    #
+    # Only the events below are ever emitted. The BEFORE_*/AFTER_* triplet
+    # members and the never-emitted ITEM_UPDATE / ITEM_HARD_DELETION mids
+    # were pruned (#3288) — zero emit sites, zero subscribers, same
+    # subscribe-to-a-dead-event trap the asset family prune (#3283) removed.
     ITEM_CREATION = define_event("item_creation", EventScope.COLLECTION)
-    AFTER_ITEM_CREATION = define_event("after_item_creation", EventScope.COLLECTION)
-
-    BEFORE_ITEM_UPDATE = define_event("before_item_update", EventScope.COLLECTION)
-    ITEM_UPDATE = define_event("item_update", EventScope.COLLECTION)
-    AFTER_ITEM_UPDATE = define_event("after_item_update", EventScope.COLLECTION)
-
-    BEFORE_ITEM_DELETION = define_event("before_item_deletion", EventScope.COLLECTION)
     ITEM_DELETION = define_event("item_deletion", EventScope.COLLECTION)
-    AFTER_ITEM_DELETION = define_event("after_item_deletion", EventScope.COLLECTION)
-
-    BEFORE_ITEM_HARD_DELETION = define_event(
-        "before_item_hard_deletion", EventScope.COLLECTION
-    )
-    ITEM_HARD_DELETION = define_event("item_hard_deletion", EventScope.COLLECTION)
-    AFTER_ITEM_HARD_DELETION = define_event(
-        "after_item_hard_deletion", EventScope.COLLECTION
-    )
 
     # M3.0 — metadata-changed events (role-based driver plan §Events).
     #
@@ -181,14 +169,8 @@ class CatalogEventType(EventType):
         "collection_metadata_changed", EventScope.CATALOG
     )
 
-    # Bulk Event Lifecycle
-    BEFORE_BULK_ITEM_CREATION = define_event(
-        "before_bulk_item_creation", EventScope.COLLECTION
-    )
+    # Bulk Event Lifecycle (BEFORE_*/AFTER_* pruned with the item family, #3288)
     BULK_ITEM_CREATION = define_event("bulk_item_creation", EventScope.COLLECTION)
-    AFTER_BULK_ITEM_CREATION = define_event(
-        "after_bulk_item_creation", EventScope.COLLECTION
-    )
 
     # Task Lifecycle Events (platform-scoped, fired by runners - no module coupling)
     TASK_FAILED = define_event("task.failed", EventScope.PLATFORM)
