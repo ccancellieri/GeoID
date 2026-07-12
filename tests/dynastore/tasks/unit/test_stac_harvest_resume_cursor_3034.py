@@ -35,6 +35,17 @@ from dynastore.tasks.stac_harvest import task as harvest_task
 from dynastore.tasks.stac_harvest.models import StacHarvestCursor, StacHarvestRequest
 
 
+@pytest.fixture(autouse=True)
+def _mock_pg_collection_metadata_upsert():
+    """``_ensure_collection`` persists collection metadata to PG (#3273 —
+    landed as part of "fix(stac): persist harvested collection metadata in
+    pg"), which needs a live ``DatabaseProtocol``. These tests only cover the
+    resume-cursor checkpoint wiring, so stub that call out — mirrors the
+    fixture ``test_stac_harvest_single_collection.py`` already uses."""
+    with patch.object(harvest_task, "_upsert_collection_metadata_pg", AsyncMock()):
+        yield
+
+
 def _mock_catalogs() -> AsyncMock:
     catalogs = AsyncMock()
     catalogs.get_collection = AsyncMock(return_value=None)  # not present -> create

@@ -72,7 +72,7 @@ def test_report_failure_source_never_bootstraps_full_module_graph():
 
 def test_report_failure_source_uses_bare_engine_and_update_task():
     src = _report_failure_src()
-    assert "create_async_engine" in src
+    assert "create_task_engine" in src
     assert "update_task(" in src
 
 
@@ -96,7 +96,10 @@ async def test_report_failure_writes_failed_without_touching_module_graph():
     task_id = str(uuid.uuid4())
 
     with (
-        patch("sqlalchemy.ext.asyncio.create_async_engine", return_value=fake_engine),
+        patch(
+            "dynastore.modules.db_config.db_timeout_config.create_task_engine",
+            return_value=fake_engine,
+        ),
         patch(
             "dynastore.modules.tasks.tasks_module.update_task",
             new=update_task_mock,
@@ -132,7 +135,10 @@ async def test_report_failure_swallows_db_errors_from_the_minimal_path():
     update_task_mock = AsyncMock(side_effect=RuntimeError("db unreachable"))
 
     with (
-        patch("sqlalchemy.ext.asyncio.create_async_engine", return_value=fake_engine),
+        patch(
+            "dynastore.modules.db_config.db_timeout_config.create_task_engine",
+            return_value=fake_engine,
+        ),
         patch(
             "dynastore.modules.tasks.tasks_module.update_task",
             new=update_task_mock,

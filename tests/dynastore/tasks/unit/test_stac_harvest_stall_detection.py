@@ -36,6 +36,17 @@ from dynastore.tasks.stac_harvest import task as harvest_task
 from dynastore.tasks.stac_harvest.models import StacHarvestRequest
 
 
+@pytest.fixture(autouse=True)
+def _mock_pg_collection_metadata_upsert():
+    """``_ensure_collection`` persists collection metadata to PG (#3273 —
+    landed as part of "fix(stac): persist harvested collection metadata in
+    pg"), which needs a live ``DatabaseProtocol``. These tests only cover the
+    stall-detection clock, so stub that call out — mirrors the fixture
+    ``test_stac_harvest_single_collection.py`` already uses."""
+    with patch.object(harvest_task, "_upsert_collection_metadata_pg", AsyncMock()):
+        yield
+
+
 def _task_scoped_monotonic(*values: float):
     """Build a ``time.monotonic`` replacement that only hands out ``values``
     to calls made from inside ``dynastore.tasks.stac_harvest.task`` (the

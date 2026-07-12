@@ -63,7 +63,7 @@ async def test_retry_helper_succeeds_on_first_attempt():
         yield conn
 
     with patch(
-        "dynastore.modules.catalog.catalog_service.managed_transaction",
+        "dynastore.modules.db_config.query_executor.managed_transaction",
         side_effect=_fake_txn,
     ):
         result = await _provisioning_write_with_retry(engine, _good_fn)
@@ -100,7 +100,7 @@ async def test_retry_helper_retries_once_on_transient_interface_error():
         return "retried-ok"
 
     with patch(
-        "dynastore.modules.catalog.catalog_service.managed_transaction",
+        "dynastore.modules.db_config.query_executor.managed_transaction",
         side_effect=_fake_txn,
     ):
         result = await _provisioning_write_with_retry(MagicMock(), _fn)
@@ -129,7 +129,7 @@ async def test_retry_helper_does_not_retry_non_transient_errors():
         raise ValueError("bad input")
 
     with patch(
-        "dynastore.modules.catalog.catalog_service.managed_transaction",
+        "dynastore.modules.db_config.query_executor.managed_transaction",
         side_effect=_fake_txn,
     ):
         with pytest.raises(ValueError, match="bad input"):
@@ -161,7 +161,7 @@ async def test_retry_helper_does_not_retry_on_second_transient_error():
         raise _FakeInterfaceError("connection was closed")
 
     with patch(
-        "dynastore.modules.catalog.catalog_service.managed_transaction",
+        "dynastore.modules.db_config.query_executor.managed_transaction",
         side_effect=_fake_txn,
     ):
         with pytest.raises(_FakeInterfaceError):
@@ -204,7 +204,7 @@ async def test_update_provisioning_status_fanout_outside_transaction():
 
     with (
         patch(
-            "dynastore.modules.catalog.catalog_service.managed_transaction",
+            "dynastore.modules.db_config.query_executor.managed_transaction",
             side_effect=_fake_txn,
         ),
         patch(
