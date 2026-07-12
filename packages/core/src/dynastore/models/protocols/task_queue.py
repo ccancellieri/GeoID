@@ -135,19 +135,6 @@ class TaskQueueProtocol(TasksProtocol, Protocol):
         """
         ...
 
-    async def find_stale(
-        self,
-        engine: Any,
-        stale_threshold: timedelta,
-        schema_name: Optional[str] = None,
-    ) -> List[Any]:
-        """
-        Find active tasks with expired locks (janitor use).
-
-        If schema_name is None, scans globally.
-        """
-        ...
-
     async def cleanup_orphans(self, engine: Any, grace_period: timedelta) -> int:
         """
         Move tasks for deleted catalogs to DEAD_LETTER.

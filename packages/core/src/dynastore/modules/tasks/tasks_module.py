@@ -604,14 +604,6 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
     ) -> None:
         return await heartbeat_tasks(engine, tasks, visibility_timeout)
 
-    async def find_stale(
-        self,
-        engine: Any,
-        stale_threshold: timedelta,
-        schema_name: Optional[str] = None,
-    ) -> List[Any]:
-        return await find_stale_tasks(engine, stale_threshold, schema_name)
-
     async def cleanup_orphans(self, engine: Any, grace_period: timedelta) -> int:
         return await cleanup_orphan_tasks(engine, grace_period)
 
@@ -3711,41 +3703,6 @@ async def reset_task_to_pending(
         await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
             conn, **params,
         )
-
-
-async def find_stale_tasks(
-    engine: DbResource,
-    stale_threshold: timedelta,
-    schema_name: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Find active tasks with expired locks (stuck-task diagnostics).
-    If schema_name is provided, scopes to that tenant (matches the catalog_id column value).
-    """
-    task_schema = get_task_schema()
-    cutoff = datetime.now(timezone.utc) - stale_threshold
-
-    schema_filter = ""
-    params: Dict[str, Any] = {"cutoff": cutoff}
-    if schema_name is not None:
-        schema_filter = "AND catalog_id = :catalog_id"
-        params["catalog_id"] = schema_name
-
-    sql = f"""
-        SELECT task_id, catalog_id, task_type, execution_mode, retry_count, max_retries,
-               owner_id, locked_until, last_heartbeat_at
-        FROM {task_schema}.tasks
-        WHERE status = 'ACTIVE'
-          AND locked_until < :cutoff
-          {schema_filter}
-        ORDER BY locked_until ASC
-        LIMIT 500;
-    """
-    async with managed_transaction(engine) as conn:
-        rows = await DQLQuery(sql, result_handler=ResultHandler.ALL_DICTS).execute(
-            conn, **params
-        )
-    return rows or []
 
 
 async def cleanup_orphan_tasks(

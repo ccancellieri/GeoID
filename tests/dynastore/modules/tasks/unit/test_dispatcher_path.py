@@ -643,12 +643,15 @@ def test_reaper_ddl_has_safe_skip_locked_scan():
 
 
 def test_reaper_ddl_scans_active_with_expired_lock():
-    """The reap predicate must match only ACTIVE rows with an expired
+    """The reap predicate must match only claimed rows with an expired
     ``locked_until`` — NOT live heartbeats.  Otherwise any long-running
-    task would be killed mid-execution."""
+    task would be killed mid-execution. Legacy ``RUNNING`` claimed rows are
+    scanned alongside ``ACTIVE`` (#3297); in-process audit rows stay exempt
+    because they never stamp ``locked_until`` and NULL never satisfies the
+    expiry comparison."""
     from dynastore.modules.tasks.tasks_module import GLOBAL_TASKS_REAPER_DDL
 
-    assert "status = 'ACTIVE'" in GLOBAL_TASKS_REAPER_DDL
+    assert "status IN ('ACTIVE', 'RUNNING')" in GLOBAL_TASKS_REAPER_DDL
     assert "locked_until < NOW()" in GLOBAL_TASKS_REAPER_DDL
 
 
