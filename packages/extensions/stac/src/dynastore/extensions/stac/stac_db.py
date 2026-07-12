@@ -17,13 +17,13 @@
 #    Contact: copyright@fao.org - http://fao.org/contact-us/terms/en/
 
 import logging
-from typing import TYPE_CHECKING, Any, FrozenSet, Optional, Tuple
+from typing import TYPE_CHECKING, Any, FrozenSet, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from starlette.requests import Request
 
 from dynastore.models.protocols import ItemsProtocol
-from dynastore.models.query_builder import QueryRequest
+from dynastore.models.query_builder import FilterCondition, QueryRequest
 from dynastore.models.driver_context import DriverContext
 from dynastore.tools.discovery import get_protocol
 from dynastore.modules.stac.stac_config import StacPluginConfig
@@ -41,6 +41,9 @@ async def get_stac_items_paginated(
     cql_filter: Optional[str] = None,
     request: "Optional[Request]" = None,
     hints: FrozenSet = frozenset(),
+    structural_filters: Optional[List[FilterCondition]] = None,
+    bbox: Optional[List[float]] = None,
+    datetime_param: Optional[str] = None,
 ) -> Tuple[list, int]:
     """
     Fetches a paginated list of items for STAC using the optimised QueryOptimizer path.
@@ -53,6 +56,17 @@ async def get_stac_items_paginated(
     explicit ``filter`` and ``?{property}={value}`` shorthand). It is validated
     and parameter-bound by the shared QueryOptimizer CQL path; an unknown
     property raises ``ValueError`` (surfaced as 400 by the route handler).
+
+    ``structural_filters`` carries the ``bbox=``/``datetime=`` predicates
+    (``geom``/``validity`` :class:`FilterCondition`) built by the route
+    handler — the PostgreSQL ``QueryOptimizer`` WHERE-builder consumes
+    ``QueryRequest.filters``, not the driver-agnostic top-level ``bbox``/
+    ``datetime`` fields. ``bbox``/``datetime_param`` are ALSO set on the
+    ``QueryRequest`` (unused by the PG path) so that if ``stream_items``'s own
+    routing-aware dispatch resolves a non-PG (Elasticsearch) driver instead of
+    running this SQL path, that driver's structural query builder — which
+    reads the top-level fields, not ``filters`` — still applies the same
+    spatial/temporal predicate rather than silently ignoring it.
 
     ``request`` is threaded from the route handler for PG row-level ABAC: when
     the collection carries an ``access_envelope`` sidecar, the caller's read
@@ -75,6 +89,9 @@ async def get_stac_items_paginated(
         offset=offset,
         include_total_count=True,
         cql_filter=cql_filter,
+        filters=list(structural_filters) if structural_filters else [],
+        bbox=bbox,
+        datetime=datetime_param,
         raw_params={
             "geom_format": "WKB",
             "simplification": simplification,

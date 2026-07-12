@@ -599,6 +599,105 @@ async def dispatch_or_stream_items(
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
+def parse_bbox_query_param(bbox: str) -> tuple:
+    """Parse and validate an OGC ``bbox`` query parameter (CRS84, STRICT_2D).
+
+    Shared by every ``/items`` listing endpoint that accepts ``bbox=`` (OGC
+    Features, STAC) so malformed input produces the same 400 message
+    regardless of which route parsed it. Raises ``HTTPException`` (400) on a
+    malformed value; never returns ``None`` — callers only invoke this when
+    ``bbox`` is present.
+    """
+    try:
+        parsed = parse_bbox_string(
+            bbox,
+            dimensionality=BboxDimensionality.STRICT_2D,
+            allow_none=False,
+            validate_geometry=False,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid BBOX: {e}") from e
+    assert parsed is not None  # allow_none=False guarantees this
+    return parsed
+
+
+def bbox_filter_condition(
+    bbox_coords: tuple,
+    *,
+    srid: int = 4326,
+) -> FilterCondition:
+    """Build the ``geom &&`` spatial :class:`FilterCondition` for a parsed bbox.
+
+    ``bbox_coords`` is ``(xmin, ymin, xmax, ymax)`` as returned by
+    :func:`parse_bbox_query_param`. The envelope is rendered as an EWKT
+    polygon literal so the shared ``QueryOptimizer`` WHERE-builder emits
+    ``geom && ST_GeomFromEWKT(:param)`` — the same spatial-intersection
+    predicate the OGC Features ``/items`` bbox filter uses.
+    """
+    xmin, ymin, xmax, ymax = bbox_coords
+    return FilterCondition(
+        field="geom",
+        operator="&&",
+        value=(
+            f"SRID={srid};POLYGON(({xmin} {ymin}, {xmin} {ymax}, "
+            f"{xmax} {ymax}, {xmax} {ymin}, {xmin} {ymin}))"
+        ),
+        spatial_op=True,
+    )
+
+
+def datetime_filter_conditions(datetime_param: str) -> List[FilterCondition]:
+    """Parse an OGC ``datetime`` query parameter into ``validity`` FilterCondition(s).
+
+    Accepts a single RFC3339 instant or a ``/``-separated interval with
+    open ends (``..``). Shared by every ``/items`` listing endpoint that
+    accepts ``datetime=`` so the temporal predicate — and its error
+    handling — is identical everywhere it is parsed. Raises
+    ``HTTPException`` (400) on a malformed value.
+    """
+    conditions: List[FilterCondition] = []
+    try:
+        if "/" in datetime_param:
+            start_str, end_str = datetime_param.split("/")
+            start_dt_str = start_str if start_str != ".." else None
+            end_dt_str = end_str if end_str != ".." else None
+            start_dt = (
+                datetime.fromisoformat(start_dt_str.replace("Z", "+00:00"))
+                if start_dt_str
+                else None
+            )
+            end_dt = (
+                datetime.fromisoformat(end_dt_str.replace("Z", "+00:00"))
+                if end_dt_str
+                else None
+            )
+
+            if start_dt and end_dt:
+                conditions.append(
+                    FilterCondition(
+                        field="validity",
+                        operator="&&",
+                        value=f"[{start_dt.isoformat()},{end_dt.isoformat()})",
+                    )
+                )
+            elif start_dt:
+                conditions.append(
+                    FilterCondition(field="validity", operator="@>", value=start_dt)
+                )
+            elif end_dt:
+                conditions.append(
+                    FilterCondition(field="validity", operator="@>", value=end_dt)
+                )
+        else:
+            dt = datetime.fromisoformat(datetime_param.replace("Z", "+00:00"))
+            conditions.append(
+                FilterCondition(field="validity", operator="@>", value=dt)
+            )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid datetime format: {e}") from e
+    return conditions
+
+
 def parse_ogc_query_request(
     bbox: Optional[str] = None,
     datetime_param: Optional[str] = None,
@@ -660,66 +759,13 @@ def parse_ogc_query_request(
         )
 
     if bbox:
-        try:
-            parsed_bbox = parse_bbox_string(
-                bbox,
-                dimensionality=BboxDimensionality.STRICT_2D,
-                allow_none=False,
-                validate_geometry=False,
-            )
-            assert parsed_bbox is not None  # allow_none=False guarantees this
-            srid = bbox_crs_srid or 4326
-            request_obj.filters.append(
-                FilterCondition(
-                    field="geom",
-                    operator="&&",
-                    value=f"SRID={srid};POLYGON(({parsed_bbox[0]} {parsed_bbox[1]}, {parsed_bbox[0]} {parsed_bbox[3]}, {parsed_bbox[2]} {parsed_bbox[3]}, {parsed_bbox[2]} {parsed_bbox[1]}, {parsed_bbox[0]} {parsed_bbox[1]}))",
-                    spatial_op=True,
-                )
-            )
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid BBOX: {e}") from e
+        parsed_bbox = parse_bbox_query_param(bbox)
+        request_obj.filters.append(
+            bbox_filter_condition(parsed_bbox, srid=bbox_crs_srid or 4326)
+        )
 
     if datetime_param:
-        try:
-            if "/" in datetime_param:
-                start_str, end_str = datetime_param.split("/")
-                start_dt_str = start_str if start_str != ".." else None
-                end_dt_str = end_str if end_str != ".." else None
-                start_dt = (
-                    datetime.fromisoformat(start_dt_str.replace("Z", "+00:00"))
-                    if start_dt_str
-                    else None
-                )
-                end_dt = (
-                    datetime.fromisoformat(end_dt_str.replace("Z", "+00:00"))
-                    if end_dt_str
-                    else None
-                )
-
-                if start_dt and end_dt:
-                    request_obj.filters.append(
-                        FilterCondition(
-                            field="validity",
-                            operator="&&",
-                            value=f"[{start_dt.isoformat()},{end_dt.isoformat()})",
-                        )
-                    )
-                elif start_dt:
-                    request_obj.filters.append(
-                        FilterCondition(field="validity", operator="@>", value=start_dt)
-                    )
-                elif end_dt:
-                    request_obj.filters.append(
-                        FilterCondition(field="validity", operator="@>", value=end_dt)
-                    )
-            else:
-                dt = datetime.fromisoformat(datetime_param.replace("Z", "+00:00"))
-                request_obj.filters.append(
-                    FilterCondition(field="validity", operator="@>", value=dt)
-                )
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid datetime format: {e}") from e
+        request_obj.filters.extend(datetime_filter_conditions(datetime_param))
     else:
         request_obj.filters.append(
             FilterCondition(

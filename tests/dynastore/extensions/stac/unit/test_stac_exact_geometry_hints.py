@@ -217,6 +217,9 @@ async def test_create_item_collection_forwards_exact_hints_to_db(monkeypatch):
         cql_filter: Any = None,
         request: Any = None,
         hints: FrozenSet = frozenset(),
+        structural_filters: Any = None,
+        bbox: Any = None,
+        datetime_param: Any = None,
     ):
         seen["hints"] = hints
         return [], 0
@@ -266,6 +269,9 @@ async def test_create_item_collection_forwards_empty_hints_to_db(monkeypatch):
         cql_filter: Any = None,
         request: Any = None,
         hints: FrozenSet = frozenset(),
+        structural_filters: Any = None,
+        bbox: Any = None,
+        datetime_param: Any = None,
     ):
         seen["hints"] = hints
         return [], 0

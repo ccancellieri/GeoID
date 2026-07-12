@@ -22,6 +22,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, FrozenSet, List, Optional, cast
 from dynastore.models.ogc import Feature
+from dynastore.models.query_builder import FilterCondition
 
 import pystac
 from fastapi import HTTPException, Request, status
@@ -1494,6 +1495,9 @@ async def create_item_collection(
     cql_filter: Optional[str] = None,
     search_dispatch: Optional[Any] = None,
     hints: FrozenSet = frozenset(),
+    structural_filters: Optional[List[FilterCondition]] = None,
+    bbox: Optional[List[float]] = None,
+    datetime_param: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Generates a STAC ItemCollection for a single collection.
 
@@ -1509,6 +1513,13 @@ async def create_item_collection(
     ``search_dispatch`` is ``None``). Pass ``EXACT_READ_HINTS`` to force the
     exact-geometry driver; the default ``frozenset()`` preserves the existing
     routing behaviour unchanged.
+
+    ``structural_filters``/``bbox``/``datetime_param``: the ``geom``/``validity``
+    ``FilterCondition`` list and the raw ``bbox=``/``datetime=`` values built by
+    the route handler when ``search_dispatch`` was not taken (a CQL filter or
+    ``?hints=geometry_exact`` skipped the SEARCH-driver fast path). Forwarded
+    to ``get_stac_items_paginated`` unchanged; see that function for why both
+    shapes are threaded.
     """
     # Ensure logical IDs are available for row-to-feature conversion
     catalog_id = catalog_id or schema
@@ -1526,6 +1537,9 @@ async def create_item_collection(
             cql_filter=cql_filter,
             request=request,
             hints=hints,
+            structural_filters=structural_filters,
+            bbox=bbox,
+            datetime_param=datetime_param,
         )
 
     # Resolve the page's public (external) catalog/collection ids ONCE — every

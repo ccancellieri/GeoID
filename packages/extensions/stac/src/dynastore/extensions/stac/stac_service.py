@@ -1145,6 +1145,22 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             ),
         ),
         offset: int = Query(0, ge=0),
+        bbox: Optional[str] = Query(
+            None,
+            description=(
+                "Bounding box filter (CRS84). Comma-separated: "
+                "minx,miny,maxx,maxy."
+            ),
+        ),
+        datetime_param: Optional[str] = Query(
+            None,
+            alias="datetime",
+            description=(
+                "Temporal filter. A single RFC3339 datetime, or a "
+                "'/'-separated interval; either end may be '..' for an "
+                "open interval."
+            ),
+        ),
         filter: Optional[str] = Query(None, description="CQL2-Text filter expression"),
         language: str = Depends(get_language),
         request_hints: FrozenSet = Depends(parse_hints_param),
@@ -1162,11 +1178,15 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
         # (unknown → 400) and values are bound as parameters, never interpolated.
         from dynastore.extensions.tools.query import (
             OGC_RESERVED_QUERY_PARAMS,
+            bbox_filter_condition,
             combine_cql_filters,
+            datetime_filter_conditions,
             maybe_dispatch_items_to_search_driver,
+            parse_bbox_query_param,
             reject_unknown_filter_params,
             resolve_queryable_property_names,
         )
+        from dynastore.models.query_builder import FilterCondition
         from dynastore.modules.storage.hints import Hint
 
         extra_filters = {
@@ -1186,6 +1206,26 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             )
             reject_unknown_filter_params(extra_filters, valid_names)
         cql_filter = combine_cql_filters(filter, extra_filters)
+
+        # ``bbox``/``datetime`` (#3295): parsed once here so both the
+        # SEARCH-driver dispatch below (top-level ``QueryRequest.bbox``/
+        # ``.datetime``, the shape Elasticsearch understands) and the PG
+        # fallback (``geom``/``validity`` FilterCondition, the shape the
+        # QueryOptimizer understands) apply the SAME predicate regardless of
+        # which driver ends up serving the listing. Malformed input → 400
+        # before any driver work, mirroring the ``filter=`` validation above.
+        # Coerce non-str defaults (the ``Query(...)`` sentinels seen when this
+        # handler is invoked directly, bypassing FastAPI's DI — unit tests
+        # that don't pass ``bbox=``/``datetime=``) to ``None``.
+        bbox = bbox if isinstance(bbox, str) else None
+        datetime_param = datetime_param if isinstance(datetime_param, str) else None
+        parsed_bbox: Optional[Tuple[float, float, float, float]] = None
+        structural_filters: List[FilterCondition] = []
+        if bbox:
+            parsed_bbox = parse_bbox_query_param(bbox)
+            structural_filters.append(bbox_filter_condition(parsed_bbox))
+        if datetime_param:
+            structural_filters.extend(datetime_filter_conditions(datetime_param))
 
         async with managed_transaction(engine) as conn:
             await self._resolve_collection_or_404(
@@ -1232,12 +1272,25 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             # through to get_stac_items_paginated, which reads directly from the
             # exact-capable driver (PostgreSQL).  With no such hint the ES
             # fast-path stays byte-for-byte unchanged.
+            #
+            # ``bbox``/``datetime`` (#3295) are structural dimensions the
+            # dispatch helper already understands (same shape STAC ``/search``
+            # and OGC Features ``/items`` pass it), so they are threaded here
+            # unconditionally — a bbox/datetime-only request (no CQL filter,
+            # no ``geometry_exact`` hint) still takes the fast path and its
+            # ``numberMatched`` still comes from the SAME driver call that
+            # served the features. A request that ALSO carries a CQL filter
+            # joins the existing PG-fallback class described above (not a new
+            # limitation); ``structural_filters``/``bbox``/``datetime_param``
+            # passed to ``create_item_collection`` below cover that fallback.
             wants_exact = Hint.GEOMETRY_EXACT in request_hints
             search_dispatch = None
             if not cql_filter and not wants_exact:
                 search_dispatch = await maybe_dispatch_items_to_search_driver(
                     catalog_id=catalog_id,
                     collection_id=collection_id,
+                    bbox=list(parsed_bbox) if parsed_bbox else None,
+                    datetime=datetime_param,
                     limit=limit,
                     offset=offset,
                     has_complex_filter=False,
@@ -1259,6 +1312,9 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
                     cql_filter=cql_filter,
                     search_dispatch=search_dispatch,
                     hints=request_hints,
+                    structural_filters=structural_filters,
+                    bbox=list(parsed_bbox) if parsed_bbox else None,
+                    datetime_param=datetime_param,
                 )
             except ValueError as e:
                 # Unknown property / malformed CQL → 400
