@@ -42,7 +42,6 @@ from dynastore.modules.db_config.query_executor import (
     run_in_event_loop,
 )
 from dynastore.modules.db_config.locking_tools import (
-    check_function_exists,
     check_table_exists,
     check_trigger_exists,
     run_startup_ddl_tolerating_lock_timeout,
@@ -59,8 +58,6 @@ from dynastore.tools.background_service import (
 
 from .models import Task, TaskCreate, TaskUpdate, TaskStatusEnum
 from .workclass_ddl import (
-    partition_create_ahead_function_name,
-    partition_retention_function_name,
     render_partition_create_ahead_ddl,
     render_partition_retention_ddl,
 )
@@ -1723,32 +1720,15 @@ async def ensure_task_storage_exists(conn: DbResource, schema: str):
     )
 
     # Provision maintenance helper functions called by the supervisor.
-    # These are CREATE OR REPLACE — idempotent and always up-to-date.
+    # These are CREATE OR REPLACE and must execute on EVERY startup — no
+    # existence check — so a changed function body converges to the current
+    # source on deploy. A pg_proc name check here froze the bodies at first
+    # creation (#3306): the #3298 reaper predicate widening never reached
+    # databases that already had reap_stuck_tasks. Peer races during rollout
+    # are serialized by the DDL advisory lock.
     await DDLQuery(GLOBAL_TASKS_REAPER_DDL).execute(conn, schema=schema)
-
-    # The retention/partition-create function names embed {schema} inside a
-    # quoted identifier (e.g. "{schema}"."maintain_partitions_{schema}_tasks"),
-    # so the auto-inferred existence check has to resolve that placeholder
-    # before checking pg_proc -- the subtle failure fixed in #3117. Pass an
-    # explicit check_query so the duplicate-object peer-race recovery on
-    # these two statements is self-documenting rather than relying on that
-    # inference.
-    def _check_tasks_retention(conn):
-        return check_function_exists(
-            conn, partition_retention_function_name(table="tasks", schema=schema), schema
-        )
-
-    def _check_tasks_partcreate(conn):
-        return check_function_exists(
-            conn, partition_create_ahead_function_name(table="tasks", schema=schema), schema
-        )
-
-    await DDLQuery(
-        GLOBAL_TASKS_RETENTION_FUNC_DDL, check_query=_check_tasks_retention
-    ).execute(conn, schema=schema)
-    await DDLQuery(
-        GLOBAL_TASKS_PARTCREATE_FUNC_DDL, check_query=_check_tasks_partcreate
-    ).execute(conn, schema=schema)
+    await DDLQuery(GLOBAL_TASKS_RETENTION_FUNC_DDL).execute(conn, schema=schema)
+    await DDLQuery(GLOBAL_TASKS_PARTCREATE_FUNC_DDL).execute(conn, schema=schema)
 
     logger.info(
         "TasksModule: provisioned tasks storage + maintenance helper functions "

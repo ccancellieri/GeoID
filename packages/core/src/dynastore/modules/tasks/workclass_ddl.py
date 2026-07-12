@@ -68,7 +68,6 @@ the same startup block.
 import logging
 from typing import Optional, Sequence
 
-from dynastore.modules.db_config.locking_tools import check_function_exists
 from dynastore.modules.db_config.query_executor import (
     DDLQuery,
     DQLQuery,
@@ -474,12 +473,10 @@ def partition_create_ahead_function_name(*, table: str, schema: str) -> str:
     """Name of the create-ahead function rendered by ``_PARTCREATE_TEMPLATE``.
 
     The function name is a *quoted identifier with an embedded ``{schema}``
-    placeholder* (``"{schema}"."create_partitions_{schema}_@TABLE@"``), which
-    ``ddl_inference._infer_existence_check`` can only verify by resolving
-    that placeholder before checking ``pg_proc`` (#3117). Kept here, next to
-    the template that defines the naming convention, so callers can build an
-    explicit ``check_query`` for :class:`DDLQuery` instead of relying on
-    inference for this pattern.
+    placeholder* (``"{schema}"."create_partitions_{schema}_@TABLE@"``). Kept
+    here, next to the template that defines the naming convention, as the
+    single source of truth for callers (schedule registration, tests) that
+    need the rendered name.
     """
     return f"create_partitions_{schema}_{table}"
 
@@ -554,44 +551,16 @@ async def ensure_workclass_storage_exists(conn: DbResource, schema: str) -> None
     await DDLQuery(EVENTS_INDEXES_DDL).execute(conn, schema=schema)
     await DDLQuery(STORAGE_INDEXES_DDL).execute(conn, schema=schema)
 
-    # 4. Maintenance functions (CREATE OR REPLACE — always up to date).
-    # Each function name embeds {schema} inside a quoted identifier, so the
-    # auto-inferred existence check has to resolve that placeholder before
-    # checking pg_proc (#3117). Pass an explicit check_query so the
-    # duplicate-object peer-race recovery on these statements is
-    # self-documenting rather than relying on that inference.
-    def _check_events_partcreate(conn):
-        return check_function_exists(
-            conn, partition_create_ahead_function_name(table="events", schema=schema), schema
-        )
-
-    def _check_events_retention(conn):
-        return check_function_exists(
-            conn, partition_retention_function_name(table="events", schema=schema), schema
-        )
-
-    def _check_storage_partcreate(conn):
-        return check_function_exists(
-            conn, partition_create_ahead_function_name(table="storage", schema=schema), schema
-        )
-
-    def _check_storage_retention(conn):
-        return check_function_exists(
-            conn, partition_retention_function_name(table="storage", schema=schema), schema
-        )
-
-    await DDLQuery(
-        EVENTS_PARTCREATE_FUNC_DDL, check_query=_check_events_partcreate
-    ).execute(conn, schema=schema)
-    await DDLQuery(
-        EVENTS_RETENTION_FUNC_DDL, check_query=_check_events_retention
-    ).execute(conn, schema=schema)
-    await DDLQuery(
-        STORAGE_PARTCREATE_FUNC_DDL, check_query=_check_storage_partcreate
-    ).execute(conn, schema=schema)
-    await DDLQuery(
-        STORAGE_RETENTION_FUNC_DDL, check_query=_check_storage_retention
-    ).execute(conn, schema=schema)
+    # 4. Maintenance functions. CREATE OR REPLACE must execute on EVERY
+    # startup — no existence check — so a changed function body (e.g. the
+    # #3278 retention rewrite) converges to the current source on deploy.
+    # The former check_function_exists gates froze the bodies at first
+    # creation (#3306). Peer races during rollout are serialized by the DDL
+    # advisory lock.
+    await DDLQuery(EVENTS_PARTCREATE_FUNC_DDL).execute(conn, schema=schema)
+    await DDLQuery(EVENTS_RETENTION_FUNC_DDL).execute(conn, schema=schema)
+    await DDLQuery(STORAGE_PARTCREATE_FUNC_DDL).execute(conn, schema=schema)
+    await DDLQuery(STORAGE_RETENTION_FUNC_DDL).execute(conn, schema=schema)
 
     # 5. Materialise initial day window by calling the create-ahead functions once.
     await DQLQuery(

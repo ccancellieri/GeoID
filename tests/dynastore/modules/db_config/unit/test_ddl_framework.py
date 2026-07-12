@@ -120,33 +120,32 @@ def test_infer_drop_returns_none():
     assert _infer_existence_check("ALTER TABLE foo ADD COLUMN bar int;") is None
 
 
-@pytest.mark.asyncio
-async def test_infer_function_check_resolves_embedded_schema_placeholder(monkeypatch):
-    from dynastore.modules.db_config.ddl_inference import (
-        _infer_existence_check,
-        clear_ddl_existence_cache,
-    )
+def test_infer_or_replace_function_returns_none():
+    """CREATE OR REPLACE FUNCTION must never get an inferred existence gate.
 
-    clear_ddl_existence_cache()
-    calls = []
+    A pg_proc name check in front of OR REPLACE freezes the function *body*
+    at first creation — the name exists, the executor skips the DDL, and
+    body fixes never reach a long-lived database (#3306: the #3298 reaper
+    predicate widening was inert on dev). The statement must always execute.
+    """
+    from dynastore.modules.db_config.ddl_inference import _infer_existence_check
 
-    async def _fake_check_function_exists(conn, function_name, schema="platform"):
-        calls.append((function_name, schema))
-        return True
-
-    monkeypatch.setattr(
-        "dynastore.modules.db_config.locking_tools.check_function_exists",
-        _fake_check_function_exists,
-    )
-
-    check = _infer_existence_check(
+    assert _infer_existence_check(
         'CREATE OR REPLACE FUNCTION "{schema}"."maintain_partitions_{schema}_tasks"() '
         "RETURNS void AS $$ BEGIN NULL; END; $$ LANGUAGE plpgsql;"
-    )
+    ) is None
+    assert _infer_existence_check(
+        "CREATE OR REPLACE FUNCTION catalog.asset_cleanup() RETURNS TRIGGER AS $$ "
+        "BEGIN RETURN NULL; END; $$ LANGUAGE plpgsql;"
+    ) is None
 
-    assert check is not None
-    assert await check(object(), {}, {"schema": "tasks"}) is True
-    assert calls == [("maintain_partitions_tasks_tasks", "tasks")]
+
+def test_ddlquery_or_replace_function_has_no_existence_gate():
+    """End-to-end guard: DDLQuery on an OR REPLACE template must not gate."""
+    from dynastore.modules.db_config.query_executor import DDLQuery
+    from dynastore.modules.tasks.tasks_module import GLOBAL_TASKS_REAPER_DDL
+
+    assert DDLQuery(GLOBAL_TASKS_REAPER_DDL)._executor.existence_check is None
 
 
 # ---------------------------------------------------------------------------
