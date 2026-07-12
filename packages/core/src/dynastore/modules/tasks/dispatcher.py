@@ -246,12 +246,18 @@ class BatchedHeartbeat:
         from dynastore.modules.tasks.tasks_module import heartbeat_tasks
         import uuid
 
-        task_ids = [uuid.UUID(tid) for tid in snapshot.keys()]
+        # ``snapshot`` maps task_id (str) -> created_at (the row's own
+        # ``timestamp`` / RANGE-partition key, registered by the caller).
+        # Passing both lets the UPDATE prune to each row's own monthly
+        # partition instead of probing every live partition (#3218).
+        tasks_arg = [
+            (uuid.UUID(tid), created_at) for tid, created_at in snapshot.items()
+        ]
 
         try:
-            await heartbeat_tasks(self._engine, task_ids, self._visibility_timeout)
+            await heartbeat_tasks(self._engine, tasks_arg, self._visibility_timeout)
             logger.debug(
-                f"BatchedHeartbeat: extended {len(task_ids)} task(s) "
+                f"BatchedHeartbeat: extended {len(tasks_arg)} task(s) "
                 f"until +{self._visibility_timeout}."
             )
         except asyncio.CancelledError:
@@ -975,7 +981,7 @@ async def run_dispatcher(
 
             completed = await complete_task(
                 engine, task_id, datetime.now(timezone.utc),
-                outputs=result, owner_id=_RUNNER_ID,
+                outputs=result, owner_id=_RUNNER_ID, created_at=timestamp,
             )
             if not completed:
                 logger.warning(
@@ -1007,7 +1013,7 @@ async def run_dispatcher(
             failed = await fail_task(
                 engine, task_id, datetime.now(timezone.utc),
                 "Runner interrupted (SIGTERM)",
-                retry=True, owner_id=_RUNNER_ID,
+                retry=True, owner_id=_RUNNER_ID, created_at=timestamp,
             )
             if not failed:
                 logger.warning(
@@ -1036,7 +1042,7 @@ async def run_dispatcher(
             dead_lettered = await dead_letter_task(
                 engine, task_id, datetime.now(timezone.utc),
                 f"Runner timed out after {timeout_s}s",
-                owner_id=_RUNNER_ID,
+                owner_id=_RUNNER_ID, created_at=timestamp,
             )
             if not dead_lettered:
                 logger.warning(
@@ -1065,7 +1071,7 @@ async def run_dispatcher(
             failed = await fail_task(
                 engine, task_id, datetime.now(timezone.utc),
                 str(e),
-                retry=False, owner_id=_RUNNER_ID,
+                retry=False, owner_id=_RUNNER_ID, created_at=timestamp,
             )
             if not failed:
                 logger.warning(
@@ -1095,7 +1101,7 @@ async def run_dispatcher(
             failed = await fail_task(
                 engine, task_id, datetime.now(timezone.utc),
                 str(e),
-                retry=True, owner_id=_RUNNER_ID,
+                retry=True, owner_id=_RUNNER_ID, created_at=timestamp,
             )
             if not failed:
                 logger.warning(

@@ -250,6 +250,7 @@ class SyncRunner(RunnerProtocol, ProtocolPlugin[Any]):
                 await _sync_dead_letter(
                     context.engine, job.task_id, _to_dt.now(_to_tz.utc),
                     f"Synchronous execution timed out after {timeout_s}s",
+                    created_at=job.timestamp,
                 )
             except Exception as dle:
                 logger.error(
@@ -289,7 +290,7 @@ class SyncRunner(RunnerProtocol, ProtocolPlugin[Any]):
             try:
                 await _sync_fail_task(
                     context.engine, job.task_id, _sync_dt.now(_sync_tz.utc),
-                    error_message, retry=False,
+                    error_message, retry=False, created_at=job.timestamp,
                 )
             except Exception as update_error:
                 logger.error(
@@ -664,7 +665,7 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                     try:
                         await _bg_fail_task(
                             context.engine, job.task_id, _bg_dt.now(_bg_tz.utc),
-                            error_message, retry=False,
+                            error_message, retry=False, created_at=job.timestamp,
                         )
                     except Exception as update_error:
                         logger.critical(f"Failed to update task '{job.task_id}' status to FAILED: {update_error}")
@@ -850,6 +851,7 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                         context.engine, claimed_task_id,
                         _dt.now(_tz.utc), outputs=result,
                         owner_id=context.extra_context.get("prior_owner_id"),
+                        created_at=claimed_ts,
                     )
                     if not completed:
                         logger.warning(
@@ -902,6 +904,7 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                                 "Runner interrupted (SIGTERM / pod shutdown)",
                                 retry=True,
                                 owner_id=context.extra_context.get("prior_owner_id"),
+                                created_at=claimed_ts,
                             )
                             if not failed:
                                 logger.warning(
@@ -931,6 +934,7 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                             error_message,
                             retry=False,
                             owner_id=context.extra_context.get("prior_owner_id"),
+                            created_at=claimed_ts,
                         )
                         if not failed:
                             logger.warning(
@@ -965,6 +969,7 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                             context.engine, claimed_task_id, _dt.now(_tz.utc),
                             f"Runner timed out after {timeout_s}s",
                             owner_id=context.extra_context.get("prior_owner_id"),
+                            created_at=claimed_ts,
                         )
                         if not dead_lettered:
                             logger.warning(
@@ -999,6 +1004,7 @@ class BackgroundRunner(RunnerProtocol, ProtocolPlugin[Any]):
                             error_message,
                             retry=True,
                             owner_id=context.extra_context.get("prior_owner_id"),
+                            created_at=claimed_ts,
                         )
                         if not failed:
                             logger.warning(

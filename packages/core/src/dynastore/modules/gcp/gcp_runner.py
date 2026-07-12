@@ -243,6 +243,24 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
         # dispatcher already claimed a PENDING row and is delegating
         # execution to us. Reuse that row instead of creating another.
         claimed_task_id = context.extra_context.get("task_id") if context.extra_context else None
+        # The dispatcher-claimed row's creation timestamp — its RANGE-
+        # partition key, threaded through the same extra_context BackgroundRunner
+        # reads for its own claimed-row path (see execution.py's dispatch()).
+        # Normalized defensively (DB may hand it back as datetime already, or
+        # as a string if it crossed a serialization boundary) — mirrors
+        # BackgroundRunner._run_claimed's identical guard.
+        claimed_timestamp = (
+            context.extra_context.get("task_timestamp") if context.extra_context else None
+        )
+        if isinstance(claimed_timestamp, datetime):
+            claimed_created_at: Optional[datetime] = claimed_timestamp
+        elif claimed_timestamp is not None:
+            try:
+                claimed_created_at = datetime.fromisoformat(str(claimed_timestamp))
+            except (ValueError, TypeError):
+                claimed_created_at = None
+        else:
+            claimed_created_at = None
 
         execution_id = generate_id_hex()
         owner_id = f"gcp_cloud_run_{execution_id}"
@@ -330,6 +348,7 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
                                 context.engine,
                                 task_id_uuid,
                                 timedelta(seconds=spawn_lease),
+                                created_at=existing.timestamp,
                             )
                             logger.debug(
                                 "GcpJobRunner: extended lease for racy task '%s' "
@@ -414,6 +433,7 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
 
             task_id_for_payload = new_task.task_id
             existing_task = new_task
+            claimed_created_at = new_task.timestamp
             logger.info(
                 f"GcpJobRunner: REST-path born-claimed task '{new_task.task_id}' for "
                 f"job '{job_name}' (execution_id={execution_id}, "
@@ -506,6 +526,7 @@ class GcpJobRunner(RunnerProtocol, ProtocolPlugin[Any]):
                     f"GcpJobRunner: failed to trigger Cloud Run job '{job_name}': {last_exc}",
                     retry=_is_transient_runjob_error(last_exc),
                     owner_id=owner_id,
+                    created_at=claimed_created_at,
                 )
                 if not released:
                     logger.warning(

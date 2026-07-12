@@ -588,10 +588,10 @@ class TasksModule(TaskQueueProtocol, ProcessRegistryProtocol, ModuleProtocol):
     async def heartbeat(
         self,
         engine: Any,
-        task_ids: List[uuid.UUID],
+        tasks: List[Tuple[uuid.UUID, datetime]],
         visibility_timeout: timedelta,
     ) -> None:
-        return await heartbeat_tasks(engine, task_ids, visibility_timeout)
+        return await heartbeat_tasks(engine, tasks, visibility_timeout)
 
     async def find_stale(
         self,
@@ -2693,6 +2693,63 @@ async def claim_batch(
     return result
 
 
+async def _diagnose_created_at_miss(
+    engine: DbResource,
+    task_id: uuid.UUID,
+    created_at: datetime,
+    op: str,
+) -> None:
+    """Log a loud, distinguishable ERROR when a ``created_at``-guarded
+    terminal write matched 0 rows because ``created_at`` does not match the
+    row's real partition key — rather than a genuine ``owner_id``/status
+    race loss (#3218).
+
+    Only meaningful to call after a 0-row UPDATE that included the
+    ``AND timestamp = :created_at`` predicate. Runs a plain ``task_id``-only
+    lookup (probes every partition — acceptable here since it only fires on
+    the rare 0-row path, never on the hot terminal-write path itself) to
+    tell apart:
+
+    - the row exists under a DIFFERENT ``timestamp`` than the caller passed
+      — the UPDATE targeted the wrong partition and never had a chance to
+      match, regardless of ``owner_id``/status. Logged as an ERROR so this
+      is not read as a benign race loss.
+    - the row is missing entirely, or exists with the matching ``timestamp``
+      — a genuine race loss (owner_id/status already moved on); the caller's
+      own "lost race" warning already covers this case, so nothing extra is
+      logged here.
+
+    Best-effort: any lookup failure is swallowed rather than raised — this
+    diagnostic must never mask the original 0-row result the caller already
+    decided to return.
+    """
+    task_schema = get_task_schema()
+    try:
+        async with managed_transaction(engine) as conn:
+            row = await DQLQuery(
+                f"SELECT timestamp FROM {task_schema}.tasks WHERE task_id = :task_id LIMIT 1;",
+                result_handler=ResultHandler.ONE_DICT,
+            ).execute(conn, task_id=task_id)
+    except Exception as exc:  # noqa: BLE001 — diagnostic only, must not raise
+        logger.debug(
+            "%s: _diagnose_created_at_miss lookup failed for task %s: %s",
+            op, task_id, exc,
+        )
+        return
+    if row is None:
+        return
+    actual_ts = row.get("timestamp")
+    if actual_ts is not None and actual_ts != created_at:
+        logger.error(
+            "%s: WRONG partition key for task %s — caller passed "
+            "created_at=%s but the row's actual creation timestamp is %s. "
+            "This UPDATE matched 0 rows because it targeted the wrong "
+            "monthly partition, NOT because of an owner_id/status race. "
+            "Fix the caller to thread the row's real creation timestamp.",
+            op, task_id, created_at, actual_ts,
+        )
+
+
 async def complete_task(
     engine: DbResource,
     task_id: uuid.UUID,
@@ -2700,6 +2757,7 @@ async def complete_task(
     outputs: Optional[Any] = None,
     *,
     owner_id: Optional[str] = None,
+    created_at: Optional[datetime] = None,
 ) -> bool:
     """Mark a claimed task as COMPLETED.
 
@@ -2713,6 +2771,19 @@ async def complete_task(
     attempt (``owner_id`` → a different value) between the reconciler's SELECT
     and this write, no row matches and the caller treats the ``False`` return
     as a lost race rather than clobbering the new attempt. See #750.
+
+    ``created_at`` is the row's ``timestamp`` column — its creation time and
+    RANGE-partition key — NOT ``timestamp`` above (the completion time
+    written to ``finished_at``). When supplied it adds
+    ``AND timestamp = :created_at`` to the UPDATE so Postgres prunes to the
+    row's own monthly partition instead of probing ``idx_tasks_task_id`` on
+    every live partition (#3218). Every production caller has the row's
+    creation timestamp in hand from its own claim/create/select and passes
+    it; it stays optional only so the handful of callers without it in scope
+    keep today's ``task_id``-only match. A 0-row result while ``created_at``
+    was supplied is diagnosed by :func:`_diagnose_created_at_miss` so a wrong
+    partition key surfaces as a loud, distinguishable error instead of
+    reading as a benign owner_id race loss.
     """
     task_schema = get_task_schema()
     # Normalize a TaskReport envelope to a plain dict + error_message pair
@@ -2726,6 +2797,7 @@ async def complete_task(
         serialized_outputs = json.dumps(outputs, cls=CustomJSONEncoder)
 
     owner_guard = " AND owner_id = :owner_id" if owner_id is not None else ""
+    created_at_guard = " AND timestamp = :created_at" if created_at is not None else ""
     sql = f"""
         UPDATE {task_schema}.tasks
         SET status = 'COMPLETED',
@@ -2734,7 +2806,7 @@ async def complete_task(
             outputs = :outputs,
             locked_until = NULL,
             owner_id = NULL
-        WHERE task_id = :task_id{owner_guard};
+        WHERE task_id = :task_id{created_at_guard}{owner_guard};
     """
     params: Dict[str, Any] = {
         "task_id": task_id,
@@ -2743,11 +2815,16 @@ async def complete_task(
     }
     if owner_id is not None:
         params["owner_id"] = owner_id
+    if created_at is not None:
+        params["created_at"] = created_at
     async with managed_transaction(engine) as conn:
         rowcount = await DQLQuery(
             sql, result_handler=ResultHandler.ROWCOUNT
         ).execute(conn, **params)
-    return bool(rowcount and rowcount > 0)
+    matched = bool(rowcount and rowcount > 0)
+    if not matched and created_at is not None:
+        await _diagnose_created_at_miss(engine, task_id, created_at, "complete_task")
+    return matched
 
 
 async def update_task_ingestion_offset(
@@ -2933,6 +3010,7 @@ async def fail_task(
     retry: bool = True,
     *,
     owner_id: Optional[str] = None,
+    created_at: Optional[datetime] = None,
 ) -> bool:
     """
     Mark a claimed task as failed. If retry=True and retries remain,
@@ -2952,9 +3030,20 @@ async def fail_task(
     reconciler's SELECT and this write, no row matches and the caller treats
     the ``False`` return as a lost race rather than failing a task that is
     legitimately running again. See #750.
+
+    ``created_at`` is the row's ``timestamp`` column — its creation time and
+    RANGE-partition key — NOT ``timestamp`` above (the completion time
+    written to ``finished_at`` on the terminal branch). When supplied it adds
+    ``AND timestamp = :created_at`` to the UPDATE so Postgres prunes to the
+    row's own monthly partition instead of probing ``idx_tasks_task_id`` on
+    every live partition (#3218). See :func:`complete_task` for the full
+    rationale, including how a wrong value is diagnosed via
+    :func:`_diagnose_created_at_miss` instead of reading as a benign
+    owner_id race loss.
     """
     task_schema = get_task_schema()
     owner_guard = " AND owner_id = :owner_id" if owner_id is not None else ""
+    created_at_guard = " AND timestamp = :created_at" if created_at is not None else ""
 
     if retry:
         # Attempt retry: increment retry_count, reset to PENDING with backoff.
@@ -2988,7 +3077,7 @@ async def fail_task(
                     WHEN retry_count + 1 < LEAST(max_retries, :hard_cap) THEN NULL
                     ELSE owner_id
                 END
-            WHERE task_id = :task_id{owner_guard}
+            WHERE task_id = :task_id{created_at_guard}{owner_guard}
             RETURNING status, task_type, caller_id, inputs, error_message;
         """
         params = {
@@ -3005,7 +3094,7 @@ async def fail_task(
                 finished_at = :finished_at,
                 locked_until = NULL,
                 owner_id = NULL
-            WHERE task_id = :task_id{owner_guard}
+            WHERE task_id = :task_id{created_at_guard}{owner_guard}
             RETURNING status, task_type, caller_id, inputs, error_message;
         """
         params = {
@@ -3016,6 +3105,8 @@ async def fail_task(
 
     if owner_id is not None:
         params["owner_id"] = owner_id
+    if created_at is not None:
+        params["created_at"] = created_at
 
     async with managed_transaction(engine) as conn:
         row = await DQLQuery(
@@ -3023,6 +3114,8 @@ async def fail_task(
         ).execute(conn, **params)
 
     if row is None:
+        if created_at is not None:
+            await _diagnose_created_at_miss(engine, task_id, created_at, "fail_task")
         return False
 
     # Emit task.failed only for terminal statuses — not for PENDING (retry).
@@ -3052,6 +3145,7 @@ async def dead_letter_task(
     error_message: str,
     *,
     owner_id: Optional[str] = None,
+    created_at: Optional[datetime] = None,
 ) -> bool:
     """Move a claimed task directly to DEAD_LETTER (no retry).
 
@@ -3068,9 +3162,16 @@ async def dead_letter_task(
     (a timeout is operationally transient — the work may be valid to replay).
     ``owner_id`` is the same optional race guard documented on
     :func:`complete_task` / :func:`fail_task`.
+
+    ``created_at`` is the row's ``timestamp`` column — its creation time and
+    RANGE-partition key — NOT ``timestamp`` above (the completion time
+    written to ``finished_at``). See :func:`complete_task` for the full
+    partition-pruning rationale (#3218) and how a wrong value is diagnosed
+    via :func:`_diagnose_created_at_miss`.
     """
     task_schema = get_task_schema()
     owner_guard = " AND owner_id = :owner_id" if owner_id is not None else ""
+    created_at_guard = " AND timestamp = :created_at" if created_at is not None else ""
     sql = f"""
         UPDATE {task_schema}.tasks
         SET status = 'DEAD_LETTER',
@@ -3078,7 +3179,7 @@ async def dead_letter_task(
             finished_at = :finished_at,
             locked_until = NULL,
             owner_id = NULL
-        WHERE task_id = :task_id{owner_guard}
+        WHERE task_id = :task_id{created_at_guard}{owner_guard}
         RETURNING task_type, caller_id, inputs, error_message;
     """
     params: Dict[str, Any] = {
@@ -3088,12 +3189,16 @@ async def dead_letter_task(
     }
     if owner_id is not None:
         params["owner_id"] = owner_id
+    if created_at is not None:
+        params["created_at"] = created_at
     async with managed_transaction(engine) as conn:
         row = await DQLQuery(
             sql, result_handler=ResultHandler.ONE_DICT
         ).execute(conn, **params)
 
     if row is None:
+        if created_at is not None:
+            await _diagnose_created_at_miss(engine, task_id, created_at, "dead_letter_task")
         return False
 
     # dead_letter_task is always terminal — always emit.
@@ -3112,26 +3217,45 @@ async def dead_letter_task(
 
 async def heartbeat_tasks(
     engine: DbResource,
-    task_ids: List[uuid.UUID],
+    tasks: List[Tuple[uuid.UUID, datetime]],
     visibility_timeout: timedelta,
 ) -> None:
-    """Extend locked_until for active tasks (batched heartbeat)."""
-    if not task_ids:
+    """Extend locked_until for active tasks (batched heartbeat).
+
+    ``tasks`` is a list of ``(task_id, created_at)`` pairs — ``created_at``
+    is each row's ``timestamp`` column (creation time, the RANGE-partition
+    key). Every caller (``BatchedHeartbeat._flush``, the Cloud Run Job
+    in-process heartbeat loop, the liveness reconciler's grace extension)
+    already has this value from its own claim/create/select. Matching on
+    ``(task_id, created_at)`` pairs — mirroring ``claim_batch``'s existing
+    ``(timestamp, task_id)`` join shape — lets Postgres prune to each row's
+    own monthly partition instead of probing ``idx_tasks_task_id`` on every
+    live partition for every heartbeat tick (#3218).
+    """
+    if not tasks:
         return
 
     task_schema = get_task_schema()
     new_locked_until = datetime.now(timezone.utc) + visibility_timeout
+    task_ids = [tid for tid, _ in tasks]
+    created_ats = [ts for _, ts in tasks]
 
     sql = f"""
-        UPDATE {task_schema}.tasks
+        UPDATE {task_schema}.tasks AS t
         SET locked_until = :locked_until,
             last_heartbeat_at = NOW()
-        WHERE task_id = ANY(:task_ids)
-          AND status = 'ACTIVE';
+        FROM UNNEST(CAST(:task_ids AS uuid[]), CAST(:created_ats AS timestamptz[]))
+            AS batch(task_id, created_at)
+        WHERE t.task_id = batch.task_id
+          AND t.timestamp = batch.created_at
+          AND t.status = 'ACTIVE';
     """
     async with managed_transaction(engine) as conn:
         await DQLQuery(sql, result_handler=ResultHandler.NONE).execute(
-            conn, locked_until=new_locked_until, task_ids=list(task_ids)
+            conn,
+            locked_until=new_locked_until,
+            task_ids=task_ids,
+            created_ats=created_ats,
         )
 
 
@@ -3139,6 +3263,8 @@ async def heartbeat_task_if_active(
     engine: DbResource,
     task_id: uuid.UUID,
     visibility_timeout: timedelta,
+    *,
+    created_at: Optional[datetime] = None,
 ) -> bool:
     """Conditionally extend ``locked_until`` for a single task.
 
@@ -3156,21 +3282,38 @@ async def heartbeat_task_if_active(
     reconciler's heartbeat finds no ACTIVE row to update; the caller logs a
     WARNING so operators can see how often the race fires in practice and
     tune the reconciler interval down accordingly. See #741 item 3.
+
+    ``created_at`` is the row's ``timestamp`` column — its creation time and
+    RANGE-partition key. When supplied it adds ``AND timestamp = :created_at``
+    so Postgres prunes to the row's own monthly partition instead of probing
+    ``idx_tasks_task_id`` on every live partition (#3218); optional only so
+    callers without it in scope keep today's ``task_id``-only match. A 0-row
+    result while ``created_at`` was supplied is diagnosed by
+    :func:`_diagnose_created_at_miss` so a wrong partition key surfaces as a
+    loud, distinguishable error instead of reading as a benign reaper-race
+    loss.
     """
     task_schema = get_task_schema()
     new_locked_until = datetime.now(timezone.utc) + visibility_timeout
+    created_at_guard = " AND timestamp = :created_at" if created_at is not None else ""
     sql = f"""
         UPDATE {task_schema}.tasks
         SET locked_until = :locked_until,
             last_heartbeat_at = NOW()
-        WHERE task_id = :task_id
+        WHERE task_id = :task_id{created_at_guard}
           AND status = 'ACTIVE';
     """
+    params: Dict[str, Any] = {"locked_until": new_locked_until, "task_id": task_id}
+    if created_at is not None:
+        params["created_at"] = created_at
     async with managed_transaction(engine) as conn:
         rowcount = await DQLQuery(sql, result_handler=ResultHandler.ROWCOUNT).execute(
-            conn, locked_until=new_locked_until, task_id=task_id
+            conn, **params
         )
-    return bool(rowcount and rowcount > 0)
+    matched = bool(rowcount and rowcount > 0)
+    if not matched and created_at is not None:
+        await _diagnose_created_at_miss(engine, task_id, created_at, "heartbeat_task_if_active")
+    return matched
 
 
 async def set_runner_ref(
@@ -3262,7 +3405,10 @@ async def select_lapsed_gcp_tasks(engine: DbResource) -> List[Dict[str, Any]]:
     routing-continuation columns ``scope``, ``caller_id``, ``inputs`` and
     ``collection_id`` that ``apply_terminal_action`` threads into the
     ``on_success`` ROUTE follow-on — so the caller has everything it needs
-    without a second round-trip (geoid#1743).
+    without a second round-trip (geoid#1743). Also surfaces ``timestamp``
+    (creation time / RANGE-partition key) so the reconciler can thread it
+    into the heartbeat/terminal write it issues for the row, enabling
+    partition pruning on that write (#3218).
 
     ``inputs`` is decoded back to a ``dict`` here: asyncpg hands JSONB back as a
     JSON *string* under a raw ``text()``/``DQLQuery`` read, and the consumer
@@ -3274,7 +3420,7 @@ async def select_lapsed_gcp_tasks(engine: DbResource) -> List[Dict[str, Any]]:
     sql = f"""
         SELECT task_id, catalog_id, task_type, owner_id, runner_ref,
                started_at, locked_until, retry_count, max_retries, outputs,
-               scope, caller_id, inputs, collection_id
+               scope, caller_id, inputs, collection_id, timestamp
         FROM {task_schema}.tasks
         WHERE status = 'ACTIVE'
           AND locked_until < NOW()
@@ -3317,7 +3463,7 @@ async def select_stale_gcp_tasks(
     sql = f"""
         SELECT task_id, catalog_id, task_type, owner_id, runner_ref,
                started_at, locked_until, retry_count, max_retries, outputs,
-               scope, caller_id, inputs, collection_id
+               scope, caller_id, inputs, collection_id, timestamp
         FROM {task_schema}.tasks
         WHERE status = 'ACTIVE'
           AND locked_until < NOW() - make_interval(secs => :grace_seconds)
@@ -3419,6 +3565,12 @@ async def claim_for_execution(
 
     Returns the claimed row dict, or ``None`` when the task must not run — the
     caller (``main_task.py``) then exits cleanly without executing it.
+
+    ``RETURNING`` includes ``timestamp`` (the row's creation time / RANGE-
+    partition key) so the caller can thread it into every subsequent
+    heartbeat / terminal write on this row (``complete_task`` / ``fail_task``
+    / ``heartbeat_tasks``), enabling partition pruning on those writes
+    without a second round-trip (#3218).
     """
     task_schema = get_task_schema()
     locked_until = datetime.now(timezone.utc) + visibility_timeout
@@ -3438,7 +3590,7 @@ async def claim_for_execution(
                 AND locked_until > NOW()
                 AND owner_id IS DISTINCT FROM :owner_id
           )
-        RETURNING task_id, status, owner_id;
+        RETURNING task_id, status, owner_id, timestamp;
     """
     async with managed_transaction(engine) as conn:
         return await DQLQuery(sql, result_handler=ResultHandler.ONE_DICT).execute(

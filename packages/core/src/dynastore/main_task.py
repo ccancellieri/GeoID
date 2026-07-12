@@ -22,7 +22,7 @@ import argparse
 import json
 import traceback
 import typing
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 import sys
 import os
@@ -69,7 +69,11 @@ def _exit_code_for_unclaimed_status(status: str | None) -> int:
 
 
 async def _heartbeat_loop(
-    engine, task_id: uuid.UUID, interval_seconds: float, schema: str
+    engine,
+    task_id: uuid.UUID,
+    interval_seconds: float,
+    schema: str,
+    created_at: datetime,
 ) -> None:
     """Extend locked_until every interval_seconds while the task runs.
 
@@ -84,6 +88,11 @@ async def _heartbeat_loop(
     again here is a belt-and-braces measure so a SIGTERM landing between two
     reporter writes still leaves the most recently known value on the row —
     exactly what a reconciled ``failed`` row surfaces to a client poll.
+
+    ``created_at`` is the row's ``timestamp`` column — its creation time and
+    RANGE-partition key, captured once by ``claim_for_execution``'s
+    ``RETURNING`` clause in ``main()`` and threaded through here so every
+    heartbeat prunes to the row's own monthly partition (#3218).
     """
     from dynastore.modules.tasks.tasks_module import heartbeat_tasks, update_task
     from dynastore.modules.tasks.models import TaskUpdate
@@ -93,7 +102,7 @@ async def _heartbeat_loop(
     while True:
         await asyncio.sleep(interval_seconds)
         try:
-            await heartbeat_tasks(engine, [task_id], _VISIBILITY_TIMEOUT)
+            await heartbeat_tasks(engine, [(task_id, created_at)], _VISIBILITY_TIMEOUT)
         except Exception as e:
             logger.warning(f"Heartbeat failed for task {task_id}: {e}")
 
@@ -269,6 +278,14 @@ async def main(task_name: str, payload: dict, schema: str):
 
     task_id_str = payload.get("task_id")
     task_id_uuid = uuid.UUID(task_id_str) if task_id_str else None
+    # The claimed row's creation timestamp — its RANGE-partition key.
+    # Declared this early (before anything that can raise) so the outer
+    # exception handler's fail_task() report can always reference it safely,
+    # even when the claim never happens. Populated once claim_for_execution
+    # succeeds below and threaded into every subsequent heartbeat / terminal
+    # write on this row so those UPDATEs prune to the row's own monthly
+    # partition instead of probing every live partition (#3218).
+    created_at: typing.Optional[datetime] = None
 
     # 1. Bootstrap the environment
     bootstrap_task_env(app_state)
@@ -365,9 +382,15 @@ async def main(task_name: str, payload: dict, schema: str):
                         if _exit_code != 0:
                             sys.exit(_exit_code)
                         return
+                    # NOT NULL column, always present in the RETURNING result —
+                    # index directly (not .get) so a regression that drops it
+                    # from claim_for_execution's RETURNING clause fails loudly
+                    # here instead of silently degrading every heartbeat.
+                    created_at = claimed_row["timestamp"]
+                    assert created_at is not None
                     interval = _VISIBILITY_TIMEOUT.total_seconds() / 3
                     hb_task = asyncio.create_task(
-                        _heartbeat_loop(engine, task_id_uuid, interval, schema)
+                        _heartbeat_loop(engine, task_id_uuid, interval, schema, created_at)
                     )
                     logger.info(
                         f"--- [main_task.py] Took ownership of task {task_id_uuid} "
@@ -426,7 +449,8 @@ async def main(task_name: str, payload: dict, schema: str):
                                 else:
                                     await asyncio.sleep(0.5 * _attempt)
                         await complete_task(
-                            engine, task_id_uuid, finished_at, outputs=jsonable_res
+                            engine, task_id_uuid, finished_at, outputs=jsonable_res,
+                            created_at=created_at,
                         )
                         logger.info(
                             f"--- [main_task.py] Task {task_id_uuid} marked COMPLETED. ---"
@@ -454,6 +478,7 @@ async def main(task_name: str, payload: dict, schema: str):
                                 _fail_updated = await fail_task(
                                     engine, task_id_uuid, datetime.now(timezone.utc),
                                     reason, retry=False, owner_id=owner_id,
+                                    created_at=created_at,
                                 )
                                 if _fail_updated:
                                     logger.warning(
@@ -492,7 +517,7 @@ async def main(task_name: str, payload: dict, schema: str):
                         from dynastore.modules.tasks.tasks_module import fail_task
                         _fail_updated = await fail_task(
                             engine, task_id_uuid, datetime.now(timezone.utc),
-                            str(exc), retry=False,
+                            str(exc), retry=False, created_at=created_at,
                         )
                         if not _fail_updated:
                             # fail_task's guarded UPDATE matched no row (already
@@ -546,7 +571,7 @@ async def main(task_name: str, payload: dict, schema: str):
                         _fail_updated = await fail_task(
                             engine, uuid.UUID(task_id_str),
                             datetime.now(timezone.utc), f"Runtime Error: {str(e)}",
-                            retry=True,
+                            retry=True, created_at=created_at,
                         )
                         if _fail_updated:
                             logger.info("Successfully reported failure to DB via fail_task.")

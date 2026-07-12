@@ -553,6 +553,7 @@ class GcpLivenessReconciler(PeriodicService):
             extended = await tasks_module.heartbeat_task_if_active(
                 self._engine, task_id,
                 timedelta(seconds=self._extend_visibility_seconds),
+                created_at=task.timestamp,
             )
             if extended:
                 logger.info(
@@ -585,7 +586,7 @@ class GcpLivenessReconciler(PeriodicService):
             acted = await tasks_module.fail_task(
                 self._engine, task_id, now,
                 f"GcpLivenessReconciler: {reason} ({runner_ref})",
-                retry=True, owner_id=owner_id,
+                retry=True, owner_id=owner_id, created_at=task.timestamp,
             )
             if acted:
                 logger.warning(
@@ -644,6 +645,7 @@ class GcpLivenessReconciler(PeriodicService):
             outputs = row.get("outputs")
             acted = await tasks_module.complete_task(
                 self._engine, task_id, now, outputs=outputs, owner_id=owner_id,
+                created_at=task.timestamp,
             )
             if acted:
                 logger.info(
@@ -703,7 +705,7 @@ class GcpLivenessReconciler(PeriodicService):
                 # grace extension so the reaper doesn't reclaim it before the
                 # handle lands and a real probe becomes possible.
                 await tasks_module.heartbeat_tasks(
-                    self._engine, [task_id],
+                    self._engine, [(task_id, task.timestamp)],
                     timedelta(seconds=self._unknown_grace_seconds),
                 )
                 logger.info(

@@ -172,17 +172,19 @@ async def reconcile_task_liveness(
         _, _, _, extend_seconds, _ = resolve_leadership_config()
         acted = await tasks_module.heartbeat_task_if_active(
             engine, task.task_id, timedelta(seconds=extend_seconds),
+            created_at=task.timestamp,
         )
     elif action is VerdictAction.FAIL_RETRY:
         acted = await tasks_module.fail_task(
             engine, task.task_id, now,
             "Reconciled: remote execution terminated without reporting "
             f"status (probe verdict={verdict.value}).",
-            retry=True, owner_id=task.owner_id,
+            retry=True, owner_id=task.owner_id, created_at=task.timestamp,
         )
     elif action is VerdictAction.COMPLETE:
         acted = await tasks_module.complete_task(
             engine, task.task_id, now, outputs=task.outputs, owner_id=task.owner_id,
+            created_at=task.timestamp,
         )
     else:  # VerdictAction.NOOP (LivenessVerdict.UNKNOWN)
         return task

@@ -33,9 +33,10 @@ from typing import (
     List,
     Optional,
     Protocol,
+    Tuple,
     runtime_checkable,
 )
-from datetime import timedelta
+from datetime import datetime, timedelta
 import uuid
 
 from dynastore.models.protocols.tasks import TasksProtocol
@@ -123,10 +124,15 @@ class TaskQueueProtocol(TasksProtocol, Protocol):
     async def heartbeat(
         self,
         engine: Any,
-        task_ids: List[uuid.UUID],
+        tasks: List[Tuple[uuid.UUID, datetime]],
         visibility_timeout: timedelta,
     ) -> None:
-        """Extend locked_until for active tasks (batched heartbeat)."""
+        """Extend locked_until for active tasks (batched heartbeat).
+
+        ``tasks`` is a list of ``(task_id, created_at)`` pairs — ``created_at``
+        is each row's creation timestamp / RANGE-partition key, required so
+        the UPDATE can prune to each row's own monthly partition (#3218).
+        """
         ...
 
     async def find_stale(
