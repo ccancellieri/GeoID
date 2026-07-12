@@ -3556,7 +3556,7 @@ async def find_stale_tasks(
     schema_name: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Find active tasks with expired locks (janitor use).
+    Find active tasks with expired locks (stuck-task diagnostics).
     If schema_name is provided, scopes to that tenant (matches the catalog_id column value).
     """
     task_schema = get_task_schema()

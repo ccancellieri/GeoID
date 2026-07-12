@@ -19,7 +19,7 @@
 """
 tasks/dispatcher.py
 
-Durable task dispatcher and Janitor for the DynaStore task system.
+Durable task dispatcher for the DynaStore task system.
 
 Uses a single global ``tasks.tasks`` table. No per-schema discovery is
 needed: the ``claim_next()`` query filters by runner-aware capability map
@@ -32,14 +32,13 @@ The Dispatcher:
   - Dispatches it to the appropriate runner (via runners.py).
   - On CancelledError, resets the task to PENDING so another instance can pick it up.
 
-The Janitor:
-  - Runs on the same event cycle as the Dispatcher (no separate thread needed).
-  - After each Dispatcher wakeup, scans for ACTIVE tasks with expired
-    visibility windows (dead runner, killed worker instance, etc.).
-  - Resets tasks to PENDING (up to max_retries) or moves them to DEAD_LETTER.
-  - Also cleans up orphaned tasks for deleted catalogs.
+Stuck-task reaping (ACTIVE tasks whose visibility window expired because a
+runner died) is NOT done here: MaintenanceSupervisor's ``JOB_TASK_REAPER``
+job invokes the ``reap_stuck_tasks`` PL/pgSQL function on a leader-elected
+cadence and ``pg_notify``-wakes dispatchers when it resets rows.
 
-Both are stateless: any worker instance can resume any task after a crash.
+The dispatcher is stateless: any worker instance can resume any task after
+a crash.
 """
 
 import asyncio
@@ -765,7 +764,8 @@ async def run_dispatcher(
     dispatches them concurrently, and updates task state on completion or
     failure.
 
-    Also runs the Janitor on every timeout-based wakeup.
+    Timeout-based wakeups re-poll ``claim_batch()`` defensively; stuck-task
+    reaping itself lives in MaintenanceSupervisor's ``JOB_TASK_REAPER``.
 
     Args:
         engine:             Async database engine.
@@ -773,9 +773,10 @@ async def run_dispatcher(
                             ``tasks.tasks`` table is always used.
         shutdown_event:     Set this to stop the dispatcher cleanly.
         visibility_timeout: How long a claimed task stays ACTIVE before the
-                            Janitor can reclaim it (heartbeat extends this).
-        signal_timeout:     Max seconds to wait for a signal before running
-                            the Janitor anyway (defensive polling).
+                            stuck-task reaper can reclaim it (heartbeat
+                            extends this).
+        signal_timeout:     Max seconds to wait for a signal before
+                            re-polling the queue anyway (defensive polling).
         batch_size:         Max tasks to claim per batch. When ``None`` (the
                             default), resolved from
                             ``TasksPluginConfig.dispatcher_batch_size``.

@@ -167,7 +167,7 @@ class RunnerContext(BaseModel):
 class RunnerCapabilities:
     """Declares what a runner needs from the dispatcher (visibility window, etc.)."""
     visibility_timeout: timedelta = field(default_factory=lambda: timedelta(minutes=5))
-    """How long the dispatcher should hold the lock before the Janitor can reclaim the task."""
+    """How long the dispatcher should hold the lock before the stuck-task reaper can reclaim the task."""
     requires_request_context: bool = False
     """If True, this runner requires an active HTTP request context (e.g. BackgroundTasks).
     The standalone worker dispatcher will automatically skip it and fall through to the next runner."""

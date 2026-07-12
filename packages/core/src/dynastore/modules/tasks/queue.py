@@ -24,8 +24,8 @@ Every instance opens its own lightweight asyncpg LISTEN connection via
 — all instances receive pg_notify events simultaneously.  The Dispatcher's
 ``claim_next()`` with ``SKIP LOCKED`` handles contention safely.
 
-A health-timeout fires periodic signals so the Dispatcher can run its
-Janitor sweep even when no notifications arrive.
+A health-timeout fires periodic signals so the Dispatcher re-polls the
+queue even when no notifications arrive.
 """
 
 import asyncio
