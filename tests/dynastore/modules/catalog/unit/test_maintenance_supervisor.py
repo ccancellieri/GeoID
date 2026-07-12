@@ -403,6 +403,54 @@ async def test_run_job_calls_mark_running_before_dispatch():
 
 
 @pytest.mark.asyncio
+async def test_run_job_logs_start_before_dispatch(caplog):
+    """_run_job logs job start at INFO before dispatch, so a job cancelled
+    mid-flight (#3300) still leaves a trace of having begun."""
+    import logging
+
+    engine = _fake_engine()
+    supervisor = MaintenanceSupervisor({"hard_cap": 5})
+
+    repo_mock = MagicMock(spec=MaintenanceScheduleRepository)
+    repo_mock.mark_running = AsyncMock(return_value=1)
+    repo_mock.mark_done = AsyncMock(return_value=1)
+
+    async def _fake_dispatch(job_name, conn, config):
+        return 0
+
+    with (
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor.background_managed_transaction",
+        ) as mock_mtx,
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor._dispatch_job",
+            new=AsyncMock(side_effect=_fake_dispatch),
+        ),
+        patch(
+            "dynastore.modules.catalog.maintenance_supervisor._set_statement_timeout",
+            new=AsyncMock(),
+        ),
+    ):
+        fake_conn = AsyncMock()
+        mock_mtx.return_value.__aenter__ = AsyncMock(return_value=fake_conn)
+        mock_mtx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        with caplog.at_level(
+            logging.INFO, logger="dynastore.modules.catalog.maintenance_supervisor"
+        ):
+            await supervisor._run_job(
+                engine, repo_mock, JOB_TASK_REAPER, _utc(2026, 6, 10)
+            )
+
+    start_logs = [
+        r
+        for r in caplog.records
+        if "starting" in r.message.lower() and JOB_TASK_REAPER in r.message
+    ]
+    assert start_logs, "Expected an INFO log announcing job start"
+
+
+@pytest.mark.asyncio
 async def test_run_job_mark_done_receives_status_ok_and_rows():
     """_run_job records status='ok' and the rowcount returned by _dispatch_job."""
     engine = _fake_engine()
@@ -717,6 +765,36 @@ def test_supervisor_advisory_lock_key_differs_from_reaper():
     from dynastore.modules.catalog.soft_delete_reaper import _REAPER_ADVISORY_LOCK_KEY
 
     assert _SUPERVISOR_ADVISORY_LOCK_KEY != _REAPER_ADVISORY_LOCK_KEY
+
+
+# ---------------------------------------------------------------------------
+# LeaseRenewalMode / tick_timeout (#3300): PER_TICK released leadership on
+# every tick overrun, thrashing through claim -> cancel -> reclaim ->
+# error-alert whenever a tick's sequential job dispatch outran the lease TTL.
+# HEARTBEAT holds tenure across ticks instead of re-electing per tick.
+# ---------------------------------------------------------------------------
+
+
+def test_lease_renewal_mode_is_heartbeat():
+    """A tick dispatches every due job sequentially and can legitimately need
+    longer than the lease TTL — the per-tick model would cancel the whole
+    tick and release leadership on every such occurrence (#3300)."""
+    from dynastore.tools.background_service import LeaseRenewalMode
+
+    assert MaintenanceSupervisor.lease_renewal_mode is LeaseRenewalMode.HEARTBEAT
+
+
+def test_tick_timeout_exceeds_job_dispatch_timeout():
+    """The declared per-tick budget must comfortably exceed the per-job
+    JOB_DISPATCH_TIMEOUT_SECONDS ceiling, or that ceiling can never be
+    reached within a single tick — the root cause of #3300."""
+    from dynastore.modules.catalog.maintenance_supervisor import (
+        JOB_DISPATCH_TIMEOUT_SECONDS,
+    )
+
+    supervisor = MaintenanceSupervisor({"hard_cap": 5})
+    assert supervisor.tick_timeout is not None
+    assert supervisor.tick_timeout > JOB_DISPATCH_TIMEOUT_SECONDS
 
 
 # ---------------------------------------------------------------------------

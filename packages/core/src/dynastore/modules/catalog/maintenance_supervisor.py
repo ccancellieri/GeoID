@@ -73,6 +73,7 @@ from dynastore.modules.tasks.durable.lock_registry import (
 )
 from dynastore.tools.background_service import (
     Leadership,
+    LeaseRenewalMode,
     PeriodicService,
     PodPolicy,
     ServiceContext,
@@ -280,6 +281,28 @@ _JOB_STATEMENT_TIMEOUT_MS = 60_000  # 60 seconds
 # a legitimate slow run across many schemas still completes; an actual hung
 # job is cancelled well before it wedges the supervisor for a full cycle.
 JOB_DISPATCH_TIMEOUT_SECONDS = 900  # 15 minutes
+
+# Per-tick wall-clock budget once MaintenanceSupervisor holds tenure under
+# LeaseRenewalMode.HEARTBEAT (below): a tick dispatches every due job
+# sequentially, so this must comfortably exceed JOB_DISPATCH_TIMEOUT_SECONDS
+# even when more than one job is due in the same tick — task_reaper (near-
+# continuous, 60s cadence) and obligation_sweep (600s cadence) are the two
+# implicated in the #3300 dev incident; the remaining jobs are single SQL
+# function calls that finish in milliseconds even under contention. Sized for
+# two genuinely slow jobs landing in the same tick plus margin, not the full
+# job roster hitting its ceiling simultaneously — that scenario already means
+# the DB itself is down, which a tick budget cannot paper over.
+#
+# NOTE: today's platform-wide LeadershipConfig (lease_ttl_seconds minus
+# lease_skew_margin_seconds — see the tick clamp in tools/background_service.py)
+# still caps a single tick below this value regardless of renewal mode. Under
+# HEARTBEAT that clamp cancels the in-flight tick and logs a warning WITHOUT
+# releasing leadership, so the supervisor retries on the next cadence instead
+# of losing the lease and re-triggering the reclaim/error-alert storm this
+# issue was filed for — the acute defect this constant (together with
+# HEARTBEAT mode) fixes. Declaring the supervisor's real per-tick need here
+# keeps it correct if that platform ceiling is ever raised.
+_TICK_TIMEOUT_SECONDS = 2 * JOB_DISPATCH_TIMEOUT_SECONDS + 60  # 1860s (31 min)
 
 # IAM schema — always "iam"
 _IAM_SCHEMA = "iam"
@@ -999,6 +1022,14 @@ class MaintenanceSupervisor(PeriodicService):
     name = "maintenance_supervisor"
     leadership = Leadership.LEADER_ONLY
     pod_policy = PodPolicy.SKIP_EPHEMERAL
+    # A tick dispatches every due job sequentially and routinely needs longer
+    # than the lease TTL to finish (see _TICK_TIMEOUT_SECONDS above). Under
+    # the default PER_TICK model that overrun cancels the whole tick AND
+    # releases leadership, forcing a full re-election on every occurrence —
+    # the claim -> cancel -> reclaim -> error-alert loop reported in #3300.
+    # Heartbeat mode holds tenure across ticks and renews independently, so a
+    # clamped tick is a soft, logged cutoff instead of a leadership loss.
+    lease_renewal_mode = LeaseRenewalMode.HEARTBEAT
 
     def __init__(self, config: dict[str, Any]) -> None:
         """Initialise with resolved job config values.
@@ -1009,6 +1040,7 @@ class MaintenanceSupervisor(PeriodicService):
         """
         self._config = config
         self.cadence_seconds = 60.0
+        self.tick_timeout = _TICK_TIMEOUT_SECONDS
         self.lock_key: Optional[Union[int, str]] = _SUPERVISOR_ADVISORY_LOCK_KEY
 
     async def tick(self, ctx: ServiceContext) -> None:
@@ -1092,6 +1124,8 @@ class MaintenanceSupervisor(PeriodicService):
                 job_name,
             )
             return
+
+        logger.info("maintenance_supervisor: job %r starting.", job_name)
 
         rows: Optional[int] = None
         status = "ok"
