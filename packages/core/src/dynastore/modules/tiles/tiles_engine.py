@@ -223,7 +223,7 @@ async def build_render_context(
     ttl=60,
     jitter=5,
     namespace="mvt_l1",
-    ignore=["conn"],
+    ignore=["conn", "on_truncation"],
     condition=lambda r: r is not None,
 )
 async def _cached_render_tile(
@@ -243,13 +243,18 @@ async def _cached_render_tile(
     subset_params: Optional[Dict[str, Any]],
     simplification: Optional[float],
     simplification_algorithm: SimplificationAlgorithm,
+    on_truncation: Optional[Callable[[int, int], None]] = None,
 ) -> Optional[bytes]:
     """In-process L1 cache above the storage-provider L2 cache.
 
     Mirrors the ``mvt_l1`` cache previously on
     ``tiles_service.TilesService._generate_mvt``: same TTL/maxsize/jitter, and
     ``conn`` stays out of the key (a fresh connection is acquired per request
-    but represents the same underlying data).
+    but represents the same underlying data). ``on_truncation`` is also kept
+    out of the key — it's a fresh closure per call, and including it would
+    defeat the cache — which means a cache HIT skips this function body
+    entirely and never invokes it (#3296): the truncation signal is only
+    ever reported for a fresh render, by construction.
     """
     return await source.render_tile(
         conn,
@@ -267,6 +272,7 @@ async def _cached_render_tile(
         subset_params=subset_params,
         simplification=simplification,
         simplification_algorithm=simplification_algorithm,
+        on_truncation=on_truncation,
     )
 
 
@@ -286,6 +292,7 @@ async def render_tile(
     subset_params: Optional[Dict[str, Any]] = None,
     simplification: Optional[float] = None,
     simplification_algorithm: SimplificationAlgorithm = SimplificationAlgorithm.TOPOLOGY_PRESERVING,
+    on_truncation: Optional[Callable[[int, int], None]] = None,
 ) -> Optional[bytes]:
     """Render one tile's bytes via ``ctx.source``.
 
@@ -293,6 +300,10 @@ async def render_tile(
     cache (the live request-serving path); the preseed task passes False —
     every tile is rendered exactly once per preseed run, so an L1 cache would
     only add memory pressure without a repeat-read to amortize.
+
+    ``on_truncation``, when given, is forwarded to ``ctx.source.render_tile``
+    unchanged — see ``TileSourceProtocol.render_tile`` for the contract. On
+    an L1 cache hit it is never invoked (the render body doesn't run).
     """
     if use_l1_cache:
         return await _cached_render_tile(
@@ -312,6 +323,7 @@ async def render_tile(
             subset_params,
             simplification,
             simplification_algorithm,
+            on_truncation,
         )
     return await ctx.source.render_tile(
         conn,
@@ -329,4 +341,5 @@ async def render_tile(
         subset_params=subset_params,
         simplification=simplification,
         simplification_algorithm=simplification_algorithm,
+        on_truncation=on_truncation,
     )

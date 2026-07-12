@@ -20,7 +20,7 @@
 
 import logging
 from collections import OrderedDict
-from typing import Dict, Any, List, Mapping, Optional, Tuple, Union
+from typing import Callable, Dict, Any, List, Mapping, Optional, Tuple, Union
 from sqlalchemy import text
 from shapely.geometry import box
 from shapely import wkb
@@ -33,9 +33,16 @@ from dynastore.modules.db_config.query_executor import (
 )
 from dynastore.tools.cache import cached
 from dynastore.tools.geospatial import SimplificationAlgorithm
+from dynastore.tools.ttl_gate import TTLGate
 from .tiles_models import TileMatrixSet
 
 logger = logging.getLogger(__name__)
+
+# Per-(catalog, collection, zoom) throttle for the feature-cap truncation
+# WARNING below (#3296) — a preseed sweep renders every tile at a zoom level
+# in quick succession, and every one of a large collection's low-zoom tiles
+# hits the same cap, so an unthrottled log would flood on every sweep.
+_TRUNCATION_LOG_GATE: TTLGate = TTLGate(maxsize=4096, ttl_seconds=300.0)
 
 # --- Self-tuning per-tile byte budget (#3155) --------------------------------
 #
@@ -74,6 +81,58 @@ def _bpf_update(key: Tuple[str, str, int], tile_bytes: int, features: int) -> No
     _BPF_ESTIMATES.move_to_end(key)
     while len(_BPF_ESTIMATES) > _BPF_MAX_ENTRIES:
         _BPF_ESTIMATES.popitem(last=False)
+
+
+async def _report_truncation_if_capped(
+    resolved_collections: List[Dict[str, Any]],
+    effective_limit: Optional[float],
+    kept: int,
+    z: str,
+    x: int,
+    y: int,
+    on_truncation: Optional[Callable[[int, int], None]],
+) -> None:
+    """Detect and surface a per-tile feature-cap truncation (#3296).
+
+    ``kept == effective_limit`` is the truncation signal — the per-collection
+    subquery's ``LIMIT`` was fully consumed, so rows beyond it were silently
+    dropped before ``ST_AsMVTGeom``. No second COUNT query over the unlimited
+    match set is run to confirm it; that would defeat the cap's purpose.
+
+    Attribution is only meaningful for single-collection tiles: a multi-
+    collection UNION's combined ``kept`` count can't be split back into a
+    per-collection figure without re-querying, so multi-collection tiles are
+    skipped here — the same restriction the byte-budget estimator above
+    already applies, for the same reason. When a density filter
+    (``min_feature_pixel_area/length_by_zoom``) is also active it can drop
+    rows AFTER the cap, so an actually-capped subquery may read as
+    untruncated here; an accepted false negative rather than tracking the
+    pre-density-filter count separately.
+    """
+    if (
+        len(resolved_collections) != 1
+        or not effective_limit
+        or effective_limit <= 0
+        or kept != int(effective_limit)
+    ):
+        return
+    limit = int(effective_limit)
+    if on_truncation is not None:
+        on_truncation(kept, limit)
+
+    coll = resolved_collections[0]
+    catalog_id = coll.get("catalog_id")
+    collection_id = coll.get("collection_id")
+    gate_key = (catalog_id, collection_id, z)
+    async with _TRUNCATION_LOG_GATE.acquire(gate_key) as h:
+        if not h.should_run:
+            return
+        logger.warning(
+            "tile_feature_cap_truncated catalog=%s collection=%s z=%s x=%s "
+            "y=%s kept=%d limit=%d",
+            catalog_id, collection_id, z, x, y, kept, limit,
+        )
+        h.mark()
 
 
 # Query to check if a specific SRID exists in PostGIS
@@ -345,10 +404,17 @@ async def get_features_as_mvt_filtered(
     simplification_algorithm: SimplificationAlgorithm = SimplificationAlgorithm.TOPOLOGY_PRESERVING,
     extent: int = 4096,
     buffer: int = 256,
+    on_truncation: Optional[Callable[[int, int], None]] = None,
 ):
     """
     Generates MVT using a list of pre-resolved collection metadata.
     Extreme speed: focuses purely on parallel SQL construction and execution.
+
+    ``on_truncation``, when given, is invoked ``on_truncation(kept, limit)``
+    once per render where the per-tile feature cap actually discarded rows
+    (see ``_report_truncation_if_capped``) — callers that need the signal
+    outside a log line (e.g. an HTTP response header) read it this way
+    rather than through the return value, which stays plain tile bytes.
     """
     # 1. PostGIS check: Ensure target SRID exists
     srid_exists = await _srid_exists(conn, target_srid)
@@ -530,9 +596,10 @@ async def get_features_as_mvt_filtered(
         )
 
     # 5. Final SQL Execution. The COUNT(*) rides the same aggregate pass as
-    # ST_AsMVT (one row, no GROUP BY) and feeds the byte-budget estimator —
-    # bytes-per-feature needs the number of features actually aggregated,
-    # which the LIMIT-ed subqueries make different from the requested cap.
+    # ST_AsMVT (one row, no GROUP BY) and feeds the byte-budget estimator and
+    # the truncation signal (#3296) — both need the number of features
+    # actually aggregated, which the LIMIT-ed subqueries make different from
+    # the requested cap.
     full_query = f"""
         WITH
         mvtgeom AS ({" UNION ALL ".join(union_queries)})
@@ -552,8 +619,12 @@ async def get_features_as_mvt_filtered(
     mvt = None
     if row is not None:
         mvt = row[0]
+        kept = int(row[1] or 0)
         if bpf_key is not None and mvt:
-            _bpf_update(bpf_key, len(mvt), int(row[1] or 0))
+            _bpf_update(bpf_key, len(mvt), kept)
+        await _report_truncation_if_capped(
+            resolved_collections, max_features, kept, z, x, y, on_truncation,
+        )
     # ST_AsMVT is an aggregate over `mvtgeom`, which this query always
     # executes as a single row (no GROUP BY) — the only way this comes back
     # None is the aggregate itself being NULL, i.e. zero features matched.

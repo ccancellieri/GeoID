@@ -34,7 +34,7 @@ here.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from dynastore.modules.concurrency import run_in_thread
 from dynastore.tools.geospatial import SimplificationAlgorithm
@@ -127,7 +127,11 @@ class MapsPngTileSource(TileSourceProtocol):
         subset_params: Optional[Dict[str, Any]] = None,
         simplification: Optional[float] = None,
         simplification_algorithm: SimplificationAlgorithm = SimplificationAlgorithm.TOPOLOGY_PRESERVING,
+        on_truncation: Optional[Callable[[int, int], None]] = None,
     ) -> Optional[bytes]:
+        # PNG rendering goes through maps_db.get_features_for_rendering, not
+        # tiles_db's feature-capped MVT query — no cap applies here, so
+        # on_truncation is accepted (Protocol conformance) but never called.
         if not resolved_collections:
             return None
         # build_render_context resolves this source's driver from the FIRST

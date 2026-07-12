@@ -1391,6 +1391,17 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             # handler.
             statement_timeout_ms = int(tiles_config.live_tile_timeout_seconds * 1000)
             render_task: Optional["asyncio.Task[Optional[bytes]]"] = None
+            # Populated by ``on_truncation`` iff the per-tile feature cap
+            # discarded rows on THIS render (#3296). A plain list, not a
+            # single-slot field, so the closure only ever appends — an L1
+            # cache hit skips the render body and never calls it, which is
+            # exactly the documented limitation: cache hits carry no
+            # X-Tile-Features-Truncated header.
+            _truncated_kept: List[int] = []
+
+            def _record_truncation(kept: int, _limit: int) -> None:
+                _truncated_kept.append(kept)
+
             try:
                 await DQLQuery(
                     f"SET LOCAL statement_timeout = {statement_timeout_ms}",
@@ -1419,6 +1430,7 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
                             subset_params=subset,  # type: ignore[arg-type]
                             simplification=simplification,
                             simplification_algorithm=simplification_algorithm,
+                            on_truncation=_record_truncation,
                         )
                     )
                 )
@@ -1558,6 +1570,10 @@ class TilesService(protocols.ExtensionProtocol, StaticFilesProtocol, OGCServiceM
             response = self._finalize_response(request, mvt_content)
             response.headers["X-Tile-Cache"] = "miss"
             response.headers["X-Tile-Source"] = "postgis"
+            if _truncated_kept:
+                # Fresh renders only (#3296) — a cached/redirected hit never
+                # reaches this branch, so it never carries this header.
+                response.headers["X-Tile-Features-Truncated"] = str(_truncated_kept[-1])
             return response
 
         except HTTPException:

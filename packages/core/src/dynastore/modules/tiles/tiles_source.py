@@ -32,7 +32,7 @@ returns True.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Protocol, Union, runtime_checkable
+from typing import Any, Callable, Dict, List, Optional, Protocol, Union, runtime_checkable
 
 from dynastore.tools.geospatial import SimplificationAlgorithm
 from dynastore.modules.tiles.tiles_models import TileMatrixSet
@@ -88,8 +88,14 @@ class TileSourceProtocol(Protocol):
         subset_params: Optional[Dict[str, Any]] = None,
         simplification: Optional[float] = None,
         simplification_algorithm: SimplificationAlgorithm = SimplificationAlgorithm.TOPOLOGY_PRESERVING,
+        on_truncation: Optional[Callable[[int, int], None]] = None,
     ) -> Optional[bytes]:
-        """Render one tile's bytes, or None when there is nothing to emit."""
+        """Render one tile's bytes, or None when there is nothing to emit.
+
+        ``on_truncation``, when given, is invoked ``on_truncation(kept, limit)``
+        if the per-tile feature cap discarded rows (#3296). Sources that don't
+        apply such a cap (e.g. ``MapsPngTileSource``) accept and ignore it.
+        """
         ...
 
 
@@ -127,6 +133,7 @@ class PostgisTileSource(TileSourceProtocol):
         subset_params: Optional[Dict[str, Any]] = None,
         simplification: Optional[float] = None,
         simplification_algorithm: SimplificationAlgorithm = SimplificationAlgorithm.TOPOLOGY_PRESERVING,
+        on_truncation: Optional[Callable[[int, int], None]] = None,
     ) -> Optional[bytes]:
         from dynastore.modules.tiles import tiles_db
 
@@ -146,6 +153,7 @@ class PostgisTileSource(TileSourceProtocol):
                 subset_params=subset_params,
                 simplification=simplification,
                 simplification_algorithm=simplification_algorithm,
+                on_truncation=on_truncation,
             )
         except ValueError as exc:
             if str(exc).startswith("Invalid CQL filter"):

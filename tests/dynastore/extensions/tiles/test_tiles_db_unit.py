@@ -37,6 +37,16 @@ def _clear_srid_cache():
     tiles_db._srid_exists.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def _clear_truncation_gate():
+    """``_TRUNCATION_LOG_GATE`` is a module-level singleton (#3296) — clear
+    it around every test so the per-(catalog, collection, zoom) TTL window
+    doesn't leak between tests."""
+    tiles_db._TRUNCATION_LOG_GATE.clear()
+    yield
+    tiles_db._TRUNCATION_LOG_GATE.clear()
+
+
 @pytest.mark.asyncio
 async def test_get_features_as_mvt_filtered_query_structure():
     """
@@ -353,6 +363,192 @@ async def test_srid_exists_cache_key_is_per_srid():
     assert result_4326 is True
     assert result_3857 is False
     assert mock_execute.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Feature-cap truncation signal (#3296)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_report_truncation_invokes_callback_and_logs_when_kept_equals_limit(caplog):
+    calls = []
+    with caplog.at_level(logging.WARNING):
+        await tiles_db._report_truncation_if_capped(
+            resolved_collections=[{"catalog_id": "cat1", "collection_id": "coll1"}],
+            effective_limit=20000,
+            kept=20000,
+            z="4",
+            x=1,
+            y=2,
+            on_truncation=lambda k, lim: calls.append((k, lim)),
+        )
+
+    assert calls == [(20000, 20000)]
+    warnings = [r.getMessage() for r in caplog.records if "tile_feature_cap_truncated" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "catalog=cat1" in warnings[0]
+    assert "collection=coll1" in warnings[0]
+    assert "kept=20000" in warnings[0]
+    assert "limit=20000" in warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_report_truncation_noop_when_kept_below_limit():
+    calls = []
+    await tiles_db._report_truncation_if_capped(
+        resolved_collections=[{"catalog_id": "cat1", "collection_id": "coll1"}],
+        effective_limit=20000,
+        kept=19999,
+        z="4",
+        x=1,
+        y=2,
+        on_truncation=lambda k, lim: calls.append((k, lim)),
+    )
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_report_truncation_noop_when_cap_disabled():
+    """``effective_limit`` falsy (cap unset/opted-out) never signals, even if
+    ``kept`` happens to equal it."""
+    calls = []
+    await tiles_db._report_truncation_if_capped(
+        resolved_collections=[{"catalog_id": "cat1", "collection_id": "coll1"}],
+        effective_limit=None,
+        kept=0,
+        z="4",
+        x=1,
+        y=2,
+        on_truncation=lambda k, lim: calls.append((k, lim)),
+    )
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_report_truncation_skipped_for_multi_collection_tiles():
+    """Attribution requires exactly one collection — a combined UNION's
+    total can't be split back per-collection without re-querying."""
+    calls = []
+    await tiles_db._report_truncation_if_capped(
+        resolved_collections=[
+            {"catalog_id": "cat1", "collection_id": "coll1"},
+            {"catalog_id": "cat1", "collection_id": "coll2"},
+        ],
+        effective_limit=20000,
+        kept=20000,
+        z="4",
+        x=1,
+        y=2,
+        on_truncation=lambda k, lim: calls.append((k, lim)),
+    )
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_report_truncation_log_throttled_within_ttl_window(caplog):
+    """Two truncated renders for the same (catalog, collection, zoom) within
+    the TTL window log only once; the callback still fires every time — the
+    throttle is a logging concern, not a header/detection one."""
+    calls = []
+    with caplog.at_level(logging.WARNING):
+        for _ in range(2):
+            await tiles_db._report_truncation_if_capped(
+                resolved_collections=[{"catalog_id": "cat1", "collection_id": "coll1"}],
+                effective_limit=20000,
+                kept=20000,
+                z="4",
+                x=1,
+                y=2,
+                on_truncation=lambda k, lim: calls.append((k, lim)),
+            )
+
+    assert calls == [(20000, 20000), (20000, 20000)]
+    warnings = [r for r in caplog.records if "tile_feature_cap_truncated" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_report_truncation_log_not_throttled_across_different_zooms(caplog):
+    """Different zoom -> different gate key -> both log."""
+    with caplog.at_level(logging.WARNING):
+        await tiles_db._report_truncation_if_capped(
+            resolved_collections=[{"catalog_id": "cat1", "collection_id": "coll1"}],
+            effective_limit=20000, kept=20000, z="4", x=1, y=2, on_truncation=None,
+        )
+        await tiles_db._report_truncation_if_capped(
+            resolved_collections=[{"catalog_id": "cat1", "collection_id": "coll1"}],
+            effective_limit=50000, kept=50000, z="8", x=1, y=2, on_truncation=None,
+        )
+
+    warnings = [r for r in caplog.records if "tile_feature_cap_truncated" in r.getMessage()]
+    assert len(warnings) == 2
+
+
+@pytest.mark.asyncio
+async def test_get_features_as_mvt_filtered_reports_truncation_via_callback():
+    """End-to-end: the aggregate query's ``feature_count`` row value flows
+    through to ``on_truncation`` when it equals the configured bracket cap."""
+    conn = AsyncMock()
+    calls = []
+
+    with patch("dynastore.modules.tiles.tiles_db.DQLQuery") as MockDQLQuery:
+        mock_execute = AsyncMock()
+        mock_execute.side_effect = [
+            True,  # srid_exists
+            (b"fake_mvt_bytes", 2),  # kept == the configured z0 bracket below
+        ]
+        MockDQLQuery.return_value.execute = mock_execute
+
+        tms_def = MagicMock(spec=TileMatrixSet)
+        tms_def.tileMatrices = [
+            MagicMock(
+                id="0",
+                pointOfOrigin=[-180, 90],
+                tileWidth=256,
+                tileHeight=256,
+                cellSize=0.703125,
+            )
+        ]
+
+        with patch("dynastore.modules.get_protocol") as mock_get_module:
+            mock_config_manager = AsyncMock()
+            mock_config_manager.get_config.return_value = None
+            mock_catalog_module = MagicMock()
+            mock_catalog_module.get_config_manager.return_value = mock_config_manager
+            mock_get_module.return_value = mock_catalog_module
+
+            with patch("dynastore.tools.discovery.get_protocol") as mock_get_proto:
+                mock_items = AsyncMock()
+                mock_items.get_features_query.return_value = ("SELECT 1", {})
+                mock_get_proto.side_effect = (
+                    lambda proto: mock_items if proto is ItemsProtocol else None
+                )
+
+                result = await tiles_db.get_features_as_mvt_filtered(
+                    conn=conn,
+                    resolved_collections=[
+                        {
+                            "phys_schema": "s_test",
+                            "phys_table": "my_table",
+                            "source_srid": 4326,
+                            "simplification_by_zoom": {},
+                            "max_features_per_tile_by_zoom": {0: 2},
+                            "catalog_id": "my_catalog",
+                            "collection_id": "my_collection",
+                            "col_config": MagicMock(),
+                        }
+                    ],
+                    tms_def=tms_def,
+                    target_srid=3857,
+                    z="0",
+                    x=0,
+                    y=0,
+                    on_truncation=lambda k, lim: calls.append((k, lim)),
+                )
+
+    assert result == b"fake_mvt_bytes"
+    assert calls == [(2, 2)]
 
 
 if __name__ == "__main__":
