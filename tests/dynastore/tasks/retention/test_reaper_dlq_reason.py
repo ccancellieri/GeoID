@@ -85,18 +85,20 @@ async def reaper_schema(async_conn) -> AsyncIterator[str]:  # noqa: ANN001
 
 async def _insert_stuck_row(
     conn, schema: str, *, retry_count: int, max_retries,
+    status: str = "ACTIVE", expired_lock: bool = True,
 ) -> str:
     import uuid
 
     task_id = str(uuid.uuid4())
+    locked_until_sql = "NOW() - INTERVAL '1 hour'" if expired_lock else "NULL"
     await conn.execute(  # type: ignore[attr-defined]
         f"""
         INSERT INTO "{schema}".tasks
             (task_id, task_type, status, retry_count, max_retries,
              owner_id, locked_until)
-        VALUES ($1, 'noop', 'ACTIVE', $2, $3, 'stale-worker', NOW() - INTERVAL '1 hour')
+        VALUES ($1, 'noop', $4, $2, $3, 'stale-worker', {locked_until_sql})
         """,
-        task_id, retry_count, max_retries,
+        task_id, retry_count, max_retries, status,
     )
     return task_id
 
@@ -164,3 +166,39 @@ async def test_plain_requeue_keeps_heartbeat_expired_text(reaper_schema, async_c
     row = await _fetch_row(conn, reaper_schema, task_id)
     assert row["status"] == "PENDING"
     assert "heartbeat expired" in row["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_running_claimed_row_is_reaped(reaper_schema, async_conn):
+    """A claimed row stamped with the legacy ``RUNNING`` status (pre-ACTIVE
+    cutover builds) and an expired lock must be requeued like an ACTIVE one.
+    Before #3297 the reaper scanned ``status = 'ACTIVE'`` only, so such rows
+    could neither heartbeat (ACTIVE-gated) nor be reaped — permanent phantoms."""
+    conn = async_conn
+    task_id = await _insert_stuck_row(
+        conn, reaper_schema, retry_count=1, max_retries=3, status="RUNNING",
+    )
+
+    await _reap(conn, reaper_schema, p_max_retries=3, p_hard_cap=5)
+
+    row = await _fetch_row(conn, reaper_schema, task_id)
+    assert row["status"] == "PENDING"
+    assert "heartbeat expired" in row["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_running_audit_row_without_lock_is_untouched(reaper_schema, async_conn):
+    """BackgroundRunner's in-process audit rows are deliberately RUNNING and
+    never stamp ``locked_until`` — the expiry predicate must keep excluding
+    them after the #3297 widening (NULL never satisfies ``<``)."""
+    conn = async_conn
+    task_id = await _insert_stuck_row(
+        conn, reaper_schema, retry_count=0, max_retries=3,
+        status="RUNNING", expired_lock=False,
+    )
+
+    await _reap(conn, reaper_schema, p_max_retries=3, p_hard_cap=5)
+
+    row = await _fetch_row(conn, reaper_schema, task_id)
+    assert row["status"] == "RUNNING"
+    assert row["error_message"] is None

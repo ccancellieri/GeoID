@@ -239,7 +239,13 @@ CREATE TRIGGER on_task_status_update
 #
 # Semantics:
 #   - Scans ACTIVE rows whose ``locked_until < NOW()`` (heartbeat expired
-#     = owner pod died / got SIGKILL / network partition / OOM).
+#     = owner pod died / got SIGKILL / network partition / OOM). Legacy
+#     ``RUNNING`` rows are scanned too: builds prior to the ACTIVE cutover
+#     stamped claimed rows as RUNNING, and both the heartbeat UPDATE and
+#     this reaper used to gate on ACTIVE only, leaving those rows as
+#     permanently un-reapable phantoms (#3297). In-process audit rows —
+#     the one deliberate RUNNING writer left — never stamp ``locked_until``,
+#     so the expiry predicate excludes them by construction.
 #   - Resets to PENDING (retry_count+1) unless ``retry_count >= max_retries``,
 #     in which case the row is moved to DEAD_LETTER.
 #   - Emits ``pg_notify('new_task_queued', 'reaper')`` so live dispatchers
@@ -350,7 +356,12 @@ BEGIN
     WITH stuck AS (
         SELECT timestamp, task_id, retry_count, max_retries
         FROM {{schema}}.tasks
-        WHERE status = 'ACTIVE'
+        -- 'RUNNING' is the pre-cutover claim status (kept as a legacy alias):
+        -- rows born-claimed by older builds can neither heartbeat (ACTIVE-gated)
+        -- nor complete, so they must be reapable here (#3297). Deliberate
+        -- RUNNING audit rows carry NULL locked_until and never match the
+        -- expiry predicate below.
+        WHERE status IN ('ACTIVE', 'RUNNING')
           AND locked_until < NOW() - CASE
                 WHEN task_type IN ({_DRAIN_TYPES_SQL})
                     THEN make_interval(secs => {DRAIN_RECLAIM_GRACE_SECONDS})
