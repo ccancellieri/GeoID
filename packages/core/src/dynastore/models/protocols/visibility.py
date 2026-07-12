@@ -115,6 +115,7 @@ __all__ = [
     "set_request_visibility",
     "reset_request_visibility",
     "get_request_visibility",
+    "clear_request_visibility",
     "visibility_bypass",
     "extract_id_constraint",
     "resolve_catalog_listing_ids",
@@ -165,6 +166,26 @@ def reset_request_visibility(token: Token[Optional[RequestVisibility]]) -> None:
 
 def get_request_visibility() -> Optional[RequestVisibility]:
     return _visibility_var.get()
+
+
+def clear_request_visibility() -> None:
+    """Force the contextvar to ``None`` in the *current* context, unconditionally.
+
+    Unlike :func:`reset_request_visibility` this takes no token and does not
+    restore a prior value — it is a one-way landing in the documented
+    "no authorization layer active" state. Intended for exactly one case:
+    the entry point of a detached background task (see
+    ``dynastore.modules.concurrency.run_in_background``). ``asyncio.create_task``
+    copies the current contextvars snapshot at creation time, so a task
+    spawned mid-request would otherwise keep that request's
+    :class:`RequestVisibility` for its whole lifetime — including after the
+    request's own middleware has reset *its* context in a ``finally`` block,
+    because that reset cannot reach the task's independent copy. Calling this
+    as the first thing a detached task's coroutine does (i.e. inside its own
+    already-copied context) puts it in the same unfiltered state as any other
+    CLI/background caller, never wider than that.
+    """
+    _visibility_var.set(None)
 
 
 @contextmanager

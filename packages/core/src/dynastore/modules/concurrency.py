@@ -67,13 +67,33 @@ async def run_in_thread(func: Callable[..., Any], *args: Any, **kwargs: Any) -> 
 # Global set to track active background tasks (prevent GC and allow waiting in tests)
 _background_tasks: set[asyncio.Task] = set()
 
+async def _isolate_visibility(coro: Coroutine[Any, Any, Any]) -> Any:
+    """Detach ``coro`` from whatever ``RequestVisibility`` happens to be
+    ambient in the spawning context.
+
+    ``asyncio.create_task`` copies the current contextvars snapshot at
+    creation time. Without this, a coroutine spawned mid-request would run
+    under that request's caller-scoped visibility for its entire lifetime,
+    surviving the request's own middleware resetting *its* context — see
+    ``dynastore.models.protocols.visibility.clear_request_visibility``.
+    """
+    from dynastore.models.protocols.visibility import clear_request_visibility
+
+    clear_request_visibility()
+    return await coro
+
+
 def run_in_background(coro: Coroutine[Any, Any, Any], name: str = "background_task") -> asyncio.Task:
     """
     Schedules a coroutine to run in the background.
-    Keeps a strong reference to the task to prevent garbage collection 
+    Keeps a strong reference to the task to prevent garbage collection
     and allows waiting for completion via `await_all_background_tasks`.
+
+    The task starts with a clean (unfiltered) request-visibility context
+    regardless of what was published in the spawning context — see
+    ``_isolate_visibility``.
     """
-    task = asyncio.create_task(coro, name=name)
+    task = asyncio.create_task(_isolate_visibility(coro), name=name)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     return task
