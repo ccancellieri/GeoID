@@ -410,3 +410,90 @@ async def test_unrelated_pg_error_still_propagates(
             lock_key="some_module_storage_init",
             ddl_body=_ddl_body,
         )
+
+
+# ---------------------------------------------------------------------------
+# Structured log lines (#3120) — a confirmed recovery must be
+# distinguishable from "still failing" via a stable, grep-able event name,
+# not just free text.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_recovered_replay_emits_detected_then_recovered_logs(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A lock-timeout followed by a successful unlocked replay must log both
+    the initial detection and the confirmed recovery, distinctly."""
+    monkeypatch.setattr(
+        locking_tools,
+        "acquire_startup_lock",
+        _make_raising_acquire_startup_lock(
+            LockNotAvailableError("canceling statement due to lock timeout")
+        ),
+    )
+
+    fake_conn = object()
+
+    @asynccontextmanager
+    async def _fake_managed_transaction(engine: Any):
+        yield fake_conn
+
+    monkeypatch.setattr(locking_tools, "managed_transaction", _fake_managed_transaction)
+
+    async def _ddl_body(conn: Any) -> None:
+        pass
+
+    with caplog.at_level("INFO", logger="dynastore.modules.db_config.locking_tools"):
+        await locking_tools.run_startup_ddl_tolerating_lock_timeout(
+            engine=object(),
+            lock_key="some_module_storage_init",
+            ddl_body=_ddl_body,
+        )
+
+    messages = [r.message for r in caplog.records]
+    assert any("ddl_startup_peer_race_detected" in m and "reason=lock_timeout" in m for m in messages)
+    assert any("ddl_startup_peer_race_recovered" in m and "reason=lock_timeout" in m for m in messages)
+    assert not any("ddl_startup_peer_race_unresolved" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_unresolved_replay_emits_unresolved_log_not_recovered(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A statement-timeout that recurs on the unlocked replay must be logged
+    as unresolved, never as a confirmed recovery."""
+    monkeypatch.setattr(
+        locking_tools,
+        "acquire_startup_lock",
+        _make_raising_acquire_startup_lock(
+            QueryCanceledError("canceling statement due to statement timeout")
+        ),
+    )
+
+    fake_conn = object()
+
+    @asynccontextmanager
+    async def _fake_managed_transaction(engine: Any):
+        yield fake_conn
+
+    monkeypatch.setattr(locking_tools, "managed_transaction", _fake_managed_transaction)
+
+    async def _ddl_body(conn: Any) -> None:
+        raise QueryCanceledError("canceling statement due to statement timeout")
+
+    with caplog.at_level("INFO", logger="dynastore.modules.db_config.locking_tools"):
+        await locking_tools.run_startup_ddl_tolerating_lock_timeout(
+            engine=object(),
+            lock_key="some_module_storage_init",
+            ddl_body=_ddl_body,
+        )
+
+    messages = [r.message for r in caplog.records]
+    assert any(
+        "ddl_startup_peer_race_unresolved" in m and "retry_reason=statement_timeout" in m
+        for m in messages
+    )
+    assert not any("ddl_startup_peer_race_recovered" in m for m in messages)

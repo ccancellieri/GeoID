@@ -56,6 +56,8 @@ from dynastore.modules.tasks.workclass_ddl import (
     STORAGE_RETENTION_FUNC_DDL,
     render_partition_create_ahead_ddl,
     render_partition_retention_ddl,
+    partition_create_ahead_function_name,
+    partition_retention_function_name,
     _WORKCLASS_CREATE_AHEAD_DAYS,
     _WORKCLASS_RETENTION_DAYS,
 )
@@ -643,6 +645,82 @@ async def test_ensure_workclass_storage_exists_calls_ddl_query():
     assert "create_partitions" in combined_dql
     assert "events" in combined_dql
     assert "storage" in combined_dql
+
+
+def test_partition_function_names_match_rendered_ddl():
+    """The name-builder helpers (#3120) must match the quoted,
+    schema-embedded function name each template actually renders — that's
+    the exact identifier passed to the explicit ``check_query``."""
+    assert (
+        partition_create_ahead_function_name(table="events", schema="tasks")
+        == "create_partitions_tasks_events"
+    )
+    assert (
+        partition_retention_function_name(table="events", schema="tasks")
+        == "maintain_partitions_tasks_events"
+    )
+    # The rendered template is still {schema}-templated (DDLQuery substitutes
+    # it later); the un-substituted function name must appear verbatim so
+    # the naming convention is guaranteed to match what CREATE OR REPLACE
+    # actually names, not just a parallel guess.
+    rendered = render_partition_create_ahead_ddl(table="events", granularity="day", window=1)
+    templated_name = partition_create_ahead_function_name(table="events", schema="{schema}")
+    assert f'"{{schema}}"."{templated_name}"' in rendered
+
+
+@pytest.mark.asyncio
+async def test_ensure_workclass_storage_exists_passes_explicit_check_query():
+    """The four maintenance-function DDLQuery calls must carry an explicit
+    ``check_query`` (#3120) — their function names embed
+    ``{schema}`` inside a quoted identifier, which ``ddl_inference`` can only
+    verify by resolving that placeholder first (#3117)."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from dynastore.modules.tasks.workclass_ddl import ensure_workclass_storage_exists
+
+    conn = AsyncMock()
+    calls: list[tuple[str, object]] = []
+
+    def _ddl_factory(sql, check_query=None, **kw):
+        calls.append((sql, check_query))
+        inst = MagicMock()
+        inst.execute = AsyncMock()
+        return inst
+
+    def _dql_factory(sql, **kw):
+        inst = MagicMock()
+        inst.execute = AsyncMock()
+        return inst
+
+    with (
+        patch("dynastore.modules.tasks.workclass_ddl.DDLQuery", side_effect=_ddl_factory),
+        patch("dynastore.modules.tasks.workclass_ddl.DQLQuery", side_effect=_dql_factory),
+        patch(
+            "dynastore.modules.tasks.workclass_ddl.check_function_exists",
+            new=AsyncMock(return_value=True),
+        ) as mocked_check,
+    ):
+        await ensure_workclass_storage_exists(conn, "myschema")
+
+        func_ddl_calls = [
+            (sql, cq) for sql, cq in calls if "CREATE OR REPLACE FUNCTION" in sql
+        ]
+        assert len(func_ddl_calls) == 4
+        assert all(cq is not None for _, cq in func_ddl_calls)
+
+        # Each check_query closure must delegate to check_function_exists
+        # with the exact resolved, schema-embedded function name.
+        seen_names = set()
+        for _, check_query in func_ddl_calls:
+            await check_query(conn)
+        for call in mocked_check.await_args_list:
+            seen_names.add(call.args[1])
+
+    assert seen_names == {
+        "create_partitions_myschema_events",
+        "maintain_partitions_myschema_events",
+        "create_partitions_myschema_storage",
+        "maintain_partitions_myschema_storage",
+    }
 
 
 @pytest.mark.asyncio

@@ -278,3 +278,60 @@ def test_sync_recovery_returns_false_when_recheck_raises() -> None:
     executor = _make_executor(existence_mock)
 
     assert not executor._try_peer_race_recovery_sync(MagicMock(), {}, _dup_exc())
+
+
+# ---------------------------------------------------------------------------
+# Structured log lines (#3120) — a verified recovery must be
+# distinguishable from a recheck failure via a stable, grep-able event name
+# (log-based metric ready), not just free text.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_async_recovery_emits_structured_recovered_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    existence_mock = AsyncMock(return_value=True)
+    existence_mock._needs_raw_params = False
+    executor = _make_executor(existence_mock)
+
+    with caplog.at_level("INFO", logger="dynastore.modules.db_config.query_executor"):
+        result = await executor._try_peer_race_recovery_async(
+            MagicMock(), {}, _dup_exc("42710")
+        )
+
+    assert result is True
+    assert any("ddl_peer_race_recovered" in r.message for r in caplog.records)
+    assert not any("ddl_peer_race_recovery_failed" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_async_recovery_emits_structured_failed_log_on_recheck_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    existence_mock = AsyncMock(side_effect=RuntimeError("recheck broken"))
+    existence_mock._needs_raw_params = False
+    executor = _make_executor(existence_mock)
+
+    with caplog.at_level("WARNING", logger="dynastore.modules.db_config.query_executor"):
+        result = await executor._try_peer_race_recovery_async(
+            MagicMock(), {}, _dup_exc("42710")
+        )
+
+    assert result is False
+    assert any("ddl_peer_race_recovery_failed" in r.message for r in caplog.records)
+    assert not any("ddl_peer_race_recovered" in r.message for r in caplog.records)
+
+
+def test_sync_recovery_emits_structured_recovered_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    existence_mock = MagicMock(return_value=True)
+    existence_mock._needs_raw_params = False
+    executor = _make_executor(existence_mock)
+
+    with caplog.at_level("INFO", logger="dynastore.modules.db_config.query_executor"):
+        result = executor._try_peer_race_recovery_sync(MagicMock(), {}, _dup_exc("23505"))
+
+    assert result is True
+    assert any("ddl_peer_race_recovered" in r.message for r in caplog.records)

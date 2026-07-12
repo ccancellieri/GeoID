@@ -1029,6 +1029,7 @@ async def run_startup_ddl_tolerating_lock_timeout(
     one-shot idempotent DDL, so silently falling back to "proceed unlocked"
     would be wrong for them.
     """
+    service = get_service_name() or "unknown"
     try:
         async with acquire_startup_lock(engine, lock_key) as locked_conn:
             if locked_conn is None:
@@ -1039,20 +1040,26 @@ async def run_startup_ddl_tolerating_lock_timeout(
         return
     except Exception as exc:
         if is_lock_not_available_error(exc):
+            reason = "lock_timeout"
+            # Structured key=value WARNING line — log-based metric ready
+            # (#3120). Not yet a confirmed recovery: the unlocked replay
+            # below still has to succeed. See ddl_startup_peer_race_recovered
+            # / ddl_startup_peer_race_unresolved for the outcome.
             logger.warning(
-                "Startup lock %r timed out — a peer is likely still "
-                "initializing this schema (possibly pool-starved, see #2333). "
-                "Proceeding with the idempotent DDL unlocked instead of aborting "
-                "startup: %s",
-                lock_key, exc,
+                "ddl_startup_peer_race_detected lock_key=%s reason=%s service=%s "
+                "— a peer is likely still initializing this schema (possibly "
+                "pool-starved, see #2333). Proceeding with the idempotent DDL "
+                "unlocked instead of aborting startup: %s",
+                lock_key, reason, service, exc,
             )
         elif is_statement_timeout_error(exc):
+            reason = "statement_timeout"
             logger.warning(
-                "Startup DDL %r hit a statement timeout — likely a boot herd "
-                "of peers applying the same idempotent DDL concurrently "
-                "(see #3121). Proceeding with the DDL unlocked instead of "
-                "aborting startup: %s",
-                lock_key, exc,
+                "ddl_startup_peer_race_detected lock_key=%s reason=%s service=%s "
+                "— likely a boot herd of peers applying the same idempotent DDL "
+                "concurrently (see #3121). Proceeding with the DDL unlocked "
+                "instead of aborting startup: %s",
+                lock_key, reason, service, exc,
             )
         else:
             raise
@@ -1065,20 +1072,31 @@ async def run_startup_ddl_tolerating_lock_timeout(
         async with managed_transaction(engine) as unlocked_conn:
             with startup_ddl_unlocked_fallback_scope():
                 await ddl_body(unlocked_conn)
+        # Structured key=value INFO line — the unlocked replay completed, so
+        # the peer race detected above is now a confirmed recovery rather
+        # than a bare "we proceeded and hoped" warning.
+        logger.info(
+            "ddl_startup_peer_race_recovered lock_key=%s reason=%s service=%s",
+            lock_key, reason, service,
+        )
     except Exception as exc:
         if is_lock_not_available_error(exc):
             logger.warning(
-                "Startup DDL %r still hit a lock timeout while replaying unlocked; "
-                "assuming a peer or hot relation is applying equivalent idempotent "
-                "DDL and continuing startup: %s",
-                lock_key, exc,
+                "ddl_startup_peer_race_unresolved lock_key=%s reason=%s "
+                "retry_reason=lock_timeout service=%s — still hit a lock "
+                "timeout while replaying unlocked; assuming a peer or hot "
+                "relation is applying equivalent idempotent DDL and "
+                "continuing startup: %s",
+                lock_key, reason, service, exc,
             )
         elif is_statement_timeout_error(exc):
             logger.warning(
-                "Startup DDL %r still hit a statement timeout while replaying "
-                "unlocked; assuming a peer or hot relation is applying "
-                "equivalent idempotent DDL and continuing startup: %s",
-                lock_key, exc,
+                "ddl_startup_peer_race_unresolved lock_key=%s reason=%s "
+                "retry_reason=statement_timeout service=%s — still hit a "
+                "statement timeout while replaying unlocked; assuming a peer "
+                "or hot relation is applying equivalent idempotent DDL and "
+                "continuing startup: %s",
+                lock_key, reason, service, exc,
             )
         else:
             raise

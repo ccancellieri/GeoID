@@ -64,6 +64,7 @@ the concept itself changed.
 - [Asset Upload Smoke Test](operations/asset-upload-smoke.md)
 - [Rate Limits & Quotas](operations/rate-limit-and-quotas.md)
 - [OGC API Compliance Verification](operations/ogc-api-compliance-verification.md)
+- [Startup DDL Peer Races & Deploy Triage](operations/startup-ddl-and-deploy-triage.md)
 
 ## Standards research (public proposals)
 

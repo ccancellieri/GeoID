@@ -1221,15 +1221,20 @@ class DDLExecutor(BaseExecutor):
                     or getattr(exc, "pgcode", None)
                     or getattr(exc, "sqlstate", None)
                 )
+                # Structured key=value INFO line — log-based metric ready
+                # (#3120). Distinguishes a verified recovery ("the peer won,
+                # the object is confirmed to exist") from the WARNING below,
+                # which means recovery could not be verified and the original
+                # error is about to surface.
                 logger.info(
-                    "DDL peer-race resolved: object exists after concurrent creation (pgcode=%s).",
-                    pgcode,
+                    "ddl_peer_race_recovered pgcode=%s service=%s sync=false",
+                    pgcode, _SERVICE_NAME_FOR_METRICS,
                 )
                 return True
         except Exception as recheck_exc:
             logger.warning(
-                "DDL peer-race recheck failed: %s; surfacing original error.",
-                recheck_exc,
+                "ddl_peer_race_recovery_failed service=%s err=%s",
+                _SERVICE_NAME_FOR_METRICS, _err_repr(recheck_exc),
             )
         return False
 
@@ -1241,14 +1246,21 @@ class DDLExecutor(BaseExecutor):
             return False
         try:
             if self._call_existence_check_sync(conn, params):
+                pgcode = (
+                    getattr(getattr(exc, "orig", None), "pgcode", None)
+                    or getattr(exc, "pgcode", None)
+                    or getattr(exc, "sqlstate", None)
+                )
+                # Structured key=value INFO line — see the async sibling above.
                 logger.info(
-                    "DDL peer-race resolved (sync): object exists after concurrent creation."
+                    "ddl_peer_race_recovered pgcode=%s service=%s sync=true",
+                    pgcode, _SERVICE_NAME_FOR_METRICS,
                 )
                 return True
         except Exception as recheck_exc:
             logger.warning(
-                "DDL peer-race recheck failed (sync): %s; surfacing original error.",
-                recheck_exc,
+                "ddl_peer_race_recovery_failed service=%s err=%s",
+                _SERVICE_NAME_FOR_METRICS, _err_repr(recheck_exc),
             )
         return False
 
@@ -1436,6 +1448,15 @@ class DDLExecutor(BaseExecutor):
                         if self.existence_check:
                             res_post = await self._call_existence_check(tx_conn, params)
                             if res_post:
+                                # Structured key=value INFO line — log-based
+                                # metric ready (#3120), same event name as
+                                # the exception-driven recovery below so both
+                                # paths roll up into one recovery-rate metric.
+                                logger.info(
+                                    "ddl_peer_race_recovered pgcode=lock_wait "
+                                    "service=%s sync=false",
+                                    _SERVICE_NAME_FOR_METRICS,
+                                )
                                 return True  # peer created it during our wait
 
                 # Timeout guard to prevent DDL hangs
