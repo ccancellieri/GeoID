@@ -963,18 +963,28 @@ class RecordsService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin):
         )
         # Pass the normalised list so the mixin works with the same payload
         # shape regardless of original body format.
+        ctx = DriverContext(db_resource=conn)
         accepted_rows, rejections, _was_single_mixin, batch_size = (
             await self._ingest_items(
                 catalog_id,
                 collection_id,
                 items,
-                DriverContext(db_resource=conn),
+                ctx,
                 policy_source,
             )
         )
 
         if rejections:
-            return self._build_rejection_response(accepted_rows, rejections, batch_size)
+            return self._build_rejection_response(accepted_rows, rejections, batch_size, ctx)
+
+        if ctx.extensions.get("_async_offload"):
+            # Budget crossed (#3253) and the remainder durably deferred —
+            # accepted_rows holds only the sub-batches flushed before the
+            # cut point (ids, not full rows, per the existing split-path
+            # contract below), so the full-row RecordCollection rendering
+            # this handler otherwise returns cannot be built. Route through
+            # the shared 202-split response instead.
+            return self._build_bulk_creation_response(accepted_rows, ctx)
 
         catalogs_svc = await self._get_catalogs_service()
         root_url = get_root_url(request)

@@ -169,6 +169,42 @@ class CollectionPluginConfig(PluginConfig):
         ),
     )
 
+    sync_ingest_inprocess_max_bytes: Mutable[int] = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Cumulative inline-ingested byte budget for a synchronous bulk "
+            "POST /collections/{id}/items request (OGCTransactionMixin."
+            "_ingest_items) before the remainder is handed off to the "
+            "async 'ingestion' process instead of continuing to write in "
+            "the request thread. Only a remainder whose items round-trip "
+            "cleanly through the shared ingestion reader (flat or nested- "
+            "scalar properties; no extra top-level keys such as STAC's "
+            "assets/links/bbox) is actually offloaded — a remainder whose "
+            "shape does not qualify (e.g. STAC) is written inline instead, "
+            "exactly as if this budget were disabled; only a genuine spill/"
+            "enqueue I/O failure is rejected. Default 0 disables the budget "
+            "entirely (the pre-#3253, synchronous-only behaviour) — this is "
+            "opt-in, not opt-out. Enabling it means a large or slow item-"
+            "write to this collection can spawn a background 'ingestion' "
+            "job, so it must NOT be enabled on a collection whose write "
+            "policy accepts unauthenticated/anonymous callers."
+        ),
+    )
+
+    sync_ingest_inprocess_max_seconds: Mutable[float] = Field(
+        default=0.0,
+        ge=0,
+        description=(
+            "Wall-clock budget (seconds) for the same synchronous bulk-POST "
+            "offload described on sync_ingest_inprocess_max_bytes. "
+            "Whichever limit is reached first — bytes or elapsed time — "
+            "triggers the offload attempt. Default 0 disables the "
+            "wall-clock trigger — see sync_ingest_inprocess_max_bytes for "
+            "why this budget is opt-in."
+        ),
+    )
+
 
 CollectionPluginConfig.model_rebuild()
 

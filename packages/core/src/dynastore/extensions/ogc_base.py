@@ -35,12 +35,15 @@ Usage::
 
 import logging
 import os
+import time
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Dict, FrozenSet, Iterable, List, Literal, Optional, Tuple, Type, TypeVar, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from dynastore.extensions.ogc_models_shared import (
+    AsyncOffloadAcceptance,
     BulkCreationResponse,
+    BulkOffloadReport,
     IngestionReport,
     SidecarRejection,
 )
@@ -2000,17 +2003,89 @@ class OGCTransactionMixin:
                     index_results, ctx.extensions.pop("_index_results", None) or {}
                 )
 
-            for item in items_list:
+            # In-process byte/wall-clock budget (#3253) — mirrors the
+            # StorageDrainTask._run_drain gate shape (tasks/workclass_drain/
+            # storage_drain_task.py): a ``> 0`` disable sentinel and ``>=``
+            # comparison. Once crossed, the un-flushed remainder is handed
+            # off to the async 'ingestion' process (see ogc_bulk_offload.py)
+            # instead of continuing to hold the request thread — the gate is
+            # checked only right after a sub-batch flush, so current_batch is
+            # always empty at the cut point.
+            inprocess_max_bytes = col_config.sync_ingest_inprocess_max_bytes
+            inprocess_max_seconds = col_config.sync_ingest_inprocess_max_seconds
+            budget_start = time.monotonic()
+            cumulative_flushed_bytes = 0
+            offloaded = False
+            # Set once an offload attempt reports the remainder is not
+            # actually offloadable — either its shape fails the round-trip
+            # classifier (STAC, or any Records item carrying extra
+            # top-level members), or an equivalent job for this exact
+            # remainder is already in flight (dedup hit on a retried
+            # request) — see ogc_bulk_offload.py. Both are properties of
+            # the payload/request, not of any one flush, so once known
+            # there is no point re-attempting on every subsequent flush:
+            # skip straight to the normal inline continuation for the rest
+            # of the request, exactly as if the budget had never been
+            # crossed (#3253 Finding 2 — a remainder the offload can't
+            # hand off as a new job must never cost the caller their data;
+            # the write path's upserts are idempotent, so writing it
+            # inline here alongside an in-flight duplicate job is safe).
+            offload_unavailable = False
+
+            for idx, item in enumerate(items_list):
                 current_batch.append(item)
                 _dump = getattr(item, "model_dump", None)
                 current_batch_bytes += _estimate_feature_bytes(
                     _dump() if callable(_dump) else item
                 )
                 if len(current_batch) >= row_cap or current_batch_bytes >= byte_budget:
+                    flushed_bytes = current_batch_bytes
                     await _flush(current_batch)
                     current_batch = []
                     current_batch_bytes = 0
-            if current_batch:
+
+                    cumulative_flushed_bytes += flushed_bytes
+                    elapsed = time.monotonic() - budget_start
+                    over_bytes = (
+                        inprocess_max_bytes > 0
+                        and cumulative_flushed_bytes >= inprocess_max_bytes
+                    )
+                    over_seconds = (
+                        inprocess_max_seconds > 0 and elapsed >= inprocess_max_seconds
+                    )
+                    # Only slice the (potentially large) remainder once the
+                    # gate has actually fired — on the disabled-by-default
+                    # (0/0) path over_bytes/over_seconds are always False,
+                    # so this used to still pay an O(n) copy on every flush
+                    # for nothing, an O(n^2 / row_cap) cost across the whole
+                    # request.
+                    if not offload_unavailable and (over_bytes or over_seconds):
+                        remainder = items_list[idx + 1:]
+                        if remainder:
+                            outcome = await self._offload_bulk_remainder(  # type: ignore[attr-defined]
+                                catalog_id, collection_id, remainder,
+                                ctx=ctx, policy_source=policy_source,
+                            )
+                            if outcome.job_id is not None:
+                                ctx.extensions["_async_offload"] = {
+                                    "job_id": outcome.job_id,
+                                    "monitor_url": outcome.monitor_url,
+                                    "count": outcome.count,
+                                }
+                                offloaded = True
+                                break
+                            elif outcome.shape_unsupported or outcome.dedup_hit:
+                                # Not applicable, not a failure — continue the
+                                # normal inline loop below exactly as if this
+                                # flush had never crossed the budget.
+                                offload_unavailable = True
+                            else:
+                                rejections.extend(outcome.rejections)
+                                if len(rejections) > MAX_ACCUMULATED_FAILURE_SAMPLES:
+                                    rejections[:] = rejections[-MAX_ACCUMULATED_FAILURE_SAMPLES:]
+                                offloaded = True
+                                break
+            if current_batch and not offloaded:
                 await _flush(current_batch)
 
             if index_results:
@@ -2080,6 +2155,34 @@ class OGCTransactionMixin:
         return accepted_rows, rejections, was_single, batch_size
 
     # ------------------------------------------------------------------
+    # Bulk sync-write backlog offload (#3253)
+    # ------------------------------------------------------------------
+
+    async def _offload_bulk_remainder(
+        self,
+        catalog_id: str,
+        collection_id: str,
+        remainder: "list[Any]",
+        *,
+        ctx: DriverContext,
+        policy_source: str,
+    ) -> Any:
+        """Thin delegate to :func:`ogc_bulk_offload.offload_bulk_remainder`.
+
+        Kept as an overridable method (rather than a bare module-level call
+        from :meth:`_ingest_items`) so tests can substitute a fake without
+        patching imports — mirrors every other overridable hook on this
+        mixin.
+        """
+        from dynastore.extensions.ogc_bulk_offload import offload_bulk_remainder
+
+        caller_id = ctx.processing.caller_id if ctx.processing else None
+        return await offload_bulk_remainder(
+            catalog_id, collection_id, remainder,
+            ctx=ctx, policy_source=policy_source, caller_id=caller_id,
+        )
+
+    # ------------------------------------------------------------------
     # Response builders (shared between Features, Records, STAC)
     # ------------------------------------------------------------------
 
@@ -2115,14 +2218,55 @@ class OGCTransactionMixin:
             ids.append(fid)
         return ids
 
+    def _build_offload_response(
+        self,
+        accepted_ids: "list[str]",
+        rejections: "list[SidecarRejection]",
+        total: int,
+        async_offload: Dict[str, Any],
+    ) -> Response:
+        """Return HTTP 202 Accepted with a :class:`BulkOffloadReport` body
+        (#3253) — the split response used once a bulk-ingest request's
+        in-process budget was crossed and its remainder deferred.
+        """
+        report = BulkOffloadReport(
+            accepted=accepted_ids,
+            accepted_async=AsyncOffloadAcceptance(**async_offload),
+            rejections=rejections,
+            total=total,
+        )
+        headers = {}
+        monitor_url = async_offload.get("monitor_url")
+        if monitor_url:
+            headers["Location"] = monitor_url
+        return JSONResponse(
+            content=report.model_dump(by_alias=True, exclude_none=True),
+            status_code=status.HTTP_202_ACCEPTED,
+            headers=headers,
+        )
+
     def _build_rejection_response(
         self,
         accepted_rows: "list[Any]",
         rejections: "list[SidecarRejection]",
         batch_size: int,
+        ctx: Optional[DriverContext] = None,
     ) -> Response:
-        """Return HTTP 207 Multi-Status with an :class:`IngestionReport` body."""
+        """Return HTTP 207 Multi-Status with an :class:`IngestionReport` body.
+
+        ``ctx``, when carrying an ``_async_offload`` marker (set by
+        :meth:`_ingest_items` when the in-process budget was crossed and the
+        remainder durably deferred, #3253), switches this to the HTTP 202
+        split response instead — a request can have both policy rejections
+        (from sub-batches flushed before the budget was crossed) and a
+        deferred remainder in the same response.
+        """
         accepted_ids = self._resolve_accepted_ids(accepted_rows)
+        async_offload = ctx.extensions.get("_async_offload") if ctx is not None else None
+        if async_offload:
+            return self._build_offload_response(
+                accepted_ids, rejections, batch_size, async_offload,
+            )
         report = IngestionReport(
             accepted_ids=accepted_ids,
             rejections=rejections,
@@ -2136,9 +2280,21 @@ class OGCTransactionMixin:
     def _build_bulk_creation_response(
         self,
         accepted_rows: "list[Any]",
+        ctx: Optional[DriverContext] = None,
     ) -> Response:
-        """Return HTTP 201 Created with a :class:`BulkCreationResponse` body."""
+        """Return HTTP 201 Created with a :class:`BulkCreationResponse` body.
+
+        See :meth:`_build_rejection_response` for the ``ctx``/``_async_offload``
+        202-split behaviour (#3253) — when nothing overflowed (the default),
+        this method's output is byte-for-byte unchanged.
+        """
         accepted_ids = self._resolve_accepted_ids(accepted_rows)
+        async_offload = ctx.extensions.get("_async_offload") if ctx is not None else None
+        if async_offload:
+            total = len(accepted_ids) + int(async_offload.get("count", 0))
+            return self._build_offload_response(
+                accepted_ids, [], total, async_offload,
+            )
         return JSONResponse(
             content=BulkCreationResponse(ids=accepted_ids).model_dump(),
             status_code=status.HTTP_201_CREATED,

@@ -1491,12 +1491,13 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
 
         try:
             async with managed_transaction(engine) as conn:
+                ctx = DriverContext(db_resource=conn)
                 accepted_rows, rejections, was_single, batch_size = (
                     await self._ingest_items(
                         catalog_id,
                         collection_id,
                         item_payload,
-                        DriverContext(db_resource=conn),
+                        ctx,
                         policy_source,
                     )
                 )
@@ -1520,10 +1521,10 @@ class STACService(ExtensionProtocol, StaticFilesProtocol, StacVirtualMixin, OGCS
             )
 
         if rejections:
-            return self._build_rejection_response(accepted_rows, rejections, batch_size)
+            return self._build_rejection_response(accepted_rows, rejections, batch_size, ctx)
 
         if not was_single:
-            return self._build_bulk_creation_response(accepted_rows)
+            return self._build_bulk_creation_response(accepted_rows, ctx)
 
         # Single-item path: render a full STAC Item response.
         # NOTE: the write transaction has already committed at this point.

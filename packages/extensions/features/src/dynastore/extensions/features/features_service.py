@@ -1154,16 +1154,17 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
             f"/configs/catalogs/{catalog_id}/collections/{collection_id}"
             f"/plugins/{ItemsWritePolicy.class_key()}"
         )
+        ctx = DriverContext(db_resource=conn)
         accepted_rows, rejections, was_single, batch_size = await self._ingest_items(
             catalog_id,
             collection_id,
             payload,
-            DriverContext(db_resource=conn),
+            ctx,
             policy_source,
         )
 
         if rejections:
-            return self._build_rejection_response(accepted_rows, rejections, batch_size)
+            return self._build_rejection_response(accepted_rows, rejections, batch_size, ctx)
 
         if was_single:
             root_url = get_root_url(request)
@@ -1182,7 +1183,7 @@ class OGCFeaturesService(ExtensionProtocol, OGCServiceMixin, OGCTransactionMixin
                 headers={"Location": location_url},
             )
 
-        return self._build_bulk_creation_response(accepted_rows)
+        return self._build_bulk_creation_response(accepted_rows, ctx)
 
     async def replace_item(
         self,

@@ -78,6 +78,54 @@ class SidecarRejection(BaseModel):
     )
 
 
+class AsyncOffloadAcceptance(BaseModel):
+    """Deferred-processing handle for a bulk-ingest remainder (#3253).
+
+    Emitted as ``BulkOffloadReport.accepted_async`` once the spilled
+    remainder is durably written and its ``ingestion`` process job is
+    enqueued — never before, so a caller can trust that ``count`` items are
+    genuinely in flight rather than lost.
+    """
+
+    job_id: str = Field(..., description="Job id of the enqueued 'ingestion' process execution.")
+    monitor_url: Optional[str] = Field(
+        default=None,
+        description="Path to poll for the job's status (also returned as the response's Location header).",
+    )
+    count: int = Field(..., description="Number of items handed off to the async job.")
+
+
+class BulkOffloadReport(BaseModel):
+    """Batch-level outcome returned with HTTP 202 when a bulk-ingest request
+    exceeds the collection's in-process budget (#3253).
+
+    Superset of :class:`BulkCreationResponse` / :class:`IngestionReport`:
+    ``accepted`` holds ids committed inline before the budget was crossed,
+    ``accepted_async`` describes the deferred remainder (``None`` when the
+    budget was never crossed), and ``rejections`` holds items refused by
+    either the collection write policy or the offload mechanism itself
+    (e.g. a shape that cannot round-trip through the ingestion reader, or a
+    spill/enqueue failure) — the latter are never counted in ``accepted``
+    or ``accepted_async``.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    accepted: List[str] = Field(
+        default_factory=list,
+        description="Ids of items committed synchronously before the budget was crossed.",
+    )
+    accepted_async: Optional[AsyncOffloadAcceptance] = Field(
+        default=None,
+        description="Deferred-processing handle for the offloaded remainder, if any.",
+    )
+    rejections: List[SidecarRejection] = Field(
+        default_factory=list,
+        description="Rejections produced by the collection write policy or the offload mechanism.",
+    )
+    total: int = Field(..., description="Number of features submitted in the batch.")
+
+
 class IngestionReport(BaseModel):
     """Batch-level ingestion outcome returned by bulk endpoints.
 
