@@ -114,25 +114,17 @@ class CatalogEventType(EventType):
     )
 
     # Asset Lifecycle
-    BEFORE_ASSET_CREATION = define_event("before_asset_creation", EventScope.COLLECTION)
+    #
+    # Only the mid event of each triplet is ever emitted — via
+    # ``_ASSET_EVENT_MAP`` in ``catalog_module.py``, which bridges
+    # ``AssetEventType`` to these ``CatalogEventType`` values. The
+    # corresponding BEFORE_*/AFTER_* members were pruned (#3283): they had
+    # zero emit sites and zero subscribers, and #3275 happened precisely
+    # because a subscriber picked one of them and never fired.
     ASSET_CREATION = define_event("asset_creation", EventScope.COLLECTION)
-    AFTER_ASSET_CREATION = define_event("after_asset_creation", EventScope.COLLECTION)
-
-    BEFORE_ASSET_UPDATE = define_event("before_asset_update", EventScope.COLLECTION)
     ASSET_UPDATE = define_event("asset_update", EventScope.COLLECTION)
-    AFTER_ASSET_UPDATE = define_event("after_asset_update", EventScope.COLLECTION)
-
-    BEFORE_ASSET_DELETION = define_event("before_asset_deletion", EventScope.COLLECTION)
     ASSET_DELETION = define_event("asset_deletion", EventScope.COLLECTION)
-    AFTER_ASSET_DELETION = define_event("after_asset_deletion", EventScope.COLLECTION)
-
-    BEFORE_ASSET_HARD_DELETION = define_event(
-        "before_asset_hard_deletion", EventScope.COLLECTION
-    )
     ASSET_HARD_DELETION = define_event("asset_hard_deletion", EventScope.COLLECTION)
-    AFTER_ASSET_HARD_DELETION = define_event(
-        "after_asset_hard_deletion", EventScope.COLLECTION
-    )
 
     # Item Lifecycle
     BEFORE_ITEM_CREATION = define_event("before_item_creation", EventScope.COLLECTION)

@@ -304,9 +304,9 @@ async def test_subscriber_skips_when_catalog_id_missing():
 
 # ---------------------------------------------------------------------------
 # #3275 — the subscriber must be wired to an event the asset bridge actually
-# emits. It was originally registered on AFTER_ASSET_CREATION, which is
-# defined on CatalogEventType but emitted nowhere, so render preseed never
-# fired at all.
+# emits. It was originally registered on a CatalogEventType member with no
+# emit site, so render preseed never fired at all. That member (and its
+# never-emitted asset-lifecycle siblings) was later pruned entirely (#3283).
 # ---------------------------------------------------------------------------
 
 
