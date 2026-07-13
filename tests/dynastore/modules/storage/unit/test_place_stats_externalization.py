@@ -36,6 +36,7 @@ from dynastore.modules.storage.computed_fields import (
 from dynastore.modules.storage.drivers.pg_sidecars.geometries_config import (
     GeometriesSidecarConfig,
 )
+from dynastore.models.query_builder import FieldSelection, QueryRequest
 from dynastore.tools.geospatial import compute_place_derived_fields
 
 
@@ -368,3 +369,75 @@ def test_mixed_2d_and_place_kinds_only_place_excluded_from_main_table():
     assert "area DOUBLE PRECISION" in main_table_ddl
     assert "z_range DOUBLE PRECISION" not in main_table_ddl
     assert "place_z_range DOUBLE PRECISION" in ddl
+
+
+# ---------------------------------------------------------------------------
+# Projection shape — get_select_fields / get_queryable_fields exclude
+# _PLACE_TABLE_KINDS (#3309). Since the main geometries table no longer
+# mints place columns, projecting or registering a place stat off the
+# geometries alias is an UndefinedColumnError on every new collection's
+# first read.
+# ---------------------------------------------------------------------------
+
+def _make_sidecar(overlay):
+    from dynastore.modules.storage.drivers.pg_sidecars.geometries import GeometriesSidecar
+    cfg = GeometriesSidecarConfig(compute_fields_overlay=overlay)
+    return GeometriesSidecar(config=cfg)
+
+
+_ALL_PLACE_COLUMNAR = [
+    ComputedField(kind=k, storage_mode=StatisticStorageMode.COLUMNAR)
+    for k in sorted(_PLACE_TABLE_KINDS, key=lambda k: k.value)
+]
+
+
+def test_full_mode_select_fields_exclude_place_kinds():
+    sidecar = _make_sidecar(
+        [ComputedField(kind=ComputedKind.AREA, storage_mode=StatisticStorageMode.COLUMNAR)]
+        + _ALL_PLACE_COLUMNAR
+    )
+    joined = " ".join(sidecar.get_select_fields(include_all=True))
+    assert 'as "area"' in joined
+    for kind in _PLACE_TABLE_KINDS:
+        assert kind.value not in joined, f"place stat {kind.value} projected off sc_geometries"
+
+
+def test_selective_mode_select_fields_exclude_requested_place_kind():
+    """Explicitly requesting a place stat must not project it off the
+    geometries alias — the column only exists on {table}_place."""
+    sidecar = _make_sidecar(_ALL_PLACE_COLUMNAR)
+    request = QueryRequest(select=[FieldSelection(field="surface_area")])
+    fields = sidecar.get_select_fields(request=request)
+    assert all("surface_area" not in f for f in fields)
+
+
+def test_place_only_jsonb_does_not_project_geom_stats():
+    """A place-only JSONB overlay mints no geom_stats column (be8b0bfe),
+    so the SELECT must not reference it either."""
+    sidecar = _make_sidecar([
+        ComputedField(kind=ComputedKind.SURFACE_AREA, storage_mode=StatisticStorageMode.JSONB)
+    ])
+    joined = " ".join(sidecar.get_select_fields(include_all=True))
+    assert "geom_stats" not in joined
+
+
+def test_non_place_jsonb_still_projects_geom_stats():
+    sidecar = _make_sidecar([
+        ComputedField(kind=ComputedKind.AREA, storage_mode=StatisticStorageMode.JSONB),
+        ComputedField(kind=ComputedKind.SURFACE_AREA, storage_mode=StatisticStorageMode.JSONB),
+    ])
+    joined = " ".join(sidecar.get_select_fields(include_all=True))
+    assert "geom_stats" in joined
+
+
+def test_queryable_fields_exclude_place_kinds():
+    sidecar = _make_sidecar(
+        [ComputedField(kind=ComputedKind.AREA, storage_mode=StatisticStorageMode.COLUMNAR)]
+        + _ALL_PLACE_COLUMNAR
+    )
+    queryables = sidecar.get_queryable_fields()
+    assert "area" in queryables
+    for kind in _PLACE_TABLE_KINDS:
+        assert kind.value not in queryables, (
+            f"place stat {kind.value} registered filterable/sortable off sc_geometries"
+        )

@@ -205,15 +205,30 @@ class GeometriesSidecar(SidecarProtocol):
             if f.storage_mode is not None
         ]
 
+    def _main_table_fields(self) -> List[ComputedField]:
+        """Storage-bearing fields that materialise on ``{table}_geometries``.
+
+        Excludes ``_PLACE_TABLE_KINDS``: place statistics live exclusively
+        on the ``{table}_place`` table, so the main table never mints their
+        columns — projecting or registering them off the geometries alias
+        is an ``UndefinedColumnError`` on every table whose DDL post-dates
+        the place-column exclusion (#3309). Same filter as the DDL loops,
+        the upsert payload builder, and ``prepare_place_upsert_payload``.
+        """
+        return [
+            f for f in self._storage_fields() if f.kind not in _PLACE_TABLE_KINDS
+        ]
+
     def _has_jsonb_stats(self) -> bool:
-        """Any storage-bearing field with ``storage_mode == JSONB``?"""
+        """Any main-table storage-bearing field with ``storage_mode == JSONB``?"""
         return any(
-            f.storage_mode == StatisticStorageMode.JSONB for f in self._storage_fields()
+            f.storage_mode == StatisticStorageMode.JSONB
+            for f in self._main_table_fields()
         )
 
     def _columnar_fields(self) -> List[ComputedField]:
         return [
-            f for f in self._storage_fields()
+            f for f in self._main_table_fields()
             if f.storage_mode == StatisticStorageMode.COLUMNAR
         ]
 
@@ -607,15 +622,13 @@ class GeometriesSidecar(SidecarProtocol):
         known_columns.add("geometry_hash")
 
         # Add Statistics Columns — derived from ``compute_fields_overlay``.
-        # Excludes _PLACE_TABLE_KINDS: those 3D place statistics are computed
-        # from the JSON-FG 'place' member and stored exclusively on the
-        # {table}_place table (below) — minting a bare column here would be
-        # dead weight, never written and never read. Same filter as the
-        # place-column DDL loop, the place payload builder, and
-        # ``resolve_computed_value``.
-        main_table_fields = [
-            f for f in self._storage_fields() if f.kind not in _PLACE_TABLE_KINDS
-        ]
+        # Excludes _PLACE_TABLE_KINDS (via ``_main_table_fields``): those 3D
+        # place statistics are computed from the JSON-FG 'place' member and
+        # stored exclusively on the {table}_place table (below) — minting a
+        # bare column here would be dead weight, never written and never
+        # read. Same filter as the place-column DDL loop, the place payload
+        # builder, and ``resolve_computed_value``.
+        main_table_fields = self._main_table_fields()
         if any(
             f.storage_mode == StatisticStorageMode.JSONB for f in main_table_fields
         ):
