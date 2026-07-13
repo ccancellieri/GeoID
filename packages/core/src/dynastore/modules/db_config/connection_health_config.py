@@ -96,14 +96,26 @@ class LeadershipConfig:
     visibility_extend_seconds: int = 300
     unknown_grace_seconds: int = 180
     # Lease-table election: leader_lease row TTL. Must exceed the longest
-    # expected tick so the lease outlives one work cycle.
-    lease_ttl_seconds: float = 30.0
+    # expected tick so the lease outlives one work cycle — the effective
+    # per-tick budget everywhere is ``lease_ttl_seconds -
+    # lease_skew_margin_seconds`` (the clamp in tools/background_service.py).
+    # 30s proved far too small in production: real maintenance ticks
+    # (obligation_sweep, task_reaper) were clamp-cancelled at 25s, daily
+    # loops had their sleep clamped, and one starved renewal was enough to
+    # lose leadership under DB contention. 300s gives slow ticks a real
+    # budget and, with the 10s heartbeat renewal below, ~30 renewal
+    # attempts per TTL of contention slack. Tradeoff: a leader pod that
+    # dies without releasing takes up to this long to be superseded —
+    # acceptable for leader-elected background loops, which tolerate
+    # minutes of pause by design.
+    lease_ttl_seconds: float = 300.0
     # Renewal cadence for the continuous-tenure heartbeat regime (opt-in via
     # BackgroundService.lease_renewal_mode = HEARTBEAT; see
     # locking_tools.lease_leadership_with_heartbeat). Not used by the default
     # per-tick acquire-renew model (CM is entered/exited every cadence).
-    # Default is TTL/3, the classic heartbeat margin tolerating two
-    # consecutive missed renewals before the lease can expire.
+    # Kept at 10s independently of the TTL: frequent renewal is what buys
+    # tolerance to transient CAS/pool starvation (many attempts must ALL
+    # fail for a whole TTL before leadership can lapse).
     lease_renew_interval_seconds: float = 10.0
     # Safety margin: a tick whose timeout is within this many seconds of
     # lease_ttl_seconds risks outliving its lease under clock skew or load.
