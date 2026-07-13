@@ -3277,11 +3277,11 @@ class AssetElasticsearchDriver(
             base_query = existing
 
         try:
+            # opensearch-py accepts only body/index/params/headers; top-level
+            # query=/size=/from_= kwargs are elasticsearch-py 8.x API (#3318).
             resp = await es.search(
                 index=index_name,
-                query=base_query,
-                size=limit,
-                from_=offset,
+                body={"query": base_query, "size": limit, "from": offset},
             )
             hits = [hit["_source"] for hit in resp["hits"]["hits"]]
             from dynastore.models.protocols.entity_transform import (

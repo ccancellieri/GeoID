@@ -44,12 +44,23 @@ from dynastore.modules.storage.drivers import elasticsearch as es_mod
 
 
 class _FakeEs:
+    """Mirrors opensearch-py's ``AsyncOpenSearch.search`` signature exactly
+    (keyword-only ``body/index/params/headers``, no ``**kwargs``) so a call
+    using elasticsearch-py 8.x kwargs (``query=``/``size=``/``from_=``)
+    fails here the same way it fails against the real client (#3318)."""
+
     def __init__(self):
         self.captured: dict = {}
+        self.hits: list = []
 
-    async def search(self, *, index, query=None, size=None, from_=None, **kwargs):
-        self.captured = {"index": index, "query": query, "size": size, "from_": from_}
-        return {"hits": {"hits": []}}
+    async def search(self, *, body=None, index=None, params=None, headers=None):
+        self.captured = {
+            "index": index,
+            "query": (body or {}).get("query"),
+            "size": (body or {}).get("size"),
+            "from": (body or {}).get("from"),
+        }
+        return {"hits": {"hits": self.hits}}
 
 
 @pytest.fixture
@@ -181,6 +192,24 @@ async def test_is_not_null_goes_to_filter(driver_and_es):
     drv, fake = driver_and_es
     q = await _search(drv, fake, [AssetFilter(field="href", op=FilterOperator.IS_NOT_NULL, value=None)])
     assert q["bool"]["filter"] == [{"exists": {"field": "href"}}]
+
+
+# ---------------------------------------------------------------------------
+# opensearch-py calling convention — #3318
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_uses_opensearch_body_convention(driver_and_es):
+    """``size``/``from`` must travel inside ``body`` and hits must reach the
+    caller. Before #3318 the driver passed elasticsearch-py 8.x kwargs, every
+    search raised TypeError, and the except-all turned it into ``[]``."""
+    drv, fake = driver_and_es
+    fake.hits = [{"_source": {"asset_id": "a-1"}}]
+    out = await drv.search_assets("cat-a", collection_id="coll-1", limit=7, offset=3)
+    assert out == [{"asset_id": "a-1"}]
+    assert fake.captured["size"] == 7
+    assert fake.captured["from"] == 3
 
 
 @pytest.mark.asyncio
