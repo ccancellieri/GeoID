@@ -66,8 +66,11 @@ leak specifically — call sites remain responsible for using
 from __future__ import annotations
 
 import dataclasses
+import datetime
+import decimal
 import logging
 import re
+import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 
@@ -104,6 +107,23 @@ _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 # are the diagnostic shape we want to keep.
 _URI_USERINFO_RE = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*://)([^/@\s]+)@")
 
+# Scalar value types whose text form cannot embed credential-shaped data,
+# passed through with their type intact. RedactingLogFilter rewrites
+# ``record.args`` BEFORE %-formatting, so repr()-ing a Decimal or UUID arg
+# into a str makes ``record.getMessage()`` raise on a numeric format
+# specifier (``%d``/``%.0f``) and destroys the very record the filter was
+# protecting (a real number is required, not str).
+_CREDENTIAL_FREE_SCALARS = (
+    bool,
+    int,
+    float,
+    decimal.Decimal,
+    uuid.UUID,
+    datetime.date,  # datetime.datetime is a date subclass
+    datetime.time,
+    datetime.timedelta,
+)
+
 
 def _is_sensitive_key(key: str) -> bool:
     normalized = _NON_ALNUM_RE.sub("_", key.lower()).strip("_")
@@ -134,7 +154,7 @@ def redact_for_log(value: Any, *, key: Optional[str] = None) -> Any:
     masked. Pass it explicitly when redacting a single named value, e.g.
     ``redact_for_log(raw_dsn, key="database_url")``.
     """
-    if value is None or isinstance(value, (bool, int, float)):
+    if value is None or isinstance(value, _CREDENTIAL_FREE_SCALARS):
         return value
     if isinstance(value, SQLAlchemyURL):
         return value.render_as_string(hide_password=True)

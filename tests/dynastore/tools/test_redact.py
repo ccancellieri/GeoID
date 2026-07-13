@@ -25,7 +25,10 @@ fake value never appears in the redacted / formatted output.
 from __future__ import annotations
 
 import dataclasses
+import datetime
+import decimal
 import logging
+import uuid
 from typing import Optional
 
 import pytest
@@ -203,3 +206,32 @@ def test_filter_never_drops_the_record_on_redaction_error():
 def test_all_suggested_key_classes_mask_bare_secrets(key):
     out = redact_for_log(_FAKE_TOKEN, key=key)
     assert out == "***"
+
+
+def test_credential_free_scalars_pass_through_with_type_preserved():
+    for value in (
+        decimal.Decimal("1203519.860405"),
+        uuid.UUID("019f1326-645d-72bf-9c17-7451e825ca34"),
+        datetime.datetime(2026, 7, 13, 9, 50, 30),
+        datetime.date(2026, 7, 13),
+        datetime.timedelta(seconds=90),
+    ):
+        assert redact_for_log(value) is value
+
+
+def test_filter_keeps_numeric_format_args_working():
+    """Regression: the filter repr()'d a Decimal ``%.0f`` arg into a str,
+    so ``record.getMessage()`` raised ``TypeError: must be real number,
+    not str`` and the record was destroyed (stuck-pending warner WARN,
+    dev 2026-07-13)."""
+    record = _capture_log({
+        "msg": "stuck-pending: task '%s' has been PENDING for %.0fs",
+        "args": (
+            uuid.UUID("019f1326-645d-72bf-9c17-7451e825ca34"),
+            decimal.Decimal("1203519.860405"),
+        ),
+        "exc_info": None,
+    })
+    formatted = record.getMessage()
+    assert "task '019f1326-645d-72bf-9c17-7451e825ca34'" in formatted
+    assert "PENDING for 1203520s" in formatted
