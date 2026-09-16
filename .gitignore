@@ -177,7 +177,7 @@ web_service.py
 .python-version
 deprecated/**
 
-# AI / Agent artifacts — never commit
+# Personal AI / agent artifacts — private by default
 CLAUDE.md
 AGENTS.md
 GEMINI.md
@@ -238,3 +238,12 @@ notebook_showcase/__pycache__/
 agentdb.rvf
 agentdb.rvf.lock
 ruvector.db
+
+# Reviewed, portable development guidance is intentionally versioned.
+!/AGENTS.md
+!/.agents/
+/.agents/*
+!/.agents/skills/
+/.agents/skills/*
+!/.agents/skills/geoid-development/
+!/.agents/skills/geoid-development/**

@@ -1,0 +1,6 @@
+interface:
+  display_name: "GeoID / DynaStore Development"
+  short_description: "Project contracts, lifecycle safety and OGC checks"
+  default_prompt: "Use $geoid-development to review this GeoID or DynaStore change against its development guidelines."
+policy:
+  allow_implicit_invocation: true
